@@ -1,0 +1,850 @@
+import { Card, Rank, Suit } from '../game/Card';
+import { evaluateHand, compareTo, HandRank, HandResult } from '../game/HandEvaluator';
+import { PokerTable, Seat, PlayerAction, GamePhase } from '../game/PokerTable';
+import { calculateEquity } from '../training/TrainingEngine';
+
+export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
+export type Personality =
+  | 'tight'
+  | 'loose'
+  | 'aggressive'
+  | 'passive'
+  | 'maniac'
+  | 'rock';
+
+export interface AIPlayerProfile {
+  botName: string;
+  difficulty: Difficulty;
+  personality: Personality;
+  vpip: number;
+  pfr: number;
+  aggressionFactor: number;
+  bluffFrequency: number;
+}
+
+export interface AIDecision {
+  action: PlayerAction;
+  raiseAmount: number;
+}
+
+// ============================================================
+// Opponent modeling: track what opponents have done this hand
+// ============================================================
+interface OpponentModel {
+  raiseCount: number;
+  callCount: number;
+  checkCount: number;
+  totalBet: number;
+  isAggressive: boolean;
+}
+
+function modelOpponents(table: PokerTable, mySeat: number): OpponentModel {
+  let raiseCount = 0;
+  let callCount = 0;
+  let checkCount = 0;
+  let totalBet = 0;
+
+  for (const seat of table.seats) {
+    if (seat.seatIndex === mySeat) continue;
+    if (seat.state !== 'occupied' || seat.folded || seat.eliminated) continue;
+
+    totalBet += seat.totalInvestedThisHand; // already includes current round bets
+    switch (seat.lastAction) {
+      case PlayerAction.Raise: raiseCount++; break;
+      case PlayerAction.Call: callCount++; break;
+      case PlayerAction.Check: checkCount++; break;
+      case PlayerAction.AllIn: raiseCount += 2; break;
+    }
+  }
+
+  return {
+    raiseCount,
+    callCount,
+    checkCount,
+    totalBet,
+    isAggressive: raiseCount >= 2,
+  };
+}
+
+// ============================================================
+// Board texture analysis
+// ============================================================
+interface BoardTexture {
+  isPaired: boolean;
+  isMonotone: boolean;   // 3+ same suit
+  isTwoTone: boolean;    // 2 of same suit
+  isConnected: boolean;  // 3+ consecutive
+  hasHighCards: boolean;  // A or K on board
+  isWet: boolean;        // many draws possible
+  isDry: boolean;        // few draws possible
+  straightPossible: boolean;
+  flushPossible: boolean;
+}
+
+function analyzeBoardTexture(community: Card[]): BoardTexture {
+  if (community.length < 3) {
+    return {
+      isPaired: false, isMonotone: false, isTwoTone: false,
+      isConnected: false, hasHighCards: false, isWet: false,
+      isDry: true, straightPossible: false, flushPossible: false,
+    };
+  }
+
+  const ranks = community.map(c => c.rank).sort((a, b) => a - b);
+  const suits = community.map(c => c.suit);
+
+  // Pair check
+  const rankCounts = new Map<number, number>();
+  for (const r of ranks) rankCounts.set(r, (rankCounts.get(r) || 0) + 1);
+  const isPaired = [...rankCounts.values()].some(v => v >= 2);
+
+  // Suit analysis
+  const suitCounts = new Map<number, number>();
+  for (const s of suits) suitCounts.set(s, (suitCounts.get(s) || 0) + 1);
+  const maxSuit = Math.max(...suitCounts.values());
+  const isMonotone = maxSuit >= 3;
+  const isTwoTone = maxSuit === 2;
+  const flushPossible = maxSuit >= 3;
+
+  // Connectivity
+  const uniqueRanks = [...new Set(ranks)].sort((a, b) => a - b);
+  let maxConsecutive = 1;
+  let current = 1;
+  for (let i = 1; i < uniqueRanks.length; i++) {
+    if (uniqueRanks[i] - uniqueRanks[i - 1] <= 2) {
+      current++;
+      maxConsecutive = Math.max(maxConsecutive, current);
+    } else {
+      current = 1;
+    }
+  }
+  const isConnected = maxConsecutive >= 3;
+  const straightPossible = maxConsecutive >= 3 || (uniqueRanks.includes(Rank.Ace) && uniqueRanks.some(r => r <= 5));
+
+  const hasHighCards = ranks.some(r => r >= Rank.King);
+  const isWet = (isConnected || isTwoTone || isMonotone) && !isPaired;
+  const isDry = !isWet && isPaired;
+
+  return {
+    isPaired, isMonotone, isTwoTone, isConnected,
+    hasHighCards, isWet, isDry, straightPossible, flushPossible,
+  };
+}
+
+// ============================================================
+// Preflop hand rankings - 169 hand matrix
+// ============================================================
+
+// Chen formula for preflop hand strength (modified)
+function chenFormulaScore(holeCards: Card[]): number {
+  if (holeCards.length < 2) return 0;
+
+  const r1 = holeCards[0].rank;
+  const r2 = holeCards[1].rank;
+  const high = Math.max(r1, r2);
+  const low = Math.min(r1, r2);
+  const suited = holeCards[0].suit === holeCards[1].suit;
+  const gap = high - low;
+  const isPair = r1 === r2;
+
+  // Base score from high card
+  let score = 0;
+  if (high === Rank.Ace) score = 10;
+  else if (high === Rank.King) score = 8;
+  else if (high === Rank.Queen) score = 7;
+  else if (high === Rank.Jack) score = 6;
+  else score = high / 2;
+
+  // Pairs double the score
+  if (isPair) {
+    score *= 2;
+    if (score < 5) score = 5; // minimum 5 for pairs
+  }
+
+  // Suited bonus
+  if (suited) score += 2;
+
+  // Gap penalty
+  if (!isPair) {
+    if (gap === 1) score += 1; // connected
+    else if (gap === 2) score -= 1;
+    else if (gap === 3) score -= 2;
+    else if (gap === 4) score -= 4;
+    else score -= 5;
+  }
+
+  // Bonus for both cards > 10
+  if (low >= Rank.Ten && !isPair) score += 1;
+
+  return Math.max(0, score);
+}
+
+// Normalize chen score to 0-1 range (max chen ≈ 20 for AA)
+function getPreFlopHandRank(holeCards: Card[]): number {
+  const chen = chenFormulaScore(holeCards);
+  return Math.min(1.0, chen / 20);
+}
+
+// ============================================================
+// Post-flop hand strength with Monte Carlo equity
+// ============================================================
+
+function getPostFlopStrength(
+  holeCards: Card[],
+  communityCards: Card[],
+  numOpponents: number,
+  difficulty: Difficulty
+): number {
+  // Expert and Hard AI use actual Monte Carlo equity (but fewer sims for speed)
+  if (difficulty === 'expert' || difficulty === 'hard') {
+    const equity = calculateEquity(
+      holeCards,
+      communityCards,
+      numOpponents
+    );
+    return equity / 100; // normalize to 0-1
+  }
+
+  // Medium/Easy use simplified evaluation
+  const allCards = [...holeCards, ...communityCards];
+  const result = evaluateHand(allCards);
+
+  let score: number;
+  switch (result.handRank) {
+    case HandRank.HighCard:      score = 0.08 + (result.primaryValue / Rank.Ace) * 0.08; break;
+    case HandRank.OnePair:       score = 0.22 + (result.primaryValue / Rank.Ace) * 0.12; break;
+    case HandRank.TwoPair:       score = 0.42 + (result.primaryValue / Rank.Ace) * 0.08; break;
+    case HandRank.ThreeOfAKind:  score = 0.58 + (result.primaryValue / Rank.Ace) * 0.06; break;
+    case HandRank.Straight:      score = 0.70 + (result.primaryValue / Rank.Ace) * 0.04; break;
+    case HandRank.Flush:         score = 0.78 + (result.primaryValue / Rank.Ace) * 0.04; break;
+    case HandRank.FullHouse:     score = 0.85 + (result.primaryValue / Rank.Ace) * 0.04; break;
+    case HandRank.FourOfAKind:   score = 0.93; break;
+    case HandRank.StraightFlush: score = 0.97; break;
+    case HandRank.RoyalFlush:    score = 1.00; break;
+    default: score = 0.05;
+  }
+
+  // Check if hole cards contribute
+  if (communityCards.length >= 5) {
+    const communityResult = evaluateHand(communityCards);
+    if (result.handRank === communityResult.handRank &&
+        result.primaryValue === communityResult.primaryValue) {
+      score *= 0.4; // playing the board = very weak
+    }
+  }
+
+  return Math.min(1.0, Math.max(0.0, score));
+}
+
+// ============================================================
+// Implied odds & stack-to-pot ratio considerations
+// ============================================================
+
+function getImpliedOdds(
+  handStrength: number,
+  outs: number,
+  potSize: number,
+  effectiveStack: number,
+  phase: GamePhase
+): number {
+  // More cards to come = more implied odds
+  const cardsTocome = phase === GamePhase.Flop ? 2 : phase === GamePhase.Turn ? 1 : 0;
+  if (cardsTocome === 0) return 0;
+
+  // Stack-to-pot ratio: deep stacks = more implied odds
+  const spr = effectiveStack / Math.max(potSize, 1);
+
+  // Base implied odds from outs
+  const drawEquity = (outs * cardsTocome * 2.2) / 100; // rough rule of 2/4
+
+  // Adjust by SPR: deep stacks make draws more valuable
+  const sprBonus = Math.min(0.15, spr * 0.01);
+
+  return drawEquity + sprBonus;
+}
+
+// ============================================================
+// Counting outs (from TrainingEngine, simplified inline)
+// ============================================================
+
+function countOuts(holeCards: Card[], communityCards: Card[]): number {
+  if (communityCards.length === 0 || communityCards.length >= 5) return 0;
+
+  const allCards = [...holeCards, ...communityCards];
+  let outs = 0;
+
+  // Flush draw check
+  const suitCounts = new Map<number, number>();
+  for (const c of allCards) suitCounts.set(c.suit, (suitCounts.get(c.suit) || 0) + 1);
+  for (const count of suitCounts.values()) {
+    if (count === 4) { outs += 9; break; }
+  }
+
+  // Straight draw check
+  const ranks = new Set<number>(allCards.map(c => c.rank as number));
+  if (allCards.some(c => c.rank === Rank.Ace)) ranks.add(1);
+
+  for (let start = 1; start <= 10; start++) {
+    let have = 0;
+    for (let r = start; r < start + 5; r++) {
+      if (ranks.has(r)) have++;
+    }
+    if (have === 4) {
+      outs += outs >= 9 ? 6 : 8; // reduce if already have flush draw (overlap)
+      break;
+    }
+  }
+
+  // Overcard outs
+  if (communityCards.length >= 3) {
+    const maxBoard = Math.max(...communityCards.map(c => c.rank));
+    const currentHand = evaluateHand(allCards);
+    if (currentHand.handRank <= HandRank.HighCard) {
+      for (const hc of holeCards) {
+        if (hc.rank > maxBoard) outs += 3;
+      }
+    }
+  }
+
+  return outs;
+}
+
+// ============================================================
+// Round a chip amount to the nearest big-blind multiple for clean bet sizing
+function roundToBB(amount: number, bigBlind: number): number {
+  if (bigBlind <= 0) return amount;
+  return Math.round(amount / bigBlind) * bigBlind;
+}
+
+// GTO-influenced bet sizing
+// ============================================================
+
+function getGTOBetSize(
+  handStrength: number,
+  potSize: number,
+  bigBlind: number,
+  chipStack: number,
+  board: BoardTexture,
+  phase: GamePhase,
+  profile: AIPlayerProfile
+): number {
+  const minBet = bigBlind * 2;
+
+  // Polarized sizing: bet big with strong hands and bluffs, small with medium
+  let potFraction: number;
+
+  if (handStrength > 0.85) {
+    // Very strong: overbet for value (sometimes)
+    if (Math.random() < 0.25 && profile.aggressionFactor > 2) {
+      potFraction = 1.25 + Math.random() * 0.5; // 125-175% pot overbet
+    } else {
+      potFraction = 0.66 + Math.random() * 0.34; // 66-100% pot
+    }
+  } else if (handStrength > 0.7) {
+    // Strong: standard value bet
+    potFraction = 0.55 + Math.random() * 0.2; // 55-75% pot
+  } else if (handStrength > 0.5) {
+    // Medium: smaller bet to control pot, or check sometimes
+    potFraction = 0.33 + Math.random() * 0.17; // 33-50% pot
+  } else {
+    // Bluff/semi-bluff: use same sizing as value bets (balanced)
+    potFraction = 0.55 + Math.random() * 0.2; // 55-75% pot (mirrors value range)
+  }
+
+  // Board texture adjustments
+  if (board.isWet) {
+    // Wet boards: bet bigger to deny equity
+    potFraction *= 1.15;
+  } else if (board.isDry) {
+    // Dry boards: smaller bets work
+    potFraction *= 0.85;
+  }
+
+  // Phase adjustments
+  if (phase === GamePhase.River) {
+    // River: polarize more (big or small, no medium)
+    if (handStrength > 0.75) potFraction *= 1.2;
+    else potFraction *= 0.8;
+  }
+
+  // Personality adjustment
+  potFraction *= 0.7 + profile.aggressionFactor * 0.15;
+
+  let betSize = Math.max(minBet, roundToBB(Math.round(potSize * potFraction), bigBlind));
+  betSize = Math.min(betSize, chipStack);
+
+  return betSize;
+}
+
+// ============================================================
+// Preflop raising ranges (position-aware)
+// ============================================================
+
+function getOpenRaiseRange(position: number, totalActive: number): number {
+  // Position: 0 = early, higher = later
+  // Returns minimum hand strength to open-raise
+  const relativePos = position / Math.max(totalActive - 1, 1);
+
+  if (relativePos < 0.3) return 0.55; // early position: tight
+  if (relativePos < 0.6) return 0.42; // middle position
+  if (relativePos < 0.85) return 0.32; // late position: wide
+  return 0.25; // button/cutoff: very wide
+}
+
+function get3BetRange(position: number): number {
+  // 3-bet range threshold (tighter than opening)
+  if (position < 3) return 0.7; // early: only premiums
+  return 0.6; // late: wider 3-bet range
+}
+
+// ============================================================
+// Main decision engine
+// ============================================================
+
+const BOT_NAMES = [
+  // Realistic first names / nicknames
+  'Mike', 'Danny', 'Steve', 'Tommy', 'Jake', 'Rico',
+  'Vinny', 'Carlos', 'Big Al', 'Joey B', 'Lex', 'Nate',
+  'Frankie', 'Dex', 'Sal', 'Manny', 'Ricky', 'Gus',
+  'Phil', 'Hank', 'Eddie', 'Marco', 'Bobby', 'Trent',
+  'Chase', 'Brody', 'Mick', 'Colt', 'Dean', 'Ray',
+  'Zeke', 'Dallas', 'Rocco', 'Benny', 'Clyde', 'Wade',
+  'Eli', 'Jax', 'Knox', 'Miles', 'Owen', 'Quinn',
+  'Theo', 'Vince', 'Wes', 'Ty', 'Ash', 'Cruz',
+  'Leo', 'Max', 'Nico', 'Reed', 'Shane', 'Troy',
+  'Blake', 'Cole', 'Drew', 'Flynn', 'Grant', 'Hugo',
+  'Ivan', 'Kurt', 'Liam', 'Nash', 'Pete', 'Russ',
+  'Seth', 'Toby', 'Vaughn', 'Wyatt', 'Axel', 'Brock',
+  'Cliff', 'Donnie', 'Earl', 'Fritz', 'Gil', 'Hector',
+  'Ike', 'Jules', 'Kenny', 'Lou', 'Moe', 'Neil',
+  'Oscar', 'Paulie', 'Ruben', 'Saul', 'Terry', 'Vic',
+];
+
+const PERSONALITIES: Personality[] = [
+  'tight', 'loose', 'aggressive', 'passive', 'maniac', 'rock',
+];
+
+export function generateRandomProfile(difficulty: Difficulty): AIPlayerProfile {
+  const botName = BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)];
+  const personality = PERSONALITIES[Math.floor(Math.random() * PERSONALITIES.length)];
+
+  let vpip: number, pfr: number, aggressionFactor: number, bluffFrequency: number;
+
+  switch (difficulty) {
+    case 'easy':
+      vpip = 0.45 + Math.random() * 0.2;
+      pfr = 0.08 + Math.random() * 0.07;
+      aggressionFactor = 0.5 + Math.random() * 0.5;
+      bluffFrequency = 0.03 + Math.random() * 0.07;
+      break;
+    case 'medium':
+      vpip = 0.25 + Math.random() * 0.1;
+      pfr = 0.17 + Math.random() * 0.08;
+      aggressionFactor = 1.2 + Math.random() * 0.8;
+      bluffFrequency = 0.08 + Math.random() * 0.07;
+      break;
+    case 'hard':
+      vpip = 0.22 + Math.random() * 0.08;
+      pfr = 0.18 + Math.random() * 0.08;
+      aggressionFactor = 2.0 + Math.random() * 1.5;
+      bluffFrequency = 0.15 + Math.random() * 0.1;
+      break;
+    case 'expert':
+      vpip = 0.20 + Math.random() * 0.08;
+      pfr = 0.18 + Math.random() * 0.07;
+      aggressionFactor = 2.5 + Math.random() * 2.0;
+      bluffFrequency = 0.18 + Math.random() * 0.12;
+      break;
+  }
+
+  switch (personality) {
+    case 'tight':      vpip *= 0.7; pfr *= 0.8; break;
+    case 'loose':      vpip *= 1.3; pfr *= 1.1; break;
+    case 'aggressive': aggressionFactor *= 1.4; pfr *= 1.2; bluffFrequency *= 1.3; break;
+    case 'passive':    aggressionFactor *= 0.6; pfr *= 0.7; bluffFrequency *= 0.5; break;
+    case 'maniac':     vpip *= 1.5; pfr *= 1.5; aggressionFactor *= 1.8; bluffFrequency *= 2.0; break;
+    case 'rock':       vpip *= 0.5; pfr *= 0.6; aggressionFactor *= 0.8; bluffFrequency *= 0.3; break;
+  }
+
+  vpip = Math.min(1.0, Math.max(0.05, vpip));
+  pfr = Math.min(vpip, Math.max(0.02, pfr));
+  aggressionFactor = Math.max(0.1, aggressionFactor);
+  bluffFrequency = Math.min(0.5, Math.max(0.01, bluffFrequency));
+
+  return { botName, difficulty, personality, vpip, pfr, aggressionFactor, bluffFrequency };
+}
+
+export function decideAction(
+  table: PokerTable,
+  seatIndex: number,
+  profile: AIPlayerProfile
+): AIDecision {
+  const seat = table.seats[seatIndex];
+  if (!seat || seat.state !== 'occupied' || seat.folded || seat.allIn) {
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  const isPreFlop = table.currentPhase === GamePhase.PreFlop;
+  const callAmount = table.getCallAmount(seat);
+  const totalPot = table.getTotalPot();
+  const potOdds = totalPot > 0 ? callAmount / (totalPot + callAmount) : 0;
+  const bigBlind = table.config.bigBlind;
+  const board = analyzeBoardTexture(table.communityCards);
+  const opponents = modelOpponents(table, seatIndex);
+
+  // Count active non-folded opponents
+  const numOpponents = table.seats.filter(
+    s => s.state === 'occupied' && !s.folded && !s.eliminated && s.seatIndex !== seatIndex
+  ).length;
+
+  // Get position info
+  const activeSeats = table.getActivePlayerSeats();
+  const myPosition = activeSeats.indexOf(seatIndex);
+  const totalActive = activeSeats.length;
+
+  // ============================================================
+  // Hand strength evaluation
+  // ============================================================
+  let handStrength: number;
+
+  if (isPreFlop) {
+    handStrength = getPreFlopHandRank(seat.holeCards);
+  } else {
+    handStrength = getPostFlopStrength(
+      seat.holeCards, table.communityCards, numOpponents, profile.difficulty
+    );
+  }
+
+  // Position multiplier (more refined than before)
+  const relativePosition = totalActive > 1 ? myPosition / (totalActive - 1) : 0.5;
+  const positionMult = 0.88 + relativePosition * 0.24; // 0.88 EP to 1.12 LP
+  handStrength *= positionMult;
+
+  // Difficulty-based noise (expert has almost none)
+  const noiseMap: Record<Difficulty, number> = {
+    easy: 0.25, medium: 0.12, hard: 0.05, expert: 0.02
+  };
+  const noise = (Math.random() - 0.5) * noiseMap[profile.difficulty];
+  handStrength = Math.min(1.0, Math.max(0.0, handStrength + noise));
+
+  // Outs and implied odds for draw decisions
+  const outs = isPreFlop ? 0 : countOuts(seat.holeCards, table.communityCards);
+  const impliedOdds = isPreFlop ? 0 : getImpliedOdds(
+    handStrength, outs, totalPot, seat.chipCount, table.currentPhase
+  );
+
+  // Adjust hand strength with implied odds for drawing hands
+  const effectiveStrength = handStrength + impliedOdds;
+
+  // ============================================================
+  // Expert-level adjustments
+  // ============================================================
+  if (profile.difficulty === 'expert' || profile.difficulty === 'hard') {
+    // Adjust for opponent aggression — tighten up against aggressive opponents
+    if (opponents.isAggressive && callAmount > bigBlind * 4) {
+      // Opponent is very aggressive — need a stronger hand to continue
+      const aggressionAdjust = profile.difficulty === 'expert' ? 0.08 : 0.05;
+      // But don't over-fold: if we have a good hand, keep it
+      if (handStrength < 0.65) {
+        handStrength -= aggressionAdjust;
+      }
+    }
+
+    // Multi-way pot adjustment: hands play worse multi-way
+    if (numOpponents >= 3 && !isPreFlop) {
+      handStrength *= 0.92; // drawing hands lose value in multi-way
+    }
+
+    // Board texture awareness
+    if (!isPreFlop && board.isWet && handStrength < 0.5) {
+      // Wet board + weak hand = dangerous
+      handStrength *= 0.85;
+    }
+  }
+
+  // ============================================================
+  // PREFLOP STRATEGY
+  // ============================================================
+  if (isPreFlop) {
+    return preFlopStrategy(
+      handStrength, callAmount, totalPot, seat, table, profile,
+      myPosition, totalActive, opponents, bigBlind
+    );
+  }
+
+  // ============================================================
+  // POST-FLOP STRATEGY
+  // ============================================================
+  return postFlopStrategy(
+    effectiveStrength, handStrength, callAmount, totalPot, potOdds,
+    seat, table, profile, board, opponents, outs, bigBlind, numOpponents
+  );
+}
+
+// ============================================================
+// Preflop decision logic
+// ============================================================
+
+function preFlopStrategy(
+  handStrength: number,
+  callAmount: number,
+  totalPot: number,
+  seat: Seat,
+  table: PokerTable,
+  profile: AIPlayerProfile,
+  position: number,
+  totalActive: number,
+  opponents: OpponentModel,
+  bigBlind: number
+): AIDecision {
+  const openRaiseThreshold = getOpenRaiseRange(position, totalActive);
+  const threeBetThreshold = get3BetRange(position);
+
+  // No bet to match (we can check or open-raise)
+  if (callAmount === 0) {
+    if (handStrength >= openRaiseThreshold) {
+      // Open raise: 2.5-3x BB from early, 2-2.5x from late
+      const raiseMult = position < 3 ? 2.5 + Math.random() * 0.5 : 2.0 + Math.random() * 0.5;
+      const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * raiseMult));
+      if (raiseAmount <= seat.chipCount) {
+        return { action: PlayerAction.Raise, raiseAmount };
+      }
+      return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    }
+    return { action: PlayerAction.Check, raiseAmount: 0 };
+  }
+
+  // Facing a raise
+  const facingRaise = callAmount > bigBlind;
+  const facingThreeBet = opponents.raiseCount >= 2;
+
+  if (facingThreeBet) {
+    // Facing 3-bet: need premium hands
+    if (handStrength >= 0.8) {
+      // 4-bet with premiums
+      const raiseAmount = Math.max(table.getMinRaise(), Math.round(totalPot * 2.2));
+      if (raiseAmount <= seat.chipCount) {
+        return { action: PlayerAction.Raise, raiseAmount };
+      }
+      return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    }
+    if (handStrength >= 0.65) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+    // Occasional light 4-bet bluff (expert only)
+    if (profile.difficulty === 'expert' && Math.random() < profile.bluffFrequency * 0.3) {
+      const raiseAmount = Math.max(table.getMinRaise(), Math.round(totalPot * 2));
+      if (raiseAmount <= seat.chipCount * 0.3) {
+        return { action: PlayerAction.Raise, raiseAmount };
+      }
+    }
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  if (facingRaise) {
+    // Facing single raise
+    if (handStrength >= threeBetThreshold) {
+      // 3-bet
+      const raiseAmount = roundToBB(Math.max(table.getMinRaise(), Math.round(callAmount * 3)), bigBlind);
+      if (raiseAmount <= seat.chipCount) {
+        return { action: PlayerAction.Raise, raiseAmount };
+      }
+    }
+    if (handStrength >= openRaiseThreshold * 0.85) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+    // Consider calling with suited connectors in position
+    if (position >= totalActive - 2 && handStrength >= 0.25) {
+      if (callAmount <= seat.chipCount * 0.05) {
+        return { action: PlayerAction.Call, raiseAmount: 0 };
+      }
+    }
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  // Facing just the big blind (limp or raise)
+  if (handStrength >= openRaiseThreshold) {
+    const raiseMult = 2.5 + Math.random() * 0.5;
+    const raiseAmount = roundToBB(Math.max(table.getMinRaise(), Math.round(bigBlind * raiseMult)), bigBlind);
+    if (raiseAmount <= seat.chipCount) {
+      return { action: PlayerAction.Raise, raiseAmount };
+    }
+  }
+
+  // Limp with speculative hands in late position
+  if (position >= totalActive - 3 && handStrength >= 0.2) {
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // VPIP threshold (personality-influenced)
+  if (handStrength >= 1.0 - profile.vpip) {
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  return { action: PlayerAction.Fold, raiseAmount: 0 };
+}
+
+// ============================================================
+// Post-flop decision logic
+// ============================================================
+
+function postFlopStrategy(
+  effectiveStrength: number,
+  rawStrength: number,
+  callAmount: number,
+  totalPot: number,
+  potOdds: number,
+  seat: Seat,
+  table: PokerTable,
+  profile: AIPlayerProfile,
+  board: BoardTexture,
+  opponents: OpponentModel,
+  outs: number,
+  bigBlind: number,
+  numOpponents: number
+): AIDecision {
+  const isRiver = table.currentPhase === GamePhase.River;
+
+  // ============================================================
+  // No bet to face: check or bet
+  // ============================================================
+  if (callAmount === 0) {
+    // Strong hand: bet for value
+    if (effectiveStrength > 0.65) {
+      const betSize = getGTOBetSize(
+        rawStrength, totalPot, bigBlind, seat.chipCount,
+        board, table.currentPhase, profile
+      );
+      const minRaise = table.getMinRaise();
+      if (betSize >= minRaise) {
+        return { action: PlayerAction.Raise, raiseAmount: betSize };
+      }
+    }
+
+    // Medium hand: check (pot control)
+    if (effectiveStrength > 0.4) {
+      // Sometimes bet as a thin value bet (expert level)
+      if (profile.difficulty === 'expert' && Math.random() < 0.25) {
+        const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.33));
+        if (betSize <= seat.chipCount) {
+          return { action: PlayerAction.Raise, raiseAmount: betSize };
+        }
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+
+    // Weak hand: check or bluff
+    if (Math.random() < profile.bluffFrequency) {
+      // Semi-bluff with draws
+      if (outs >= 8) {
+        const betSize = getGTOBetSize(
+          0.7, totalPot, bigBlind, seat.chipCount,
+          board, table.currentPhase, profile
+        );
+        const minRaise = table.getMinRaise();
+        if (betSize >= minRaise && betSize <= seat.chipCount * 0.4) {
+          return { action: PlayerAction.Raise, raiseAmount: betSize };
+        }
+      }
+      // Pure bluff on dry boards (expert/hard)
+      if (board.isDry && (profile.difficulty === 'expert' || profile.difficulty === 'hard')) {
+        const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.55));
+        if (betSize <= seat.chipCount * 0.25) {
+          return { action: PlayerAction.Raise, raiseAmount: betSize };
+        }
+      }
+    }
+
+    return { action: PlayerAction.Check, raiseAmount: 0 };
+  }
+
+  // ============================================================
+  // Facing a bet: call, raise, or fold
+  // ============================================================
+
+  // All-in decision (calling would commit most of stack)
+  if (callAmount >= seat.chipCount * 0.6) {
+    if (effectiveStrength > 0.7) {
+      return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    }
+    if (effectiveStrength > potOdds + 0.1) {
+      return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    }
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  // Strong hand: raise (value raise or check-raise)
+  if (effectiveStrength > 0.75) {
+    const raiseSize = getGTOBetSize(
+      rawStrength, totalPot, bigBlind, seat.chipCount,
+      board, table.currentPhase, profile
+    );
+    const minRaise = table.getMinRaise();
+    if (raiseSize >= minRaise && raiseSize + callAmount <= seat.chipCount) {
+      return { action: PlayerAction.Raise, raiseAmount: Math.max(raiseSize, minRaise) };
+    }
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // Medium hand: call if pot odds are right
+  if (effectiveStrength > potOdds || effectiveStrength > 0.45) {
+    // But consider raising sometimes (merge/balanced)
+    if (effectiveStrength > 0.6 && Math.random() < 0.3 * profile.aggressionFactor / 3) {
+      const raiseSize = roundToBB(Math.max(table.getMinRaise(), Math.round(totalPot * 0.6)), bigBlind);
+      if (raiseSize + callAmount <= seat.chipCount) {
+        return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      }
+    }
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // Drawing hand: call if implied odds justify it
+  if (outs >= 8 && !isRiver) {
+    // Flush/straight draw: call if getting at least 3:1
+    if (callAmount <= totalPot * 0.35) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+    // Semi-bluff raise with big draws
+    if (outs >= 12 && Math.random() < profile.aggressionFactor * 0.2) {
+      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.7));
+      if (raiseSize + callAmount <= seat.chipCount * 0.4) {
+        return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      }
+    }
+    if (callAmount <= seat.chipCount * 0.1) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+  }
+
+  // Gutshot or small draw on good price
+  if (outs >= 4 && !isRiver && callAmount <= totalPot * 0.2) {
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // Bluff-raise (expert level, balanced frequency)
+  if (profile.difficulty === 'expert' && Math.random() < profile.bluffFrequency * 0.4) {
+    // Only bluff-raise on certain board textures
+    if (board.hasHighCards || board.isPaired) {
+      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.65));
+      if (raiseSize + callAmount <= seat.chipCount * 0.25) {
+        return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      }
+    }
+  }
+
+  // Fold
+  return { action: PlayerAction.Fold, raiseAmount: 0 };
+}
+
+// ============================================================
+// Thinking delay
+// ============================================================
+
+export function getThinkingDelay(difficulty: Difficulty): number {
+  switch (difficulty) {
+    case 'easy':   return 600 + Math.floor(Math.random() * 800);
+    case 'medium': return 1000 + Math.floor(Math.random() * 1000);
+    case 'hard':   return 1200 + Math.floor(Math.random() * 1200);
+    case 'expert': return 1500 + Math.floor(Math.random() * 1500);
+  }
+}
