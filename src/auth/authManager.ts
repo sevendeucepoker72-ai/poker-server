@@ -83,18 +83,22 @@ export function initDB(): void {
     db.exec('ALTER TABLE users ADD COLUMN banned INTEGER DEFAULT 0');
   } catch { /* column already exists */ }
 
-  // Seed default user "Josh" if not exists, mark as admin
+  // Seed default admin user "Josh" if not exists
   const existingUser = db.prepare('SELECT id FROM users WHERE username = ?').get('Josh') as { id: number } | undefined;
-  const joshHash = bcrypt.hashSync('13811', BCRYPT_ROUNDS);
   if (!existingUser) {
-    db.prepare(
-      'INSERT INTO users (username, passwordHash, chips, level, xp, stats, achievements, isAdmin) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-    ).run('Josh', joshHash, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, '{}', '[]', 1);
-    console.log('[Auth] Default user "Josh" seeded as admin');
+    const adminPassword = process.env.ADMIN_PASSWORD;
+    if (!adminPassword) {
+      console.warn('[Auth] WARNING: ADMIN_PASSWORD env var not set. Admin account "Josh" not seeded. Set ADMIN_PASSWORD to create it.');
+    } else {
+      const joshHash = bcrypt.hashSync(adminPassword, BCRYPT_ROUNDS);
+      db.prepare(
+        'INSERT INTO users (username, passwordHash, chips, level, xp, stats, achievements, isAdmin) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+      ).run('Josh', joshHash, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, '{}', '[]', 1);
+      console.log('[Auth] Default admin user "Josh" seeded');
+    }
   } else {
-    // Always reset Josh's password and ensure admin status
-    db.prepare('UPDATE users SET passwordHash = ?, isAdmin = 1 WHERE username = ?').run(joshHash, 'Josh');
-    console.log('[Auth] Default user "Josh" password refreshed');
+    // Ensure Josh remains admin but do NOT reset password — changes made in-app are preserved
+    db.prepare('UPDATE users SET isAdmin = 1 WHERE username = ?').run('Josh');
   }
 
   console.log('[Auth] Database initialized');
@@ -140,8 +144,8 @@ export function registerUser(username: string, password: string): AuthResult {
   if (!username || username.trim().length < 2) {
     return { success: false, error: 'Username must be at least 2 characters' };
   }
-  if (!password || password.length < 3) {
-    return { success: false, error: 'Password must be at least 3 characters' };
+  if (!password || password.length < 6) {
+    return { success: false, error: 'Password must be at least 6 characters' };
   }
 
   // Check if username is taken

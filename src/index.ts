@@ -1253,6 +1253,11 @@ Give feedback in this JSON format:
 
   // ========== Admin Events ==========
 
+  function auditLog(adminUsername: string, action: string, details: Record<string, unknown> = {}) {
+    const entry = `[ADMIN AUDIT] ${new Date().toISOString()} | ${adminUsername} | ${action} | ${JSON.stringify(details)}`;
+    console.log(entry);
+  }
+
   socket.on('getAdminStats', () => {
     const auth = authSessions.get(socket.id);
     if (!auth || !isUserAdmin(auth.userId)) {
@@ -1283,6 +1288,7 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'Access denied' });
       return;
     }
+    auditLog(auth.username, 'BAN_USER', { targetUserId: data.userId });
     banUserDB(data.userId);
     socket.emit('userBanned', { userId: data.userId });
   });
@@ -1293,6 +1299,7 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'Access denied' });
       return;
     }
+    auditLog(auth.username, 'UNBAN_USER', { targetUserId: data.userId });
     unbanUserDB(data.userId);
     socket.emit('userUnbanned', { userId: data.userId });
   });
