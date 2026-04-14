@@ -159,6 +159,14 @@ export class PokerTable extends EventEmitter {
   public handNumber: number = 0;
   public lastRaiseAmount: number = 0;
 
+  /** TDA Rule 33 (Dead Button): track previous BB position so blinds advance
+   * by exactly one occupied seat per hand even when players bust. */
+  public previousBigBlindSeat: number = -1;
+  /** When true, no SB is posted this hand (dead small blind). */
+  public deadSmallBlind: boolean = false;
+  /** When true, the button sits on an empty seat this hand (dead button). */
+  public deadButton: boolean = false;
+
   /** Persists until next hand starts - contains showdown results for display */
   public lastHandResult: LastHandResult | null = null;
 
@@ -316,20 +324,71 @@ export class PokerTable extends EventEmitter {
     return true;
   }
 
+  /**
+   * TDA Rule 33 — Dead Button Rule.
+   * The big blind always advances by exactly one position per hand. The small
+   * blind and button are derived from the new BB position. If the seat that
+   * would be SB is empty (e.g., the previous BB busted), no SB is posted this
+   * hand ("dead small blind"). If the seat that would be the button is empty,
+   * the button sits on a dead seat ("dead button").
+   *
+   * Heads-up is a special case: dealer = SB, opponent = BB; standard rotation.
+   */
   protected moveDealerButton(): void {
-    if (this.dealerButtonSeat === -1) {
-      // First hand - pick first occupied seat
+    // Reset dead-button flags
+    this.deadSmallBlind = false;
+    this.deadButton = false;
+
+    const occupied = this.getActivePlayerSeats();
+    if (occupied.length < 2) return;
+
+    // First hand: pick first occupied seat as dealer button
+    if (this.dealerButtonSeat === -1 || this.previousBigBlindSeat === -1) {
       const firstOccupied = this.getNextOccupiedSeat(0);
-      if (firstOccupied !== -1) {
-        this.dealerButtonSeat = firstOccupied;
+      if (firstOccupied === -1) return;
+      this.dealerButtonSeat = firstOccupied;
+
+      // Initial blinds: SB is next occupied after button (or button itself in HU)
+      if (occupied.length === 2) {
+        // Heads-up: button = SB
+        const bbSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
+        this.previousBigBlindSeat = bbSeat;
+      } else {
+        const sbSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
+        const bbSeat = this.getNextOccupiedSeat(sbSeat + 1);
+        this.previousBigBlindSeat = bbSeat;
       }
-    } else {
-      // Move to next occupied seat
-      const next = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
-      if (next !== -1) {
-        this.dealerButtonSeat = next;
-      }
+      return;
     }
+
+    // Heads-up rotation: button alternates between the two players
+    if (occupied.length === 2) {
+      const otherSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
+      this.dealerButtonSeat = otherSeat;
+      const bbSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
+      this.previousBigBlindSeat = bbSeat;
+      return;
+    }
+
+    // Multi-way: BB always advances by one occupied seat from previous BB.
+    // From there we derive SB (the seat between old BB and new BB) and button
+    // (the seat before the SB). Empty intermediate seats become dead.
+    const newBBSeat = this.getNextOccupiedSeat(this.previousBigBlindSeat + 1);
+    if (newBBSeat === -1) return;
+
+    // Walk seats between previousBigBlindSeat and newBBSeat
+    // Slot before newBBSeat is the SB slot. If empty -> dead SB.
+    const sbSlot = (newBBSeat - 1 + MAX_SEATS) % MAX_SEATS;
+    const sbOccupied = this.seats[sbSlot]?.state === 'occupied';
+    this.deadSmallBlind = !sbOccupied;
+
+    // Button slot is the seat before the SB slot.
+    const buttonSlot = (sbSlot - 1 + MAX_SEATS) % MAX_SEATS;
+    const buttonOccupied = this.seats[buttonSlot]?.state === 'occupied';
+    this.deadButton = !buttonOccupied;
+
+    this.dealerButtonSeat = buttonSlot;
+    this.previousBigBlindSeat = newBBSeat;
   }
 
   protected postBlinds(): void {
@@ -347,9 +406,19 @@ export class PokerTable extends EventEmitter {
       sbSeat = this.dealerButtonSeat;
       bbSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
     } else {
-      // TDA Rules 6-9: SB is left of dealer, BB is left of SB
-      sbSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
-      bbSeat = this.getNextOccupiedSeat(sbSeat + 1);
+      // TDA Rule 33: Use the BB position chosen by moveDealerButton(), then
+      // derive SB. If the SB seat is empty (player busted), it's a dead SB.
+      bbSeat = this.previousBigBlindSeat;
+      if (this.deadSmallBlind) {
+        sbSeat = -1;
+      } else {
+        sbSeat = (bbSeat - 1 + MAX_SEATS) % MAX_SEATS;
+        // Defensive: if for some reason sbSlot points to an empty seat, mark dead
+        if (this.seats[sbSeat]?.state !== 'occupied') {
+          sbSeat = -1;
+          this.deadSmallBlind = true;
+        }
+      }
     }
 
     // TDA Rule 6-9: Handle missed blinds - players returning must post
@@ -799,6 +868,9 @@ export class PokerTable extends EventEmitter {
           }
         }
       }
+      // TDA Rule 16: track last aggressor BEFORE updating currentBetToMatch,
+      // otherwise the guard below (totalBet > currentBetToMatch) is always false.
+      this.lastAggressorSeat = seatIndex;
       this.currentBetToMatch = totalBet;
     }
 
@@ -808,11 +880,6 @@ export class PokerTable extends EventEmitter {
     seat.allIn = true;
     seat.lastAction = PlayerAction.AllIn;
     seat.hasActedSinceLastFullRaise = true;
-
-    // TDA Rule 16: If this all-in is a raise, track as last aggressor
-    if (totalBet > this.currentBetToMatch) {
-      this.lastAggressorSeat = seatIndex;
-    }
 
     this.actionLog.push({
       seatIndex,
@@ -973,6 +1040,8 @@ export class PokerTable extends EventEmitter {
   protected resetBettingRound(): void {
     this.currentBetToMatch = 0;
     this.lastRaiseAmount = this.config.bigBlind;
+    // TDA Rule 16: reset per-street so showdown order uses final-street aggressor only
+    this.lastAggressorSeat = -1;
 
     for (const seat of this.seats) {
       if (seat.state === 'occupied') {
@@ -1013,6 +1082,12 @@ export class PokerTable extends EventEmitter {
   }
 
   accumulateInvestments(): void {
+    // TDA Rule 41 (Uncalled Bets): refund any uncalled bet excess from THIS
+    // betting round BEFORE rolling currentBet into the pot. This is the only
+    // correct moment to detect uncalled bets — once the round closes, no other
+    // player can call, so the excess is definitively uncalled.
+    this.refundUncalledBetThisRound();
+
     // Reset currentBet to 0 for all seats
     // totalInvestedThisHand is already accumulated when bets are made
     // Pots are calculated from totalInvestedThisHand
@@ -1023,8 +1098,89 @@ export class PokerTable extends EventEmitter {
     }
   }
 
+  /**
+   * TDA Rule 41 (Uncalled Bets): when a betting round ends, the highest
+   * currentBet may exceed the next-highest currentBet from any other player.
+   * That excess is "uncalled" — no other player matched it, regardless of why
+   * (they folded, they were all-in capped, etc.) — and must be returned to the
+   * bettor's stack instead of staying in the pot.
+   *
+   * Example: A all-in 50, B bets 200, C folds.
+   * → top = B (200), second = A (50). Refund 150 to B.
+   * → Pot keeps 50 (A's contribution) + 50 (B's matched portion) = 100.
+   *
+   * Per TDA: this applies even when other players folded — the uncalled bet
+   * is simply the part of B's wager that no opponent matched at the table.
+   */
+  protected refundUncalledBetThisRound(): void {
+    // Snapshot current bets per occupied seat (regardless of fold state —
+    // folders' currentBet still represents what they put in this round before
+    // folding).
+    const bets = this.seats
+      .filter(s => s.state === 'occupied' && !s.eliminated && s.currentBet > 0)
+      .map(s => ({ seat: s, bet: s.currentBet }))
+      .sort((a, b) => b.bet - a.bet);
+
+    if (bets.length === 0) return;
+
+    const top = bets[0];
+    // The "matched" amount is the highest bet from any OTHER player.
+    // If no other player has any currentBet, top is entirely uncalled.
+    const second = bets.length >= 2 ? bets[1].bet : 0;
+
+    if (top.bet <= second) return; // fully called, nothing to refund
+
+    // Don't refund a folded player — if they folded, their "raise" was just
+    // dead money that stays in the pot for whoever wins.
+    if (top.seat.folded) return;
+
+    const excess = top.bet - second;
+    top.seat.chipCount += excess;
+    top.seat.totalInvestedThisHand -= excess;
+    top.seat.currentBet -= excess;
+
+    // Emit so clients can update the action log
+    this.emit('uncalledBetReturned', {
+      seatIndex: top.seat.seatIndex,
+      amount: excess,
+    });
+    this.actionLog.push({
+      seatIndex: top.seat.seatIndex,
+      playerName: top.seat.playerName,
+      action: `uncalled bet (${excess}) returned`,
+    });
+  }
+
+  /**
+   * Safety net: catches any leftover excess that the per-round refund missed
+   * (shouldn't happen in normal play, but protects against engine bugs).
+   * Called from determineWinners() before pot calculation.
+   */
+  protected refundUncalledBets(): void {
+    // This is now mostly a no-op because refundUncalledBetThisRound() handles
+    // the real cases per round. Kept as a safety net.
+    const invested = this.seats
+      .filter(s => s.state === 'occupied' && !s.eliminated && s.totalInvestedThisHand > 0 && !s.folded)
+      .sort((a, b) => b.totalInvestedThisHand - a.totalInvestedThisHand);
+
+    if (invested.length < 2) return;
+
+    const top = invested[0];
+    const second = invested[1];
+    const excess = top.totalInvestedThisHand - second.totalInvestedThisHand;
+
+    if (excess > 0) {
+      console.warn(`[refundUncalledBets] Late refund of ${excess} to seat ${top.seatIndex} — per-round refund should have caught this`);
+      top.chipCount += excess;
+      top.totalInvestedThisHand = second.totalInvestedThisHand;
+    }
+  }
+
   protected determineWinners(): void {
     this.currentPhase = GamePhase.Showdown;
+
+    // Refund any uncalled top-stack excess BEFORE calculating pots.
+    this.refundUncalledBets();
 
     const seatInfos: SeatInfo[] = this.seats
       .filter(s => s.state === 'occupied' && !s.eliminated)
@@ -1070,12 +1226,15 @@ export class PokerTable extends EventEmitter {
         bestFiveCards: [],
       });
     } else {
-      // Evaluate all non-folded hands for showdown display
+      // Evaluate all non-folded hands once and cache — reused for showdownHands,
+      // awardPots evaluator, and winnerInfos to avoid triple evaluation per player.
+      const handResultCache = new Map<number, HandResult>();
       for (const info of nonFolded) {
         const seat = this.seats[info.seatIndex];
         const allCards = [...seat.holeCards, ...this.communityCards];
         if (allCards.length >= 5 || (!this.usesCommunityCards() && seat.holeCards.length >= 5)) {
           const handRes = this.evaluatePlayerHand(seat.holeCards, this.communityCards);
+          handResultCache.set(info.seatIndex, handRes);
           showdownHands.push({
             seatIndex: info.seatIndex,
             playerName: seat.playerName,
@@ -1105,42 +1264,58 @@ export class PokerTable extends EventEmitter {
         });
       }
 
-      // Award pots using side pot manager, passing variant evaluator
+      // Award pots using side pot manager.
+      // Pass a cache-backed evaluator so awardPots never re-evaluates a hand
+      // that was already computed in the loop above (fixes double evaluation).
+      // Issue #1 fix: build a reverse Map<holeCards ref → seatIndex> for O(1)
+      // lookup instead of iterating all cache entries with reference equality.
+      const holeCardsToSeatIdx = new Map<Card[], number>();
+      for (const info of seatInfos) {
+        holeCardsToSeatIdx.set(info.holeCards, info.seatIndex);
+      }
       const evaluator = (hole: Card[], community: Card[]): HandResult => {
+        const seatIdx = holeCardsToSeatIdx.get(hole);
+        if (seatIdx !== undefined && handResultCache.has(seatIdx)) {
+          return handResultCache.get(seatIdx)!;
+        }
+        // Fallback (shouldn't be reached for known seats)
         return this.evaluatePlayerHand(hole, community);
       };
-      const winnings = this.sidePotManager.awardPots(
+      const { winnings, perPot } = this.sidePotManager.awardPots(
         seatInfos,
         this.communityCards,
         this.dealerButtonSeat,
         evaluator
       );
 
+      // Credit chips to each winner
       for (const [seatIdx, amount] of winnings) {
         this.seats[seatIdx].chipCount += amount;
+      }
 
-        const handResult = this.evaluatePlayerHand(
-          this.seats[seatIdx].holeCards,
-          this.communityCards
-        );
+      // Build results array with correct per-pot names
+      for (const potWin of perPot) {
+        const seatIdx = potWin.seatIndex;
+        const handResult = handResultCache.get(seatIdx) ||
+          this.evaluatePlayerHand(this.seats[seatIdx].holeCards, this.communityCards);
 
         results.push({
           seatIndex: seatIdx,
           playerName: this.seats[seatIdx].playerName,
-          amount,
+          amount: potWin.amount,
           handResult,
-          potName: 'Pot',
+          potName: potWin.potName,
         });
 
-        // Build winner info (aggregate chips won per seat)
+        // Build winner info (aggregate chips won per seat across all pots)
         const existing = winnerInfos.find(w => w.seatIndex === seatIdx);
         if (existing) {
-          existing.chipsWon += amount;
+          existing.chipsWon += potWin.amount;
         } else {
           winnerInfos.push({
             seatIndex: seatIdx,
             playerName: this.seats[seatIdx].playerName,
-            chipsWon: amount,
+            chipsWon: potWin.amount,
             handName: handResult?.handName || 'Unknown',
             bestFiveCards: handResult?.bestFiveCards || [],
           });
@@ -1148,20 +1323,38 @@ export class PokerTable extends EventEmitter {
       }
     }
 
-    // Calculate pot breakdown for hand history
+    // Calculate pot breakdown for hand history.
+    // Note: awardPots() internally calls calculatePots() as well. This second call
+    // is intentional — it provides the named pot list for the hand history record.
+    // calculatePots() now includes a consistency check (Issue #3 fix) so any
+    // mismatch between pot totals and invested amounts will throw here.
     const pots = this.sidePotManager.calculatePots(seatInfos);
-    const potBreakdown = pots.map(p => ({
-      amount: p.amount,
-      winners: winnerInfos
-        .filter(w => p.eligibleSeatIndices.includes(w.seatIndex))
-        .map(w => w.seatIndex),
-    }));
+    // Build per-pot winner amounts from perPot details (available in multi-player path)
+    // For single-player (fold) path, winnerInfos already has the right data.
+    const potBreakdown = pots.map(p => {
+      // Find perPot entries for this pot name
+      const potEntries = (nonFolded.length > 1 && (results as any[]).length > 0)
+        ? results.filter(r => r.potName === p.name)
+        : [];
+      const winnerAmounts: { seatIndex: number; amount: number }[] = potEntries.map(r => ({
+        seatIndex: r.seatIndex,
+        amount: r.amount,
+      }));
+      return {
+        name: p.name,
+        amount: p.amount,
+        winners: [...new Set(potEntries.map(r => r.seatIndex))],
+        winnerAmounts,
+      };
+    });
     // If no pots calculated (single winner by fold), create a synthetic one
     if (potBreakdown.length === 0 && winnerInfos.length > 0) {
       const totalPot = seatInfos.reduce((sum, s) => sum + s.totalInvestedThisHand, 0);
       potBreakdown.push({
+        name: 'Main Pot',
         amount: totalPot,
         winners: winnerInfos.map(w => w.seatIndex),
+        winnerAmounts: winnerInfos.map(w => ({ seatIndex: w.seatIndex, amount: w.chipsWon })),
       });
     }
 
@@ -1280,6 +1473,16 @@ export class PokerTable extends EventEmitter {
         holeCards: s.holeCards,
         state: s.state,
       }));
+
+    // Only split into side pots when at least one player is actually all-in.
+    // Without an all-in, unequal contributions (SB/BB) would create false "side pots".
+    const hasAllIn = seatInfos.some(s => s.allIn);
+    if (!hasAllIn) {
+      const total = seatInfos.reduce((sum, s) => sum + s.totalInvestedThisHand, 0);
+      if (total === 0) return [];
+      const eligible = seatInfos.filter(s => !s.folded).map(s => s.seatIndex);
+      return [{ amount: total, eligibleSeatIndices: eligible, name: 'Main Pot' }];
+    }
 
     return this.sidePotManager.calculatePots(seatInfos);
   }

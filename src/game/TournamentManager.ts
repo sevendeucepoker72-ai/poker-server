@@ -40,11 +40,14 @@ export interface Tournament {
   blindTimer: NodeJS.Timeout | null;
   nextStartTime: number; // timestamp
   tableId: string | null;
+  tableIds: string[]; // multi-table: all active table IDs
   startedAt: number;
   eliminationOrder: string[]; // playerIds in elimination order
+  turboMode: boolean; // fast AI actions for stress testing
+  playerTableMap: Map<string, string>; // playerId → tableId mapping
 }
 
-const DEFAULT_BLIND_LEVELS: BlindLevel[] = [
+export const DEFAULT_BLIND_LEVELS: BlindLevel[] = [
   { sb: 10, bb: 20, ante: 0, duration: 300 },
   { sb: 15, bb: 30, ante: 0, duration: 300 },
   { sb: 25, bb: 50, ante: 5, duration: 300 },
@@ -195,8 +198,11 @@ export class TournamentManager {
       blindTimer: null,
       nextStartTime: template.startInterval > 0 ? now + template.startInterval : 0,
       tableId: null,
+      tableIds: [],
       startedAt: 0,
       eliminationOrder: [],
+      turboMode: false,
+      playerTableMap: new Map(),
     };
 
     this.tournaments.set(tournamentId, tournament);
@@ -321,7 +327,7 @@ export class TournamentManager {
     this.scheduleBlindUp(tournamentId);
   }
 
-  eliminatePlayer(tournamentId: string, playerId: string): { finished: boolean; position: number; payout: number } | null {
+  eliminatePlayer(tournamentId: string, playerId: string, eliminatorId?: string): { finished: boolean; position: number; payout: number; bountyPayout?: number } | null {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament || tournament.status !== 'running') return null;
 
@@ -334,10 +340,28 @@ export class TournamentManager {
     const alivePlayers = tournament.players.filter((p) => !p.eliminated);
     player.finishPosition = alivePlayers.length + 1;
 
+    // Bounty payout: award the eliminator if this is a bounty tournament
+    let bountyPayout = 0;
+    if (tournament.config.isBounty && tournament.config.bountyAmount && eliminatorId) {
+      const eliminator = tournament.players.find((p) => p.playerId === eliminatorId && !p.eliminated);
+      if (eliminator) {
+        eliminator.bounties++;
+        eliminator.bountyEarnings += tournament.config.bountyAmount;
+        bountyPayout = tournament.config.bountyAmount;
+        this.emitEvent(tournamentId, 'bountyAwarded', {
+          eliminatorId,
+          eliminatorName: eliminator.playerName,
+          eliminatedName: player.playerName,
+          bountyAmount: tournament.config.bountyAmount,
+        });
+      }
+    }
+
     this.emitEvent(tournamentId, 'playerEliminated', {
       playerId,
       playerName: player.playerName,
       position: player.finishPosition,
+      eliminatorId,
     });
 
     // Check if tournament is over
@@ -345,7 +369,7 @@ export class TournamentManager {
       return this.finishTournament(tournamentId);
     }
 
-    return { finished: false, position: player.finishPosition, payout: 0 };
+    return { finished: false, position: player.finishPosition, payout: 0, bountyPayout };
   }
 
   private finishTournament(tournamentId: string): { finished: boolean; position: number; payout: number } | null {
@@ -438,5 +462,124 @@ export class TournamentManager {
       }
     }
     return readyToStart;
+  }
+
+  // ========== Multi-Table Tournament Support ==========
+
+  /** Set all table IDs for a multi-table tournament */
+  setTableIds(tournamentId: string, tableIds: string[]): void {
+    const t = this.tournaments.get(tournamentId);
+    if (t) {
+      t.tableIds = [...tableIds];
+      // Legacy single-table compat
+      if (!t.tableId && tableIds.length > 0) t.tableId = tableIds[0];
+    }
+  }
+
+  /** Map a player to their current table */
+  setPlayerTable(tournamentId: string, playerId: string, tableId: string): void {
+    const t = this.tournaments.get(tournamentId);
+    if (t) t.playerTableMap.set(playerId, tableId);
+  }
+
+  /** Get which table a player is at */
+  getPlayerTable(tournamentId: string, playerId: string): string | undefined {
+    return this.tournaments.get(tournamentId)?.playerTableMap.get(playerId);
+  }
+
+  /** Remove a table from the tournament (after breaking) */
+  removeTable(tournamentId: string, tableId: string): void {
+    const t = this.tournaments.get(tournamentId);
+    if (t) {
+      t.tableIds = t.tableIds.filter(id => id !== tableId);
+    }
+  }
+
+  /** Get alive (non-eliminated) player count */
+  getAliveCount(tournamentId: string): number {
+    const t = this.tournaments.get(tournamentId);
+    if (!t) return 0;
+    return t.players.filter(p => !p.eliminated).length;
+  }
+
+  /** Get count of active tables */
+  getActiveTableCount(tournamentId: string): number {
+    return this.tournaments.get(tournamentId)?.tableIds.length || 0;
+  }
+
+  /** Get alive players on a specific table */
+  getAlivePlayersOnTable(tournamentId: string, tableId: string): TournamentPlayer[] {
+    const t = this.tournaments.get(tournamentId);
+    if (!t) return [];
+    return t.players.filter(p => !p.eliminated && t.playerTableMap.get(p.playerId) === tableId);
+  }
+
+  /**
+   * Check if tables should be combined and return the table to break.
+   * Rule: if total alive players <= (activeTableCount - 1) * 9, break smallest table.
+   * Returns { breakTableId, moves: [{playerId, fromTable, toTable, toSeat}] } or null.
+   */
+  checkRebalance(tournamentId: string): {
+    breakTableId: string;
+    playersToMove: { playerId: string; playerName: string }[];
+  } | null {
+    const t = this.tournaments.get(tournamentId);
+    if (!t || t.tableIds.length <= 1) return null;
+
+    const alive = this.getAliveCount(tournamentId);
+    const tableCount = t.tableIds.length;
+    const threshold = (tableCount - 1) * 9;
+
+    if (alive > threshold) return null;
+
+    // Find the table with fewest alive players — that's the one to break
+    let smallestTable = '';
+    let smallestCount = Infinity;
+    for (const tid of t.tableIds) {
+      const count = this.getAlivePlayersOnTable(tournamentId, tid).length;
+      if (count < smallestCount) {
+        smallestCount = count;
+        smallestTable = tid;
+      }
+    }
+
+    if (!smallestTable) return null;
+
+    const playersToMove = this.getAlivePlayersOnTable(tournamentId, smallestTable)
+      .map(p => ({ playerId: p.playerId, playerName: p.playerName }));
+
+    return { breakTableId: smallestTable, playersToMove };
+  }
+
+  /** Set turbo mode for fast AI */
+  setTurboMode(tournamentId: string, turbo: boolean): void {
+    const t = this.tournaments.get(tournamentId);
+    if (t) t.turboMode = turbo;
+  }
+
+  isTurboMode(tournamentId: string): boolean {
+    return this.tournaments.get(tournamentId)?.turboMode || false;
+  }
+
+  /** Get tournament summary for overlay display */
+  getTournamentStatus(tournamentId: string): {
+    totalPlayers: number;
+    alivePlayers: number;
+    tables: number;
+    blindLevel: number;
+    blinds: { sb: number; bb: number; ante: number } | null;
+    turbo: boolean;
+  } | null {
+    const t = this.tournaments.get(tournamentId);
+    if (!t) return null;
+    const blinds = t.config.blindLevels[t.currentBlindLevel] || null;
+    return {
+      totalPlayers: t.players.length,
+      alivePlayers: this.getAliveCount(tournamentId),
+      tables: t.tableIds.length || (t.tableId ? 1 : 0),
+      blindLevel: t.currentBlindLevel + 1,
+      blinds: blinds ? { sb: blinds.sb, bb: blinds.bb, ante: blinds.ante } : null,
+      turbo: t.turboMode,
+    };
   }
 }

@@ -12,15 +12,61 @@ export type Personality =
   | 'maniac'
   | 'rock';
 
+/**
+ * Archetype = a complete poker strategy profile, not just numeric tweaks.
+ * Each archetype has its own decision branch in `decideAction` so different
+ * AIs actually play differently — not just slightly different numbers in the
+ * same decision tree.
+ *
+ * - NIT:             Ultra-tight, premium hands only, no bluffs, pot-control on flops
+ * - ROCK:            Tight-passive, calls down with marginals, never raises
+ * - TAG:             Tight-aggressive, balanced GTO-leaning play
+ * - LAG:             Loose-aggressive, lots of 3-bets, frequent c-bets, balanced bluffs
+ * - MANIAC:          Hyper-aggressive, raises constantly, overbets, big bluffs
+ * - CALLING_STATION: Calls everything, never folds top pair, rarely raises
+ * - FISH:            Loose-passive, plays too many hands, calls too much, rare raises
+ */
+export type Archetype =
+  | 'NIT'
+  | 'ROCK'
+  | 'TAG'
+  | 'LAG'
+  | 'MANIAC'
+  | 'CALLING_STATION'
+  | 'FISH';
+
 export interface AIPlayerProfile {
   botName: string;
   difficulty: Difficulty;
   personality: Personality;
+  archetype: Archetype;
   vpip: number;
   pfr: number;
   aggressionFactor: number;
   bluffFrequency: number;
 }
+
+/** Tunable per-archetype parameters */
+interface ArchetypeParams {
+  vpipBase: number;       // % hands played
+  pfrBase: number;        // % hands raised preflop
+  aggression: number;     // 0=passive, 5=maniac
+  bluffFreq: number;      // 0..0.5
+  cbetFreq: number;       // 0..1 — how often to c-bet flop after preflop raise
+  callDownTendency: number; // 0..1 — how willing to call river bets
+  betSizingMultiplier: number; // 0.5..1.8 — overall bet size multiplier
+  openLimpFreq: number;   // 0..1 — fish/calling stations limp instead of raising
+}
+
+const ARCHETYPE_PARAMS: Record<Archetype, ArchetypeParams> = {
+  NIT:             { vpipBase: 0.10, pfrBase: 0.08, aggression: 1.5, bluffFreq: 0.02, cbetFreq: 0.50, callDownTendency: 0.20, betSizingMultiplier: 0.85, openLimpFreq: 0.0 },
+  ROCK:            { vpipBase: 0.14, pfrBase: 0.06, aggression: 0.8, bluffFreq: 0.03, cbetFreq: 0.40, callDownTendency: 0.55, betSizingMultiplier: 0.75, openLimpFreq: 0.3 },
+  TAG:             { vpipBase: 0.22, pfrBase: 0.18, aggression: 2.5, bluffFreq: 0.15, cbetFreq: 0.65, callDownTendency: 0.45, betSizingMultiplier: 1.00, openLimpFreq: 0.0 },
+  LAG:             { vpipBase: 0.32, pfrBase: 0.26, aggression: 3.5, bluffFreq: 0.25, cbetFreq: 0.78, callDownTendency: 0.55, betSizingMultiplier: 1.15, openLimpFreq: 0.0 },
+  MANIAC:          { vpipBase: 0.55, pfrBase: 0.45, aggression: 5.0, bluffFreq: 0.40, cbetFreq: 0.92, callDownTendency: 0.65, betSizingMultiplier: 1.45, openLimpFreq: 0.0 },
+  CALLING_STATION: { vpipBase: 0.55, pfrBase: 0.05, aggression: 0.4, bluffFreq: 0.02, cbetFreq: 0.10, callDownTendency: 0.95, betSizingMultiplier: 0.65, openLimpFreq: 0.7 },
+  FISH:            { vpipBase: 0.42, pfrBase: 0.10, aggression: 1.0, bluffFreq: 0.08, cbetFreq: 0.30, callDownTendency: 0.75, betSizingMultiplier: 0.80, openLimpFreq: 0.55 },
+};
 
 export interface AIDecision {
   action: PlayerAction;
@@ -424,46 +470,59 @@ const PERSONALITIES: Personality[] = [
   'tight', 'loose', 'aggressive', 'passive', 'maniac', 'rock',
 ];
 
+const ARCHETYPES: Archetype[] = [
+  'NIT', 'ROCK', 'TAG', 'LAG', 'MANIAC', 'CALLING_STATION', 'FISH',
+];
+
+/**
+ * Deterministic name → archetype mapping. Same bot name always gets the same
+ * archetype across games, so players can learn which characters play which way.
+ * Uses a simple FNV-1a-style hash so the mapping is stable across server restarts.
+ */
+function nameToArchetype(name: string): Archetype {
+  let h = 2166136261;
+  for (let i = 0; i < name.length; i++) {
+    h ^= name.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  // Convert to unsigned and modulo
+  return ARCHETYPES[(h >>> 0) % ARCHETYPES.length];
+}
+
+function archetypeToPersonality(a: Archetype): Personality {
+  switch (a) {
+    case 'NIT':             return 'rock';
+    case 'ROCK':            return 'tight';
+    case 'TAG':             return 'tight';
+    case 'LAG':             return 'aggressive';
+    case 'MANIAC':          return 'maniac';
+    case 'CALLING_STATION': return 'passive';
+    case 'FISH':            return 'loose';
+  }
+}
+
 export function generateRandomProfile(difficulty: Difficulty): AIPlayerProfile {
   const botName = BOT_NAMES[Math.floor(Math.random() * BOT_NAMES.length)];
-  const personality = PERSONALITIES[Math.floor(Math.random() * PERSONALITIES.length)];
+  const archetype = nameToArchetype(botName);
+  const personality = archetypeToPersonality(archetype);
+  const params = ARCHETYPE_PARAMS[archetype];
 
-  let vpip: number, pfr: number, aggressionFactor: number, bluffFrequency: number;
+  // Difficulty determines noise/skill, but archetype params dominate strategy.
+  // Add a small per-bot jitter so two NITs aren't perfectly identical.
+  const jitter = () => 0.85 + Math.random() * 0.30; // 0.85..1.15
 
+  let vpip = params.vpipBase * jitter();
+  let pfr = params.pfrBase * jitter();
+  let aggressionFactor = params.aggression * jitter();
+  let bluffFrequency = params.bluffFreq * jitter();
+
+  // Difficulty influence: harder difficulties tighten up slightly (better hand selection)
+  // and easier ones loosen up (more mistakes).
   switch (difficulty) {
-    case 'easy':
-      vpip = 0.45 + Math.random() * 0.2;
-      pfr = 0.08 + Math.random() * 0.07;
-      aggressionFactor = 0.5 + Math.random() * 0.5;
-      bluffFrequency = 0.03 + Math.random() * 0.07;
-      break;
-    case 'medium':
-      vpip = 0.25 + Math.random() * 0.1;
-      pfr = 0.17 + Math.random() * 0.08;
-      aggressionFactor = 1.2 + Math.random() * 0.8;
-      bluffFrequency = 0.08 + Math.random() * 0.07;
-      break;
-    case 'hard':
-      vpip = 0.22 + Math.random() * 0.08;
-      pfr = 0.18 + Math.random() * 0.08;
-      aggressionFactor = 2.0 + Math.random() * 1.5;
-      bluffFrequency = 0.15 + Math.random() * 0.1;
-      break;
-    case 'expert':
-      vpip = 0.20 + Math.random() * 0.08;
-      pfr = 0.18 + Math.random() * 0.07;
-      aggressionFactor = 2.5 + Math.random() * 2.0;
-      bluffFrequency = 0.18 + Math.random() * 0.12;
-      break;
-  }
-
-  switch (personality) {
-    case 'tight':      vpip *= 0.7; pfr *= 0.8; break;
-    case 'loose':      vpip *= 1.3; pfr *= 1.1; break;
-    case 'aggressive': aggressionFactor *= 1.4; pfr *= 1.2; bluffFrequency *= 1.3; break;
-    case 'passive':    aggressionFactor *= 0.6; pfr *= 0.7; bluffFrequency *= 0.5; break;
-    case 'maniac':     vpip *= 1.5; pfr *= 1.5; aggressionFactor *= 1.8; bluffFrequency *= 2.0; break;
-    case 'rock':       vpip *= 0.5; pfr *= 0.6; aggressionFactor *= 0.8; bluffFrequency *= 0.3; break;
+    case 'easy':   vpip *= 1.20; pfr *= 0.85; bluffFrequency *= 0.7; break;
+    case 'medium': /* no change */ break;
+    case 'hard':   vpip *= 0.95; aggressionFactor *= 1.10; break;
+    case 'expert': vpip *= 0.90; aggressionFactor *= 1.20; bluffFrequency *= 1.20; break;
   }
 
   vpip = Math.min(1.0, Math.max(0.05, vpip));
@@ -471,7 +530,7 @@ export function generateRandomProfile(difficulty: Difficulty): AIPlayerProfile {
   aggressionFactor = Math.max(0.1, aggressionFactor);
   bluffFrequency = Math.min(0.5, Math.max(0.01, bluffFrequency));
 
-  return { botName, difficulty, personality, vpip, pfr, aggressionFactor, bluffFrequency };
+  return { botName, difficulty, personality, archetype, vpip, pfr, aggressionFactor, bluffFrequency };
 }
 
 export function decideAction(
@@ -597,6 +656,148 @@ function preFlopStrategy(
   opponents: OpponentModel,
   bigBlind: number
 ): AIDecision {
+  const params = ARCHETYPE_PARAMS[profile.archetype];
+
+  // ============================================================
+  // ARCHETYPE-SPECIFIC PREFLOP BRANCHES
+  // Each archetype gets a fundamentally different decision tree.
+  // ============================================================
+
+  // CALLING_STATION: never folds to a normal raise, calls everything but never raises
+  if (profile.archetype === 'CALLING_STATION') {
+    if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
+    // Only fold to massive bets (> 30% of stack) AND a weak hand
+    if (callAmount > seat.chipCount * 0.30 && handStrength < 0.30) {
+      return { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
+    if (callAmount >= seat.chipCount) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // MANIAC: raises with anything, almost never just calls preflop
+  if (profile.archetype === 'MANIAC') {
+    // Always raise/3-bet/4-bet unless hand is total trash (handStrength < 0.12)
+    const wantToRaise = handStrength >= 0.12 || Math.random() < 0.6;
+    if (wantToRaise) {
+      const sizeMult = 2.5 + Math.random() * 2.5; // 2.5x..5x BB
+      const target = callAmount === 0
+        ? Math.round(bigBlind * sizeMult)
+        : Math.round(callAmount * (2.5 + Math.random() * 1.5));
+      const raiseAmount = Math.max(table.getMinRaise(), target);
+      if (raiseAmount >= seat.chipCount * 0.7) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+      if (raiseAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount };
+    }
+    if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  // NIT: only premiums (top ~10%), folds to any 3-bet without aces/kings
+  if (profile.archetype === 'NIT') {
+    const NIT_OPEN = 0.78; // ~AQs+, TT+, AKo, JJ+
+    const NIT_CALL_RAISE = 0.85; // QQ+, AK
+    const NIT_4BET = 0.93; // KK+, AA only
+    if (callAmount === 0) {
+      if (handStrength >= NIT_OPEN) {
+        const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * 2.5));
+        return raiseAmount <= seat.chipCount
+          ? { action: PlayerAction.Raise, raiseAmount }
+          : { action: PlayerAction.AllIn, raiseAmount: 0 };
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    if (opponents.raiseCount >= 2 && handStrength < NIT_4BET) {
+      return { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
+    if (handStrength >= NIT_4BET) {
+      return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    }
+    if (handStrength >= NIT_CALL_RAISE) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  // ROCK: tight-passive, calls down with marginals, almost never raises preflop
+  if (profile.archetype === 'ROCK') {
+    if (callAmount === 0) {
+      if (handStrength >= 0.85) {
+        const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * 2.5));
+        return raiseAmount <= seat.chipCount
+          ? { action: PlayerAction.Raise, raiseAmount }
+          : { action: PlayerAction.AllIn, raiseAmount: 0 };
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    if (handStrength >= 0.50 && callAmount <= bigBlind * 4) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+    if (handStrength >= 0.85) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  // FISH: loose-passive, limps a lot, calls almost any raise with anything decent
+  if (profile.archetype === 'FISH') {
+    if (callAmount === 0) {
+      // Often limp with marginal hands (very fishy behavior)
+      if (handStrength >= 0.85) {
+        const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * 3));
+        return raiseAmount <= seat.chipCount
+          ? { action: PlayerAction.Raise, raiseAmount }
+          : { action: PlayerAction.AllIn, raiseAmount: 0 };
+      }
+      if (handStrength >= 0.18) {
+        return { action: PlayerAction.Check, raiseAmount: 0 }; // limp
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    // Calls way too wide
+    if (handStrength >= 0.22 && callAmount <= seat.chipCount * 0.10) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+    if (handStrength >= 0.60) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+    if (handStrength >= 0.88) {
+      return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    }
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  // LAG: 3-bets wide, raises in late position with anything decent
+  if (profile.archetype === 'LAG') {
+    const lagOpen = position >= totalActive - 3 ? 0.20 : 0.32;
+    const lag3Bet = 0.42;
+    if (callAmount === 0) {
+      if (handStrength >= lagOpen) {
+        const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * (2.5 + Math.random() * 0.8)));
+        return raiseAmount <= seat.chipCount
+          ? { action: PlayerAction.Raise, raiseAmount }
+          : { action: PlayerAction.AllIn, raiseAmount: 0 };
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    if (handStrength >= 0.85) {
+      return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    }
+    if (opponents.raiseCount >= 2) {
+      // Facing 3-bet
+      if (handStrength >= 0.65) return { action: PlayerAction.Call, raiseAmount: 0 };
+      return { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
+    if (handStrength >= lag3Bet) {
+      // 3-bet
+      const raiseAmount = roundToBB(Math.max(table.getMinRaise(), Math.round(callAmount * 3)), bigBlind);
+      if (raiseAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount };
+    }
+    if (handStrength >= 0.30) {
+      return { action: PlayerAction.Call, raiseAmount: 0 };
+    }
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  // TAG (default): falls through to existing GTO-leaning logic
   const openRaiseThreshold = getOpenRaiseRange(position, totalActive);
   const threeBetThreshold = get3BetRange(position);
 
@@ -704,7 +905,143 @@ function postFlopStrategy(
   numOpponents: number
 ): AIDecision {
   const isRiver = table.currentPhase === GamePhase.River;
+  const params = ARCHETYPE_PARAMS[profile.archetype];
 
+  // ============================================================
+  // ARCHETYPE-SPECIFIC POSTFLOP BRANCHES
+  // ============================================================
+
+  // CALLING_STATION: never folds top pair, calls down with second pair
+  if (profile.archetype === 'CALLING_STATION') {
+    if (callAmount === 0) {
+      // Almost never bets — only obvious value bets
+      if (effectiveStrength > 0.85) {
+        const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.4));
+        if (betSize <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: betSize };
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    // Folds only with absolute trash on big bets
+    if (effectiveStrength < 0.18 && callAmount > totalPot) {
+      return { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
+    if (callAmount >= seat.chipCount) {
+      return effectiveStrength > 0.45 ? { action: PlayerAction.AllIn, raiseAmount: 0 } : { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // MANIAC: bets/raises everything, big bluffs, never just calls
+  if (profile.archetype === 'MANIAC') {
+    if (callAmount === 0) {
+      // Always c-bet/barrel
+      const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * (0.7 + Math.random() * 0.6) * params.betSizingMultiplier));
+      if (betSize >= seat.chipCount * 0.7 && effectiveStrength > 0.5) {
+        return { action: PlayerAction.AllIn, raiseAmount: 0 };
+      }
+      if (betSize <= seat.chipCount && betSize >= table.getMinRaise()) {
+        return { action: PlayerAction.Raise, raiseAmount: betSize };
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    // Facing a bet: raise or fold (almost never just call)
+    if (effectiveStrength > 0.55 || (Math.random() < 0.45 && !isRiver)) {
+      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 1.0 * params.betSizingMultiplier));
+      if (raiseSize + callAmount >= seat.chipCount * 0.8) {
+        return { action: PlayerAction.AllIn, raiseAmount: 0 };
+      }
+      if (raiseSize + callAmount <= seat.chipCount) {
+        return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      }
+    }
+    if (effectiveStrength < 0.25) return { action: PlayerAction.Fold, raiseAmount: 0 };
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // NIT: pot-controls everything except monsters, gives up on missed flops
+  if (profile.archetype === 'NIT') {
+    if (callAmount === 0) {
+      if (effectiveStrength > 0.80) {
+        const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.5 * params.betSizingMultiplier));
+        if (betSize <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: betSize };
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    // Folds anything below top pair to a bet
+    if (effectiveStrength < 0.55) return { action: PlayerAction.Fold, raiseAmount: 0 };
+    if (effectiveStrength > 0.85) {
+      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.7));
+      if (raiseSize + callAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+    }
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // ROCK: tight-passive — calls down marginal hands but rarely raises
+  if (profile.archetype === 'ROCK') {
+    if (callAmount === 0) {
+      if (effectiveStrength > 0.78) {
+        const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.4));
+        if (betSize <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: betSize };
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    if (effectiveStrength < 0.30) return { action: PlayerAction.Fold, raiseAmount: 0 };
+    if (effectiveStrength > 0.92) {
+      // Only raise with monsters
+      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.5));
+      if (raiseSize + callAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+    }
+    if (callAmount >= seat.chipCount * 0.6 && effectiveStrength < 0.7) {
+      return { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // FISH: chases draws too far, calls bottom pair, occasional weird raise
+  if (profile.archetype === 'FISH') {
+    if (callAmount === 0) {
+      if (effectiveStrength > 0.70) {
+        const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.5));
+        if (betSize <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: betSize };
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    // Chases ANY draw
+    if (outs >= 4 && callAmount <= totalPot * 0.6) return { action: PlayerAction.Call, raiseAmount: 0 };
+    if (effectiveStrength < 0.20 && callAmount > totalPot * 0.4) return { action: PlayerAction.Fold, raiseAmount: 0 };
+    if (effectiveStrength > 0.88) {
+      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.6));
+      if (raiseSize + callAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+    }
+    return { action: PlayerAction.Call, raiseAmount: 0 };
+  }
+
+  // LAG: high c-bet frequency, lots of bluffs, frequent raises
+  if (profile.archetype === 'LAG') {
+    if (callAmount === 0) {
+      // C-bet most flops if we raised preflop
+      const cbetRoll = Math.random();
+      if (effectiveStrength > 0.55 || cbetRoll < params.cbetFreq) {
+        const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * (0.6 + Math.random() * 0.3) * params.betSizingMultiplier));
+        if (betSize <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: betSize };
+      }
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    if (effectiveStrength > 0.70) {
+      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.85 * params.betSizingMultiplier));
+      if (raiseSize + callAmount >= seat.chipCount * 0.8) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+      if (raiseSize + callAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+    }
+    if (effectiveStrength > potOdds + 0.05) return { action: PlayerAction.Call, raiseAmount: 0 };
+    // Bluff-raise occasionally
+    if (Math.random() < params.bluffFreq && !isRiver) {
+      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.7));
+      if (raiseSize + callAmount <= seat.chipCount * 0.4) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+    }
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  // TAG (default): existing GTO-leaning logic below
   // ============================================================
   // No bet to face: check or bet
   // ============================================================

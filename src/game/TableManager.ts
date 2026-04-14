@@ -3,6 +3,8 @@ import { OmahaTable } from './variants/OmahaTable';
 import { ShortDeckTable } from './variants/ShortDeckTable';
 import { FiveCardDrawTable } from './variants/FiveCardDrawTable';
 import { SevenStudTable } from './variants/SevenStudTable';
+import { PineappleTable } from './variants/PineappleTable';
+import { BadugiTable } from './variants/BadugiTable';
 import { VariantType } from './variants/PokerVariant';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -79,6 +81,79 @@ export class TableManager {
       ante: 5,
       minBuyIn: 5000,
     }, 'seven-card-stud');
+
+    // ─── Additional variants ───
+    this.createVariantTable({
+      tableName: '5-Card Omaha',
+      smallBlind: 50,
+      bigBlind: 100,
+      ante: 0,
+      minBuyIn: 10000,
+    }, 'omaha-5');
+
+    this.createVariantTable({
+      tableName: '6-Card Omaha',
+      smallBlind: 50,
+      bigBlind: 100,
+      ante: 0,
+      minBuyIn: 10000,
+    }, 'omaha-6');
+
+    this.createVariantTable({
+      tableName: 'Stud Hi-Lo (Stud 8)',
+      smallBlind: 25,
+      bigBlind: 50,
+      ante: 5,
+      minBuyIn: 5000,
+    }, 'seven-card-stud-hi-lo');
+
+    this.createVariantTable({
+      tableName: 'Pineapple Lounge',
+      smallBlind: 25,
+      bigBlind: 50,
+      ante: 0,
+      minBuyIn: 5000,
+    }, 'pineapple');
+
+    this.createVariantTable({
+      tableName: 'Crazy Pineapple',
+      smallBlind: 25,
+      bigBlind: 50,
+      ante: 0,
+      minBuyIn: 5000,
+    }, 'crazy-pineapple');
+
+    this.createVariantTable({
+      tableName: 'Badugi Room',
+      smallBlind: 25,
+      bigBlind: 50,
+      ante: 0,
+      minBuyIn: 5000,
+    }, 'badugi');
+
+    this.createVariantTable({
+      tableName: 'Razz Lowball',
+      smallBlind: 25,
+      bigBlind: 50,
+      ante: 5,
+      minBuyIn: 5000,
+    }, 'razz');
+
+    this.createVariantTable({
+      tableName: 'Triple Draw 2-7',
+      smallBlind: 25,
+      bigBlind: 50,
+      ante: 0,
+      minBuyIn: 5000,
+    }, 'triple-draw');
+
+    this.createVariantTable({
+      tableName: 'Omaha Hi-Lo',
+      smallBlind: 50,
+      bigBlind: 100,
+      ante: 0,
+      minBuyIn: 10000,
+    }, 'omaha-hi-lo');
   }
 
   createTable(config: Omit<TableConfig, 'tableId'>): string {
@@ -96,10 +171,16 @@ export class TableManager {
 
     switch (variant) {
       case 'omaha':
-        table = new OmahaTable(fullConfig, false);
+        table = new OmahaTable(fullConfig, false, 4);
         break;
       case 'omaha-hi-lo':
-        table = new OmahaTable(fullConfig, true);
+        table = new OmahaTable(fullConfig, true, 4);
+        break;
+      case 'omaha-5':
+        table = new OmahaTable(fullConfig, false, 5);
+        break;
+      case 'omaha-6':
+        table = new OmahaTable(fullConfig, false, 6);
         break;
       case 'short-deck':
         table = new ShortDeckTable(fullConfig);
@@ -110,11 +191,29 @@ export class TableManager {
       case 'triple-draw':
         table = new FiveCardDrawTable(fullConfig, true);
         break;
+      case 'badugi':
+        table = new BadugiTable(fullConfig);
+        break;
       case 'seven-card-stud':
-        table = new SevenStudTable(fullConfig, false);
+        table = new SevenStudTable(fullConfig, false, false);
+        break;
+      case 'seven-card-stud-hi-lo':
+        table = new SevenStudTable(fullConfig, false, true);
         break;
       case 'razz':
-        table = new SevenStudTable(fullConfig, true);
+        table = new SevenStudTable(fullConfig, true, false);
+        break;
+      case 'pineapple':
+        table = new PineappleTable(fullConfig, false);
+        break;
+      case 'crazy-pineapple':
+        table = new PineappleTable(fullConfig, true);
+        break;
+      case 'mixed-horse':
+        // HORSE (Hold'em, Omaha H/L, Razz, Stud, Stud H/L) — not yet implemented
+        // Fall back to Texas Hold'em rather than silently using wrong variant
+        console.warn('[TableManager] mixed-horse is not implemented; defaulting to Texas Hold\'em');
+        table = new PokerTable(fullConfig);
         break;
       default:
         table = new PokerTable(fullConfig);
@@ -141,14 +240,20 @@ export class TableManager {
       let variantName = "Texas Hold'em";
       let maxSeats = 9;
 
+      // Order matters: BadugiTable extends FiveCardDrawTable, so check
+      // subclasses first.
       if (table instanceof OmahaTable) {
         const omTable = table as OmahaTable;
-        variant = omTable.variant.type;
-        variantName = omTable.variant.name;
+        variant = (omTable.variantId as VariantType) || omTable.variant.type;
+        variantName = omTable.variantName || omTable.variant.name;
       } else if (table instanceof ShortDeckTable) {
         const sdTable = table as ShortDeckTable;
         variant = sdTable.variant.type;
         variantName = sdTable.variant.name;
+      } else if (table instanceof BadugiTable) {
+        variant = 'badugi';
+        variantName = 'Badugi';
+        maxSeats = 6;
       } else if (table instanceof FiveCardDrawTable) {
         const fdTable = table as FiveCardDrawTable;
         variant = fdTable.variant.type;
@@ -156,9 +261,13 @@ export class TableManager {
         maxSeats = 6;
       } else if (table instanceof SevenStudTable) {
         const ssTable = table as SevenStudTable;
-        variant = ssTable.variant.type;
-        variantName = ssTable.variant.name;
+        variant = (ssTable.variantId as VariantType) || ssTable.variant.type;
+        variantName = ssTable.variantName || ssTable.variant.name;
         maxSeats = 8;
+      } else if (table instanceof PineappleTable) {
+        const pTable = table as PineappleTable;
+        variant = (pTable.variantId as VariantType) || 'pineapple';
+        variantName = pTable.variantName || 'Pineapple';
       }
 
       list.push({

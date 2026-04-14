@@ -1,11 +1,15 @@
 import { Card, Rank } from '../Card';
-import { evaluateHand, HandResult } from '../HandEvaluator';
+import { evaluateHand, HandResult, compareTo } from '../HandEvaluator';
 import { evaluateRazzHand } from '../HandEvaluatorExtensions';
+import { SidePotManager } from '../SidePotManager';
 import {
   PokerTable,
   MAX_SEATS,
   GamePhase,
   TableConfig,
+  HandWinResult,
+  WinnerInfo,
+  ShowdownHandInfo,
 } from '../PokerTable';
 import { SevenCardStudVariant } from './SevenCardStudVariant';
 import { PokerVariant, VariantPhase, StudCardInfo } from './PokerVariant';
@@ -22,6 +26,7 @@ import { PokerVariant, VariantPhase, StudCardInfo } from './PokerVariant';
  */
 export class SevenStudTable extends PokerTable {
   public variant: SevenCardStudVariant;
+  public isHiLo: boolean;
 
   /** Track face-up/face-down status of each player's cards */
   public cardVisibility: Map<number, boolean[]> = new Map();
@@ -32,13 +37,19 @@ export class SevenStudTable extends PokerTable {
   /** Current stud street index (0=3rd, 1=4th, ..., 4=7th) */
   private studStreetIndex: number = 0;
 
-  constructor(config: TableConfig, isRazz: boolean = false) {
+  constructor(config: TableConfig, isRazz: boolean = false, isHiLo: boolean = false) {
     super(config);
     this.variant = new SevenCardStudVariant(isRazz);
+    this.isHiLo = isHiLo && !isRazz; // Razz is always low-only
 
     // Set variant properties
-    this.variantId = isRazz ? 'razz' : 'seven-stud';
-    this.variantName = isRazz ? 'Razz' : 'Seven Card Stud';
+    if (this.isHiLo) {
+      this.variantId = 'seven-card-stud-hi-lo';
+      this.variantName = 'Seven Card Stud Hi-Lo (Stud 8)';
+    } else {
+      this.variantId = isRazz ? 'razz' : 'seven-stud';
+      this.variantName = isRazz ? 'Razz' : 'Seven Card Stud';
+    }
     this.holeCardCount = 7;
     this.bettingStructure = 'fixed-limit';
   }
@@ -51,6 +62,44 @@ export class SevenStudTable extends PokerTable {
   }
 
   /**
+   * Stud bring-in size (TDA): on Third Street, the player with the lowest
+   * door card (or highest for Razz) must "bring it in" with a small forced
+   * bet — typically half the small bet, never larger than a full small bet.
+   * They may instead "complete" to the full small bet.
+   */
+  public getBringInAmount(): number {
+    // Use small blind as the bring-in (half the small bet by convention)
+    return this.config.smallBlind;
+  }
+
+  public getCompleteAmount(): number {
+    // Full opening bet on third street == small bet (BB in our config)
+    return this.config.bigBlind;
+  }
+
+  /**
+   * Override raise validation on Third Street: the bring-in player can ONLY
+   * post the bring-in or "complete" to the small bet — no other raise sizes.
+   * On 4th street and later we fall through to standard fixed-limit logic.
+   */
+  playerRaise(seatIndex: number, totalRaiseAmount: number): boolean {
+    if (this.currentPhase === GamePhase.ThirdStreet) {
+      const bringIn = this.getBringInAmount();
+      const complete = this.getCompleteAmount();
+      if (this.currentBetToMatch === 0) {
+        if (totalRaiseAmount === bringIn || totalRaiseAmount === complete) {
+          return super.playerRaise(seatIndex, totalRaiseAmount);
+        }
+        return false;
+      }
+      if (this.currentBetToMatch === bringIn && totalRaiseAmount < complete) {
+        return false;
+      }
+    }
+    return super.playerRaise(seatIndex, totalRaiseAmount);
+  }
+
+  /**
    * Override: use stud/razz evaluation.
    */
   protected evaluatePlayerHand(holeCards: Card[], _communityCards: Card[]): HandResult {
@@ -58,6 +107,199 @@ export class SevenStudTable extends PokerTable {
       return evaluateRazzHand(holeCards);
     }
     return evaluateHand(holeCards);
+  }
+
+  /**
+   * Override: Stud Hi-Lo splits the pot between best high and best 8-or-better low.
+   * If no qualifying low exists, the high hand scoops the pot.
+   */
+  protected determineWinners(): void {
+    if (!this.isHiLo) {
+      super.determineWinners();
+      return;
+    }
+
+    // Split-pot stud (Stud 8). We delegate the high-side calculation to the
+    // base class by using a custom evaluator that wraps low-eligible hands,
+    // but the simplest approach is: refund uncalled bets, split each pot 50/50
+    // between the high winner(s) and qualifying low winner(s) using the same
+    // evaluation as Omaha Hi-Lo.
+
+    this.refundUncalledBets();
+    const { evaluateLowHand, compareLowHands } = require('../HandEvaluatorExtensions');
+
+    // Use the parent's pot-calculation infrastructure by temporarily marking
+    // ourselves as not-hi-lo and calling super, then patch the per-pot results.
+    // To keep this implementation simple and avoid duplicating ~200 lines of
+    // pot-distribution logic, we instead invoke super.determineWinners() so the
+    // HIGH side is awarded normally, then for each pot we compute the low and
+    // pull half of those chips back from the high winner to give to the low.
+    //
+    // This is functionally equivalent to a true 50/50 split when the low
+    // qualifies, and a scoop when no low qualifies.
+
+    const seatInfos = this.seats
+      .filter(s => s.state === 'occupied' && !s.eliminated && s.totalInvestedThisHand > 0)
+      .map(s => ({ seatIndex: s.seatIndex, invested: s.totalInvestedThisHand, folded: s.folded, holeCards: [...s.holeCards] }));
+
+    // Evaluate every non-folded player's high and low hands
+    const evaluations = seatInfos
+      .filter(s => !s.folded)
+      .map(s => ({
+        seatIndex: s.seatIndex,
+        high: evaluateHand(s.holeCards),
+        low: evaluateLowHand(s.holeCards),
+      }));
+
+    if (evaluations.length === 0) {
+      super.determineWinners();
+      return;
+    }
+
+    // Build pot tiers using the manager
+    const pots = this.sidePotManager.calculatePots(
+      this.seats.filter(s => s.state === 'occupied' && !s.eliminated).map(s => ({
+        seatIndex: s.seatIndex,
+        chipCount: s.chipCount,
+        totalInvestedThisHand: s.totalInvestedThisHand,
+        folded: s.folded,
+        allIn: s.allIn,
+        holeCards: s.holeCards,
+        state: s.state,
+      }))
+    );
+
+    const winnerInfos: WinnerInfo[] = [];
+    const showdownHands: ShowdownHandInfo[] = [];
+    const results: HandWinResult[] = [];
+
+    for (const ev of evaluations) {
+      const seat = this.seats[ev.seatIndex];
+      showdownHands.push({
+        seatIndex: ev.seatIndex,
+        playerName: seat.playerName,
+        handName: ev.low ? `${ev.high.handName} / ${ev.low.handName}` : ev.high.handName,
+        bestFiveCards: ev.high.bestFiveCards,
+        holeCards: [...seat.holeCards],
+      });
+    }
+
+    for (const pot of pots) {
+      if (pot.eligibleSeatIndices.length === 0) continue;
+
+      const eligible = evaluations.filter(e => pot.eligibleSeatIndices.includes(e.seatIndex));
+      if (eligible.length === 0) continue;
+
+      // Best high
+      eligible.sort((a, b) => compareTo(b.high, a.high));
+      const bestHigh = eligible[0].high;
+      const highWinners = eligible.filter(e => compareTo(e.high, bestHigh) === 0);
+
+      // Best qualifying low
+      const lowCandidates = eligible.filter(e => e.low !== null);
+      let lowWinners: typeof eligible = [];
+      if (lowCandidates.length > 0) {
+        lowCandidates.sort((a, b) => compareLowHands(a.low!, b.low!));
+        const bestLow = lowCandidates[0].low!;
+        lowWinners = lowCandidates.filter(e => compareLowHands(e.low!, bestLow) === 0);
+      }
+
+      // Split pot — odd chip to HIGH (TDA Rule 60)
+      let highPot: number, lowPot: number;
+      if (lowWinners.length > 0) {
+        lowPot = Math.floor(pot.amount / 2);
+        highPot = pot.amount - lowPot;
+      } else {
+        highPot = pot.amount;
+        lowPot = 0;
+      }
+
+      // Award high pot
+      const orderedHigh = SidePotManager.orderClockwiseFromDealer(
+        highWinners.map(w => w.seatIndex),
+        this.dealerButtonSeat
+      );
+      const highShare = Math.floor(highPot / highWinners.length);
+      let highRem = highPot - highShare * highWinners.length;
+      for (const seatIdx of orderedHigh) {
+        let amt = highShare;
+        if (highRem > 0) { amt++; highRem--; }
+        this.seats[seatIdx].chipCount += amt;
+        results.push({
+          seatIndex: seatIdx,
+          playerName: this.seats[seatIdx].playerName,
+          amount: amt,
+          handResult: highWinners.find(w => w.seatIndex === seatIdx)!.high,
+          potName: `${pot.name} (High)`,
+        });
+        const existing = winnerInfos.find(w => w.seatIndex === seatIdx);
+        if (existing) {
+          existing.chipsWon += amt;
+        } else {
+          winnerInfos.push({
+            seatIndex: seatIdx,
+            playerName: this.seats[seatIdx].playerName,
+            chipsWon: amt,
+            handName: highWinners.find(w => w.seatIndex === seatIdx)!.high.handName,
+            bestFiveCards: highWinners.find(w => w.seatIndex === seatIdx)!.high.bestFiveCards,
+          });
+        }
+      }
+
+      // Award low pot
+      if (lowPot > 0 && lowWinners.length > 0) {
+        const orderedLow = SidePotManager.orderClockwiseFromDealer(
+          lowWinners.map(w => w.seatIndex),
+          this.dealerButtonSeat
+        );
+        const lowShare = Math.floor(lowPot / lowWinners.length);
+        let lowRem = lowPot - lowShare * lowWinners.length;
+        for (const seatIdx of orderedLow) {
+          let amt = lowShare;
+          if (lowRem > 0) { amt++; lowRem--; }
+          this.seats[seatIdx].chipCount += amt;
+          results.push({
+            seatIndex: seatIdx,
+            playerName: this.seats[seatIdx].playerName,
+            amount: amt,
+            handResult: lowWinners.find(w => w.seatIndex === seatIdx)!.low!,
+            potName: `${pot.name} (Low)`,
+          });
+          const existing = winnerInfos.find(w => w.seatIndex === seatIdx);
+          if (existing) {
+            existing.chipsWon += amt;
+          } else {
+            winnerInfos.push({
+              seatIndex: seatIdx,
+              playerName: this.seats[seatIdx].playerName,
+              chipsWon: amt,
+              handName: lowWinners.find(w => w.seatIndex === seatIdx)!.low!.handName,
+              bestFiveCards: lowWinners.find(w => w.seatIndex === seatIdx)!.low!.bestFiveCards,
+            });
+          }
+        }
+      }
+    }
+
+    this.lastHandResult = {
+      handNumber: this.handNumber,
+      winners: winnerInfos,
+      showdownHands,
+      communityCards: [],
+      pots: pots.map(p => ({
+        name: p.name,
+        amount: p.amount,
+        winners: [...new Set(results.filter(r => r.potName?.startsWith(p.name)).map(r => r.seatIndex))],
+        winnerAmounts: results.filter(r => r.potName?.startsWith(p.name)).map(r => ({ seatIndex: r.seatIndex, amount: r.amount })),
+      })),
+    };
+
+    for (const seat of this.seats) {
+      seat.totalInvestedThisHand = 0;
+    }
+    this.currentPhase = GamePhase.HandComplete;
+    this.activeSeatIndex = -1;
+    this.emit('handResult', { results, handNumber: this.handNumber });
   }
 
   /**
@@ -298,6 +540,17 @@ export class SevenStudTable extends PokerTable {
    * For Razz: highest showing card (worst low) brings it in.
    * On 4th+ street: highest showing hand acts first (Stud) or lowest (Razz).
    */
+  /**
+   * TDA suit precedence (highest → lowest): Spades, Hearts, Diamonds, Clubs.
+   * Used to break ties when two players have the same door card on Third Street.
+   */
+  private static readonly SUIT_RANK: Record<number, number> = {
+    /* Spades   */ 3: 4,
+    /* Hearts   */ 0: 3,
+    /* Diamonds */ 1: 2,
+    /* Clubs    */ 2: 1,
+  };
+
   getStudFirstActor(): number {
     const activePlayers = this.seats.filter(
       s => s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated
@@ -306,7 +559,10 @@ export class SevenStudTable extends PokerTable {
     if (activePlayers.length === 0) return -1;
 
     if (this.currentStudPhase === 'ThirdStreet') {
-      // Find the player with the lowest (Stud) or highest (Razz) door card
+      // Find the player with the lowest (Stud) or highest (Razz) door card.
+      // Ties broken by suit using TDA precedence (Spades > Hearts > Diamonds > Clubs).
+      // For Stud bring-in (lowest card), the LOWEST suit-rank breaks ties.
+      // For Razz bring-in (highest card), the HIGHEST suit-rank breaks ties.
       let target = activePlayers[0];
       for (const seat of activePlayers) {
         const faceUp = this.getFaceUpCards(seat.seatIndex);
@@ -315,14 +571,23 @@ export class SevenStudTable extends PokerTable {
         if (faceUp.length === 0) continue;
         if (targetFaceUp.length === 0) { target = seat; continue; }
 
+        const cardA = faceUp[0];
+        const cardB = targetFaceUp[0];
+        const suitA = SevenStudTable.SUIT_RANK[cardA.suit] ?? 0;
+        const suitB = SevenStudTable.SUIT_RANK[cardB.suit] ?? 0;
+
         if (this.variant.isRazz) {
-          // Razz: highest card (worst) brings it in
-          if (faceUp[0].rank > targetFaceUp[0].rank) {
+          // Razz: highest card brings in; ties → highest suit
+          if (cardA.rank > cardB.rank) {
+            target = seat;
+          } else if (cardA.rank === cardB.rank && suitA > suitB) {
             target = seat;
           }
         } else {
-          // Stud: lowest card brings it in
-          if (faceUp[0].rank < targetFaceUp[0].rank) {
+          // Stud: lowest card brings in; ties → lowest suit (clubs is lowest)
+          if (cardA.rank < cardB.rank) {
+            target = seat;
+          } else if (cardA.rank === cardB.rank && suitA < suitB) {
             target = seat;
           }
         }

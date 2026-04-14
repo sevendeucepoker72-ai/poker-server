@@ -1,7 +1,7 @@
 import { Card } from '../Card';
 import { HandResult, compareTo } from '../HandEvaluator';
 import { evaluateOmahaHand, evaluateOmahaHiLo, compareLowHands } from '../HandEvaluatorExtensions';
-import { SeatInfo } from '../SidePotManager';
+import { SeatInfo, SidePotManager, TABLE_SEAT_COUNT } from '../SidePotManager';
 import {
   PokerTable,
   MAX_SEATS,
@@ -31,24 +31,34 @@ import { PokerVariant } from './PokerVariant';
 export class OmahaTable extends PokerTable {
   public variant: PokerVariant;
   private isHiLo: boolean;
+  private numHoleCards: number;
 
-  constructor(config: TableConfig, isHiLo: boolean = false) {
+  constructor(config: TableConfig, isHiLo: boolean = false, numHoleCards: number = 4) {
     super(config);
     this.isHiLo = isHiLo;
+    this.numHoleCards = numHoleCards;
     this.variant = isHiLo ? new OmahaHiLoVariant() : new OmahaVariant();
 
     // Set variant properties
-    this.variantId = isHiLo ? 'omaha-hi-lo' : 'omaha';
-    this.variantName = isHiLo ? 'Omaha Hi-Lo' : 'Pot-Limit Omaha';
-    this.holeCardCount = 4;
+    if (numHoleCards === 5) {
+      this.variantId = 'omaha-5';
+      this.variantName = isHiLo ? '5-Card Omaha Hi-Lo' : '5-Card Omaha';
+    } else if (numHoleCards === 6) {
+      this.variantId = 'omaha-6';
+      this.variantName = isHiLo ? '6-Card Omaha Hi-Lo' : '6-Card Omaha';
+    } else {
+      this.variantId = isHiLo ? 'omaha-hi-lo' : 'omaha';
+      this.variantName = isHiLo ? 'Omaha Hi-Lo' : 'Pot-Limit Omaha';
+    }
+    this.holeCardCount = numHoleCards;
     this.bettingStructure = 'pot-limit';
   }
 
   /**
-   * Override: deal 4 hole cards instead of 2.
+   * Override: deal numHoleCards (4, 5, or 6) instead of 2.
    */
   protected getHoleCardCount(): number {
-    return 4;
+    return this.numHoleCards;
   }
 
   /**
@@ -88,6 +98,9 @@ export class OmahaTable extends PokerTable {
 
     // Omaha Hi-Lo: split pots between best high and best qualifying low
     this.currentPhase = GamePhase.Showdown;
+
+    // TDA Rule 41: refund uncalled top-stack excess before pot calculation
+    this.refundUncalledBets();
 
     const seatInfos: SeatInfo[] = this.seats
       .filter(s => s.state === 'occupied' && !s.eliminated)
@@ -149,8 +162,20 @@ export class OmahaTable extends PokerTable {
       // Calculate pots
       const pots = this.sidePotManager.calculatePots(seatInfos);
 
-      for (const pot of pots) {
-        if (pot.eligibleSeatIndices.length === 0) continue;
+      // Carry-over for orphaned (zero-eligible) pot amounts — matches the
+      // canonical SidePotManager.awardPots behaviour so chips are never lost.
+      let orphanedCarry = 0;
+      for (const rawPot of pots) {
+        if (rawPot.eligibleSeatIndices.length === 0) {
+          console.error(
+            `[OmahaTable] Orphaned pot "${rawPot.name}" with ${rawPot.amount} chips and no eligible players — rolling forward.`
+          );
+          orphanedCarry += rawPot.amount;
+          continue;
+        }
+        const effectiveAmount = rawPot.amount + orphanedCarry;
+        orphanedCarry = 0;
+        const pot = effectiveAmount === rawPot.amount ? rawPot : { ...rawPot, amount: effectiveAmount };
 
         if (pot.eligibleSeatIndices.length === 1) {
           const winIdx = pot.eligibleSeatIndices[0];
@@ -210,40 +235,52 @@ export class OmahaTable extends PokerTable {
           lowWinners = lowCandidates.filter(hr => compareLowHands(hr.low!, bestLow) === 0);
         }
 
-        // Split pot
+        // Split pot — TDA Rule 60: when a hi/lo split has an odd chip,
+        // the odd chip goes to the HIGH side (low side gets the floor).
         let highPot: number;
         let lowPot: number;
         if (lowWinners.length > 0) {
-          // Split 50/50 between high and low
-          highPot = Math.floor(pot.amount / 2);
-          lowPot = pot.amount - highPot;
+          lowPot  = Math.floor(pot.amount / 2);
+          highPot = pot.amount - lowPot; // odd chip → high
         } else {
-          // No qualifying low - high scoops
           highPot = pot.amount;
           lowPot = 0;
         }
 
-        // Award high pot
+        // Order winners clockwise from dealer (TDA Rule 60).
+        const orderedHighSeats = SidePotManager.orderClockwiseFromDealer(
+          highWinners.map(w => w.seatIndex),
+          this.dealerButtonSeat,
+          TABLE_SEAT_COUNT
+        );
+        const orderedLowSeats = SidePotManager.orderClockwiseFromDealer(
+          lowWinners.map(w => w.seatIndex),
+          this.dealerButtonSeat,
+          TABLE_SEAT_COUNT
+        );
+
+        // Award high pot in clockwise order so odd chip lands on first seat after button
         const highShare = Math.floor(highPot / highWinners.length);
         let highRemainder = highPot - highShare * highWinners.length;
-        for (const hw of highWinners) {
+        for (const seatIdx of orderedHighSeats) {
+          const hw = highWinners.find(w => w.seatIndex === seatIdx)!;
           let amt = highShare;
           if (highRemainder > 0) { amt++; highRemainder--; }
-          this.seats[hw.seatIndex].chipCount += amt;
+          this.seats[seatIdx].chipCount += amt;
           results.push({
-            seatIndex: hw.seatIndex,
-            playerName: this.seats[hw.seatIndex].playerName,
+            seatIndex: seatIdx,
+            playerName: this.seats[seatIdx].playerName,
             amount: amt,
             handResult: hw.high,
             potName: `${pot.name} (High)`,
           });
-          const existing = winnerInfos.find(w => w.seatIndex === hw.seatIndex);
+          const existing = winnerInfos.find(w => w.seatIndex === seatIdx);
           if (existing) {
             existing.chipsWon += amt;
           } else {
             winnerInfos.push({
-              seatIndex: hw.seatIndex,
-              playerName: this.seats[hw.seatIndex].playerName,
+              seatIndex: seatIdx,
+              playerName: this.seats[seatIdx].playerName,
               chipsWon: amt,
               handName: hw.high.handName,
               bestFiveCards: hw.high.bestFiveCards,
@@ -251,28 +288,29 @@ export class OmahaTable extends PokerTable {
           }
         }
 
-        // Award low pot
+        // Award low pot in clockwise order
         if (lowPot > 0 && lowWinners.length > 0) {
           const lowShare = Math.floor(lowPot / lowWinners.length);
           let lowRemainder = lowPot - lowShare * lowWinners.length;
-          for (const lw of lowWinners) {
+          for (const seatIdx of orderedLowSeats) {
+            const lw = lowWinners.find(w => w.seatIndex === seatIdx)!;
             let amt = lowShare;
             if (lowRemainder > 0) { amt++; lowRemainder--; }
-            this.seats[lw.seatIndex].chipCount += amt;
+            this.seats[seatIdx].chipCount += amt;
             results.push({
-              seatIndex: lw.seatIndex,
-              playerName: this.seats[lw.seatIndex].playerName,
+              seatIndex: seatIdx,
+              playerName: this.seats[seatIdx].playerName,
               amount: amt,
               handResult: lw.low!,
               potName: `${pot.name} (Low)`,
             });
-            const existing = winnerInfos.find(w => w.seatIndex === lw.seatIndex);
+            const existing = winnerInfos.find(w => w.seatIndex === seatIdx);
             if (existing) {
               existing.chipsWon += amt;
             } else {
               winnerInfos.push({
-                seatIndex: lw.seatIndex,
-                playerName: this.seats[lw.seatIndex].playerName,
+                seatIndex: seatIdx,
+                playerName: this.seats[seatIdx].playerName,
                 chipsWon: amt,
                 handName: lw.low!.handName,
                 bestFiveCards: lw.low!.bestFiveCards,
@@ -281,21 +319,31 @@ export class OmahaTable extends PokerTable {
           }
         }
       }
+
+      if (orphanedCarry > 0) {
+        console.error(`[OmahaTable] ${orphanedCarry} chips orphaned after all pots processed.`);
+      }
     }
 
     // Calculate pot breakdown for hand history
     const pots = this.sidePotManager.calculatePots(seatInfos);
-    const potBreakdown = pots.map(p => ({
-      amount: p.amount,
-      winners: winnerInfos
-        .filter(w => p.eligibleSeatIndices.includes(w.seatIndex))
-        .map(w => w.seatIndex),
-    }));
+    const potBreakdown = pots.map(p => {
+      const potResults = results.filter(r => r.potName === p.name);
+      const winnerAmounts = potResults.map(r => ({ seatIndex: r.seatIndex, amount: r.amount }));
+      return {
+        name: p.name,
+        amount: p.amount,
+        winners: [...new Set(potResults.map(r => r.seatIndex))],
+        winnerAmounts,
+      };
+    });
     if (potBreakdown.length === 0 && winnerInfos.length > 0) {
       const totalPot = seatInfos.reduce((sum, s) => sum + s.totalInvestedThisHand, 0);
       potBreakdown.push({
+        name: 'Main Pot',
         amount: totalPot,
         winners: winnerInfos.map(w => w.seatIndex),
+        winnerAmounts: winnerInfos.map(w => ({ seatIndex: w.seatIndex, amount: w.chipsWon })),
       });
     }
 

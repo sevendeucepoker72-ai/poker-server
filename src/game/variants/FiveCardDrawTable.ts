@@ -201,6 +201,7 @@ export class FiveCardDrawTable extends PokerTable {
     this.currentDrawPhase = null;
     this.drawRound = 0;
     this.discardPile = [];
+    this._discardOverflow = [];
     return super.startNewHand();
   }
 
@@ -241,9 +242,9 @@ export class FiveCardDrawTable extends PokerTable {
     for (let i = 0; i < discardIndices.length; i++) {
       let newCard = this.deck.dealOne();
       if (!newCard) {
-        // Deck ran out - reshuffle discard pile
+        // Deck ran out - reshuffle discard pile into overflow buffer
         this.reshuffleDiscardPile();
-        newCard = this.deck.dealOne();
+        newCard = this._discardOverflow.length > 0 ? this._discardOverflow.pop()! : null;
       }
       if (newCard) {
         seat.holeCards.push(newCard);
@@ -285,22 +286,19 @@ export class FiveCardDrawTable extends PokerTable {
     return true;
   }
 
+  /** Overflow buffer: shuffled discards used when the main deck is exhausted */
+  private _discardOverflow: Card[] = [];
+
   /**
-   * Reshuffle the discard pile back into the deck when it runs out.
+   * Reshuffle the discard pile into _discardOverflow so playerDraw can draw from it.
+   * Uses the deck's seeded PRNG so the reshuffle is provably fair (verifiable
+   * after the hand by combining the revealed seed with the 'discards' domain tag).
    */
   private reshuffleDiscardPile(): void {
     if (this.discardPile.length === 0) return;
-
-    // We can't easily inject cards into the CardDeck, so we'll track extra cards
-    // This is a simplified approach - shuffle discards and they become available
-    for (let i = this.discardPile.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [this.discardPile[i], this.discardPile[j]] = [this.discardPile[j], this.discardPile[i]];
-    }
-
-    // Store reshuffled cards back - we'll draw from discardPile as overflow
-    // Actually, let's just push them as available via deck.dealOne() won't work since
-    // we can't add cards back. We'll handle it in playerDraw by checking discardPile.
+    const cards = this.deck.shuffleForeignCards(this.discardPile, `discards-h${this.handNumber}`);
+    this.discardPile = [];
+    this._discardOverflow = cards;
   }
 
   /**
@@ -308,7 +306,12 @@ export class FiveCardDrawTable extends PokerTable {
    */
   protected getMaxRaise(seatIndex: number): number {
     if (this.variant.bettingStructure === 'fixed-limit') {
-      const isLateRound = this.currentPhase === GamePhase.Bet3 || this.currentPhase === GamePhase.Bet4;
+      // 2-7 Triple Draw: small bet only on Bet1 (before any draw); big bet
+      // on every betting round after the first draw.
+      const isLateRound =
+        this.currentPhase === GamePhase.Bet2 ||
+        this.currentPhase === GamePhase.Bet3 ||
+        this.currentPhase === GamePhase.Bet4;
       const betSize = isLateRound ? this.config.bigBlind * 2 : this.config.bigBlind;
       return this.currentBetToMatch + betSize;
     }

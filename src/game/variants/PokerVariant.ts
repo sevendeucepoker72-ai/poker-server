@@ -35,11 +35,17 @@ export type VariantType =
   | 'texas-holdem'
   | 'omaha'
   | 'omaha-hi-lo'
+  | 'omaha-5'
+  | 'omaha-6'
   | 'short-deck'
   | 'five-card-draw'
   | 'seven-card-stud'
+  | 'seven-card-stud-hi-lo'
   | 'razz'
   | 'triple-draw'
+  | 'pineapple'
+  | 'crazy-pineapple'
+  | 'badugi'
   | 'mixed-horse';
 
 /**

@@ -78,4 +78,21 @@ export class CardDeck {
   get commitment(): DeckCommitment | null {
     return this._commitment;
   }
+
+  /**
+   * Shuffle a foreign array of cards using a PRNG derived from this deck's
+   * commitment seed (plus a domain tag so the same seed produces a different
+   * shuffle for different purposes — e.g., reshuffling discards in 5-card draw).
+   * Falls back to a fresh per-call seed if no commitment exists yet.
+   */
+  shuffleForeignCards(cards: Card[], domain: string): Card[] {
+    const seed = (this._commitment?.seed || crypto.randomBytes(16).toString('hex')) + ':' + domain;
+    const rng = seededRandom(seed);
+    const arr = [...cards];
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
 }

@@ -98,8 +98,10 @@ export class FiveCardDrawVariant implements PokerVariant {
     phase: VariantPhase
   ): number {
     if (this.bettingStructure === 'fixed-limit') {
-      // Fixed limit: small bet on early rounds, big bet on later rounds
-      const isLateRound = ['Bet3', 'Bet4'].includes(phase);
+      // Fixed limit: small bet ONLY on Bet1 (before first draw); big bet on
+      // every round after the first draw (Bet2/Bet3/Bet4). This matches
+      // 2-7 Triple Draw house rules.
+      const isLateRound = ['Bet2', 'Bet3', 'Bet4'].includes(phase);
       const betSize = isLateRound ? bigBlind * 2 : bigBlind;
       return Math.min(currentBet + betSize, playerChips);
     }

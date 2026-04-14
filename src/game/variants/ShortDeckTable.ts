@@ -34,11 +34,12 @@ export class ShortDeckTable extends PokerTable {
 
   /**
    * Override: reset the deck with only 36 cards (6-A, no 2-5).
+   * Uses the same seeded PRNG as CardDeck to preserve provably-fair guarantees.
    */
   protected resetDeck(): void {
-    // We need to manually build the short deck since CardDeck always builds 52 cards
-    // Use the deck's reset and then override the cards by dealing through them
-    this.deck.reset();
+    // Use CardDeck.shuffle() to generate a commitment and seed the PRNG
+    const commitment = this.deck.shuffle(this.handNumber);
+    this._shortDeckCommitment = commitment;
 
     // Build short deck cards: only 6 through Ace
     const shortDeckCards: Card[] = [];
@@ -48,9 +49,22 @@ export class ShortDeckTable extends PokerTable {
       }
     }
 
-    // Fisher-Yates shuffle
+    // Use the same seed from the CardDeck commitment for a deterministic shuffle
+    const crypto = require('crypto');
+    const hash = crypto.createHash('sha256').update(commitment.seed + ':shortdeck').digest();
+    let s0 = hash.readUInt32BE(0), s1 = hash.readUInt32BE(4);
+    let s2 = hash.readUInt32BE(8), s3 = hash.readUInt32BE(12);
+    const rng = () => {
+      const t = s1 << 9;
+      s2 ^= s0; s3 ^= s1; s1 ^= s2; s0 ^= s3;
+      s2 ^= t;
+      s3 = (s3 << 11) | (s3 >>> 21);
+      return (s0 >>> 0) / 4294967296;
+    };
+
+    // Fisher-Yates with seeded PRNG
     for (let i = shortDeckCards.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
+      const j = Math.floor(rng() * (i + 1));
       [shortDeckCards[i], shortDeckCards[j]] = [shortDeckCards[j], shortDeckCards[i]];
     }
 
@@ -61,6 +75,7 @@ export class ShortDeckTable extends PokerTable {
 
   private _shortDeckCards: Card[] = [];
   private _shortDeckIndex: number = 0;
+  private _shortDeckCommitment: import('../CardDeck').DeckCommitment | null = null;
 
   /**
    * Override deal hole cards to use our short deck.

@@ -318,6 +318,7 @@ export class ProgressionManager {
     if (!progress) return;
 
     progress.totalHandsPlayed++;
+    (progress as any).lastHandAt = Date.now();
 
     // Update missions
     for (const mission of progress.dailyMissions) {

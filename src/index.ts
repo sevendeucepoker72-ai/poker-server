@@ -29,13 +29,13 @@ import {
 import { ProgressionManager } from './progression/ProgressionManager';
 import { HandRank } from './game/HandEvaluator';
 import { getFullTrainingData } from './training/TrainingEngine';
-import { TournamentManager } from './game/TournamentManager';
+import { TournamentManager, DEFAULT_BLIND_LEVELS } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, loginUser, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers } from './auth/authManager';
+import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats } from './auth/authManager';
 import {
   initClubTables,
   createClub,
@@ -112,6 +112,8 @@ const io = new Server(httpServer, {
     origin: '*',
     methods: ['GET', 'POST'],
   },
+  // Limit incoming message size to 16KB — prevents large-payload DoS
+  maxHttpBufferSize: 16 * 1024,
 });
 
 const PORT = parseInt(process.env.PORT || '3001');
@@ -129,9 +131,19 @@ interface PlayerSession {
   playerId: string;
   trainingEnabled: boolean;
   sittingOut: boolean;
+  avatar?: any;
 }
 
 const playerSessions = new Map<string, PlayerSession>();
+
+// Turn timeout: tableId -> { timeout, seatIndex, turnId }
+const turnTimers = new Map<string, { timeout: ReturnType<typeof setTimeout>; seatIndex: number; turnId: number }>();
+let globalTurnId = 0;
+const TURN_TIMEOUT_MS = 30000; // 30 seconds
+
+// Track when each table's current turn started (epoch ms) so clients can render
+// a per-player countdown ring.
+const turnStartedAtMap = new Map<string, number>();
 
 // Delta state tracking: socketId -> last full state sent to that client
 const lastSentState = new Map<string, Record<string, any>>();
@@ -189,6 +201,57 @@ const spectators = new Map<string, Set<string>>();
 
 // Emote rate limiting: socketId -> last emote timestamp
 const lastEmoteTime = new Map<string, number>();
+// Reaction rate limiting: socketId -> last reaction timestamp
+const lastReactionTime = new Map<string, number>();
+// Chat rate limiting: socketId -> last chat timestamp
+const lastChatTime = new Map<string, number>();
+// tokenLogin rate limiting: socketId -> { attempts, firstAt }
+const tokenLoginAttempts = new Map<string, { attempts: number; firstAt: number }>();
+// Per-IP connection tracking: ip -> Set of socketIds
+const ipConnections = new Map<string, Set<string>>();
+const MAX_CONNECTIONS_PER_IP = 5;
+// Per-IP seated players: ip -> Set of tableId:seatIndex strings (collusion detection)
+const ipSeatedSlots = new Map<string, Set<string>>();
+// Chip velocity tracking: userId -> { chipsAtSessionStart, sessionStartAt }
+const chipVelocity = new Map<number, { chipsAtStart: number; sessionStartAt: number; handsThisSession: number; lastActionMs: number[] }>();
+// Bot detection: socketId -> list of action response times in ms
+const actionTimings = new Map<string, number[]>();
+// Action nonce tracking: tableId:seatIndex -> last nonce used
+const actionNonces = new Map<string, string>();
+// Chip velocity auto-ban counter: userId -> alert count
+const chipVelocityAlerts = new Map<number, number>();
+
+// Module-scope audit log (used by anti-cheat auto-ban, admin ops, and buy-in audit)
+function auditLog(actorUsername: string, action: string, details: Record<string, unknown> = {}) {
+  const entry = `[AUDIT] ${new Date().toISOString()} | ${actorUsername} | ${action} | ${JSON.stringify(details)}`;
+  console.log(entry);
+}
+
+// Pending hand-complete autoStart timers per table, so we can cancel them if
+// the table becomes empty / a player disconnects before the timer fires.
+const pendingAutoStartTimers = new Map<string, NodeJS.Timeout>();
+
+// Periodic sweeper: prunes stale entries from rate-limit maps so long-running
+// servers don't accumulate unbounded memory from abandoned sockets.
+const RATE_MAP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+setInterval(() => {
+  const now = Date.now();
+  // tokenLoginAttempts: drop entries whose window has expired
+  for (const [sid, entry] of tokenLoginAttempts) {
+    if (now - entry.firstAt > 60_000) tokenLoginAttempts.delete(sid);
+  }
+  // emote / reaction / chat timestamps: if older than TTL and the socket is gone
+  for (const [sid, ts] of lastEmoteTime)    { if (now - ts > RATE_MAP_TTL_MS && !io.sockets.sockets.get(sid)) lastEmoteTime.delete(sid); }
+  for (const [sid, ts] of lastReactionTime) { if (now - ts > RATE_MAP_TTL_MS && !io.sockets.sockets.get(sid)) lastReactionTime.delete(sid); }
+  for (const [sid, ts] of lastChatTime)     { if (now - ts > RATE_MAP_TTL_MS && !io.sockets.sockets.get(sid)) lastChatTime.delete(sid); }
+  // actionTimings: drop if socket is gone
+  for (const sid of actionTimings.keys())   { if (!io.sockets.sockets.get(sid)) actionTimings.delete(sid); }
+  for (const sid of actionNonces.keys())    { if (!io.sockets.sockets.get(sid)) actionNonces.delete(sid); }
+  // chipVelocity: drop entries with no recent activity
+  for (const [uid, v] of chipVelocity) {
+    if (now - v.sessionStartAt > 4 * 60 * 60 * 1000) chipVelocity.delete(uid); // 4h idle
+  }
+}, 60_000).unref?.();
 
 // Auth session tracking: socketId -> userId
 const authSessions = new Map<string, { userId: number; username: string }>();
@@ -209,8 +272,22 @@ const sitOutTracker = new Map<string, Set<number>>();
 // Track AI profiles per table
 const aiProfiles = new Map<string, Map<number, AIPlayerProfile>>();
 
+// Seat reservations: userId -> reserved seat info (10-min expiry on disconnect)
+interface ReservedSeat {
+  tableId: string;
+  seatIndex: number;
+  playerName: string;
+  chips: number;
+  avatar?: any;
+  sittingOut: boolean;
+  expiresAt: number;
+  cleanupTimer: ReturnType<typeof setTimeout>;
+}
+const reservedSeats = new Map<number, ReservedSeat>();
+const SEAT_RESERVE_MS = 10 * 60 * 1000; // 10 minutes
+
 // Track AI decision timeouts
-const aiTimeouts = new Map<string, NodeJS.Timeout>();
+const aiTimeouts = new Map<string, { handle: NodeJS.Timeout; seatIndex: number }>();
 
 // ========== Bomb Pot Tracking ==========
 // tableId -> true means next hand is a bomb pot
@@ -243,6 +320,87 @@ app.get('/api/tables', (_req, res) => {
 
 app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', tables: tableManager.getTableList().length });
+});
+
+// ========== Qualifier Integration ==========
+// Qualified players are fetched from the master API (americanpub.poker) and
+// cached in memory. The frontend checks qualification status on login.
+
+interface QualifiedPlayer {
+  phone: string;
+  firstName: string;
+  lastName: string;
+  tier: string;           // 'weekly' | 'monthly'
+  creditCount: number;    // how many credits they have
+  venueName?: string;
+  earnedAt?: string;
+}
+
+// In-memory cache of qualified players, keyed by tier
+const qualifiedPlayers = new Map<string, QualifiedPlayer[]>();
+let lastQualifierFetch = 0;
+const QUALIFIER_CACHE_MS = 5 * 60 * 1000; // 5-minute cache
+
+async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<QualifiedPlayer[]> {
+  try {
+    const masterApi = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+    // Fetch ALL credits (including redeemed) — credits stay valid until the
+    // player actually plays in the tournament. Redemption on the master API
+    // side is just a registration marker, not a consumption marker.
+    const res = await fetch(`${masterApi}/qualifier-credits`);
+    const data: any = await res.json();
+    if (!data.success || !data.credits) return [];
+
+    // Group credits by phone+tier and count
+    const byKey = new Map<string, QualifiedPlayer>();
+    for (const c of data.credits) {
+      if (c.tier !== tier || !c.phone_number) continue;
+      const key = `${c.phone_number}-${c.tier}`;
+      const existing = byKey.get(key);
+      if (existing) {
+        existing.creditCount++;
+      } else {
+        byKey.set(key, {
+          phone: c.phone_number,
+          firstName: c.first_name || '',
+          lastName: c.last_name || '',
+          tier: c.tier,
+          creditCount: 1,
+          venueName: c.venue_name,
+          earnedAt: c.earned_at,
+        });
+      }
+    }
+    return Array.from(byKey.values());
+  } catch (err) {
+    console.error('[Qualifiers] Failed to fetch from master API:', err);
+    return [];
+  }
+}
+
+async function getQualifiedPlayers(tier: string): Promise<QualifiedPlayer[]> {
+  const now = Date.now();
+  if (now - lastQualifierFetch > QUALIFIER_CACHE_MS || !qualifiedPlayers.has(tier)) {
+    const players = await fetchQualifiersFromMaster(tier);
+    qualifiedPlayers.set(tier, players);
+    lastQualifierFetch = now;
+  }
+  return qualifiedPlayers.get(tier) || [];
+}
+
+// REST endpoint: get qualified players for a tier
+app.get('/api/qualifiers/:tier', async (req, res) => {
+  const tier = req.params.tier || 'weekly';
+  const players = await getQualifiedPlayers(tier);
+  res.json({ success: true, tier, count: players.length, players });
+});
+
+// REST endpoint: force refresh qualifier cache
+app.post('/api/qualifiers/refresh', async (_req, res) => {
+  lastQualifierFetch = 0;
+  const weekly = await getQualifiedPlayers('weekly');
+  const monthly = await getQualifiedPlayers('monthly');
+  res.json({ success: true, weekly: weekly.length, monthly: monthly.length });
 });
 
 // ========== Helper Functions ==========
@@ -300,11 +458,13 @@ function getGameStateForPlayer(
 ): object {
   const variantInfo = getVariantInfo(table);
 
-  // Build a name→playerId lookup from current sessions for rank enrichment
+  // Build a name→session lookup for rank enrichment and avatar passthrough
   const nameToPlayerId = new Map<string, string>();
+  const nameToAvatar = new Map<string, any>();
   for (const [, session] of playerSessions) {
     if (session.tableId === table.config.tableId) {
       nameToPlayerId.set(session.playerName, session.playerId);
+      if (session.avatar) nameToAvatar.set(session.playerName, session.avatar);
     }
   }
 
@@ -323,11 +483,13 @@ function getGameStateForPlayer(
       eliminated: seat.eliminated,
     };
 
-    // Attach rank for display on nameplates
+    // Attach rank and avatar for display on nameplates/seats
     if (seat.playerName && !seat.isAI) {
       const pid = nameToPlayerId.get(seat.playerName);
       const prog = pid ? progressionManager.getProgress(pid) : null;
       if (prog) seatData.rank = prog.rank;
+      const av = nameToAvatar.get(seat.playerName);
+      if (av) seatData.avatar = av;
     }
 
     // For Stud games: show face-up cards to everyone
@@ -378,6 +540,8 @@ function getGameStateForPlayer(
       eligiblePlayers: p.eligibleSeatIndices,
     })),
     activeSeatIndex: table.activeSeatIndex,
+    turnStartedAt: turnStartedAtMap.get(table.config.tableId) ?? 0,
+    turnTimeout: TURN_TIMEOUT_MS,
     dealerButtonSeat: table.dealerButtonSeat,
     currentBetToMatch: table.currentBetToMatch,
     handNumber: table.handNumber,
@@ -449,6 +613,12 @@ function getGameStateForPlayer(
         handName: h.handName,
         bestFiveCards: h.bestFiveCards.map(serializeCard),
         holeCards: h.holeCards.map(serializeCard),
+      })),
+      // Per-pot breakdown for UI: who won what from which pot
+      potBreakdown: table.lastHandResult.pots.map((p: any) => ({
+        name: p.name || 'Main Pot',
+        amount: p.amount,
+        winnerAmounts: p.winnerAmounts || [],
       })),
     };
   }
@@ -567,22 +737,72 @@ function broadcastGameState(tableId: string): void {
 
   // Auto-fold sitting-out players when it's their turn
   if (table.isHandInProgress()) {
-    for (const [socketId, session] of playerSessions) {
-      if (session.tableId === tableId && session.sittingOut && table.activeSeatIndex === session.seatIndex) {
-        setTimeout(() => {
-          const t = tableManager.getTable(tableId);
-          if (t && t.activeSeatIndex === session.seatIndex) {
-            const callAmt = t.currentBetToMatch - (t.seats[session.seatIndex]?.currentBet || 0);
-            if (callAmt <= 0) {
-              t.playerCheck(session.seatIndex);
-            } else {
-              t.playerFold(session.seatIndex);
-            }
-            broadcastGameState(tableId);
-          }
-        }, 500); // Small delay so client sees it's their turn briefly
+    const activeIdx = table.activeSeatIndex;
+    let shouldAutoAct = false;
+
+    for (const [, session] of playerSessions) {
+      if (session.tableId === tableId && session.sittingOut && activeIdx === session.seatIndex) {
+        shouldAutoAct = true;
         break;
       }
+    }
+
+    // Also auto-act if the active seat belongs to a player whose socket is gone
+    // (reserved seat scenario) so a disconnected human doesn't deadlock the table.
+    if (!shouldAutoAct && activeIdx >= 0) {
+      const seat = table.seats[activeIdx];
+      if (seat && seat.state === 'occupied' && !seat.isAI) {
+        const hasLiveSession = [...playerSessions.values()].some(
+          (s) => s.tableId === tableId && s.seatIndex === activeIdx
+        );
+        if (!hasLiveSession) shouldAutoAct = true;
+      }
+    }
+
+    if (shouldAutoAct) {
+      setTimeout(() => {
+        const t = tableManager.getTable(tableId);
+        if (t && t.activeSeatIndex === activeIdx && t.isHandInProgress()) {
+          const callAmt = t.currentBetToMatch - (t.seats[activeIdx]?.currentBet || 0);
+          if (callAmt <= 0) {
+            t.playerCheck(activeIdx);
+          } else {
+            t.playerFold(activeIdx);
+          }
+          broadcastGameState(tableId);
+        }
+      }, 500);
+    }
+  }
+
+  // Server-side turn timeout: clear old timer, set new one if hand is in progress
+  {
+    const existing = turnTimers.get(tableId);
+    if (existing) clearTimeout(existing.timeout);
+    turnTimers.delete(tableId);
+
+    if (table.isHandInProgress() && table.activeSeatIndex >= 0) {
+      const activeSeat = table.activeSeatIndex;
+      const turnId = ++globalTurnId;
+      turnStartedAtMap.set(tableId, Date.now());
+      const timeout = setTimeout(() => {
+        const entry = turnTimers.get(tableId);
+        if (!entry || entry.turnId !== turnId) return; // stale timer
+        turnTimers.delete(tableId);
+        const t = tableManager.getTable(tableId);
+        if (!t || !t.isHandInProgress() || t.activeSeatIndex !== activeSeat) return;
+        const seat = t.seats[activeSeat];
+        if (!seat || !seat.playerName || seat.folded) return;
+        const callAmt = t.currentBetToMatch - (seat.currentBet || 0);
+        console.log(`[Timer] Seat ${activeSeat} (${seat.playerName}) timed out — ${callAmt > 0 ? 'folding' : 'checking'}`);
+        if (callAmt > 0) {
+          t.playerFold(activeSeat);
+        } else {
+          t.playerCheck(activeSeat);
+        }
+        broadcastGameState(tableId);
+      }, TURN_TIMEOUT_MS);
+      turnTimers.set(tableId, { timeout, seatIndex: activeSeat, turnId });
     }
   }
 
@@ -609,7 +829,49 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   tableProgressListeners.add(tableId);
 
   table.on('handResult', (data: { results: any[]; handNumber: number }) => {
+    incrementHandsPlayed();
     handleHandComplete(tableId, data.results);
+
+    // Chip velocity monitoring
+    for (const result of data.results) {
+      if (!result.playerId || result.isAI) continue;
+      const session = [...playerSessions.values()].find((s) => s.tableId === tableId && s.playerId === result.playerId);
+      if (!session) continue;
+      const auth = authSessions.get(session.socketId);
+      if (!auth) continue;
+      const userId = auth.userId;
+      if (!chipVelocity.has(userId)) {
+        chipVelocity.set(userId, {
+          chipsAtStart: getUserChips(userId),
+          sessionStartAt: Date.now(),
+          handsThisSession: 0,
+          lastActionMs: [],
+        });
+      }
+      const vel = chipVelocity.get(userId)!;
+      vel.handsThisSession++;
+      if (result.chipsWon && result.chipsWon > 0) {
+        const currentChips = getUserChips(userId);
+        const gained = currentChips - vel.chipsAtStart;
+        const sessionMinutes = (Date.now() - vel.sessionStartAt) / 60_000;
+        if (vel.handsThisSession >= 5 && gained > vel.chipsAtStart * 10) {
+          console.warn(`[AntiCheat] Chip velocity alert: userId=${userId} gained ${gained} chips (${vel.handsThisSession} hands, ${sessionMinutes.toFixed(1)}m)`);
+          // Track alert count; auto-ban after 3 alerts
+          chipVelocityAlerts.set(userId, (chipVelocityAlerts.get(userId) || 0) + 1);
+          const alertCount = chipVelocityAlerts.get(userId)!;
+          if (alertCount >= 3) {
+            console.warn(`[AntiCheat] Auto-banning userId=${userId} after ${alertCount} chip velocity alerts`);
+            try {
+              banUserDB(userId);
+              auditLog('SYSTEM', 'AUTO_BAN_CHIP_VELOCITY', { userId, gained, handsThisSession: vel.handsThisSession });
+            } catch (e) {
+              console.error('[AntiCheat] Auto-ban failed:', e);
+            }
+            chipVelocityAlerts.delete(userId);
+          }
+        }
+      }
+    }
   });
 
   // Emit hand history to all human players at the table (Part 3)
@@ -695,7 +957,7 @@ function scheduleAIAction(tableId: string): void {
     table.currentPhase === GamePhase.HandComplete ||
     table.currentPhase === GamePhase.Showdown
   ) {
-    console.log(`[AI] Phase ${table.currentPhase}, skipping`);
+    // console.log(`[AI] Phase ${table.currentPhase}, skipping`);
     return;
   }
 
@@ -731,35 +993,45 @@ function scheduleAIAction(tableId: string): void {
   }
 
   const activeSeat = table.activeSeatIndex;
-  if (activeSeat < 0 || activeSeat >= MAX_SEATS) { console.log(`[AI] Invalid active seat: ${activeSeat}`); return; }
+  if (activeSeat < 0 || activeSeat >= MAX_SEATS) { return; }
 
   const seat = table.seats[activeSeat];
-  console.log(`[AI] Active seat ${activeSeat}: ${seat.playerName}, isAI=${seat.isAI}, state=${seat.state}`);
-  if (!seat.isAI) { console.log(`[AI] Seat ${activeSeat} is human, waiting`); return; }
+  // console.log(`[AI] Active seat ${activeSeat}: ${seat.playerName}, isAI=${seat.isAI}, state=${seat.state}`);
+  if (!seat.isAI) { return; }
 
   const profiles = aiProfiles.get(tableId);
   if (!profiles) { console.log('[AI] No profiles found'); return; }
 
   const profile = profiles.get(activeSeat);
-  if (!profile) { console.log(`[AI] No profile for seat ${activeSeat}`); return; }
+  if (!profile) { return; }
 
-  // Clear any existing timeout for this table
+  // CRITICAL: don't reschedule if there's already a pending action for the
+  // same seat. Otherwise repeated broadcastGameState → scheduleAIAction calls
+  // will keep cancelling and re-arming the timer, so it never actually fires
+  // and the table wedges until the 30s turn timer takes over.
   const timeoutKey = `${tableId}`;
-  if (aiTimeouts.has(timeoutKey)) {
-    clearTimeout(aiTimeouts.get(timeoutKey)!);
+  const existing = aiTimeouts.get(timeoutKey);
+  if (existing && existing.seatIndex === activeSeat) {
+    return; // already scheduled for this seat — let it fire
+  }
+  if (existing) {
+    clearTimeout(existing.handle);
   }
 
   const isFastMode = fastModeTables.get(tableId) || false;
-  const delay = isFastMode ? 300 : getThinkingDelay(profile.difficulty);
-  console.log(`[AI] Scheduling ${seat.playerName} (seat ${activeSeat}) in ${delay}ms${isFastMode ? ' (fast mode)' : ''}`);
+  // Normalize AI response window to a fixed range so timing doesn't leak hand strength.
+  // Internally compute the "natural" delay but clamp to [800, 1200]ms (or 300ms in fast mode).
+  const naturalDelay = getThinkingDelay(profile.difficulty);
+  const delay = isFastMode ? 300 : Math.min(1200, Math.max(800, naturalDelay));
+  // console.log(`[AI] Scheduling ${seat.playerName} (seat ${activeSeat}) in ${delay}ms${isFastMode ? ' (fast mode)' : ''}`);
 
-  const timeout = setTimeout(() => {
+  const handle = setTimeout(() => {
     aiTimeouts.delete(timeoutKey);
-    console.log(`[AI] Executing action for seat ${activeSeat}`);
+    // console.log(`[AI] Executing action for seat ${activeSeat}`);
     executeAIAction(tableId, activeSeat, profile);
   }, delay);
 
-  aiTimeouts.set(timeoutKey, timeout);
+  aiTimeouts.set(timeoutKey, { handle, seatIndex: activeSeat });
 }
 
 function executeAIAction(
@@ -825,14 +1097,29 @@ function executeAIAction(
 
     // Check if hand is complete
     if (table.currentPhase === GamePhase.HandComplete) {
-      // Auto-start next hand after delay
-      setTimeout(() => {
+      // Cancel any previously scheduled auto-start for this table (defensive)
+      const existing = pendingAutoStartTimers.get(tableId);
+      if (existing) clearTimeout(existing);
+      const t = setTimeout(() => {
+        pendingAutoStartTimers.delete(tableId);
         autoStartNextHand(tableId);
       }, 3000);
+      pendingAutoStartTimers.set(tableId, t);
     } else {
       // Schedule next AI action if needed
       scheduleAIAction(tableId);
     }
+  } else {
+    // All action attempts failed (active seat is somehow already folded/eliminated/invalid).
+    // Force-advance the turn so the table doesn't wedge in an infinite reschedule loop.
+    console.warn(`[AI] All action attempts failed for seat ${seatIndex} on ${tableId} — forcing turn advance`);
+    try {
+      (table as any).advanceTurn();
+    } catch (e) {
+      console.error('[AI] Forced advanceTurn failed:', e);
+    }
+    broadcastGameState(tableId);
+    scheduleAIAction(tableId);
   }
 }
 
@@ -874,6 +1161,8 @@ function autoStartNextHand(tableId: string): void {
     if (table.dealerButtonSeat === dcState.dealerAtOrbitStart && table.handNumber > 1) {
       dcState.orbitCount++;
       dcState.currentVariantIndex = (dcState.currentVariantIndex + 1) % DEALERS_CHOICE_VARIANTS.length;
+      // Advance the orbit start to the current dealer so the next orbit is measured correctly
+      dcState.dealerAtOrbitStart = table.dealerButtonSeat;
     }
   }
 
@@ -892,7 +1181,8 @@ function autoStartNextHand(tableId: string): void {
         if (seat.state === 'occupied' && !seat.folded && !seat.eliminated) {
           const deduction = Math.min(bombAnte, seat.chipCount);
           seat.chipCount -= deduction;
-          seat.currentBet += deduction;
+          seat.currentBet = deduction;
+          seat.totalInvestedThisHand += deduction;
         }
       }
 
@@ -907,24 +1197,19 @@ function autoStartNextHand(tableId: string): void {
           if (card) table.communityCards.push(card);
         }
         (table as any).currentPhase = GamePhase.Flop;
+        // Ante has already been posted — reset currentBet to 0 for the post-flop betting round
         table.currentBetToMatch = 0;
-        // Reset all current bets for the flop betting round
         for (let i = 0; i < MAX_SEATS; i++) {
           table.seats[i].currentBet = 0;
         }
         // Set active seat to first non-folded player after dealer
-        const occupiedSeats = table.seats
-          .map((s, idx) => ({ ...s, idx }))
-          .filter(s => s.state === 'occupied' && !s.folded && !s.eliminated && s.chipCount > 0);
-        if (occupiedSeats.length > 0) {
-          let startIdx = (table.dealerButtonSeat + 1) % MAX_SEATS;
-          for (let j = 0; j < MAX_SEATS; j++) {
-            const checkSeat = (startIdx + j) % MAX_SEATS;
-            const s = table.seats[checkSeat];
-            if (s.state === 'occupied' && !s.folded && !s.eliminated && s.chipCount > 0) {
-              table.activeSeatIndex = checkSeat;
-              break;
-            }
+        let startIdx = (table.dealerButtonSeat + 1) % MAX_SEATS;
+        for (let j = 0; j < MAX_SEATS; j++) {
+          const checkSeat = (startIdx + j) % MAX_SEATS;
+          const s = table.seats[checkSeat];
+          if (s.state === 'occupied' && !s.folded && !s.eliminated && s.chipCount >= 0) {
+            table.activeSeatIndex = checkSeat;
+            break;
           }
         }
       }
@@ -970,8 +1255,15 @@ function handleHandComplete(tableId: string, results: any[]): void {
     }
   }
 
-  // Determine winner seat indices
+  // Aggregate total chips won per seat (a player can appear in results multiple times
+  // if they won chips from both Main Pot and Side Pots).
   const winnerSeatIndices = new Set(results.map((r: any) => r.seatIndex));
+  const totalWonPerSeat = new Map<number, number>();
+  const handResultPerSeat = new Map<number, any>();
+  for (const r of results) {
+    totalWonPerSeat.set(r.seatIndex, (totalWonPerSeat.get(r.seatIndex) || 0) + (r.amount || 0));
+    if (!handResultPerSeat.has(r.seatIndex)) handResultPerSeat.set(r.seatIndex, r.handResult);
+  }
 
   for (const session of humanSessions) {
     // Everyone who played gets recordHandPlayed + 5 XP
@@ -992,9 +1284,8 @@ function handleHandComplete(tableId: string, results: any[]): void {
     else if (relativePos >= totalOccupied - 2) posCategory = 'late';
 
     if (isWinner) {
-      const result = results.find((r: any) => r.seatIndex === session.seatIndex);
-      const potSize = result?.amount || 0;
-      const handRank = result?.handResult?.handRank;
+      const potSize = totalWonPerSeat.get(session.seatIndex) || 0;
+      const handRank = handResultPerSeat.get(session.seatIndex)?.handRank;
       const wasAllIn = seat?.allIn || false;
 
       progressionManager.recordHandWon(session.playerId, potSize, handRank, wasAllIn);
@@ -1031,11 +1322,68 @@ function handleHandComplete(tableId: string, results: any[]): void {
   }
 
   // Send updated progress to all human players at the table
+  // and persist key stats (incl. lastHandAt) to DB for leaderboard accuracy
   for (const [socketId, session] of playerSessions) {
     if (session.tableId === tableId) {
       sendProgressToPlayer(socketId);
+      const authSession = authSessions.get(socketId);
+      if (authSession) {
+        const clientProgress = progressionManager.getClientProgress(session.playerId) as any;
+        if (clientProgress) {
+          mergeUserStats(authSession.userId, {
+            handsPlayed: clientProgress.totalHandsPlayed || 0,
+            handsWon: clientProgress.handsWon || 0,
+            biggestPot: clientProgress.biggestPot || 0,
+            lastHandAt: Date.now(),
+          });
+        }
+      }
     }
   }
+
+  // Tournament elimination tracking: if this table is part of a tournament,
+  // record busted players so finish positions and bounty payouts are correct.
+  const tournamentId = tournamentTables.get(tableId);
+  if (tournamentId) {
+    // Identify winners of this hand to credit as bounty eliminators
+    const winnerPlayerIds = new Set<string>();
+    for (const r of results) {
+      if ((r.amount || 0) > 0) {
+        const seat = table.seats[r.seatIndex];
+        if (seat?.playerId) winnerPlayerIds.add(seat.playerId);
+      }
+    }
+    for (let i = 0; i < MAX_SEATS; i++) {
+      const seat = table.seats[i];
+      if (seat?.state === 'occupied' && seat.chipCount <= 0 && !seat.eliminated) {
+        seat.eliminated = true;
+        const eliminatorId = winnerPlayerIds.values().next().value;
+        try {
+          const result = tournamentManager.eliminatePlayer(tournamentId, seat.playerId, eliminatorId);
+          if (result && result.bountyPayout && eliminatorId) {
+            // Notify eliminator
+            for (const [sid, s] of playerSessions) {
+              if (s.playerId === eliminatorId) {
+                io.to(sid).emit('bountyAwarded', { amount: result.bountyPayout, eliminated: seat.playerName });
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          console.error('[Tournament] eliminatePlayer failed:', e);
+        }
+      }
+    }
+  }
+}
+
+// ========== Server-wide stats tracking ==========
+let handsPlayedToday = 0;
+let handsPlayedTodayDate = new Date().toDateString();
+function incrementHandsPlayed(): void {
+  const today = new Date().toDateString();
+  if (today !== handsPlayedTodayDate) { handsPlayedToday = 0; handsPlayedTodayDate = today; }
+  handsPlayedToday++;
 }
 
 // ========== Quick-Play & Career Tracking ==========
@@ -1071,7 +1419,7 @@ function cleanupQuickTable(tableId: string): void {
 
   const timeoutKey = tableId;
   if (aiTimeouts.has(timeoutKey)) {
-    clearTimeout(aiTimeouts.get(timeoutKey)!);
+    clearTimeout(aiTimeouts.get(timeoutKey)!.handle);
     aiTimeouts.delete(timeoutKey);
   }
 }
@@ -1079,12 +1427,44 @@ function cleanupQuickTable(tableId: string): void {
 // ========== Socket.io Events ==========
 
 io.on('connection', (socket: Socket) => {
+  // Per-IP connection limit
+  const clientIp = socket.handshake.address;
+  if (!ipConnections.has(clientIp)) ipConnections.set(clientIp, new Set());
+  const ipSockets = ipConnections.get(clientIp)!;
+  if (ipSockets.size >= MAX_CONNECTIONS_PER_IP) {
+    socket.emit('error', { message: 'Too many connections from your IP' });
+    socket.disconnect(true);
+    return;
+  }
+  ipSockets.add(socket.id);
+
+  socket.on('disconnect', () => {
+    ipSockets.delete(socket.id);
+    if (ipSockets.size === 0) ipConnections.delete(clientIp);
+    // Clean up seated slot tracking
+    for (const [ip, slots] of ipSeatedSlots) {
+      for (const slot of slots) {
+        if (slot.startsWith(socket.id + ':')) slots.delete(slot);
+      }
+      if (slots.size === 0) ipSeatedSlots.delete(ip);
+    }
+    actionNonces.delete(socket.id);
+    actionTimings.delete(socket.id);
+    tokenLoginAttempts.delete(socket.id);
+    lastEmoteTime.delete(socket.id);
+    lastReactionTime.delete(socket.id);
+    lastChatTime.delete(socket.id);
+  });
+
   console.log(`Player connected: ${socket.id}`);
 
   // ========== Auth Events ==========
 
-  socket.on('login', (data: { username: string; password: string }) => {
-    const result = loginUser(data.username, data.password);
+  socket.on('login', async (data: { phone?: string; username?: string; password: string }) => {
+    const phone = data.phone || data.username || '';
+    console.log(`[Auth] Login attempt: phone="${phone}", hasPassword=${!!data?.password}`);
+    const result = await loginUserAsync(phone, data.password);
+    console.log(`[Auth] Login result: success=${result.success}, error=${result.error || 'none'}`);
     if (result.success && result.userData) {
       authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username });
     }
@@ -1099,6 +1479,22 @@ io.on('connection', (socket: Socket) => {
     socket.emit('registerResult', result);
   });
 
+  // Qualifier status: client checks if the logged-in player is qualified
+  socket.on('getQualifications', async (data: { phone: string }) => {
+    const phone = (data?.phone || '').trim();
+    if (!phone) { socket.emit('qualifications', { weekly: false, monthly: false }); return; }
+    const [weekly, monthly] = await Promise.all([
+      getQualifiedPlayers('weekly'),
+      getQualifiedPlayers('monthly'),
+    ]);
+    const weeklyEntry = weekly.find(p => p.phone === phone);
+    const monthlyEntry = monthly.find(p => p.phone === phone);
+    socket.emit('qualifications', {
+      weekly: weeklyEntry ? { qualified: true, credits: weeklyEntry.creditCount, venue: weeklyEntry.venueName } : false,
+      monthly: monthlyEntry ? { qualified: true, credits: monthlyEntry.creditCount, venue: monthlyEntry.venueName } : false,
+    });
+  });
+
   socket.on('checkUsername', (data: { username: string }) => {
     const name = (data.username || '').trim();
     if (name.length < 2) { socket.emit('checkUsernameResult', { available: null, username: name }); return; }
@@ -1107,12 +1503,37 @@ io.on('connection', (socket: Socket) => {
   });
 
   // ========== LLM Post-Hand Coach ==========
+  // Rate limit: max 1 coach request per 10s per authenticated user
+  const coachLastRequest = new Map<number, number>();
   socket.on('coachHand', async (data: { handHistory: any; playerName: string }) => {
     try {
+      const auth = authSessions.get(socket.id);
+      if (!auth) { socket.emit('coachResult', { error: 'Not authenticated' }); return; }
+
+      // Payload size cap — prevents LLM token DoS
+      const serialized = JSON.stringify(data || {});
+      if (serialized.length > 8 * 1024) { // 8 KB
+        socket.emit('coachResult', { error: 'Hand history too large' });
+        return;
+      }
+
+      // Per-user rate limit
+      const now = Date.now();
+      const last = coachLastRequest.get(auth.userId) || 0;
+      if (now - last < 10_000) {
+        socket.emit('coachResult', { error: 'Please wait a moment before requesting another analysis' });
+        return;
+      }
+      coachLastRequest.set(auth.userId, now);
+
       const apiKey = process.env.ANTHROPIC_API_KEY;
       if (!apiKey) { socket.emit('coachResult', { error: 'Coach unavailable — API key not configured' }); return; }
       const client = new Anthropic({ apiKey });
       const { handHistory, playerName } = data;
+      if (!handHistory || typeof playerName !== 'string') {
+        socket.emit('coachResult', { error: 'Invalid request' });
+        return;
+      }
       const actionLog = (handHistory.players || [])
         .find((p: any) => p.name === playerName)?.actions || [];
       const prompt = `You are an expert poker coach. Analyze this hand and give concise, actionable feedback on each decision.
@@ -1140,28 +1561,50 @@ Give feedback in this JSON format:
   });
 
   // ========== WebRTC Voice Chat Signaling ==========
+  // All voice handlers require authentication and that the caller is actually
+  // seated at the referenced table (prevents impersonation & room flooding).
+  const isSeatedAt = (tableId: string): boolean => {
+    const s = playerSessions.get(socket.id);
+    return !!(s && s.tableId === tableId);
+  };
   socket.on('voiceJoin', (data: { tableId: string; username: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
+    if (!data?.tableId || !isSeatedAt(data.tableId)) { socket.emit('error', { message: 'Not seated at table' }); return; }
     const room = `voice_${data.tableId}`;
     socket.join(room);
-    socket.to(room).emit('voicePeerJoined', { socketId: socket.id, username: data.username });
+    // Use the authenticated username, not the one the client sent.
+    socket.to(room).emit('voicePeerJoined', { socketId: socket.id, username: auth.username });
   });
   socket.on('voiceLeave', (data: { tableId: string }) => {
+    if (!authSessions.get(socket.id)) return;
+    if (!data?.tableId) return;
     socket.leave(`voice_${data.tableId}`);
     socket.to(`voice_${data.tableId}`).emit('voicePeerLeft', { socketId: socket.id });
   });
   socket.on('voiceOffer', (data: { to: string; offer: any; username: string }) => {
-    io.to(data.to).emit('voiceOffer', { from: socket.id, offer: data.offer, username: data.username });
+    const auth = authSessions.get(socket.id);
+    if (!auth || !data?.to) return;
+    io.to(data.to).emit('voiceOffer', { from: socket.id, offer: data.offer, username: auth.username });
   });
   socket.on('voiceAnswer', (data: { to: string; answer: any }) => {
+    if (!authSessions.get(socket.id) || !data?.to) return;
     io.to(data.to).emit('voiceAnswer', { from: socket.id, answer: data.answer });
   });
   socket.on('voiceIce', (data: { to: string; candidate: any }) => {
+    if (!authSessions.get(socket.id) || !data?.to) return;
     io.to(data.to).emit('voiceIce', { from: socket.id, candidate: data.candidate });
   });
 
   // ========== Staking Marketplace ==========
   const stakingOffers: Map<string, any> = (global as any).__stakingOffers || ((global as any).__stakingOffers = new Map());
   socket.on('createStake', (data: { tournamentId: string; totalPct: number; pricePerPct: number; playerName: string }) => {
+    if (!data.tournamentId || typeof data.totalPct !== 'number' || data.totalPct <= 0 || data.totalPct > 100) {
+      socket.emit('error', { message: 'Invalid staking offer' }); return;
+    }
+    if (typeof data.pricePerPct !== 'number' || data.pricePerPct <= 0) {
+      socket.emit('error', { message: 'Invalid price per percent' }); return;
+    }
     const id = uuidv4();
     const offer = { id, ...data, remaining: data.totalPct, backers: [], createdAt: Date.now() };
     stakingOffers.set(id, offer);
@@ -1169,10 +1612,13 @@ Give feedback in this JSON format:
     socket.emit('stakeCreated', { id });
   });
   socket.on('buyStake', (data: { offerId: string; pct: number; buyerName: string }) => {
+    if (!data.offerId || typeof data.pct !== 'number' || data.pct <= 0) {
+      socket.emit('buyStakeResult', { success: false, error: 'Invalid purchase' }); return;
+    }
     const offer = stakingOffers.get(data.offerId);
     if (!offer || offer.remaining < data.pct) { socket.emit('buyStakeResult', { success: false, error: 'Offer unavailable' }); return; }
     offer.remaining -= data.pct;
-    offer.backers.push({ name: data.buyerName, pct: data.pct });
+    offer.backers.push({ name: data.buyerName || 'Anonymous', pct: data.pct });
     if (offer.remaining <= 0) stakingOffers.delete(data.offerId);
     io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
     socket.emit('buyStakeResult', { success: true });
@@ -1182,11 +1628,77 @@ Give feedback in this JSON format:
   });
 
   socket.on('tokenLogin', (data: { token: string }) => {
+    // Rate limit: max 3 attempts per minute per socket
+    const now = Date.now();
+    const tlKey = socket.id;
+    const tlEntry = tokenLoginAttempts.get(tlKey) || { attempts: 0, firstAt: now };
+    if (now - tlEntry.firstAt > 60_000) {
+      tlEntry.attempts = 0;
+      tlEntry.firstAt = now;
+    }
+    tlEntry.attempts++;
+    tokenLoginAttempts.set(tlKey, tlEntry);
+    if (tlEntry.attempts > 3) {
+      socket.emit('tokenLoginResult', { success: false, message: 'Too many login attempts' });
+      return;
+    }
+
     const result = getUserFromToken(data.token);
     if (result.success && result.userData) {
-      authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username });
+      const userId = result.userData.id;
+      authSessions.set(socket.id, { userId, username: result.userData.username });
+
+      // Check for a reserved seat and restore it
+      const reserved = reservedSeats.get(userId);
+      if (reserved && reserved.expiresAt > Date.now()) {
+        const table = tableManager.getTable(reserved.tableId);
+        if (table) {
+          const seat = table.seats[reserved.seatIndex];
+          // Seat still belongs to this player (state occupied, not AI)
+          if (seat && seat.state === 'occupied' && !seat.isAI) {
+            clearTimeout(reserved.cleanupTimer);
+            reservedSeats.delete(userId);
+
+            // Re-associate socket with the session
+            const restoredSession: PlayerSession = {
+              socketId: socket.id,
+              tableId: reserved.tableId,
+              seatIndex: reserved.seatIndex,
+              playerName: reserved.playerName,
+              playerId: `user_${userId}`,
+              trainingEnabled: false,
+              sittingOut: reserved.sittingOut,
+              avatar: reserved.avatar,
+            };
+            playerSessions.set(socket.id, restoredSession);
+            socket.join(`table:${reserved.tableId}`);
+
+            // Remove from sit-out if they were marked out during disconnect
+            // (they'll sit back in since they reconnected)
+            restoredSession.sittingOut = false;
+            const tracker = sitOutTracker.get(reserved.tableId);
+            if (tracker) tracker.delete(reserved.seatIndex);
+
+            socket.emit('reconnectedToTable', {
+              tableId: reserved.tableId,
+              seatIndex: reserved.seatIndex,
+            });
+
+            broadcastGameState(reserved.tableId);
+            console.log(`[Reserve] User ${userId} (${reserved.playerName}) reconnected to seat ${reserved.seatIndex}`);
+          } else {
+            reservedSeats.delete(userId);
+          }
+        } else {
+          reservedSeats.delete(userId);
+        }
+      }
     }
     socket.emit('loginResult', result);
+  });
+
+  socket.on('logout', () => {
+    authSessions.delete(socket.id);
   });
 
   socket.on('loadProgress', (data: { userId: number }) => {
@@ -1195,6 +1707,10 @@ Give feedback in this JSON format:
   });
 
   socket.on('saveProgress', (data: { userId: number; chips?: number; level?: number; xp?: number; stats?: Record<string, any>; achievements?: string[] }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || auth.userId !== data.userId) {
+      socket.emit('error', { message: 'Unauthorized' }); return;
+    }
     const { userId, ...progressData } = data;
     const success = saveProgress(userId, progressData);
     socket.emit('progressSaved', { success });
@@ -1234,7 +1750,7 @@ Give feedback in this JSON format:
   socket.on('getLeaderboard', (data: { period?: string }) => {
     try {
       const period = data?.period || 'alltime';
-      const entries = getLeaderboard(50);
+      const entries = getLeaderboard(50, period);
       socket.emit('leaderboardData', { period, entries });
     } catch {
       socket.emit('leaderboardData', { period: data?.period || 'alltime', entries: [] });
@@ -1252,11 +1768,7 @@ Give feedback in this JSON format:
   });
 
   // ========== Admin Events ==========
-
-  function auditLog(adminUsername: string, action: string, details: Record<string, unknown> = {}) {
-    const entry = `[ADMIN AUDIT] ${new Date().toISOString()} | ${adminUsername} | ${action} | ${JSON.stringify(details)}`;
-    console.log(entry);
-  }
+  // auditLog is declared at module scope
 
   socket.on('getAdminStats', () => {
     const auth = authSessions.get(socket.id);
@@ -1275,11 +1787,31 @@ Give feedback in this JSON format:
       totalUsers: getTotalUsers(),
       activeConnections: io.engine.clientsCount,
       tablesRunning: tableManager.getTableList().length,
-      handsPlayedToday: 0, // could be tracked separately
+      handsPlayedToday,
       uptime: `${hours}h ${mins}m`,
       memoryUsage: `${memMB} MB`,
       users: getAllUsers(),
     });
+  });
+
+  socket.on('adminGrantChips', (data: { userId: number; amount: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !isUserAdmin(auth.userId)) {
+      socket.emit('error', { message: 'Access denied' });
+      return;
+    }
+    const CHIP_GRANT_ALERT_THRESHOLD = 1_000_000;
+    const amount = Math.floor(data.amount);
+    if (amount <= 0 || amount > 100_000_000) {
+      socket.emit('error', { message: 'Invalid chip amount' });
+      return;
+    }
+    auditLog(auth.username, 'GRANT_CHIPS', { targetUserId: data.userId, amount });
+    if (amount >= CHIP_GRANT_ALERT_THRESHOLD) {
+      console.warn(`[AntiCheat] LARGE CHIP GRANT ALERT: admin ${auth.username} granted ${amount} chips to userId=${data.userId}`);
+    }
+    const success = addChipsToUser(data.userId, amount);
+    socket.emit('adminGrantChipsResult', { success, userId: data.userId, amount });
   });
 
   socket.on('banUser', (data: { userId: number }) => {
@@ -1505,8 +2037,21 @@ Give feedback in this JSON format:
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     if (!isClubMember(data.clubId, auth.userId)) { socket.emit('error', { message: 'Not a club member' }); return; }
 
+    // Rate limit: min 800ms between messages per socket (reuses lastChatTime map)
+    const now = Date.now();
+    const last = lastChatTime.get(socket.id) || 0;
+    if (now - last < 800) {
+      socket.emit('error', { message: 'Chat rate limited' });
+      return;
+    }
+    lastChatTime.set(socket.id, now);
+
+    // Validate message length
+    const msgText = typeof data.message === 'string' ? data.message.trim().slice(0, 500) : '';
+    if (!msgText) { socket.emit('error', { message: 'Empty message' }); return; }
+
     const msgType = data.type || 'chat';
-    const result = sendClubMessage(data.clubId, auth.userId, auth.username, data.message, msgType);
+    const result = sendClubMessage(data.clubId, auth.userId, auth.username, msgText, msgType);
     if (result.success && result.message) {
       io.to(`club:${data.clubId}`).emit('clubMessage', result.message);
       if (msgType === 'announcement') {
@@ -1697,6 +2242,29 @@ Give feedback in this JSON format:
   socket.on('createBlindStructure', (data: { clubId: number; name: string; levels: any[] }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
+
+    // Validate blind levels: SB > 0, BB >= 2*SB, ante >= 0, monotonically non-decreasing
+    if (!Array.isArray(data.levels) || data.levels.length === 0 || data.levels.length > 30) {
+      socket.emit('error', { message: 'Invalid blind structure' });
+      return;
+    }
+    let prevBB = 0;
+    for (const lvl of data.levels) {
+      const sb = Number(lvl?.sb);
+      const bb = Number(lvl?.bb);
+      const ante = Number(lvl?.ante || 0);
+      if (!Number.isInteger(sb) || !Number.isInteger(bb) || !Number.isInteger(ante)) {
+        socket.emit('error', { message: 'Blind amounts must be integers' }); return;
+      }
+      if (sb <= 0 || bb < sb * 2 || ante < 0 || ante > sb) {
+        socket.emit('error', { message: 'Invalid blind level (BB must be ≥ 2×SB, ante ≤ SB)' }); return;
+      }
+      if (bb < prevBB) {
+        socket.emit('error', { message: 'Blinds must not decrease between levels' }); return;
+      }
+      prevBB = bb;
+    }
+
     const result = createBlindStructure(data.clubId, auth.userId, data.name, data.levels);
     if (result.success) {
       socket.emit('blindStructureCreated', result);
@@ -1916,6 +2484,47 @@ Give feedback in this JSON format:
         if (profiles) profiles.delete(seatIndex);
       }
 
+      // Check if the authenticated user is banned before seating
+      const authForJoin = authSessions.get(socket.id);
+      if (authForJoin && isUserBanned(authForJoin.userId)) {
+        socket.emit('error', { message: 'Your account has been banned' });
+        return;
+      }
+
+      // Sanitize playerName
+      playerName = playerName.trim().slice(0, 30).replace(/[<>&"']/g, '');
+      if (!playerName) {
+        socket.emit('error', { message: 'Invalid player name' });
+        return;
+      }
+
+      // Block same-IP multi-seating at the same table (collusion prevention)
+      const tableSlotKey = `${tableId}`;
+      if (!ipSeatedSlots.has(clientIp)) ipSeatedSlots.set(clientIp, new Set());
+      const mySlots = ipSeatedSlots.get(clientIp)!;
+      for (const slot of mySlots) {
+        if (slot.endsWith(`:${tableSlotKey}`)) {
+          socket.emit('error', { message: 'Another connection from your network is already seated at this table' });
+          return;
+        }
+      }
+
+      // Validate buy-in against DB balance for authenticated users
+      if (authForJoin) {
+        const dbChips = getUserChips(authForJoin.userId);
+        if (buyIn > dbChips) {
+          socket.emit('error', { message: 'Insufficient chips' });
+          return;
+        }
+        if (!deductChips(authForJoin.userId, buyIn)) {
+          socket.emit('error', { message: 'Could not deduct chips — try again' });
+          return;
+        }
+        auditLog(authForJoin.username, 'BUY_IN_DEDUCT', { tableId, buyIn });
+      }
+
+      mySlots.add(`${socket.id}:${tableSlotKey}`);
+
       const playerId = `player-${uuidv4()}`;
       const success = table.sitDown(
         seatIndex,
@@ -1938,7 +2547,8 @@ Give feedback in this JSON format:
         playerName,
         playerId,
         trainingEnabled: false,
-      sittingOut: false,
+        sittingOut: false,
+        avatar: data.avatar || undefined,
       };
       playerSessions.set(socket.id, session);
 
@@ -1985,8 +2595,16 @@ Give feedback in this JSON format:
 
       const tables = tableManager.getTableList();
 
-      // Find best table (least players, lowest blinds first)
+      // Quick Play prefers Texas Hold'em tables. Sort: holdem first,
+      // then by player count, then by smallest blinds.
+      const isHoldem = (t: any) => {
+        const tbl = tableManager.getTable(t.tableId);
+        const id = (tbl as any)?.variantId || '';
+        return !id || id === 'texas-holdem';
+      };
       const sorted = [...tables].sort((a, b) => {
+        const ah = isHoldem(a), bh = isHoldem(b);
+        if (ah !== bh) return ah ? -1 : 1;
         if (a.playerCount !== b.playerCount)
           return a.playerCount - b.playerCount;
         return a.smallBlind - b.smallBlind;
@@ -2051,7 +2669,8 @@ Give feedback in this JSON format:
         playerName,
         playerId,
         trainingEnabled: false,
-      sittingOut: false,
+        sittingOut: false,
+        avatar: data.avatar || undefined,
       };
       playerSessions.set(socket.id, session);
       socket.join(`table:${bestTable.tableId}`);
@@ -2134,6 +2753,7 @@ Give feedback in this JSON format:
     (data: {
       type: 'fold' | 'check' | 'call' | 'raise' | 'allIn';
       amount?: number;
+      nonce?: string;
     }) => {
       const session = playerSessions.get(socket.id);
       if (!session) {
@@ -2147,9 +2767,42 @@ Give feedback in this JSON format:
         return;
       }
 
+      // Nonce replay prevention (keyed per table:seat so multi-table players
+      // can't replay a nonce from one table at another)
+      if (data.nonce) {
+        const nonceKey = `${session.tableId}:${session.seatIndex}`;
+        const lastNonce = actionNonces.get(nonceKey);
+        if (lastNonce === data.nonce) {
+          socket.emit('error', { message: 'Duplicate action' });
+          return;
+        }
+        actionNonces.set(nonceKey, data.nonce);
+      }
+
+      // Bot detection: track action timings
+      const nowMs = Date.now();
+      if (!actionTimings.has(socket.id)) actionTimings.set(socket.id, []);
+      const timings = actionTimings.get(socket.id)!;
+      timings.push(nowMs);
+      if (timings.length > 20) timings.shift();
+      if (timings.length >= 10) {
+        const intervals = timings.slice(1).map((t, i) => t - timings[i]);
+        const underThreshold = intervals.filter((ms) => ms < 200).length;
+        if (underThreshold >= intervals.length * 0.8) {
+          console.warn(`[AntiCheat] Possible bot detected: socket ${socket.id} — ${underThreshold}/${intervals.length} actions under 200ms`);
+        }
+      }
+
       // Validate it's this player's turn
       if (table.activeSeatIndex !== session.seatIndex) {
         socket.emit('error', { message: 'Not your turn' });
+        return;
+      }
+
+      // All-In-Or-Fold: only fold or allIn allowed.
+      // Reject check/call/raise outright — even "raise equal to stack" must use allIn.
+      if (allInOrFoldTables.has(session.tableId) && data.type !== 'fold' && data.type !== 'allIn') {
+        socket.emit('error', { message: 'Only fold or all-in allowed at this table' });
         return;
       }
 
@@ -2164,14 +2817,28 @@ Give feedback in this JSON format:
         case 'call':
           success = table.playerCall(session.seatIndex);
           break;
-        case 'raise':
-          if (data.amount !== undefined) {
-            success = table.playerRaise(session.seatIndex, data.amount);
+        case 'raise': {
+          // Strict integer validation to prevent NaN/Infinity/negative/float exploits
+          const amt = data.amount;
+          if (
+            typeof amt !== 'number' ||
+            !Number.isFinite(amt) ||
+            !Number.isInteger(amt) ||
+            amt <= 0 ||
+            amt > 1_000_000_000
+          ) {
+            socket.emit('error', { message: 'Invalid raise amount' });
+            return;
           }
+          success = table.playerRaise(session.seatIndex, amt);
           break;
+        }
         case 'allIn':
           success = table.playerAllIn(session.seatIndex);
           break;
+        default:
+          socket.emit('error', { message: 'Unknown action type' });
+          return;
       }
 
       if (!success) {
@@ -2188,9 +2855,14 @@ Give feedback in this JSON format:
 
       // Check if hand is complete
       if (table.currentPhase === GamePhase.HandComplete) {
-        setTimeout(() => {
-          autoStartNextHand(session.tableId);
+        const existing = pendingAutoStartTimers.get(session.tableId);
+        if (existing) clearTimeout(existing);
+        const tid = session.tableId;
+        const t = setTimeout(() => {
+          pendingAutoStartTimers.delete(tid);
+          autoStartNextHand(tid);
         }, 3000);
+        pendingAutoStartTimers.set(tid, t);
       } else {
         // Schedule AI action if needed
         scheduleAIAction(session.tableId);
@@ -2233,6 +2905,12 @@ Give feedback in this JSON format:
     const session = playerSessions.get(socket.id);
     if (!session) return;
     if (!data.message || data.message.length > 200) return;
+
+    // Rate limit: 1 message per 1.5 seconds
+    const now = Date.now();
+    const lastChat = lastChatTime.get(socket.id) || 0;
+    if (now - lastChat < 1500) return;
+    lastChatTime.set(socket.id, now);
 
     // Track chat for progression
     progressionManager.recordAction(session.playerId, 'chat');
@@ -2323,10 +3001,43 @@ Give feedback in this JSON format:
     }
   });
 
+  // ========== AFK Handler ==========
+  socket.on('playerAFK', () => {
+    const session = playerSessions.get(socket.id);
+    if (!session) return;
+
+    session.sittingOut = true;
+    if (!sitOutTracker.has(session.tableId)) sitOutTracker.set(session.tableId, new Set());
+    sitOutTracker.get(session.tableId)!.add(session.seatIndex);
+
+    socket.emit('sitOutToggled', { sittingOut: true, reason: 'afk' });
+
+    // Auto-fold if it's currently their turn
+    const table = tableManager.getTable(session.tableId);
+    if (table && table.activeSeatIndex === session.seatIndex) {
+      table.playerFold(session.seatIndex);
+      broadcastGameState(session.tableId);
+    }
+  });
+
+  socket.on('playerBack', () => {
+    const session = playerSessions.get(socket.id);
+    if (!session) return;
+
+    session.sittingOut = false;
+    const tracker = sitOutTracker.get(session.tableId);
+    if (tracker) tracker.delete(session.seatIndex);
+
+    socket.emit('sitOutToggled', { sittingOut: false, reason: 'back' });
+  });
+
   // ========== Fast Mode (#12) ==========
   socket.on('setFastMode', (data: { enabled: boolean }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
+    // Only authenticated (registered) players can change fast mode
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Must be logged in to change fast mode' }); return; }
     fastModeTables.set(session.tableId, data.enabled);
     socket.emit('fastModeSet', { enabled: data.enabled });
   });
@@ -2400,7 +3111,9 @@ Give feedback in this JSON format:
   socket.on('triggerBombPot', (data: { tableId?: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
+    // Only players seated at the table may trigger a bomb pot
     const tableId = data?.tableId || session.tableId;
+    if (session.tableId !== tableId) return;
 
     // Verify the player is at this table (owner/manager check could be added)
     bombPotPending.set(tableId, true);
@@ -2414,6 +3127,8 @@ Give feedback in this JSON format:
     const session = playerSessions.get(socket.id);
     if (!session) return;
     const tableId = data?.tableId || session.tableId;
+    // Only players at this table may toggle dealer's choice
+    if (session.tableId !== tableId) return;
     const table = tableManager.getTable(tableId);
     if (!table) return;
 
@@ -2852,25 +3567,16 @@ Give feedback in this JSON format:
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
+    // Rate limit: 1 reaction per 2 seconds
+    const now = Date.now();
+    const lastTime = lastReactionTime.get(socket.id) || 0;
+    if (now - lastTime < 2000) return;
+    lastReactionTime.set(socket.id, now);
+
     io.to(`table:${session.tableId}`).emit('tableReaction', {
       seatIndex: session.seatIndex,
       reactionId: data.reactionId,
       playerName: session.playerName,
-    });
-  });
-
-  // ========== Mucked Hand Reveal ==========
-
-  socket.on('showMuckedHand', (data: { cards: any[] }) => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
-    if (!data.cards || !Array.isArray(data.cards) || data.cards.length === 0) return;
-
-    // Broadcast to all players at the table
-    io.to(`table:${session.tableId}`).emit('muckedHandRevealed', {
-      seatIndex: session.seatIndex,
-      playerName: session.playerName,
-      cards: data.cards,
     });
   });
 
@@ -2921,17 +3627,38 @@ Give feedback in this JSON format:
 
   // ========== Theme Shop ==========
 
-  socket.on('purchaseTheme', (data: { themeId: string; cost: number }) => {
+  socket.on('purchaseTheme', (data: { themeId: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
-    const result = progressionManager.purchaseTheme(session.playerId, data.themeId, data.cost);
+    // Cost is looked up server-side — never trust cost from the client
+    const THEME_COSTS: Record<string, number> = {
+      gold: 500, neon: 300, classic: 200, dark: 250, ocean: 350, royal: 600,
+    };
+    const cost = THEME_COSTS[data.themeId] ?? 400;
+
+    const result = progressionManager.purchaseTheme(session.playerId, data.themeId, cost);
     if (result.success) {
       socket.emit('themePurchased', { themeId: data.themeId });
     } else {
       socket.emit('error', { message: result.error || 'Purchase failed' });
     }
     sendProgressToPlayer(socket.id);
+  });
+
+  socket.on('purchaseBattlePass', (_data: unknown, callback?: (ack: { success: boolean; error?: string }) => void) => {
+    const auth = authSessions.get(socket.id);
+    const session = playerSessions.get(socket.id);
+    const respond = (ack: { success: boolean; error?: string }) => { if (typeof callback === 'function') callback(ack); };
+    if (!auth) { respond({ success: false, error: 'Not authenticated' }); return; }
+    const playerId = session?.playerId;
+    if (!playerId) { respond({ success: false, error: 'Not in a session' }); return; }
+    const BATTLE_PASS_COST = 950;
+    const result = progressionManager.purchaseTheme(playerId, '__battlepass_premium__', BATTLE_PASS_COST);
+    if (!result.success) { respond({ success: false, error: result.error }); return; }
+    mergeUserStats(auth.userId, { battlePassPremium: true });
+    sendProgressToPlayer(socket.id);
+    respond({ success: true });
   });
 
   socket.on('equipTheme', (data: { themeId: string }) => {
@@ -2984,10 +3711,49 @@ Give feedback in this JSON format:
     io.emit('tournamentList', tournamentManager.getTournamentList());
   });
 
+  // Start a simulated multi-table tournament
+  socket.on('startSimulatedTournament', (data: { playerCount?: number; turbo?: boolean }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Must be logged in' }); return; }
+
+    const session = playerSessions.get(socket.id);
+    const playerCount = data?.playerCount || 200;
+    const turbo = data?.turbo || false;
+
+    const result = startMultiTableTournament(
+      playerCount,
+      socket.id,
+      session?.playerId || auth.username,
+      session?.playerName || auth.username,
+      turbo,
+    );
+
+    if (result) {
+      socket.emit('simulatedTournamentStarted', {
+        tournamentId: result.tournamentId,
+        tableCount: result.tableCount,
+        playerCount,
+        turbo,
+      });
+    } else {
+      socket.emit('error', { message: 'Failed to start tournament simulation' });
+    }
+  });
+
+  // Toggle tournament speed
+  socket.on('setTournamentSpeed', (data: { tournamentId: string; turbo: boolean }) => {
+    const tournament = tournamentManager.getTournament(data.tournamentId);
+    if (!tournament) return;
+    tournament.turboMode = data.turbo;
+    for (const tid of tournament.tableIds) {
+      fastModeTables.set(tid, data.turbo);
+    }
+  });
+
   // ========== Multi-Table Support ==========
 
   socket.on('joinAdditionalTable', (data: { tableId: string; playerName: string; buyIn: number; avatar?: string }) => {
-    const { tableId, playerName, buyIn } = data;
+    const { tableId, playerName, buyIn, avatar } = data;
     const table = tableManager.getTable(tableId);
     if (!table) {
       socket.emit('error', { message: 'Table not found' });
@@ -3030,6 +3796,7 @@ Give feedback in this JSON format:
       playerId,
       trainingEnabled: false,
       sittingOut: false,
+      avatar: avatar || undefined,
     };
 
     if (!multiTableSessions.has(socket.id)) {
@@ -3132,7 +3899,7 @@ Give feedback in this JSON format:
 
     const session: PlayerSession = {
       socketId: socket.id, tableId, seatIndex: openSeat, playerName, playerId,
-      trainingEnabled: false, sittingOut: false,
+      trainingEnabled: false, sittingOut: false, avatar: avatar || undefined,
     };
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
@@ -3153,12 +3920,16 @@ Give feedback in this JSON format:
 
   // ── Coach whisper (relay from coach to student) ───────────────────────
   socket.on('coachWhisper', (data: { targetSocketId: string; message: string; coachName?: string }) => {
-    if (data.targetSocketId && data.message) {
-      io.to(data.targetSocketId).emit('coachWhisper', {
-        message: data.message,
-        coachName: data.coachName || 'Coach',
-      });
-    }
+    // Must be authenticated to send whispers
+    const auth = authSessions.get(socket.id);
+    if (!auth) return;
+    if (!data.targetSocketId || !data.message) return;
+    // Prevent whisper to self
+    if (data.targetSocketId === socket.id) return;
+    io.to(data.targetSocketId).emit('coachWhisper', {
+      message: data.message,
+      coachName: data.coachName || auth.username,
+    });
   });
 
   // ── Session recap — generate LLM recap at session end ─────────────────
@@ -3206,31 +3977,110 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
   const predictionBets = new Map<string, { socketId: string; outcome: string; amount: number }[]>();
 
   socket.on('marketBet', (data: { marketId: string; handId: string; outcome: string; amount: number }) => {
+    if (!data.marketId || !data.handId || !data.outcome || typeof data.amount !== 'number' || data.amount <= 0) return;
     const key = `${data.marketId}:${data.handId}`;
     const existing = predictionBets.get(key) || [];
     existing.push({ socketId: socket.id, outcome: data.outcome, amount: data.amount });
     predictionBets.set(key, existing);
   });
 
+  socket.on('marketResolve', (data: { marketId: string; handId: string; winningOutcome: string }) => {
+    if (!data.marketId || !data.handId || !data.winningOutcome) return;
+    const key = `${data.marketId}:${data.handId}`;
+    const bets = predictionBets.get(key);
+    if (!bets || bets.length === 0) return;
+
+    const totalPool = bets.reduce((sum, b) => sum + b.amount, 0);
+    const winners = bets.filter((b) => b.outcome === data.winningOutcome);
+    const totalWinnerStake = winners.reduce((sum, b) => sum + b.amount, 0);
+
+    if (winners.length === 0) {
+      // No winners — refund all bettors
+      for (const bet of bets) {
+        const s = io.sockets.sockets.get(bet.socketId);
+        if (s) s.emit('marketResult', { marketId: data.marketId, handId: data.handId, refund: bet.amount, payout: 0 });
+      }
+    } else {
+      // Pay winners proportionally from total pool
+      for (const bet of winners) {
+        const payout = Math.floor((bet.amount / totalWinnerStake) * totalPool);
+        const s = io.sockets.sockets.get(bet.socketId);
+        if (s) s.emit('marketResult', { marketId: data.marketId, handId: data.handId, payout, refund: 0 });
+      }
+      // Losers get nothing (their bets funded the pool)
+      const loserSocketIds = new Set(bets.filter((b) => b.outcome !== data.winningOutcome).map((b) => b.socketId));
+      for (const sid of loserSocketIds) {
+        const s = io.sockets.sockets.get(sid);
+        if (s) s.emit('marketResult', { marketId: data.marketId, handId: data.handId, payout: 0, refund: 0 });
+      }
+    }
+
+    predictionBets.delete(key);
+  });
+
   socket.on('disconnect', () => {
     console.log(`Player disconnected: ${socket.id}`);
 
-    // Auto-save progress on disconnect
     const authSession = authSessions.get(socket.id);
-    if (authSession) {
-      const session = playerSessions.get(socket.id);
-      if (session) {
-        const table = tableManager.getTable(session.tableId);
-        if (table) {
-          const seat = table.seats[session.seatIndex];
-          if (seat && seat.state === 'occupied') {
-            saveProgress(authSession.userId, { chips: seat.chipCount });
+    const session = playerSessions.get(socket.id);
+
+    // Auto-save progress on disconnect
+    if (authSession && session) {
+      const table = tableManager.getTable(session.tableId);
+      if (table) {
+        const seat = table.seats[session.seatIndex];
+        if (seat && seat.state === 'occupied') {
+          saveProgress(authSession.userId, { chips: seat.chipCount });
+
+          // Reserve the seat for 10 minutes so the player can reconnect
+          // Cancel any existing reservation for this user first
+          const existing = reservedSeats.get(authSession.userId);
+          if (existing) clearTimeout(existing.cleanupTimer);
+
+          const cleanupTimer = setTimeout(() => {
+            const reserved = reservedSeats.get(authSession.userId);
+            if (reserved) {
+              const t = tableManager.getTable(reserved.tableId);
+              if (t) t.standUp(reserved.seatIndex);
+              reservedSeats.delete(authSession.userId);
+              console.log(`[Reserve] Seat reservation expired for user ${authSession.userId}`);
+            }
+          }, SEAT_RESERVE_MS);
+
+          reservedSeats.set(authSession.userId, {
+            tableId: session.tableId,
+            seatIndex: session.seatIndex,
+            playerName: session.playerName,
+            chips: seat.chipCount,
+            avatar: session.avatar,
+            sittingOut: session.sittingOut,
+            expiresAt: Date.now() + SEAT_RESERVE_MS,
+            cleanupTimer,
+          });
+
+          // Mark player as sitting out while disconnected (auto-folds their turn)
+          session.sittingOut = true;
+          if (!sitOutTracker.has(session.tableId)) sitOutTracker.set(session.tableId, new Set());
+          sitOutTracker.get(session.tableId)!.add(session.seatIndex);
+
+          // Auto-fold if it's their turn right now
+          if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
+            table.playerFold(session.seatIndex);
+            broadcastGameState(session.tableId);
           }
+
+          console.log(`[Reserve] Seat ${session.seatIndex} on table ${session.tableId} reserved for user ${authSession.userId} (${session.playerName})`);
+
+          // Don't call handlePlayerLeave — seat stays reserved
+          playerSessions.delete(socket.id);
+          authSessions.delete(socket.id);
+          lastSentState.delete(socket.id);
+          return;
         }
       }
-      authSessions.delete(socket.id);
     }
 
+    if (authSession) authSessions.delete(socket.id);
     handlePlayerLeave(socket);
     // Clear delta tracking so a reconnect gets a fresh full state
     lastSentState.delete(socket.id);
@@ -3270,8 +4120,14 @@ function handlePlayerLeave(socket: Socket): void {
       // Clear any AI timeouts
       const timeoutKey = session.tableId;
       if (aiTimeouts.has(timeoutKey)) {
-        clearTimeout(aiTimeouts.get(timeoutKey)!);
+        clearTimeout(aiTimeouts.get(timeoutKey)!.handle);
         aiTimeouts.delete(timeoutKey);
+      }
+      // Cancel any pending auto-start hand timer — table is empty
+      const pendingStart = pendingAutoStartTimers.get(session.tableId);
+      if (pendingStart) {
+        clearTimeout(pendingStart);
+        pendingAutoStartTimers.delete(session.tableId);
       }
     } else {
       broadcastGameState(session.tableId);
@@ -3307,8 +4163,10 @@ function handlePlayerLeave(socket: Socket): void {
     }
   }
 
-  // Clean up emote rate limit
+  // Clean up rate limits
   lastEmoteTime.delete(socket.id);
+  lastReactionTime.delete(socket.id);
+  lastChatTime.delete(socket.id);
 }
 
 // ========== Tournament Helpers ==========
@@ -3398,6 +4256,343 @@ setInterval(() => {
     startTournamentGame(id);
   }
 }, 10000);
+
+// ========== Multi-Table Tournament Simulation ==========
+
+const AI_NAMES_POOL = [
+  'Ace','Bear','Cobra','Duke','Eagle','Fox','Ghost','Hawk','Iron','Jester',
+  'King','Lion','Maverick','Neon','Omega','Phoenix','Quest','Raven','Shadow','Tiger',
+  'Ultra','Viper','Wolf','Xray','Yeti','Zeus','Blaze','Cliff','Drake','Echo',
+  'Flint','Granite','Haze','Ivory','Jade','Knox','Lance','Mars','Nash','Onyx',
+  'Pike','Quinn','Rex','Slate','Thor','Umbra','Volt','Wren','Axle','Bolt',
+  'Cruz','Dash','Edge','Frost','Grit','Hex','Ink','Jet','Kite','Lux',
+  'Mist','Nox','Opal','Pulse','Quill','Reef','Sage','Tusk','Ursa','Vale',
+  'Wisp','Zap','Ash','Birch','Clay','Dune','Elm','Fern','Glen','Heath',
+  'Isle','Juno','Kelp','Lark','Moss','Nile','Oak','Pine','Rain','Star',
+  'Tide','Una','Vine','Wave','Yew','Zen','Aria','Bliss','Cove','Dawn',
+  'Eve','Faith','Grace','Hope','Iris','Joy','Kit','Luna','Mia','Neve',
+  'Ora','Pearl','Rue','Sky','Tara','Uma','Vera','Willow','Xena','Yara',
+  'Zara','Abel','Beau','Colt','Dean','Ezra','Finn','Grey','Hugo','Ivan',
+  'Jake','Kane','Leo','Max','Nico','Owen','Paul','Ray','Sam','Troy',
+  'Vic','Wade','Zeke','Adam','Brad','Cole','Drew','Eli','Fred','Gene',
+  'Hank','Ike','Joel','Kirk','Luke','Mark','Ned','Otto','Pete','Rick',
+  'Seth','Todd','Vern','Will','York','Zach','Barb','Cara','Dina','Ella',
+  'Faye','Gina','Hana','Ida','Jane','Kate','Lena','Mona','Nina','Opal',
+  'Rosa','Sara','Tina','Wanda','Yoko','Zoe','Bret','Chip','Doug','Earl',
+  'Glen','Hans','Juan','Kurt','Lars','Milo','Nate','Phil','Russ','Stan',
+];
+
+/**
+ * Start a multi-table tournament simulation.
+ * Creates `playerCount` AI bots + optionally 1 human player.
+ */
+function startMultiTableTournament(
+  playerCount: number = 200,
+  humanSocketId?: string,
+  humanPlayerId?: string,
+  humanPlayerName?: string,
+  turbo: boolean = false,
+): { tournamentId: string; tableIds: string[]; tableCount: number } | null {
+  const startingChips = 5000;
+  const seatsPerTable = 9;
+  const tableCount = Math.ceil(playerCount / seatsPerTable);
+
+  // Create tournament
+  const tournamentId = tournamentManager.createTournament({
+    name: `${playerCount}-Player Championship`,
+    buyIn: 0,
+    prizePool: playerCount * 100,
+    maxPlayers: playerCount,
+    startInterval: 0,
+    blindLevels: DEFAULT_BLIND_LEVELS,
+  });
+
+  const tournament = tournamentManager.getTournament(tournamentId);
+  if (!tournament) return null;
+
+  // Register all players
+  const allPlayers: { id: string; name: string; socketId: string; isHuman: boolean }[] = [];
+
+  // Add human player first if provided
+  if (humanSocketId && humanPlayerId && humanPlayerName) {
+    allPlayers.push({ id: humanPlayerId, name: humanPlayerName, socketId: humanSocketId, isHuman: true });
+  }
+
+  // Add AI players
+  const usedNames = new Set(allPlayers.map(p => p.name));
+  const shuffledNames = [...AI_NAMES_POOL].sort(() => Math.random() - 0.5);
+  let nameIdx = 0;
+  while (allPlayers.length < playerCount) {
+    let name = shuffledNames[nameIdx % shuffledNames.length];
+    if (usedNames.has(name)) name = `${name}${Math.floor(Math.random() * 99)}`;
+    if (usedNames.has(name)) { nameIdx++; continue; }
+    usedNames.add(name);
+    const playerId = `ai-${uuidv4().slice(0, 8)}`;
+    allPlayers.push({ id: playerId, name, socketId: `ai-sock-${playerId}`, isHuman: false });
+    nameIdx++;
+  }
+
+  // Register all with tournament manager
+  for (const p of allPlayers) {
+    tournamentManager.registerPlayer(tournamentId, p.id, p.name, p.socketId);
+  }
+
+  // Start the tournament
+  const startResult = tournamentManager.startTournament(tournamentId);
+  if (!startResult) return null;
+
+  // Override starting chips
+  for (const tp of tournament.players) {
+    tp.chips = startingChips;
+  }
+
+  tournament.turboMode = turbo;
+
+  // Create tables
+  const tableIds: string[] = [];
+  const blinds = startResult.blinds;
+
+  for (let t = 0; t < tableCount; t++) {
+    const tid = tableManager.createQuickTable(
+      `Tournament Table ${t + 1}`,
+      seatsPerTable,
+      blinds.sb,
+      blinds.bb,
+      startingChips,
+    );
+    tableIds.push(tid);
+    tournamentTables.set(tid, tournamentId);
+    if (turbo) fastModeTables.set(tid, true);
+  }
+
+  tournamentManager.setTableIds(tournamentId, tableIds);
+
+  // Distribute players round-robin across tables
+  for (let i = 0; i < allPlayers.length; i++) {
+    const p = allPlayers[i];
+    const tableIdx = i % tableCount;
+    const tid = tableIds[tableIdx];
+    const seatIdx = Math.floor(i / tableCount);
+    const table = tableManager.getTable(tid);
+    if (!table || seatIdx >= seatsPerTable) continue;
+
+    const isAI = !p.isHuman;
+    table.sitDown(seatIdx, p.name, startingChips, p.id, isAI);
+    tournamentManager.setPlayerTable(tournamentId, p.id, tid);
+
+    if (p.isHuman && humanSocketId) {
+      const session: PlayerSession = {
+        socketId: humanSocketId,
+        tableId: tid,
+        seatIndex: seatIdx,
+        playerName: p.name,
+        playerId: p.id,
+        trainingEnabled: false,
+        sittingOut: false,
+      };
+      playerSessions.set(humanSocketId, session);
+      const sock = io.sockets.sockets.get(humanSocketId);
+      if (sock) {
+        sock.join(`table:${tid}`);
+        sock.emit('tournamentStarted', {
+          tournamentId,
+          tableId: tid,
+          name: tournament.config.name,
+          startingChips,
+          blinds: { sb: blinds.sb, bb: blinds.bb, ante: blinds.ante },
+          totalPlayers: playerCount,
+          tableCount,
+        });
+      }
+    }
+
+    // Set up AI profiles for bots
+    if (isAI) {
+      if (!aiProfiles.has(tid)) aiProfiles.set(tid, new Map());
+      const profile = generateRandomProfile('hard');
+      profile.botName = p.name;
+      aiProfiles.get(tid)!.set(seatIdx, profile);
+    }
+  }
+
+  // Set up each table: listeners, start hands
+  for (const tid of tableIds) {
+    const table = tableManager.getTable(tid);
+    if (!table) continue;
+    ensureTableProgressListener(table, tid);
+    table.startNewHand();
+    broadcastGameState(tid);
+    scheduleAIAction(tid);
+  }
+
+  // Listen for blind level changes → apply to ALL tables
+  tournamentManager.onEvent(tournamentId, (event, data) => {
+    if (event === 'blindLevelUp') {
+      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
+        const t = tableManager.getTable(tid);
+        if (t) {
+          t.config.smallBlind = data.sb;
+          t.config.bigBlind = data.bb;
+          t.config.ante = data.ante;
+        }
+        io.to(`table:${tid}`).emit('blindLevelUp', data);
+      }
+    }
+    if (event === 'playerEliminated') {
+      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
+        io.to(`table:${tid}`).emit('playerEliminated', data);
+      }
+      // Check table rebalancing after elimination
+      handleTableRebalance(tournamentId);
+    }
+    if (event === 'tournamentFinished') {
+      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
+        io.to(`table:${tid}`).emit('tournamentFinished', data);
+      }
+    }
+  });
+
+  console.log(`[Tournament] Started ${playerCount}-player tournament ${tournamentId} across ${tableCount} tables`);
+  return { tournamentId, tableIds, tableCount };
+}
+
+/**
+ * Handle table rebalancing after a player is eliminated.
+ * Breaks the smallest table when alive players fit in fewer tables.
+ */
+function handleTableRebalance(tournamentId: string): void {
+  const rebalance = tournamentManager.checkRebalance(tournamentId);
+  if (!rebalance) return;
+
+  const tournament = tournamentManager.getTournament(tournamentId);
+  if (!tournament) return;
+
+  const { breakTableId, playersToMove } = rebalance;
+  const breakTable = tableManager.getTable(breakTableId);
+
+  console.log(`[Tournament] Breaking table ${breakTableId} — moving ${playersToMove.length} players`);
+
+  // Emit table breaking event
+  io.to(`table:${breakTableId}`).emit('tableBroken', { tableId: breakTableId, reason: 'Table combining' });
+
+  // Find seats on remaining tables
+  const remainingTables = tournament.tableIds.filter(tid => tid !== breakTableId);
+
+  for (const player of playersToMove) {
+    // Find a table with an empty seat
+    let placed = false;
+
+    // Get player's current chips from the breaking table
+    const breakSeat = breakTable?.seats.find(s => s.playerId === player.playerId);
+    const chips = breakSeat?.chipCount || tournament.players.find(p => p.playerId === player.playerId)?.chips || 5000;
+    const isAI = breakSeat?.isAI ?? true;
+
+    for (const targetTid of remainingTables) {
+      if (placed) break;
+      const targetTable = tableManager.getTable(targetTid);
+      if (!targetTable) continue;
+
+      // Find ALL empty seats on this table, try each one
+      for (let seatIdx = 0; seatIdx < 9; seatIdx++) {
+        if (targetTable.seats[seatIdx].state !== 'empty') continue;
+
+        // Sit down at new table — sitDown returns false if seat is taken
+        const seated = targetTable.sitDown(seatIdx, player.playerName, chips, player.playerId, isAI);
+        if (!seated) continue;
+
+        tournamentManager.setPlayerTable(tournamentId, player.playerId, targetTid);
+        const emptySeat = seatIdx;
+
+        // Move AI profile if it's a bot
+        if (isAI && breakSeat) {
+          const oldSeatIdx = breakTable?.seats.findIndex(s => s.playerId === player.playerId) ?? -1;
+          const oldProfile = aiProfiles.get(breakTableId)?.get(oldSeatIdx);
+          if (oldProfile) {
+            if (!aiProfiles.has(targetTid)) aiProfiles.set(targetTid, new Map());
+            aiProfiles.get(targetTid)!.set(emptySeat, oldProfile);
+          }
+        } else {
+          // Human player — update their session
+          const tp = tournament.players.find(p => p.playerId === player.playerId);
+          if (tp) {
+            const session = playerSessions.get(tp.socketId);
+            if (session) {
+              session.tableId = targetTid;
+              session.seatIndex = emptySeat;
+            }
+            const sock = io.sockets.sockets.get(tp.socketId);
+            if (sock) {
+              sock.leave(`table:${breakTableId}`);
+              sock.join(`table:${targetTid}`);
+              sock.emit('playerMoved', {
+                fromTable: breakTableId,
+                toTable: targetTid,
+                toSeat: emptySeat,
+                tableId: targetTid,
+              });
+            }
+          }
+        }
+
+        placed = true;
+        console.log(`[Tournament] Moved ${player.playerName} to table ${targetTid} seat ${emptySeat}`);
+        break; // break out of seat loop
+      }
+    }
+
+    if (!placed) {
+      console.error(`[Tournament] Could not place ${player.playerName} — no empty seats!`);
+    }
+  }
+
+  // Remove the broken table
+  tournamentManager.removeTable(tournamentId, breakTableId);
+  tournamentTables.delete(breakTableId);
+  aiProfiles.delete(breakTableId);
+  // Don't remove the table from tableManager yet — let current hand finish
+  // Mark it for cleanup
+  setTimeout(() => {
+    tableManager.removeTable(breakTableId);
+  }, 5000);
+
+  // Broadcast updated state to remaining tables
+  for (const tid of remainingTables) {
+    broadcastGameState(tid);
+    scheduleAIAction(tid);
+  }
+
+  const alive = tournamentManager.getAliveCount(tournamentId);
+  const tables = tournamentManager.getActiveTableCount(tournamentId);
+  console.log(`[Tournament] After rebalance: ${alive} players, ${tables} tables`);
+
+  // Broadcast tournament status update
+  const status = tournamentManager.getTournamentStatus(tournamentId);
+  if (status) {
+    for (const tid of tournament.tableIds) {
+      io.to(`table:${tid}`).emit('tournamentUpdate', status);
+    }
+  }
+}
+
+// REST endpoint to start a simulated tournament
+app.post('/api/tournament/simulate', (req, res) => {
+  const playerCount = req.body?.playerCount || 200;
+  const turbo = req.body?.turbo || false;
+
+  const result = startMultiTableTournament(playerCount, undefined, undefined, undefined, turbo);
+  if (!result) {
+    res.status(500).json({ error: 'Failed to start tournament' });
+    return;
+  }
+
+  res.json({
+    success: true,
+    tournamentId: result.tournamentId,
+    tableCount: result.tableCount,
+    playerCount,
+    turbo,
+  });
+});
 
 // ========== Initialize Auth Database ==========
 initDB();

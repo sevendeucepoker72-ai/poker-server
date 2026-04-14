@@ -745,12 +745,42 @@ function evaluate27FiveCards(cards: Card[]): HandResult {
   const highestFirst = [...values].sort((a, b) => b - a);
   const sorted = [...cards].sort((a, b) => a.rank - b.rank);
 
+  // 2-7 lowball naming: hands are described by the high card ("8-low") with
+  // the next-highest as a tiebreaker for unpaired hands ("8-7-low" etc.).
+  // Made hands (pair, straight, flush, etc.) keep a descriptive label.
+  const rankName = (v: number): string =>
+    ({ 2: 'Two', 3: 'Three', 4: 'Four', 5: 'Five', 6: 'Six', 7: 'Seven',
+       8: 'Eight', 9: 'Nine', 10: 'Ten', 11: 'Jack', 12: 'Queen', 13: 'King', 14: 'Ace'
+     } as Record<number, string>)[v] || String(v);
+
+  let handName: string;
+  if (badnessRank === 0) {
+    // Unpaired — show "X-low" (e.g. "Eight-low")
+    handName = `${rankName(highestFirst[0])}-low`;
+  } else if (hasQuads) {
+    handName = `Four of a Kind (bad)`;
+  } else if (hasTrips && hasPair) {
+    handName = `Full House (bad)`;
+  } else if (flushCheck && straightCheck) {
+    handName = `Straight Flush (bad)`;
+  } else if (hasTrips) {
+    handName = `Three of a Kind (bad)`;
+  } else if (flushCheck) {
+    handName = `Flush (bad)`;
+  } else if (straightCheck) {
+    handName = `Straight (bad)`;
+  } else if (pairCount >= 2) {
+    handName = `Two Pair (bad)`;
+  } else {
+    handName = `Pair (bad)`;
+  }
+
   return {
     handRank: badnessRank as HandRank,
     primaryValue: highestFirst[0],
     kickers: highestFirst.slice(1),
     bestFiveCards: sorted,
-    handName: `${values.join('-')}${flushCheck ? ' (flush)' : ''}${straightCheck ? ' (straight)' : ''}`,
+    handName,
   };
 }
 
@@ -764,4 +794,123 @@ export function compare27Hands(a: HandResult, b: HandResult): number {
     if (a.kickers[i] !== b.kickers[i]) return a.kickers[i] - b.kickers[i];
   }
   return 0;
+}
+
+// ============================================================
+// BADUGI HAND EVALUATION
+// ============================================================
+//
+// Badugi: 4-card lowball draw game. The best hand uses 4 cards of all
+// different suits AND all different ranks. Aces are LOW. The best possible
+// hand is A-2-3-4 of four different suits ("badugi").
+//
+// Hand size:
+//   - 4-card hand (a "4-card badugi"): all 4 cards different ranks AND
+//     different suits → strongest, ranked by highest card descending.
+//   - 3-card hand: best 3 cards of different ranks + suits, ignoring 1 card.
+//   - 2-card hand: best 2 cards of different ranks + suits.
+//   - 1-card hand: just the lowest card.
+//
+// A 4-card badugi always beats any 3-card hand, which always beats any
+// 2-card hand, etc. Within the same hand size, lower is better.
+//
+// Examples:
+//   A♠ 2♥ 3♦ 4♣           = perfect badugi (4-card, A-high)
+//   A♠ 2♠ 3♥ 4♦           = 3-card hand A-3-4 (drop the 2 of spades)
+//   K♠ 7♥ 7♦ 4♣           = 3-card hand K-7-4 (drop one 7)
+//   A♠ A♥ A♦ A♣           = 1-card hand A
+// ============================================================
+
+interface BadugiResult {
+  size: number;        // 1..4 (higher = better)
+  cards: Card[];       // selected cards making the hand
+  values: number[];    // ace-low values, sorted high-to-low (lowest=last)
+}
+
+/**
+ * Find the best Badugi hand from any number of input cards (typically 4).
+ * Returns the largest possible "rainbow" set (all unique ranks AND suits)
+ * with the lowest values.
+ */
+function findBestBadugi(cards: Card[]): BadugiResult {
+  // Map ace to value 1 for comparison
+  const valOf = (c: Card) => (c.rank === Rank.Ace ? 1 : c.rank);
+
+  // Sort by ace-low value ascending (lowest first — better)
+  const sorted = [...cards].sort((a, b) => valOf(a) - valOf(b));
+
+  // Greedy selection: pick the lowest card whose rank and suit aren't yet used
+  let best: BadugiResult = { size: 0, cards: [], values: [] };
+
+  // Try every subset of 4 cards (small input, brute force is fine)
+  const n = sorted.length;
+  for (let mask = 1; mask < (1 << n); mask++) {
+    const subset: Card[] = [];
+    for (let i = 0; i < n; i++) {
+      if (mask & (1 << i)) subset.push(sorted[i]);
+    }
+    // Check rainbow + unpaired
+    const ranks = new Set(subset.map(c => valOf(c)));
+    const suits = new Set(subset.map(c => c.suit));
+    if (ranks.size !== subset.length || suits.size !== subset.length) continue;
+
+    // Compute "badness" tuple: highest values come first (lower-is-better when comparing)
+    const values = subset.map(valOf).sort((a, b) => b - a);
+
+    if (subset.length > best.size) {
+      best = { size: subset.length, cards: subset, values };
+    } else if (subset.length === best.size) {
+      // Same size — lower highest card wins, then next, etc.
+      if (compareBadugiValues(values, best.values) < 0) {
+        best = { size: subset.length, cards: subset, values };
+      }
+    }
+  }
+
+  return best;
+}
+
+/** Compare two Badugi value arrays (highest-first). Returns negative if a is better (lower). */
+function compareBadugiValues(a: number[], b: number[]): number {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+export function evaluateBadugiHand(holeCards: Card[]): HandResult {
+  const best = findBestBadugi(holeCards);
+
+  // Encode in HandResult shape so it slots into existing infra.
+  // Store size in handRank (higher = better), highest card in primaryValue (lower = better).
+  const sizeNames: Record<number, string> = {
+    4: '4-card Badugi',
+    3: '3-card hand',
+    2: '2-card hand',
+    1: '1-card hand',
+    0: 'No hand',
+  };
+  const handName = best.size === 4
+    ? `${sizeNames[4]} (${best.values[0]}-high)`
+    : `${sizeNames[best.size]} (${best.values.length > 0 ? best.values[0] + '-high' : ''})`;
+
+  return {
+    handRank: best.size as HandRank,
+    primaryValue: best.values[0] || 0,
+    kickers: best.values.slice(1),
+    bestFiveCards: best.cards, // technically <=4 cards, but the field is named bestFiveCards
+    handName,
+  };
+}
+
+/**
+ * Compare two Badugi hands. Returns positive if a is better.
+ * Bigger hand wins; ties broken by lower values.
+ */
+export function compareBadugiHands(a: HandResult, b: HandResult): number {
+  if (a.handRank !== b.handRank) return a.handRank - b.handRank; // larger size wins
+  // Same size — lower primaryValue is better, so invert
+  const aVals = [a.primaryValue, ...a.kickers];
+  const bVals = [b.primaryValue, ...b.kickers];
+  return -compareBadugiValues(aVals, bVals);
 }
