@@ -3221,14 +3221,25 @@ Give feedback in this JSON format:
       // tapped; if the server has since converted the tableId (rebalance,
       // auto-combine, etc.) this protects the user from landing at a Draw
       // table when they meant Hold'em.
+      //
+      // Normalize aliases — base PokerTable defaults `variantId = 'holdem'`
+      // while the lobby list ships `'texas-holdem'`. Treat them as equivalent
+      // so a direct Hold'em join doesn't false-positive as a mismatch.
       if (data.expectedVariant) {
-        const actualVariant =
+        const rawActual =
           (table as any).variantId ||
           (table as any).variant?.type ||
           'texas-holdem';
-        if (actualVariant !== data.expectedVariant) {
+        const normalize = (v: string) => {
+          const s = String(v || '').toLowerCase();
+          if (s === 'holdem' || s === 'texas-holdem' || s === 'texasholdem' || s === 'texas_holdem') return 'texas-holdem';
+          return s;
+        };
+        const actualVariant = normalize(rawActual);
+        const expected = normalize(data.expectedVariant);
+        if (actualVariant !== expected) {
           socket.emit('error', {
-            message: `This table is now ${actualVariant}, not ${data.expectedVariant}. Refreshing the lobby.`,
+            message: `This table is now ${actualVariant}, not ${expected}. Refreshing the lobby.`,
             code: 'variant_mismatch',
             actualVariant,
           });
