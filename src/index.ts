@@ -1478,6 +1478,87 @@ function autoStartNextHand(tableId: string): void {
   }
 }
 
+// ========== Live-Room Heartbeat ==========
+//
+// Keeps every non-tournament (cash) table running 24/7 so the app behaves
+// like a real live poker room:
+//   • Any table sitting in WaitingForPlayers with ≥ 2 players seated gets
+//     a hand started immediately (no manual "Start Hand" tap required).
+//   • Every cash table is kept topped up to a minimum of 3 players — AI
+//     backfill so a walk-up human never lands at an empty table and the
+//     lobby "players online" counts stay believable.
+//   • Tournament tables are skipped entirely — TournamentManager owns their
+//     scheduling and rebalancing.
+
+const LIVE_ROOM_MIN_OCCUPIED = 3;
+
+function backfillAIToMin(table: PokerTable, tableId: string, min: number): void {
+  if (!aiProfiles.has(tableId)) aiProfiles.set(tableId, new Map());
+  const profiles = aiProfiles.get(tableId)!;
+  const usedNames = new Set<string>();
+  for (const seat of table.seats) {
+    if (seat.state === 'occupied') usedNames.add(seat.playerName);
+  }
+  const emptySeats: number[] = [];
+  for (let i = 0; i < MAX_SEATS; i++) {
+    if (table.seats[i].state === 'empty') emptySeats.push(i);
+  }
+  const occupied = table.getOccupiedSeatCount();
+  const needed = Math.max(0, min - occupied);
+  const seatsToFill = emptySeats.slice(0, needed);
+  for (const i of seatsToFill) {
+    let profile = generateRandomProfile('hard');
+    let attempts = 0;
+    while (usedNames.has(profile.botName) && attempts < 50) {
+      profile = generateRandomProfile('hard');
+      attempts++;
+    }
+    usedNames.add(profile.botName);
+    const aiPlayerId = `ai-${uuidv4()}`;
+    table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true);
+    profiles.set(i, profile);
+  }
+}
+
+function ensureCashTableRunning(tableId: string): void {
+  const table = tableManager.getTable(tableId);
+  if (!table) return;
+  // Skip tournament tables — those run on a different schedule.
+  if (tournamentTables.has(tableId)) return;
+
+  // Keep a minimum floor of bots so any human walk-up has action immediately.
+  if (table.getOccupiedSeatCount() < LIVE_ROOM_MIN_OCCUPIED) {
+    backfillAIToMin(table, tableId, LIVE_ROOM_MIN_OCCUPIED);
+  }
+
+  // If stuck in WaitingForPlayers with ≥ 2 seated and no pending auto-start
+  // already scheduled, kick off a new hand.
+  if (
+    table.currentPhase === GamePhase.WaitingForPlayers &&
+    table.getOccupiedSeatCount() >= 2 &&
+    !pendingAutoStartTimers.has(tableId)
+  ) {
+    const started = table.startNewHand();
+    if (started) {
+      broadcastGameState(tableId);
+      scheduleAIAction(tableId);
+      console.log(`[LiveRoom] Auto-started hand on ${tableId} (occupied=${table.getOccupiedSeatCount()})`);
+    }
+  }
+}
+
+// 12-second heartbeat. Not faster — we don't want to spam seat churn while
+// a HandComplete 3s timer is already scheduled. Tournament tables are
+// skipped inside ensureCashTableRunning.
+setInterval(() => {
+  try {
+    const tables = tableManager.getTableList();
+    for (const t of tables) ensureCashTableRunning(t.tableId);
+  } catch (err) {
+    console.error('[LiveRoom] heartbeat error:', (err as Error).message);
+  }
+}, 12000);
+
 // ========== Progression Helpers ==========
 
 function sendProgressToPlayer(socketId: string): void {
