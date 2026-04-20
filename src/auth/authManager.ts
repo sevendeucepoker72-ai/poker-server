@@ -376,11 +376,49 @@ export async function saveProgress(userId: number, data: { chips?: number; level
     const sets: string[] = [];
     const vals: any[] = [];
     let idx = 1;
+    // Chips CAN decrease (losses); write plainly.
     if (data.chips !== undefined) { sets.push(`chips = $${idx++}`); vals.push(data.chips); }
-    if (data.level !== undefined) { sets.push(`level = $${idx++}`); vals.push(data.level); }
-    if (data.xp !== undefined) { sets.push(`xp = $${idx++}`); vals.push(data.xp); }
+    // Level can ONLY go up — use GREATEST so a race-condition save
+    // (in-memory fresh-init level 1 overwriting DB level 9) is rejected
+    // at the database layer. This is the third-layer safety net on top of
+    // the `hydrated` gate in the hand-complete handler and the in-memory
+    // hydration step. Belt + suspenders for the "level keeps resetting"
+    // bug users reported.
+    if (data.level !== undefined) {
+      sets.push(`level = GREATEST(level, $${idx++})`);
+      vals.push(data.level);
+    }
+    // XP resets on level-up and can temporarily go down, BUT only if the
+    // level field also advanced in the same write. Guard: accept xp write
+    // only if either (a) level also bumped up, or (b) new xp >= old xp.
+    // Use a subquery-driven ternary via CASE to handle both cases.
+    if (data.xp !== undefined) {
+      if (data.level !== undefined) {
+        // Paired with a level write: accept xp unconditionally (new level means xp can reset).
+        sets.push(`xp = $${idx++}`);
+        vals.push(data.xp);
+      } else {
+        // Lone xp write: ratchet — only accept if >= current.
+        sets.push(`xp = GREATEST(xp, $${idx++})`);
+        vals.push(data.xp);
+      }
+    }
     if (data.stats !== undefined) { sets.push(`stats = $${idx++}`); vals.push(JSON.stringify(data.stats)); }
-    if (data.achievements !== undefined) { sets.push(`achievements = $${idx++}`); vals.push(JSON.stringify(data.achievements)); }
+    // Achievements list should only grow — use a JSONB union via SQL so a
+    // stale (empty) write doesn't erase unlocked achievements. We merge
+    // existing + incoming, dedup, sort for stable comparison.
+    if (data.achievements !== undefined) {
+      sets.push(`achievements = (
+        SELECT jsonb_agg(DISTINCT a ORDER BY a)::text
+        FROM (
+          SELECT jsonb_array_elements_text(achievements::jsonb) AS a
+          UNION ALL
+          SELECT jsonb_array_elements_text($${idx}::jsonb) AS a
+        ) s
+      )`);
+      vals.push(JSON.stringify(data.achievements));
+      idx++;
+    }
     if (sets.length === 0) return true;
     vals.push(userId);
     await pool.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${idx}`, vals);

@@ -44,6 +44,17 @@ export interface PlayerProgress {
   bluffWins: number;
   allInWins: number;
   chatMessagesSent: number;
+
+  /**
+   * True once hydrateFromDB has completed for this progress entry.
+   * The hand-complete save path MUST check this before writing xp/level
+   * to Postgres — otherwise a hand that resolves before the async hydrate
+   * finishes overwrites the user's real DB values with the fresh-init
+   * defaults (level 1, xp 0). This was the root cause of "level resets
+   * every login" reports: first hand after join kept bulldozing the
+   * previous session's progress.
+   */
+  hydrated: boolean;
 }
 
 export interface Mission {

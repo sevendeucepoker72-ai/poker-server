@@ -270,6 +270,10 @@ export class ProgressionManager {
       bluffWins: 0,
       allInWins: 0,
       chatMessagesSent: 0,
+      // Gate for save paths — flipped to true only after hydrateFromDB
+      // completes successfully. Until then, no write should touch the
+      // users row (could clobber real values with fresh-init defaults).
+      hydrated: false,
     };
 
     this.progressMap.set(playerId, progress);
@@ -297,6 +301,9 @@ export class ProgressionManager {
   async hydrateFromDB(playerId: string, userId: number): Promise<void> {
     const progress = this.progressMap.get(playerId);
     if (!progress) return;
+    // Idempotent: short-circuit if already hydrated for this userId.
+    // Prevents a late re-hydrate from clobbering mid-session gains.
+    if (progress.hydrated && progress.userId === userId) return;
     progress.userId = userId;
 
     // ─── Hydrate xp / level / achievements / chips from users table ────────
@@ -350,6 +357,8 @@ export class ProgressionManager {
       if (equippedCB) progress.equippedCardBack = equippedCB;
       if (equippedTheme) progress.equippedTableTheme = equippedTheme;
     }
+    // Flip hydrated LAST — all DB reads complete, safe to save now.
+    progress.hydrated = true;
   }
 
   /** Push the current stars balance to Postgres. Fire-and-forget. */
@@ -820,6 +829,7 @@ export class ProgressionManager {
     return {
       playerId: progress.playerId,
       playerName: progress.playerName,
+      hydrated: progress.hydrated,
       level: progress.level,
       xp: progress.xp,
       xpToNextLevel: progress.xpToNextLevel,

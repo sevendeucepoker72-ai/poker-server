@@ -1906,22 +1906,28 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       if (authSession) {
         const clientProgress = progressionManager.getClientProgress(session.playerId) as any;
         if (clientProgress) {
-          await mergeUserStats(authSession.userId, {
-            handsPlayed: clientProgress.totalHandsPlayed || 0,
-            handsWon: clientProgress.handsWon || 0,
-            biggestPot: clientProgress.biggestPot || 0,
-            lastHandAt: Date.now(),
-          });
+          // CRITICAL: refuse to write xp/level/achievements until
+          // hydrateFromDB has filled the in-memory entry from Postgres.
+          // Without this gate, a hand that resolves in <100ms after table
+          // join reads fresh-init values (level 1 / xp 0 / achievements [])
+          // and clobbers the user's real DB state. Repeated over sessions
+          // this caused the "my level keeps resetting" bug.
+          if (clientProgress.hydrated) {
+            await mergeUserStats(authSession.userId, {
+              handsPlayed: clientProgress.totalHandsPlayed || 0,
+              handsWon: clientProgress.handsWon || 0,
+              biggestPot: clientProgress.biggestPot || 0,
+              lastHandAt: Date.now(),
+            });
 
-          // ─── Persist XP / level / achievements after EVERY hand ───────────
-          // Prior to this, xp/level/achievements lived only in
-          // progressionManager.progressMap (in-memory) and were lost on
-          // every Railway restart. Save them durably to the users table.
-          await saveProgress(authSession.userId, {
-            xp: clientProgress.xp,
-            level: clientProgress.level,
-            achievements: clientProgress.achievements || [],
-          }).catch((e) => console.warn(`[saveProgress hand-complete ${authSession.userId}]`, e?.message));
+            await saveProgress(authSession.userId, {
+              xp: clientProgress.xp,
+              level: clientProgress.level,
+              achievements: clientProgress.achievements || [],
+            }).catch((e) => console.warn(`[saveProgress hand-complete ${authSession.userId}]`, e?.message));
+          } else {
+            console.warn(`[hand-complete] SKIPPED save for userId=${authSession.userId} — progress not hydrated yet (would have overwritten real values with fresh-init)`);
+          }
 
           // Persistence sweep: record this hand to user_hand_history + tick scratch card progress
           const seat = table.seats[session.seatIndex];
@@ -2017,29 +2023,42 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
  * holds regardless of prior disconnects / tab reloads / multi-tab logins.
  * Fixes the "3-of-me" ghost-seat bug.
  */
-function clearGhostSeatsForUser(userId: number, tableId: string, excludeSocketId?: string): number {
+function clearGhostSeatsForUser(userId: number, tableId: string, excludeSocketId?: string, excludeSeatIndex?: number): number {
   let cleared = 0;
   const table = tableManager.getTable(tableId);
   if (!table) return 0;
+
+  // Resolve the user's display name and phone/username so we can match
+  // seats even when no session record remains (e.g. orphaned seats
+  // left behind after a crash or a non-joinTable seat path).
+  let userDisplayName: string | null = null;
+  let userUsername: string | null = null;
+  try {
+    // Best effort — find via any existing auth session, then via DB if needed.
+    for (const [, auth] of authSessions) {
+      if (auth.userId === userId) { userUsername = auth.username; break; }
+    }
+  } catch {}
 
   // 1. Scan active sessions — any prior socket of the same user on this table
   for (const [otherSocketId, otherSession] of playerSessions) {
     if (otherSocketId === excludeSocketId) continue;
     if (otherSession.tableId !== tableId) continue;
+    if (excludeSeatIndex !== undefined && otherSession.seatIndex === excludeSeatIndex) continue;
     const otherAuth = authSessions.get(otherSocketId);
     if (!otherAuth || otherAuth.userId !== userId) continue;
 
     const seat = table.seats[otherSession.seatIndex];
     if (seat && seat.state === 'occupied' && !seat.isAI) {
-      // If it's their turn on the ghost seat, fold first to keep the hand moving.
       if (table.isHandInProgress() && table.activeSeatIndex === otherSession.seatIndex) {
         try { table.playerFold(otherSession.seatIndex); } catch {}
       }
+      // Remember the name for step 3 (in case OTHER dead seats also match)
+      userDisplayName = userDisplayName || seat.playerName;
       table.standUp(otherSession.seatIndex);
       cleared++;
     }
     playerSessions.delete(otherSocketId);
-    // Let the ghost socket (if still connected) know so its UI lobby-returns.
     const ghostSocket = io.sockets.sockets.get(otherSocketId);
     if (ghostSocket) {
       ghostSocket.leave(`table:${tableId}`);
@@ -2049,18 +2068,42 @@ function clearGhostSeatsForUser(userId: number, tableId: string, excludeSocketId
 
   // 2. Clear any reserved seat on this table
   const reserved = reservedSeats.get(userId);
-  if (reserved && reserved.tableId === tableId) {
+  if (reserved && reserved.tableId === tableId
+      && (excludeSeatIndex === undefined || reserved.seatIndex !== excludeSeatIndex)) {
     clearTimeout(reserved.cleanupTimer);
     reservedSeats.delete(userId);
     const rSeat = table.seats[reserved.seatIndex];
     if (rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
+      userDisplayName = userDisplayName || rSeat.playerName;
       table.standUp(reserved.seatIndex);
       cleared++;
     }
   }
 
+  // 3. NAME-based scan — catch seats where the playerName matches our
+  // user but NO session/reservation points at them (true orphans from
+  // crashes, forced disconnects, or code paths that bypass cleanup).
+  // Stronger than the session scan because it doesn't require any
+  // lookup map to still hold the stale entry.
+  const namesToMatch = new Set<string>();
+  if (userDisplayName) namesToMatch.add(userDisplayName);
+  if (userUsername) namesToMatch.add(userUsername);
+  if (namesToMatch.size > 0) {
+    for (let i = 0; i < table.seats.length; i++) {
+      if (i === excludeSeatIndex) continue;
+      const s = table.seats[i];
+      if (s.state !== 'occupied' || s.isAI) continue;
+      if (!namesToMatch.has(s.playerName)) continue;
+      if (table.isHandInProgress() && table.activeSeatIndex === i) {
+        try { table.playerFold(i); } catch {}
+      }
+      table.standUp(i);
+      cleared++;
+    }
+  }
+
   if (cleared > 0) {
-    console.log(`[clearGhostSeatsForUser] userId=${userId} tableId=${tableId} cleared=${cleared}`);
+    console.log(`[clearGhostSeatsForUser] userId=${userId} tableId=${tableId} cleared=${cleared} (name-match=${userDisplayName || userUsername || 'n/a'})`);
     broadcastGameState(tableId);
   }
   return cleared;
@@ -3880,6 +3923,13 @@ Give feedback in this JSON format:
       }
 
       const playerId = `player-${uuidv4()}`;
+      // Ghost-seat defense (quickplay path): same invariant as the main
+      // joinTable handler. Prevents a prior socket's seat on this table
+      // from lingering when the user comes back via quickplay.
+      {
+        const authNow = authSessions.get(socket.id);
+        if (authNow) clearGhostSeatsForUser(authNow.userId, chosenTableId, socket.id, targetSeat);
+      }
       const success = table.sitDown(
         targetSeat,
         playerName,
@@ -4516,6 +4566,12 @@ Give feedback in this JSON format:
         const existingName = playerSessions.get(socket.id)?.playerName;
         const playerName = existingName || `Player-${remoteUserId.slice(0, 6)}`;
         const playerId = `player-${uuidv4()}`;
+        // Ghost-seat defense (authWithTicket path): clear any lingering
+        // seat from a previous session before re-seating.
+        {
+          const authNow = authSessions.get(socket.id);
+          if (authNow) clearGhostSeatsForUser(authNow.userId, bestTable.tableId, socket.id, targetSeat);
+        }
         const success = table.sitDown(
           targetSeat,
           playerName,
@@ -5824,6 +5880,11 @@ Give feedback in this JSON format:
     }
 
     const playerId = `player-${uuidv4()}`;
+    // Ghost-seat defense (multi-table / joinTableAsPlayer path).
+    {
+      const authNow = authSessions.get(socket.id);
+      if (authNow) clearGhostSeatsForUser(authNow.userId, tableId, socket.id, targetSeat);
+    }
     const success = table.sitDown(targetSeat, playerName, buyIn, playerId, false);
     if (!success) {
       socket.emit('error', { message: 'Could not join table' });
