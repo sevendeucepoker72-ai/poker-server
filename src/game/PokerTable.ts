@@ -1233,13 +1233,27 @@ export class PokerTable extends EventEmitter {
         const seat = this.seats[info.seatIndex];
         const allCards = [...seat.holeCards, ...this.communityCards];
         if (allCards.length >= 5 || (!this.usesCommunityCards() && seat.holeCards.length >= 5)) {
+          // Defensive: `evaluatePlayerHand` CAN return null in variant
+          // subclasses under edge cases (Omaha hi-lo with no qualifying
+          // low, or a bugged hole-card array). A null result here used to
+          // crash the whole hand with `Cannot read properties of null`
+          // which took the server process down on Railway. Skip this
+          // player's showdown row if we can't evaluate — everyone else
+          // still gets a proper hand, and this player falls through to
+          // the "Won by fold" / unknown branch in awardPots.
           const handRes = this.evaluatePlayerHand(seat.holeCards, this.communityCards);
+          if (!handRes) {
+            console.warn(
+              `[PokerTable.determineWinners] evaluatePlayerHand returned null for seat ${info.seatIndex} (${seat.playerName}) — skipping showdown row. holeCards=${JSON.stringify(seat.holeCards)} community=${this.communityCards.length}`
+            );
+            continue;
+          }
           handResultCache.set(info.seatIndex, handRes);
           showdownHands.push({
             seatIndex: info.seatIndex,
             playerName: seat.playerName,
-            handName: handRes.handName,
-            bestFiveCards: handRes.bestFiveCards,
+            handName: handRes.handName || 'Unknown',
+            bestFiveCards: handRes.bestFiveCards || [],
             holeCards: [...seat.holeCards],
           });
         }
