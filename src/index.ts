@@ -147,6 +147,10 @@ interface PlayerSession {
   trainingEnabled: boolean;
   sittingOut: boolean;
   avatar?: any;
+  // Seat-move queue — set by `moveSeat` handler; consumed by autoStartNextHand
+  // on the next hand boundary. Cleared when the move completes or is cancelled.
+  // Only meaningful on cash tables; tournament tables reject the event entirely.
+  pendingSeatIndex?: number;
   // Deep-link context from player app — e.g. { source: 'waitlist', gameId, venue }
   context?: {
     source: string;
@@ -1443,6 +1447,84 @@ function executeAIAction(
   }
 }
 
+// Atomically move a session's seat at a cash table. Transfers chip stack,
+// avatar, all seat-level state from the old seat to the new seat; evicts
+// an AI occupant if the target is held by a bot; clears sit-out state.
+// Returns true on success, false if the target turned out invalid (e.g.
+// a human took it between queue and execute — the player stays put).
+//
+// IMPORTANT: caller is expected to have already verified the table is
+// between hands (or about to start one). Mid-hand moves would interrupt
+// an active betting round.
+function executePendingMove(tableId: string, session: PlayerSession): boolean {
+  const target = session.pendingSeatIndex;
+  if (target == null) return false;
+  delete session.pendingSeatIndex;
+
+  const table = tableManager.getTable(tableId);
+  if (!table) return false;
+
+  const src = table.seats[session.seatIndex];
+  const dst = table.seats[target];
+  if (!src || !dst) return false;
+
+  // Re-check: target must still be empty or AI. A human may have joined
+  // this seat between queue and execute.
+  if (dst.state === 'occupied' && !dst.isAI) {
+    const sock = io.sockets.sockets.get(session.socketId);
+    if (sock) sock.emit('error', { message: 'Target seat was taken — move cancelled' });
+    return false;
+  }
+
+  // Evict an AI from the target if any.
+  if (dst.state === 'occupied' && dst.isAI) {
+    table.standUp(target);
+    const profiles = aiProfiles.get(tableId);
+    if (profiles) profiles.delete(target);
+  }
+
+  // Snapshot the player's current seat data then wipe the source seat.
+  const chipCount = src.chipCount;
+  const avatar = session.avatar;
+  const playerName = session.playerName;
+  const playerId = session.playerId;
+  table.standUp(session.seatIndex);
+
+  // Sit down at the new seat with the preserved stack. `sitDown`'s buy-in
+  // argument becomes the new chip count, so we pass the EXACT snapshot to
+  // preserve every chip.
+  const success = table.sitDown(target, playerName, chipCount, playerId, false);
+  if (!success) {
+    // Extremely rare — sitDown shouldn't fail on an empty seat — but fall
+    // back by attempting to return to the original seat with the same stack.
+    console.warn(`[MoveSeat] sitDown failed for ${playerName} on seat ${target}; restoring to ${session.seatIndex}`);
+    table.sitDown(session.seatIndex, playerName, chipCount, playerId, false);
+    return false;
+  }
+
+  // Carry avatar forward on the new seat.
+  if (avatar && table.seats[target]) {
+    (table.seats[target] as any).avatar = avatar;
+  }
+
+  // Update the session to reflect the new seat + clear sit-out.
+  session.seatIndex = target;
+  session.sittingOut = false;
+  const tracker = sitOutTracker.get(tableId);
+  if (tracker) {
+    tracker.delete(target);
+    // Clean up any lingering old-seat entry too.
+  }
+
+  // Notify the socket that their move completed.
+  const sock = io.sockets.sockets.get(session.socketId);
+  if (sock) {
+    sock.emit('moveSeatComplete', { tableId, newSeat: target });
+  }
+  console.log(`[MoveSeat] ${playerName} moved to seat ${target} on ${tableId} (${chipCount} chips)`);
+  return true;
+}
+
 function autoStartNextHand(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
@@ -1464,6 +1546,30 @@ function autoStartNextHand(tableId: string): void {
       seat.chipCount = table.config.minBuyIn;
       seat.eliminated = false;
       console.log(`[Reload] ${seat.playerName} (${seat.isAI ? 'AI' : 'human'}) busted → reloaded to ${table.config.minBuyIn}`);
+    }
+  }
+
+  // Execute any pending seat-move requests BEFORE we trim / refill AI.
+  // A player's pendingSeatIndex was queued by the `moveSeat` socket
+  // handler; this is the hand boundary where it takes effect. Only cash
+  // tables allow these requests (the handler already refuses tournaments).
+  if (!tournamentTables.has(tableId)) {
+    const movedSockets: string[] = [];
+    for (const [sid, session] of playerSessions) {
+      if (session.tableId === tableId && session.pendingSeatIndex != null) {
+        if (executePendingMove(tableId, session)) movedSockets.push(sid);
+      }
+    }
+    // Also scan multi-table sessions that belong to this table.
+    for (const [sid, multi] of multiTableSessions) {
+      for (const session of multi) {
+        if (session.tableId === tableId && session.pendingSeatIndex != null) {
+          if (executePendingMove(tableId, session)) movedSockets.push(sid);
+        }
+      }
+    }
+    if (movedSockets.length > 0) {
+      console.log(`[MoveSeat] executed ${movedSockets.length} queued moves on ${tableId} at hand boundary`);
     }
   }
 
@@ -4440,6 +4546,96 @@ Give feedback in this JSON format:
     socket.emit('rebuyComplete', { success: true, newStack: requested, added: topUpAmount });
     console.log(`[Rebuy] ${seat.playerName} topped up by ${topUpAmount} to ${requested}`);
   })(); });
+
+  // ========== Seat move (cash tables only) ==========
+  //
+  // Queued request to move the player to a different seat at the SAME
+  // table. Takes effect at the next hand boundary (enforced by
+  // autoStartNextHand). Disabled for tournament tables because the
+  // TournamentManager owns seat assignment there (rebalance flow).
+  //
+  // Payload: { targetSeatIndex: number, tableId?: string (for multi-table) }
+  socket.on('moveSeat', async (data: { targetSeatIndex?: number; tableId?: string } = {}) => {
+    try {
+      const targetSeat = Number(data?.targetSeatIndex);
+      if (!Number.isInteger(targetSeat) || targetSeat < 0 || targetSeat >= MAX_SEATS) {
+        socket.emit('error', { message: 'Invalid target seat' });
+        return;
+      }
+      // Resolve the player's session. Multi-table support: if `tableId` is
+      // passed and matches a secondary session, use that; otherwise the
+      // primary session.
+      let session: PlayerSession | undefined = playerSessions.get(socket.id);
+      if (data?.tableId) {
+        if (session?.tableId !== data.tableId) {
+          const multi = multiTableSessions.get(socket.id) || [];
+          const match = multi.find((s) => s.tableId === data.tableId);
+          if (match) session = match;
+        }
+      }
+      if (!session) {
+        socket.emit('error', { message: 'Not at a table' });
+        return;
+      }
+      const table = tableManager.getTable(session.tableId);
+      if (!table) { socket.emit('error', { message: 'Table not found' }); return; }
+
+      // Gate: cash tables only. Tournament table seat assignment is owned
+      // by TournamentManager (rebalance logic); allowing self-serve seat
+      // change there would race with table-balance decisions.
+      if (tournamentTables.has(session.tableId)) {
+        socket.emit('error', { message: 'Seat moves are disabled in tournaments' });
+        return;
+      }
+
+      if (targetSeat === session.seatIndex) {
+        // Same seat — treat as a cancel of any pending move.
+        delete session.pendingSeatIndex;
+        socket.emit('moveSeatCancelled', { tableId: session.tableId });
+        broadcastGameState(session.tableId);
+        return;
+      }
+
+      const dest = table.seats[targetSeat];
+      if (!dest) {
+        socket.emit('error', { message: 'Invalid target seat' });
+        return;
+      }
+      // Target must be empty OR occupied by an AI we can evict. Refuse if
+      // a real human (or reserved seat) sits there.
+      if (dest.state === 'occupied' && !dest.isAI) {
+        socket.emit('error', { message: 'That seat is occupied by another player' });
+        return;
+      }
+
+      session.pendingSeatIndex = targetSeat;
+      socket.emit('moveSeatPending', {
+        tableId: session.tableId,
+        currentSeat: session.seatIndex,
+        pendingSeat: targetSeat,
+      });
+      console.log(`[MoveSeat] ${session.playerName} queued move ${session.seatIndex} → ${targetSeat} on ${session.tableId}`);
+
+      // If the table isn't in an active hand right now, execute immediately
+      // instead of waiting for the next HandComplete.
+      if (!table.isHandInProgress()) {
+        executePendingMove(session.tableId, session);
+        broadcastGameState(session.tableId);
+      }
+    } catch (err: any) {
+      console.error('[moveSeat] error:', err.message);
+      socket.emit('error', { message: 'Server error queuing seat move' });
+    }
+  });
+
+  socket.on('cancelMoveSeat', () => {
+    const session = playerSessions.get(socket.id);
+    if (!session) return;
+    if (session.pendingSeatIndex == null) return;
+    delete session.pendingSeatIndex;
+    socket.emit('moveSeatCancelled', { tableId: session.tableId });
+    console.log(`[MoveSeat] ${session.playerName} cancelled pending move on ${session.tableId}`);
+  });
 
   socket.on('startHand', async () => {
     const session = playerSessions.get(socket.id);
