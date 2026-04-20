@@ -1427,11 +1427,21 @@ function autoStartNextHand(tableId: string): void {
     }
   }
 
-  // Refill AI seats if needed
+  // Cap occupancy at each hand boundary — the 12s heartbeat might miss the
+  // HandComplete window if we immediately transition back to PreFlop via the
+  // 3s timer. Trim excess AI here too so tables packed by the old behavior
+  // drop back to the target within one hand.
+  if (!tournamentTables.has(tableId)) {
+    trimExcessAI(table, tableId, CASH_TABLE_TARGET_OCCUPIED);
+  }
+
+  // Refill AI seats if needed (fill now respects CASH_TABLE_TARGET_OCCUPIED
+  // by default, so this is a no-op at or above cap). Skip for tournament
+  // tables — they manage their own seating via the rebalance flow.
   const humanCount = table.seats.filter(
     (s) => s.state === 'occupied' && !s.isAI
   ).length;
-  if (humanCount > 0) {
+  if (humanCount > 0 && !tournamentTables.has(tableId)) {
     fillWithAI(table, tableId);
   }
 
