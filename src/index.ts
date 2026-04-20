@@ -1233,36 +1233,39 @@ function fillWithAI(
   }
 }
 
-// Trim excess AI when a table is over the occupancy cap. Only runs between
-// hands (WaitingForPlayers / HandComplete) — never mid-hand, to avoid
-// yanking seats out from under an active turn. Keeps humans untouched.
+// Trim excess AI when a table is over the occupancy cap.
+// Safe between-hands: WaitingForPlayers / HandComplete always OK.
+// Safe mid-hand ONLY for folded AI seats (they're already out of the hand,
+// standing them up changes nothing about the active action).
+// Never touches humans. Logs what it does.
 function trimExcessAI(
   table: PokerTable,
   tableId: string,
   targetMaxOccupied: number = CASH_TABLE_TARGET_OCCUPIED
 ): void {
-  if (
-    table.currentPhase !== GamePhase.WaitingForPlayers &&
-    table.currentPhase !== GamePhase.HandComplete
-  ) {
-    return;
-  }
   const occupied = table.getOccupiedSeatCount();
   if (occupied <= targetMaxOccupied) return;
+  const betweenHands =
+    table.currentPhase === GamePhase.WaitingForPlayers ||
+    table.currentPhase === GamePhase.HandComplete;
   const aiSeats: number[] = [];
   for (let i = 0; i < MAX_SEATS; i++) {
     const s = table.seats[i];
-    if (s.state === 'occupied' && s.isAI) aiSeats.push(i);
+    if (s.state !== 'occupied' || !s.isAI) continue;
+    // Between hands: any AI is fair game. Mid-hand: only folded AI so
+    // we don't interrupt a live betting round.
+    if (!betweenHands && !s.folded) continue;
+    aiSeats.push(i);
   }
-  // Remove the lowest-index AI first (arbitrary but deterministic). Keep
-  // enough AI that minimum still holds once humans-only is over cap too.
-  const toRemove = occupied - targetMaxOccupied;
+  const toRemove = Math.min(occupied - targetMaxOccupied, aiSeats.length);
+  if (toRemove <= 0) return;
   const profiles = aiProfiles.get(tableId);
-  for (let k = 0; k < toRemove && k < aiSeats.length; k++) {
+  for (let k = 0; k < toRemove; k++) {
     const i = aiSeats[k];
     table.standUp(i);
     if (profiles) profiles.delete(i);
   }
+  console.log(`[LiveRoom] trimExcessAI ${tableId}: removed ${toRemove} AI seats (was ${occupied}, cap ${targetMaxOccupied}, phase ${table.currentPhase})`);
 }
 
 function scheduleAIAction(tableId: string): void {
@@ -1643,10 +1646,20 @@ function ensureCashTableRunning(tableId: string): void {
 // 12-second heartbeat. Not faster — we don't want to spam seat churn while
 // a HandComplete 3s timer is already scheduled. Tournament tables are
 // skipped inside ensureCashTableRunning.
+console.log('[LiveRoom] heartbeat installed (12s interval, target occupancy ' + CASH_TABLE_TARGET_OCCUPIED + ')');
 setInterval(() => {
   try {
     const tables = tableManager.getTableList();
-    for (const t of tables) ensureCashTableRunning(t.tableId);
+    let trimmedTables = 0;
+    for (const t of tables) {
+      const before = tableManager.getTable(t.tableId)?.getOccupiedSeatCount() ?? 0;
+      ensureCashTableRunning(t.tableId);
+      const after = tableManager.getTable(t.tableId)?.getOccupiedSeatCount() ?? 0;
+      if (before !== after) trimmedTables++;
+    }
+    if (trimmedTables > 0) {
+      console.log(`[LiveRoom] heartbeat: ${trimmedTables} table(s) changed occupancy`);
+    }
   } catch (err) {
     console.error('[LiveRoom] heartbeat error:', (err as Error).message);
   }
