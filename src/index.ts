@@ -1449,23 +1449,21 @@ function autoStartNextHand(tableId: string): void {
 
   if (table.currentPhase !== GamePhase.HandComplete) return;
 
-  // Reload EVERYONE at 0 chips — humans AND AI — so cash tables never
-  // empty out. Previously AI were removed entirely on bust, which caused
-  // tables to shrink toward heads-up and finally hit "Open" seats across
-  // the oval. Live-room behavior: bots stay, get a fresh stack, keep the
-  // action going. Humans still get their free reload as before.
+  // Reload BUSTED-OUT seats only — humans AND AI — so cash tables never
+  // empty out. Previously AI at 0 chips were removed from the table, which
+  // drained it to heads-up over time. Now bots stay and get a fresh stack,
+  // same as humans. BUT reload only triggers at chipCount === 0 (truly
+  // busted), not just "below min buy-in" — that was giving free top-ups
+  // every hand to anyone short-stacked, which is not how poker works.
+  // A short stack is a real state; the player needs to play out of it
+  // or leave. Only a full bust gets the safety-net reload.
   for (let i = 0; i < MAX_SEATS; i++) {
     const seat = table.seats[i];
     if (seat.state !== 'occupied') continue;
-    // Reload if chip stack has fallen below a playable amount. `chipCount
-    // < minBuyIn` (not just <= 0) covers the case where a short-stack
-    // lost a big pot and is now below the minimum — still technically
-    // seated but unable to post blinds meaningfully next hand.
-    if (seat.chipCount < table.config.minBuyIn) {
-      const prev = seat.chipCount;
+    if (seat.chipCount <= 0) {
       seat.chipCount = table.config.minBuyIn;
       seat.eliminated = false;
-      console.log(`[Reload] ${seat.playerName} (${seat.isAI ? 'AI' : 'human'}) reloaded from ${prev} to ${table.config.minBuyIn}`);
+      console.log(`[Reload] ${seat.playerName} (${seat.isAI ? 'AI' : 'human'}) busted → reloaded to ${table.config.minBuyIn}`);
     }
   }
 
