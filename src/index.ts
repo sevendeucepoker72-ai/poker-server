@@ -4647,6 +4647,20 @@ Give feedback in this JSON format:
   // stack to the requested amount, debiting from their DB balance. In
   // testing mode, ensureChipsForBuyIn auto-tops-up the DB balance if
   // needed so the rebuy never fails.
+  // PWA audit #2/#11: client explicitly requests a state sync after
+  // reconnect/app-resume so the player immediately sees the current
+  // table state (phase, turn, community cards, chips) instead of
+  // whatever stale gameState was last in their store.
+  socket.on('syncTableState', (data: { tableId?: string } = {}) => {
+    const session = playerSessions.get(socket.id);
+    const tableId = session?.tableId || data?.tableId;
+    if (!tableId) return;
+    const table = tableManager.getTable(tableId);
+    if (!table) return;
+    const state = getGameStateForPlayer(table, session?.seatIndex ?? -1, session?.trainingEnabled || false);
+    emitGameState(socket, state, true);
+  });
+
   socket.on('rebuy', async (data: { amount?: number } = {}) => { (async () => {
     const session = playerSessions.get(socket.id);
     if (!session) { socket.emit('error', { message: 'Not at a table' }); return; }

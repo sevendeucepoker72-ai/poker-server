@@ -326,7 +326,15 @@ export class PokerTable extends EventEmitter {
     const bbSeat = isHeadsUp ? orderedFromButton[0] : orderedFromButton[1];
 
     // Mark ONLY if that position is in our sitting-out set.
-    if (sbSeat != null && this._sittingOutSeats.has(sbSeat)) {
+    //
+    // Re-audit fix: respect TDA Rule 33 "dead small blind". When the
+    // SB position falls on an empty seat from a prior-hand bust, the
+    // SB is DEAD this hand — no one owes it. Previously a sitting-out
+    // player whose seat coincidentally mapped to the natural SB slot
+    // would accumulate a false SB debt. `this.deadSmallBlind` is set
+    // by moveDealerButton() earlier in startNewHand; skip the SB mark
+    // when it's true.
+    if (sbSeat != null && !this.deadSmallBlind && this._sittingOutSeats.has(sbSeat)) {
       this.markMissedBlind(sbSeat, 'small');
     }
     if (bbSeat != null && this._sittingOutSeats.has(bbSeat)) {
