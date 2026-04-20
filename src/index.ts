@@ -1904,6 +1904,16 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
             lastHandAt: Date.now(),
           });
 
+          // ─── Persist XP / level / achievements after EVERY hand ───────────
+          // Prior to this, xp/level/achievements lived only in
+          // progressionManager.progressMap (in-memory) and were lost on
+          // every Railway restart. Save them durably to the users table.
+          await saveProgress(authSession.userId, {
+            xp: clientProgress.xp,
+            level: clientProgress.level,
+            achievements: clientProgress.achievements || [],
+          }).catch((e) => console.warn(`[saveProgress hand-complete ${authSession.userId}]`, e?.message));
+
           // Persistence sweep: record this hand to user_hand_history + tick scratch card progress
           const seat = table.seats[session.seatIndex];
           const result = handResultPerSeat.get(session.seatIndex);
@@ -3667,8 +3677,8 @@ Give feedback in this JSON format:
       };
       playerSessions.set(socket.id, session);
 
-      // Initialize progression
-      progressionManager.getOrCreateProgress(playerId, playerName);
+      // Initialize progression (userId → hydrate xp/level/achievements from DB)
+      progressionManager.getOrCreateProgress(playerId, playerName, authSessions.get(socket.id)?.userId);
       ensureTableProgressListener(table, tableId);
 
       // Join socket room for table
@@ -3825,8 +3835,8 @@ Give feedback in this JSON format:
       playerSessions.set(socket.id, session);
       socket.join(`table:${chosenTableId}`);
 
-      // Initialize progression
-      progressionManager.getOrCreateProgress(playerId, playerName);
+      // Initialize progression (userId → hydrate xp/level/achievements from DB)
+      progressionManager.getOrCreateProgress(playerId, playerName, authSessions.get(socket.id)?.userId);
       ensureTableProgressListener(table, chosenTableId);
 
       // Fill with AI
@@ -4459,7 +4469,7 @@ Give feedback in this JSON format:
         playerSessions.set(socket.id, session);
         socket.join(`table:${bestTable.tableId}`);
 
-        progressionManager.getOrCreateProgress(playerId, playerName);
+        progressionManager.getOrCreateProgress(playerId, playerName, authSessions.get(socket.id)?.userId);
         ensureTableProgressListener(table, bestTable.tableId);
         fillWithAI(table, bestTable.tableId);
 
@@ -5117,7 +5127,7 @@ Give feedback in this JSON format:
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
 
-    progressionManager.getOrCreateProgress(playerId, playerName);
+    progressionManager.getOrCreateProgress(playerId, playerName, authSessions.get(socket.id)?.userId);
     ensureTableProgressListener(table, tableId);
 
     // Add 1 Hard AI opponent
@@ -5235,7 +5245,7 @@ Give feedback in this JSON format:
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
 
-    progressionManager.getOrCreateProgress(playerId, playerName);
+    progressionManager.getOrCreateProgress(playerId, playerName, authSessions.get(socket.id)?.userId);
     ensureTableProgressListener(table, tableId);
 
     // Add 2 AI opponents (medium-hard)
@@ -5351,7 +5361,7 @@ Give feedback in this JSON format:
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
 
-    progressionManager.getOrCreateProgress(playerId, playerName);
+    progressionManager.getOrCreateProgress(playerId, playerName, authSessions.get(socket.id)?.userId);
     ensureTableProgressListener(table, tableId);
 
     // Fill with 5 AI (mixed difficulty)
@@ -5444,7 +5454,7 @@ Give feedback in this JSON format:
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
 
-    progressionManager.getOrCreateProgress(playerId, careerPlayerName);
+    progressionManager.getOrCreateProgress(playerId, careerPlayerName, authSessions.get(socket.id)?.userId);
     ensureTableProgressListener(table, tableId);
 
     // Fill with AI
@@ -5739,7 +5749,7 @@ Give feedback in this JSON format:
     multiTableSessions.get(socket.id)!.push(session);
     socket.join(`table:${tableId}`);
 
-    progressionManager.getOrCreateProgress(playerId, playerName);
+    progressionManager.getOrCreateProgress(playerId, playerName, authSessions.get(socket.id)?.userId);
     ensureTableProgressListener(table, tableId);
     fillWithAI(table, tableId);
 
@@ -5868,7 +5878,7 @@ Give feedback in this JSON format:
     };
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
-    progressionManager.getOrCreateProgress(playerId, playerName);
+    progressionManager.getOrCreateProgress(playerId, playerName, authSessions.get(socket.id)?.userId);
     ensureTableProgressListener(table, tableId);
     fillWithAI(table, tableId);
 
@@ -5995,7 +6005,14 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
       if (table) {
         const seat = table.seats[session.seatIndex];
         if (seat && seat.state === 'occupied') {
-          await saveProgress(authSession.userId, { chips: seat.chipCount });
+          // Persist everything we can — chips, xp, level, achievements.
+          const prog = progressionManager.getClientProgress(session.playerId) as any;
+          await saveProgress(authSession.userId, {
+            chips: seat.chipCount,
+            xp: prog?.xp,
+            level: prog?.level,
+            achievements: prog?.achievements || [],
+          });
 
           // Reserve the seat for 10 minutes so the player can reconnect
           // Cancel any existing reservation for this user first

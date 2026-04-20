@@ -1,5 +1,5 @@
 import { PlayerProgress, Mission, MissionType } from './PlayerProgress';
-import { persistStars as dbPersistStars, loadDurableProgress, loadInventory } from '../auth/authManager';
+import { persistStars as dbPersistStars, loadDurableProgress, loadInventory, loadProgress as dbLoadProgress } from '../auth/authManager';
 
 // ── Ranked / ELO constants ──────────────────────────────────────────────────
 const ELO_START = 500;
@@ -214,10 +214,18 @@ export class ProgressionManager {
   private progressMap: Map<string, PlayerProgress> = new Map();
   private pendingEvents: Map<string, ProgressEvent[]> = new Map();
 
-  getOrCreateProgress(playerId: string, playerName: string): PlayerProgress {
+  getOrCreateProgress(playerId: string, playerName: string, userId?: number): PlayerProgress {
     let progress = this.progressMap.get(playerId);
     if (progress) {
       progress.playerName = playerName;
+      // If we now have a userId and the entry hasn't been hydrated yet, do it.
+      // This ensures xp/level/achievements reflect DB state even for
+      // entries that were created pre-auth.
+      if (userId && !progress.userId) {
+        this.hydrateFromDB(playerId, userId).catch((e) =>
+          console.warn(`[ProgressionManager.getOrCreateProgress hydrate ${userId}]`, e?.message)
+        );
+      }
       return progress;
     }
 
@@ -266,6 +274,14 @@ export class ProgressionManager {
 
     this.progressMap.set(playerId, progress);
     this.generateDailyMissions(playerId);
+
+    // Hydrate new entry from DB if userId known — this is the normal path
+    // for authenticated players joining their first table in a session.
+    if (userId) {
+      this.hydrateFromDB(playerId, userId).catch((e) =>
+        console.warn(`[ProgressionManager.getOrCreateProgress hydrate-new ${userId}]`, e?.message)
+      );
+    }
     return progress;
   }
 
@@ -282,6 +298,40 @@ export class ProgressionManager {
     const progress = this.progressMap.get(playerId);
     if (!progress) return;
     progress.userId = userId;
+
+    // ─── Hydrate xp / level / achievements / chips from users table ────────
+    // Without this, every login seeds level=1 xp=0 achievements=[] in-memory
+    // even though the DB already has the real values. Then the first XP gain
+    // overwrites the DB with fresh-start numbers. This is the root cause of
+    // "exp and achievements don't persist".
+    try {
+      const res = await dbLoadProgress(userId);
+      if (res.success && res.userData) {
+        const u = res.userData;
+        if (typeof u.level === 'number' && u.level > 0) progress.level = u.level;
+        if (typeof u.xp === 'number' && u.xp >= 0) progress.xp = u.xp;
+        // xpToNextLevel scales with level
+        progress.xpToNextLevel = Math.max(100, progress.level * 100);
+        if (Array.isArray(u.achievements)) {
+          progress.achievements = Array.from(new Set([...(progress.achievements || []), ...u.achievements]));
+        }
+        if (typeof u.chips === 'number') progress.chips = u.chips;
+        if (u.stats && typeof u.stats === 'object') {
+          // Re-seed stat counters that live in PlayerProgress.
+          const s: any = u.stats;
+          if (typeof s.handsPlayed === 'number') progress.totalHandsPlayed = s.handsPlayed;
+          if (typeof s.handsWon === 'number')    progress.handsWon = s.handsWon;
+          if (typeof s.biggestPot === 'number')  progress.biggestPot = s.biggestPot;
+          if (typeof s.bestStreak === 'number')  progress.bestStreak = s.bestStreak;
+          if (typeof s.bluffWins === 'number')   progress.bluffWins = s.bluffWins;
+          if (typeof s.allInWins === 'number')   progress.allInWins = s.allInWins;
+          if (typeof s.chatMessagesSent === 'number') progress.chatMessagesSent = s.chatMessagesSent;
+        }
+      }
+    } catch (e: any) {
+      console.warn(`[ProgressionManager.hydrateFromDB progress ${userId}]`, e?.message);
+    }
+
     const durable = await loadDurableProgress(userId);
     if (durable) {
       progress.stars = durable.stars;
