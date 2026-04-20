@@ -1141,10 +1141,16 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   });
 }
 
+// Target occupancy for cash tables. Keeps the game alive without hogging
+// every seat — humans walking into the lobby always see open seats at
+// every table. 5 = roughly half a 9-max, feels like a "busy" cash game.
+const CASH_TABLE_TARGET_OCCUPIED = 5;
+
 function fillWithAI(
   table: PokerTable,
   tableId: string,
-  difficulty: Difficulty = 'hard'
+  difficulty: Difficulty = 'hard',
+  targetMaxOccupied: number = CASH_TABLE_TARGET_OCCUPIED
 ): void {
   if (!aiProfiles.has(tableId)) {
     aiProfiles.set(tableId, new Map());
@@ -1159,16 +1165,20 @@ function fillWithAI(
     }
   }
 
-  // Count empty seats — always leave at least 1 open for a live player
-  const emptySeats = [];
+  const emptySeats: number[] = [];
   for (let i = 0; i < MAX_SEATS; i++) {
     if (table.seats[i].state === 'empty') {
       emptySeats.push(i);
     }
   }
 
-  // Leave 1 seat open for live players
-  const seatsToFill = emptySeats.slice(0, Math.max(0, emptySeats.length - 1));
+  // Target-based fill: only add bots up to the cap, so humans always have
+  // open seats and the table never shows "Full" (9/9) to walk-ups.
+  const currentOccupied = table.getOccupiedSeatCount();
+  const needed = Math.max(0, targetMaxOccupied - currentOccupied);
+  // And always leave at least 1 seat open regardless of cap.
+  const seatsToFill = emptySeats
+    .slice(0, Math.min(needed, Math.max(0, emptySeats.length - 1)));
 
   for (const i of seatsToFill) {
     let profile = generateRandomProfile(difficulty);
@@ -1184,6 +1194,38 @@ function fillWithAI(
     const aiPlayerId = `ai-${uuidv4()}`;
     table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true);
     profiles.set(i, profile);
+  }
+}
+
+// Trim excess AI when a table is over the occupancy cap. Only runs between
+// hands (WaitingForPlayers / HandComplete) — never mid-hand, to avoid
+// yanking seats out from under an active turn. Keeps humans untouched.
+function trimExcessAI(
+  table: PokerTable,
+  tableId: string,
+  targetMaxOccupied: number = CASH_TABLE_TARGET_OCCUPIED
+): void {
+  if (
+    table.currentPhase !== GamePhase.WaitingForPlayers &&
+    table.currentPhase !== GamePhase.HandComplete
+  ) {
+    return;
+  }
+  const occupied = table.getOccupiedSeatCount();
+  if (occupied <= targetMaxOccupied) return;
+  const aiSeats: number[] = [];
+  for (let i = 0; i < MAX_SEATS; i++) {
+    const s = table.seats[i];
+    if (s.state === 'occupied' && s.isAI) aiSeats.push(i);
+  }
+  // Remove the lowest-index AI first (arbitrary but deterministic). Keep
+  // enough AI that minimum still holds once humans-only is over cap too.
+  const toRemove = occupied - targetMaxOccupied;
+  const profiles = aiProfiles.get(tableId);
+  for (let k = 0; k < toRemove && k < aiSeats.length; k++) {
+    const i = aiSeats[k];
+    table.standUp(i);
+    if (profiles) profiles.delete(i);
   }
 }
 
@@ -1525,6 +1567,11 @@ function ensureCashTableRunning(tableId: string): void {
   if (!table) return;
   // Skip tournament tables — those run on a different schedule.
   if (tournamentTables.has(tableId)) return;
+
+  // Trim excess AI FIRST so we don't flip-flop: if autoStartNextHand /
+  // legacy fillWithAI packed the table to 9/9, drop back to the target
+  // between hands.
+  trimExcessAI(table, tableId, CASH_TABLE_TARGET_OCCUPIED);
 
   // Keep a minimum floor of bots so any human walk-up has action immediately.
   if (table.getOccupiedSeatCount() < LIVE_ROOM_MIN_OCCUPIED) {
