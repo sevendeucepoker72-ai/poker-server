@@ -1997,6 +1997,66 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   }
 }
 
+// ========== Ghost-seat cleanup ==========
+/**
+ * Stand up any seat on `tableId` currently occupied by `userId` through a
+ * different socket than `excludeSocketId` (or any socket, if no exclude).
+ * Also clears any reservedSeats entry the user has on this table.
+ *
+ * This runs before every sitDown attempt so the invariant
+ *   "one userId → at most one seat per table"
+ * holds regardless of prior disconnects / tab reloads / multi-tab logins.
+ * Fixes the "3-of-me" ghost-seat bug.
+ */
+function clearGhostSeatsForUser(userId: number, tableId: string, excludeSocketId?: string): number {
+  let cleared = 0;
+  const table = tableManager.getTable(tableId);
+  if (!table) return 0;
+
+  // 1. Scan active sessions — any prior socket of the same user on this table
+  for (const [otherSocketId, otherSession] of playerSessions) {
+    if (otherSocketId === excludeSocketId) continue;
+    if (otherSession.tableId !== tableId) continue;
+    const otherAuth = authSessions.get(otherSocketId);
+    if (!otherAuth || otherAuth.userId !== userId) continue;
+
+    const seat = table.seats[otherSession.seatIndex];
+    if (seat && seat.state === 'occupied' && !seat.isAI) {
+      // If it's their turn on the ghost seat, fold first to keep the hand moving.
+      if (table.isHandInProgress() && table.activeSeatIndex === otherSession.seatIndex) {
+        try { table.playerFold(otherSession.seatIndex); } catch {}
+      }
+      table.standUp(otherSession.seatIndex);
+      cleared++;
+    }
+    playerSessions.delete(otherSocketId);
+    // Let the ghost socket (if still connected) know so its UI lobby-returns.
+    const ghostSocket = io.sockets.sockets.get(otherSocketId);
+    if (ghostSocket) {
+      ghostSocket.leave(`table:${tableId}`);
+      ghostSocket.emit('seatVacated', { tableId, seatIndex: otherSession.seatIndex, reason: 'joined_new_seat' });
+    }
+  }
+
+  // 2. Clear any reserved seat on this table
+  const reserved = reservedSeats.get(userId);
+  if (reserved && reserved.tableId === tableId) {
+    clearTimeout(reserved.cleanupTimer);
+    reservedSeats.delete(userId);
+    const rSeat = table.seats[reserved.seatIndex];
+    if (rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
+      table.standUp(reserved.seatIndex);
+      cleared++;
+    }
+  }
+
+  if (cleared > 0) {
+    console.log(`[clearGhostSeatsForUser] userId=${userId} tableId=${tableId} cleared=${cleared}`);
+    broadcastGameState(tableId);
+  }
+  return cleared;
+}
+
 // ========== Server-wide stats tracking ==========
 let handsPlayedToday = 0;
 let handsPlayedTodayDate = new Date().toDateString();
@@ -3555,6 +3615,15 @@ Give feedback in this JSON format:
       const existingSession = playerSessions.get(socket.id);
       if (existingSession) {
         handlePlayerLeave(socket);
+      }
+
+      // Ghost-seat cleanup: stand up any other seat on this table held by
+      // the same authenticated user via a prior socket / reserved entry.
+      // Without this, disconnect+rejoin-at-new-seat leaves the old seat
+      // occupied, producing the "3-of-me at the table" bug.
+      const authForGhostClear = authSessions.get(socket.id);
+      if (authForGhostClear) {
+        clearGhostSeatsForUser(authForGhostClear.userId, tableId, socket.id);
       }
 
       // Auto-find seat if seatIndex is -1 or invalid
