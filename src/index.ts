@@ -203,16 +203,22 @@ function shallowDiff(prev: Record<string, any>, next: Record<string, any>): Reco
 function emitGameState(socket: any, state: any, forceFullState = false): void {
   const prev = lastSentState.get(socket.id);
   if (!prev || forceFullState) {
-    socket.emit('gameState', { full: true, state });
+    socket.emit('gameState', { full: true, state, _serverTs: Date.now() });
     lastSentState.set(socket.id, state);
   } else {
     const delta = shallowDiff(prev, state);
     if (delta) {
-      socket.emit('gameState', { full: false, delta });
+      socket.emit('gameState', { full: false, delta, _serverTs: Date.now() });
       // Merge into stored state so subsequent diffs are accurate
       lastSentState.set(socket.id, { ...prev, ...delta });
+    } else {
+      // Heartbeat-only emit: no state change, but we still send a stamped
+      // empty delta so the client can use it as a liveness signal and so
+      // any pending "waiting for server" UI can resolve. Previously empty
+      // deltas produced silence, which was indistinguishable from a dead
+      // connection during fast-fold/AI-only turns.
+      socket.emit('gameState', { full: false, delta: {}, _serverTs: Date.now(), _heartbeat: true });
     }
-    // If nothing changed, skip emitting entirely
   }
 }
 
@@ -308,7 +314,45 @@ interface ReservedSeat {
   handsRemaining: number; // disconnect = 20 hands to reconnect
 }
 const reservedSeats = new Map<number, ReservedSeat>();
-const SEAT_RESERVE_MS = 30 * 60 * 1000; // 30 minutes (fallback — hands are the real limit)
+
+// Deep-link ticket replay guard. The master API verifies tickets but does not
+// currently mark them as consumed, so a leaked URL from marketing/player app
+// could be replayed from multiple sockets to claim multiple seats. We hash the
+// raw token string and remember the hash locally; a second attempt within the
+// TTL window is rejected. Hashes expire after 2 hours (longer than any token
+// lifetime we issue, so legitimate retries within the token window still work
+// because the socket re-emit from the same tab doesn't create a new ticket).
+const usedTicketHashes = new Map<string, number>(); // hash -> expiresAt (ms)
+const TICKET_HASH_TTL_MS = 2 * 60 * 60 * 1000;
+function hashTicketToken(token: string): string {
+  // Tiny deterministic hash — we don't need cryptographic strength, just
+  // enough to distinguish tokens without storing the token itself in memory.
+  let h1 = 0x811c9dc5, h2 = 0;
+  for (let i = 0; i < token.length; i++) {
+    const c = token.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
+    h2 = Math.imul(h2 ^ c, 2246822519) >>> 0;
+  }
+  return h1.toString(16) + '_' + h2.toString(16) + '_' + token.length.toString(16);
+}
+function markTicketUsed(token: string): boolean {
+  const now = Date.now();
+  // Opportunistic GC — drop entries older than TTL on every touch.
+  for (const [k, exp] of usedTicketHashes) {
+    if (exp <= now) usedTicketHashes.delete(k);
+  }
+  const hash = hashTicketToken(token);
+  if (usedTicketHashes.has(hash)) return false;
+  usedTicketHashes.set(hash, now + TICKET_HASH_TTL_MS);
+  return true;
+}
+
+// Keep seats reserved for 6 hours of wall-clock time (was 30 minutes).
+// The real limiter on involuntary stand-up is DISCONNECT_HANDS_LIMIT (20 hands)
+// — this TTL is only the absolute hard cap for a silent/idle disconnect, and
+// 30 minutes was short enough that a long ride home or overnight pause kicked
+// people out of cash games. Expiry now covers typical session lengths.
+const SEAT_RESERVE_MS = 6 * 60 * 60 * 1000; // 6 hours
 const DISCONNECT_HANDS_LIMIT = 20; // player has 20 hands to reconnect
 
 // Track AI decision timeouts
@@ -2307,6 +2351,15 @@ Give feedback in this JSON format:
                 tableId: reserved.tableId,
                 seatIndex: reserved.seatIndex,
               });
+              // Send a FORCED full state to the reconnecting socket so they
+              // get hole cards + current phase + turn info immediately, not
+              // wait for the next delta. `broadcastGameState` alone uses
+              // delta compression and can send an empty frame if nothing
+              // changed during the disconnect window.
+              const rTable = tableManager.getTable(reserved.tableId);
+              if (rTable) {
+                emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
+              }
               broadcastGameState(reserved.tableId);
               console.log(`[OAuth Reserve] User ${userId} reconnected to seat ${reserved.seatIndex}`);
             } else {
@@ -2364,6 +2417,12 @@ Give feedback in this JSON format:
               seatIndex: reserved.seatIndex,
             });
 
+            // Forced full state to the reconnecting socket — see the OAuth
+            // branch above for rationale.
+            const rTable2 = tableManager.getTable(reserved.tableId);
+            if (rTable2) {
+              emitGameState(socket, getGameStateForPlayer(rTable2, reserved.seatIndex), true);
+            }
             broadcastGameState(reserved.tableId);
             console.log(`[Reserve] User ${userId} (${reserved.playerName}) reconnected to seat ${reserved.seatIndex}`);
           } else {
@@ -3215,6 +3274,18 @@ Give feedback in this JSON format:
       );
 
       if (!success) {
+        // Roll back the chip deduction we did above — otherwise the player
+        // is debited with no seat. Previously this path silently swallowed
+        // the deducted chips.
+        if (authForJoin) {
+          try {
+            await addChipsToUser(authForJoin.userId, buyIn);
+            auditLog(authForJoin.username, 'BUY_IN_REFUND', { tableId, buyIn, reason: 'sitDown_failed' });
+          } catch (e) {
+            auditLog(authForJoin.username, 'BUY_IN_REFUND_FAILED', { tableId, buyIn, error: String(e) });
+          }
+        }
+        mySlots.delete(`${socket.id}:${tableSlotKey}`);
         socket.emit('error', { message: 'Could not sit down at that seat' });
         return;
       }
@@ -3264,7 +3335,7 @@ Give feedback in this JSON format:
 
   socket.on(
     'quickPlay',
-    (data: { playerName: string; avatar?: string }) => {
+    (data: { playerName: string; avatar?: string }) => { (async () => {
       const { playerName } = data;
 
       // If the player already has a session on a table, leave it first
@@ -3295,56 +3366,87 @@ Give feedback in this JSON format:
         return;
       }
 
-      const bestTable = sorted[0];
-      const table = tableManager.getTable(bestTable.tableId);
-      if (!table) {
-        socket.emit('error', { message: 'Table not found' });
-        return;
-      }
-
-      // Find an empty seat or an AI seat
-      let targetSeat = -1;
-      for (let i = 0; i < MAX_SEATS; i++) {
-        if (table.seats[i].state === 'empty') {
-          targetSeat = i;
-          break;
-        }
-      }
-      if (targetSeat === -1) {
-        // Try to take an AI seat
+      // Race-safe seat selection with retry across candidate tables — walk
+      // the sorted list until we find one where we can ATOMICALLY claim a
+      // seat. Previous implementation picked a seat and then sat down a few
+      // statements later, so two simultaneous quickPlay calls could both
+      // pick the same empty seat and the second one silently failed.
+      let chosen: { tableId: string; table: any; targetSeat: number } | null = null;
+      for (const candidate of sorted) {
+        const table = tableManager.getTable(candidate.tableId);
+        if (!table) continue;
+        let targetSeat = -1;
         for (let i = 0; i < MAX_SEATS; i++) {
-          if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
-            table.standUp(i);
-            const profiles = aiProfiles.get(bestTable.tableId);
-            if (profiles) profiles.delete(i);
-            targetSeat = i;
-            break;
+          if (table.seats[i].state === 'empty') { targetSeat = i; break; }
+        }
+        if (targetSeat === -1) {
+          for (let i = 0; i < MAX_SEATS; i++) {
+            if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
+              table.standUp(i);
+              const profiles = aiProfiles.get(candidate.tableId);
+              if (profiles) profiles.delete(i);
+              targetSeat = i;
+              break;
+            }
           }
         }
+        if (targetSeat === -1) continue;
+        // Re-check right before commit — if another call has already claimed
+        // this seat since we found it, try the next table.
+        if (table.seats[targetSeat].state !== 'empty') continue;
+        chosen = { tableId: candidate.tableId, table, targetSeat };
+        break;
       }
-
-      if (targetSeat === -1) {
+      if (!chosen) {
         socket.emit('error', { message: 'No seats available' });
         return;
+      }
+      const { tableId: chosenTableId, table, targetSeat } = chosen;
+
+      // Server-authoritative buy-in = table minimum. For authenticated users
+      // we validate balance and deduct; anonymous users still get free chips
+      // (legacy Quick Play behavior, preserved so unauthed demo play works).
+      const authForJoin = authSessions.get(socket.id);
+      const buyIn = table.config.minBuyIn;
+      let chipsDeducted = false;
+      if (authForJoin) {
+        const dbChips = await getUserChips(authForJoin.userId);
+        if (buyIn > dbChips) {
+          socket.emit('error', { message: 'Insufficient chips' });
+          return;
+        }
+        if (!(await deductChips(authForJoin.userId, buyIn))) {
+          socket.emit('error', { message: 'Could not deduct chips — try again' });
+          return;
+        }
+        chipsDeducted = true;
+        auditLog(authForJoin.username, 'QUICKPLAY_BUY_IN_DEDUCT', { tableId: chosenTableId, buyIn });
       }
 
       const playerId = `player-${uuidv4()}`;
       const success = table.sitDown(
         targetSeat,
         playerName,
-        table.config.minBuyIn,
+        buyIn,
         playerId,
         false
       );
 
       if (!success) {
+        // Roll back deduction if the commit-time seat check failed.
+        if (chipsDeducted && authForJoin) {
+          try {
+            await addChipsToUser(authForJoin.userId, buyIn);
+            auditLog(authForJoin.username, 'QUICKPLAY_REFUND', { tableId: chosenTableId, buyIn, reason: 'sitDown_failed' });
+          } catch {}
+        }
         socket.emit('error', { message: 'Could not join table' });
         return;
       }
 
       const session: PlayerSession = {
         socketId: socket.id,
-        tableId: bestTable.tableId,
+        tableId: chosenTableId,
         seatIndex: targetSeat,
         playerName,
         playerId,
@@ -3353,14 +3455,14 @@ Give feedback in this JSON format:
         avatar: data.avatar || undefined,
       };
       playerSessions.set(socket.id, session);
-      socket.join(`table:${bestTable.tableId}`);
+      socket.join(`table:${chosenTableId}`);
 
       // Initialize progression
       progressionManager.getOrCreateProgress(playerId, playerName);
-      ensureTableProgressListener(table, bestTable.tableId);
+      ensureTableProgressListener(table, chosenTableId);
 
       // Fill with AI
-      fillWithAI(table, bestTable.tableId);
+      fillWithAI(table, chosenTableId);
 
       // Auto-start hand if not in progress
       const inProgress = table.isHandInProgress();
@@ -3375,12 +3477,12 @@ Give feedback in this JSON format:
         'gameState',
         getGameStateForPlayer(table, targetSeat)
       );
-      broadcastGameState(bestTable.tableId);
+      broadcastGameState(chosenTableId);
       sendProgressToPlayer(socket.id);
 
       // Schedule AI if it's an AI's turn
-      scheduleAIAction(bestTable.tableId);
-    }
+      scheduleAIAction(chosenTableId);
+    })(); }
   );
 
   /**
@@ -3723,6 +3825,11 @@ Give feedback in this JSON format:
           socket.emit('loginResult', { success: false, error: 'Missing token' });
           return;
         }
+        // Ticket replay guard — reject if this exact token has been used already.
+        if (!markTicketUsed(data.token)) {
+          socket.emit('loginResult', { success: false, error: 'Token already used — please request a new link' });
+          return;
+        }
 
         const MASTER_API_BASE =
           process.env.MASTER_API_URL ||
@@ -3830,6 +3937,11 @@ Give feedback in this JSON format:
           socket.emit('error', { message: 'Missing token' });
           return;
         }
+        // Ticket replay guard for the waitlist path.
+        if (!markTicketUsed(data.token)) {
+          socket.emit('error', { message: 'Token already used — please request a new link' });
+          return;
+        }
 
         // 1) Verify token with master API
         const MASTER_API_BASE =
@@ -3856,6 +3968,43 @@ Give feedback in this JSON format:
         const remoteUserId = claims.userId;
         if (!remoteUserId) {
           socket.emit('error', { message: 'Token missing userId' });
+          return;
+        }
+
+        // Resolve local user + set auth session BEFORE seating. Previously
+        // this handler seated the player purely on the ticket claim, without
+        // confirming authSessions[socket.id] — if the parallel oauthLogin from
+        // the client never completed (stale refresh token, server hiccup), the
+        // player would be visually seated but unable to take any later action
+        // that requires auth (cash-out, switch tables). Resolving locally here
+        // closes that gap: waitlist seat ALWAYS comes with a real auth session.
+        if (!authSessions.has(socket.id)) {
+          try {
+            const meRes = await fetch(`${MASTER_API_BASE}/users/${remoteUserId}/me`);
+            if (meRes.ok) {
+              const meJson: any = await meRes.json();
+              const masterUser = meJson?.data || meJson;
+              const phone = masterUser.phoneNumber || masterUser.phone_number;
+              if (phone) {
+                const { rows: urows } = await getPool().query(
+                  'SELECT id, username FROM users WHERE username = $1 LIMIT 1',
+                  [phone]
+                );
+                if (urows[0]) {
+                  authSessions.set(socket.id, { userId: urows[0].id, username: urows[0].username });
+                }
+              }
+            }
+          } catch (e) {
+            console.warn('[joinWithWaitlistContext] auth-bootstrap failed:', (e as Error).message);
+          }
+        }
+
+        // If we still don't have an auth session after the bootstrap attempt,
+        // abort rather than seating an unauthenticated player who will then
+        // silently fail on every subsequent action.
+        if (!authSessions.has(socket.id)) {
+          socket.emit('error', { message: 'Authentication could not be established — please sign in and try again.' });
           return;
         }
 
@@ -5171,9 +5320,40 @@ Give feedback in this JSON format:
       return;
     }
 
-    const playerId = `player-${uuidv4()}`;
     const actualBuyIn = Math.max(table.config.minBuyIn, buyIn || table.config.minBuyIn);
-    table.sitDown(openSeat, playerName, actualBuyIn, playerId, false);
+
+    // Server-authoritative chip deduction for authenticated users — previously
+    // this path bypassed deductChips entirely, letting a player multi-table
+    // the same chips across private invites.
+    const authForJoin = authSessions.get(socket.id);
+    let chipsDeducted = false;
+    if (authForJoin) {
+      const dbChips = await getUserChips(authForJoin.userId);
+      if (actualBuyIn > dbChips) {
+        socket.emit('joinError', { message: 'Insufficient chips for this table.' });
+        return;
+      }
+      if (!(await deductChips(authForJoin.userId, actualBuyIn))) {
+        socket.emit('joinError', { message: 'Could not deduct chips — try again.' });
+        return;
+      }
+      chipsDeducted = true;
+      auditLog(authForJoin.username, 'INVITE_BUY_IN_DEDUCT', { tableId, buyIn: actualBuyIn });
+    }
+
+    const playerId = `player-${uuidv4()}`;
+    const success = table.sitDown(openSeat, playerName, actualBuyIn, playerId, false);
+
+    if (!success) {
+      if (chipsDeducted && authForJoin) {
+        try {
+          await addChipsToUser(authForJoin.userId, actualBuyIn);
+          auditLog(authForJoin.username, 'INVITE_REFUND', { tableId, buyIn: actualBuyIn, reason: 'sitDown_failed' });
+        } catch {}
+      }
+      socket.emit('joinError', { message: 'Could not seat you at that table.' });
+      return;
+    }
 
     const session: PlayerSession = {
       socketId: socket.id, tableId, seatIndex: openSeat, playerName, playerId,
