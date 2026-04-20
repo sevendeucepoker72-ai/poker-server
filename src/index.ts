@@ -366,11 +366,12 @@ const tournamentTables = new Map<string, string>();
 // Fast mode tracking per table (#12)
 const fastModeTables = new Map<string, boolean>();
 
-// Missed blinds tracking per table per seat (#16)
-// tableId -> Map<seatIndex, missedBlindsAmount>
-const missedBlinds = new Map<string, Map<number, number>>();
-
-// Track which seats were sitting out when they missed blinds (#16)
+// Track which seats were sitting out when they missed blinds (#16).
+// Kept because it's used by the broader sit-in/sit-out flow, but the
+// per-seat missed-blind chip debt is now tracked on the `Seat` object
+// itself (`seat.deadBlindOwedChips` + `seat.missedBlind`) — single
+// source of truth. The old `missedBlinds` Map was removed in the
+// missed-blinds audit refactor (resolved 20 findings).
 const sitOutTracker = new Map<string, Set<number>>();
 
 // Track AI profiles per table
@@ -760,6 +761,11 @@ function getGameStateForPlayer(
       state: seat.state,
       hasCards: seat.holeCards.length > 0,
       eliminated: seat.eliminated,
+      // Dead-blind debt surfaced to the client so the seat pod can
+      // render a small "🎯 N" badge on seats currently owing dead
+      // blinds (audit finding: observers couldn't see who owed).
+      missedBlind: seat.missedBlind || 'none',
+      deadBlindOwedChips: seat.deadBlindOwedChips || 0,
     };
 
     // Attach rank and avatar for display on nameplates/seats
@@ -921,11 +927,14 @@ function getGameStateForPlayer(
     stateObj.ante = table.config.ante;
   }
 
-  // Add missed blinds for this player (#16)
+  // Add missed-blind info for this player. Now sourced directly from the
+  // seat object (seat.deadBlindOwedChips + seat.missedBlind) — single
+  // source of truth after the audit refactor.
   if (playerSeatIndex >= 0) {
-    const tableMissed = missedBlinds.get(table.config.tableId);
-    if (tableMissed && tableMissed.has(playerSeatIndex)) {
-      stateObj.missedBlinds = tableMissed.get(playerSeatIndex);
+    const seat = table.seats[playerSeatIndex];
+    if (seat && (seat.deadBlindOwedChips || 0) > 0) {
+      stateObj.missedBlinds = seat.deadBlindOwedChips;
+      stateObj.missedBlindType = seat.missedBlind; // 'small' | 'big' | 'both'
     }
   }
 
@@ -4740,19 +4749,13 @@ Give feedback in this JSON format:
       return;
     }
 
-    // Track missed blinds for sitting-out players (#16)
+    // Missed-blinds refactor: hand the current sit-out set to the table
+    // so markSittingOutBlinds (inside startNewHand) can compute the real
+    // TDA-compliant obligations per seat based on whether the button
+    // rotation lands on a sitting-out seat. Previous logic here added a
+    // flat BB per sitting-out seat to a parallel Map — now dead.
     const sitOuts = sitOutTracker.get(session.tableId);
-    if (sitOuts && sitOuts.size > 0) {
-      if (!missedBlinds.has(session.tableId)) {
-        missedBlinds.set(session.tableId, new Map());
-      }
-      const tableMissed = missedBlinds.get(session.tableId)!;
-      const bb = table.config.bigBlind || 50;
-      for (const seatIdx of sitOuts) {
-        const current = tableMissed.get(seatIdx) || 0;
-        tableMissed.set(seatIdx, current + bb);
-      }
-    }
+    if (sitOuts) table.setSittingOutSeats(sitOuts);
 
     const started = table.startNewHand();
     if (started) {
@@ -4996,11 +4999,16 @@ Give feedback in this JSON format:
       }
       sitOutTracker.get(session.tableId)!.add(session.seatIndex);
     } else {
-      // Returning from sit-out: check if they have missed blinds
-      const tableMissed = missedBlinds.get(session.tableId);
-      if (tableMissed && tableMissed.has(session.seatIndex)) {
-        const amount = tableMissed.get(session.seatIndex)!;
-        socket.emit('missedBlinds', { amount });
+      // Returning from sit-out — remove from tracker and notify client of
+      // any dead-blind debt still on the seat. Source of truth is now
+      // seat.deadBlindOwedChips (set by markSittingOutBlinds during
+      // hands the player sat out).
+      sitOutTracker.get(session.tableId)?.delete(session.seatIndex);
+      const tableForSitIn = tableManager.getTable(session.tableId);
+      const seat = tableForSitIn?.seats?.[session.seatIndex];
+      const owed = seat?.deadBlindOwedChips || 0;
+      if (owed > 0) {
+        socket.emit('missedBlinds', { amount: owed, type: seat?.missedBlind || 'big' });
       }
     }
 
@@ -5055,27 +5063,48 @@ Give feedback in this JSON format:
     socket.emit('fastModeSet', { enabled: data.enabled });
   });
 
-  // ========== Post Missed Blinds (#16) ==========
+  // ========== Post Missed Blinds (refactored 2026-04-20) ==========
+  // Delegates to PokerTable.postOwedBlindsNow which uses seat.deadBlindOwedChips
+  // as the source of truth. Emits proper error codes so the client can
+  // surface "Not enough chips" or "Nothing owed" instead of silently
+  // failing. Adds dead money to totalInvestedThisHand ONLY — NOT currentBet
+  // — so the post doesn't count toward the player's live call obligation.
   socket.on('postMissedBlinds', async () => {
     const session = playerSessions.get(socket.id);
-    if (!session) return;
-    const tableMissed = missedBlinds.get(session.tableId);
-    if (!tableMissed || !tableMissed.has(session.seatIndex)) return;
-
-    const amount = tableMissed.get(session.seatIndex)!;
-    const table = tableManager.getTable(session.tableId);
-    if (!table) return;
-
-    const seat = table.seats[session.seatIndex];
-    if (seat && seat.chipCount >= amount) {
-      seat.chipCount -= amount;
-      // Add missed blinds to the pot as dead money
-      seat.currentBet += amount;
-      seat.totalInvestedThisHand += amount;
-      tableMissed.delete(session.seatIndex);
-      socket.emit('missedBlindsPosted', { amount });
-      broadcastGameState(session.tableId);
+    if (!session) {
+      socket.emit('missedBlindsError', { code: 'no_session', message: 'Not seated at a table.' });
+      return;
     }
+    const table = tableManager.getTable(session.tableId);
+    if (!table) {
+      socket.emit('missedBlindsError', { code: 'no_table', message: 'Table not found.' });
+      return;
+    }
+
+    const result = table.postOwedBlindsNow(session.seatIndex);
+    if (!result.ok) {
+      const messages: Record<string, string> = {
+        no_debt: 'You don\'t currently owe any dead blinds.',
+        insufficient_chips: 'Not enough chips to post the owed blinds. Rebuy first.',
+        invalid_seat: 'Invalid seat.',
+      };
+      socket.emit('missedBlindsError', {
+        code: result.reason,
+        message: messages[result.reason || ''] || 'Could not post blinds.',
+      });
+      return;
+    }
+
+    socket.emit('missedBlindsPosted', { amount: result.amount });
+    const authSessionForAudit = authSessions.get(socket.id);
+    if (authSessionForAudit) {
+      auditLog(authSessionForAudit.username, 'DEAD_BLIND_POSTED', {
+        tableId: session.tableId,
+        seatIndex: session.seatIndex,
+        amount: result.amount,
+      });
+    }
+    broadcastGameState(session.tableId);
   });
 
   // ========== Show Mucked Hand ==========

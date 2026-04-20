@@ -57,6 +57,14 @@ export interface Seat {
   timeBankRemaining: number;
   /** TDA Rule 6-9: Track if player missed their blind obligation */
   missedBlind: 'none' | 'small' | 'big' | 'both';
+  /**
+   * TDA Rule 6-9/6-10: actual chips owed as dead-blind debt. Accumulates
+   * across multiple missed hands (1 BB per skipped hand minimum). Used as
+   * source of truth for the "Post Blinds to re-enter" payment. When this is
+   * non-zero, `missedBlind` summarizes which categories; both clear on
+   * successful post.
+   */
+  deadBlindOwedChips: number;
 }
 
 export interface TableConfig {
@@ -146,6 +154,7 @@ function createEmptySeat(index: number): Seat {
     playerId: '',
     timeBankRemaining: 30,
     missedBlind: 'none',
+    deadBlindOwedChips: 0,
   };
 }
 
@@ -239,12 +248,24 @@ export class PokerTable extends EventEmitter {
     return true;
   }
 
-  /** TDA Rule 6-9: Mark a seat as having missed their blind obligation */
+  /**
+   * TDA Rule 6-9: Mark a seat as having missed their blind obligation.
+   * Updates the status flag (`missedBlind`) AND accumulates the chip debt
+   * (`deadBlindOwedChips`) so a seat that sits out multiple rotations
+   * correctly owes multiple BB+SB rather than a single BB.
+   *
+   * Accepts seats in any state — including `sitting_out` — because the
+   * whole point is that a sitting-out player is the one who owes. Was
+   * previously gated on `state === 'occupied'` which meant the function
+   * could never be called on the seats that actually need marking. That
+   * gating was the root cause of the dead-code bug flagged in audit #1.
+   */
   markMissedBlind(seatIndex: number, blindType: 'small' | 'big'): void {
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return;
     const seat = this.seats[seatIndex];
-    if (seat.state !== 'occupied') return;
+    if (seat.state === 'empty' || seat.eliminated) return;
 
+    // Advance the flag. 'both' is terminal until cleared.
     if (seat.missedBlind === 'none') {
       seat.missedBlind = blindType;
     } else if (
@@ -253,6 +274,111 @@ export class PokerTable extends EventEmitter {
     ) {
       seat.missedBlind = 'both';
     }
+    // Accumulate chip debt. Small = smallBlind, Big = bigBlind.
+    const delta = blindType === 'big' ? this.config.bigBlind : this.config.smallBlind;
+    seat.deadBlindOwedChips = (seat.deadBlindOwedChips || 0) + delta;
+  }
+
+  /**
+   * Externally-provided set of seat indices currently sitting out. Populated
+   * by the socket layer (sitOutTracker) ahead of each hand because the
+   * current codebase tracks sit-out status on the SESSION, not the seat.
+   * Reset each hand so stale seats don't bleed forward.
+   */
+  private _sittingOutSeats: Set<number> = new Set();
+  public setSittingOutSeats(indices: Iterable<number>): void {
+    this._sittingOutSeats = new Set(indices);
+  }
+
+  /**
+   * Mark seats in _sittingOutSeats that would naturally be due SB/BB this
+   * hand with the appropriate missed-blind debt. Called from startNewHand
+   * BEFORE postBlinds so the blind rotation can bypass them while still
+   * recording their obligation.
+   *
+   * Strategy: compute the positions the SB and BB WOULD be if every
+   * non-eliminated seat (playing or sitting out) participated in the
+   * button rotation. If those positions land on a sitting-out seat,
+   * mark it. This mirrors the TDA intent — blinds are a function of
+   * seat rotation, not of current turn eligibility.
+   */
+  protected markSittingOutBlinds(): void {
+    if (this._sittingOutSeats.size === 0) return;
+
+    const allPlayable = this.seats
+      .map((s, idx) => ({ s, idx }))
+      .filter(({ s, idx }) =>
+        (s.state === 'occupied' || this._sittingOutSeats.has(idx))
+        && !s.eliminated);
+    if (allPlayable.length < 2) return;
+
+    const btn = this.dealerButtonSeat;
+    if (btn < 0) return;
+
+    const orderedFromButton: number[] = [];
+    for (let offset = 1; offset <= MAX_SEATS && orderedFromButton.length < allPlayable.length; offset++) {
+      const probe = (btn + offset) % MAX_SEATS;
+      if (allPlayable.find((p) => p.idx === probe)) orderedFromButton.push(probe);
+    }
+
+    const isHeadsUp = allPlayable.length === 2;
+    const sbSeat = isHeadsUp ? btn : orderedFromButton[0];
+    const bbSeat = isHeadsUp ? orderedFromButton[0] : orderedFromButton[1];
+
+    // Mark ONLY if that position is in our sitting-out set.
+    if (sbSeat != null && this._sittingOutSeats.has(sbSeat)) {
+      this.markMissedBlind(sbSeat, 'small');
+    }
+    if (bbSeat != null && this._sittingOutSeats.has(bbSeat)) {
+      this.markMissedBlind(bbSeat, 'big');
+    }
+  }
+
+  /**
+   * Clear dead-blind debt on a seat. Called after successful posting
+   * (on-demand via postOwedBlindsNow, OR automatically from the blind
+   * loop in postBlinds). Idempotent.
+   */
+  clearDeadBlind(seatIndex: number): void {
+    if (seatIndex < 0 || seatIndex >= MAX_SEATS) return;
+    const seat = this.seats[seatIndex];
+    seat.missedBlind = 'none';
+    seat.deadBlindOwedChips = 0;
+  }
+
+  /**
+   * On-demand payment of owed dead blinds. Called from the
+   * `postMissedBlinds` socket handler when the player taps "Post Blinds".
+   *
+   * Returns:
+   *   { ok: true, amount } — chips deducted, debt cleared, pot incremented
+   *   { ok: false, reason } — 'no_debt' | 'insufficient_chips' | 'invalid_seat'
+   *
+   * The deducted chips go into the pot as DEAD money: they increment
+   * `totalInvestedThisHand` but NOT `currentBet`, so they don't count
+   * toward the player's call obligation (TDA Rule 6-9).
+   */
+  postOwedBlindsNow(seatIndex: number): { ok: boolean; amount?: number; reason?: string } {
+    if (seatIndex < 0 || seatIndex >= MAX_SEATS) return { ok: false, reason: 'invalid_seat' };
+    const seat = this.seats[seatIndex];
+    if (!seat || seat.state === 'empty') return { ok: false, reason: 'invalid_seat' };
+    const owed = seat.deadBlindOwedChips || 0;
+    if (owed <= 0) return { ok: false, reason: 'no_debt' };
+    if (seat.chipCount < owed) return { ok: false, reason: 'insufficient_chips' };
+
+    seat.chipCount -= owed;
+    seat.totalInvestedThisHand += owed;
+    // No currentBet change — dead money doesn't count toward the call.
+    if (seat.chipCount === 0) seat.allIn = true;
+    this.clearDeadBlind(seatIndex);
+    this.emit('blindPosted', { seatIndex, amount: owed, type: 'dead' });
+    return { ok: true, amount: owed };
+  }
+
+  /** Quick read-only check — used by socket handlers + clients. */
+  hasDeadBlindDebt(seatIndex: number): boolean {
+    if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
+    return (this.seats[seatIndex]?.deadBlindOwedChips || 0) > 0;
   }
 
   // ========== Hand Flow ==========
@@ -305,6 +431,13 @@ export class PokerTable extends EventEmitter {
 
     // Move dealer button
     this.moveDealerButton();
+
+    // Missed-blinds refactor: BEFORE posting blinds, mark any sitting-out
+    // seats whose "natural" position this hand would be SB or BB. The
+    // debt accumulates against their deadBlindOwedChips so they owe the
+    // proper amount when they sit back in. Seats that are active this
+    // hand won't be marked here — they'll post live blinds in postBlinds.
+    this.markSittingOutBlinds();
 
     // Post blinds
     this.postBlinds();
@@ -421,35 +554,35 @@ export class PokerTable extends EventEmitter {
       }
     }
 
-    // TDA Rule 6-9: Handle missed blinds - players returning must post
+    // TDA Rule 6-9: Handle missed blinds — players returning with debt
+    // auto-pay from their stack at the start of the hand (if they have
+    // enough). Uses `deadBlindOwedChips` as the authoritative amount
+    // (accumulates across multiple missed hands). Skip seats that are
+    // themselves posting SB/BB this hand — they're paying live.
     for (const seatIdx of activePlayers) {
       const seat = this.seats[seatIdx];
-      if (seat.missedBlind !== 'none' && seatIdx !== sbSeat && seatIdx !== bbSeat) {
-        // Player missed blind(s) - post dead blind (goes to pot, doesn't count toward bet)
-        let deadAmount = 0;
-        if (seat.missedBlind === 'both') {
-          deadAmount = this.config.smallBlind + this.config.bigBlind;
-        } else if (seat.missedBlind === 'big') {
-          deadAmount = this.config.bigBlind;
-        } else if (seat.missedBlind === 'small') {
-          deadAmount = this.config.smallBlind;
-        }
-        if (deadAmount > 0) {
-          const postAmount = Math.min(deadAmount, seat.chipCount);
+      const owed = seat.deadBlindOwedChips || 0;
+      if (owed > 0 && seatIdx !== sbSeat && seatIdx !== bbSeat) {
+        const postAmount = Math.min(owed, seat.chipCount);
+        if (postAmount > 0) {
           seat.chipCount -= postAmount;
           seat.totalInvestedThisHand += postAmount;
-          // Dead blind doesn't count toward currentBet - it's dead money
-          if (seat.chipCount === 0) {
-            seat.allIn = true;
-          }
+          // Dead blind doesn't count toward currentBet — it's dead money
+          if (seat.chipCount === 0) seat.allIn = true;
           this.emit('blindPosted', { seatIndex: seatIdx, amount: postAmount, type: 'dead' });
           this.actionLog.push({
             seatIndex: seatIdx,
             playerName: seat.playerName,
             action: `posted dead blind ${postAmount}`,
           });
+          // Track remaining debt (if seat couldn't cover the full amount
+          // e.g., short stack). The unpaid remainder stays on the seat
+          // and will be attempted again next hand.
+          seat.deadBlindOwedChips = Math.max(0, owed - postAmount);
+          if (seat.deadBlindOwedChips === 0) {
+            seat.missedBlind = 'none';
+          }
         }
-        seat.missedBlind = 'none'; // Clear after posting
       }
     }
 
