@@ -231,6 +231,69 @@ function getPreFlopHandRank(holeCards: Card[]): number {
   return Math.min(1.0, chen / 20);
 }
 
+/**
+ * Generic hand-strength estimator for non-community-card variants.
+ * Used for stud (3rd-7th street), razz, draw games, and badugi — where the
+ * Hold'em-centric chen formula and Monte Carlo flop equity don't apply.
+ *
+ * Returns 0 (weak) to 1 (strong) regardless of variant. Lowball variants
+ * invert the scale so the AI treats a low hand as "strong".
+ */
+function getVariantHandStrength(holeCards: Card[], variantId: string, isLowball: boolean): number {
+  if (!holeCards || holeCards.length === 0) return 0;
+
+  // Lowball variants: count cards ≤ 8 and penalize pairs (badugi: penalize
+  // duplicate suits). Higher low-card count = better expected low hand.
+  if (isLowball) {
+    const ranks = holeCards.map((c) => c.rank);
+    const suits = holeCards.map((c) => c.suit);
+    const uniqueLowRanks = new Set(ranks.filter((r) => r <= 8 || r === 14)).size; // Rank.Ace === 14
+    const pairs = ranks.length - new Set(ranks).size;
+    const dupSuits = suits.length - new Set(suits).size;
+    if (variantId === 'badugi') {
+      // Best badugi = 4 unique suits + 4 unique low ranks
+      const uniqueSuits = new Set(suits).size;
+      const score = (uniqueLowRanks * 0.12) + (uniqueSuits * 0.15) - (pairs * 0.05);
+      return Math.max(0, Math.min(1, score));
+    }
+    if (variantId === 'triple-draw') {
+      // 2-7 lowball: no aces (ace is HIGH), no straights/flushes, no pairs
+      const lowNoAce = ranks.filter((r) => r >= 2 && r <= 7).length;
+      const score = (lowNoAce * 0.13) - (pairs * 0.12) - (dupSuits >= 4 ? 0.15 : 0);
+      return Math.max(0, Math.min(1, score + 0.2));
+    }
+    // razz: best 5 of 7 low, A-2-3-4-5 is nuts
+    const score = (uniqueLowRanks * 0.12) - (pairs * 0.08);
+    return Math.max(0, Math.min(1, score + 0.1));
+  }
+
+  // High-card variants (seven-card-stud, seven-card-stud-hi-lo, five-card-draw).
+  // Use pair structure + high cards as a rough strength signal.
+  const ranks = holeCards.map((c) => c.rank);
+  const uniqueRanks = new Set(ranks).size;
+  const pairs = ranks.length - uniqueRanks;
+  const avgRank = ranks.reduce((a, b) => a + b, 0) / ranks.length; // Rank.Ace=14, Two=2
+  // Flush / three-of-a-kind bonus (crude)
+  const suitCounts: Record<string, number> = {};
+  for (const c of holeCards) suitCounts[c.suit] = (suitCounts[c.suit] || 0) + 1;
+  const maxSuit = Math.max(...Object.values(suitCounts));
+  const flushDraw = maxSuit >= 4 ? 0.15 : maxSuit >= 3 ? 0.08 : 0;
+
+  const rankCounts: Record<number, number> = {};
+  for (const r of ranks) rankCounts[r] = (rankCounts[r] || 0) + 1;
+  const maxSame = Math.max(...Object.values(rankCounts));
+  let handBonus = 0;
+  if (maxSame >= 4) handBonus = 0.85;          // quads
+  else if (maxSame === 3 && pairs >= 1) handBonus = 0.75; // full house (if 7 cards + pair)
+  else if (maxSame === 3) handBonus = 0.55;    // trips
+  else if (pairs >= 2) handBonus = 0.40;       // two pair
+  else if (pairs === 1) handBonus = 0.25;      // one pair
+
+  const highCardBonus = (avgRank - 7) * 0.03;  // favors high average rank
+  const score = handBonus + flushDraw + highCardBonus;
+  return Math.max(0.05, Math.min(1, score));
+}
+
 // ============================================================
 // Post-flop hand strength with Monte Carlo equity
 // ============================================================
@@ -543,7 +606,27 @@ export function decideAction(
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
-  const isPreFlop = table.currentPhase === GamePhase.PreFlop;
+  // A "pre-action" phase is the first betting round of a hand — where we have
+  // minimal info and lean on starting-hand strength heuristics. Covers Hold'em
+  // PreFlop, stud ThirdStreet, and the first betting round of draw games (Bet1).
+  const isPreFlop =
+    table.currentPhase === GamePhase.PreFlop ||
+    table.currentPhase === GamePhase.ThirdStreet ||
+    table.currentPhase === GamePhase.Bet1;
+  const isStudStreet =
+    table.currentPhase === GamePhase.ThirdStreet ||
+    table.currentPhase === GamePhase.FourthStreet ||
+    table.currentPhase === GamePhase.FifthStreet ||
+    table.currentPhase === GamePhase.SixthStreet ||
+    table.currentPhase === GamePhase.SeventhStreet;
+  const isDrawBet =
+    table.currentPhase === GamePhase.Bet1 ||
+    table.currentPhase === GamePhase.Bet2 ||
+    table.currentPhase === GamePhase.Bet3 ||
+    table.currentPhase === GamePhase.Bet4;
+  const variantId: string = (table as any).variantId || 'texas-holdem';
+  const isLowball = variantId === 'razz' || variantId === 'triple-draw' || variantId === 'badugi';
+  const isStudFamily = variantId === 'seven-card-stud' || variantId === 'seven-card-stud-hi-lo' || variantId === 'razz';
   const callAmount = table.getCallAmount(seat);
   const totalPot = table.getTotalPot();
   const potOdds = totalPot > 0 ? callAmount / (totalPot + callAmount) : 0;
@@ -566,7 +649,11 @@ export function decideAction(
   // ============================================================
   let handStrength: number;
 
-  if (isPreFlop) {
+  if (isStudFamily || isDrawBet) {
+    // Non-community-card variants: use a generic hand-strength heuristic based
+    // on the variant's own evaluator (or a lowball-aware one for razz/badugi/2-7).
+    handStrength = getVariantHandStrength(seat.holeCards, variantId, isLowball);
+  } else if (isPreFlop) {
     handStrength = getPreFlopHandRank(seat.holeCards);
   } else {
     handStrength = getPostFlopStrength(

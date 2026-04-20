@@ -1,5 +1,8 @@
 export interface PlayerProgress {
   playerId: string;
+  /** Numeric users.id in Postgres — set by ProgressionManager.hydrateFromDB.
+   *  Required for persistStars and other DB writes. May be 0 for AI / unauth. */
+  userId?: number;
   playerName: string;
   level: number;
   xp: number;

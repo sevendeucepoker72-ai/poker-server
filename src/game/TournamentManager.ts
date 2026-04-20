@@ -514,10 +514,17 @@ export class TournamentManager {
     return t.players.filter(p => !p.eliminated && t.playerTableMap.get(p.playerId) === tableId);
   }
 
+  /** Minimum players per table when multiple tables are in play */
+  static readonly MIN_TABLE_PLAYERS = 5;
+
   /**
    * Check if tables should be combined and return the table to break.
-   * Rule: if total alive players <= (activeTableCount - 1) * 9, break smallest table.
-   * Returns { breakTableId, moves: [{playerId, fromTable, toTable, toSeat}] } or null.
+   *
+   * Rules:
+   * 1. If total alive players fit in fewer tables, break the smallest.
+   * 2. Any table with fewer than MIN_TABLE_PLAYERS (5) must be broken
+   *    when multiple tables are still in play.
+   * 3. The final table (only 1 table left) plays with any number of players.
    */
   checkRebalance(tournamentId: string): {
     breakTableId: string;
@@ -530,25 +537,38 @@ export class TournamentManager {
     const tableCount = t.tableIds.length;
     const threshold = (tableCount - 1) * 9;
 
-    if (alive > threshold) return null;
-
-    // Find the table with fewest alive players — that's the one to break
-    let smallestTable = '';
-    let smallestCount = Infinity;
+    // Build table population list
+    const tablePops: { tid: string; count: number }[] = [];
     for (const tid of t.tableIds) {
-      const count = this.getAlivePlayersOnTable(tournamentId, tid).length;
-      if (count < smallestCount) {
-        smallestCount = count;
-        smallestTable = tid;
+      tablePops.push({ tid, count: this.getAlivePlayersOnTable(tournamentId, tid).length });
+    }
+    tablePops.sort((a, b) => a.count - b.count);
+
+    // Rule 1: can we fit everyone in fewer tables?
+    if (alive <= threshold) {
+      const smallest = tablePops[0];
+      if (smallest) {
+        return {
+          breakTableId: smallest.tid,
+          playersToMove: this.getAlivePlayersOnTable(tournamentId, smallest.tid)
+            .map(p => ({ playerId: p.playerId, playerName: p.playerName })),
+        };
       }
     }
 
-    if (!smallestTable) return null;
+    // Rule 2: any table with < 5 players must be broken (unless it's the final table)
+    if (tableCount > 1) {
+      const underMin = tablePops.find(tp => tp.count > 0 && tp.count < TournamentManager.MIN_TABLE_PLAYERS);
+      if (underMin) {
+        return {
+          breakTableId: underMin.tid,
+          playersToMove: this.getAlivePlayersOnTable(tournamentId, underMin.tid)
+            .map(p => ({ playerId: p.playerId, playerName: p.playerName })),
+        };
+      }
+    }
 
-    const playersToMove = this.getAlivePlayersOnTable(tournamentId, smallestTable)
-      .map(p => ({ playerId: p.playerId, playerName: p.playerName }));
-
-    return { breakTableId: smallestTable, playersToMove };
+    return null;
   }
 
   /** Set turbo mode for fast AI */

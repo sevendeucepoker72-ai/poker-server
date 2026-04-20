@@ -1,4 +1,5 @@
 import { PlayerProgress, Mission, MissionType } from './PlayerProgress';
+import { persistStars as dbPersistStars, loadDurableProgress, loadInventory } from '../auth/authManager';
 
 // ── Ranked / ELO constants ──────────────────────────────────────────────────
 const ELO_START = 500;
@@ -272,6 +273,43 @@ export class ProgressionManager {
     return this.progressMap.get(playerId);
   }
 
+  /**
+   * Hydrate a player's progress entry from Postgres. Call once after auth
+   * (authWithTicket, oauthLogin, etc.) so stars + durable fields reflect DB.
+   * Idempotent — safe to call multiple times.
+   */
+  async hydrateFromDB(playerId: string, userId: number): Promise<void> {
+    const progress = this.progressMap.get(playerId);
+    if (!progress) return;
+    progress.userId = userId;
+    const durable = await loadDurableProgress(userId);
+    if (durable) {
+      progress.stars = durable.stars;
+      progress.dailyLoginStreak = durable.loginStreak;
+      // Don't clobber equippedCardBack / equippedTableTheme here — those are
+      // sourced from user_inventory via loadInventory below.
+    }
+    const inv = await loadInventory(userId);
+    if (inv.length > 0) {
+      const cardBacks = inv.filter((r) => r.item_type === 'card_back').map((r) => r.item_id);
+      const themes    = inv.filter((r) => r.item_type === 'theme').map((r) => r.item_id);
+      const equippedCB = inv.find((r) => r.item_type === 'card_back' && r.equipped)?.item_id;
+      const equippedTheme = inv.find((r) => r.item_type === 'theme' && r.equipped)?.item_id;
+      if (cardBacks.length > 0) progress.ownedCardBacks = Array.from(new Set([...progress.ownedCardBacks, ...cardBacks]));
+      if (themes.length > 0) progress.ownedThemes = Array.from(new Set([...progress.ownedThemes, ...themes]));
+      if (equippedCB) progress.equippedCardBack = equippedCB;
+      if (equippedTheme) progress.equippedTableTheme = equippedTheme;
+    }
+  }
+
+  /** Push the current stars balance to Postgres. Fire-and-forget. */
+  private persistStars(progress: PlayerProgress): void {
+    if (!progress.userId) return;
+    dbPersistStars(progress.userId, progress.stars).catch((e) =>
+      console.warn(`[ProgressionManager.persistStars ${progress.userId}]`, e?.message)
+    );
+  }
+
   // Consume pending events (levelUp, achievements, missionComplete)
   consumeEvents(playerId: string): ProgressEvent[] {
     const events = this.pendingEvents.get(playerId) || [];
@@ -301,6 +339,7 @@ export class ProgressionManager {
       const bonusStars = progress.level * 5;
       progress.chips += bonusChips;
       progress.stars += bonusStars;
+      this.persistStars(progress);
 
       this.pushEvent(playerId, {
         type: 'levelUp',
@@ -457,6 +496,7 @@ export class ProgressionManager {
     if (progress.stars < cost) return { success: false, error: 'Not enough stars' };
 
     progress.stars -= cost;
+    this.persistStars(progress);
     progress.ownedThemes.push(themeId);
     return { success: true };
   }
@@ -575,6 +615,7 @@ export class ProgressionManager {
         progress.achievements.push('royal_flush');
         progress.chips += achDef.reward.chips;
         progress.stars += (achDef.reward.stars || 0);
+        this.persistStars(progress);
         this.addXP(playerId, achDef.reward.xp);
 
         this.pushEvent(playerId, {
@@ -647,6 +688,7 @@ export class ProgressionManager {
     progress.chips += mission.reward.chips;
     if (mission.reward.stars) {
       progress.stars += mission.reward.stars;
+      this.persistStars(progress);
     }
     this.addXP(playerId, mission.reward.xp);
 
@@ -680,6 +722,7 @@ export class ProgressionManager {
 
     progress.chips += bonusChips;
     progress.stars += bonusStars;
+    this.persistStars(progress);
 
     return {
       success: true,
@@ -702,6 +745,7 @@ export class ProgressionManager {
         progress.chips += achDef.reward.chips;
         if (achDef.reward.stars) {
           progress.stars += achDef.reward.stars;
+          this.persistStars(progress);
         }
         this.addXP(playerId, achDef.reward.xp);
 

@@ -35,7 +35,8 @@ import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats } from './auth/authManager';
+import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, loadDurableProgress } from './auth/authManager';
+import { validateOAuthToken } from './auth/oauthValidator';
 import {
   initClubTables,
   createClub,
@@ -118,6 +119,20 @@ const io = new Server(httpServer, {
 
 const PORT = parseInt(process.env.PORT || '3001');
 
+// Redis adapter for Socket.io (optional — for multi-instance scaling)
+if (process.env.REDIS_URL) {
+  import('@socket.io/redis-adapter').then(({ createAdapter }) => {
+    import('redis').then(({ createClient }) => {
+      const pubClient = createClient({ url: process.env.REDIS_URL });
+      const subClient = pubClient.duplicate();
+      Promise.all([pubClient.connect(), subClient.connect()]).then(() => {
+        io.adapter(createAdapter(pubClient, subClient));
+        console.log('[Redis] Socket.io adapter connected');
+      }).catch(err => console.warn('[Redis] Connection failed, running without:', err.message));
+    });
+  }).catch(() => console.warn('[Redis] @socket.io/redis-adapter not available'));
+}
+
 const tableManager = new TableManager();
 const progressionManager = new ProgressionManager();
 const tournamentManager = new TournamentManager();
@@ -132,6 +147,14 @@ interface PlayerSession {
   trainingEnabled: boolean;
   sittingOut: boolean;
   avatar?: any;
+  // Deep-link context from player app — e.g. { source: 'waitlist', gameId, venue }
+  context?: {
+    source: string;
+    gameId?: string | null;
+    position?: number | null;
+    venue?: string | null;
+    startTime?: string | null;
+  };
 }
 
 const playerSessions = new Map<string, PlayerSession>();
@@ -282,9 +305,11 @@ interface ReservedSeat {
   sittingOut: boolean;
   expiresAt: number;
   cleanupTimer: ReturnType<typeof setTimeout>;
+  handsRemaining: number; // disconnect = 20 hands to reconnect
 }
 const reservedSeats = new Map<number, ReservedSeat>();
-const SEAT_RESERVE_MS = 10 * 60 * 1000; // 10 minutes
+const SEAT_RESERVE_MS = 30 * 60 * 1000; // 30 minutes (fallback — hands are the real limit)
+const DISCONNECT_HANDS_LIMIT = 20; // player has 20 hands to reconnect
 
 // Track AI decision timeouts
 const aiTimeouts = new Map<string, { handle: NodeJS.Timeout; seatIndex: number }>();
@@ -403,9 +428,144 @@ app.post('/api/qualifiers/refresh', async (_req, res) => {
   res.json({ success: true, weekly: weekly.length, monthly: monthly.length });
 });
 
+// ========== Qualifier Tournament Registration ==========
+
+interface QualifierTournamentReg {
+  qualifierId: string;
+  qualifierType: string; // 'weekly' | 'monthly'
+  qualifierName: string;
+  scheduledAt: string; // ISO timestamp
+  startingStack: number;
+  maxPlayers: number;
+  players: { playerId: string; playerName: string; phone: string; socketId: string }[];
+  status: 'registering' | 'starting' | 'running' | 'finished';
+  tournamentId: string | null; // linked TournamentManager ID once started
+  blindStructure: any[];
+}
+
+const qualifierTournaments = new Map<string, QualifierTournamentReg>();
+
+// REST endpoint: get qualifier tournament registrations
+app.get('/api/qualifier-tournaments', (_req, res) => {
+  const list: any[] = [];
+  for (const [id, qt] of qualifierTournaments) {
+    list.push({
+      qualifierId: id,
+      qualifierType: qt.qualifierType,
+      qualifierName: qt.qualifierName,
+      scheduledAt: qt.scheduledAt,
+      registeredCount: qt.players.length,
+      maxPlayers: qt.maxPlayers,
+      status: qt.status,
+      tournamentId: qt.tournamentId,
+      players: qt.players.map(p => ({ name: p.playerName })),
+    });
+  }
+  res.json({ success: true, tournaments: list });
+});
+
+// REST endpoint: get specific qualifier tournament
+app.get('/api/qualifier-tournaments/:qualifierId', (req, res) => {
+  const qt = qualifierTournaments.get(req.params.qualifierId);
+  if (!qt) return res.json({ success: false, error: 'Not found' });
+  res.json({
+    success: true,
+    tournament: {
+      ...qt,
+      players: qt.players.map(p => ({ name: p.playerName, phone: p.phone.slice(-4) })),
+    },
+  });
+});
+
+/**
+ * Auto-start qualifier tournaments when scheduled time arrives.
+ * Runs every 30 seconds.
+ */
+setInterval(() => {
+  const now = Date.now();
+  for (const [qualId, qt] of qualifierTournaments) {
+    if (qt.status !== 'registering') continue;
+    const scheduledTime = new Date(qt.scheduledAt).getTime();
+    if (now < scheduledTime) continue;
+    if (qt.players.length < 2) continue;
+
+    // Time to start!
+    qt.status = 'starting';
+    console.log(`[QualifierTournament] Auto-starting ${qt.qualifierName} with ${qt.players.length} players`);
+
+    const turbo = false;
+    const humanPlayers = qt.players.map(p => ({
+      id: p.playerId,
+      name: p.playerName,
+      socketId: p.socketId,
+    }));
+
+    // Create multi-table tournament with registered players + AI fill
+    const playerCount = Math.max(qt.players.length, 18); // minimum 2 tables
+    const result = startMultiTableTournament(
+      playerCount,
+      humanPlayers[0]?.socketId,
+      humanPlayers[0]?.id,
+      humanPlayers[0]?.name,
+      turbo,
+    );
+
+    if (result) {
+      qt.status = 'running';
+      qt.tournamentId = result.tournamentId;
+
+      // Notify all registered players
+      for (const p of qt.players) {
+        const sock = io.sockets.sockets.get(p.socketId);
+        if (sock) {
+          const playerTable = tournamentManager.getPlayerTable(result.tournamentId, p.playerId);
+          sock.emit('qualifierTournamentStarted', {
+            qualifierId: qualId,
+            tournamentId: result.tournamentId,
+            tableId: playerTable || result.tableIds[0],
+            tableCount: result.tableCount,
+            playerCount: playerCount,
+          });
+        }
+      }
+
+      // Broadcast to all connected clients
+      io.emit('qualifierTournamentUpdate', {
+        qualifierId: qualId,
+        status: 'running',
+        tournamentId: result.tournamentId,
+        playerCount: playerCount,
+        tableCount: result.tableCount,
+      });
+    } else {
+      qt.status = 'registering'; // revert on failure
+      console.error(`[QualifierTournament] Failed to start ${qt.qualifierName}`);
+    }
+  }
+}, 30000);
+
 // ========== Helper Functions ==========
 
-function getVariantInfo(table: PokerTable): { variant: VariantType; variantName: string; holeCardCount: number; hasDrawPhase: boolean; isStudGame: boolean } {
+function getVariantInfo(table: PokerTable): { variant: VariantType; variantName: string; holeCardCount: number; hasDrawPhase: boolean; isStudGame: boolean; isPineapple?: boolean; pineappleDiscardActive?: boolean } {
+  // Pineapple / Crazy Pineapple — client enables manual discard when the table
+  // has 3 hole cards and the current phase precedes the discard transition.
+  const vid = (table as any).variantId;
+  const isCrazy = vid === 'crazy-pineapple';
+  const isRegular = vid === 'pineapple';
+  if (isRegular || isCrazy) {
+    const discardActive = isCrazy
+      ? table.currentPhase === GamePhase.Flop
+      : table.currentPhase === GamePhase.PreFlop;
+    return {
+      variant: 'texas-holdem' as VariantType,
+      variantName: table.variantName,
+      holeCardCount: 3,
+      hasDrawPhase: false,
+      isStudGame: false,
+      isPineapple: true,
+      pineappleDiscardActive: discardActive,
+    };
+  }
   if (table instanceof OmahaTable) {
     return {
       variant: table.variant.type,
@@ -828,7 +988,7 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   if (tableProgressListeners.has(tableId)) return;
   tableProgressListeners.add(tableId);
 
-  table.on('handResult', (data: { results: any[]; handNumber: number }) => {
+  table.on('handResult', async (data: { results: any[]; handNumber: number }) => {
     incrementHandsPlayed();
     handleHandComplete(tableId, data.results);
 
@@ -842,7 +1002,7 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
       const userId = auth.userId;
       if (!chipVelocity.has(userId)) {
         chipVelocity.set(userId, {
-          chipsAtStart: getUserChips(userId),
+          chipsAtStart: await getUserChips(userId),
           sessionStartAt: Date.now(),
           handsThisSession: 0,
           lastActionMs: [],
@@ -851,7 +1011,7 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
       const vel = chipVelocity.get(userId)!;
       vel.handsThisSession++;
       if (result.chipsWon && result.chipsWon > 0) {
-        const currentChips = getUserChips(userId);
+        const currentChips = await getUserChips(userId);
         const gained = currentChips - vel.chipsAtStart;
         const sessionMinutes = (Date.now() - vel.sessionStartAt) / 60_000;
         if (vel.handsThisSession >= 5 && gained > vel.chipsAtStart * 10) {
@@ -1166,6 +1326,23 @@ function autoStartNextHand(tableId: string): void {
     }
   }
 
+  // Tournament table guard: don't start a new hand if table has < 5 alive players
+  // and there are multiple tables still in play. Wait for rebalance to fill it.
+  const tId = tournamentTables.get(tableId);
+  if (tId) {
+    const tourn = tournamentManager.getTournament(tId);
+    if (tourn && tourn.tableIds.length > 1) {
+      const aliveOnTable = tourn.players.filter(
+        p => !p.eliminated && tourn.playerTableMap.get(p.playerId) === tableId
+      ).length;
+      if (aliveOnTable < 5) {
+        // Trigger rebalance and don't start hand
+        handleTableRebalance(tId);
+        return;
+      }
+    }
+  }
+
   // Start new hand
   const started = table.startNewHand();
   if (started) {
@@ -1243,9 +1420,26 @@ function sendProgressToPlayer(socketId: string): void {
   }
 }
 
-function handleHandComplete(tableId: string, results: any[]): void {
+async function handleHandComplete(tableId: string, results: any[]): Promise<void> {
   const table = tableManager.getTable(tableId);
   if (!table) return;
+
+  // Decrement sit-out hand counter for reserved (disconnected) seats on this table
+  for (const [userId, reserved] of reservedSeats) {
+    if (reserved.tableId === tableId) {
+      reserved.handsRemaining--;
+      if (reserved.handsRemaining <= 0) {
+        // Player ran out of hands — remove them from the table
+        const t = tableManager.getTable(reserved.tableId);
+        if (t) {
+          t.standUp(reserved.seatIndex);
+          console.log(`[Reserve] ${reserved.playerName} removed after ${DISCONNECT_HANDS_LIMIT} hands of sitting out`);
+        }
+        clearTimeout(reserved.cleanupTimer);
+        reservedSeats.delete(userId);
+      }
+    }
+  }
 
   // Collect all human players at the table
   const humanSessions: PlayerSession[] = [];
@@ -1330,12 +1524,32 @@ function handleHandComplete(tableId: string, results: any[]): void {
       if (authSession) {
         const clientProgress = progressionManager.getClientProgress(session.playerId) as any;
         if (clientProgress) {
-          mergeUserStats(authSession.userId, {
+          await mergeUserStats(authSession.userId, {
             handsPlayed: clientProgress.totalHandsPlayed || 0,
             handsWon: clientProgress.handsWon || 0,
             biggestPot: clientProgress.biggestPot || 0,
             lastHandAt: Date.now(),
           });
+
+          // Persistence sweep: record this hand to user_hand_history + tick scratch card progress
+          const seat = table.seats[session.seatIndex];
+          const result = handResultPerSeat.get(session.seatIndex);
+          const potWon = totalWonPerSeat.get(session.seatIndex) || 0;
+          recordHand(authSession.userId, `${tableId}-${Date.now()}-${session.seatIndex}`, {
+            tableId,
+            seatIndex: session.seatIndex,
+            chipCount: seat?.chipCount || 0,
+            potWon,
+            handRank: result?.handRank,
+            holeCards: seat?.holeCards || [],
+            communityCards: table.communityCards,
+          }).catch(() => {});
+
+          const awarded = await tickScratchProgress(authSession.userId).catch(() => false);
+          if (awarded) {
+            const s = io.sockets.sockets.get(socketId);
+            s?.emit('scratchCardEarned', { message: 'You earned a scratch card!' });
+          }
         }
       }
     }
@@ -1366,6 +1580,29 @@ function handleHandComplete(tableId: string, results: any[]): void {
               if (s.playerId === eliminatorId) {
                 io.to(sid).emit('bountyAwarded', { amount: result.bountyPayout, eliminated: seat.playerName });
                 break;
+              }
+            }
+          }
+
+          // Auto-switch eliminated human players to spectator mode
+          if (!seat.isAI && result) {
+            const tp = tournamentManager.getTournament(tournamentId)?.players.find(p => p.playerId === seat.playerId);
+            if (tp) {
+              const sock = io.sockets.sockets.get(tp.socketId);
+              if (sock) {
+                // Add as spectator on their current table
+                const specSet = spectators.get(tableId) || new Set();
+                specSet.add(tp.socketId);
+                spectators.set(tableId, specSet);
+
+                sock.emit('eliminatedToSpectator', {
+                  tournamentId,
+                  tableId,
+                  position: result.position,
+                  totalPlayers: tournamentManager.getTournament(tournamentId)?.players.length || 0,
+                  status: tournamentManager.getTournamentStatus(tournamentId),
+                  tableIds: tournamentManager.getTournament(tournamentId)?.tableIds || [],
+                });
               }
             }
           }
@@ -1438,7 +1675,7 @@ io.on('connection', (socket: Socket) => {
   }
   ipSockets.add(socket.id);
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     ipSockets.delete(socket.id);
     if (ipSockets.size === 0) ipConnections.delete(clientIp);
     // Clean up seated slot tracking
@@ -1471,12 +1708,25 @@ io.on('connection', (socket: Socket) => {
     socket.emit('loginResult', result);
   });
 
-  socket.on('register', (data: { username: string; password: string }) => {
-    const result = registerUser(data.username, data.password);
+  socket.on('register', async (data: { username: string; password: string }) => {
+    const result = await registerUser(data.username, data.password);
     if (result.success && result.userData) {
       authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username });
     }
     socket.emit('registerResult', result);
+  });
+
+  // Choose display name (after first login with phone)
+  socket.on('setDisplayName', async (data: { name: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('setDisplayNameResult', { success: false, error: 'Not authenticated' }); return; }
+    const result = await setDisplayName(auth.userId, data.name);
+    if (result.success) {
+      auth.username = data.name.trim(); // Update session
+      socket.emit('setDisplayNameResult', { success: true, displayName: data.name.trim() });
+    } else {
+      socket.emit('setDisplayNameResult', result);
+    }
   });
 
   // Qualifier status: client checks if the logged-in player is qualified
@@ -1495,10 +1745,298 @@ io.on('connection', (socket: Socket) => {
     });
   });
 
-  socket.on('checkUsername', (data: { username: string }) => {
+  // ========== Qualifier Tournament Registration ==========
+
+  // Register for a qualifier tournament
+  socket.on('registerQualifierTournament', async (data: { qualifierId: string; playerName: string; phone: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Must be logged in' }); return; }
+
+    const qualId = data.qualifierId;
+    let qt = qualifierTournaments.get(qualId);
+
+    // Create registration if it doesn't exist yet
+    if (!qt) {
+      // Default config — frontend should send these but fallback to defaults
+      qt = {
+        qualifierId: qualId,
+        qualifierType: qualId.includes('monthly') ? 'monthly' : 'weekly',
+        qualifierName: qualId.includes('monthly') ? 'Monthly Major Qualifier' : 'Weekly Qualifier',
+        scheduledAt: new Date(Date.now() + 7 * 86400000).toISOString(), // default: 7 days from now
+        startingStack: 50000,
+        maxPlayers: 999,
+        players: [],
+        status: 'registering',
+        tournamentId: null,
+        blindStructure: [],
+      };
+      qualifierTournaments.set(qualId, qt);
+    }
+
+    const LATE_REG_WINDOW_MS = 1.5 * 60 * 60 * 1000; // 1.5 hours after start
+    const SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000; // 3 hours before start
+    const phone = (data.phone || '').trim();
+
+    // Signup window: opens 3 hours before scheduledAt, closes 1.5 hours after scheduledAt
+    const scheduledTime = new Date(qt.scheduledAt).getTime();
+    const now = Date.now();
+    const signupOpensAt = scheduledTime - SIGNUP_OPENS_BEFORE_MS;
+    const signupClosesAt = scheduledTime + LATE_REG_WINDOW_MS;
+
+    if (now < signupOpensAt) {
+      const opensIn = Math.ceil((signupOpensAt - now) / 60000);
+      const h = Math.floor(opensIn / 60);
+      const m = opensIn % 60;
+      const timeStr = h > 0 ? `${h}h ${m}m` : `${m}m`;
+      socket.emit('qualifierRegistrationResult', { success: false, error: `Signup opens in ${timeStr}` });
+      return;
+    }
+
+    if (now > signupClosesAt) {
+      socket.emit('qualifierRegistrationResult', { success: false, error: 'Signup window has closed' });
+      return;
+    }
+
+    // Check if tournament is in late-registration window (running but within 1.5 hours)
+    const isLateReg = qt.status === 'running' && qt.tournamentId &&
+      (now - scheduledTime) < LATE_REG_WINDOW_MS;
+
+    if (qt.status !== 'registering' && !isLateReg) {
+      socket.emit('qualifierRegistrationResult', { success: false, error: 'Tournament is no longer accepting registrations' });
+      return;
+    }
+
+    // Check if player is already registered and NOT eliminated (can't double-enter)
+    const existingEntry = qt.players.find(p => p.playerId === (auth.username || phone) || (phone && p.phone === phone));
+    if (existingEntry) {
+      // Check if they were eliminated — if so, allow re-entry (costs another credit)
+      const tournament = qt.tournamentId ? tournamentManager.getTournament(qt.tournamentId) : null;
+      const wasEliminated = tournament?.players.find(p => p.playerId === existingEntry.playerId)?.eliminated;
+
+      if (!wasEliminated) {
+        socket.emit('qualifierRegistrationResult', { success: false, error: 'Already registered and still playing' });
+        return;
+      }
+
+      // Re-entry: check if they have remaining qualifier credits
+      // (The frontend should verify credits before allowing re-entry)
+      // Allow the re-entry — they'll be seated at a new table with starting stack
+      if (isLateReg && tournament) {
+        // Find a table with empty seats and seat them
+        const startingStack = qt.startingStack || 50000;
+        let seated = false;
+        for (const tid of tournament.tableIds) {
+          const table = tableManager.getTable(tid);
+          if (!table) continue;
+          for (let s = 0; s < 9; s++) {
+            if (table.seats[s].state !== 'empty') continue;
+            table.sitDown(s, existingEntry.playerName, startingStack, existingEntry.playerId, false);
+            tournamentManager.setPlayerTable(qt.tournamentId!, existingEntry.playerId, tid);
+            // Un-eliminate the player in tournament manager
+            const tp = tournament.players.find(p => p.playerId === existingEntry.playerId);
+            if (tp) { tp.eliminated = false; tp.chips = startingStack; }
+            // Update socket session
+            const sess = playerSessions.get(socket.id);
+            if (sess) { sess.tableId = tid; sess.seatIndex = s; }
+            socket.join(`table:${tid}`);
+            seated = true;
+            console.log(`[Tournament] Re-entry: ${existingEntry.playerName} seated at table ${tid} seat ${s}`);
+            break;
+          }
+          if (seated) break;
+        }
+        if (!seated) {
+          socket.emit('qualifierRegistrationResult', { success: false, error: 'No seats available for re-entry' });
+          return;
+        }
+        socket.emit('qualifierRegistrationResult', { success: true, qualifierId: qualId, reentry: true });
+        broadcastGameState(tournament.tableIds[0]);
+        return;
+      }
+
+      socket.emit('qualifierRegistrationResult', { success: false, error: 'Re-entry not available at this time' });
+      return;
+    }
+    // IP duplicate check — prevent multi-accounting from same device
+    const regIp = socket.handshake.address;
+    const sameIpCount = qt.players.filter(p => (p as any).ip === regIp).length;
+    if (sameIpCount >= 2) {
+      socket.emit('qualifierRegistrationResult', { success: false, error: 'Too many registrations from this device' });
+      return;
+    }
+
+    qt.players.push({
+      playerId: auth.username || phone,
+      playerName: data.playerName || auth.username,
+      phone: phone,
+      socketId: socket.id,
+      ip: regIp,
+    } as any);
+
+    socket.emit('qualifierRegistrationResult', {
+      success: true,
+      qualifierId: qualId,
+      registeredCount: qt.players.length,
+    });
+
+    // Broadcast updated count to all clients
+    io.emit('qualifierTournamentUpdate', {
+      qualifierId: qualId,
+      status: qt.status,
+      registeredCount: qt.players.length,
+      players: qt.players.map(p => ({ name: p.playerName })),
+    });
+  });
+
+  // Unregister from a qualifier tournament
+  socket.on('unregisterQualifierTournament', async (data: { qualifierId: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) return;
+
+    const qt = qualifierTournaments.get(data.qualifierId);
+    if (!qt || qt.status !== 'registering') return;
+
+    qt.players = qt.players.filter(p => p.playerId !== auth.username);
+
+    socket.emit('qualifierRegistrationResult', {
+      success: true,
+      qualifierId: data.qualifierId,
+      registeredCount: qt.players.length,
+      unregistered: true,
+    });
+
+    io.emit('qualifierTournamentUpdate', {
+      qualifierId: data.qualifierId,
+      status: qt.status,
+      registeredCount: qt.players.length,
+      players: qt.players.map(p => ({ name: p.playerName })),
+    });
+  });
+
+  // Get qualifier tournament registrations
+  socket.on('getQualifierTournaments', async () => {
+    const SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000;
+    const SIGNUP_CLOSES_AFTER_MS = 1.5 * 60 * 60 * 1000;
+    const now = Date.now();
+    const list: any[] = [];
+    for (const [id, qt] of qualifierTournaments) {
+      const scheduledTime = new Date(qt.scheduledAt).getTime();
+      const signupOpensAt = new Date(scheduledTime - SIGNUP_OPENS_BEFORE_MS).toISOString();
+      const signupClosesAt = new Date(scheduledTime + SIGNUP_CLOSES_AFTER_MS).toISOString();
+      const signupOpen = now >= (scheduledTime - SIGNUP_OPENS_BEFORE_MS) && now <= (scheduledTime + SIGNUP_CLOSES_AFTER_MS);
+      list.push({
+        qualifierId: id,
+        qualifierType: qt.qualifierType,
+        qualifierName: qt.qualifierName,
+        scheduledAt: qt.scheduledAt,
+        signupOpensAt,
+        signupClosesAt,
+        signupOpen,
+        registeredCount: qt.players.length,
+        maxPlayers: qt.maxPlayers,
+        status: qt.status,
+        tournamentId: qt.tournamentId,
+        players: qt.players.map(p => ({ name: p.playerName })),
+      });
+    }
+    socket.emit('qualifierTournamentList', list);
+  });
+
+  // ========== Tournament Spectator Mode ==========
+
+  // Spectate a tournament (auto-picks busiest table)
+  socket.on('spectateTournament', async (data: { tournamentId: string }) => {
+    const tournament = tournamentManager.getTournament(data.tournamentId);
+    if (!tournament || tournament.status !== 'running') {
+      socket.emit('error', { message: 'Tournament not found or not running' });
+      return;
+    }
+
+    // Find the table with the most alive players
+    let bestTable = '';
+    let bestCount = 0;
+    for (const tid of tournament.tableIds) {
+      const count = tournamentManager.getAlivePlayersOnTable(data.tournamentId, tid).length;
+      if (count > bestCount) {
+        bestCount = count;
+        bestTable = tid;
+      }
+    }
+
+    if (!bestTable) {
+      socket.emit('error', { message: 'No active tables' });
+      return;
+    }
+
+    // Use existing spectator system
+    socket.emit('spectateTable', { tableId: bestTable });
+    // Manually trigger spectate logic
+    const specSet = spectators.get(bestTable) || new Set();
+    specSet.add(socket.id);
+    spectators.set(bestTable, specSet);
+    socket.join(`table:${bestTable}`);
+
+    const table = tableManager.getTable(bestTable);
+    if (table) {
+      const state: any = getGameStateForPlayer(table, -1, false);
+      state.isSpectator = true;
+      state.spectatorCount = specSet.size;
+      state.tournamentStatus = tournamentManager.getTournamentStatus(data.tournamentId);
+      state.tournamentTableIds = tournament.tableIds;
+      emitGameState(socket, state);
+    }
+
+    socket.emit('spectatingTournament', {
+      tournamentId: data.tournamentId,
+      tableId: bestTable,
+      tableIds: tournament.tableIds,
+      status: tournamentManager.getTournamentStatus(data.tournamentId),
+    });
+  });
+
+  // Cycle to next/prev tournament table
+  socket.on('spectateNextTable', async (data: { tournamentId: string; currentTableId: string; direction?: string }) => {
+    const tournament = tournamentManager.getTournament(data.tournamentId);
+    if (!tournament) return;
+
+    const tableIds = tournament.tableIds;
+    const currentIdx = tableIds.indexOf(data.currentTableId);
+    const dir = data.direction === 'prev' ? -1 : 1;
+    const nextIdx = (currentIdx + dir + tableIds.length) % tableIds.length;
+    const nextTableId = tableIds[nextIdx];
+
+    // Leave current table
+    const oldSet = spectators.get(data.currentTableId);
+    if (oldSet) { oldSet.delete(socket.id); }
+    socket.leave(`table:${data.currentTableId}`);
+
+    // Join new table
+    const newSet = spectators.get(nextTableId) || new Set();
+    newSet.add(socket.id);
+    spectators.set(nextTableId, newSet);
+    socket.join(`table:${nextTableId}`);
+
+    const table = tableManager.getTable(nextTableId);
+    if (table) {
+      const state: any = getGameStateForPlayer(table, -1, false);
+      state.isSpectator = true;
+      state.tournamentStatus = tournamentManager.getTournamentStatus(data.tournamentId);
+      state.tournamentTableIds = tournament.tableIds;
+      emitGameState(socket, state);
+    }
+
+    socket.emit('spectatingTournament', {
+      tournamentId: data.tournamentId,
+      tableId: nextTableId,
+      tableIds: tournament.tableIds,
+      status: tournamentManager.getTournamentStatus(data.tournamentId),
+    });
+  });
+
+  socket.on('checkUsername', async (data: { username: string }) => {
     const name = (data.username || '').trim();
     if (name.length < 2) { socket.emit('checkUsernameResult', { available: null, username: name }); return; }
-    const taken = isUsernameTaken(name);
+    const taken = await isUsernameTaken(name);
     socket.emit('checkUsernameResult', { available: !taken, username: name });
   });
 
@@ -1567,7 +2105,7 @@ Give feedback in this JSON format:
     const s = playerSessions.get(socket.id);
     return !!(s && s.tableId === tableId);
   };
-  socket.on('voiceJoin', (data: { tableId: string; username: string }) => {
+  socket.on('voiceJoin', async (data: { tableId: string; username: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     if (!data?.tableId || !isSeatedAt(data.tableId)) { socket.emit('error', { message: 'Not seated at table' }); return; }
@@ -1576,29 +2114,29 @@ Give feedback in this JSON format:
     // Use the authenticated username, not the one the client sent.
     socket.to(room).emit('voicePeerJoined', { socketId: socket.id, username: auth.username });
   });
-  socket.on('voiceLeave', (data: { tableId: string }) => {
+  socket.on('voiceLeave', async (data: { tableId: string }) => {
     if (!authSessions.get(socket.id)) return;
     if (!data?.tableId) return;
     socket.leave(`voice_${data.tableId}`);
     socket.to(`voice_${data.tableId}`).emit('voicePeerLeft', { socketId: socket.id });
   });
-  socket.on('voiceOffer', (data: { to: string; offer: any; username: string }) => {
+  socket.on('voiceOffer', async (data: { to: string; offer: any; username: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth || !data?.to) return;
     io.to(data.to).emit('voiceOffer', { from: socket.id, offer: data.offer, username: auth.username });
   });
-  socket.on('voiceAnswer', (data: { to: string; answer: any }) => {
+  socket.on('voiceAnswer', async (data: { to: string; answer: any }) => {
     if (!authSessions.get(socket.id) || !data?.to) return;
     io.to(data.to).emit('voiceAnswer', { from: socket.id, answer: data.answer });
   });
-  socket.on('voiceIce', (data: { to: string; candidate: any }) => {
+  socket.on('voiceIce', async (data: { to: string; candidate: any }) => {
     if (!authSessions.get(socket.id) || !data?.to) return;
     io.to(data.to).emit('voiceIce', { from: socket.id, candidate: data.candidate });
   });
 
   // ========== Staking Marketplace ==========
   const stakingOffers: Map<string, any> = (global as any).__stakingOffers || ((global as any).__stakingOffers = new Map());
-  socket.on('createStake', (data: { tournamentId: string; totalPct: number; pricePerPct: number; playerName: string }) => {
+  socket.on('createStake', async (data: { tournamentId: string; totalPct: number; pricePerPct: number; playerName: string }) => {
     if (!data.tournamentId || typeof data.totalPct !== 'number' || data.totalPct <= 0 || data.totalPct > 100) {
       socket.emit('error', { message: 'Invalid staking offer' }); return;
     }
@@ -1611,7 +2149,7 @@ Give feedback in this JSON format:
     io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
     socket.emit('stakeCreated', { id });
   });
-  socket.on('buyStake', (data: { offerId: string; pct: number; buyerName: string }) => {
+  socket.on('buyStake', async (data: { offerId: string; pct: number; buyerName: string }) => {
     if (!data.offerId || typeof data.pct !== 'number' || data.pct <= 0) {
       socket.emit('buyStakeResult', { success: false, error: 'Invalid purchase' }); return;
     }
@@ -1623,11 +2161,102 @@ Give feedback in this JSON format:
     io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
     socket.emit('buyStakeResult', { success: true });
   });
-  socket.on('getStakes', () => {
+  socket.on('getStakes', async () => {
     socket.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
   });
 
-  socket.on('tokenLogin', (data: { token: string }) => {
+  // OAuth2 login: validate access token from auth server.
+  //
+  // The auth server's `sub` claim is the master-API users.id UUID. poker-server
+  // has its OWN SQLite users table with integer IDs keyed on phone, so we
+  // mirror the same upsert-by-phone pattern authWithTicket uses: look up the
+  // local user by phone (or create a placeholder row on first login) and use
+  // THAT integer id for authSessions and loadProgress. The previous
+  // `parseInt(oauthResult.sub, 10)` just parsed the first digit of the UUID
+  // and always failed with "User not found".
+  socket.on('oauthLogin', async (data: { accessToken: string }) => {
+    if (!data?.accessToken) {
+      socket.emit('loginResult', { success: false, error: 'No access token provided' });
+      return;
+    }
+    try {
+      const oauthResult = await validateOAuthToken(data.accessToken);
+      if (!oauthResult.valid || !oauthResult.sub) {
+        socket.emit('loginResult', { success: false, error: oauthResult.error || 'Invalid token' });
+        return;
+      }
+
+      const phone = oauthResult.phone || oauthResult.username;
+      if (!phone) {
+        socket.emit('loginResult', { success: false, error: 'Token missing phone/username claim' });
+        return;
+      }
+
+      const displayName = oauthResult.username || String(phone);
+
+      // Upsert local poker-server user keyed on phone (= username column).
+      // Same convention as authWithTicket + syncMasterUser in authManager.
+      const bcrypt = require('bcryptjs');
+      const placeholderHash = bcrypt.hashSync(
+        `oauth-placeholder-${oauthResult.sub}-${Date.now()}`,
+        10
+      );
+      const { rows } = await getPool().query(
+        `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
+           VALUES ($1, $2, $3, 10000, 1, 0, $4)
+           ON CONFLICT (LOWER(username)) DO UPDATE
+             SET display_name = COALESCE(users.display_name, $2)
+         RETURNING *`,
+        [
+          String(phone),
+          displayName,
+          placeholderHash,
+          JSON.stringify({ masterPhone: phone, masterUsername: oauthResult.username, masterUserId: oauthResult.sub }),
+        ]
+      );
+      const localUser = rows[0];
+
+      const userId = localUser.id;
+      const progress = await loadProgress(userId);
+
+      // Fall back to a minimal payload if loadProgress can't construct one
+      // (e.g., brand-new user with no progression rows yet). Include phone so
+      // the client can emit `getQualifications` — without it the qualifier
+      // tournament lobby hangs on "Checking qualification..." forever.
+      const baseUserData = (progress.success && progress.userData) ? progress.userData : {
+        id: localUser.id,
+        username: localUser.username,
+        displayName: localUser.display_name,
+        chips: localUser.chips,
+        level: localUser.level,
+        xp: localUser.xp,
+        stats: typeof localUser.stats === 'string' ? JSON.parse(localUser.stats || '{}') : (localUser.stats || {}),
+        achievements: typeof localUser.achievements === 'string' ? JSON.parse(localUser.achievements || '[]') : (localUser.achievements || []),
+        isAdmin: !!oauthResult.isAdmin,
+      };
+      const userData = {
+        ...baseUserData,
+        phone: String(phone),
+        phoneNumber: String(phone),
+      };
+
+      authSessions.set(socket.id, { userId, username: localUser.username });
+      socket.emit('loginResult', {
+        success: true,
+        token: data.accessToken,
+        userData,
+      });
+
+      console.log(
+        `[OAuth] oauthLogin ok: localId=${localUser.id} phone=${phone} masterId=${oauthResult.sub}`
+      );
+    } catch (err: any) {
+      console.error('[OAuth] oauthLogin error:', err);
+      socket.emit('loginResult', { success: false, error: 'Authentication failed' });
+    }
+  });
+
+  socket.on('tokenLogin', async (data: { token: string }) => {
     // Rate limit: max 3 attempts per minute per socket
     const now = Date.now();
     const tlKey = socket.id;
@@ -1643,7 +2272,58 @@ Give feedback in this JSON format:
       return;
     }
 
-    const result = getUserFromToken(data.token);
+    // Try OAuth2 RS256 token first, then fall back to legacy HS256 JWT
+    const oauthResult = await validateOAuthToken(data.token);
+    if (oauthResult.valid && oauthResult.sub) {
+      const userId = parseInt(oauthResult.sub, 10);
+      const progress = await loadProgress(userId);
+      if (progress.success && progress.userData) {
+        authSessions.set(socket.id, { userId, username: progress.userData.username });
+
+        // Check for reserved seat (same reconnection logic as legacy)
+        const reserved = reservedSeats.get(userId);
+        if (reserved && reserved.expiresAt > Date.now()) {
+          const table = tableManager.getTable(reserved.tableId);
+          if (table) {
+            const seat = table.seats[reserved.seatIndex];
+            if (seat && seat.state === 'occupied' && !seat.isAI) {
+              clearTimeout(reserved.cleanupTimer);
+              reservedSeats.delete(userId);
+              const restoredSession: PlayerSession = {
+                socketId: socket.id,
+                tableId: reserved.tableId,
+                seatIndex: reserved.seatIndex,
+                playerName: reserved.playerName,
+                playerId: `user_${userId}`,
+                trainingEnabled: false,
+                sittingOut: false,
+                avatar: reserved.avatar,
+              };
+              playerSessions.set(socket.id, restoredSession);
+              socket.join(`table:${reserved.tableId}`);
+              const tracker = sitOutTracker.get(reserved.tableId);
+              if (tracker) tracker.delete(reserved.seatIndex);
+              socket.emit('reconnectedToTable', {
+                tableId: reserved.tableId,
+                seatIndex: reserved.seatIndex,
+              });
+              broadcastGameState(reserved.tableId);
+              console.log(`[OAuth Reserve] User ${userId} reconnected to seat ${reserved.seatIndex}`);
+            } else {
+              reservedSeats.delete(userId);
+            }
+          } else {
+            reservedSeats.delete(userId);
+          }
+        }
+
+        socket.emit('loginResult', { success: true, token: data.token, userData: progress.userData });
+        return;
+      }
+    }
+
+    // Legacy HS256 JWT fallback
+    const result = await getUserFromToken(data.token);
     if (result.success && result.userData) {
       const userId = result.userData.id;
       authSessions.set(socket.id, { userId, username: result.userData.username });
@@ -1697,22 +2377,22 @@ Give feedback in this JSON format:
     socket.emit('loginResult', result);
   });
 
-  socket.on('logout', () => {
+  socket.on('logout', async () => {
     authSessions.delete(socket.id);
   });
 
-  socket.on('loadProgress', (data: { userId: number }) => {
-    const result = loadProgress(data.userId);
+  socket.on('loadProgress', async (data: { userId: number }) => {
+    const result = await loadProgress(data.userId);
     socket.emit('progressLoaded', result);
   });
 
-  socket.on('saveProgress', (data: { userId: number; chips?: number; level?: number; xp?: number; stats?: Record<string, any>; achievements?: string[] }) => {
+  socket.on('saveProgress', async (data: { userId: number; chips?: number; level?: number; xp?: number; stats?: Record<string, any>; achievements?: string[] }) => {
     const auth = authSessions.get(socket.id);
     if (!auth || auth.userId !== data.userId) {
       socket.emit('error', { message: 'Unauthorized' }); return;
     }
     const { userId, ...progressData } = data;
-    const success = saveProgress(userId, progressData);
+    const success = await saveProgress(userId, progressData);
     socket.emit('progressSaved', { success });
   });
 
@@ -1720,7 +2400,7 @@ Give feedback in this JSON format:
 
   // ========== Spin Wheel / Reward Events ==========
 
-  socket.on('claimSpinReward', (data: { type: string; value: number; label: string }) => {
+  socket.on('claimSpinReward', async (data: { type: string; value: number; label: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
@@ -1735,7 +2415,7 @@ Give feedback in this JSON format:
 
     if (data.type === 'chips' || data.type === 'mystery') {
       const chips = data.type === 'mystery' ? Math.floor(Math.random() * 3000) + 500 : data.value;
-      addChipsToUser(auth.userId, chips);
+      await addChipsToUser(auth.userId, chips);
       socket.emit('spinRewardClaimed', { type: 'chips', value: chips });
     } else if (data.type === 'xp_multiplier') {
       socket.emit('spinRewardClaimed', { type: 'xp_multiplier', value: data.value });
@@ -1747,21 +2427,21 @@ Give feedback in this JSON format:
 
   // ========== Leaderboard Events ==========
 
-  socket.on('getLeaderboard', (data: { period?: string }) => {
+  socket.on('getLeaderboard', async (data: { period?: string }) => { // async
     try {
       const period = data?.period || 'alltime';
-      const entries = getLeaderboard(50, period);
+      const entries = await getLeaderboard(50, period);
       socket.emit('leaderboardData', { period, entries });
     } catch {
       socket.emit('leaderboardData', { period: data?.period || 'alltime', entries: [] });
     }
   });
 
-  socket.on('searchPlayers', (data: { query: string }) => {
+  socket.on('searchPlayers', async (data: { query: string }) => {
     try {
       const q = (data?.query || '').trim();
       if (q.length < 2) { socket.emit('playerSearchResults', { results: [] }); return; }
-      socket.emit('playerSearchResults', { results: searchUsers(q) });
+      socket.emit('playerSearchResults', { results: await searchUsers(q) });
     } catch {
       socket.emit('playerSearchResults', { results: [] });
     }
@@ -1770,9 +2450,9 @@ Give feedback in this JSON format:
   // ========== Admin Events ==========
   // auditLog is declared at module scope
 
-  socket.on('getAdminStats', () => {
+  socket.on('getAdminStats', async () => {
     const auth = authSessions.get(socket.id);
-    if (!auth || !isUserAdmin(auth.userId)) {
+    if (!auth || !(await isUserAdmin(auth.userId))) {
       socket.emit('adminStats', { error: 'Access denied' });
       return;
     }
@@ -1784,19 +2464,19 @@ Give feedback in this JSON format:
     const memMB = (memUsage.heapUsed / 1024 / 1024).toFixed(1);
 
     socket.emit('adminStats', {
-      totalUsers: getTotalUsers(),
+      totalUsers: await getTotalUsers(),
       activeConnections: io.engine.clientsCount,
       tablesRunning: tableManager.getTableList().length,
       handsPlayedToday,
       uptime: `${hours}h ${mins}m`,
       memoryUsage: `${memMB} MB`,
-      users: getAllUsers(),
+      users: await getAllUsers(),
     });
   });
 
-  socket.on('adminGrantChips', (data: { userId: number; amount: number }) => {
+  socket.on('adminGrantChips', async (data: { userId: number; amount: number }) => {
     const auth = authSessions.get(socket.id);
-    if (!auth || !isUserAdmin(auth.userId)) {
+    if (!auth || !(await isUserAdmin(auth.userId))) {
       socket.emit('error', { message: 'Access denied' });
       return;
     }
@@ -1810,13 +2490,13 @@ Give feedback in this JSON format:
     if (amount >= CHIP_GRANT_ALERT_THRESHOLD) {
       console.warn(`[AntiCheat] LARGE CHIP GRANT ALERT: admin ${auth.username} granted ${amount} chips to userId=${data.userId}`);
     }
-    const success = addChipsToUser(data.userId, amount);
+    const success = await addChipsToUser(data.userId, amount);
     socket.emit('adminGrantChipsResult', { success, userId: data.userId, amount });
   });
 
-  socket.on('banUser', (data: { userId: number }) => {
+  socket.on('banUser', async (data: { userId: number }) => {
     const auth = authSessions.get(socket.id);
-    if (!auth || !isUserAdmin(auth.userId)) {
+    if (!auth || !(await isUserAdmin(auth.userId))) {
       socket.emit('error', { message: 'Access denied' });
       return;
     }
@@ -1825,9 +2505,9 @@ Give feedback in this JSON format:
     socket.emit('userBanned', { userId: data.userId });
   });
 
-  socket.on('unbanUser', (data: { userId: number }) => {
+  socket.on('unbanUser', async (data: { userId: number }) => {
     const auth = authSessions.get(socket.id);
-    if (!auth || !isUserAdmin(auth.userId)) {
+    if (!auth || !(await isUserAdmin(auth.userId))) {
       socket.emit('error', { message: 'Access denied' });
       return;
     }
@@ -1840,7 +2520,7 @@ Give feedback in this JSON format:
 
   // ========== Club Events ==========
 
-  socket.on('createClub', (data: { name: string; description: string; settings?: any }) => {
+  socket.on('createClub', async (data: { name: string; description: string; settings?: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = createClub(auth.userId, data.name, data.description, data.settings || {});
@@ -1851,7 +2531,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('joinClub', (data: { clubCode: string }) => {
+  socket.on('joinClub', async (data: { clubCode: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = joinClub(auth.userId, data.clubCode);
@@ -1866,7 +2546,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('leaveClub', (data: { clubId: number }) => {
+  socket.on('leaveClub', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = leaveClub(auth.userId, data.clubId);
@@ -1879,25 +2559,25 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getMyClubs', () => {
+  socket.on('getMyClubs', async () => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('myClubs', { success: false, clubs: [] }); return; }
     const result = getMyClubs(auth.userId);
     socket.emit('myClubs', result);
   });
 
-  socket.on('getClubInfo', (data: { clubId: number }) => {
+  socket.on('getClubInfo', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     const result = getClubInfo(data.clubId, auth?.userId);
     socket.emit('clubInfo', result);
   });
 
-  socket.on('getClubMembers', (data: { clubId: number }) => {
+  socket.on('getClubMembers', async (data: { clubId: number }) => {
     const result = getClubMembers(data.clubId);
     socket.emit('clubMembers', result);
   });
 
-  socket.on('approveMember', (data: { clubId: number; userId: number }) => {
+  socket.on('approveMember', async (data: { clubId: number; userId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = approveMember(auth.userId, data.clubId, data.userId);
@@ -1908,7 +2588,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('removeMember', (data: { clubId: number; userId: number }) => {
+  socket.on('removeMember', async (data: { clubId: number; userId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = removeMember(auth.userId, data.clubId, data.userId);
@@ -1919,7 +2599,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('promoteToManager', (data: { clubId: number; userId: number }) => {
+  socket.on('promoteToManager', async (data: { clubId: number; userId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = promoteToManager(auth.userId, data.clubId, data.userId);
@@ -1930,7 +2610,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('createClubTable', (data: { clubId: number; config: any }) => {
+  socket.on('createClubTable', async (data: { clubId: number; config: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = createClubTable(auth.userId, data.clubId, data.config);
@@ -1959,12 +2639,12 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getClubTables', (data: { clubId: number }) => {
+  socket.on('getClubTables', async (data: { clubId: number }) => {
     const result = getClubTables(data.clubId);
     socket.emit('clubTables', result);
   });
 
-  socket.on('joinClubTable', (data: { clubTableId: number; playerName: string; seatIndex: number; buyIn: number; avatar?: string }) => {
+  socket.on('joinClubTable', async (data: { clubTableId: number; playerName: string; seatIndex: number; buyIn: number; avatar?: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
@@ -1992,12 +2672,12 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('searchClubs', (data: { query: string }) => {
+  socket.on('searchClubs', async (data: { query: string }) => {
     const result = searchClubs(data.query || '');
     socket.emit('clubSearchResults', result);
   });
 
-  socket.on('updateClubSettings', (data: { clubId: number; settings: any }) => {
+  socket.on('updateClubSettings', async (data: { clubId: number; settings: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = updateClubSettings(auth.userId, data.clubId, data.settings);
@@ -2008,7 +2688,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('deleteClub', (data: { clubId: number }) => {
+  socket.on('deleteClub', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = deleteClub(auth.userId, data.clubId);
@@ -2021,18 +2701,18 @@ Give feedback in this JSON format:
 
   // ─── Club Chat & Messages ───
 
-  socket.on('joinClubRoom', (data: { clubId: number }) => {
+  socket.on('joinClubRoom', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) return;
     if (!isClubMember(data.clubId, auth.userId)) return;
     socket.join(`club:${data.clubId}`);
   });
 
-  socket.on('leaveClubRoom', (data: { clubId: number }) => {
+  socket.on('leaveClubRoom', async (data: { clubId: number }) => {
     socket.leave(`club:${data.clubId}`);
   });
 
-  socket.on('sendClubMessage', (data: { clubId: number; message: string; type?: 'chat' | 'announcement' | 'system' }) => {
+  socket.on('sendClubMessage', async (data: { clubId: number; message: string; type?: 'chat' | 'announcement' | 'system' }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     if (!isClubMember(data.clubId, auth.userId)) { socket.emit('error', { message: 'Not a club member' }); return; }
@@ -2062,17 +2742,17 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getClubMessages', (data: { clubId: number; limit?: number }) => {
+  socket.on('getClubMessages', async (data: { clubId: number; limit?: number }) => {
     const result = getClubMessages(data.clubId, data.limit || 50);
     socket.emit('clubMessages', result);
   });
 
-  socket.on('getClubAnnouncements', (data: { clubId: number }) => {
+  socket.on('getClubAnnouncements', async (data: { clubId: number }) => {
     const result = getAnnouncements(data.clubId);
     socket.emit('clubAnnouncements', result);
   });
 
-  socket.on('pinClubMessage', (data: { clubId: number; messageId: number; pin: boolean }) => {
+  socket.on('pinClubMessage', async (data: { clubId: number; messageId: number; pin: boolean }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = data.pin ? pinMessage(data.clubId, data.messageId) : unpinMessage(data.clubId, data.messageId);
@@ -2085,26 +2765,26 @@ Give feedback in this JSON format:
 
   // ─── Club Leaderboard & Stats ───
 
-  socket.on('getClubLeaderboard', (data: { clubId: number; period?: 'today' | 'week' | 'alltime' }) => {
+  socket.on('getClubLeaderboard', async (data: { clubId: number; period?: 'today' | 'week' | 'alltime' }) => {
     const result = getClubLeaderboard(data.clubId, data.period || 'alltime');
     socket.emit('clubLeaderboard', result);
   });
 
-  socket.on('getClubStatistics', (data: { clubId: number }) => {
+  socket.on('getClubStatistics', async (data: { clubId: number }) => {
     const result = getClubStatistics(data.clubId);
     socket.emit('clubStatistics', result);
   });
 
   // ─── Club Activity Feed ───
 
-  socket.on('getClubActivity', (data: { clubId: number; limit?: number }) => {
+  socket.on('getClubActivity', async (data: { clubId: number; limit?: number }) => {
     const result = getActivityFeed(data.clubId, data.limit || 20);
     socket.emit('clubActivity', result);
   });
 
   // ========== Club Tournaments ==========
 
-  socket.on('createClubTournament', (data: { clubId: number; config: any }) => {
+  socket.on('createClubTournament', async (data: { clubId: number; config: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = createClubTournament(auth.userId, data.clubId, data.config);
@@ -2115,12 +2795,12 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getClubTournaments', (data: { clubId: number }) => {
+  socket.on('getClubTournaments', async (data: { clubId: number }) => {
     const result = getClubTournaments(data.clubId);
     socket.emit('clubTournaments', result);
   });
 
-  socket.on('registerClubTournament', (data: { tournamentId: number }) => {
+  socket.on('registerClubTournament', async (data: { tournamentId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = registerForClubTournament(data.tournamentId, auth.userId);
@@ -2131,7 +2811,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('startClubTournament', (data: { tournamentId: number }) => {
+  socket.on('startClubTournament', async (data: { tournamentId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = startClubTournament(data.tournamentId, auth.userId);
@@ -2144,7 +2824,7 @@ Give feedback in this JSON format:
 
   // ========== Club Challenges ==========
 
-  socket.on('createClubChallenge', (data: { clubId: number; challengedId: number; stakes: number }) => {
+  socket.on('createClubChallenge', async (data: { clubId: number; challengedId: number; stakes: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = createChallenge(data.clubId, auth.userId, data.challengedId, data.stakes);
@@ -2155,7 +2835,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('acceptClubChallenge', (data: { challengeId: number }) => {
+  socket.on('acceptClubChallenge', async (data: { challengeId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = acceptChallenge(data.challengeId, auth.userId);
@@ -2166,7 +2846,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('declineClubChallenge', (data: { challengeId: number }) => {
+  socket.on('declineClubChallenge', async (data: { challengeId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = declineChallenge(data.challengeId, auth.userId);
@@ -2177,14 +2857,14 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getClubChallenges', (data: { clubId: number }) => {
+  socket.on('getClubChallenges', async (data: { clubId: number }) => {
     const result = getClubChallenges(data.clubId);
     socket.emit('clubChallenges', result);
   });
 
   // ========== Table Scheduling ==========
 
-  socket.on('scheduleClubTable', (data: { clubId: number; config: any; scheduledTime: string; recurring: boolean; recurrencePattern?: string }) => {
+  socket.on('scheduleClubTable', async (data: { clubId: number; config: any; scheduledTime: string; recurring: boolean; recurrencePattern?: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = scheduleTable(data.clubId, auth.userId, data.config, data.scheduledTime, data.recurring, data.recurrencePattern);
@@ -2195,12 +2875,12 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getScheduledClubTables', (data: { clubId: number }) => {
+  socket.on('getScheduledClubTables', async (data: { clubId: number }) => {
     const result = getScheduledTables(data.clubId);
     socket.emit('scheduledClubTables', result);
   });
 
-  socket.on('activateScheduledClubTable', (data: { id: number; clubId: number }) => {
+  socket.on('activateScheduledClubTable', async (data: { id: number; clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = activateScheduledTable(data.id, auth.userId);
@@ -2226,7 +2906,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('deleteScheduledClubTable', (data: { id: number }) => {
+  socket.on('deleteScheduledClubTable', async (data: { id: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = deleteScheduledTable(data.id, auth.userId);
@@ -2239,7 +2919,7 @@ Give feedback in this JSON format:
 
   // ========== Custom Blind Structures ==========
 
-  socket.on('createBlindStructure', (data: { clubId: number; name: string; levels: any[] }) => {
+  socket.on('createBlindStructure', async (data: { clubId: number; name: string; levels: any[] }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
@@ -2273,12 +2953,12 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getBlindStructures', (data: { clubId: number }) => {
+  socket.on('getBlindStructures', async (data: { clubId: number }) => {
     const result = getBlindStructures(data.clubId);
     socket.emit('blindStructures', result);
   });
 
-  socket.on('deleteBlindStructure', (data: { id: number }) => {
+  socket.on('deleteBlindStructure', async (data: { id: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = deleteBlindStructure(data.id, auth.userId);
@@ -2291,7 +2971,7 @@ Give feedback in this JSON format:
 
   // ── Feature 10: Club Invitations ──
 
-  socket.on('inviteToClub', (data: { clubId: number; invitedUsername: string }) => {
+  socket.on('inviteToClub', async (data: { clubId: number; invitedUsername: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = inviteToClub(data.clubId, auth.userId, auth.username || '', data.invitedUsername);
@@ -2302,14 +2982,14 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getMyInvitations', () => {
+  socket.on('getMyInvitations', async () => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('myInvitations', { success: false, invitations: [] }); return; }
     const result = getMyInvitations(auth.userId);
     socket.emit('myInvitations', result);
   });
 
-  socket.on('acceptInvitation', (data: { invitationId: number }) => {
+  socket.on('acceptInvitation', async (data: { invitationId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = acceptInvitation(data.invitationId, auth.userId);
@@ -2321,7 +3001,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('declineInvitation', (data: { invitationId: number }) => {
+  socket.on('declineInvitation', async (data: { invitationId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = declineInvitation(data.invitationId, auth.userId);
@@ -2334,7 +3014,7 @@ Give feedback in this JSON format:
 
   // ── Feature 11: Club Unions ──
 
-  socket.on('createUnion', (data: { clubId: number; name: string; description: string }) => {
+  socket.on('createUnion', async (data: { clubId: number; name: string; description: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = createUnion(data.clubId, auth.userId, data.name, data.description);
@@ -2345,21 +3025,21 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getUnionInfo', (data: { clubId: number }) => {
+  socket.on('getUnionInfo', async (data: { clubId: number }) => {
     const result = getUnionInfo(data.clubId);
     socket.emit('unionInfo', result);
   });
 
   // ── Feature 12: Member Profiles ──
 
-  socket.on('getMemberProfile', (data: { clubId: number; userId: number }) => {
+  socket.on('getMemberProfile', async (data: { clubId: number; userId: number }) => {
     const result = getMemberProfile(data.clubId, data.userId);
     socket.emit('memberProfile', result);
   });
 
   // ── Feature 13: Club Badges ──
 
-  socket.on('updateClubBadge', (data: { clubId: number; badge: string }) => {
+  socket.on('updateClubBadge', async (data: { clubId: number; badge: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = updateClubBadge(data.clubId, auth.userId, data.badge);
@@ -2372,14 +3052,14 @@ Give feedback in this JSON format:
 
   // ── Feature 14: Referral Rewards ──
 
-  socket.on('generateReferralCode', (data: { clubId: number }) => {
+  socket.on('generateReferralCode', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = generateReferralCode(data.clubId, auth.userId);
     socket.emit('referralCode', result);
   });
 
-  socket.on('joinByReferral', (data: { referralCode: string }) => {
+  socket.on('joinByReferral', async (data: { referralCode: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = joinByReferral(data.referralCode, auth.userId);
@@ -2391,7 +3071,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('getReferralStats', (data: { clubId: number }) => {
+  socket.on('getReferralStats', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = getReferralStats(data.clubId, auth.userId);
@@ -2400,14 +3080,14 @@ Give feedback in this JSON format:
 
   // ── Feature 15: Club Levels ──
 
-  socket.on('getClubLevel', (data: { clubId: number }) => {
+  socket.on('getClubLevel', async (data: { clubId: number }) => {
     const result = getClubLevel(data.clubId);
     socket.emit('clubLevel', result);
   });
 
   // ── Feature 16: Featured Clubs ──
 
-  socket.on('getFeaturedClubs', () => {
+  socket.on('getFeaturedClubs', async () => {
     const featured = getFeaturedClubs();
     const clubOfWeek = getClubOfWeek();
     socket.emit('featuredClubs', { ...featured, clubOfWeek: clubOfWeek.club || null });
@@ -2415,7 +3095,7 @@ Give feedback in this JSON format:
 
   // ========== End Club Events ==========
 
-  socket.on('getTableList', () => {
+  socket.on('getTableList', async () => {
     const tables = tableManager.getTableList().map((t) => ({
       ...t,
       spectatorCount: spectators.get(t.tableId)?.size || 0,
@@ -2431,7 +3111,7 @@ Give feedback in this JSON format:
       seatIndex: number;
       buyIn: number;
       avatar?: string;
-    }) => {
+    }) => { (async () => {
       let { tableId, playerName, seatIndex, buyIn } = data;
       const table = tableManager.getTable(tableId);
 
@@ -2486,7 +3166,7 @@ Give feedback in this JSON format:
 
       // Check if the authenticated user is banned before seating
       const authForJoin = authSessions.get(socket.id);
-      if (authForJoin && isUserBanned(authForJoin.userId)) {
+      if (authForJoin && await isUserBanned(authForJoin.userId)) {
         socket.emit('error', { message: 'Your account has been banned' });
         return;
       }
@@ -2511,12 +3191,12 @@ Give feedback in this JSON format:
 
       // Validate buy-in against DB balance for authenticated users
       if (authForJoin) {
-        const dbChips = getUserChips(authForJoin.userId);
+        const dbChips = await getUserChips(authForJoin.userId);
         if (buyIn > dbChips) {
           socket.emit('error', { message: 'Insufficient chips' });
           return;
         }
-        if (!deductChips(authForJoin.userId, buyIn)) {
+        if (!(await deductChips(authForJoin.userId, buyIn))) {
           socket.emit('error', { message: 'Could not deduct chips — try again' });
           return;
         }
@@ -2579,7 +3259,7 @@ Give feedback in this JSON format:
 
       // Schedule AI if it's an AI's turn
       scheduleAIAction(tableId);
-    }
+    })(); }
   );
 
   socket.on(
@@ -2703,7 +3383,605 @@ Give feedback in this JSON format:
     }
   );
 
-  socket.on('startHand', () => {
+  /**
+   * (placeholder — inline helpers live below)
+   */
+
+  // ───── Persistence sweep: socket handlers ──────────────────────────────────
+  // Server-authoritative shop prices. Client cannot influence cost.
+  const SHOP_PRICES: Record<string, Record<string, number>> = {
+    card_back:   { classic_red: 0, royal_blue: 0, gold_premium: 500, neon_green: 500 },
+    emote:       { nice_hand: 150, good_game: 150, big_brain: 200, money: 200, fire: 250, tears: 250, rocket: 300, crown: 400 },
+    frame:       { bronze: 500, silver: 1000, gold: 2000, diamond: 5000 },
+    celebration: { confetti: 400, chip_rain: 800, fireworks: 1200, lightning: 1500 },
+    sound_pack:  { vegas_casino: 300, old_school: 500, cyberpunk: 750, silent_mode: 100 },
+    title:       { the_shark: 800, all_in_legend: 1500, river_rat: 600, bluff_master: 1200 },
+    chip_pack:   { refill: 50, big: 200, pro: 600, whale: 2500 },
+  };
+  const CHIP_PACK_PAYOUT: Record<string, number> = {
+    refill: 10000, big: 50000, pro: 200000, whale: 1000000,
+  };
+
+  // Lazy hydration — first socket call after auth hydrates player progress from DB.
+  async function ensureHydrated(s: Socket): Promise<{ userId: number; playerId: string; username: string } | null> {
+    const auth = authSessions.get(s.id);
+    if (!auth) return null;
+    const playerId = playerSessions.get(s.id)?.playerId || `user-${auth.userId}`;
+    const progress = progressionManager.getOrCreateProgress(playerId, auth.username);
+    if (!progress.userId) {
+      await progressionManager.hydrateFromDB(playerId, auth.userId);
+    }
+    return { userId: auth.userId, playerId, username: auth.username };
+  }
+
+  // Shop: purchase an item. Deducts stars (or chips for chip_pack), inventory-inserts, emits update.
+  socket.on('purchaseShopItem', async (data: { itemType: string; itemId: string }) => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) { socket.emit('purchaseResult', { success: false, error: 'Not authenticated' }); return; }
+      const { itemType, itemId } = data || {};
+      const prices = SHOP_PRICES[itemType];
+      if (!prices || prices[itemId] == null) {
+        socket.emit('purchaseResult', { success: false, error: 'Unknown item' });
+        return;
+      }
+      const cost = prices[itemId];
+      const progress = progressionManager.getProgress(ctx.playerId)!;
+      if (progress.stars < cost) {
+        socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
+        return;
+      }
+
+      // Chip pack: spend stars → credit chips. No inventory row.
+      if (itemType === 'chip_pack') {
+        const payout = CHIP_PACK_PAYOUT[itemId] || 0;
+        progress.stars -= cost;
+        progress.chips += payout;
+        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+        await addChipsToUser(ctx.userId, payout);
+        socket.emit('purchaseResult', { success: true, itemType, itemId, cost, payout });
+        sendProgressToPlayer(socket.id);
+        return;
+      }
+
+      // Cosmetic: deduct stars + insert into inventory.
+      const granted = await dbGrantItem(ctx.userId, itemType, itemId);
+      if (!granted) {
+        socket.emit('purchaseResult', { success: false, error: 'Already owned' });
+        return;
+      }
+      progress.stars -= cost;
+      dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+      socket.emit('purchaseResult', { success: true, itemType, itemId, cost });
+      // Push updated inventory snapshot too
+      const inv = await loadInventory(ctx.userId);
+      socket.emit('inventoryUpdated', { inventory: inv });
+      sendProgressToPlayer(socket.id);
+    } catch (err: any) {
+      console.error('purchaseShopItem error:', err);
+      socket.emit('purchaseResult', { success: false, error: 'Server error' });
+    }
+  });
+
+  // Shop: equip an owned item (unequips siblings of same type).
+  socket.on('equipItem', async (data: { itemType: string; itemId: string }) => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) return;
+      const { itemType, itemId } = data || {};
+      const ok = await dbEquipItem(ctx.userId, itemType, itemId);
+      socket.emit('equipResult', { success: ok, itemType, itemId, error: ok ? undefined : 'not_owned' });
+      if (ok) {
+        const inv = await loadInventory(ctx.userId);
+        socket.emit('inventoryUpdated', { inventory: inv });
+      }
+    } catch (err: any) {
+      console.error('equipItem error:', err);
+    }
+  });
+
+  // Return the full inventory snapshot — called on login to hydrate the shop UI.
+  socket.on('getInventory', async () => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) return;
+      const inv = await loadInventory(ctx.userId);
+      socket.emit('inventoryUpdated', { inventory: inv });
+    } catch (err: any) {
+      console.error('getInventory error:', err);
+    }
+  });
+
+  // Daily login reward — real server-validated claim, awards actual stars+chips.
+  socket.on('claimDailyLogin', async () => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) { socket.emit('dailyLoginClaimed', { success: false, error: 'Not authenticated' }); return; }
+
+      if (await hasClaimedToday(ctx.userId, 'login')) {
+        socket.emit('dailyLoginClaimed', { success: false, error: 'already_claimed' });
+        return;
+      }
+
+      const durable = await loadDurableProgress(ctx.userId);
+      const today = new Date().toISOString().slice(0, 10);
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+      const prev = durable?.lastLoginClaimDate;
+      let newStreak: number;
+      if (prev === yesterday) newStreak = (durable!.loginStreak || 0) + 1;
+      else                    newStreak = 1;
+      // Cap the streak display cycle at 7
+      const day = ((newStreak - 1) % 7) + 1;
+
+      // Reward table: Days 1-3 chips only; 4→+5⭐; 5→+10⭐; 6→+20⭐; 7→+50⭐
+      const CHIPS_BY_DAY = [0, 1000, 2000, 3000, 5000, 7500, 10000, 20000];
+      const STARS_BY_DAY = [0,    0,    0,    0,    5,   10,    20,    50];
+      const chips = CHIPS_BY_DAY[day] || 0;
+      const stars = STARS_BY_DAY[day] || 0;
+
+      const progress = progressionManager.getProgress(ctx.playerId)!;
+      progress.chips += chips;
+      progress.stars += stars;
+      progress.dailyLoginStreak = newStreak;
+
+      if (chips > 0) await addChipsToUser(ctx.userId, chips);
+      dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+      await updateLoginStreak(ctx.userId, newStreak);
+      await recordDailyClaim(ctx.userId, 'login', { day, chips, stars });
+
+      socket.emit('dailyLoginClaimed', { success: true, day, streak: newStreak, chips, stars });
+      sendProgressToPlayer(socket.id);
+    } catch (err: any) {
+      console.error('claimDailyLogin error:', err);
+      socket.emit('dailyLoginClaimed', { success: false, error: 'server_error' });
+    }
+  });
+
+  // Daily spin — server-validated one-per-day with stars included in reward table.
+  socket.on('claimDailySpinServer', async () => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) { socket.emit('dailySpinClaimed', { success: false, error: 'Not authenticated' }); return; }
+
+      if (await hasClaimedToday(ctx.userId, 'spin')) {
+        socket.emit('dailySpinClaimed', { success: false, error: 'already_claimed' });
+        return;
+      }
+
+      // Reward roll: 5% big stars, 20% small stars, 50% chips, 25% big chips.
+      const roll = Math.random();
+      let reward: { chips: number; stars: number; label: string };
+      if (roll < 0.05) reward = { chips: 0, stars: 100, label: '💰 100 stars!' };
+      else if (roll < 0.25) reward = { chips: 0, stars: 25, label: '⭐ 25 stars' };
+      else if (roll < 0.75) reward = { chips: 2500, stars: 0, label: '2,500 chips' };
+      else                  reward = { chips: 10000, stars: 0, label: '🎰 10,000 chips' };
+
+      const progress = progressionManager.getProgress(ctx.playerId)!;
+      progress.chips += reward.chips;
+      progress.stars += reward.stars;
+      if (reward.chips > 0) await addChipsToUser(ctx.userId, reward.chips);
+      if (reward.stars > 0) dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+      await recordDailyClaim(ctx.userId, 'spin', reward);
+
+      socket.emit('dailySpinClaimed', { success: true, reward });
+      sendProgressToPlayer(socket.id);
+    } catch (err: any) {
+      console.error('claimDailySpinServer error:', err);
+      socket.emit('dailySpinClaimed', { success: false, error: 'server_error' });
+    }
+  });
+
+  // Scratch card — consume from user's banked inventory, reveal reward.
+  socket.on('claimScratchCard', async () => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) { socket.emit('scratchCardRevealed', { success: false, error: 'Not authenticated' }); return; }
+
+      const consumed = await consumeScratchCard(ctx.userId);
+      if (!consumed) {
+        socket.emit('scratchCardRevealed', { success: false, error: 'no_cards_available' });
+        return;
+      }
+
+      // Reward roll: 20% stars, 10% cosmetic surprise, 70% chips.
+      const roll = Math.random();
+      let reward: { chips?: number; stars?: number; item?: { type: string; id: string }; label: string };
+      if (roll < 0.20) {
+        const amt = 10 + Math.floor(Math.random() * 40);
+        reward = { stars: amt, label: `⭐ ${amt} stars` };
+      } else if (roll < 0.30) {
+        // Grant a cheap surprise emote
+        const pool = ['nice_hand', 'good_game', 'fire', 'crown'];
+        const id = pool[Math.floor(Math.random() * pool.length)];
+        await dbGrantItem(ctx.userId, 'emote', id);
+        reward = { item: { type: 'emote', id }, label: `🎁 Emote: ${id}` };
+      } else {
+        const amt = 1000 + Math.floor(Math.random() * 9000);
+        reward = { chips: amt, label: `🪙 ${amt.toLocaleString()} chips` };
+      }
+
+      const progress = progressionManager.getProgress(ctx.playerId)!;
+      if (reward.chips) {
+        progress.chips += reward.chips;
+        await addChipsToUser(ctx.userId, reward.chips);
+      }
+      if (reward.stars) {
+        progress.stars += reward.stars;
+        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+      }
+
+      socket.emit('scratchCardRevealed', { success: true, reward });
+      if (reward.item) {
+        const inv = await loadInventory(ctx.userId);
+        socket.emit('inventoryUpdated', { inventory: inv });
+      }
+      sendProgressToPlayer(socket.id);
+    } catch (err: any) {
+      console.error('claimScratchCard error:', err);
+      socket.emit('scratchCardRevealed', { success: false, error: 'server_error' });
+    }
+  });
+
+  // Battle pass tier claim — idempotent via unique constraint.
+  socket.on('claimBattlePassTier', async (data: { seasonId: string; tierId: number; reward?: { chips?: number; stars?: number; itemType?: string; itemId?: string } }) => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) { socket.emit('battlePassTierClaimed', { success: false, error: 'Not authenticated' }); return; }
+
+      const seasonId = data?.seasonId || 'season_1_the_river';
+      const tierId = Number(data?.tierId);
+      if (!Number.isInteger(tierId) || tierId < 1 || tierId > 50) {
+        socket.emit('battlePassTierClaimed', { success: false, error: 'invalid_tier' });
+        return;
+      }
+
+      const ok = await dbClaimBattlePassTier(ctx.userId, seasonId, tierId);
+      if (!ok) {
+        socket.emit('battlePassTierClaimed', { success: false, error: 'already_claimed', tierId });
+        return;
+      }
+
+      // Server-side reward table per tier. Every 5th tier grants stars, rest grant chips.
+      const progress = progressionManager.getProgress(ctx.playerId)!;
+      const chips = tierId % 5 === 0 ? 0 : 1000 + tierId * 200;
+      const stars = tierId % 5 === 0 ? 25 + tierId : 0;
+      if (chips > 0) { progress.chips += chips; await addChipsToUser(ctx.userId, chips); }
+      if (stars > 0) { progress.stars += stars; dbPersistStars(ctx.userId, progress.stars).catch(() => {}); }
+
+      socket.emit('battlePassTierClaimed', { success: true, tierId, chips, stars });
+      sendProgressToPlayer(socket.id);
+    } catch (err: any) {
+      console.error('claimBattlePassTier error:', err);
+      socket.emit('battlePassTierClaimed', { success: false, error: 'server_error' });
+    }
+  });
+
+  // Avatar customization sync.
+  socket.on('updateAvatar', async (data: any) => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) return;
+      await persistCustomization(ctx.userId, data || {});
+      socket.emit('customizationUpdated', { success: true, customization: data || {} });
+    } catch (err: any) {
+      console.error('updateAvatar error:', err);
+    }
+  });
+
+  // Settings / preferences sync.
+  socket.on('updatePreferences', async (data: any) => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) return;
+      await persistPreferences(ctx.userId, data || {});
+      socket.emit('preferencesUpdated', { success: true });
+    } catch (err: any) {
+      console.error('updatePreferences error:', err);
+    }
+  });
+
+  // Load durable extras (inventory, battle pass claims, hand history, prefs) —
+  // called by client once after login to hydrate UI.
+  socket.on('getDurableState', async (data: { seasonId?: string } = {}) => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) return;
+      const [inventory, bpClaims, durable, handHistory] = await Promise.all([
+        loadInventory(ctx.userId),
+        loadBattlePassClaims(ctx.userId, data.seasonId || 'season_1_the_river'),
+        loadDurableProgress(ctx.userId),
+        loadHandHistory(ctx.userId, 100),
+      ]);
+      socket.emit('durableState', {
+        inventory,
+        battlePassClaims: bpClaims,
+        customization: durable?.customization || {},
+        preferences: durable?.preferences || {},
+        stars: durable?.stars || 0,
+        loginStreak: durable?.loginStreak || 0,
+        lastLoginClaimDate: durable?.lastLoginClaimDate || null,
+        scratchCardsAvailable: durable?.scratchCardsAvailable || 0,
+        handHistory,
+      });
+    } catch (err: any) {
+      console.error('getDurableState error:', err);
+    }
+  });
+
+  /**
+   * Deep-link from player app: "Play Online" tile (general play, not waitlist).
+   * Player app issued a short-lived signed ticket via the master API; we
+   * verify it here, resolve / sync the local user, set the auth session, and
+   * emit loginResult. Does NOT auto-seat the player — they land on the lobby
+   * logged in and choose their table.
+   */
+  socket.on(
+    'authWithTicket',
+    async (data: { token: string }) => {
+      try {
+        if (!data?.token) {
+          socket.emit('loginResult', { success: false, error: 'Missing token' });
+          return;
+        }
+
+        const MASTER_API_BASE =
+          process.env.MASTER_API_URL ||
+          'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+
+        // 1. Verify ticket with master API
+        const verifyRes = await fetch(`${MASTER_API_BASE}/online-link-token/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: data.token }),
+        });
+        if (!verifyRes.ok) {
+          socket.emit('loginResult', { success: false, error: 'Token verify failed' });
+          return;
+        }
+        const verifyJson: any = await verifyRes.json();
+        const payload = verifyJson?.data || verifyJson;
+        if (!payload?.valid) {
+          socket.emit('loginResult', { success: false, error: `Invalid token: ${payload?.reason || 'unknown'}` });
+          return;
+        }
+        const remoteUserId = payload.payload?.userId;
+        if (!remoteUserId) {
+          socket.emit('loginResult', { success: false, error: 'Token missing userId' });
+          return;
+        }
+
+        // 2. Fetch master user details
+        const meRes = await fetch(`${MASTER_API_BASE}/users/${remoteUserId}/me`);
+        if (!meRes.ok) {
+          socket.emit('loginResult', { success: false, error: 'Could not load user' });
+          return;
+        }
+        const meJson: any = await meRes.json();
+        const masterUser = meJson?.data || meJson;
+        const phone = masterUser.phoneNumber || masterUser.phone_number;
+        const displayName = masterUser.firstName
+          ? `${masterUser.firstName} ${(masterUser.lastName || '')[0] || ''}.`.trim()
+          : masterUser.username || phone;
+
+        // 3. Lookup or insert local user. We key on the master phone number
+        //    (same convention as syncMasterUser in authManager.ts). We do NOT
+        //    overwrite an existing password_hash on upsert — only insert when
+        //    absent so a ticket-login never invalidates the user's password.
+        const bcrypt = require('bcryptjs');
+        const placeholderHash = bcrypt.hashSync(
+          `ticket-placeholder-${remoteUserId}-${Date.now()}`,
+          10
+        );
+        const { rows } = await getPool().query(
+          `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
+             VALUES ($1, $2, $3, 10000, 1, 0, $4)
+             ON CONFLICT (LOWER(username)) DO UPDATE
+               SET display_name = COALESCE(users.display_name, $2)
+           RETURNING *`,
+          [phone, displayName, placeholderHash, JSON.stringify({ masterPhone: phone, masterUsername: masterUser.username, masterUserId: remoteUserId })]
+        );
+        const localUser = rows[0];
+
+        // 4. Set auth session + emit loginResult in the shape the client expects.
+        authSessions.set(socket.id, { userId: localUser.id, username: localUser.username });
+        const userData = {
+          id: localUser.id,
+          username: localUser.username,
+          displayName: localUser.display_name,
+          chips: localUser.chips,
+          level: localUser.level,
+          xp: localUser.xp,
+          stats: typeof localUser.stats === 'string' ? JSON.parse(localUser.stats || '{}') : (localUser.stats || {}),
+          achievements: typeof localUser.achievements === 'string' ? JSON.parse(localUser.achievements || '[]') : (localUser.achievements || []),
+          isAdmin: !!localUser.is_admin,
+        };
+        socket.emit('loginResult', { success: true, token: data.token, userData });
+
+        console.log(
+          `[authWithTicket] logged in userId=${localUser.id} (masterId=${remoteUserId}) username=${localUser.username}`
+        );
+      } catch (err: any) {
+        console.error('authWithTicket error:', err);
+        socket.emit('loginResult', { success: false, error: 'Server error authenticating ticket' });
+      }
+    }
+  );
+
+  /**
+   * Deep-link from player app: a logged-in player on the live waitlist taps
+   * "Play online while you wait". Player app issued a short-lived signed
+   * token via the master API; we verify it here, then auto-seat the player
+   * at the Beginner's Table (lowest blinds) with the context attached.
+   */
+  socket.on(
+    'joinWithWaitlistContext',
+    async (data: {
+      token: string;
+      context: {
+        source?: string;
+        gameId?: string | null;
+        position?: number | null;
+        venue?: string | null;
+        startTime?: string | null;
+      };
+    }) => {
+      try {
+        if (!data || !data.token) {
+          socket.emit('error', { message: 'Missing token' });
+          return;
+        }
+
+        // 1) Verify token with master API
+        const MASTER_API_BASE =
+          process.env.MASTER_API_URL ||
+          'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+        const verifyRes = await fetch(`${MASTER_API_BASE}/online-link-token/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: data.token }),
+        });
+        if (!verifyRes.ok) {
+          socket.emit('error', { message: 'Token verify failed' });
+          return;
+        }
+        const verifyJson: any = await verifyRes.json();
+        const payload = verifyJson?.data || verifyJson;
+        if (!payload || !payload.valid) {
+          socket.emit('error', {
+            message: `Invalid token: ${payload?.reason || 'unknown'}`,
+          });
+          return;
+        }
+        const claims = payload.payload || {};
+        const remoteUserId = claims.userId;
+        if (!remoteUserId) {
+          socket.emit('error', { message: 'Token missing userId' });
+          return;
+        }
+
+        // 2) Pick lowest-stakes Texas Hold'em table (Beginner's Table)
+        const existingSession = playerSessions.get(socket.id);
+        if (existingSession) handlePlayerLeave(socket);
+        const tables = tableManager.getTableList();
+        const isHoldem = (t: any) => {
+          const tbl = tableManager.getTable(t.tableId);
+          const id = (tbl as any)?.variantId || '';
+          return !id || id === 'texas-holdem';
+        };
+        const holdem = tables.filter(isHoldem);
+        holdem.sort((a, b) => a.smallBlind - b.smallBlind);
+        if (holdem.length === 0) {
+          socket.emit('error', { message: 'No tables available' });
+          return;
+        }
+        const bestTable = holdem[0];
+        const table = tableManager.getTable(bestTable.tableId);
+        if (!table) {
+          socket.emit('error', { message: 'Table not found' });
+          return;
+        }
+
+        // 3) Find empty or AI seat
+        let targetSeat = -1;
+        for (let i = 0; i < MAX_SEATS; i++) {
+          if (table.seats[i].state === 'empty') {
+            targetSeat = i;
+            break;
+          }
+        }
+        if (targetSeat === -1) {
+          for (let i = 0; i < MAX_SEATS; i++) {
+            if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
+              table.standUp(i);
+              const profiles = aiProfiles.get(bestTable.tableId);
+              if (profiles) profiles.delete(i);
+              targetSeat = i;
+              break;
+            }
+          }
+        }
+        if (targetSeat === -1) {
+          socket.emit('error', { message: 'No seats available' });
+          return;
+        }
+
+        // 4) Seat the player. Use existing session's playerName if available,
+        //    else fall back to a generic name (the client's auth flow supplies
+        //    the real name via loginResult, this handler runs after login).
+        const existingName = playerSessions.get(socket.id)?.playerName;
+        const playerName = existingName || `Player-${remoteUserId.slice(0, 6)}`;
+        const playerId = `player-${uuidv4()}`;
+        const success = table.sitDown(
+          targetSeat,
+          playerName,
+          table.config.minBuyIn,
+          playerId,
+          false
+        );
+        if (!success) {
+          socket.emit('error', { message: 'Could not join table' });
+          return;
+        }
+
+        const session: PlayerSession = {
+          socketId: socket.id,
+          tableId: bestTable.tableId,
+          seatIndex: targetSeat,
+          playerName,
+          playerId,
+          trainingEnabled: false,
+          sittingOut: false,
+          context: {
+            source: 'waitlist',
+            gameId: data.context?.gameId ?? claims.gameId ?? null,
+            position: data.context?.position ?? claims.position ?? null,
+            venue: data.context?.venue ?? claims.venueName ?? null,
+            startTime: data.context?.startTime ?? claims.startTime ?? null,
+          },
+        };
+        playerSessions.set(socket.id, session);
+        socket.join(`table:${bestTable.tableId}`);
+
+        progressionManager.getOrCreateProgress(playerId, playerName);
+        ensureTableProgressListener(table, bestTable.tableId);
+        fillWithAI(table, bestTable.tableId);
+
+        if (!table.isHandInProgress() && table.getOccupiedSeatCount() >= 2) {
+          table.startNewHand();
+        }
+
+        socket.emit('gameState', getGameStateForPlayer(table, targetSeat));
+        broadcastGameState(bestTable.tableId);
+        sendProgressToPlayer(socket.id);
+        scheduleAIAction(bestTable.tableId);
+
+        console.log(
+          `[waitlistContext] seated user=${remoteUserId} at table=${bestTable.tableId} seat=${targetSeat} gameId=${claims.gameId}`
+        );
+      } catch (err: any) {
+        console.error('joinWithWaitlistContext error:', err);
+        socket.emit('error', { message: 'Server error joining with context' });
+      }
+    }
+  );
+
+  // Pineapple / Crazy Pineapple manual discard. Player picks which of their 3
+  // hole cards to throw away. If they don't pick before the deadline, the
+  // server auto-discards their weakest card.
+  socket.on('selectPineappleDiscard', (data: { cardIndex: number }) => {
+    const session = playerSessions.get(socket.id);
+    if (!session) { socket.emit('error', { message: 'Not at a table' }); return; }
+    const table = tableManager.getTable(session.tableId) as any;
+    if (!table || typeof table.selectPineappleDiscard !== 'function') {
+      socket.emit('error', { message: 'Table does not support discard' });
+      return;
+    }
+    const ok = table.selectPineappleDiscard(session.seatIndex, data?.cardIndex);
+    socket.emit('pineappleDiscardAck', { success: !!ok, cardIndex: data?.cardIndex });
+    if (ok) broadcastGameState(session.tableId);
+  });
+
+  socket.on('startHand', async () => {
     const session = playerSessions.get(socket.id);
     if (!session) {
       socket.emit('error', { message: 'Not at a table' });
@@ -2871,7 +4149,7 @@ Give feedback in this JSON format:
   );
 
   // ========== Draw Game: Player Draw Action ==========
-  socket.on('playerDraw', (data: { discardIndices: number[] }) => {
+  socket.on('playerDraw', async (data: { discardIndices: number[] }) => {
     const session = playerSessions.get(socket.id);
     if (!session) {
       socket.emit('error', { message: 'Not at a table' });
@@ -2901,7 +4179,7 @@ Give feedback in this JSON format:
   });
 
   // Chat message handler
-  socket.on('chatMessage', (data: { message: string }) => {
+  socket.on('chatMessage', async (data: { message: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
     if (!data.message || data.message.length > 200) return;
@@ -2926,11 +4204,11 @@ Give feedback in this JSON format:
 
   // ========== Progression Events ==========
 
-  socket.on('getProgress', () => {
+  socket.on('getProgress', async () => {
     sendProgressToPlayer(socket.id);
   });
 
-  socket.on('claimMission', (data: { missionId: string }) => {
+  socket.on('claimMission', async (data: { missionId: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -2941,7 +4219,7 @@ Give feedback in this JSON format:
     sendProgressToPlayer(socket.id);
   });
 
-  socket.on('claimDailyBonus', () => {
+  socket.on('claimDailyBonus', async () => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -2958,7 +4236,7 @@ Give feedback in this JSON format:
     sendProgressToPlayer(socket.id);
   });
 
-  socket.on('getDailyMissions', () => {
+  socket.on('getDailyMissions', async () => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -2969,7 +4247,7 @@ Give feedback in this JSON format:
 
   // ========== Sit Out ==========
 
-  socket.on('sitOut', () => {
+  socket.on('sitOut', async () => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -3002,7 +4280,7 @@ Give feedback in this JSON format:
   });
 
   // ========== AFK Handler ==========
-  socket.on('playerAFK', () => {
+  socket.on('playerAFK', async () => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -3020,7 +4298,7 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('playerBack', () => {
+  socket.on('playerBack', async () => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -3032,7 +4310,7 @@ Give feedback in this JSON format:
   });
 
   // ========== Fast Mode (#12) ==========
-  socket.on('setFastMode', (data: { enabled: boolean }) => {
+  socket.on('setFastMode', async (data: { enabled: boolean }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
     // Only authenticated (registered) players can change fast mode
@@ -3043,7 +4321,7 @@ Give feedback in this JSON format:
   });
 
   // ========== Post Missed Blinds (#16) ==========
-  socket.on('postMissedBlinds', () => {
+  socket.on('postMissedBlinds', async () => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
     const tableMissed = missedBlinds.get(session.tableId);
@@ -3066,7 +4344,7 @@ Give feedback in this JSON format:
   });
 
   // ========== Show Mucked Hand ==========
-  socket.on('showMuckedHand', (data: { cards: any[] }) => {
+  socket.on('showMuckedHand', async (data: { cards: any[] }) => {
     const session = playerSessions.get(socket.id);
     if (!session || !data?.cards?.length) return;
 
@@ -3088,7 +4366,7 @@ Give feedback in this JSON format:
 
   // ========== Training Mode ==========
 
-  socket.on('toggleTraining', () => {
+  socket.on('toggleTraining', async () => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -3108,7 +4386,7 @@ Give feedback in this JSON format:
   });
 
   // ========== Bomb Pot ==========
-  socket.on('triggerBombPot', (data: { tableId?: string }) => {
+  socket.on('triggerBombPot', async (data: { tableId?: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
     // Only players seated at the table may trigger a bomb pot
@@ -3123,7 +4401,7 @@ Give feedback in this JSON format:
   });
 
   // ========== Dealer's Choice ==========
-  socket.on('enableDealersChoice', (data: { tableId?: string; enabled: boolean }) => {
+  socket.on('enableDealersChoice', async (data: { tableId?: string; enabled: boolean }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
     const tableId = data?.tableId || session.tableId;
@@ -3156,7 +4434,7 @@ Give feedback in this JSON format:
   // ========== Quick-Play Formats ==========
 
   // Heads-Up Snap: 2 players, 5-minute fast game
-  socket.on('quickHeadsUp', (data: { playerName: string }) => {
+  socket.on('quickHeadsUp', async (data: { playerName: string }) => {
     const { playerName } = data;
 
     // Leave existing table if any
@@ -3260,7 +4538,7 @@ Give feedback in this JSON format:
   });
 
   // Spin & Go: 3 players, random prize multiplier
-  socket.on('quickSpinGo', (data: { playerName: string }) => {
+  socket.on('quickSpinGo', async (data: { playerName: string }) => {
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -3385,7 +4663,7 @@ Give feedback in this JSON format:
   });
 
   // All-In or Fold
-  socket.on('quickAllInOrFold', (data: { playerName: string }) => {
+  socket.on('quickAllInOrFold', async (data: { playerName: string }) => {
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -3453,7 +4731,7 @@ Give feedback in this JSON format:
 
   // ========== Career Mode ==========
 
-  socket.on('startCareerGame', (data: { venue: number; stage: number }) => {
+  socket.on('startCareerGame', async (data: { venue: number; stage: number }) => {
     const { venue, stage } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -3544,7 +4822,7 @@ Give feedback in this JSON format:
 
   // ========== Emote System ==========
 
-  socket.on('emote', (data: { emoteId: string }) => {
+  socket.on('emote', async (data: { emoteId: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -3563,7 +4841,7 @@ Give feedback in this JSON format:
 
   // ========== Table Reactions ==========
 
-  socket.on('tableReaction', (data: { reactionId: string }) => {
+  socket.on('tableReaction', async (data: { reactionId: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -3582,7 +4860,7 @@ Give feedback in this JSON format:
 
   // ========== Spectator Mode ==========
 
-  socket.on('spectate', (data: { tableId: string }) => {
+  socket.on('spectate', async (data: { tableId: string }) => {
     const { tableId } = data;
     const table = tableManager.getTable(tableId);
     if (!table) {
@@ -3611,7 +4889,7 @@ Give feedback in this JSON format:
     socket.emit('spectating', { tableId, tableName: table.config.tableName });
   });
 
-  socket.on('stopSpectating', () => {
+  socket.on('stopSpectating', async () => {
     // Remove from all spectator lists
     for (const [tableId, specs] of spectators) {
       if (specs.has(socket.id)) {
@@ -3627,7 +4905,7 @@ Give feedback in this JSON format:
 
   // ========== Theme Shop ==========
 
-  socket.on('purchaseTheme', (data: { themeId: string }) => {
+  socket.on('purchaseTheme', async (data: { themeId: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -3646,7 +4924,7 @@ Give feedback in this JSON format:
     sendProgressToPlayer(socket.id);
   });
 
-  socket.on('purchaseBattlePass', (_data: unknown, callback?: (ack: { success: boolean; error?: string }) => void) => {
+  socket.on('purchaseBattlePass', async (_data: unknown, callback?: (ack: { success: boolean; error?: string }) => void) => {
     const auth = authSessions.get(socket.id);
     const session = playerSessions.get(socket.id);
     const respond = (ack: { success: boolean; error?: string }) => { if (typeof callback === 'function') callback(ack); };
@@ -3656,12 +4934,12 @@ Give feedback in this JSON format:
     const BATTLE_PASS_COST = 950;
     const result = progressionManager.purchaseTheme(playerId, '__battlepass_premium__', BATTLE_PASS_COST);
     if (!result.success) { respond({ success: false, error: result.error }); return; }
-    mergeUserStats(auth.userId, { battlePassPremium: true });
+    await mergeUserStats(auth.userId, { battlePassPremium: true });
     sendProgressToPlayer(socket.id);
     respond({ success: true });
   });
 
-  socket.on('equipTheme', (data: { themeId: string }) => {
+  socket.on('equipTheme', async (data: { themeId: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -3676,7 +4954,7 @@ Give feedback in this JSON format:
 
   // ========== Detailed Stats ==========
 
-  socket.on('getDetailedStats', () => {
+  socket.on('getDetailedStats', async () => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
@@ -3686,11 +4964,11 @@ Give feedback in this JSON format:
 
   // ========== Tournament System ==========
 
-  socket.on('getTournaments', () => {
+  socket.on('getTournaments', async () => {
     socket.emit('tournamentList', tournamentManager.getTournamentList());
   });
 
-  socket.on('registerTournament', (data: { tournamentId: string; playerName: string }) => {
+  socket.on('registerTournament', async (data: { tournamentId: string; playerName: string }) => {
     const session = playerSessions.get(socket.id);
     const playerId = session?.playerId || `player-${uuidv4()}`;
     const playerName = data.playerName || session?.playerName || 'Player';
@@ -3712,7 +4990,7 @@ Give feedback in this JSON format:
   });
 
   // Start a simulated multi-table tournament
-  socket.on('startSimulatedTournament', (data: { playerCount?: number; turbo?: boolean }) => {
+  socket.on('startSimulatedTournament', async (data: { playerCount?: number; turbo?: boolean }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Must be logged in' }); return; }
 
@@ -3741,7 +5019,7 @@ Give feedback in this JSON format:
   });
 
   // Toggle tournament speed
-  socket.on('setTournamentSpeed', (data: { tournamentId: string; turbo: boolean }) => {
+  socket.on('setTournamentSpeed', async (data: { tournamentId: string; turbo: boolean }) => {
     const tournament = tournamentManager.getTournament(data.tournamentId);
     if (!tournament) return;
     tournament.turboMode = data.turbo;
@@ -3752,7 +5030,7 @@ Give feedback in this JSON format:
 
   // ========== Multi-Table Support ==========
 
-  socket.on('joinAdditionalTable', (data: { tableId: string; playerName: string; buyIn: number; avatar?: string }) => {
+  socket.on('joinAdditionalTable', async (data: { tableId: string; playerName: string; buyIn: number; avatar?: string }) => {
     const { tableId, playerName, buyIn, avatar } = data;
     const table = tableManager.getTable(tableId);
     if (!table) {
@@ -3818,7 +5096,7 @@ Give feedback in this JSON format:
     broadcastGameState(tableId);
   });
 
-  socket.on('leaveAdditionalTable', (data: { tableId: string }) => {
+  socket.on('leaveAdditionalTable', async (data: { tableId: string }) => {
     const sessions = multiTableSessions.get(socket.id);
     if (!sessions) return;
 
@@ -3839,12 +5117,12 @@ Give feedback in this JSON format:
     socket.leave(`table:${data.tableId}`);
   });
 
-  socket.on('switchTable', (data: { tableId: string }) => {
+  socket.on('switchTable', async (data: { tableId: string }) => {
     // Client-side only - just acknowledge
     socket.emit('tableSwitched', { tableId: data.tableId });
   });
 
-  socket.on('leaveTable', () => {
+  socket.on('leaveTable', async () => {
     handlePlayerLeave(socket);
   });
 
@@ -3876,7 +5154,7 @@ Give feedback in this JSON format:
     console.log(`[privateTable] Created ${tableId} (invite: ${inviteCode})`);
   });
 
-  socket.on('joinByInviteCode', (data: { inviteCode: string; playerName: string; buyIn: number; avatar?: any }) => {
+  socket.on('joinByInviteCode', async (data: { inviteCode: string; playerName: string; buyIn: number; avatar?: any }) => {
     const { inviteCode, playerName, buyIn, avatar } = data;
     // Find table whose ID starts with the invite code (lowercased)
     const target = tableManager.getTableByInviteCode(inviteCode.toLowerCase());
@@ -3919,7 +5197,7 @@ Give feedback in this JSON format:
   });
 
   // ── Coach whisper (relay from coach to student) ───────────────────────
-  socket.on('coachWhisper', (data: { targetSocketId: string; message: string; coachName?: string }) => {
+  socket.on('coachWhisper', async (data: { targetSocketId: string; message: string; coachName?: string }) => {
     // Must be authenticated to send whispers
     const auth = authSessions.get(socket.id);
     if (!auth) return;
@@ -3976,7 +5254,7 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
   // ── Prediction market ─────────────────────────────────────────────────
   const predictionBets = new Map<string, { socketId: string; outcome: string; amount: number }[]>();
 
-  socket.on('marketBet', (data: { marketId: string; handId: string; outcome: string; amount: number }) => {
+  socket.on('marketBet', async (data: { marketId: string; handId: string; outcome: string; amount: number }) => {
     if (!data.marketId || !data.handId || !data.outcome || typeof data.amount !== 'number' || data.amount <= 0) return;
     const key = `${data.marketId}:${data.handId}`;
     const existing = predictionBets.get(key) || [];
@@ -3984,7 +5262,7 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
     predictionBets.set(key, existing);
   });
 
-  socket.on('marketResolve', (data: { marketId: string; handId: string; winningOutcome: string }) => {
+  socket.on('marketResolve', async (data: { marketId: string; handId: string; winningOutcome: string }) => {
     if (!data.marketId || !data.handId || !data.winningOutcome) return;
     const key = `${data.marketId}:${data.handId}`;
     const bets = predictionBets.get(key);
@@ -4018,7 +5296,7 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
     predictionBets.delete(key);
   });
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log(`Player disconnected: ${socket.id}`);
 
     const authSession = authSessions.get(socket.id);
@@ -4030,7 +5308,7 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
       if (table) {
         const seat = table.seats[session.seatIndex];
         if (seat && seat.state === 'occupied') {
-          saveProgress(authSession.userId, { chips: seat.chipCount });
+          await saveProgress(authSession.userId, { chips: seat.chipCount });
 
           // Reserve the seat for 10 minutes so the player can reconnect
           // Cancel any existing reservation for this user first
@@ -4056,6 +5334,7 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
             sittingOut: session.sittingOut,
             expiresAt: Date.now() + SEAT_RESERVE_MS,
             cleanupTimer,
+            handsRemaining: DISCONNECT_HANDS_LIMIT,
           });
 
           // Mark player as sitting out while disconnected (auto-folds their turn)
@@ -4572,7 +5851,48 @@ function handleTableRebalance(tournamentId: string): void {
       io.to(`table:${tid}`).emit('tournamentUpdate', status);
     }
   }
+
+  // Cascade: keep rebalancing until all tables have >= 5 players or only 1 table left
+  const nextRebalance = tournamentManager.checkRebalance(tournamentId);
+  if (nextRebalance) {
+    // Delay slightly to let table state settle
+    setTimeout(() => handleTableRebalance(tournamentId), 500);
+  } else {
+    // All tables are balanced — restart hands on tables that were waiting
+    const t = tournamentManager.getTournament(tournamentId);
+    if (t) {
+      for (const tid of t.tableIds) {
+        const table = tableManager.getTable(tid);
+        if (table && !table.isHandInProgress()) {
+          const alivePlayers = tournamentManager.getAlivePlayersOnTable(tournamentId, tid);
+          const isFinalTable = t.tableIds.length === 1;
+          if (alivePlayers.length >= 2 && (isFinalTable || alivePlayers.length >= 5)) {
+            table.startNewHand();
+            broadcastGameState(tid);
+            scheduleAIAction(tid);
+          }
+        }
+      }
+    }
+  }
 }
+
+// Periodic rebalance check — prevents stalls when tables have < 5 players
+// and no eliminations are happening to trigger event-driven rebalance.
+setInterval(() => {
+  for (const [tableId, tournamentId] of tournamentTables) {
+    const tournament = tournamentManager.getTournament(tournamentId);
+    if (!tournament || tournament.status !== 'running') continue;
+    if (tournament.tableIds.length <= 1) continue;
+
+    // Check if any table has < 5 players
+    const rebalance = tournamentManager.checkRebalance(tournamentId);
+    if (rebalance) {
+      handleTableRebalance(tournamentId);
+      break; // handle one tournament at a time per tick
+    }
+  }
+}, 5000);
 
 // REST endpoint to start a simulated tournament
 app.post('/api/tournament/simulate', (req, res) => {
@@ -4595,8 +5915,8 @@ app.post('/api/tournament/simulate', (req, res) => {
 });
 
 // ========== Initialize Auth Database ==========
-initDB();
-initClubTables();
+initDB().then(() => {
+initClubTables(); });
 
 // ========== Start Server ==========
 

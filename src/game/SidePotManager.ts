@@ -246,8 +246,14 @@ export class SidePotManager {
       }
 
       if (handResults.length === 0) {
-        // No evaluable hands — roll forward like an orphan
-        orphanedCarry += workPot.amount;
+        // No evaluable hands — award to first eligible player rather than orphaning
+        if (workPot.eligibleSeatIndices.length > 0) {
+          const fallbackWinner = workPot.eligibleSeatIndices[0];
+          winnings.set(fallbackWinner, (winnings.get(fallbackWinner) || 0) + workPot.amount);
+          perPot.push({ seatIndex: fallbackWinner, amount: workPot.amount, potName: workPot.name });
+        } else {
+          orphanedCarry += workPot.amount;
+        }
         continue;
       }
 
