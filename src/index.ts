@@ -291,6 +291,42 @@ function auditLog(actorUsername: string, action: string, details: Record<string,
   console.log(entry);
 }
 
+// ========== Testing-mode unlimited chip refills ==========
+//
+// While the .online room is still in testing we want every player to be
+// able to sit at any table regardless of their current DB balance. Rather
+// than granting a huge starting stack up front (which would distort
+// progression testing) we auto-top-up ON-DEMAND: any buy-in path that
+// finds `dbChips < buyIn` calls ensureChipsForBuyIn which credits the
+// user enough to cover the buy-in plus a small buffer, then proceeds.
+//
+// Disable for production by setting UNLIMITED_CHIPS_TESTING=0 on Railway.
+// Default ENABLED so a fresh deploy just works for live testers.
+const UNLIMITED_CHIPS_TESTING = process.env.UNLIMITED_CHIPS_TESTING !== '0';
+async function ensureChipsForBuyIn(
+  userId: number,
+  username: string,
+  buyIn: number
+): Promise<number> {
+  const dbChips = await getUserChips(userId);
+  if (dbChips >= buyIn) return dbChips;
+  if (!UNLIMITED_CHIPS_TESTING) return dbChips;
+  // Top to buyIn * 2 or 50k, whichever is larger. That gives the player
+  // enough to bust once and rebuy without another top-up call.
+  const target = Math.max(buyIn * 2, 50000);
+  const toAdd = target - dbChips;
+  try {
+    await addChipsToUser(userId, toAdd);
+    auditLog(username, 'TEST_MODE_AUTO_REFILL', {
+      buyIn, oldBalance: dbChips, newBalance: target, added: toAdd,
+    });
+    return target;
+  } catch (err) {
+    auditLog(username, 'TEST_MODE_AUTO_REFILL_FAILED', { error: (err as Error).message });
+    return dbChips;
+  }
+}
+
 // Pending hand-complete autoStart timers per table, so we can cancel them if
 // the table becomes empty / a player disconnects before the timer fires.
 const pendingAutoStartTimers = new Map<string, NodeJS.Timeout>();
@@ -3454,9 +3490,11 @@ Give feedback in this JSON format:
         }
       }
 
-      // Validate buy-in against DB balance for authenticated users
+      // Validate buy-in against DB balance for authenticated users. In
+      // testing mode, ensureChipsForBuyIn auto-tops-up below-buyin balances
+      // so no one ever hits "Insufficient chips" while we're iterating.
       if (authForJoin) {
-        const dbChips = await getUserChips(authForJoin.userId);
+        const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, buyIn);
         if (buyIn > dbChips) {
           socket.emit('error', { message: 'Insufficient chips' });
           return;
@@ -3615,11 +3653,12 @@ Give feedback in this JSON format:
       // Server-authoritative buy-in = table minimum. For authenticated users
       // we validate balance and deduct; anonymous users still get free chips
       // (legacy Quick Play behavior, preserved so unauthed demo play works).
+      // Testing mode auto-tops-up via ensureChipsForBuyIn.
       const authForJoin = authSessions.get(socket.id);
       const buyIn = table.config.minBuyIn;
       let chipsDeducted = false;
       if (authForJoin) {
-        const dbChips = await getUserChips(authForJoin.userId);
+        const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, buyIn);
         if (buyIn > dbChips) {
           socket.emit('error', { message: 'Insufficient chips' });
           return;
@@ -5533,11 +5572,11 @@ Give feedback in this JSON format:
 
     // Server-authoritative chip deduction for authenticated users — previously
     // this path bypassed deductChips entirely, letting a player multi-table
-    // the same chips across private invites.
+    // the same chips across private invites. Testing mode auto-top-up too.
     const authForJoin = authSessions.get(socket.id);
     let chipsDeducted = false;
     if (authForJoin) {
-      const dbChips = await getUserChips(authForJoin.userId);
+      const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, actualBuyIn);
       if (actualBuyIn > dbChips) {
         socket.emit('joinError', { message: 'Insufficient chips for this table.' });
         return;
