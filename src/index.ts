@@ -1449,20 +1449,23 @@ function autoStartNextHand(tableId: string): void {
 
   if (table.currentPhase !== GamePhase.HandComplete) return;
 
-  // Remove eliminated AI players; give human players a free reload
+  // Reload EVERYONE at 0 chips — humans AND AI — so cash tables never
+  // empty out. Previously AI were removed entirely on bust, which caused
+  // tables to shrink toward heads-up and finally hit "Open" seats across
+  // the oval. Live-room behavior: bots stay, get a fresh stack, keep the
+  // action going. Humans still get their free reload as before.
   for (let i = 0; i < MAX_SEATS; i++) {
     const seat = table.seats[i];
-    if (seat.state === 'occupied' && seat.chipCount <= 0) {
-      if (seat.isAI) {
-        table.standUp(i);
-        const profiles = aiProfiles.get(tableId);
-        if (profiles) profiles.delete(i);
-      } else {
-        // Human player at 0 chips: free reload to min buy-in
-        seat.chipCount = table.config.minBuyIn;
-        seat.eliminated = false;
-        console.log(`[Reload] ${seat.playerName} reloaded with ${table.config.minBuyIn} chips`);
-      }
+    if (seat.state !== 'occupied') continue;
+    // Reload if chip stack has fallen below a playable amount. `chipCount
+    // < minBuyIn` (not just <= 0) covers the case where a short-stack
+    // lost a big pot and is now below the minimum — still technically
+    // seated but unable to post blinds meaningfully next hand.
+    if (seat.chipCount < table.config.minBuyIn) {
+      const prev = seat.chipCount;
+      seat.chipCount = table.config.minBuyIn;
+      seat.eliminated = false;
+      console.log(`[Reload] ${seat.playerName} (${seat.isAI ? 'AI' : 'human'}) reloaded from ${prev} to ${table.config.minBuyIn}`);
     }
   }
 
@@ -4390,6 +4393,55 @@ Give feedback in this JSON format:
     socket.emit('pineappleDiscardAck', { success: !!ok, cardIndex: data?.cardIndex });
     if (ok) broadcastGameState(session.tableId);
   });
+
+  // Top-up / rebuy — client calls this when their auto-rebuy fires (or a
+  // manual "Add Chips" button if one existed). Refills the player's seat
+  // stack to the requested amount, debiting from their DB balance. In
+  // testing mode, ensureChipsForBuyIn auto-tops-up the DB balance if
+  // needed so the rebuy never fails.
+  socket.on('rebuy', async (data: { amount?: number } = {}) => { (async () => {
+    const session = playerSessions.get(socket.id);
+    if (!session) { socket.emit('error', { message: 'Not at a table' }); return; }
+    const table = tableManager.getTable(session.tableId);
+    if (!table) { socket.emit('error', { message: 'Table not found' }); return; }
+    const seat = table.seats[session.seatIndex];
+    if (!seat || seat.state !== 'occupied') {
+      socket.emit('error', { message: 'Seat not occupied' });
+      return;
+    }
+    // Don't allow rebuys in the middle of a hand while the player is
+    // still in the pot — the stack is committed. Rebuy between hands or
+    // while folded/sat-out only.
+    if (table.isHandInProgress() && !seat.folded) {
+      socket.emit('error', { message: 'Cannot rebuy while in a live hand — wait for the hand to finish' });
+      return;
+    }
+    const requested = Math.max(table.config.minBuyIn, data?.amount || table.config.minBuyIn);
+    // How much are we actually trying to top up to?
+    const topUpAmount = Math.max(0, requested - seat.chipCount);
+    if (topUpAmount <= 0) {
+      socket.emit('rebuyComplete', { success: true, newStack: seat.chipCount, added: 0 });
+      return;
+    }
+    const authForRebuy = authSessions.get(socket.id);
+    if (authForRebuy) {
+      const dbChips = await ensureChipsForBuyIn(authForRebuy.userId, authForRebuy.username, topUpAmount);
+      if (topUpAmount > dbChips) {
+        socket.emit('error', { message: 'Insufficient chips for rebuy' });
+        return;
+      }
+      if (!(await deductChips(authForRebuy.userId, topUpAmount))) {
+        socket.emit('error', { message: 'Could not deduct chips — try again' });
+        return;
+      }
+      auditLog(authForRebuy.username, 'REBUY_DEDUCT', { tableId: session.tableId, topUpAmount, newStack: requested });
+    }
+    seat.chipCount = requested;
+    seat.eliminated = false;
+    broadcastGameState(session.tableId);
+    socket.emit('rebuyComplete', { success: true, newStack: requested, added: topUpAmount });
+    console.log(`[Rebuy] ${seat.playerName} topped up by ${topUpAmount} to ${requested}`);
+  })(); });
 
   socket.on('startHand', async () => {
     const session = playerSessions.get(socket.id);
