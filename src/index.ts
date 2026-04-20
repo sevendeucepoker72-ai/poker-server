@@ -200,24 +200,59 @@ function shallowDiff(prev: Record<string, any>, next: Record<string, any>): Reco
  * Sends a full state on first send or reconnect; subsequent sends only include changed keys.
  * Pass forceFullState=true to always send the full state (e.g. on joinTable / reconnect).
  */
+// Fields that MUST survive every delta — turn/timer metadata that the
+// client's countdown depends on. Previously a shallowDiff drop could strip
+// these on a no-op tick and leave the client's timer frozen at a stale value
+// until the next structural change, which presented as a "mid-hand freeze".
+// We also always carry `phase`, `activeSeat`, and the variant identifiers so
+// the client never has to guess what table it's at.
+const ALWAYS_EMIT_KEYS = [
+  'turnStartedAt',
+  'turnTimeout',
+  'serverTurnStartedAt',
+  'serverTurnTimeout',
+  'phase',
+  'activeSeat',
+  'activeSeatIndex',
+  'variantId',
+  'variant',
+  'variantName',
+  'tableId',
+];
+function pickAlwaysEmit(state: any): Record<string, any> {
+  const out: Record<string, any> = {};
+  if (!state || typeof state !== 'object') return out;
+  for (const k of ALWAYS_EMIT_KEYS) {
+    if (k in state) out[k] = state[k];
+  }
+  return out;
+}
+
 function emitGameState(socket: any, state: any, forceFullState = false): void {
   const prev = lastSentState.get(socket.id);
   if (!prev || forceFullState) {
     socket.emit('gameState', { full: true, state, _serverTs: Date.now() });
     lastSentState.set(socket.id, state);
   } else {
-    const delta = shallowDiff(prev, state);
+    const delta = shallowDiff(prev, state) as Record<string, any> | null;
+    // Always re-stamp the turn/variant metadata — even on a no-op tick — so
+    // the client's timer + variant guards stay fresh. Merging these into the
+    // delta is idempotent: equal values are a no-op on the client merger.
+    const forceKeys = pickAlwaysEmit(state);
     if (delta) {
-      socket.emit('gameState', { full: false, delta, _serverTs: Date.now() });
-      // Merge into stored state so subsequent diffs are accurate
-      lastSentState.set(socket.id, { ...prev, ...delta });
+      const merged = { ...forceKeys, ...delta };
+      socket.emit('gameState', { full: false, delta: merged, _serverTs: Date.now() });
+      lastSentState.set(socket.id, { ...prev, ...merged });
     } else {
-      // Heartbeat-only emit: no state change, but we still send a stamped
-      // empty delta so the client can use it as a liveness signal and so
-      // any pending "waiting for server" UI can resolve. Previously empty
-      // deltas produced silence, which was indistinguishable from a dead
-      // connection during fast-fold/AI-only turns.
-      socket.emit('gameState', { full: false, delta: {}, _serverTs: Date.now(), _heartbeat: true });
+      // Heartbeat: still carry the always-emit keys so a tick through a
+      // quiet period doesn't let turnStartedAt/Timeout grow stale.
+      socket.emit('gameState', {
+        full: false,
+        delta: forceKeys,
+        _serverTs: Date.now(),
+        _heartbeat: true,
+      });
+      lastSentState.set(socket.id, { ...prev, ...forceKeys });
     }
   }
 }
@@ -3170,6 +3205,7 @@ Give feedback in this JSON format:
       seatIndex: number;
       buyIn: number;
       avatar?: string;
+      expectedVariant?: string;
     }) => { (async () => {
       let { tableId, playerName, seatIndex, buyIn } = data;
       const table = tableManager.getTable(tableId);
@@ -3177,6 +3213,27 @@ Give feedback in this JSON format:
       if (!table) {
         socket.emit('error', { message: 'Table not found' });
         return;
+      }
+
+      // Variant sanity check — if the client told us which variant they
+      // thought they were joining, refuse to seat them at a different one.
+      // The list view passes `expectedVariant` from the table row the user
+      // tapped; if the server has since converted the tableId (rebalance,
+      // auto-combine, etc.) this protects the user from landing at a Draw
+      // table when they meant Hold'em.
+      if (data.expectedVariant) {
+        const actualVariant =
+          (table as any).variantId ||
+          (table as any).variant?.type ||
+          'texas-holdem';
+        if (actualVariant !== data.expectedVariant) {
+          socket.emit('error', {
+            message: `This table is now ${actualVariant}, not ${data.expectedVariant}. Refreshing the lobby.`,
+            code: 'variant_mismatch',
+            actualVariant,
+          });
+          return;
+        }
       }
 
       // If player already has a session, leave old table first
@@ -3348,11 +3405,14 @@ Give feedback in this JSON format:
 
       // Quick Play prefers Texas Hold'em tables. Sort: holdem first,
       // then by player count, then by smallest blinds.
-      const isHoldem = (t: any) => {
-        const tbl = tableManager.getTable(t.tableId);
-        const id = (tbl as any)?.variantId || '';
-        return !id || id === 'texas-holdem';
-      };
+      // STRICT: Use the variant field the list already serializes
+      // (getTableList populates this from the concrete subclass via
+      // `variant.type` / `variantId` depending on the class). Relying on
+      // live-instance `.variantId` was fragile — only some subclasses set
+      // that property, so a Five-Card-Draw or heads-up table (base PokerTable
+      // with no variantId) passed the old `!id || === 'texas-holdem'` check
+      // and Quick Play happily seated Hold'em players at Draw games.
+      const isHoldem = (t: any) => t?.variant === 'texas-holdem';
       const sorted = [...tables].sort((a, b) => {
         const ah = isHoldem(a), bh = isHoldem(b);
         if (ah !== bh) return ah ? -1 : 1;
