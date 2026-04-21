@@ -1904,9 +1904,18 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       if (reserved.handsRemaining <= 0) {
         // Player ran out of hands — remove them from the table
         const t = tableManager.getTable(reserved.tableId);
+        const seatNow = t?.seats?.[reserved.seatIndex];
+        // Cash out the at-table stack to the user's wallet before tearing
+        // the seat down, so disconnect-timeouts don't destroy chips.
+        const chipsToReturn = seatNow?.chipCount ?? reserved.chips ?? 0;
+        if (chipsToReturn > 0) {
+          addChipsToUser(userId, chipsToReturn).catch((e: any) =>
+            console.warn(`[Reserve hand-limit cash-out ${userId}]`, e?.message)
+          );
+        }
         if (t) {
           t.standUp(reserved.seatIndex);
-          console.log(`[Reserve] ${reserved.playerName} removed after ${DISCONNECT_HANDS_LIMIT} hands of sitting out`);
+          console.log(`[Reserve] ${reserved.playerName} removed after ${DISCONNECT_HANDS_LIMIT} hands of sitting out (returned ${chipsToReturn} chips)`);
         }
         clearTimeout(reserved.cleanupTimer);
         reservedSeats.delete(userId);
@@ -6646,10 +6655,16 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
       if (table) {
         const seat = table.seats[session.seatIndex];
         if (seat && seat.state === 'occupied') {
-          // Persist everything we can — chips, xp, level, achievements.
+          // CRITICAL: do NOT write `chips: seat.chipCount` here.
+          // seat.chipCount is the AT-TABLE stack. users.chips is the
+          // OFF-TABLE wallet (already decremented by deductChips at
+          // sit-down). Writing seat.chipCount into users.chips would
+          // clobber the wallet with the tiny at-table amount — this
+          // was the cause of "I had a billion chips, now I have 100K"
+          // reports. The at-table stack is preserved in reservedSeats
+          // below and restored on reconnect; the wallet stays untouched.
           const prog = progressionManager.getClientProgress(session.playerId) as any;
           await saveProgress(authSession.userId, {
-            chips: seat.chipCount,
             xp: prog?.xp,
             level: prog?.level,
             achievements: prog?.achievements || [],
@@ -6664,9 +6679,18 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
             const reserved = reservedSeats.get(authSession.userId);
             if (reserved) {
               const t = tableManager.getTable(reserved.tableId);
+              const seatNow = t?.seats?.[reserved.seatIndex];
+              const chipsToReturn = seatNow?.chipCount ?? reserved.chips ?? 0;
+              // Credit the at-table stack back to the wallet before
+              // the seat is torn down. Otherwise the chips vanish.
+              if (chipsToReturn > 0) {
+                addChipsToUser(authSession.userId, chipsToReturn).catch((e: any) =>
+                  console.warn(`[Reserve expiry cash-out ${authSession.userId}]`, e?.message)
+                );
+              }
               if (t) t.standUp(reserved.seatIndex);
               reservedSeats.delete(authSession.userId);
-              console.log(`[Reserve] Seat reservation expired for user ${authSession.userId}`);
+              console.log(`[Reserve] Seat reservation expired for user ${authSession.userId} (returned ${chipsToReturn} chips)`);
             }
           }, SEAT_RESERVE_MS);
 
@@ -6746,6 +6770,17 @@ function handlePlayerLeave(socket: Socket): void {
       leavingSeat.missedBlind = 'none';
     }
     syncSitOutToTable(session.tableId);
+
+    // CRITICAL: credit the at-table stack back to the user's wallet
+    // before standUp clears it. deductChips() took the buy-in at sit-
+    // down time; if we standUp without crediting, those chips vanish.
+    const auth = authSessions.get(socket.id);
+    const chipsToReturn = leavingSeat?.chipCount || 0;
+    if (auth && chipsToReturn > 0) {
+      addChipsToUser(auth.userId, chipsToReturn).catch((e: any) =>
+        console.warn(`[handlePlayerLeave cash-out ${auth.userId}]`, e?.message)
+      );
+    }
 
     table.standUp(session.seatIndex);
 
