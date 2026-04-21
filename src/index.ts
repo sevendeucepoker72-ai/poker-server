@@ -3152,7 +3152,7 @@ Give feedback in this JSON format:
     }
     const CHIP_GRANT_ALERT_THRESHOLD = 1_000_000;
     const amount = Math.floor(data.amount);
-    if (amount <= 0 || amount > 100_000_000) {
+    if (amount <= 0 || amount > 10_000_000_000) {
       socket.emit('error', { message: 'Invalid chip amount' });
       return;
     }
@@ -3162,6 +3162,40 @@ Give feedback in this JSON format:
     }
     const success = await addChipsToUser(data.userId, amount);
     socket.emit('adminGrantChipsResult', { success, userId: data.userId, amount });
+  });
+
+  // Restore previous balances — admin-only, grants 1B chips + 50K stars
+  // to the caller's own account. No idempotency flag — callable any time
+  // by admin. Backed by direct additive UPDATE so race conditions can't
+  // clobber it. In-memory progress is also bumped so the UI sees the
+  // new balance on the next playerProgress emit.
+  socket.on('adminRestoreBalance', async () => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) {
+      socket.emit('adminRestoreBalanceResult', { success: false, error: 'Access denied' });
+      return;
+    }
+    try {
+      const CHIP_AMOUNT = 1_000_000_000;
+      const STAR_AMOUNT = 50_000;
+      await getPool().query(
+        `UPDATE users SET chips = chips + $1, stars = stars + $2 WHERE id = $3`,
+        [CHIP_AMOUNT, STAR_AMOUNT, auth.userId]
+      );
+      auditLog(auth.username, 'RESTORE_BALANCE', { chips: CHIP_AMOUNT, stars: STAR_AMOUNT });
+      console.warn(`[Restore] Admin ${auth.username} restored ${CHIP_AMOUNT.toLocaleString()} chips + ${STAR_AMOUNT.toLocaleString()} stars`);
+      const playerId = playerSessions.get(socket.id)?.playerId || `user-${auth.userId}`;
+      const progress = progressionManager.getProgress(playerId);
+      if (progress) {
+        progress.chips = (progress.chips || 0) + CHIP_AMOUNT;
+        progress.stars = (progress.stars || 0) + STAR_AMOUNT;
+      }
+      socket.emit('adminRestoreBalanceResult', { success: true, chips: CHIP_AMOUNT, stars: STAR_AMOUNT });
+      sendProgressToPlayer(socket.id);
+    } catch (err: any) {
+      console.error('[adminRestoreBalance]', err);
+      socket.emit('adminRestoreBalanceResult', { success: false, error: 'Server error' });
+    }
   });
 
   socket.on('banUser', async (data: { userId: number }) => {
