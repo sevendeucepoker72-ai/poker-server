@@ -1860,6 +1860,19 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   const table = tableManager.getTable(tableId);
   if (!table) return;
 
+  // Clear the bomb-pot flag as soon as the hand ends. Previously the flag
+  // was cleared only on the NEXT startNewHand (line ~1734) — which left
+  // the "BOMB POT!" banner flashing indefinitely whenever the next hand
+  // didn't immediately start (empty table, still in showdown, tournament
+  // pause, etc.). Clearing here makes the banner disappear the moment the
+  // bomb-pot hand resolves, matching user intent.
+  if (bombPotActive.get(tableId)) {
+    bombPotActive.delete(tableId);
+    // Force-broadcast so clients clear their local banner without waiting
+    // for the next delta tick.
+    broadcastGameState(tableId);
+  }
+
   // Decrement sit-out hand counter for reserved (disconnected) seats on this table
   for (const [userId, reserved] of reservedSeats) {
     if (reserved.tableId === tableId) {
