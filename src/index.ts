@@ -3058,7 +3058,25 @@ Give feedback in this JSON format:
     if (!auth || auth.userId !== data.userId) {
       socket.emit('error', { message: 'Unauthorized' }); return;
     }
-    const { userId, ...progressData } = data;
+    // SECURITY + DATA-SAFETY:
+    // - NEVER trust the client with chips writes — saveProgress would
+    //   plain-overwrite users.chips, letting the client set any balance.
+    //   All chip mutations must flow through server-authoritative paths
+    //   (pot distribution, shop purchase, admin grant, etc.).
+    // - Gate on progress.hydrated so a stale client push can't fire
+    //   before we've loaded the real values from DB.
+    const playerId = playerSessions.get(socket.id)?.playerId || `user-${auth.userId}`;
+    const progress = progressionManager.getProgress(playerId);
+    if (!progress || !progress.hydrated || progress.userId !== auth.userId) {
+      // Hydrate, then retry once. Subsequent races fall through to error.
+      await progressionManager.hydrateFromDB(playerId, auth.userId).catch(() => {});
+      const rehydrated = progressionManager.getProgress(playerId);
+      if (!rehydrated || !rehydrated.hydrated) {
+        socket.emit('progressSaved', { success: false, error: 'not_ready' });
+        return;
+      }
+    }
+    const { userId, chips: _ignoredChips, ...progressData } = data;
     const success = await saveProgress(userId, progressData);
     socket.emit('progressSaved', { success });
   });
@@ -3067,29 +3085,14 @@ Give feedback in this JSON format:
 
   // ========== Spin Wheel / Reward Events ==========
 
-  socket.on('claimSpinReward', async (data: { type: string; value: number; label: string }) => {
-    const auth = authSessions.get(socket.id);
-    if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-
-    // Validate daily limit (server-side)
-    const spinKey = `spin_${auth.userId}_${new Date().toDateString()}`;
-    if ((global as any).__spinTracker?.[spinKey]) {
-      socket.emit('error', { message: 'Daily spin already claimed' });
-      return;
-    }
-    if (!(global as any).__spinTracker) (global as any).__spinTracker = {};
-    (global as any).__spinTracker[spinKey] = true;
-
-    if (data.type === 'chips' || data.type === 'mystery') {
-      const chips = data.type === 'mystery' ? Math.floor(Math.random() * 3000) + 500 : data.value;
-      await addChipsToUser(auth.userId, chips);
-      socket.emit('spinRewardClaimed', { type: 'chips', value: chips });
-    } else if (data.type === 'xp_multiplier') {
-      socket.emit('spinRewardClaimed', { type: 'xp_multiplier', value: data.value });
-    } else if (data.type === 'xp') {
-      // XP from scratch cards
-      socket.emit('spinRewardClaimed', { type: 'xp', value: data.value });
-    }
+  socket.on('claimSpinReward', async () => {
+    // SECURITY: legacy handler used to trust a client-supplied `value`
+    // for the chip reward amount — a blatant cheat vector. Deprecated in
+    // favor of the server-authoritative `claimDailySpinServer` flow.
+    // This shim emits the same acknowledgement shape so older clients
+    // don't break, but does NOT credit any chips. Newer clients should
+    // emit 'claimDailySpinServer' instead.
+    socket.emit('spinRewardClaimed', { type: 'deprecated', value: 0 });
   });
 
   // ========== Leaderboard Events ==========
@@ -4326,7 +4329,15 @@ Give feedback in this JSON format:
     if (!auth) return null;
     const playerId = playerSessions.get(s.id)?.playerId || `user-${auth.userId}`;
     const progress = progressionManager.getOrCreateProgress(playerId, auth.username);
-    if (!progress.userId) {
+    // Await hydration fully. Previously we only checked `!progress.userId`
+    // which returns false the instant hydrateFromDB sets userId at the top
+    // of its function, but `hydrated=true` isn't set until the very end
+    // after all DB reads complete. That race window was enough for a
+    // caller to mutate in-memory values (stars/xp/etc.) and then write
+    // them to DB via a non-gated path, clobbering real data. Now we
+    // always await hydrateFromDB — it's idempotent (early-returns if
+    // already hydrated for this userId) so this is cheap.
+    if (!progress.hydrated || progress.userId !== auth.userId) {
       await progressionManager.hydrateFromDB(playerId, auth.userId);
     }
     return { userId: auth.userId, playerId, username: auth.username };
