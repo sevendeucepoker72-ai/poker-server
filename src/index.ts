@@ -374,6 +374,20 @@ const fastModeTables = new Map<string, boolean>();
 // missed-blinds audit refactor (resolved 20 findings).
 const sitOutTracker = new Map<string, Set<number>>();
 
+/**
+ * Sync the current sit-out seat set to the PokerTable. Called after
+ * every mutation of `sitOutTracker` so PokerTable.markSittingOutBlinds
+ * sees the right set at EVERY startNewHand (there are 13 entry points;
+ * previously only one of them pushed the set, which silently broke
+ * missed-blind debt tracking for 24/7 cash-table heartbeat auto-starts).
+ */
+function syncSitOutToTable(tableId: string): void {
+  const table = tableManager.getTable(tableId);
+  if (!table) return;
+  const set = sitOutTracker.get(tableId) || new Set<number>();
+  table.setSittingOutSeats(set);
+}
+
 // Track AI profiles per table
 const aiProfiles = new Map<string, Map<number, AIPlayerProfile>>();
 
@@ -4819,14 +4833,11 @@ Give feedback in this JSON format:
       return;
     }
 
-    // Missed-blinds refactor: hand the current sit-out set to the table
-    // so markSittingOutBlinds (inside startNewHand) can compute the real
-    // TDA-compliant obligations per seat based on whether the button
-    // rotation lands on a sitting-out seat. Previous logic here added a
-    // flat BB per sitting-out seat to a parallel Map — now dead.
-    const sitOuts = sitOutTracker.get(session.tableId);
-    if (sitOuts) table.setSittingOutSeats(sitOuts);
-
+    // Missed-blinds refactor: syncSitOutToTable keeps the table's
+    // sit-out set current after every mutation to sitOutTracker, so
+    // markSittingOutBlinds runs against the right set at EVERY
+    // startNewHand (including the 24/7 heartbeat auto-starts). No
+    // pre-start push needed here — the set is already cached.
     const started = table.startNewHand();
     if (started) {
       broadcastGameState(session.tableId);
@@ -5068,12 +5079,12 @@ Give feedback in this JSON format:
         sitOutTracker.set(session.tableId, new Set());
       }
       sitOutTracker.get(session.tableId)!.add(session.seatIndex);
+      syncSitOutToTable(session.tableId);
     } else {
       // Returning from sit-out — remove from tracker and notify client of
-      // any dead-blind debt still on the seat. Source of truth is now
-      // seat.deadBlindOwedChips (set by markSittingOutBlinds during
-      // hands the player sat out).
+      // any dead-blind debt still on the seat.
       sitOutTracker.get(session.tableId)?.delete(session.seatIndex);
+      syncSitOutToTable(session.tableId);
       const tableForSitIn = tableManager.getTable(session.tableId);
       const seat = tableForSitIn?.seats?.[session.seatIndex];
       const owed = seat?.deadBlindOwedChips || 0;
@@ -5100,6 +5111,7 @@ Give feedback in this JSON format:
     session.sittingOut = true;
     if (!sitOutTracker.has(session.tableId)) sitOutTracker.set(session.tableId, new Set());
     sitOutTracker.get(session.tableId)!.add(session.seatIndex);
+    syncSitOutToTable(session.tableId);
 
     socket.emit('sitOutToggled', { sittingOut: true, reason: 'afk' });
 
@@ -6218,6 +6230,7 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
           session.sittingOut = true;
           if (!sitOutTracker.has(session.tableId)) sitOutTracker.set(session.tableId, new Set());
           sitOutTracker.get(session.tableId)!.add(session.seatIndex);
+          syncSitOutToTable(session.tableId);
 
           // Auto-fold if it's their turn right now
           if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
