@@ -13,6 +13,13 @@ export interface OAuthTokenResult {
 }
 
 export async function validateOAuthToken(token: string): Promise<OAuthTokenResult> {
+  // 5s hard timeout — if the auth server stalls we want to fail fast so
+  // the client's `loginResult` timeout doesn't fire first with no error
+  // message. Previously this fetch() had no timeout and would hang until
+  // Node's default TCP timeout (~2 min), making every login appear to
+  // "time out" even though the real failure was upstream.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
   try {
     // Use token introspection endpoint (RFC 7662)
     const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
@@ -23,6 +30,7 @@ export async function validateOAuthToken(token: string): Promise<OAuthTokenResul
         'Authorization': `Basic ${credentials}`,
       },
       body: new URLSearchParams({ token }),
+      signal: controller.signal,
     });
 
     if (!response.ok) {
@@ -43,10 +51,14 @@ export async function validateOAuthToken(token: string): Promise<OAuthTokenResul
       isAdmin: data.is_admin === true,
     };
   } catch (err: any) {
-    // Not an OAuth token or introspection unreachable — return invalid
+    // Not an OAuth token or introspection unreachable — return invalid.
+    // AbortError from the 5s timeout surfaces here as a generic failure.
+    const isTimeout = err?.name === 'AbortError';
     return {
       valid: false,
-      error: err.message || 'Token validation failed',
+      error: isTimeout ? 'Auth server timed out' : (err.message || 'Token validation failed'),
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }

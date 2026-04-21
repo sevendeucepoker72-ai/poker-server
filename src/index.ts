@@ -4369,12 +4369,36 @@ Give feedback in this JSON format:
           process.env.MASTER_API_URL ||
           'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
 
+        // 6s hard timeout for every Master API hop. Without this the fetch
+        // hangs on Node's default TCP timeout (~2 min) whenever the master
+        // API has a cold start / DNS blip, which reliably causes the client
+        // to time out before the server ever emits loginResult.
+        const fetchWithTimeout = async (url: string, init?: RequestInit, ms = 6000) => {
+          const ac = new AbortController();
+          const t = setTimeout(() => ac.abort(), ms);
+          try {
+            return await fetch(url, { ...init, signal: ac.signal });
+          } finally {
+            clearTimeout(t);
+          }
+        };
+
         // 1. Verify ticket with master API
-        const verifyRes = await fetch(`${MASTER_API_BASE}/online-link-token/verify`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: data.token }),
-        });
+        let verifyRes;
+        try {
+          verifyRes = await fetchWithTimeout(`${MASTER_API_BASE}/online-link-token/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: data.token }),
+          });
+        } catch (err: any) {
+          const isTimeout = err?.name === 'AbortError';
+          socket.emit('loginResult', {
+            success: false,
+            error: isTimeout ? 'Auth service slow — please try again' : 'Auth service unreachable',
+          });
+          return;
+        }
         if (!verifyRes.ok) {
           socket.emit('loginResult', { success: false, error: 'Token verify failed' });
           return;
@@ -4392,7 +4416,17 @@ Give feedback in this JSON format:
         }
 
         // 2. Fetch master user details
-        const meRes = await fetch(`${MASTER_API_BASE}/users/${remoteUserId}/me`);
+        let meRes;
+        try {
+          meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`);
+        } catch (err: any) {
+          const isTimeout = err?.name === 'AbortError';
+          socket.emit('loginResult', {
+            success: false,
+            error: isTimeout ? 'Auth service slow — please try again' : 'Could not load user',
+          });
+          return;
+        }
         if (!meRes.ok) {
           socket.emit('loginResult', { success: false, error: 'Could not load user' });
           return;
@@ -4481,11 +4515,28 @@ Give feedback in this JSON format:
         const MASTER_API_BASE =
           process.env.MASTER_API_URL ||
           'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
-        const verifyRes = await fetch(`${MASTER_API_BASE}/online-link-token/verify`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token: data.token }),
-        });
+        // 6s hard timeout — see authWithTicket handler for rationale.
+        const fetchWithTimeout = async (url: string, init?: RequestInit, ms = 6000) => {
+          const ac = new AbortController();
+          const t = setTimeout(() => ac.abort(), ms);
+          try {
+            return await fetch(url, { ...init, signal: ac.signal });
+          } finally {
+            clearTimeout(t);
+          }
+        };
+        let verifyRes;
+        try {
+          verifyRes = await fetchWithTimeout(`${MASTER_API_BASE}/online-link-token/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: data.token }),
+          });
+        } catch (err: any) {
+          const isTimeout = err?.name === 'AbortError';
+          socket.emit('error', { message: isTimeout ? 'Auth service slow — please try again' : 'Auth service unreachable' });
+          return;
+        }
         if (!verifyRes.ok) {
           socket.emit('error', { message: 'Token verify failed' });
           return;
@@ -4514,7 +4565,7 @@ Give feedback in this JSON format:
         // closes that gap: waitlist seat ALWAYS comes with a real auth session.
         if (!authSessions.has(socket.id)) {
           try {
-            const meRes = await fetch(`${MASTER_API_BASE}/users/${remoteUserId}/me`);
+            const meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`);
             if (meRes.ok) {
               const meJson: any = await meRes.json();
               const masterUser = meJson?.data || meJson;

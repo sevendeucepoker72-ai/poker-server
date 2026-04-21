@@ -112,7 +112,17 @@ export async function initDB(): Promise<void> {
     process.exit(1);
   }
 
-  pool = new Pool({ connectionString: dbUrl });
+  // Explicit timeouts so a slow/broken DB can't stall auth indefinitely.
+  // Without these, pool.connect() could wait on the default kernel TCP
+  // timeout (~2 min), leaving login sockets hanging past the client's
+  // 10–15s timeout with no error surfaced.
+  pool = new Pool({
+    connectionString: dbUrl,
+    connectionTimeoutMillis: 5_000,   // give up acquiring a conn after 5s
+    idleTimeoutMillis: 30_000,        // recycle idle conns after 30s
+    statement_timeout: 8_000,         // any single query aborts after 8s
+    query_timeout: 8_000,
+  });
 
   pool.on('error', (err) => {
     console.error('[Auth] PostgreSQL pool error:', err);
@@ -280,17 +290,30 @@ export async function registerUser(username: string, password: string): Promise<
 const MASTER_API_BASE = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
 
 async function authenticateWithMasterAPI(phone: string, password: string): Promise<any | null> {
+  // 6s hard timeout. Previously this fetch had no timeout, so when the
+  // master API was slow the login would hang until Node's default TCP
+  // timeout (~2 min) — by which time the client had already given up and
+  // the user saw "login timed out" with no upstream error logged.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 6000);
   try {
     const res = await fetch(`${MASTER_API_BASE}/users/login`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ phone, password }),
+      signal: controller.signal,
     });
     const data: any = await res.json();
     return (data.success && data.data) ? data.data : null;
-  } catch (err) {
-    console.error('[Auth] Master API login failed:', err);
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      console.error('[Auth] Master API login timed out after 6s');
+    } else {
+      console.error('[Auth] Master API login failed:', err);
+    }
     return null;
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
