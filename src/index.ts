@@ -975,10 +975,12 @@ function getGameStateForPlayer(
     };
   }
 
-  // Add bomb pot flag
-  if (bombPotActive.get(table.config.tableId)) {
-    stateObj.bombPot = true;
-  }
+  // Add bomb pot flag — ALWAYS emit (true OR false) so the delta
+  // compression actually clears the flag client-side. Previously we
+  // only set stateObj.bombPot = true when active; when it flipped back
+  // to inactive the key was omitted, shallowDiff didn't see a change,
+  // the client kept its stale `true` and the banner stayed stuck.
+  stateObj.bombPot = !!bombPotActive.get(table.config.tableId);
 
   // Add dealer's choice info
   const dcState = dealersChoiceState.get(table.config.tableId);
@@ -1932,8 +1934,13 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
             console.warn(`[Reserve hand-limit cash-out ${userId}]`, e?.message)
           );
         }
+        // Clean the sit-out tracker so the NEXT occupant of this seat
+        // doesn't inherit a stale sitting-out flag.
+        const tr = sitOutTracker.get(reserved.tableId);
+        if (tr) tr.delete(reserved.seatIndex);
         if (t) {
           t.standUp(reserved.seatIndex);
+          syncSitOutToTable(reserved.tableId);
           console.log(`[Reserve] ${reserved.playerName} removed after ${DISCONNECT_HANDS_LIMIT} hands of sitting out (returned ${chipsToReturn} chips)`);
         }
         clearTimeout(reserved.cleanupTimer);
@@ -6720,7 +6727,13 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
                   console.warn(`[Reserve expiry cash-out ${authSession.userId}]`, e?.message)
                 );
               }
+              // Clean the sit-out tracker so the NEXT occupant of this
+              // seat doesn't inherit a stale sitting-out flag (root cause
+              // of recurring "missed blinds" popup on a fresh sit-down).
+              const tr = sitOutTracker.get(reserved.tableId);
+              if (tr) tr.delete(reserved.seatIndex);
               if (t) t.standUp(reserved.seatIndex);
+              syncSitOutToTable(reserved.tableId);
               reservedSeats.delete(authSession.userId);
               console.log(`[Reserve] Seat reservation expired for user ${authSession.userId} (returned ${chipsToReturn} chips)`);
             }
@@ -7349,8 +7362,55 @@ app.post('/api/tournament/simulate', (req, res) => {
 });
 
 // ========== Initialize Auth Database ==========
-initDB().then(() => {
-initClubTables(); });
+initDB().then(async () => {
+  initClubTables();
+
+  // One-time chip recovery grant for admin — compensates for the
+  // "disconnect wiped my wallet" bug (fixed in commit 03b5170). Guarded
+  // by a JSONB flag in users.stats so this only runs once per admin even
+  // across redeploys.
+  try {
+    const adminPhone = process.env.ADMIN_PHONE || '7202780636';
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT id, chips, stats FROM users WHERE username = $1 OR username ILIKE $2 LIMIT 1`,
+      [adminPhone, adminPhone]
+    );
+    if (rows.length > 0) {
+      const user = rows[0];
+      const stats = typeof user.stats === 'string' ? JSON.parse(user.stats || '{}') : (user.stats || {});
+      let mutatedStats = false;
+
+      // One-time 1B chip recovery grant — compensates for the disconnect
+      // chip-wipe bug (fixed in 03b5170).
+      if (!stats.chipRecoveryGrantApplied) {
+        const GRANT_AMOUNT = 1_000_000_000;
+        await pool.query(`UPDATE users SET chips = chips + $1 WHERE id = $2`, [GRANT_AMOUNT, user.id]);
+        stats.chipRecoveryGrantApplied = true;
+        stats.chipRecoveryGrantAt = new Date().toISOString();
+        mutatedStats = true;
+        console.log(`[Recovery] Granted ${GRANT_AMOUNT.toLocaleString()} chips to admin userId=${user.id} (${adminPhone})`);
+      }
+
+      // One-time stars recovery grant — compensates for the persistStars
+      // pre-hydration clobber bug (fixed this commit).
+      if (!stats.starsRecoveryGrantApplied) {
+        const STARS_GRANT = 50000;
+        await pool.query(`UPDATE users SET stars = stars + $1 WHERE id = $2`, [STARS_GRANT, user.id]);
+        stats.starsRecoveryGrantApplied = true;
+        stats.starsRecoveryGrantAt = new Date().toISOString();
+        mutatedStats = true;
+        console.log(`[Recovery] Granted ${STARS_GRANT.toLocaleString()} stars to admin userId=${user.id} (${adminPhone})`);
+      }
+
+      if (mutatedStats) {
+        await pool.query(`UPDATE users SET stats = $1 WHERE id = $2`, [JSON.stringify(stats), user.id]);
+      }
+    }
+  } catch (err: any) {
+    console.warn('[Recovery] grant failed:', err?.message);
+  }
+});
 
 // ========== Start Server ==========
 

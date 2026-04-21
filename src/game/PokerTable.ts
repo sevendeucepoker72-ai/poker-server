@@ -1673,7 +1673,9 @@ export class PokerTable extends EventEmitter {
       if (
         seat.state === 'occupied' &&
         !seat.folded &&
-        !seat.eliminated
+        !seat.eliminated &&
+        seat.chipCount > 0 &&
+        seat.holeCards.length > 0
       ) {
         return idx;
       }
@@ -1682,6 +1684,13 @@ export class PokerTable extends EventEmitter {
   }
 
   getNextActiveSeat(from: number): number {
+    // Skip seats that have no ability to act:
+    //   - folded / all-in / eliminated (historically handled)
+    //   - chipCount <= 0 (busted mid-hand, pending auto-rebuy, etc.)
+    //   - no hole cards (joined mid-hand, not dealt this round)
+    // A chip-less or card-less seat getting assigned as active would
+    // just burn the 30s turn timer and auto-fold — frustrating and
+    // pointless. Silently skip them instead.
     for (let i = 0; i < MAX_SEATS; i++) {
       const idx = (from + i) % MAX_SEATS;
       const seat = this.seats[idx];
@@ -1689,7 +1698,9 @@ export class PokerTable extends EventEmitter {
         seat.state === 'occupied' &&
         !seat.folded &&
         !seat.allIn &&
-        !seat.eliminated
+        !seat.eliminated &&
+        seat.chipCount > 0 &&
+        seat.holeCards.length > 0
       ) {
         return idx;
       }

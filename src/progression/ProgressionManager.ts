@@ -554,9 +554,20 @@ export class ProgressionManager {
     progress.hydrated = true;
   }
 
-  /** Push the current stars balance to Postgres. Fire-and-forget. */
+  /** Push the current stars balance to Postgres. Fire-and-forget.
+   *  HARD GATE on progress.hydrated — writing the fresh-init value 0
+   *  (plus any mid-race bonus) would overwrite the user's real DB
+   *  balance. This was the cause of "my stars keep disappearing" and
+   *  is the same class of bug as the earlier chips wipeout. If an
+   *  achievement / level-up fires before hydration finishes, we simply
+   *  skip the persist — the in-memory value will be corrected on the
+   *  next hydrate call which reads from DB. */
   private persistStars(progress: PlayerProgress): void {
     if (!progress.userId) return;
+    if (!progress.hydrated) {
+      console.warn(`[persistStars ${progress.userId}] SKIPPED — progress not hydrated yet (would have clobbered DB stars)`);
+      return;
+    }
     dbPersistStars(progress.userId, progress.stars).catch((e) =>
       console.warn(`[ProgressionManager.persistStars ${progress.userId}]`, e?.message)
     );
