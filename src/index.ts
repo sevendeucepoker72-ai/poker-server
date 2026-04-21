@@ -2810,8 +2810,22 @@ Give feedback in this JSON format:
               };
               playerSessions.set(socket.id, restoredSession);
               socket.join(`table:${reserved.tableId}`);
+              // MISSED-BLINDS FIX: on reconnect, remove seat from
+              // sit-out set AND push the fresh set to the table so
+              // markSittingOutBlinds on next hand doesn't re-mark.
+              // Also clear any dead-blind debt that accumulated during
+              // the brief disconnect — the user didn't intentionally
+              // sit out; their socket just blipped (PWA background,
+              // WiFi hiccup). If they meant to sit out they'd use the
+              // explicit Sit Out button.
               const tracker = sitOutTracker.get(reserved.tableId);
               if (tracker) tracker.delete(reserved.seatIndex);
+              syncSitOutToTable(reserved.tableId);
+              const reSeat = table.seats[reserved.seatIndex];
+              if (reSeat) {
+                reSeat.deadBlindOwedChips = 0;
+                reSeat.missedBlind = 'none';
+              }
               socket.emit('reconnectedToTable', {
                 tableId: reserved.tableId,
                 seatIndex: reserved.seatIndex,
@@ -6226,11 +6240,23 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
             handsRemaining: DISCONNECT_HANDS_LIMIT,
           });
 
-          // Mark player as sitting out while disconnected (auto-folds their turn)
+          // Mark player as sitting out while disconnected (auto-folds
+          // their turn). DELAYED add-to-tracker: a brief socket blip
+          // (PWA backgrounding, WiFi handoff, iOS suspend) was flagging
+          // the user as sitting-out, and every subsequent hand's
+          // markSittingOutBlinds charged them dead-blind debt even
+          // though they never intentionally sat out. Now we wait 20s
+          // before adding to the tracker. The callback re-checks
+          // reservedSeats.has(userId) — reconnect paths clear that Map
+          // entry, so if the user came back inside 20s the timer fires
+          // harmlessly and nothing is flagged.
           session.sittingOut = true;
-          if (!sitOutTracker.has(session.tableId)) sitOutTracker.set(session.tableId, new Set());
-          sitOutTracker.get(session.tableId)!.add(session.seatIndex);
-          syncSitOutToTable(session.tableId);
+          setTimeout(() => {
+            if (!reservedSeats.has(authSession.userId)) return; // reconnected already
+            if (!sitOutTracker.has(session.tableId)) sitOutTracker.set(session.tableId, new Set());
+            sitOutTracker.get(session.tableId)!.add(session.seatIndex);
+            syncSitOutToTable(session.tableId);
+          }, 20_000);
 
           // Auto-fold if it's their turn right now
           if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {

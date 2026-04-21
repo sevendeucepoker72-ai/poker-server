@@ -1272,3 +1272,193 @@ export function getThinkingDelay(difficulty: Difficulty): number {
     case 'expert': return 1500 + Math.floor(Math.random() * 1500);
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// AI INTELLIGENCE UPGRADES — audit-driven (5 additions)
+//
+// Additive helpers + a module-scope opponent profile store. The existing
+// archetype decision branches stay the skeleton; these helpers layer on:
+//   1) Session-level opponent modeling (across hands, not per-hand)
+//   2) Stack-depth-aware pre-flop range adjustment
+//   3) Multi-way pot c-bet + call-tighten + sizing adjustment
+//   4) Balanced bluff strategy (board + hand + opponent-category aware)
+//   5) Thin river value-betting against loose opponents
+// ═══════════════════════════════════════════════════════════════════════
+
+export interface OpponentSessionProfile {
+  handsSeen: number;
+  vpipHands: number;
+  pfrHands: number;
+  threeBetsFaced: number;
+  threeBetFolds: number;
+  cbetsFaced: number;
+  cbetFolds: number;
+  showdownsReached: number;
+  showdownsWonWithBluff: number;
+  lastHandNumber: number;
+}
+
+const OPPONENT_PROFILES: Map<string, OpponentSessionProfile> = new Map();
+
+function getOrCreateOpponentProfile(playerName: string): OpponentSessionProfile {
+  let p = OPPONENT_PROFILES.get(playerName);
+  if (!p) {
+    p = {
+      handsSeen: 0, vpipHands: 0, pfrHands: 0,
+      threeBetsFaced: 0, threeBetFolds: 0,
+      cbetsFaced: 0, cbetFolds: 0,
+      showdownsReached: 0, showdownsWonWithBluff: 0,
+      lastHandNumber: -1,
+    };
+    OPPONENT_PROFILES.set(playerName, p);
+  }
+  return p;
+}
+
+export function getOpponentProfile(playerName: string): OpponentSessionProfile | null {
+  return OPPONENT_PROFILES.get(playerName) || null;
+}
+
+// External hook — PokerTable calls on action events to build session view.
+export function recordOpponentObservation(
+  playerName: string,
+  observation: 'hand_start' | 'vpip' | 'pfr' | 'face_3bet' | 'fold_to_3bet' | 'face_cbet' | 'fold_to_cbet' | 'showdown',
+  extra?: { bluffed?: boolean; handNumber?: number }
+): void {
+  if (!playerName) return;
+  const p = getOrCreateOpponentProfile(playerName);
+  switch (observation) {
+    case 'hand_start':
+      if (extra && extra.handNumber != null && extra.handNumber !== p.lastHandNumber) {
+        p.handsSeen++;
+        p.lastHandNumber = extra.handNumber;
+      }
+      break;
+    case 'vpip':         p.vpipHands++; break;
+    case 'pfr':          p.pfrHands++; break;
+    case 'face_3bet':    p.threeBetsFaced++; break;
+    case 'fold_to_3bet': p.threeBetFolds++; break;
+    case 'face_cbet':    p.cbetsFaced++; break;
+    case 'fold_to_cbet': p.cbetFolds++; break;
+    case 'showdown':
+      p.showdownsReached++;
+      if (extra && extra.bluffed) p.showdownsWonWithBluff++;
+      break;
+  }
+}
+
+export type OpponentCategory = 'unknown' | 'nit' | 'tag' | 'lag' | 'fish' | 'station' | 'maniac';
+
+export function categorizeOpponent(playerName: string): OpponentCategory {
+  const p = OPPONENT_PROFILES.get(playerName);
+  if (!p || p.handsSeen < 10) return 'unknown';
+  const vpip = p.vpipHands / p.handsSeen;
+  const pfr = p.pfrHands / p.handsSeen;
+  const foldTo3bet = p.threeBetsFaced > 0 ? p.threeBetFolds / p.threeBetsFaced : 0.6;
+  if (vpip < 0.15 && pfr < 0.12) return 'nit';
+  if (vpip > 0.45 && pfr < 0.10) return 'station';
+  if (vpip > 0.50 && pfr > 0.35) return 'maniac';
+  if (vpip > 0.35 && pfr < 0.15) return 'fish';
+  if (vpip > 0.25 && pfr > 0.20 && foldTo3bet < 0.55) return 'lag';
+  if (vpip > 0.18 && pfr > 0.12) return 'tag';
+  return 'unknown';
+}
+
+// UPGRADE #3 — stack-depth pre-flop threshold multiplier.
+export function getStackDepthMultiplier(effectiveStackBB: number): number {
+  if (effectiveStackBB < 30)  return 1.4;
+  if (effectiveStackBB < 60)  return 1.1;
+  if (effectiveStackBB < 120) return 1.0;
+  if (effectiveStackBB < 200) return 0.95;
+  return 0.90;
+}
+
+// UPGRADE #5 — multi-way pot adjustments.
+export function getMultiWayAdjustment(numOpponentsInPot: number): { cbetMult: number; callTightenMult: number; sizeMult: number } {
+  if (numOpponentsInPot <= 1) return { cbetMult: 1.0, callTightenMult: 1.0, sizeMult: 1.0 };
+  if (numOpponentsInPot === 2) return { cbetMult: 0.7, callTightenMult: 1.12, sizeMult: 1.1 };
+  return { cbetMult: 0.5, callTightenMult: 1.25, sizeMult: 1.2 };
+}
+
+// UPGRADE #2 — balanced bluff decision.
+export function shouldBluffBalanced(
+  handStrength: number,
+  board: BoardTexture,
+  phase: GamePhase,
+  profile: AIPlayerProfile,
+  opponentNames: string[]
+): boolean {
+  if (handStrength > 0.75) return false;
+  if (handStrength < 0.08) return false;
+  let foldyCount = 0;
+  let stickyCount = 0;
+  for (const name of opponentNames) {
+    const cat = categorizeOpponent(name);
+    if (cat === 'nit' || cat === 'tag') foldyCount++;
+    if (cat === 'station' || cat === 'fish' || cat === 'maniac') stickyCount++;
+  }
+  if (stickyCount > foldyCount + 1) return false;
+  const baseBluff = profile.bluffFrequency;
+  let storyMult = 0;
+  if (phase === GamePhase.Flop) {
+    if (board.isDry && board.hasHighCards) storyMult = 1.2;
+    else if (board.isMonotone) storyMult = 0.9;
+    else if (board.isWet && !board.hasHighCards) storyMult = 0.5;
+    else storyMult = 0.7;
+  } else if (phase === GamePhase.Turn) {
+    storyMult = board.straightPossible || board.flushPossible ? 0.7 : 0.35;
+  } else if (phase === GamePhase.River) {
+    storyMult = board.isMonotone || board.isPaired ? 0.45 : 0.15;
+  }
+  const foldMult = foldyCount > 0 ? 1 + (foldyCount * 0.15) : 1;
+  return Math.random() < Math.min(0.35, baseBluff * storyMult * foldMult);
+}
+
+// UPGRADE #4 — thin river value bet.
+export function shouldThinValueBet(
+  handStrength: number,
+  phase: GamePhase,
+  board: BoardTexture,
+  opponentNames: string[],
+  profile: AIPlayerProfile
+): boolean {
+  if (phase !== GamePhase.River) return false;
+  if (handStrength < 0.45 || handStrength > 0.68) return false;
+  if (board.isMonotone || (board.isPaired && board.hasHighCards)) return false;
+  const loose = opponentNames.filter((n) => {
+    const c = categorizeOpponent(n);
+    return c === 'station' || c === 'fish' || c === 'lag';
+  }).length;
+  const tight = opponentNames.filter((n) => categorizeOpponent(n) === 'nit').length;
+  if (loose === 0 || tight > loose) return false;
+  if (profile.difficulty === 'easy') return false;
+  const baseProb = profile.difficulty === 'expert' ? 0.45
+                 : profile.difficulty === 'hard'   ? 0.30
+                 : 0.15;
+  return Math.random() < baseProb;
+}
+
+export function getEffectiveStackBB(table: PokerTable, mySeat: number): number {
+  const seat = table.seats[mySeat];
+  if (!seat) return 100;
+  const bb = table.config.bigBlind || 50;
+  let largestOpp = 0;
+  for (const s of table.seats) {
+    if (s.seatIndex === mySeat) continue;
+    if (s.state !== 'occupied' || s.folded || s.eliminated) continue;
+    if (s.chipCount > largestOpp) largestOpp = s.chipCount;
+  }
+  const effective = Math.min(seat.chipCount, largestOpp);
+  return Math.max(1, Math.round(effective / bb));
+}
+
+/** Enumerate the non-folded opponent player names on a table. */
+export function getActiveOpponentNames(table: PokerTable, mySeat: number): string[] {
+  const names: string[] = [];
+  for (const s of table.seats) {
+    if (s.seatIndex === mySeat) continue;
+    if (s.state !== 'occupied' || s.folded || s.eliminated) continue;
+    if (!s.isAI && s.playerName) names.push(s.playerName);
+  }
+  return names;
+}
