@@ -1252,6 +1252,17 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         if (socket) {
           socket.emit('handHistory', serializedHistory);
         }
+        // Persist the FULL serialized replay record to DB per-user so
+        // the Last Hand viewer still works across logins. Previously
+        // handleHandComplete wrote a minimal snapshot here (just chips +
+        // holeCards + community), which the replay viewer couldn't use
+        // — opening Last Hand after login threw inside buildReplaySteps
+        // because history.players was undefined.
+        const auth = authSessions.get(socketId);
+        if (auth) {
+          const handId = `${tableId}-${serializedHistory.handNumber}-${session.seatIndex}-${Date.now()}`;
+          recordHand(auth.userId, handId, serializedHistory).catch(() => {});
+        }
       }
     }
   });
@@ -2009,19 +2020,10 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
             console.warn(`[hand-complete] SKIPPED save for userId=${authSession.userId} — progress not hydrated yet (would have overwritten real values with fresh-init)`);
           }
 
-          // Persistence sweep: record this hand to user_hand_history + tick scratch card progress
-          const seat = table.seats[session.seatIndex];
-          const result = handResultPerSeat.get(session.seatIndex);
-          const potWon = totalWonPerSeat.get(session.seatIndex) || 0;
-          recordHand(authSession.userId, `${tableId}-${Date.now()}-${session.seatIndex}`, {
-            tableId,
-            seatIndex: session.seatIndex,
-            chipCount: seat?.chipCount || 0,
-            potWon,
-            handRank: result?.handRank,
-            holeCards: seat?.holeCards || [],
-            communityCards: table.communityCards,
-          }).catch(() => {});
+          // Hand persistence moved to the table.on('handHistory') listener
+          // so the full replay-compatible record is stored (this handler
+          // only has access to the minimal result data, which the replay
+          // viewer couldn't render).
 
           const awarded = await tickScratchProgress(authSession.userId).catch(() => false);
           if (awarded) {
