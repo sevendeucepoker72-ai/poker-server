@@ -1933,8 +1933,11 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   }
 
   for (const session of humanSessions) {
-    // Everyone who played gets recordHandPlayed + 5 XP
-    progressionManager.recordHandPlayed(session.playerId);
+    // Everyone who played gets recordHandPlayed + 5 XP. Pass variantId
+    // so lifetime "all_variants" + daily/weekly variety achievements
+    // can track it.
+    const variantId: string | undefined = (table as any).config?.variantId || (table as any).variantId;
+    progressionManager.recordHandPlayed(session.playerId, variantId);
     progressionManager.addXP(session.playerId, 5);
 
     const seat = table.seats[session.seatIndex];
@@ -4393,6 +4396,19 @@ Give feedback in this JSON format:
     } catch (err: any) {
       console.error('updatePreferences error:', err);
     }
+  });
+
+  // Achievements panel — 3-bucket summary (daily / weekly / lifetime) with
+  // per-entry unlock status + reward + window end timestamps for countdown.
+  socket.on('getAchievements', () => {
+    const session = playerSessions.get(socket.id);
+    const playerId = session?.playerId;
+    if (!playerId) {
+      socket.emit('achievementsList', { daily: [], weekly: [], lifetime: [], windowEndsAt: { daily: 0, weekly: 0 } });
+      return;
+    }
+    const summary = progressionManager.getAchievementsSummary(playerId);
+    socket.emit('achievementsList', summary || { daily: [], weekly: [], lifetime: [], windowEndsAt: { daily: 0, weekly: 0 } });
   });
 
   // Load durable extras (inventory, battle pass claims, hand history, prefs) —

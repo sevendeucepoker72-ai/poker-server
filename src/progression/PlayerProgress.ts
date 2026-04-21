@@ -45,6 +45,29 @@ export interface PlayerProgress {
   allInWins: number;
   chatMessagesSent: number;
 
+  // ── Daily / weekly rolling stat windows (for daily/weekly achievements) ──
+  // Reset lazily on first stat-touch in a new window (UTC date / week).
+  dailyStats: DailyStats;
+  dailyStatsDate: string;        // 'YYYY-MM-DD' UTC
+  weeklyStats: WeeklyStats;
+  weeklyStatsWeekStart: string;  // 'YYYY-MM-DD' UTC Sunday
+
+  // Cached IDs of daily/weekly achievements already earned in the current
+  // window — hydrated from DB on login, appended to on each new unlock.
+  dailyAchievementsToday: string[];
+  weeklyAchievementsThisWeek: string[];
+
+  // Rare-hand counters (for lifetime achievements)
+  straightFlushHits: number;
+  fullHouseHits: number;
+  quadsHits: number;
+  royalFlushHits: number;
+  // Tournament tracking
+  tournamentsWon: number;
+  tournamentsPlayed: number;
+  // Variant breadth tracking for "variety" achievements
+  variantsPlayed: string[];      // distinct variantIds
+
   /**
    * True once hydrateFromDB has completed for this progress entry.
    * The hand-complete save path MUST check this before writing xp/level
@@ -78,3 +101,61 @@ export enum MissionType {
   FoldPreFlop = 'FoldPreFlop',
   WinWithBluff = 'WinWithBluff',
 }
+
+/** Per-day counters used by daily-achievement check functions. */
+export interface DailyStats {
+  handsPlayed: number;
+  handsWon: number;
+  chipsWon: number;            // total chips won today (sum of pot wins)
+  bestPotToday: number;
+  currentWinStreakToday: number;
+  bluffWinsToday: number;
+  allInWinsToday: number;
+  variantsPlayedToday: string[];
+  flushesHit: number;          // flush or better
+  straightsHit: number;        // straight or better (excluding flushes)
+  fullHousesHit: number;
+  foldsToday: number;
+  preflopRaisesToday: number;
+}
+
+/** Per-week counters — reset every Sunday 00:00 UTC. */
+export interface WeeklyStats {
+  handsPlayed: number;
+  handsWon: number;
+  chipsWonThisWeek: number;
+  tournamentsWonThisWeek: number;
+  daysActive: number;          // incremented once per distinct day
+  lastActiveDate: string;      // 'YYYY-MM-DD' for daysActive accounting
+  variantsPlayedThisWeek: string[];
+  bestPotThisWeek: number;
+  winStreakThisWeek: number;
+}
+
+export const emptyDailyStats = (): DailyStats => ({
+  handsPlayed: 0,
+  handsWon: 0,
+  chipsWon: 0,
+  bestPotToday: 0,
+  currentWinStreakToday: 0,
+  bluffWinsToday: 0,
+  allInWinsToday: 0,
+  variantsPlayedToday: [],
+  flushesHit: 0,
+  straightsHit: 0,
+  fullHousesHit: 0,
+  foldsToday: 0,
+  preflopRaisesToday: 0,
+});
+
+export const emptyWeeklyStats = (): WeeklyStats => ({
+  handsPlayed: 0,
+  handsWon: 0,
+  chipsWonThisWeek: 0,
+  tournamentsWonThisWeek: 0,
+  daysActive: 0,
+  lastActiveDate: '',
+  variantsPlayedThisWeek: [],
+  bestPotThisWeek: 0,
+  winStreakThisWeek: 0,
+});

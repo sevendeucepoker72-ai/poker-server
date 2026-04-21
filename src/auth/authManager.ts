@@ -213,6 +213,31 @@ export async function initDB(): Promise<void> {
   `).catch((e: any) => console.warn('[Auth] user_hand_history:', e.message));
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_hand_history_user_created ON user_hand_history(user_id, created_at DESC)`).catch(() => {});
 
+  // Daily achievements — (user, ach_id, date) composite PK so the same
+  // achievement can be earned once per UTC calendar day.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_daily_achievements (
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      ach_id      TEXT    NOT NULL,
+      claim_date  DATE    NOT NULL,
+      claimed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, ach_id, claim_date)
+    )
+  `).catch((e: any) => console.warn('[Auth] user_daily_achievements:', e.message));
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_daily_ach_user_date ON user_daily_achievements(user_id, claim_date DESC)`).catch(() => {});
+
+  // Weekly achievements — keyed by ISO week-start date (Sunday 00:00 UTC).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_weekly_achievements (
+      user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      ach_id          TEXT    NOT NULL,
+      week_start_date DATE    NOT NULL,
+      claimed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, ach_id, week_start_date)
+    )
+  `).catch((e: any) => console.warn('[Auth] user_weekly_achievements:', e.message));
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_weekly_ach_user_date ON user_weekly_achievements(user_id, week_start_date DESC)`).catch(() => {});
+
   console.log('[Auth] Persistence sweep DDL applied');
 
   // Seed admin accounts
@@ -823,6 +848,80 @@ export async function loadHandHistory(userId: number, limit = 100): Promise<any[
     return rows.map((r: any) => ({ ...r.data, handId: r.hand_id, timestamp: r.created_at }));
   } catch (e: any) {
     console.warn(`[loadHandHistory ${userId}]`, e.message);
+    return [];
+  }
+}
+
+// ── Daily / Weekly achievement persistence ─────────────────────────────────
+//
+// Daily:  keyed by (user, ach_id, UTC date). PK is unique so a second insert
+//         for the same day is a no-op via ON CONFLICT DO NOTHING. Returns
+//         true if the row was actually inserted (first earn today).
+// Weekly: same pattern but keyed by week_start_date (Sunday 00:00 UTC).
+
+/** Return today's UTC date as a YYYY-MM-DD string. */
+function utcDateStr(d: Date = new Date()): string {
+  return d.toISOString().slice(0, 10);
+}
+/** Return the Sunday (week start) of the current UTC week as YYYY-MM-DD. */
+function utcWeekStartStr(d: Date = new Date()): string {
+  const dow = d.getUTCDay();
+  const sunday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - dow));
+  return sunday.toISOString().slice(0, 10);
+}
+
+export async function recordDailyAchievement(userId: number, achId: string): Promise<boolean> {
+  try {
+    const { rowCount } = await pool.query(
+      `INSERT INTO user_daily_achievements (user_id, ach_id, claim_date)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [userId, achId, utcDateStr()]
+    );
+    return (rowCount || 0) > 0;
+  } catch (e: any) {
+    console.warn(`[recordDailyAchievement ${userId} ${achId}]`, e.message);
+    return false;
+  }
+}
+
+export async function recordWeeklyAchievement(userId: number, achId: string): Promise<boolean> {
+  try {
+    const { rowCount } = await pool.query(
+      `INSERT INTO user_weekly_achievements (user_id, ach_id, week_start_date)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+      [userId, achId, utcWeekStartStr()]
+    );
+    return (rowCount || 0) > 0;
+  } catch (e: any) {
+    console.warn(`[recordWeeklyAchievement ${userId} ${achId}]`, e.message);
+    return false;
+  }
+}
+
+/** Return the IDs of daily achievements this user already earned TODAY. */
+export async function loadTodayDailyAchievements(userId: number): Promise<string[]> {
+  try {
+    const { rows } = await pool.query(
+      `SELECT ach_id FROM user_daily_achievements WHERE user_id = $1 AND claim_date = $2`,
+      [userId, utcDateStr()]
+    );
+    return rows.map((r: any) => r.ach_id);
+  } catch (e: any) {
+    console.warn(`[loadTodayDailyAchievements ${userId}]`, e.message);
+    return [];
+  }
+}
+
+/** Return the IDs of weekly achievements this user already earned THIS WEEK. */
+export async function loadThisWeekWeeklyAchievements(userId: number): Promise<string[]> {
+  try {
+    const { rows } = await pool.query(
+      `SELECT ach_id FROM user_weekly_achievements WHERE user_id = $1 AND week_start_date = $2`,
+      [userId, utcWeekStartStr()]
+    );
+    return rows.map((r: any) => r.ach_id);
+  } catch (e: any) {
+    console.warn(`[loadThisWeekWeeklyAchievements ${userId}]`, e.message);
     return [];
   }
 }
