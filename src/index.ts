@@ -4165,10 +4165,112 @@ Give feedback in this JSON format:
     mystery_box: {
       basic: 500, premium: 2000, legendary: 8000,
     },
+    // Chip skins — how your chips look in your seat stack visual
+    chip_skin: {
+      classic: 0, crimson: 400, cobalt: 500, emerald: 600,
+      amethyst: 800, gold_rimmed: 1200, neon: 1800, holographic: 2500, mythic: 4000,
+    },
+    // Card front designs — alt faces for your cards (hero only; others see default)
+    card_front: {
+      standard: 0, minimal: 400, retro: 600, modern: 800,
+      futuristic: 1200, luxury: 1800, hanafuda: 2200, artistic: 2800,
+    },
+    // Dealer voice packs — audio pack for dealer callouts
+    dealer_voice: {
+      standard: 0, vegas_vet: 600, british_butler: 800,
+      pirate: 900, robot: 1100, sportscaster: 1400, celebrity: 2200, mythic_sage: 4000,
+    },
+    // Profile backgrounds — the backdrop behind your avatar in the lobby
+    profile_bg: {
+      default: 0, sunset: 200, city_lights: 350, deep_space: 500,
+      aurora: 700, volcano: 900, underwater: 1100, cherry_blossom: 1400, diamond_rain: 2500,
+    },
+    // XP & chip boosters (consumable — expiry handled server-side)
+    booster: {
+      xp_2x_15m: 200, xp_2x_1h: 600, xp_2x_1d: 2500,
+      chip_1p5x_1h: 400, chip_1p5x_1d: 2000,
+    },
+    // VIP passes — future-use flag, gates premium-only perks
+    vip_pass: {
+      daily: 300, weekly: 1500, monthly: 5000, lifetime: 50000,
+    },
+    // Bundles — single-purchase multi-item grants. See BUNDLE_CONTENTS below.
+    bundle: {
+      starter:       800,    // 3 items
+      collector:     2500,   // 5 items
+      tournament:    4000,   // 6 items + chip pack
+      whale_bundle:  10000,  // 8 items + chip pack
+      mythic_bundle: 25000,  // everything mythic-tier
+    },
   };
   const CHIP_PACK_PAYOUT: Record<string, number> = {
     refill: 10000, small: 25000, medium: 100000, big: 250000,
     pro: 750000, whale: 2000000, kingpin: 5000000, emperor: 15000000,
+  };
+
+  // Bundle contents: what items a single purchase grants.
+  // Each entry is an array of [itemType, itemId] tuples. If the user
+  // already owns any item, a 25% pro-rata stars refund is credited for
+  // each duplicate.
+  const BUNDLE_CONTENTS: Record<string, Array<[string, string]>> = {
+    starter: [
+      ['card_back', 'silver_foil'],
+      ['emote', 'nice_hand'],
+      ['frame', 'bronze'],
+    ],
+    collector: [
+      ['card_back', 'gold_premium'],
+      ['theme', 'casino_royale'],
+      ['frame', 'silver'],
+      ['emote', 'crown'],
+      ['celebration', 'chip_rain'],
+    ],
+    tournament: [
+      ['title', 'tournament_champ'],
+      ['theme', 'royal_gold'],
+      ['frame', 'gold'],
+      ['card_back', 'holographic'],
+      ['celebration', 'fireworks'],
+      ['emote', 'trophy'],
+    ],
+    whale_bundle: [
+      ['theme', 'cosmic_nebula'],
+      ['card_back', 'diamond_pattern'],
+      ['frame', 'diamond'],
+      ['celebration', 'golden_shower'],
+      ['emote', 'mic_drop'],
+      ['title', 'royal'],
+      ['sound_pack', 'fantasy'],
+      ['dealer_voice', 'celebrity'],
+    ],
+    mythic_bundle: [
+      ['card_back', 'mythic'],
+      ['frame', 'mythic'],
+      ['title', 'godmode'],
+      ['celebration', 'supernova'],
+      ['chip_skin', 'mythic'],
+      ['card_front', 'artistic'],
+      ['dealer_voice', 'mythic_sage'],
+      ['profile_bg', 'diamond_rain'],
+      ['theme', 'cosmic_nebula'],
+    ],
+  };
+
+  // Booster durations in ms (for consumable activation record)
+  const BOOSTER_DURATION: Record<string, { kind: 'xp' | 'chip'; mult: number; ms: number }> = {
+    xp_2x_15m:    { kind: 'xp',   mult: 2,   ms: 15 * 60 * 1000 },
+    xp_2x_1h:     { kind: 'xp',   mult: 2,   ms: 60 * 60 * 1000 },
+    xp_2x_1d:     { kind: 'xp',   mult: 2,   ms: 24 * 60 * 60 * 1000 },
+    chip_1p5x_1h: { kind: 'chip', mult: 1.5, ms: 60 * 60 * 1000 },
+    chip_1p5x_1d: { kind: 'chip', mult: 1.5, ms: 24 * 60 * 60 * 1000 },
+  };
+
+  // VIP pass durations
+  const VIP_PASS_DURATION: Record<string, number> = {
+    daily:    24 * 60 * 60 * 1000,
+    weekly:   7  * 24 * 60 * 60 * 1000,
+    monthly:  30 * 24 * 60 * 60 * 1000,
+    lifetime: 100 * 365 * 24 * 60 * 60 * 1000,
   };
 
   // Lazy hydration — first socket call after auth hydrates player progress from DB.
@@ -4277,6 +4379,81 @@ Give feedback in this JSON format:
         }
 
         socket.emit('purchaseResult', { success: true, itemType, itemId, cost, mysteryReward: payload });
+        sendProgressToPlayer(socket.id);
+        return;
+      }
+
+      // Bundle: multi-item grant in a single purchase. Duplicates refund
+      // pro-rata stars so the user isn't penalized for partial overlap.
+      if (itemType === 'bundle') {
+        const contents = BUNDLE_CONTENTS[itemId] || [];
+        if (contents.length === 0) {
+          socket.emit('purchaseResult', { success: false, error: 'Unknown bundle' });
+          return;
+        }
+        progress.stars -= cost;
+        const grantedItems: Array<[string, string]> = [];
+        let duplicates = 0;
+        for (const [t, id] of contents) {
+          const ok = await dbGrantItem(ctx.userId, t, id);
+          if (ok) grantedItems.push([t, id]);
+          else duplicates++;
+        }
+        // Refund 25% of bundle cost per duplicate, averaged over item count.
+        if (duplicates > 0) {
+          const refund = Math.floor((cost * 0.25 * duplicates) / contents.length);
+          progress.stars += refund;
+        }
+        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+        socket.emit('purchaseResult', {
+          success: true, itemType, itemId, cost,
+          bundleGranted: grantedItems, bundleDuplicates: duplicates,
+        });
+        const inv = await loadInventory(ctx.userId);
+        socket.emit('inventoryUpdated', { inventory: inv });
+        sendProgressToPlayer(socket.id);
+        return;
+      }
+
+      // Booster (XP / chip multiplier): consumable with expiry. Applied
+      // to the in-memory progress; future hands respect the multiplier.
+      // Persistence is best-effort — a server restart clears boosters
+      // (acceptable trade-off given short durations).
+      if (itemType === 'booster') {
+        const b = BOOSTER_DURATION[itemId];
+        if (!b) {
+          socket.emit('purchaseResult', { success: false, error: 'Unknown booster' });
+          return;
+        }
+        progress.stars -= cost;
+        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+        const expiresAt = Date.now() + b.ms;
+        (progress as any).activeBoosters = (progress as any).activeBoosters || {};
+        (progress as any).activeBoosters[b.kind] = { mult: b.mult, expiresAt };
+        socket.emit('purchaseResult', {
+          success: true, itemType, itemId, cost,
+          booster: { kind: b.kind, mult: b.mult, expiresAt },
+        });
+        sendProgressToPlayer(socket.id);
+        return;
+      }
+
+      // VIP pass: timed premium flag; gates future premium-only perks.
+      if (itemType === 'vip_pass') {
+        const ms = VIP_PASS_DURATION[itemId];
+        if (!ms) {
+          socket.emit('purchaseResult', { success: false, error: 'Unknown VIP pass' });
+          return;
+        }
+        progress.stars -= cost;
+        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+        const current = (progress as any).vipExpiresAt || 0;
+        const base = Math.max(Date.now(), current);
+        (progress as any).vipExpiresAt = base + ms;
+        socket.emit('purchaseResult', {
+          success: true, itemType, itemId, cost,
+          vipExpiresAt: (progress as any).vipExpiresAt,
+        });
         sendProgressToPlayer(socket.id);
         return;
       }

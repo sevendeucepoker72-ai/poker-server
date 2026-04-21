@@ -586,6 +586,11 @@ export class ProgressionManager {
       return;
     }
 
+    // Apply XP booster if active (consumable from shop).
+    const xpBooster = (progress as any).activeBoosters?.xp;
+    if (xpBooster && xpBooster.expiresAt > Date.now()) {
+      amount = Math.round(amount * (xpBooster.mult || 1));
+    }
     progress.xp += amount;
 
     while (progress.level < MAX_LEVEL && progress.xp >= progress.xpToNextLevel) {
