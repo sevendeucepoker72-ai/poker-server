@@ -4108,16 +4108,67 @@ Give feedback in this JSON format:
   // ───── Persistence sweep: socket handlers ──────────────────────────────────
   // Server-authoritative shop prices. Client cannot influence cost.
   const SHOP_PRICES: Record<string, Record<string, number>> = {
-    card_back:   { classic_red: 0, royal_blue: 0, gold_premium: 500, neon_green: 500 },
-    emote:       { nice_hand: 150, good_game: 150, big_brain: 200, money: 200, fire: 250, tears: 250, rocket: 300, crown: 400 },
-    frame:       { bronze: 500, silver: 1000, gold: 2000, diamond: 5000 },
-    celebration: { confetti: 400, chip_rain: 800, fireworks: 1200, lightning: 1500 },
-    sound_pack:  { vegas_casino: 300, old_school: 500, cyberpunk: 750, silent_mode: 100 },
-    title:       { the_shark: 800, all_in_legend: 1500, river_rat: 600, bluff_master: 1200 },
-    chip_pack:   { refill: 50, big: 200, pro: 600, whale: 2500 },
+    // Card backs
+    card_back: {
+      classic_red: 0, royal_blue: 0,
+      gold_premium: 500, neon_green: 500, silver_foil: 400,
+      holographic: 800, dragon: 1200, phoenix: 1500,
+      diamond_pattern: 2000, mythic: 5000,
+    },
+    // Table themes — moved off the broken "Browse Table Themes" modal
+    // flow and into the main shop grid.
+    theme: {
+      classic_blue: 0, green_felt: 0,
+      midnight_purple: 300, ocean_breeze: 400, casino_royale: 500,
+      neon_vegas: 600, carbon_black: 700, royal_gold: 800,
+      cherry_wood: 900, cosmic_nebula: 1500,
+    },
+    // Avatar frames
+    frame: {
+      bronze: 500, silver: 1000, gold: 2000, diamond: 5000,
+      flame: 6000, ice: 6000, crown: 10000, platinum: 8000, mythic: 15000,
+    },
+    // Emotes
+    emote: {
+      nice_hand: 150, good_game: 150, well_played: 150,
+      thumbs_up: 150, clap: 200, love: 250,
+      big_brain: 200, money: 200, fire: 250,
+      tears: 250, rocket: 300, crown: 400,
+      sunglasses: 200, laughing: 200, surprised: 200,
+      dead: 300, think: 300, poker_face: 400,
+      mic_drop: 500, trophy: 600,
+    },
+    // Celebrations
+    celebration: {
+      confetti: 400, chip_rain: 800, fireworks: 1200, lightning: 1500,
+      golden_shower: 2000, dragon_breath: 3000, cosmic_burst: 4000, supernova: 6000,
+    },
+    // Sound packs
+    sound_pack: {
+      silent_mode: 100, classic_casino: 300, vegas_casino: 300,
+      old_school: 500, cyberpunk: 750, fantasy: 1000,
+    },
+    // Player titles
+    title: {
+      nitwit: 300, calling_station: 400, grinder: 500,
+      river_rat: 600, chip_leader: 700, degenerate: 700,
+      the_shark: 800, bad_beat_survivor: 800, final_table: 1000,
+      bluff_master: 1200, all_in_legend: 1500, phantom: 1500,
+      tournament_champ: 2000, royal: 3000, godmode: 8000,
+    },
+    // Chip packs — stars → chips conversion
+    chip_pack: {
+      refill: 50, small: 100, medium: 300, big: 600,
+      pro: 1500, whale: 3000, kingpin: 6000, emperor: 12000,
+    },
+    // Mystery boxes — random reward
+    mystery_box: {
+      basic: 500, premium: 2000, legendary: 8000,
+    },
   };
   const CHIP_PACK_PAYOUT: Record<string, number> = {
-    refill: 10000, big: 50000, pro: 200000, whale: 1000000,
+    refill: 10000, small: 25000, medium: 100000, big: 250000,
+    pro: 750000, whale: 2000000, kingpin: 5000000, emperor: 15000000,
   };
 
   // Lazy hydration — first socket call after auth hydrates player progress from DB.
@@ -4158,6 +4209,74 @@ Give feedback in this JSON format:
         dbPersistStars(ctx.userId, progress.stars).catch(() => {});
         await addChipsToUser(ctx.userId, payout);
         socket.emit('purchaseResult', { success: true, itemType, itemId, cost, payout });
+        sendProgressToPlayer(socket.id);
+        return;
+      }
+
+      // Mystery box: spend stars → roll a random reward (chips / stars
+      // refund / cosmetic). Tier determines loot quality.
+      if (itemType === 'mystery_box') {
+        progress.stars -= cost;
+        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+
+        const tierTable: Record<string, { chips: [number, number]; stars: [number, number]; itemPool?: Array<{ type: string; id: string }> }> = {
+          basic: {
+            chips: [5000, 25000], stars: [50, 150],
+            itemPool: [
+              { type: 'emote', id: 'nice_hand' }, { type: 'emote', id: 'fire' },
+              { type: 'sound_pack', id: 'classic_casino' },
+            ],
+          },
+          premium: {
+            chips: [25000, 150000], stars: [200, 600],
+            itemPool: [
+              { type: 'frame', id: 'silver' }, { type: 'celebration', id: 'chip_rain' },
+              { type: 'title', id: 'the_shark' }, { type: 'card_back', id: 'holographic' },
+            ],
+          },
+          legendary: {
+            chips: [150000, 1000000], stars: [800, 2500],
+            itemPool: [
+              { type: 'frame', id: 'diamond' }, { type: 'celebration', id: 'supernova' },
+              { type: 'title', id: 'royal' }, { type: 'card_back', id: 'mythic' },
+            ],
+          },
+        };
+        const tier = tierTable[itemId] || tierTable.basic;
+        const roll = Math.random();
+        let payload: any = {};
+        if (roll < 0.5) {
+          // 50% chips
+          const amt = Math.floor(tier.chips[0] + Math.random() * (tier.chips[1] - tier.chips[0]));
+          progress.chips += amt;
+          await addChipsToUser(ctx.userId, amt);
+          payload = { kind: 'chips', amount: amt };
+        } else if (roll < 0.8) {
+          // 30% stars refund
+          const amt = Math.floor(tier.stars[0] + Math.random() * (tier.stars[1] - tier.stars[0]));
+          progress.stars += amt;
+          dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+          payload = { kind: 'stars', amount: amt };
+        } else if (tier.itemPool && tier.itemPool.length > 0) {
+          // 20% cosmetic item
+          const pick = tier.itemPool[Math.floor(Math.random() * tier.itemPool.length)];
+          const granted = await dbGrantItem(ctx.userId, pick.type, pick.id);
+          if (granted) {
+            payload = { kind: 'item', itemType: pick.type, itemId: pick.id };
+            const inv = await loadInventory(ctx.userId);
+            socket.emit('inventoryUpdated', { inventory: inv });
+          } else {
+            // Duplicate — refund equivalent stars.
+            const refund = Math.floor(cost * 0.4);
+            progress.stars += refund;
+            dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+            payload = { kind: 'stars', amount: refund, reason: 'duplicate_refund' };
+          }
+        } else {
+          payload = { kind: 'chips', amount: 0 };
+        }
+
+        socket.emit('purchaseResult', { success: true, itemType, itemId, cost, mysteryReward: payload });
         sendProgressToPlayer(socket.id);
         return;
       }
