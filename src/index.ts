@@ -1861,6 +1861,25 @@ setInterval(() => {
 
 // ========== Progression Helpers ==========
 
+/**
+ * Hydrate a user's in-memory progress from Postgres and push a
+ * playerProgress event to the socket immediately. Safe to call right
+ * after login — works even when the user hasn't joined a table yet
+ * (no playerSession required). Prevents the "I logged in and I'm level 1"
+ * flash that happens before the first ensureHydrated-gated handler runs.
+ */
+async function hydrateAndPushProgress(socket: Socket, userId: number, username: string): Promise<void> {
+  try {
+    const playerId = playerSessions.get(socket.id)?.playerId || `user-${userId}`;
+    progressionManager.getOrCreateProgress(playerId, username);
+    await progressionManager.hydrateFromDB(playerId, userId);
+    const clientProgress = progressionManager.getClientProgress(playerId);
+    if (clientProgress) socket.emit('playerProgress', clientProgress);
+  } catch (err: any) {
+    console.warn(`[hydrateAndPushProgress ${userId}]`, err?.message);
+  }
+}
+
 function sendProgressToPlayer(socketId: string): void {
   const session = playerSessions.get(socketId);
   if (!session) return;
@@ -2295,6 +2314,11 @@ io.on('connection', (socket: Socket) => {
       authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username });
     }
     socket.emit('loginResult', result);
+    // Proactively hydrate + push playerProgress so the client never
+    // renders the fresh-init level:1 / xp:0 state after a redeploy.
+    if (result.success && result.userData) {
+      hydrateAndPushProgress(socket, result.userData.id, result.userData.username).catch(() => {});
+    }
   });
 
   socket.on('register', async (data: { username: string; password: string }) => {
@@ -2835,6 +2859,7 @@ Give feedback in this JSON format:
         token: data.accessToken,
         userData,
       });
+      hydrateAndPushProgress(socket, userId, localUser.username).catch(() => {});
 
       console.log(
         `[OAuth] oauthLogin ok: localId=${localUser.id} phone=${phone} masterId=${oauthResult.sub}`
@@ -2930,6 +2955,7 @@ Give feedback in this JSON format:
         }
 
         socket.emit('loginResult', { success: true, token: data.token, userData: progress.userData });
+        hydrateAndPushProgress(socket, progress.userData.id, progress.userData.username).catch(() => {});
         return;
       }
     }
@@ -3004,6 +3030,11 @@ Give feedback in this JSON format:
       }
     }
     socket.emit('loginResult', result);
+    // Hydrate + push progress for legacy tokenLogin path too so the
+    // UI never sits at fresh-init level:1 after a redeploy.
+    if (result.success && result.userData) {
+      hydrateAndPushProgress(socket, result.userData.id, result.userData.username).catch(() => {});
+    }
   });
 
   socket.on('logout', async () => {
@@ -4871,6 +4902,7 @@ Give feedback in this JSON format:
           isAdmin: !!localUser.is_admin,
         };
         socket.emit('loginResult', { success: true, token: data.token, userData });
+        hydrateAndPushProgress(socket, localUser.id, localUser.username).catch(() => {});
 
         console.log(
           `[authWithTicket] logged in userId=${localUser.id} (masterId=${remoteUserId}) username=${localUser.username}`
@@ -7331,3 +7363,93 @@ httpServer.listen(PORT, () => {
     );
   }
 });
+
+// ========== Graceful shutdown — preserve player state on Railway redeploys ==========
+//
+// Railway sends SIGTERM then kills the process ~30s later. Before the
+// process dies, we MUST cash out every seated player's at-table stack
+// back to their users.chips wallet, and flush in-memory progress
+// (xp/level/achievements) to DB. Without this, every redeploy evaporates
+// seated chip stacks and any mid-session XP/level gains that hadn't
+// already been saved via hand-complete.
+//
+// Also flushes:
+// - users.stars (via persistStars)
+// - users.chips (at-table stack added back)
+// - xp/level/achievements/stats (via saveProgress)
+let shutdownInProgress = false;
+async function gracefulShutdown(signal: string) {
+  if (shutdownInProgress) return;
+  shutdownInProgress = true;
+  console.log(`[Shutdown] ${signal} received — preserving player state...`);
+
+  try {
+    // 1. Cash out every seated human player and flush their progress.
+    const seenUserIds = new Set<number>();
+    for (const [socketId, session] of playerSessions) {
+      try {
+        const auth = authSessions.get(socketId);
+        if (!auth) continue;
+        const table = tableManager.getTable(session.tableId);
+        const seat = table?.seats?.[session.seatIndex];
+        if (seat && seat.state === 'occupied' && seat.chipCount > 0) {
+          await addChipsToUser(auth.userId, seat.chipCount);
+          console.log(`[Shutdown] Cashed out ${seat.chipCount} chips for user ${auth.userId} (seat ${session.seatIndex})`);
+        }
+        const prog = progressionManager.getClientProgress(session.playerId) as any;
+        if (prog && prog.hydrated) {
+          await saveProgress(auth.userId, {
+            xp: prog.xp,
+            level: prog.level,
+            achievements: prog.achievements || [],
+            stats: {
+              handsPlayed: prog.totalHandsPlayed,
+              handsWon: prog.handsWon,
+              biggestPot: prog.biggestPot,
+              bestStreak: prog.bestStreak,
+              bluffWins: prog.bluffWins,
+              allInWins: prog.allInWins,
+              chatMessagesSent: prog.chatMessagesSent,
+              straightFlushHits: prog.straightFlushHits,
+              fullHouseHits: prog.fullHouseHits,
+              quadsHits: prog.quadsHits,
+              royalFlushHits: prog.royalFlushHits,
+              tournamentsWon: prog.tournamentsWon,
+              tournamentsPlayed: prog.tournamentsPlayed,
+              variantsPlayed: prog.variantsPlayed || [],
+            },
+          });
+        }
+        seenUserIds.add(auth.userId);
+      } catch (e: any) {
+        console.warn(`[Shutdown] flush failed for socket ${socketId}:`, e?.message);
+      }
+    }
+
+    // 2. Cash out every reserved seat (disconnected but not yet expired).
+    for (const [userId, reserved] of reservedSeats) {
+      if (seenUserIds.has(userId)) continue;
+      try {
+        const table = tableManager.getTable(reserved.tableId);
+        const seat = table?.seats?.[reserved.seatIndex];
+        const chips = seat?.chipCount ?? reserved.chips ?? 0;
+        if (chips > 0) {
+          await addChipsToUser(userId, chips);
+          console.log(`[Shutdown] Cashed out ${chips} reserved chips for user ${userId}`);
+        }
+      } catch (e: any) {
+        console.warn(`[Shutdown] reserved flush failed for user ${userId}:`, e?.message);
+      }
+    }
+
+    console.log('[Shutdown] State preserved. Exiting.');
+  } catch (err: any) {
+    console.error('[Shutdown] fatal error during flush:', err?.message);
+  } finally {
+    // Give the logger a moment, then exit so Railway can finish the redeploy.
+    setTimeout(() => process.exit(0), 500);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
