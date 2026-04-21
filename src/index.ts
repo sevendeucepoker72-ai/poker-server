@@ -425,6 +425,19 @@ function syncSitOutToTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
   const set = sitOutTracker.get(tableId) || new Set<number>();
+  // Garbage-collect stale entries before pushing to the table. A seat
+  // that used to be occupied by a sitting-out player but is now empty
+  // (player stood up / seat re-assigned) must not propagate into the
+  // table's _sittingOutSeats, or the NEXT occupant of that seat index
+  // will be charged dead-blind debt on their very first hand. This was
+  // the root cause of "first hand I sit down, missed blinds popup".
+  for (const idx of [...set]) {
+    const s = table.seats[idx];
+    if (!s || s.state !== 'occupied' || s.eliminated) {
+      set.delete(idx);
+    }
+  }
+  sitOutTracker.set(tableId, set);
   table.setSittingOutSeats(set);
 }
 
@@ -2939,10 +2952,21 @@ Give feedback in this JSON format:
             socket.join(`table:${reserved.tableId}`);
 
             // Remove from sit-out if they were marked out during disconnect
-            // (they'll sit back in since they reconnected)
+            // (they'll sit back in since they reconnected). MUST mirror the
+            // OAuth reconnect path (line ~2866): clear the tracker entry,
+            // sync the change into the PokerTable's _sittingOutSeats set,
+            // AND zero out any dead-blind debt that accumulated during the
+            // brief disconnect. Without this, a PWA backgrounding blip on
+            // the legacy tokenLogin path left the user flagged + billed.
             restoredSession.sittingOut = false;
             const tracker = sitOutTracker.get(reserved.tableId);
             if (tracker) tracker.delete(reserved.seatIndex);
+            syncSitOutToTable(reserved.tableId);
+            const reSeatLegacy = table.seats[reserved.seatIndex];
+            if (reSeatLegacy) {
+              reSeatLegacy.deadBlindOwedChips = 0;
+              reSeatLegacy.missedBlind = 'none';
+            }
 
             socket.emit('reconnectedToTable', {
               tableId: reserved.tableId,
@@ -6344,25 +6368,19 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
             handsRemaining: DISCONNECT_HANDS_LIMIT,
           });
 
-          // Mark player as sitting out while disconnected (auto-folds
-          // their turn). DELAYED add-to-tracker: a brief socket blip
-          // (PWA backgrounding, WiFi handoff, iOS suspend) was flagging
-          // the user as sitting-out, and every subsequent hand's
-          // markSittingOutBlinds charged them dead-blind debt even
-          // though they never intentionally sat out. Now we wait 20s
-          // before adding to the tracker. The callback re-checks
-          // reservedSeats.has(userId) — reconnect paths clear that Map
-          // entry, so if the user came back inside 20s the timer fires
-          // harmlessly and nothing is flagged.
-          session.sittingOut = true;
-          setTimeout(() => {
-            if (!reservedSeats.has(authSession.userId)) return; // reconnected already
-            if (!sitOutTracker.has(session.tableId)) sitOutTracker.set(session.tableId, new Set());
-            sitOutTracker.get(session.tableId)!.add(session.seatIndex);
-            syncSitOutToTable(session.tableId);
-          }, 20_000);
+          // Auto-fold if it's their turn right now. That's the ONLY
+          // behavior we need on disconnect. Previously we ALSO flagged
+          // the seat as sitting-out after a 20s timer so future hands'
+          // markSittingOutBlinds would charge dead-blind debt — but
+          // PWA backgrounding / WiFi handoff / iOS suspend triggered
+          // that timer on users who never actually sat out, leading to
+          // a recurring "missed blinds" popup. The `reservedSeats`
+          // mechanism + turn-auto-fold already handle the disconnect
+          // case cleanly; there's no reason to double-flag with the
+          // sit-out tracker. If the user really wants to sit out,
+          // they'll tap the explicit Sit Out button.
+          session.sittingOut = false;
 
-          // Auto-fold if it's their turn right now
           if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
             table.playerFold(session.seatIndex);
             broadcastGameState(session.tableId);
@@ -6399,6 +6417,21 @@ function handlePlayerLeave(socket: Socket): void {
     ) {
       table.playerFold(session.seatIndex);
     }
+
+    // Clear sit-out tracker + any dead-blind debt on the vacated seat
+    // before standing up. Without this, the NEXT occupant of this seat
+    // index inherits stale missed-blind state — the exact "first hand
+    // I sit down, missed blinds popup" bug. syncSitOutToTable below
+    // has a defensive filter too, but clearing explicitly here means
+    // the tracker never even briefly contains a stale seat index.
+    const tracker = sitOutTracker.get(session.tableId);
+    if (tracker) tracker.delete(session.seatIndex);
+    const leavingSeat = table.seats[session.seatIndex];
+    if (leavingSeat) {
+      leavingSeat.deadBlindOwedChips = 0;
+      leavingSeat.missedBlind = 'none';
+    }
+    syncSitOutToTable(session.tableId);
 
     table.standUp(session.seatIndex);
 

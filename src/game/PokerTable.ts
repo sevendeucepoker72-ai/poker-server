@@ -232,6 +232,15 @@ export class PokerTable extends EventEmitter {
     seat.eliminated = false;
     seat.folded = false;
     seat.allIn = false;
+    // A brand-new player at this seat must not inherit any missed-blind
+    // state from the previous occupant. Without this reset, a seat
+    // vacated by a sitting-out player would charge the next occupant
+    // dead-blind debt on their first hand.
+    seat.missedBlind = 'none';
+    seat.deadBlindOwedChips = 0;
+    // Also drop the seat from the sitting-out set if it was still in
+    // there — the new occupant is not sitting out.
+    this._sittingOutSeats.delete(seatIndex);
 
     this.emit('playerSatDown', { seatIndex, playerName, buyIn, isAI });
     return true;
@@ -243,6 +252,10 @@ export class PokerTable extends EventEmitter {
 
     const playerName = this.seats[seatIndex].playerName;
     this.seats[seatIndex] = createEmptySeat(seatIndex);
+    // Defensively drop from the sitting-out set so a new occupant of
+    // this index inherits a clean slate — belt-and-suspenders on top
+    // of handlePlayerLeave's server-side cleanup.
+    this._sittingOutSeats.delete(seatIndex);
 
     this.emit('playerStoodUp', { seatIndex, playerName });
     return true;
