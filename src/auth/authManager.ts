@@ -419,13 +419,21 @@ export async function getUserFromToken(token: string): Promise<AuthResult> {
   }
 }
 
-export async function saveProgress(userId: number, data: { chips?: number; level?: number; xp?: number; stats?: Record<string, any>; achievements?: string[] }): Promise<boolean> {
+export async function saveProgress(userId: number, data: { level?: number; xp?: number; stats?: Record<string, any>; achievements?: string[] }): Promise<boolean> {
   try {
     const sets: string[] = [];
     const vals: any[] = [];
     let idx = 1;
-    // Chips CAN decrease (losses); write plainly.
-    if (data.chips !== undefined) { sets.push(`chips = $${idx++}`); vals.push(data.chips); }
+    // SECURITY: `chips` is intentionally NOT in the accepted shape.
+    // All chip mutations must flow through server-authoritative paths:
+    //   - pot distribution (hand-complete)
+    //   - addChipsToUser / deductChips (buy-in, rebuy, shop, daily rewards)
+    //   - adminGrantChips (audited admin flow)
+    // A client that sends chips here would have had its value written raw
+    // before 2026-04-22. The socket handler strips chips before calling,
+    // but this function also refuses at the DB boundary as defense-in-depth
+    // — if any future caller passes `chips`, TypeScript rejects it and
+    // runtime-strict destructuring below ignores it.
     // Level can ONLY go up — use GREATEST so a race-condition save
     // (in-memory fresh-init level 1 overwriting DB level 9) is rejected
     // at the database layer. This is the third-layer safety net on top of
@@ -488,9 +496,27 @@ export async function isUserAdmin(userId: number): Promise<boolean> {
   return rows[0]?.is_admin === true;
 }
 
+// Character whitelist for display names. Intentionally strict:
+//   letters (Unicode, so "João" / "Владимир" / "美琪" are fine),
+//   digits, spaces, hyphen, underscore, period, apostrophe.
+// No angle brackets, quotes, semicolons, backticks, HTML entities — those
+// have been the XSS/injection vectors in the wild when names get echoed
+// back unescaped (chat lines, leaderboard, hand history, etc.).
+// `u` flag enables \p{L}/\p{N}; `v` would be newer, but Node runtimes we
+// target don't all support it.
+const DISPLAY_NAME_RE = /^[\p{L}\p{N} _.'-]+$/u;
+
 export async function setDisplayName(userId: number, name: string): Promise<{ success: boolean; error?: string }> {
   const trimmed = (name || '').trim();
   if (trimmed.length < 2 || trimmed.length > 20) return { success: false, error: 'Name must be 2-20 characters' };
+  if (!DISPLAY_NAME_RE.test(trimmed)) {
+    return { success: false, error: 'Name can only contain letters, numbers, spaces, and _ . - \'' };
+  }
+  // Reject all-whitespace / all-punctuation names (would pass the regex
+  // but look blank when rendered). Require at least one letter OR digit.
+  if (!/[\p{L}\p{N}]/u.test(trimmed)) {
+    return { success: false, error: 'Name must contain at least one letter or number' };
+  }
   // Check if name is already taken by another user
   const existing = await pool.query('SELECT id FROM users WHERE LOWER(display_name) = LOWER($1) AND id != $2', [trimmed, userId]);
   if (existing.rows.length > 0) return { success: false, error: 'Name already taken' };

@@ -548,6 +548,34 @@ app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', tables: tableManager.getTableList().length });
 });
 
+// ========== Provably-fair shuffle verification ==========
+// Before each hand the server emits the SHA-256 hash of the seed. After the
+// hand ends the seed itself is revealed. These endpoints let a client (or
+// any 3rd party) verify the hash committed pre-hand matches the seed
+// revealed post-hand — i.e. the server didn't swap decks mid-hand.
+
+app.get('/api/fairness/:tableId', (req, res) => {
+  const buf = revealedCommitmentsByTable.get(req.params.tableId) || [];
+  res.json({ tableId: req.params.tableId, commitments: buf });
+});
+
+app.get('/api/fairness/:tableId/:handNumber', (req, res) => {
+  const handNumber = Number(req.params.handNumber);
+  const buf = revealedCommitmentsByTable.get(req.params.tableId) || [];
+  const rc = buf.find((r) => r.handNumber === handNumber);
+  if (!rc) { res.status(404).json({ error: 'no revealed commitment for that hand' }); return; }
+  const computed = require('crypto').createHash('sha256').update(rc.seed).digest('hex');
+  res.json({
+    tableId: req.params.tableId,
+    handNumber: rc.handNumber,
+    seed: rc.seed,
+    hash: rc.hash,
+    computedHash: computed,
+    verified: computed === rc.hash,
+    revealedAt: rc.revealedAt,
+  });
+});
+
 // ========== Qualifier Integration ==========
 // Qualified players are fetched from the master API (americanpub.poker) and
 // cached in memory. The frontend checks qualification status on login.
@@ -1228,6 +1256,25 @@ function broadcastGameState(tableId: string): void {
 // Track which tables already have handResult listeners
 const tableProgressListeners = new Set<string>();
 
+// Rolling buffer of revealed deck commitments per table, newest-first.
+// Capped so memory stays bounded on long-lived tables. Used by the
+// /api/fairness/* endpoints so players can verify the shuffle after a hand.
+interface RevealedCommitment {
+  handNumber: number;
+  seed: string;
+  hash: string;
+  revealedAt: number;
+}
+const revealedCommitmentsByTable = new Map<string, RevealedCommitment[]>();
+const FAIRNESS_BUFFER_SIZE = 50;
+
+function recordRevealedCommitment(tableId: string, rc: RevealedCommitment) {
+  let buf = revealedCommitmentsByTable.get(tableId);
+  if (!buf) { buf = []; revealedCommitmentsByTable.set(tableId, buf); }
+  buf.unshift(rc);
+  if (buf.length > FAIRNESS_BUFFER_SIZE) buf.length = FAIRNESS_BUFFER_SIZE;
+}
+
 function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   if (tableProgressListeners.has(tableId)) return;
   tableProgressListeners.add(tableId);
@@ -1276,6 +1323,12 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         }
       }
     }
+  });
+
+  // Capture revealed deck seeds into the fairness buffer so /api/fairness/*
+  // can serve them back to clients for provably-fair verification.
+  table.on('deckSeedRevealed', (c: { seed: string; hash: string; handNumber: number }) => {
+    recordRevealedCommitment(tableId, { ...c, revealedAt: Date.now() });
   });
 
   // Emit hand history to all human players at the table (Part 3)
