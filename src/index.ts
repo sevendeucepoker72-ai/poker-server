@@ -1935,29 +1935,42 @@ setInterval(() => {
 
       const seatStuck = now - prior.seatSince;
       const potPhaseStuck = now - prior.potPhaseSince;
-      // Classic wedge: same seat active > 45s. Oscillation wedge: pot+phase
-      // unchanged > 60s even if the ring is cycling. Both recover the same
-      // way (force-advance the current active seat).
-      const isWedged = seatStuck >= 45000 || potPhaseStuck >= 60000;
+      // Tightened 2026-04-22 after user observed repeated check-check loops.
+      // Was 45s/60s — halved to 20s/25s so the user-visible stall caps at
+      // ~25s instead of 60s. If the root bug keeps re-wedging after recovery
+      // we want to recover faster between wedges so play still feels
+      // continuous.
+      const isWedged = seatStuck >= 20000 || potPhaseStuck >= 25000;
 
       if (isWedged) {
-        const reason = seatStuck >= 45000
+        const reason = seatStuck >= 20000
           ? `stuck on seat ${activeSeat} for ${seatStuck}ms`
           : `pot+phase unchanged ${potPhaseStuck}ms (oscillating seat ${activeSeat})`;
         console.warn(`[WedgeWatchdog] Table ${t.tableId} ${reason} — forcing advance`);
         try {
           const seat = table.seats[activeSeat];
-          if (seat && seat.state === 'occupied') {
+          // Diagnostic: dump what the stuck state looks like so we can
+          // trace the root cause. Logged once per wedge fire.
+          const diag = table.seats.slice(0, 9).map((s, i) => {
+            if (s.state !== 'occupied') return `${i}:-`;
+            return `${i}:${s.folded?'F':''}${s.allIn?'A':''}cb=${s.currentBet || 0}h=${s.hasActedSinceLastFullRaise?'1':'0'}${s.holeCards.length === 0 ? 'nc' : ''}`;
+          }).join(' ');
+          console.warn(`[WedgeWatchdog] diag phase=${table.currentPhase} b2m=${table.currentBetToMatch} active=${activeSeat} | ${diag}`);
+
+          let forced = false;
+          if (seat && seat.state === 'occupied' && !seat.folded && !seat.allIn) {
             const callAmt = table.currentBetToMatch - (seat.currentBet || 0);
-            if (callAmt > 0) table.playerFold(activeSeat);
-            else table.playerCheck(activeSeat);
-            broadcastGameState(t.tableId);
-            scheduleAIAction(t.tableId);
+            if (callAmt > 0) forced = table.playerFold(activeSeat);
+            else forced = table.playerCheck(activeSeat);
+            if (!forced) {
+              console.warn(`[WedgeWatchdog] playerCheck/Fold returned false for seat ${activeSeat} — advanceTurn fallback`);
+              (table as any).advanceTurn?.();
+            }
           } else {
             (table as any).advanceTurn?.();
-            broadcastGameState(t.tableId);
-            scheduleAIAction(t.tableId);
           }
+          broadcastGameState(t.tableId);
+          scheduleAIAction(t.tableId);
           wedgeWatchdog.delete(t.tableId);
         } catch (err) {
           console.error(`[WedgeWatchdog] recovery failed for ${t.tableId}:`, (err as Error).message);
