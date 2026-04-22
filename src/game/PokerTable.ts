@@ -1667,6 +1667,14 @@ export class PokerTable extends EventEmitter {
   }
 
   getNextPlayingSeat(from: number): number {
+    // Two-pass lookup (mirrors getNextActiveSeat). Strict first: chipCount > 0
+    // AND holeCards dealt. Fallback to loose so if the deal hasn't completed
+    // yet OR hole cards got cleared on an intermediate street, we still find
+    // a playing seat. Without the fallback, the table wedges because
+    // setFirstActivePlayer (post-flop) assigns activeSeatIndex = -1 and no
+    // one can act. 2026-04-22 audit observation: oscillating active-seat
+    // ring across the preflop→flop boundary, suggesting this was returning
+    // -1 transiently during the phase flip.
     for (let i = 0; i < MAX_SEATS; i++) {
       const idx = (from + i) % MAX_SEATS;
       const seat = this.seats[idx];
@@ -1676,6 +1684,18 @@ export class PokerTable extends EventEmitter {
         !seat.eliminated &&
         seat.chipCount > 0 &&
         seat.holeCards.length > 0
+      ) {
+        return idx;
+      }
+    }
+    // Loose fallback — preserves pre-d91ca29 behaviour
+    for (let i = 0; i < MAX_SEATS; i++) {
+      const idx = (from + i) % MAX_SEATS;
+      const seat = this.seats[idx];
+      if (
+        seat.state === 'occupied' &&
+        !seat.folded &&
+        !seat.eliminated
       ) {
         return idx;
       }

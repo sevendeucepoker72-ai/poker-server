@@ -1878,7 +1878,19 @@ setInterval(() => {
 // bail on line 1150 kicked out silently). This watchdog is a
 // belt-and-suspenders safety net — the real fix goes in PokerTable's
 // phase-advance logic, but meanwhile this keeps tables playable.
-const wedgeWatchdog = new Map<string, { lastSeat: number; since: number }>();
+// Tracks both classic wedges (active seat unchanged for 45s) AND
+// oscillation wedges (active seat changes but pot/phase don't, meaning
+// isBettingRoundComplete() is failing in a loop). Oscillation was
+// observed 2026-04-22 during a playtest: the active-seat ring kept
+// bouncing between Max (SB) and Knox (BB) for 60+ seconds without pot
+// or phase changing. The original stuck-seat check missed it.
+const wedgeWatchdog = new Map<string, {
+  lastSeat: number;
+  seatSince: number;
+  lastPot: number;
+  lastPhase: string;
+  potPhaseSince: number;
+}>();
 setInterval(() => {
   try {
     const now = Date.now();
@@ -1891,14 +1903,42 @@ setInterval(() => {
         continue;
       }
       const activeSeat = table.activeSeatIndex;
+      const pot = table.pot || 0;
+      const phase = String(table.currentPhase);
       const prior = wedgeWatchdog.get(t.tableId);
-      if (!prior || prior.lastSeat !== activeSeat) {
-        wedgeWatchdog.set(t.tableId, { lastSeat: activeSeat, since: now });
+
+      if (!prior) {
+        wedgeWatchdog.set(t.tableId, {
+          lastSeat: activeSeat, seatSince: now,
+          lastPot: pot, lastPhase: phase, potPhaseSince: now,
+        });
         continue;
       }
-      const stuckFor = now - prior.since;
-      if (stuckFor >= 45000) {
-        console.warn(`[WedgeWatchdog] Table ${t.tableId} stuck on seat ${activeSeat} for ${stuckFor}ms — forcing advance`);
+
+      // Seat tracking — reset timer if seat changed
+      if (prior.lastSeat !== activeSeat) {
+        prior.lastSeat = activeSeat;
+        prior.seatSince = now;
+      }
+      // Pot/phase tracking — reset timer if either moved (normal progress)
+      if (prior.lastPot !== pot || prior.lastPhase !== phase) {
+        prior.lastPot = pot;
+        prior.lastPhase = phase;
+        prior.potPhaseSince = now;
+      }
+
+      const seatStuck = now - prior.seatSince;
+      const potPhaseStuck = now - prior.potPhaseSince;
+      // Classic wedge: same seat active > 45s. Oscillation wedge: pot+phase
+      // unchanged > 60s even if the ring is cycling. Both recover the same
+      // way (force-advance the current active seat).
+      const isWedged = seatStuck >= 45000 || potPhaseStuck >= 60000;
+
+      if (isWedged) {
+        const reason = seatStuck >= 45000
+          ? `stuck on seat ${activeSeat} for ${seatStuck}ms`
+          : `pot+phase unchanged ${potPhaseStuck}ms (oscillating seat ${activeSeat})`;
+        console.warn(`[WedgeWatchdog] Table ${t.tableId} ${reason} — forcing advance`);
         try {
           const seat = table.seats[activeSeat];
           if (seat && seat.state === 'occupied') {
@@ -1908,7 +1948,6 @@ setInterval(() => {
             broadcastGameState(t.tableId);
             scheduleAIAction(t.tableId);
           } else {
-            // Active seat is invalid entirely — advance the turn manually
             (table as any).advanceTurn?.();
             broadcastGameState(t.tableId);
             scheduleAIAction(t.tableId);
