@@ -1684,13 +1684,24 @@ export class PokerTable extends EventEmitter {
   }
 
   getNextActiveSeat(from: number): number {
-    // Skip seats that have no ability to act:
-    //   - folded / all-in / eliminated (historically handled)
-    //   - chipCount <= 0 (busted mid-hand, pending auto-rebuy, etc.)
-    //   - no hole cards (joined mid-hand, not dealt this round)
-    // A chip-less or card-less seat getting assigned as active would
-    // just burn the 30s turn timer and auto-fold — frustrating and
-    // pointless. Silently skip them instead.
+    // Two-pass lookup. Pass 1 applies the *strict* filter: folded/all-in/
+    // eliminated excluded AND seat must have chips AND hole cards. Pass 2
+    // falls back to the *loose* filter (original behaviour: just
+    // occupied+non-folded+non-all-in+non-eliminated) if the strict pass
+    // yields nothing.
+    //
+    // Why the fallback matters: the strict filter was added 2026-04-21 to
+    // skip chipless/cardless seats. But on a table where EVERY
+    // qualifying seat happens to have holeCards.length === 0 at the
+    // moment this runs (e.g. mid-deal, pre-deal PreFlop phase, or a
+    // corrupted state where only the active seat has cards), returning
+    // -1 wedges the table entirely — no turn ever advances, no timer
+    // ever fires the fold-fallback, and the hand sits frozen until a
+    // manual intervention. Fallback keeps the game moving at the cost
+    // of occasionally assigning a seat that will auto-fold on timeout
+    // (the old behaviour). Better to burn one 30s timer than freeze
+    // the whole table indefinitely. Fixed 2026-04-22 after live
+    // gameplay audit observed a frozen Beginner's Table.
     for (let i = 0; i < MAX_SEATS; i++) {
       const idx = (from + i) % MAX_SEATS;
       const seat = this.seats[idx];
@@ -1701,6 +1712,19 @@ export class PokerTable extends EventEmitter {
         !seat.eliminated &&
         seat.chipCount > 0 &&
         seat.holeCards.length > 0
+      ) {
+        return idx;
+      }
+    }
+    // Loose fallback — returns -1 only if truly no one can act.
+    for (let i = 0; i < MAX_SEATS; i++) {
+      const idx = (from + i) % MAX_SEATS;
+      const seat = this.seats[idx];
+      if (
+        seat.state === 'occupied' &&
+        !seat.folded &&
+        !seat.allIn &&
+        !seat.eliminated
       ) {
         return idx;
       }
