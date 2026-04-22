@@ -1521,7 +1521,7 @@ function executeAIAction(
       const t = setTimeout(() => {
         pendingAutoStartTimers.delete(tableId);
         autoStartNextHand(tableId);
-      }, 3000);
+      }, 1500);
       pendingAutoStartTimers.set(tableId, t);
     } else {
       // Schedule next AI action if needed
