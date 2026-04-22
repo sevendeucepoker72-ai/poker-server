@@ -1433,9 +1433,12 @@ function scheduleAIAction(tableId: string): void {
 
   const isFastMode = fastModeTables.get(tableId) || false;
   // Normalize AI response window to a fixed range so timing doesn't leak hand strength.
-  // Internally compute the "natural" delay but clamp to [800, 1200]ms (or 300ms in fast mode).
+  // Tightened 2026-04-22 — previous [800,1200] felt like "a full turn timer" on tables
+  // with 6+ AI seats (6 AIs × 1s = 6s of idle time between hero actions). New range
+  // [250, 550] keeps just enough variance to look non-robotic without making the user
+  // wait on the bots.
   const naturalDelay = getThinkingDelay(profile.difficulty);
-  const delay = isFastMode ? 300 : Math.min(1200, Math.max(800, naturalDelay));
+  const delay = isFastMode ? 150 : Math.min(550, Math.max(250, naturalDelay));
   // console.log(`[AI] Scheduling ${seat.playerName} (seat ${activeSeat}) in ${delay}ms${isFastMode ? ' (fast mode)' : ''}`);
 
   const handle = setTimeout(() => {
