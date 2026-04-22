@@ -1265,11 +1265,18 @@ function postFlopStrategy(
 // ============================================================
 
 export function getThinkingDelay(difficulty: Difficulty): number {
+  // Natural human-like variance per difficulty. Ranges overlap so two bots
+  // of the same difficulty don't feel lockstep; higher-difficulty bots lean
+  // longer without being grindingly slow. Max is ~2.35s (turn clock is 30s,
+  // so bots will NEVER burn the whole timer). Min is ~250-650ms so the
+  // fastest bot still has "a beat of thought" — acting in <100ms feels
+  // robotic. Rebalanced 2026-04-22 after audit feedback: "AI shouldn't
+  // look like AI, but should never take the entire turn clock."
   switch (difficulty) {
-    case 'easy':   return 600 + Math.floor(Math.random() * 800);
-    case 'medium': return 1000 + Math.floor(Math.random() * 1000);
-    case 'hard':   return 1200 + Math.floor(Math.random() * 1200);
-    case 'expert': return 1500 + Math.floor(Math.random() * 1500);
+    case 'easy':   return 250 + Math.floor(Math.random() * 750);   // 250-1000ms
+    case 'medium': return 400 + Math.floor(Math.random() * 1000);  // 400-1400ms
+    case 'hard':   return 550 + Math.floor(Math.random() * 1350);  // 550-1900ms
+    case 'expert': return 650 + Math.floor(Math.random() * 1700);  // 650-2350ms
   }
 }
 
