@@ -1415,8 +1415,31 @@ function scheduleAIAction(tableId: string): void {
   const profiles = aiProfiles.get(tableId);
   if (!profiles) { console.log('[AI] No profiles found'); return; }
 
-  const profile = profiles.get(activeSeat);
-  if (!profile) { return; }
+  let profile = profiles.get(activeSeat);
+  if (!profile) {
+    // AI seat with no profile = silent dead-lock. Log + attempt recovery:
+    // synthesize a default medium profile so the turn still progresses
+    // instead of waiting 20s for the wedge watchdog. Root cause is
+    // elsewhere (profile deleted mid-hand? AI re-seated without
+    // re-profile?) but this keeps play flowing.
+    const seat = table.seats[activeSeat];
+    if (seat?.isAI) {
+      console.warn(`[AI] Missing profile for seat ${activeSeat} (${seat.playerName}) on ${tableId} — synthesizing default`);
+      profile = {
+        botName: seat.playerName || `AI${activeSeat}`,
+        difficulty: 'medium',
+        personality: 'tight',
+        archetype: 'TAG',
+        vpip: 22,
+        pfr: 17,
+        aggressionFactor: 2.5,
+        bluffFrequency: 0.15,
+      } as AIPlayerProfile;
+      profiles.set(activeSeat, profile);
+    } else {
+      return;
+    }
+  }
 
   // CRITICAL: don't reschedule if there's already a pending action for the
   // same seat. Otherwise repeated broadcastGameState → scheduleAIAction calls
