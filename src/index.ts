@@ -44,7 +44,7 @@ import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, loadDurableProgress } from './auth/authManager';
+import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, loadDurableProgress } from './auth/authManager';
 import { validateOAuthToken } from './auth/oauthValidator';
 import {
   initClubTables,
@@ -1141,12 +1141,16 @@ function broadcastGameState(tableId: string): void {
     }
   }
 
-  // Also broadcast to any spectators in the room
+  // Also broadcast to any spectators in the room.
+  // Guard activeSeatIndex: when no hand is in progress PokerTable leaves it
+  // at -1, which spectator clients can mis-use as an array index. Emit null
+  // in that case — client code that checks `typeof activeSeatIndex === 'number'`
+  // or `activeSeatIndex >= 0` both handle the nullish case correctly.
   io.to(`table:${tableId}`).emit('tableUpdate', {
     tableId,
     phase: table.currentPhase,
     pot: table.getTotalPot(),
-    activeSeatIndex: table.activeSeatIndex,
+    activeSeatIndex: table.activeSeatIndex < 0 ? null : table.activeSeatIndex,
     communityCards: table.communityCards.map((c) => ({
       suit: c.suit,
       rank: c.rank,
@@ -2980,7 +2984,17 @@ Give feedback in this JSON format:
       });
       const text = message.content[0].type === 'text' ? message.content[0].text : '';
       const jsonMatch = text.match(/\{[\s\S]*\}/);
-      const result = jsonMatch ? JSON.parse(jsonMatch[0]) : { score: 5, summary: text, decisions: [], keyLesson: '' };
+      let result: any;
+      if (jsonMatch) {
+        try {
+          result = JSON.parse(jsonMatch[0]);
+        } catch (parseErr) {
+          socket.emit('coachResult', { error: 'parse_failed' });
+          return;
+        }
+      } else {
+        result = { score: 5, summary: text, decisions: [], keyLesson: '' };
+      }
       socket.emit('coachResult', { success: true, analysis: result });
     } catch (err: any) {
       socket.emit('coachResult', { error: err.message || 'Coach error' });
@@ -4712,9 +4726,14 @@ Give feedback in this JSON format:
       // Chip pack: spend stars → credit chips. No inventory row.
       if (itemType === 'chip_pack') {
         const payout = CHIP_PACK_PAYOUT[itemId] || 0;
+        const ok = await deductStars(ctx.userId, cost);
+        if (!ok) {
+          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_chip_pack' });
+          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
+          return;
+        }
         progress.stars -= cost;
         progress.chips += payout;
-        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
         await addChipsToUser(ctx.userId, payout);
         socket.emit('purchaseResult', { success: true, itemType, itemId, cost, payout });
         sendProgressToPlayer(socket.id);
@@ -4724,8 +4743,13 @@ Give feedback in this JSON format:
       // Mystery box: spend stars → roll a random reward (chips / stars
       // refund / cosmetic). Tier determines loot quality.
       if (itemType === 'mystery_box') {
+        const ok = await deductStars(ctx.userId, cost);
+        if (!ok) {
+          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_mystery_box' });
+          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
+          return;
+        }
         progress.stars -= cost;
-        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
 
         const tierTable: Record<string, { chips: [number, number]; stars: [number, number]; itemPool?: Array<{ type: string; id: string }> }> = {
           basic: {
@@ -4762,8 +4786,11 @@ Give feedback in this JSON format:
         } else if (roll < 0.8) {
           // 30% stars refund
           const amt = Math.floor(tier.stars[0] + Math.random() * (tier.stars[1] - tier.stars[0]));
+          const ok = await addStarsToUser(ctx.userId, amt);
+          if (!ok) {
+            auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: amt, path: 'shop_mystery_box_refund' });
+          }
           progress.stars += amt;
-          dbPersistStars(ctx.userId, progress.stars).catch(() => {});
           payload = { kind: 'stars', amount: amt };
         } else if (tier.itemPool && tier.itemPool.length > 0) {
           // 20% cosmetic item
@@ -4776,8 +4803,11 @@ Give feedback in this JSON format:
           } else {
             // Duplicate — refund equivalent stars.
             const refund = Math.floor(cost * 0.4);
+            const ok = await addStarsToUser(ctx.userId, refund);
+            if (!ok) {
+              auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: refund, path: 'shop_mystery_box_dup_refund' });
+            }
             progress.stars += refund;
-            dbPersistStars(ctx.userId, progress.stars).catch(() => {});
             payload = { kind: 'stars', amount: refund, reason: 'duplicate_refund' };
           }
         } else {
@@ -4797,6 +4827,12 @@ Give feedback in this JSON format:
           socket.emit('purchaseResult', { success: false, error: 'Unknown bundle' });
           return;
         }
+        const deducted = await deductStars(ctx.userId, cost);
+        if (!deducted) {
+          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_bundle' });
+          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
+          return;
+        }
         progress.stars -= cost;
         const grantedItems: Array<[string, string]> = [];
         let duplicates = 0;
@@ -4808,9 +4844,14 @@ Give feedback in this JSON format:
         // Refund 25% of bundle cost per duplicate, averaged over item count.
         if (duplicates > 0) {
           const refund = Math.floor((cost * 0.25 * duplicates) / contents.length);
+          if (refund > 0) {
+            const refunded = await addStarsToUser(ctx.userId, refund);
+            if (!refunded) {
+              auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: refund, path: 'shop_bundle_dup_refund' });
+            }
+          }
           progress.stars += refund;
         }
-        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
         socket.emit('purchaseResult', {
           success: true, itemType, itemId, cost,
           bundleGranted: grantedItems, bundleDuplicates: duplicates,
@@ -4831,8 +4872,13 @@ Give feedback in this JSON format:
           socket.emit('purchaseResult', { success: false, error: 'Unknown booster' });
           return;
         }
+        const ok = await deductStars(ctx.userId, cost);
+        if (!ok) {
+          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_booster' });
+          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
+          return;
+        }
         progress.stars -= cost;
-        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
         const expiresAt = Date.now() + b.ms;
         (progress as any).activeBoosters = (progress as any).activeBoosters || {};
         (progress as any).activeBoosters[b.kind] = { mult: b.mult, expiresAt };
@@ -4851,8 +4897,13 @@ Give feedback in this JSON format:
           socket.emit('purchaseResult', { success: false, error: 'Unknown VIP pass' });
           return;
         }
+        const ok = await deductStars(ctx.userId, cost);
+        if (!ok) {
+          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_vip_pass' });
+          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
+          return;
+        }
         progress.stars -= cost;
-        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
         const current = (progress as any).vipExpiresAt || 0;
         const base = Math.max(Date.now(), current);
         (progress as any).vipExpiresAt = base + ms;
@@ -4870,8 +4921,13 @@ Give feedback in this JSON format:
         socket.emit('purchaseResult', { success: false, error: 'Already owned' });
         return;
       }
+      const ok = await deductStars(ctx.userId, cost);
+      if (!ok) {
+        auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_cosmetic' });
+        socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
+        return;
+      }
       progress.stars -= cost;
-      dbPersistStars(ctx.userId, progress.stars).catch(() => {});
       socket.emit('purchaseResult', { success: true, itemType, itemId, cost });
       // Push updated inventory snapshot too
       const inv = await loadInventory(ctx.userId);
@@ -4945,7 +5001,12 @@ Give feedback in this JSON format:
       progress.dailyLoginStreak = newStreak;
 
       if (chips > 0) await addChipsToUser(ctx.userId, chips);
-      dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+      if (stars > 0) {
+        const ok = await addStarsToUser(ctx.userId, stars);
+        if (!ok) {
+          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: stars, path: 'daily_login' });
+        }
+      }
       await updateLoginStreak(ctx.userId, newStreak);
       await recordDailyClaim(ctx.userId, 'login', { day, chips, stars });
 
@@ -4980,7 +5041,12 @@ Give feedback in this JSON format:
       progress.chips += reward.chips;
       progress.stars += reward.stars;
       if (reward.chips > 0) await addChipsToUser(ctx.userId, reward.chips);
-      if (reward.stars > 0) dbPersistStars(ctx.userId, progress.stars).catch(() => {});
+      if (reward.stars > 0) {
+        const ok = await addStarsToUser(ctx.userId, reward.stars);
+        if (!ok) {
+          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: reward.stars, path: 'daily_spin' });
+        }
+      }
       await recordDailyClaim(ctx.userId, 'spin', reward);
 
       socket.emit('dailySpinClaimed', { success: true, reward });
@@ -5026,8 +5092,11 @@ Give feedback in this JSON format:
         await addChipsToUser(ctx.userId, reward.chips);
       }
       if (reward.stars) {
+        const ok = await addStarsToUser(ctx.userId, reward.stars);
+        if (!ok) {
+          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: reward.stars, path: 'scratch_card' });
+        }
         progress.stars += reward.stars;
-        dbPersistStars(ctx.userId, progress.stars).catch(() => {});
       }
 
       socket.emit('scratchCardRevealed', { success: true, reward });

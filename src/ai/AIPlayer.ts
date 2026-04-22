@@ -360,6 +360,10 @@ function getImpliedOdds(
   const cardsTocome = phase === GamePhase.Flop ? 2 : phase === GamePhase.Turn ? 1 : 0;
   if (cardsTocome === 0) return 0;
 
+  // Guard against zero / negative inputs which would produce NaN / Infinity
+  // and poison effectiveStrength downstream.
+  if (effectiveStack <= 0 || potSize <= 0) return 0;
+
   // Stack-to-pot ratio: deep stacks = more implied odds
   const spr = effectiveStack / Math.max(potSize, 1);
 
@@ -369,7 +373,10 @@ function getImpliedOdds(
   // Adjust by SPR: deep stacks make draws more valuable
   const sprBonus = Math.min(0.15, spr * 0.01);
 
-  return drawEquity + sprBonus;
+  const value = drawEquity + sprBonus;
+  if (!isFinite(value)) return 0;
+  // Clamp to [0, 0.5] so a malformed draw can never poison effectiveStrength.
+  return Math.max(0, Math.min(0.5, value));
 }
 
 // ============================================================
@@ -665,19 +672,27 @@ export function decideAction(
   const relativePosition = totalActive > 1 ? myPosition / (totalActive - 1) : 0.5;
   const positionMult = 0.88 + relativePosition * 0.24; // 0.88 EP to 1.12 LP
   handStrength *= positionMult;
+  if (!isFinite(handStrength)) handStrength = 0.3;
 
   // Difficulty-based noise (expert has almost none)
   const noiseMap: Record<Difficulty, number> = {
     easy: 0.25, medium: 0.12, hard: 0.05, expert: 0.02
   };
-  const noise = (Math.random() - 0.5) * noiseMap[profile.difficulty];
+  const rawNoise = (Math.random() - 0.5) * noiseMap[profile.difficulty];
+  const noise = isFinite(rawNoise) ? rawNoise : 0;
   handStrength = Math.min(1.0, Math.max(0.0, handStrength + noise));
 
   // Outs and implied odds for draw decisions
   const outs = isPreFlop ? 0 : countOuts(seat.holeCards, table.communityCards);
-  const impliedOdds = isPreFlop ? 0 : getImpliedOdds(
+  const rawImplied = isPreFlop ? 0 : getImpliedOdds(
     handStrength, outs, totalPot, seat.chipCount, table.currentPhase
   );
+  const impliedOdds = isFinite(rawImplied) ? rawImplied : 0;
+
+  // Final NaN/Infinity guard — any upstream division or multiplication
+  // that leaks a non-finite value here would otherwise poison every
+  // comparison in the strategy blocks below.
+  handStrength = isFinite(handStrength) ? Math.max(0, Math.min(1, handStrength)) : 0.3;
 
   // Adjust hand strength with implied odds for drawing hands
   const effectiveStrength = handStrength + impliedOdds;

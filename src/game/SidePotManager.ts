@@ -56,7 +56,7 @@ export class SidePotManager {
    * action). Folded players contribute their chips to whichever tier their
    * total investment falls into, but never create a new tier themselves.
    */
-  calculatePots(seats: SeatInfo[]): Pot[] {
+  calculatePots(seats: SeatInfo[], dealerSeat?: number): Pot[] {
     const investedSeats = seats.filter(
       s => s.state === 'occupied' && s.totalInvestedThisHand > 0
     );
@@ -110,12 +110,24 @@ export class SidePotManager {
       }
 
       // If no one is eligible (all contributors folded), award the dead money
-      // to ALL non-folded players still in the hand — they inherit it.
+      // to the non-folded players still in the hand — they inherit it.
+      // TDA Rule 43: orphan / odd chip goes clockwise from dealer. Order the
+      // candidates clockwise so a single effectively-eligible player gets the
+      // pot outright, and multi-candidate inheritance lists are consistently
+      // ordered for downstream split math.
       if (potAmount > 0 && eligible.length === 0) {
         const nonFoldedInHand = investedSeats
           .filter(s => !s.folded)
           .map(s => s.seatIndex);
-        eligible.push(...nonFoldedInHand);
+        const ordered = dealerSeat !== undefined
+          ? SidePotManager.orderClockwiseFromDealer(nonFoldedInHand, dealerSeat, TABLE_SEAT_COUNT)
+          : nonFoldedInHand;
+        if (ordered.length === 1) {
+          // Single effectively-eligible player — they get the orphan pot.
+          eligible.push(ordered[0]);
+        } else {
+          eligible.push(...ordered);
+        }
       }
 
       if (potAmount > 0) {
@@ -183,7 +195,7 @@ export class SidePotManager {
   ): AwardPotsResult {
     const winnings = new Map<number, number>();
     const perPot: PotWinResult[] = [];
-    const pots = this.calculatePots(seats);
+    const pots = this.calculatePots(seats, dealerSeat);
 
     // Use provided evaluator or default to standard evaluateHand
     const evalFn = evaluator || ((hole: Card[], community: Card[]): HandResult => {

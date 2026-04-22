@@ -2,6 +2,8 @@ node_modules/
 dist/
 data/*.db
 .env
+.env.production
+.env.production.local
 
 # Never commit FTP / deploy credentials
 .ftp-credentials
