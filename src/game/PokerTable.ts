@@ -1775,4 +1775,132 @@ export class PokerTable extends EventEmitter {
       this.currentPhase !== GamePhase.HandComplete
     );
   }
+
+  /**
+   * Snapshot enough state that a restarted server can rehydrate this
+   * table in the middle of a hand. Only the CORE base-class fields are
+   * captured — variant-specific subclasses (Stud, Draw) should override
+   * if they have extra state.
+   *
+   * Emits/timers/listeners are NOT serialized — the restored table
+   * recreates them from a fresh EventEmitter base on rehydrate().
+   */
+  serializeSnapshot(): PokerTableSnapshot {
+    return {
+      version: 1,
+      tableId: this.config.tableId,
+      variantId: this.variantId,
+      handNumber: this.handNumber,
+      currentPhase: this.currentPhase,
+      dealerButtonSeat: this.dealerButtonSeat,
+      activeSeatIndex: this.activeSeatIndex,
+      currentBetToMatch: this.currentBetToMatch,
+      lastRaiseAmount: this.lastRaiseAmount,
+      lastAggressorSeat: this.lastAggressorSeat,
+      previousBigBlindSeat: this.previousBigBlindSeat,
+      deadSmallBlind: this.deadSmallBlind,
+      deadButton: this.deadButton,
+      communityCards: this.communityCards,
+      seats: this.seats.map((s) => ({
+        seatIndex: s.seatIndex,
+        state: s.state,
+        playerName: s.playerName,
+        playerId: s.playerId,
+        isAI: s.isAI,
+        chipCount: s.chipCount,
+        currentBet: s.currentBet,
+        totalInvestedThisHand: s.totalInvestedThisHand,
+        holeCards: s.holeCards,
+        lastAction: s.lastAction,
+        folded: s.folded,
+        allIn: s.allIn,
+        hasActedSinceLastFullRaise: s.hasActedSinceLastFullRaise,
+        eliminated: s.eliminated,
+        timeBankRemaining: s.timeBankRemaining,
+        missedBlind: s.missedBlind,
+        deadBlindOwedChips: s.deadBlindOwedChips,
+      })),
+      sittingOutSeats: Array.from(this._sittingOutSeats),
+      deck: this.deck.serialize(),
+      actionLog: this.actionLog,
+      startChips: Array.from(this.startChips.entries()),
+    };
+  }
+
+  /**
+   * Restore table state from a snapshot. Applies to THIS instance —
+   * call after construction so subclass fields are already set up.
+   * Idempotent: running twice with the same snapshot is fine.
+   */
+  rehydrateFromSnapshot(snap: PokerTableSnapshot): void {
+    this.handNumber = snap.handNumber;
+    this.currentPhase = snap.currentPhase;
+    this.dealerButtonSeat = snap.dealerButtonSeat;
+    this.activeSeatIndex = snap.activeSeatIndex;
+    this.currentBetToMatch = snap.currentBetToMatch;
+    this.lastRaiseAmount = snap.lastRaiseAmount;
+    this.lastAggressorSeat = snap.lastAggressorSeat;
+    this.previousBigBlindSeat = snap.previousBigBlindSeat;
+    this.deadSmallBlind = snap.deadSmallBlind;
+    this.deadButton = snap.deadButton;
+    this.communityCards = snap.communityCards || [];
+    this.actionLog = snap.actionLog || [];
+    this.startChips = new Map(snap.startChips || []);
+    this._sittingOutSeats = new Set(snap.sittingOutSeats || []);
+
+    // Seats — merge rather than replace so default-initialized seats
+    // (from constructor) keep any fields the snapshot omits (future-
+    // compatibility if we add seat properties later).
+    for (const snapSeat of snap.seats || []) {
+      const i = snapSeat.seatIndex;
+      if (i < 0 || i >= this.seats.length) continue;
+      const seat = this.seats[i];
+      Object.assign(seat, snapSeat);
+    }
+
+    // Deck: rebuild from commitment + currentIndex (deterministic re-
+    // shuffle preserves the exact card order without exposing the array).
+    this.deck = CardDeck.deserialize(snap.deck);
+  }
+}
+
+/** Serializable snapshot of a PokerTable — only core base-class state. */
+export interface PokerTableSnapshot {
+  version: 1;
+  tableId: string;
+  variantId: string;
+  handNumber: number;
+  currentPhase: GamePhase;
+  dealerButtonSeat: number;
+  activeSeatIndex: number;
+  currentBetToMatch: number;
+  lastRaiseAmount: number;
+  lastAggressorSeat: number;
+  previousBigBlindSeat: number;
+  deadSmallBlind: boolean;
+  deadButton: boolean;
+  communityCards: Card[];
+  seats: Array<{
+    seatIndex: number;
+    state: 'empty' | 'occupied' | 'sitting_out';
+    playerName: string;
+    playerId: string;
+    isAI: boolean;
+    chipCount: number;
+    currentBet: number;
+    totalInvestedThisHand: number;
+    holeCards: Card[];
+    lastAction: PlayerAction;
+    folded: boolean;
+    allIn: boolean;
+    hasActedSinceLastFullRaise: boolean;
+    eliminated: boolean;
+    timeBankRemaining: number;
+    missedBlind: 'none' | 'small' | 'big' | 'both';
+    deadBlindOwedChips: number;
+  }>;
+  sittingOutSeats: number[];
+  deck: { commitment: { seed: string; hash: string; handNumber: number } | null; currentIndex: number };
+  actionLog: ActionLogEntry[];
+  startChips: Array<[number, number]>;
 }

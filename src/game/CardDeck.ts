@@ -95,4 +95,36 @@ export class CardDeck {
     }
     return arr;
   }
+
+  /**
+   * Serialize enough state to restore a deck identically after a
+   * server restart. We only persist the commitment (seed + hash +
+   * handNumber) and currentIndex. On restore we reset, re-run Fisher-
+   * Yates with the same seed (deterministic because the PRNG is seeded
+   * from the seed), and advance the index — producing the exact same
+   * card order and the same "cards already dealt" pointer without ever
+   * serializing the card array itself.
+   */
+  serialize(): { commitment: DeckCommitment | null; currentIndex: number } {
+    return {
+      commitment: this._commitment,
+      currentIndex: this.currentIndex,
+    };
+  }
+
+  static deserialize(snapshot: { commitment: DeckCommitment | null; currentIndex: number }): CardDeck {
+    const deck = new CardDeck();
+    deck.reset();
+    if (snapshot.commitment) {
+      // Replay the shuffle deterministically with the original seed.
+      deck._commitment = snapshot.commitment;
+      const rng = seededRandom(snapshot.commitment.seed);
+      for (let i = deck.cards.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        [deck.cards[i], deck.cards[j]] = [deck.cards[j], deck.cards[i]];
+      }
+    }
+    deck.currentIndex = Math.max(0, Math.min(snapshot.currentIndex, deck.cards.length));
+    return deck;
+  }
 }

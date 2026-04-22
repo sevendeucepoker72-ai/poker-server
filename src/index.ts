@@ -13,7 +13,16 @@ import {
   Seat,
   MAX_SEATS,
   HandHistoryRecord,
+  PokerTableSnapshot,
 } from './game/PokerTable';
+import {
+  connectRedis as connectHandStore,
+  snapshotHand,
+  clearHand as clearHandSnapshot,
+  scanHands,
+  flushAll as flushAllHandSnapshots,
+  isRedisReady as isHandStoreReady,
+} from './redisStore';
 // Re-export GamePhase values for draw/stud phase checks
 const DrawPhases = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
 const StudPhases = [GamePhase.ThirdStreet, GamePhase.FourthStreet, GamePhase.FifthStreet, GamePhase.SixthStreet, GamePhase.SeventhStreet];
@@ -1182,6 +1191,25 @@ function broadcastGameState(tableId: string): void {
     }
   }
 
+  // Hand-state checkpoint: snapshot to Redis so a Railway restart can
+  // rehydrate this exact table state. Only persist while a hand is
+  // actually in progress — no point serializing WaitingForPlayers or
+  // HandComplete states (they reset on startup anyway). On hand
+  // completion, proactively clear any existing snapshot instead of
+  // waiting for 2h TTL expiry.
+  try {
+    if (isHandStoreReady()) {
+      if (table.isHandInProgress()) {
+        snapshotHand(tableId, table.serializeSnapshot());
+      } else {
+        clearHandSnapshot(tableId).catch(() => {});
+      }
+    }
+  } catch (err) {
+    // Never let persistence failure break the broadcast.
+    console.warn('[snapshot] failed:', (err as Error)?.message);
+  }
+
   // Send spectator-specific state (no hole cards unless showdown)
   const tableSpectators = spectators.get(tableId);
   if (tableSpectators && tableSpectators.size > 0) {
@@ -1557,6 +1585,9 @@ function executeAIAction(
 
     // Check if hand is complete
     if (table.currentPhase === GamePhase.HandComplete) {
+      // Completed hands don't need the Redis snapshot anymore — clear
+      // so a restart doesn't try to rehydrate a finished hand.
+      clearHandSnapshot(tableId).catch(() => {});
       // Cancel any previously scheduled auto-start for this table (defensive)
       const existing = pendingAutoStartTimers.get(tableId);
       if (existing) clearTimeout(existing);
@@ -3063,6 +3094,41 @@ Give feedback in this JSON format:
       const progress = await loadProgress(userId);
       if (progress.success && progress.userData) {
         authSessions.set(socket.id, { userId, username: progress.userData.username });
+
+        // Post-restart seat recovery: Railway redeploy wipes in-memory
+        // state (including reservedSeats Map). But table state was
+        // rehydrated from Redis so this user's seat still exists with
+        // their playerId. Synthesize a reservedSeats entry so the
+        // existing reconnect flow can claim the seat.
+        if (!reservedSeats.has(userId)) {
+          const expectedPlayerId = `user_${userId}`;
+          for (const t of tableManager.getTableList()) {
+            const table = tableManager.getTable(t.tableId);
+            if (!table) continue;
+            for (let i = 0; i < table.seats.length; i++) {
+              const seat = table.seats[i];
+              if (seat.state !== 'occupied' || seat.isAI) continue;
+              if (seat.playerId !== expectedPlayerId) continue;
+              // Found an orphaned seat for this user. Reserve it so the
+              // block below treats it as a normal reconnect. cleanupTimer
+              // is a dummy no-op since this synthetic reservation will
+              // be consumed immediately.
+              reservedSeats.set(userId, {
+                userId,
+                tableId: t.tableId,
+                seatIndex: i,
+                playerName: seat.playerName,
+                chips: seat.chipCount,
+                avatar: (progress.userData as any).avatar ?? undefined,
+                expiresAt: Date.now() + 60_000,
+                cleanupTimer: setTimeout(() => {}, 0),
+              } as any);
+              console.log(`[Reconnect] orphan-seat recovery: user ${userId} → ${t.tableId} seat ${i}`);
+              break;
+            }
+            if (reservedSeats.has(userId)) break;
+          }
+        }
 
         // Check for reserved seat (same reconnection logic as legacy)
         const reserved = reservedSeats.get(userId);
@@ -7622,13 +7688,46 @@ initDB().then(async () => {
 
 // ========== Start Server ==========
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   console.log(`Poker server running on port ${PORT}`);
   console.log(`Tables available: ${tableManager.getTableList().length}`);
   for (const table of tableManager.getTableList()) {
     console.log(
       `  - ${table.tableName} (${table.smallBlind}/${table.bigBlind} blinds, min buy-in: ${table.minBuyIn})`
     );
+  }
+
+  // Hand-state persistence: connect to Redis, then rehydrate any
+  // in-progress hands left over from the previous process. Without
+  // this, every Railway deploy evaporates mid-hand state and players
+  // see a frozen table until the watchdog recovers.
+  const redisConnected = await connectHandStore();
+  if (redisConnected) {
+    try {
+      const snapshots = await scanHands();
+      let rehydrated = 0;
+      for (const { tableId, state } of snapshots) {
+        const table = tableManager.getTable(tableId);
+        const snap = state as PokerTableSnapshot;
+        if (!table || !snap || snap.version !== 1) continue;
+        try {
+          table.rehydrateFromSnapshot(snap);
+          rehydrated++;
+          // Restore turn + AI scheduler so play continues from where it
+          // left off. broadcastGameState handles timer arming; the
+          // scheduler kicks the AI whose turn it is.
+          broadcastGameState(tableId);
+          scheduleAIAction(tableId);
+        } catch (err) {
+          console.warn(`[Rehydrate] failed for ${tableId}:`, (err as Error)?.message);
+        }
+      }
+      if (rehydrated > 0) {
+        console.log(`[Rehydrate] restored ${rehydrated} in-progress hand(s) from Redis`);
+      }
+    } catch (err) {
+      console.warn('[Rehydrate] scan failed:', (err as Error)?.message);
+    }
   }
 });
 
@@ -7708,6 +7807,25 @@ async function gracefulShutdown(signal: string) {
       } catch (e: any) {
         console.warn(`[Shutdown] reserved flush failed for user ${userId}:`, e?.message);
       }
+    }
+
+    // 3. Flush every pending debounced hand-snapshot to Redis.
+    //    Without this, the last ~100ms of state (the debounce window)
+    //    could be lost on restart — the new process would rehydrate
+    //    from a snapshot that's one action behind reality. Also
+    //    proactively snapshot every in-progress hand even if its
+    //    debounce window has already fired, so the latest state
+    //    definitely makes it to Redis before SIGTERM kills us.
+    try {
+      for (const t of tableManager.getTableList()) {
+        const table = tableManager.getTable(t.tableId);
+        if (table?.isHandInProgress()) {
+          snapshotHand(t.tableId, table.serializeSnapshot(), 0); // bypass debounce
+        }
+      }
+      await flushAllHandSnapshots();
+    } catch (e: any) {
+      console.warn('[Shutdown] hand-snapshot flush failed:', e?.message);
     }
 
     console.log('[Shutdown] State preserved. Exiting.');
