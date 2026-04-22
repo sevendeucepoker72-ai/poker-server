@@ -1866,6 +1866,64 @@ setInterval(() => {
   }
 }, 12000);
 
+// Wedge watchdog — fires every 15s. Detects tables where a hand is
+// in progress but hasn't progressed in 45s (activeSeatIndex unchanged,
+// no broadcast). Recovery: force-advance the turn or abort the hand.
+//
+// Why this exists: observed 2026-04-22 that a Beginner's Table froze
+// on pre-flop with the client showing one seat as active but that
+// seat had already acted according to the log. Turn timer wasn't
+// firing (possibly the `activeSeat` snapshot captured a stale index
+// at `setTimeout` time, so the `t.activeSeatIndex !== activeSeat`
+// bail on line 1150 kicked out silently). This watchdog is a
+// belt-and-suspenders safety net — the real fix goes in PokerTable's
+// phase-advance logic, but meanwhile this keeps tables playable.
+const wedgeWatchdog = new Map<string, { lastSeat: number; since: number }>();
+setInterval(() => {
+  try {
+    const now = Date.now();
+    const tables = tableManager.getTableList();
+    for (const t of tables) {
+      const table = tableManager.getTable(t.tableId);
+      if (!table) continue;
+      if (!table.isHandInProgress()) {
+        wedgeWatchdog.delete(t.tableId);
+        continue;
+      }
+      const activeSeat = table.activeSeatIndex;
+      const prior = wedgeWatchdog.get(t.tableId);
+      if (!prior || prior.lastSeat !== activeSeat) {
+        wedgeWatchdog.set(t.tableId, { lastSeat: activeSeat, since: now });
+        continue;
+      }
+      const stuckFor = now - prior.since;
+      if (stuckFor >= 45000) {
+        console.warn(`[WedgeWatchdog] Table ${t.tableId} stuck on seat ${activeSeat} for ${stuckFor}ms — forcing advance`);
+        try {
+          const seat = table.seats[activeSeat];
+          if (seat && seat.state === 'occupied') {
+            const callAmt = table.currentBetToMatch - (seat.currentBet || 0);
+            if (callAmt > 0) table.playerFold(activeSeat);
+            else table.playerCheck(activeSeat);
+            broadcastGameState(t.tableId);
+            scheduleAIAction(t.tableId);
+          } else {
+            // Active seat is invalid entirely — advance the turn manually
+            (table as any).advanceTurn?.();
+            broadcastGameState(t.tableId);
+            scheduleAIAction(t.tableId);
+          }
+          wedgeWatchdog.delete(t.tableId);
+        } catch (err) {
+          console.error(`[WedgeWatchdog] recovery failed for ${t.tableId}:`, (err as Error).message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[WedgeWatchdog] tick error:', (err as Error).message);
+  }
+}, 15000);
+
 // ========== Progression Helpers ==========
 
 /**
