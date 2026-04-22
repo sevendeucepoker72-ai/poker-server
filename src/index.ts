@@ -1132,14 +1132,23 @@ function broadcastGameState(tableId: string): void {
     }
   }
 
-  // Server-side turn timeout: clear old timer, set new one if hand is in progress
+  // Server-side turn timeout: only rearm when the active seat CHANGES.
+  // Previously every broadcastGameState cleared + re-armed the 30s timer
+  // AND reset turnStartedAt, so any non-action event (chat, spectator
+  // join, watchdog fire) bumped both the server auto-fold clock AND the
+  // client-visible turn timer back to 30s — players saw AI "add time"
+  // to their countdown. 2026-04-22 user observation.
   {
     const existing = turnTimers.get(tableId);
-    if (existing) clearTimeout(existing.timeout);
-    turnTimers.delete(tableId);
+    const activeSeat = table.activeSeatIndex;
+    const seatChanged = !existing || existing.seatIndex !== activeSeat;
 
-    if (table.isHandInProgress() && table.activeSeatIndex >= 0) {
-      const activeSeat = table.activeSeatIndex;
+    if (seatChanged) {
+      if (existing) clearTimeout(existing.timeout);
+      turnTimers.delete(tableId);
+    }
+
+    if (table.isHandInProgress() && activeSeat >= 0 && seatChanged) {
       const turnId = ++globalTurnId;
       turnStartedAtMap.set(tableId, Date.now());
       const timeout = setTimeout(() => {
