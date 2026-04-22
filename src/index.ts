@@ -171,6 +171,11 @@ const TURN_TIMEOUT_MS = 30000; // 30 seconds
 // Track when each table's current turn started (epoch ms) so clients can render
 // a per-player countdown ring.
 const turnStartedAtMap = new Map<string, number>();
+// Tracks which seat "owns" the current turnStartedAt timestamp. Separate
+// from turnTimers because timer entries get deleted on callback fire;
+// this keeps a stable "prior seat" reference so a subsequent broadcast
+// can tell if the active seat really changed or not.
+const turnStartedSeatMap = new Map<string, number>();
 
 // Delta state tracking: socketId -> last full state sent to that client
 const lastSentState = new Map<string, Record<string, any>>();
@@ -1132,16 +1137,20 @@ function broadcastGameState(tableId: string): void {
     }
   }
 
-  // Server-side turn timeout: only rearm when the active seat CHANGES.
-  // Previously every broadcastGameState cleared + re-armed the 30s timer
-  // AND reset turnStartedAt, so any non-action event (chat, spectator
-  // join, watchdog fire) bumped both the server auto-fold clock AND the
-  // client-visible turn timer back to 30s — players saw AI "add time"
-  // to their countdown. 2026-04-22 user observation.
+  // Server-side turn timeout: only reset the turn clock when the active
+  // seat actually CHANGES from the prior one we remembered. We track the
+  // seat-for-turnStartedAt separately from the turnTimers entry because
+  // the timer entry gets deleted when the timeout callback fires — using
+  // that as the "prior seat" source caused a bug where after the timer
+  // expired (or was cleared silently), the next broadcast saw no entry
+  // and treated it as a fresh turn, resetting the countdown to 30s on
+  // the same seat. User observed: "his turn doesn't pause no more, the
+  // turn timer just starts over when complete" (2026-04-22).
   {
     const existing = turnTimers.get(tableId);
     const activeSeat = table.activeSeatIndex;
-    const seatChanged = !existing || existing.seatIndex !== activeSeat;
+    const priorSeatForStart = turnStartedSeatMap.get(tableId);
+    const seatChanged = priorSeatForStart !== activeSeat;
 
     if (seatChanged) {
       if (existing) clearTimeout(existing.timeout);
@@ -1151,6 +1160,7 @@ function broadcastGameState(tableId: string): void {
     if (table.isHandInProgress() && activeSeat >= 0 && seatChanged) {
       const turnId = ++globalTurnId;
       turnStartedAtMap.set(tableId, Date.now());
+      turnStartedSeatMap.set(tableId, activeSeat);
       const timeout = setTimeout(() => {
         const entry = turnTimers.get(tableId);
         if (!entry || entry.turnId !== turnId) return; // stale timer
