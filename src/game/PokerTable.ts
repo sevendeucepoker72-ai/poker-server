@@ -1090,12 +1090,19 @@ export class PokerTable extends EventEmitter {
   }
 
   protected isBettingRoundComplete(): boolean {
+    // A seat must have hole cards to be "playing" this round. Otherwise
+    // a user who joined mid-hand sits `state === 'occupied'` but with no
+    // cards, counted as playing, and the round never completes because
+    // their hasActed flag is stuck at false. 2026-04-22 root-cause fix
+    // for pre-flop wedges where the hand was stuck on the active seat
+    // because a cardless newcomer was blocking round-complete.
     const playingSeats = this.seats.filter(
       s =>
         s.state === 'occupied' &&
         !s.folded &&
         !s.allIn &&
-        !s.eliminated
+        !s.eliminated &&
+        s.holeCards.length > 0
     );
 
     // If no one can act (all folded or all-in), betting is complete
