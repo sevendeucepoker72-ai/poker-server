@@ -44,7 +44,7 @@ import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, loadDurableProgress } from './auth/authManager';
+import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, loadDurableProgress } from './auth/authManager';
 import { validateOAuthToken } from './auth/oauthValidator';
 import {
   initClubTables,
@@ -334,8 +334,28 @@ const chipVelocity = new Map<number, { chipsAtStart: number; sessionStartAt: num
 const actionTimings = new Map<string, number[]>();
 // Action nonce tracking: tableId:seatIndex -> last nonce used
 const actionNonces = new Map<string, string>();
-// Chip velocity auto-ban counter: userId -> alert count
-const chipVelocityAlerts = new Map<number, number>();
+// Chip velocity auto-ban counter: userId -> { count, lastAlertAt }
+// Decays by 1 every CHIP_VELOCITY_DECAY_MS of quiet time so a user who
+// got 2 false-positive alerts months ago isn't auto-banned on alert #3
+// today. Without decay, innocent users accumulate permanent state that
+// tips them over the ban threshold on a single future alert.
+const chipVelocityAlerts = new Map<number, { count: number; lastAlertAt: number }>();
+const CHIP_VELOCITY_DECAY_MS = 24 * 60 * 60 * 1000; // 24h quiet → count -= 1
+
+function incrementChipVelocityAlert(userId: number): number {
+  const now = Date.now();
+  const entry = chipVelocityAlerts.get(userId);
+  if (!entry) {
+    chipVelocityAlerts.set(userId, { count: 1, lastAlertAt: now });
+    return 1;
+  }
+  // Apply decay: subtract 1 for every full DECAY_MS window of quiet
+  const decayWindows = Math.floor((now - entry.lastAlertAt) / CHIP_VELOCITY_DECAY_MS);
+  const decayedCount = Math.max(0, entry.count - decayWindows);
+  const newCount = decayedCount + 1;
+  chipVelocityAlerts.set(userId, { count: newCount, lastAlertAt: now });
+  return newCount;
+}
 
 // Module-scope audit log (used by anti-cheat auto-ban, admin ops, and buy-in audit)
 function auditLog(actorUsername: string, action: string, details: Record<string, unknown> = {}) {
@@ -1307,9 +1327,11 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         const sessionMinutes = (Date.now() - vel.sessionStartAt) / 60_000;
         if (vel.handsThisSession >= 5 && gained > vel.chipsAtStart * 10) {
           console.warn(`[AntiCheat] Chip velocity alert: userId=${userId} gained ${gained} chips (${vel.handsThisSession} hands, ${sessionMinutes.toFixed(1)}m)`);
-          // Track alert count; auto-ban after 3 alerts
-          chipVelocityAlerts.set(userId, (chipVelocityAlerts.get(userId) || 0) + 1);
-          const alertCount = chipVelocityAlerts.get(userId)!;
+          // Track alert count with decay; auto-ban after 3 alerts inside
+          // the decay window (24h). Previously this was a permanent count
+          // that could survive months of quiet play and then trip a ban
+          // on a single new alert.
+          const alertCount = incrementChipVelocityAlert(userId);
           if (alertCount >= 3) {
             console.warn(`[AntiCheat] Auto-banning userId=${userId} after ${alertCount} chip velocity alerts`);
             try {
@@ -3163,9 +3185,12 @@ Give feedback in this JSON format:
               if (seat.state !== 'occupied' || seat.isAI) continue;
               if (seat.playerId !== expectedPlayerId) continue;
               // Found an orphaned seat for this user. Reserve it so the
-              // block below treats it as a normal reconnect. cleanupTimer
-              // is a dummy no-op since this synthetic reservation will
-              // be consumed immediately.
+              // block below treats it as a normal reconnect. No cleanupTimer
+              // needed — this synthetic reservation will be consumed
+              // immediately by the reconnect code below. Previous version
+              // used a dummy `setTimeout(() => {}, 0)` which was a harmless
+              // but confusing no-op and caused audit false-positives.
+              // Consumers of cleanupTimer must guard with optional-chain.
               reservedSeats.set(userId, {
                 userId,
                 tableId: t.tableId,
@@ -3174,7 +3199,7 @@ Give feedback in this JSON format:
                 chips: seat.chipCount,
                 avatar: (progress.userData as any).avatar ?? undefined,
                 expiresAt: Date.now() + 60_000,
-                cleanupTimer: setTimeout(() => {}, 0),
+                cleanupTimer: undefined,
               } as any);
               console.log(`[Reconnect] orphan-seat recovery: user ${userId} → ${t.tableId} seat ${i}`);
               break;
@@ -3190,7 +3215,7 @@ Give feedback in this JSON format:
           if (table) {
             const seat = table.seats[reserved.seatIndex];
             if (seat && seat.state === 'occupied' && !seat.isAI) {
-              clearTimeout(reserved.cleanupTimer);
+              if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
               reservedSeats.delete(userId);
               const restoredSession: PlayerSession = {
                 socketId: socket.id,
@@ -3263,7 +3288,7 @@ Give feedback in this JSON format:
           const seat = table.seats[reserved.seatIndex];
           // Seat still belongs to this player (state occupied, not AI)
           if (seat && seat.state === 'occupied' && !seat.isAI) {
-            clearTimeout(reserved.cleanupTimer);
+            if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
             reservedSeats.delete(userId);
 
             // Re-associate socket with the session
@@ -4420,7 +4445,14 @@ Give feedback in this JSON format:
           try {
             await addChipsToUser(authForJoin.userId, buyIn);
             auditLog(authForJoin.username, 'QUICKPLAY_REFUND', { tableId: chosenTableId, buyIn, reason: 'sitDown_failed' });
-          } catch {}
+          } catch (e) {
+            // Refund failed AFTER the deduction succeeded. The user now
+            // owes `buyIn` that the DB didn't credit back. Don't swallow —
+            // log + audit loud so an operator can manually restore. Matches
+            // the joinTable path's error handling at ~line 4255.
+            console.error(`[Buy-in] QUICKPLAY_REFUND failed for userId=${authForJoin.userId}, amount=${buyIn}:`, e);
+            auditLog(authForJoin.username, 'QUICKPLAY_REFUND_FAILED', { tableId: chosenTableId, buyIn, error: String(e) });
+          }
         }
         socket.emit('error', { message: 'Could not join table' });
         return;
@@ -5030,11 +5062,34 @@ Give feedback in this JSON format:
       }
 
       // Server-side reward table per tier. Every 5th tier grants stars, rest grant chips.
+      // DB-first ordering: award chips/stars in DB BEFORE mutating in-memory
+      // progress. Reverse order could leave UI showing a reward that never
+      // landed in users.chips / users.stars if the DB write failed. Audit
+      // logs on failure so ops can reconcile.
       const progress = progressionManager.getProgress(ctx.playerId)!;
       const chips = tierId % 5 === 0 ? 0 : 1000 + tierId * 200;
       const stars = tierId % 5 === 0 ? 25 + tierId : 0;
-      if (chips > 0) { progress.chips += chips; await addChipsToUser(ctx.userId, chips); }
-      if (stars > 0) { progress.stars += stars; dbPersistStars(ctx.userId, progress.stars).catch(() => {}); }
+      if (chips > 0) {
+        const ok = await addChipsToUser(ctx.userId, chips);
+        if (!ok) {
+          auditLog('SYSTEM', 'BATTLEPASS_CHIPS_DB_FAIL', { userId: ctx.userId, seasonId, tierId, amount: chips });
+          socket.emit('battlePassTierClaimed', { success: false, error: 'db_failed' });
+          return;
+        }
+        progress.chips += chips;
+      }
+      if (stars > 0) {
+        // addStarsToUser is atomic-additive (UPDATE users SET stars = stars + $1).
+        // Using the new helper instead of persistStars avoids clobbering
+        // concurrent star grants (e.g. daily rewards) with a plain SET.
+        const ok = await addStarsToUser(ctx.userId, stars);
+        if (!ok) {
+          auditLog('SYSTEM', 'BATTLEPASS_STARS_DB_FAIL', { userId: ctx.userId, seasonId, tierId, amount: stars });
+          socket.emit('battlePassTierClaimed', { success: false, error: 'db_failed' });
+          return;
+        }
+        progress.stars += stars;
+      }
 
       socket.emit('battlePassTierClaimed', { success: true, tierId, chips, stars });
       sendProgressToPlayer(socket.id);
@@ -7146,12 +7201,28 @@ function handlePlayerLeave(socket: Socket): void {
     // CRITICAL: credit the at-table stack back to the user's wallet
     // before standUp clears it. deductChips() took the buy-in at sit-
     // down time; if we standUp without crediting, those chips vanish.
+    //
+    // Refund failures MUST be auditable — previously this only `console.warn`d
+    // and the chips vanished silently. Now we auditLog(FAILED) so an operator
+    // can manually reconcile from the audit trail. Still fire-and-forget
+    // because we can't block the user's standUp on a DB retry loop — but
+    // the failure is permanently recorded.
     const auth = authSessions.get(socket.id);
     const chipsToReturn = leavingSeat?.chipCount || 0;
     if (auth && chipsToReturn > 0) {
-      addChipsToUser(auth.userId, chipsToReturn).catch((e: any) =>
-        console.warn(`[handlePlayerLeave cash-out ${auth.userId}]`, e?.message)
-      );
+      addChipsToUser(auth.userId, chipsToReturn)
+        .then((ok) => {
+          if (!ok) {
+            console.error(`[handlePlayerLeave] addChipsToUser returned false for userId=${auth.userId}, amount=${chipsToReturn}`);
+            auditLog(auth.username, 'CASH_OUT_FAILED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, reason: 'addChipsToUser_returned_false' });
+          } else {
+            auditLog(auth.username, 'CASH_OUT', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn });
+          }
+        })
+        .catch((e: any) => {
+          console.error(`[handlePlayerLeave cash-out ${auth.userId}] amount=${chipsToReturn}`, e?.message || e);
+          auditLog(auth.username, 'CASH_OUT_FAILED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, error: String(e?.message || e) });
+        });
     }
 
     table.standUp(session.seatIndex);
@@ -7565,16 +7636,24 @@ function handleTableRebalance(tournamentId: string): void {
             aiProfiles.get(targetTid)!.set(emptySeat, oldProfile);
           }
         } else {
-          // Human player — update their session
+          // Human player — update their session IF they're still connected.
+          // If the socket disconnected during rebalance, playerSessions may
+          // still hold a stale entry (cleanup race). Mutating it blindly
+          // would leave a ghost session pointing at the wrong table. Check
+          // the live socket registry first: no live socket → log + skip the
+          // session mutation. The player's tournament seat is already
+          // reassigned (setPlayerTable above); on reconnect, the orphan-seat
+          // recovery flow (oauthLogin) will pick it up correctly.
           const tp = tournament.players.find(p => p.playerId === player.playerId);
           if (tp) {
-            const session = playerSessions.get(tp.socketId);
-            if (session) {
-              session.tableId = targetTid;
-              session.seatIndex = emptySeat;
-            }
             const sock = io.sockets.sockets.get(tp.socketId);
-            if (sock) {
+            const sockLive = sock && sock.connected;
+            if (sockLive) {
+              const session = playerSessions.get(tp.socketId);
+              if (session) {
+                session.tableId = targetTid;
+                session.seatIndex = emptySeat;
+              }
               sock.leave(`table:${breakTableId}`);
               sock.join(`table:${targetTid}`);
               sock.emit('playerMoved', {
@@ -7583,6 +7662,8 @@ function handleTableRebalance(tournamentId: string): void {
                 toSeat: emptySeat,
                 tableId: targetTid,
               });
+            } else {
+              console.warn(`[Tournament] Rebalance: ${player.playerName} socket ${tp.socketId} not live — skipping session mutation; reconnect recovery will pick it up`);
             }
           }
         }

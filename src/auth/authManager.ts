@@ -615,12 +615,52 @@ export async function searchUsers(query: string, limit = 10): Promise<Array<{ id
 // Persistence sweep helpers (stars, inventory, claims, customization, etc.)
 // =============================================================================
 
-/** Update the stars balance for a user. Fire-and-forget friendly. */
+/** Update the stars balance for a user. Fire-and-forget friendly.
+ *
+ * WARNING: plain SET — callers must hold a hydrated in-memory source of
+ * truth before writing, or data from parallel grants can be clobbered.
+ * Prefer `addStarsToUser` / `deductStars` for grants. `persistStars` is
+ * only appropriate for full-snapshot resync paths (graceful shutdown,
+ * durable-state reconciliation) where the caller has loaded fresh DB
+ * state first.
+ */
 export async function persistStars(userId: number, stars: number): Promise<void> {
   try {
     await pool.query('UPDATE users SET stars = $1 WHERE id = $2', [Math.max(0, Math.floor(stars)), userId]);
   } catch (e: any) {
     console.warn(`[persistStars ${userId}]`, e.message);
+  }
+}
+
+/** Atomic additive star credit — analogous to addChipsToUser.
+ *  Postgres serializes `stars = stars + $1` correctly across concurrent
+ *  writes, so grants can't clobber each other. Use for daily rewards,
+ *  battle pass, scratch cards, shop refunds — anywhere a delta is added. */
+export async function addStarsToUser(userId: number, stars: number): Promise<boolean> {
+  try {
+    const amount = Math.max(0, Math.floor(stars));
+    if (amount === 0) return true;
+    await pool.query('UPDATE users SET stars = stars + $1 WHERE id = $2', [amount, userId]);
+    return true;
+  } catch (e: any) {
+    console.error(`[addStarsToUser ${userId}] amount=${stars}`, e.message);
+    return false;
+  }
+}
+
+/** Atomic check-and-deduct — returns false if balance insufficient. */
+export async function deductStars(userId: number, stars: number): Promise<boolean> {
+  try {
+    const amount = Math.max(0, Math.floor(stars));
+    if (amount === 0) return true;
+    const { rowCount } = await pool.query(
+      'UPDATE users SET stars = stars - $1 WHERE id = $2 AND stars >= $1',
+      [amount, userId]
+    );
+    return (rowCount || 0) > 0;
+  } catch (e: any) {
+    console.error(`[deductStars ${userId}] amount=${stars}`, e.message);
+    return false;
   }
 }
 
