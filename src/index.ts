@@ -1903,7 +1903,13 @@ setInterval(() => {
         continue;
       }
       const activeSeat = table.activeSeatIndex;
-      const pot = table.pot || 0;
+      // PokerTable doesn't expose a single `.pot` — sum totalInvestedThisHand
+      // + currentBet across seats as a "progress fingerprint". Any change
+      // here means real chips moved (bet, call, raise, all-in, or refund).
+      const pot = table.seats.reduce(
+        (sum, s) => sum + (s.totalInvestedThisHand || 0) + (s.currentBet || 0),
+        0,
+      );
       const phase = String(table.currentPhase);
       const prior = wedgeWatchdog.get(t.tableId);
 
