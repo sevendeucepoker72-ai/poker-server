@@ -301,10 +301,23 @@ export async function registerUser(username: string, password: string): Promise<
   if (existing.rows.length > 0) return { success: false, error: 'Username already taken' };
 
   const hash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
-  const { rows } = await pool.query(
-    'INSERT INTO users (username, password_hash, chips, level, xp) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-    [trimmed, hash, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP]
-  );
+  // 2026-05-02 audit: pre-check + INSERT is a TOCTOU. If two registrations
+  // race for the same username, both pass the existence check, second hits
+  // UNIQUE on INSERT (23505) and the user sees a 500. Now: catch the unique
+  // violation and return the same graceful error as the pre-check path.
+  let rows;
+  try {
+    const result = await pool.query(
+      'INSERT INTO users (username, password_hash, chips, level, xp) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+      [trimmed, hash, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP]
+    );
+    rows = result.rows;
+  } catch (err: any) {
+    if (err?.code === '23505') {
+      return { success: false, error: 'Username already taken' };
+    }
+    throw err;
+  }
 
   const user = rowToUserData(rows[0]);
   const token = generateToken(user.id, user.username);
@@ -568,13 +581,24 @@ export async function getTotalUsers(): Promise<number> {
 }
 
 export async function mergeUserStats(userId: number, patch: Record<string, any>): Promise<void> {
+  // Earned 2026-05-02 audit: pre-fix, this was a plain read-modify-write.
+  // Two concurrent calls both read {handsWon: 5}, both write back, second
+  // wins → first's increment lost. Now wrap SELECT + UPDATE in a transaction
+  // with `FOR UPDATE` row lock so concurrent merges serialize cleanly.
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query('SELECT stats FROM users WHERE id = $1', [userId]);
+    await client.query('BEGIN');
+    const { rows } = await client.query('SELECT stats FROM users WHERE id = $1 FOR UPDATE', [userId]);
     let existing: Record<string, any> = {};
     try { existing = JSON.parse(rows[0]?.stats || '{}'); } catch { /* ignore */ }
     const merged = { ...existing, ...patch };
-    await pool.query('UPDATE users SET stats = $1 WHERE id = $2', [JSON.stringify(merged), userId]);
-  } catch { /* ignore */ }
+    await client.query('UPDATE users SET stats = $1 WHERE id = $2', [JSON.stringify(merged), userId]);
+    await client.query('COMMIT');
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+  } finally {
+    client.release();
+  }
 }
 
 export interface LeaderboardEntry {
