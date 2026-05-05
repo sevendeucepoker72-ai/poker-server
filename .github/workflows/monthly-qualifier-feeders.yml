@@ -1,0 +1,63 @@
+name: Monthly Qualifier Feeders
+
+# 2026-05-05 — Calls the poker-prod-api cron endpoint on the 1st of every
+# month at 06:00 UTC to fire the two qualifier feeders:
+#   1) monthly_venue_points  — top 20% of last month's points per venue
+#                              → that month's monthly online qualifier roster
+#   2) attendance_direct_seats — top 20% of avg attendance per venue
+#                                → direct championship_seats
+#
+# Why GitHub Actions instead of Cloud Scheduler: enabling Cloud Scheduler
+# requires `roles/serviceusage.serviceUsageAdmin` on the GCP project, which
+# the league owner's account doesn't have. GitHub Actions cron is free,
+# already wired into this repo, and the same secret-header authentication
+# pattern works fine.
+#
+# The workflow is also `workflow_dispatch`-able — admin can fire it on
+# demand from the GitHub Actions UI (e.g. for backfills or testing).
+#
+# Required repo secret: CRON_SECRET (must match the env var on
+# poker-prod-api Cloud Run service).
+
+on:
+  schedule:
+    # 06:00 UTC on the 1st of every month
+    - cron: '0 6 1 * *'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why are you triggering manually? (audit trail)'
+        required: false
+        default: 'manual run'
+
+jobs:
+  run-feeders:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Hit cron-run endpoint
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          if [ -z "$CRON_SECRET" ]; then
+            echo "::error::CRON_SECRET secret is not set in this repo. Add it via Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          set -e
+          URL="https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api/qualifiers/feeders/cron-run"
+          echo "POSTing to $URL"
+          # -f makes curl exit non-zero on HTTP 4xx/5xx; -s silences progress;
+          # -S still shows errors; --retry 3 handles transient Cloud Run cold-start.
+          RESPONSE=$(curl -fsS --retry 3 --retry-delay 5 \
+            -X POST "$URL" \
+            -H "X-Cron-Secret: $CRON_SECRET" \
+            -H "Content-Type: application/json" \
+            -d '{}')
+          echo "Response:"
+          echo "$RESPONSE" | head -c 4000
+          # Fail the workflow if the response shape signals failure.
+          # Both feeders return success=true when they ran (or skipped because
+          # today isn't the 1st on a manual_dispatch).
+          echo "$RESPONSE" | grep -q '"success":true' || {
+            echo "::error::cron-run did not return success=true"
+            exit 1
+          }
