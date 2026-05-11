@@ -5253,6 +5253,14 @@ Give feedback in this JSON format:
       // landed in users.chips / users.stars if the DB write failed. Audit
       // logs on failure so ops can reconcile.
       const progress = progressionManager.getProgress(ctx.playerId)!;
+      // 2026-05-11 stats audit — added hydrated gate. Pre-fix, a claim
+      // firing during the async hydrate window would modify in-memory stars
+      // that got clobbered when hydrate finished and overwrote with DB
+      // state — the claim reward was effectively lost until next login.
+      if (!progress.hydrated) {
+        socket.emit('battlePassTierClaimed', { success: false, error: 'NOT_HYDRATED' });
+        return;
+      }
       const chips = tierId % 5 === 0 ? 0 : 1000 + tierId * 200;
       const stars = tierId % 5 === 0 ? 25 + tierId : 0;
       if (chips > 0) {
@@ -6142,6 +6150,28 @@ Give feedback in this JSON format:
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
+    // 2026-05-11 stats audit — claimDailyBonus used to be in-memory only,
+    // letting a Railway redeploy + rehydrate desync state and double-credit
+    // within seconds. user_daily_claims is now the source of truth.
+    const ctx = await ensureHydrated(socket);
+    if (!ctx) {
+      socket.emit('error', { message: 'Not authenticated' });
+      return;
+    }
+    const progress = progressionManager.getProgress(ctx.playerId);
+    if (!progress || !progress.hydrated) {
+      socket.emit('error', { code: 'NOT_HYDRATED', message: 'Progress is still loading; try again' });
+      return;
+    }
+
+    // DB write is the source of truth. If the row was already there for
+    // today (INSERT ... ON CONFLICT DO NOTHING returned 0 rows), refuse.
+    const newlyClaimed = await recordDailyClaim(ctx.userId, 'daily_bonus', null);
+    if (!newlyClaimed) {
+      socket.emit('error', { message: 'Daily bonus already claimed today' });
+      return;
+    }
+
     const result = progressionManager.claimDailyBonus(session.playerId);
     if (result.success) {
       socket.emit('dailyBonusClaimed', {
@@ -6150,6 +6180,8 @@ Give feedback in this JSON format:
         streak: result.streak,
       });
     } else {
+      // DB-write succeeded but in-memory claim refused (e.g. lastDailyBonusClaimed
+      // matched today after rehydrate). The DB row is the lock; keep it.
       socket.emit('error', { message: 'Daily bonus already claimed today' });
     }
     sendProgressToPlayer(socket.id);

@@ -208,9 +208,22 @@ export async function initDB(): Promise<void> {
       user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       hand_id     TEXT    NOT NULL,
       data        JSONB   NOT NULL,
-      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, hand_id)
     )
   `).catch((e: any) => console.warn('[Auth] user_hand_history:', e.message));
+  // Idempotent ALTER for existing DBs that pre-date the inline UNIQUE constraint.
+  // Postgres doesn't support IF NOT EXISTS on constraints, so swallow duplicate
+  // errors in a DO block.
+  await pool.query(`
+    DO $$ BEGIN
+      ALTER TABLE user_hand_history
+        ADD CONSTRAINT user_hand_history_user_hand_uniq UNIQUE (user_id, hand_id);
+    EXCEPTION
+      WHEN duplicate_table THEN NULL;
+      WHEN duplicate_object THEN NULL;
+    END $$;
+  `).catch((e: any) => console.warn('[Auth] user_hand_history uniq:', e.message));
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_hand_history_user_created ON user_hand_history(user_id, created_at DESC)`).catch(() => {});
 
   // Daily achievements — (user, ach_id, date) composite PK so the same
@@ -790,7 +803,14 @@ export async function hasClaimedToday(userId: number, claimType: string): Promis
   }
 }
 
-/** Record a daily claim. Returns true if newly recorded, false if already claimed. */
+/**
+ * Insert into user_daily_claims with ON CONFLICT DO NOTHING. Returns true
+ * if this is a new claim (row was inserted), false if it was already
+ * claimed today.
+ * 2026-05-11 stats audit — claimDailyBonus used to be in-memory only,
+ * letting a Railway redeploy + rehydrate desync state and double-credit
+ * within seconds.
+ */
 export async function recordDailyClaim(userId: number, claimType: string, payload: any = null): Promise<boolean> {
   try {
     const { rowCount } = await pool.query(
@@ -909,22 +929,32 @@ export async function persistPreferences(userId: number, patch: any): Promise<vo
 
 /** Record a hand into user_hand_history. Caps to latest 100 per user. */
 export async function recordHand(userId: number, handId: string, data: any): Promise<void> {
+  // 2026-05-11 stats audit:
+  //   (1) ON CONFLICT (user_id, hand_id) DO NOTHING — retries are
+  //       idempotent (network reconnect can't double-insert the same hand).
+  //   (2) INSERT + DELETE wrapped in BEGIN/COMMIT so the 100-row cap is
+  //       enforced atomically. Pre-fix, a DELETE failure silently left
+  //       the table growing past 100 rows.
+  const client = await pool.connect();
   try {
-    await pool.query(
-      `INSERT INTO user_hand_history (user_id, hand_id, data) VALUES ($1, $2, $3)`,
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO user_hand_history (user_id, hand_id, data) VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, hand_id) DO NOTHING`,
       [userId, handId, JSON.stringify(data)]
     );
-    // Cap at 100 — delete anything older than the newest 100.
-    await pool.query(
-      `DELETE FROM user_hand_history
-         WHERE user_id = $1
-           AND id NOT IN (
-             SELECT id FROM user_hand_history WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100
-           )`,
+    await client.query(
+      `DELETE FROM user_hand_history WHERE user_id = $1 AND id NOT IN (
+        SELECT id FROM user_hand_history WHERE user_id = $1 ORDER BY created_at DESC LIMIT 100
+      )`,
       [userId]
     );
+    await client.query('COMMIT');
   } catch (e: any) {
-    console.warn(`[recordHand ${userId}]`, e.message);
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.warn(`[recordHand ${userId}] failed:`, e?.message || e);
+  } finally {
+    client.release();
   }
 }
 
