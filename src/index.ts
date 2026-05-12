@@ -7331,11 +7331,16 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
           // reports. The at-table stack is preserved in reservedSeats
           // below and restored on reconnect; the wallet stays untouched.
           const prog = progressionManager.getClientProgress(session.playerId) as any;
-          await saveProgress(authSession.userId, {
-            xp: prog?.xp,
-            level: prog?.level,
-            achievements: prog?.achievements || [],
-          });
+          // Per CLAUDE.md: never persist progress that hasn't been hydrated — pre-hydrate in-memory zeros can clobber real DB data.
+          if (prog?.hydrated) {
+            await saveProgress(authSession.userId, {
+              xp: prog?.xp,
+              level: prog?.level,
+              achievements: prog?.achievements || [],
+            });
+          } else {
+            console.warn(`[disconnect] SKIPPED saveProgress for userId=${authSession.userId} — progress not hydrated yet (would have overwritten real values with fresh-init)`);
+          }
 
           // Reserve the seat for 10 minutes so the player can reconnect
           // Cancel any existing reservation for this user first
@@ -8033,32 +8038,54 @@ initDB().then(async () => {
     if (rows.length > 0) {
       const user = rows[0];
       const stats = typeof user.stats === 'string' ? JSON.parse(user.stats || '{}') : (user.stats || {});
-      let mutatedStats = false;
 
       // One-time 1B chip recovery grant — compensates for the disconnect
-      // chip-wipe bug (fixed in 03b5170).
+      // chip-wipe bug (fixed in 03b5170). Per CLAUDE.md, ALL chip mutations
+      // must flow through the sanctioned `addChipsToUser` helper (atomic
+      // `chips = chips + $1`) and be audited via `auditLog`. The
+      // idempotency flag write goes through `mergeUserStats` (FOR UPDATE
+      // locking) so concurrent stats writers can't clobber the marker.
       if (!stats.chipRecoveryGrantApplied) {
         const GRANT_AMOUNT = 1_000_000_000;
-        await pool.query(`UPDATE users SET chips = chips + $1 WHERE id = $2`, [GRANT_AMOUNT, user.id]);
-        stats.chipRecoveryGrantApplied = true;
-        stats.chipRecoveryGrantAt = new Date().toISOString();
-        mutatedStats = true;
-        console.log(`[Recovery] Granted ${GRANT_AMOUNT.toLocaleString()} chips to admin userId=${user.id} (${adminPhone})`);
+        const ok = await addChipsToUser(user.id, GRANT_AMOUNT);
+        if (ok) {
+          await mergeUserStats(user.id, {
+            chipRecoveryGrantApplied: true,
+            chipRecoveryGrantAt: new Date().toISOString(),
+          });
+          auditLog('SYSTEM', 'CHIP_RECOVERY_GRANT', {
+            targetUserId: user.id,
+            amount: GRANT_AMOUNT,
+            reason: 'disconnect_chip_wipe_03b5170',
+          });
+          console.log(`[Recovery] Granted ${GRANT_AMOUNT.toLocaleString()} chips to admin userId=${user.id} (${adminPhone})`);
+        } else {
+          console.warn(`[Recovery] addChipsToUser failed for userId=${user.id} — grant NOT marked applied (will retry next boot)`);
+        }
       }
 
       // One-time stars recovery grant — compensates for the persistStars
-      // pre-hydration clobber bug (fixed this commit).
+      // pre-hydration clobber bug (fixed this commit). Use the atomic
+      // additive `addStarsToUser` for the same reason chips use
+      // `addChipsToUser`, and route the idempotency flag through
+      // `mergeUserStats` for FOR-UPDATE-locked safety.
       if (!stats.starsRecoveryGrantApplied) {
         const STARS_GRANT = 50000;
-        await pool.query(`UPDATE users SET stars = stars + $1 WHERE id = $2`, [STARS_GRANT, user.id]);
-        stats.starsRecoveryGrantApplied = true;
-        stats.starsRecoveryGrantAt = new Date().toISOString();
-        mutatedStats = true;
-        console.log(`[Recovery] Granted ${STARS_GRANT.toLocaleString()} stars to admin userId=${user.id} (${adminPhone})`);
-      }
-
-      if (mutatedStats) {
-        await pool.query(`UPDATE users SET stats = $1 WHERE id = $2`, [JSON.stringify(stats), user.id]);
+        const ok = await addStarsToUser(user.id, STARS_GRANT);
+        if (ok) {
+          await mergeUserStats(user.id, {
+            starsRecoveryGrantApplied: true,
+            starsRecoveryGrantAt: new Date().toISOString(),
+          });
+          auditLog('SYSTEM', 'STARS_RECOVERY_GRANT', {
+            targetUserId: user.id,
+            amount: STARS_GRANT,
+            reason: 'persistStars_prehydrate_clobber',
+          });
+          console.log(`[Recovery] Granted ${STARS_GRANT.toLocaleString()} stars to admin userId=${user.id} (${adminPhone})`);
+        } else {
+          console.warn(`[Recovery] addStarsToUser failed for userId=${user.id} — grant NOT marked applied (will retry next boot)`);
+        }
       }
     }
   } catch (err: any) {

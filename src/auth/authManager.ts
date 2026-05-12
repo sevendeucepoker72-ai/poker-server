@@ -485,7 +485,16 @@ export async function saveProgress(userId: number, data: { level?: number; xp?: 
         vals.push(data.xp);
       }
     }
-    if (data.stats !== undefined) { sets.push(`stats = $${idx++}`); vals.push(JSON.stringify(data.stats)); }
+    // JSONB merge instead of full replacement: preserves DB keys that
+    // aren't part of this caller's payload (chipRecoveryGrantApplied,
+    // starsRecoveryGrantApplied, lastSeen, welcomedAt, etc.). A plain
+    // `stats = $N` write would clobber those — exactly the failure mode
+    // CLAUDE.md describes for stats-shaped fields. The `||` operator
+    // concatenates JSONB objects with right-hand precedence.
+    if (data.stats !== undefined) {
+      sets.push(`stats = COALESCE(stats, '{}'::jsonb) || $${idx++}::jsonb`);
+      vals.push(JSON.stringify(data.stats));
+    }
     // Achievements list should only grow — use a JSONB union via SQL so a
     // stale (empty) write doesn't erase unlocked achievements. We merge
     // existing + incoming, dedup, sort for stable comparison.
@@ -663,7 +672,12 @@ export async function searchUsers(query: string, limit = 10): Promise<Array<{ id
  */
 export async function persistStars(userId: number, stars: number): Promise<void> {
   try {
-    await pool.query('UPDATE users SET stars = $1 WHERE id = $2', [Math.max(0, Math.floor(stars)), userId]);
+    // GREATEST ratchet: a stale in-memory stars value (e.g. fresh-init 0
+    // racing a real grant) cannot regress the DB. Mirrors the pattern
+    // used for `level` and session `xp` in saveProgress. Belt + suspenders
+    // on top of the `progress.hydrated` gate at the call site.
+    // Earned: CLAUDE.md cites this as a class of historical regression.
+    await pool.query('UPDATE users SET stars = GREATEST(stars, $1) WHERE id = $2', [Math.max(0, Math.floor(stars)), userId]);
   } catch (e: any) {
     console.warn(`[persistStars ${userId}]`, e.message);
   }

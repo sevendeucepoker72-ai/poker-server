@@ -1,0 +1,77 @@
+# Canonical Features Manifest — poker-server (Railway socket server)
+#
+# PURPOSE: prevent feature regressions on deploy. The deploy script
+# (when wired) greps the BUILT bundle (dist/) and/or src/ for every
+# non-comment/non-blank line in this file and ABORTS the deploy if any
+# are missing. This is the same pattern as the mono-repo apps:
+# - apps/web/canonical-features.txt        (player web)
+# - apps/web/poker-admin/canonical-features.txt (admin)
+# - apps/marketing/canonical-features.txt (marketing)
+#
+# NOTE: 2026-05-12 — this manifest is currently READ-ONLY INVENTORY.
+# poker-server's Railway deploy script does NOT yet grep against it. The
+# file is committed now to establish the lock surface; the deploy-side
+# enforcement will be wired in a follow-up. Per CLAUDE.md's "three layers
+# of locks" rule, having the manifest in place is layer #1 (the contract);
+# the grep step is layer #2 (enforcement).
+#
+# RULES:
+# - One token per line
+# - Tokens matched as plain substrings (literal grep -F, not regex)
+# - Lines starting with `#` are comments. Blanks ignored.
+# - Use string literals (CSS class names, log tags, event-name strings,
+#   route paths) that survive Terser minification. Function names get
+#   mangled.
+# - When you ship a NEW feature you don't want to regress: append the
+#   identifying tokens in the SAME commit as the feature.
+# - When you legitimately retire a feature: delete the matching tokens
+#   in the same commit. The diff is the audit trail.
+
+# ============================================================
+# REST surface (Express, src/index.ts) — health + provably-fair
+# verification. If these routes disappear, /api/fairness verifiers and
+# the Railway health probe break.
+# ============================================================
+/api/fairness/
+/api/health
+
+# ============================================================
+# Socket event names emitted to clients. The 3D frontend
+# (poker-3d/src/services/socketService.js, tableStore.js) keys off these
+# strings — renaming any of them silently breaks the table view, the
+# action queue, or the provably-fair UI.
+# ============================================================
+deckCommitment
+deckSeedRevealed
+actionNonce
+tableUpdate
+
+# ============================================================
+# Cross-site SSO bridge — poker-server consumes id tokens minted by the
+# auth-server bridge flow. Anchor on the grant-type string and the URL
+# fragment key that AuthCallback parses. CLAUDE.md Pattern A precedent.
+# ============================================================
+bridge_id_token
+urn:apk:bridge
+
+# ============================================================
+# Chip-mutation invariants (CLAUDE.md "🚨 Chip mutations flow through
+# server-authoritative paths ONLY" rule). The whitelist of named entry
+# points must remain wired — renaming any of these silently breaks the
+# audit story and removes the only places that produce auditLog entries.
+# ============================================================
+addChipsToUser
+deductChips
+adminGrantChips
+adminRestoreBalance
+saveProgress
+
+# ============================================================
+# Graceful-shutdown flush (CLAUDE.md "🚨 User data MUST persist" rule).
+# Railway SIGTERMs the process on every redeploy; without these log tags
+# the cash-out + progress flush is silently missing. Anchor on the
+# bracket-prefixed log strings that survive minification.
+# ============================================================
+[Shutdown]
+SIGTERM
+SIGINT
