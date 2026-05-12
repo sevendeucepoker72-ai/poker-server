@@ -19,6 +19,14 @@ const KEY_PREFIX = 'hand:';
 const KEY_TTL_SECONDS = 60 * 60 * 2; // 2 hours
 const DEFAULT_DEBOUNCE_MS = 100;
 
+// Provably-fair revealed-commitment buffer keys: one LIST per table,
+// newest-first (LPUSH + LTRIM 0 49), capped at 50 entries to match the
+// in-process FAIRNESS_BUFFER_SIZE. 7-day TTL — older verifications
+// aren't useful to clients and we don't want unbounded growth.
+const FAIRNESS_KEY_PREFIX = 'poker:fairness:';
+const FAIRNESS_KEY_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
+const FAIRNESS_LIST_CAP = 50;
+
 let client: RedisClientType | null = null;
 let ready = false;
 let connectAttempted = false;
@@ -168,4 +176,102 @@ export async function scanHands(): Promise<Array<{ tableId: string; state: unkno
 export async function flushAll(): Promise<void> {
   const tableIds = Array.from(pendingTimers.keys());
   await Promise.all(tableIds.map((id) => flushHand(id)));
+}
+
+// ===== Provably-fair revealed-commitment buffer =====
+//
+// The in-process `revealedCommitmentsByTable` Map in index.ts is the
+// authoritative read source for /api/fairness/*. These helpers mirror
+// it to Redis so a Railway restart doesn't erase the last 50 revealed
+// commitments per table. On Redis-less instances they no-op (matching
+// the rest of this module).
+
+export interface RevealedFairnessEntry {
+  handNumber: number;
+  seed: string;
+  hash: string;
+  revealedAt: number;
+}
+
+let fairnessRedisWarned = false;
+function warnFairnessUnavailableOnce(reason: string): void {
+  if (fairnessRedisWarned) return;
+  fairnessRedisWarned = true;
+  console.warn(`[redisStore] fairness buffer persistence disabled (${reason}) — in-process only, will be lost on restart`);
+}
+
+/**
+ * Append a revealed commitment to the persistent rolling list for the
+ * given table. Newest-first (LPUSH), capped at FAIRNESS_LIST_CAP via
+ * LTRIM, with a 7-day TTL. Safe to call on Redis-less instances —
+ * degrades to a one-time warning.
+ */
+export async function appendFairnessCommitment(tableId: string, entry: RevealedFairnessEntry): Promise<void> {
+  if (!isRedisReady() || !client) {
+    warnFairnessUnavailableOnce(process.env.REDIS_URL ? 'redis not ready' : 'no REDIS_URL');
+    return;
+  }
+  try {
+    const key = FAIRNESS_KEY_PREFIX + tableId;
+    const json = JSON.stringify(entry);
+    // Pipeline so all three commands ship in one round-trip and the
+    // cap+TTL are guaranteed to apply alongside the push.
+    const multi = client.multi();
+    multi.lPush(key, json);
+    multi.lTrim(key, 0, FAIRNESS_LIST_CAP - 1);
+    multi.expire(key, FAIRNESS_KEY_TTL_SECONDS);
+    await multi.exec();
+  } catch (err) {
+    console.warn(`[redisStore] appendFairnessCommitment failed for ${tableId}:`, (err as Error)?.message);
+  }
+}
+
+/**
+ * Load the persisted fairness buffer for one table. Returns newest-first
+ * (matching the in-process Map shape) so callers can assign the result
+ * directly. Empty array if Redis is down or the key doesn't exist.
+ */
+export async function loadFairnessBuffer(tableId: string): Promise<RevealedFairnessEntry[]> {
+  if (!isRedisReady() || !client) return [];
+  try {
+    const raw = await client.lRange(FAIRNESS_KEY_PREFIX + tableId, 0, FAIRNESS_LIST_CAP - 1);
+    const out: RevealedFairnessEntry[] = [];
+    for (const item of raw) {
+      try {
+        const parsed = JSON.parse(item);
+        if (parsed && typeof parsed.handNumber === 'number' && typeof parsed.seed === 'string' && typeof parsed.hash === 'string') {
+          out.push(parsed as RevealedFairnessEntry);
+        }
+      } catch {
+        // skip corrupt entry
+      }
+    }
+    return out;
+  } catch (err) {
+    console.warn(`[redisStore] loadFairnessBuffer failed for ${tableId}:`, (err as Error)?.message);
+    return [];
+  }
+}
+
+/**
+ * Scan every poker:fairness:* key and return per-table buffers.
+ * Called on startup after connectRedis() to rehydrate the in-process
+ * `revealedCommitmentsByTable` Map.
+ */
+export async function scanFairnessBuffers(): Promise<Array<{ tableId: string; entries: RevealedFairnessEntry[] }>> {
+  if (!isRedisReady() || !client) return [];
+  const results: Array<{ tableId: string; entries: RevealedFairnessEntry[] }> = [];
+  try {
+    for await (const key of client.scanIterator({ MATCH: FAIRNESS_KEY_PREFIX + '*', COUNT: 100 })) {
+      const keys = Array.isArray(key) ? key : [key];
+      for (const k of keys) {
+        const tableId = (k as string).slice(FAIRNESS_KEY_PREFIX.length);
+        const entries = await loadFairnessBuffer(tableId);
+        if (entries.length > 0) results.push({ tableId, entries });
+      }
+    }
+  } catch (err) {
+    console.warn('[redisStore] scanFairnessBuffers failed:', (err as Error)?.message);
+  }
+  return results;
 }

@@ -1,6 +1,25 @@
 const AUTH_SERVER_URL = process.env.AUTH_SERVER_URL || 'https://auth.americanpubpoker.online';
 const INTROSPECTION_URL = `${AUTH_SERVER_URL}/token/introspection`;
 const CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'poker-server';
+
+// Fail-close the OAUTH_CLIENT_SECRET fallback. The dev value
+// ('dev-poker-server-secret') is public-knowledge and must NEVER be used to
+// authenticate to a real auth-server. In production (NODE_ENV=production or
+// any non-empty RAILWAY_ENVIRONMENT) we throw at module load so Railway
+// crash-loops the deploy until the env var is set — which is the right
+// behavior versus silently shipping with a known weak credential.
+// In dev, keep the fallback so local workflows still work, but log loudly.
+const IS_PRODUCTION = process.env.NODE_ENV === 'production' || !!process.env.RAILWAY_ENVIRONMENT;
+if (!process.env.OAUTH_CLIENT_SECRET) {
+  if (IS_PRODUCTION) {
+    throw new Error('OAUTH_CLIENT_SECRET env var is required in production');
+  }
+  // eslint-disable-next-line no-console
+  console.warn(
+    '[oauthValidator] OAUTH_CLIENT_SECRET is not set — falling back to the dev value. ' +
+      'This is only safe in local development. Set OAUTH_CLIENT_SECRET before deploying.'
+  );
+}
 const CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET || 'dev-poker-server-secret';
 
 export interface OAuthTokenResult {

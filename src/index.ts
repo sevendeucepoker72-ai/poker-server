@@ -23,6 +23,8 @@ import {
   flushAll as flushAllHandSnapshots,
   isRedisReady as isHandStoreReady,
   pingRedis,
+  appendFairnessCommitment,
+  scanFairnessBuffers,
 } from './redisStore';
 // Re-export GamePhase values for draw/stud phase checks
 const DrawPhases = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
@@ -1441,6 +1443,14 @@ function recordRevealedCommitment(tableId: string, rc: RevealedCommitment) {
   if (!buf) { buf = []; revealedCommitmentsByTable.set(tableId, buf); }
   buf.unshift(rc);
   if (buf.length > FAIRNESS_BUFFER_SIZE) buf.length = FAIRNESS_BUFFER_SIZE;
+  // Mirror to Redis so the rolling buffer survives Railway restarts.
+  // Fire-and-forget — the in-process Map is the authoritative read source
+  // for /api/fairness/* during this process's lifetime; Redis only matters
+  // after a restart. If Redis is unavailable the helper logs once and
+  // no-ops, so this never blocks gameplay.
+  appendFairnessCommitment(tableId, rc).catch((err) => {
+    console.warn(`[Fairness] persist failed for table=${tableId} hand=${rc.handNumber}:`, (err as Error)?.message);
+  });
 }
 
 function ensureTableProgressListener(table: PokerTable, tableId: string): void {
@@ -8217,6 +8227,27 @@ httpServer.listen(PORT, async () => {
       }
     } catch (err) {
       console.warn('[Rehydrate] scan failed:', (err as Error)?.message);
+    }
+
+    // Rehydrate the provably-fair revealed-commitment buffer. Without
+    // this, /api/fairness/:tableId returns empty after every Railway
+    // restart even though the commitment was logged. The Redis copy
+    // becomes the in-process Map directly — we never read from Redis
+    // again during this process's lifetime.
+    try {
+      const fairnessBuffers = await scanFairnessBuffers();
+      let totalEntries = 0;
+      for (const { tableId, entries } of fairnessBuffers) {
+        // Defensive cap in case Redis state somehow exceeds the limit.
+        const capped = entries.slice(0, FAIRNESS_BUFFER_SIZE);
+        revealedCommitmentsByTable.set(tableId, capped);
+        totalEntries += capped.length;
+      }
+      if (totalEntries > 0) {
+        console.log(`[Rehydrate] restored ${totalEntries} fairness commitment(s) across ${fairnessBuffers.length} table(s) from Redis`);
+      }
+    } catch (err) {
+      console.warn('[Rehydrate] fairness scan failed:', (err as Error)?.message);
     }
   }
 });
