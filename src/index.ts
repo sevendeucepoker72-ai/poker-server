@@ -771,7 +771,15 @@ interface QualifierTournamentReg {
   scheduledAt: string; // ISO timestamp
   startingStack: number;
   maxPlayers: number;
-  players: { playerId: string; playerName: string; phone: string; socketId: string }[];
+  // Re-entry economics — round-4 audit P0 #4 (2026-05-12). Defaults are
+  // applied at registration if the qualifier was lazily created here.
+  // TODO: when a `games`-backed qualifier schema lands (with buy_in,
+  //       max_re_entries, late_entry_close_time columns), hydrate these
+  //       from the row instead of in-memory defaults.
+  buyIn?: number;
+  maxReEntries?: number;
+  requiresQualifierCredit?: boolean;
+  players: { playerId: string; playerName: string; phone: string; socketId: string; reEntries?: number }[];
   status: 'registering' | 'starting' | 'running' | 'finished';
   tournamentId: string | null; // linked TournamentManager ID once started
   blindStructure: any[];
@@ -2912,11 +2920,95 @@ io.on('connection', (socket: Socket) => {
         return;
       }
 
-      // Re-entry: check if they have remaining qualifier credits
-      // (The frontend should verify credits before allowing re-entry)
-      // Allow the re-entry — they'll be seated at a new table with starting stack
+      // Re-entry: enforce server-side caps + chip/credit consumption.
+      // Round-4 audit P0 #4 (2026-05-12): handler previously deducted no
+      // chips, consumed no qualifier credit, and trusted the frontend to
+      // enforce the re-entry cap. That violates the
+      // server-authoritative chip-mutations rule (CLAUDE.md). All gates
+      // now run BEFORE sitDown; on any failure we bail without re-seating.
       if (isLateReg && tournament) {
-        // Find a table with empty seats and seat them
+        // (a) Max re-entry quota. Defensive default of 3 until a
+        // games-backed schema with a per-tournament max_re_entries
+        // column exists. TODO referenced on the interface above.
+        const MAX_RE_ENTRIES_DEFAULT = 3;
+        const maxReEntries = qt.maxReEntries ?? MAX_RE_ENTRIES_DEFAULT;
+        const priorReEntries = (existingEntry as any).reEntries || 0;
+        if (priorReEntries >= maxReEntries) {
+          socket.emit('qualifierRegistrationResult', { success: false, error: `Re-entry limit reached (${maxReEntries})` });
+          return;
+        }
+
+        // (b) Atomic chip deduction (mirrors cash-buy-in pattern at
+        // index.ts:4471 and rebuy at index.ts:5878). Only runs when the
+        // qualifier carries a chip buy-in.
+        const buyIn = Math.floor(qt.buyIn || 0);
+        if (buyIn > 0) {
+          const dbChips = await ensureChipsForBuyIn(auth.userId, auth.username, buyIn);
+          if (buyIn > dbChips) {
+            socket.emit('qualifierRegistrationResult', { success: false, error: 'Insufficient chips for re-entry' });
+            return;
+          }
+          if (!(await deductChips(auth.userId, buyIn))) {
+            socket.emit('qualifierRegistrationResult', { success: false, error: 'Could not deduct chips — try again' });
+            return;
+          }
+          auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_DEDUCT', { qualifierId: qualId, buyIn, priorReEntries });
+        }
+
+        // (c) Qualifier-credit consumption — atomic conditional update
+        // mirrors apps/lambdas/poker-api/src/handlers/qualifierCredits.js
+        // redeemCredit(). Picks the oldest unredeemed credit owned by
+        // this user and stamps it; if none are available we refund the
+        // buy-in and abort.
+        let consumedCreditId: string | null = null;
+        if (qt.requiresQualifierCredit) {
+          try {
+            const credRes = await getPool().query(
+              `UPDATE qualifier_credits
+                  SET redeemed_at = NOW(),
+                      redeemed_for_qualifier_id = $1,
+                      notes = COALESCE(notes, '') || ' [re-entry]'
+                WHERE id = (
+                  SELECT id FROM qualifier_credits
+                   WHERE player_id = $2 AND redeemed_at IS NULL
+                   ORDER BY created_at ASC
+                   LIMIT 1
+                )
+                RETURNING id`,
+              [qualId, auth.userId]
+            );
+            if (credRes.rows.length === 0) {
+              // Refund the chip buy-in we just took (if any) — the
+              // re-entry isn't happening.
+              if (buyIn > 0) {
+                try {
+                  await addChipsToUser(auth.userId, buyIn);
+                  auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND', { qualifierId: qualId, buyIn, reason: 'no_credit' });
+                } catch (e) {
+                  auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND_FAILED', { qualifierId: qualId, buyIn, error: String(e) });
+                }
+              }
+              socket.emit('qualifierRegistrationResult', { success: false, error: 'No qualifier credits available for re-entry' });
+              return;
+            }
+            consumedCreditId = credRes.rows[0].id;
+            auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_CONSUME', { qualifierId: qualId, creditId: consumedCreditId });
+          } catch (err: any) {
+            // Refund the buy-in on DB error — never leave a player out
+            // of pocket without a re-entry.
+            if (buyIn > 0) {
+              try {
+                await addChipsToUser(auth.userId, buyIn);
+                auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND', { qualifierId: qualId, buyIn, reason: 'credit_db_error' });
+              } catch (_) { /* logged below */ }
+            }
+            console.error('[QualifierReEntry] credit consume failed:', err);
+            socket.emit('qualifierRegistrationResult', { success: false, error: 'Server error consuming qualifier credit' });
+            return;
+          }
+        }
+
+        // (d) NOW re-seat. Find a table with empty seats.
         const startingStack = qt.startingStack || 50000;
         let seated = false;
         for (const tid of tournament.tableIds) {
@@ -2940,9 +3032,34 @@ io.on('connection', (socket: Socket) => {
           if (seated) break;
         }
         if (!seated) {
+          // Roll back every charge so the player isn't billed for a
+          // seat they never got. Mirrors the BUY_IN_REFUND path at
+          // index.ts:4493.
+          if (buyIn > 0) {
+            try {
+              await addChipsToUser(auth.userId, buyIn);
+              auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND', { qualifierId: qualId, buyIn, reason: 'no_seat' });
+            } catch (e) {
+              auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND_FAILED', { qualifierId: qualId, buyIn, error: String(e) });
+            }
+          }
+          if (consumedCreditId) {
+            try {
+              await getPool().query(
+                `UPDATE qualifier_credits SET redeemed_at = NULL, redeemed_for_qualifier_id = NULL WHERE id = $1`,
+                [consumedCreditId]
+              );
+              auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_REFUND', { qualifierId: qualId, creditId: consumedCreditId, reason: 'no_seat' });
+            } catch (e) {
+              auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: consumedCreditId, error: String(e) });
+            }
+          }
           socket.emit('qualifierRegistrationResult', { success: false, error: 'No seats available for re-entry' });
           return;
         }
+        // Bump in-memory re-entry counter — survives until the qt is
+        // garbage-collected on tournament finish.
+        (existingEntry as any).reEntries = priorReEntries + 1;
         socket.emit('qualifierRegistrationResult', { success: true, qualifierId: qualId, reentry: true });
         broadcastGameState(tournament.tableIds[0]);
         return;
@@ -3701,6 +3818,13 @@ Give feedback in this JSON format:
     try {
       const CHIP_AMOUNT = 1_000_000_000;
       const STAR_AMOUNT = 50_000;
+      // Mirror the adminGrantChips anti-cheat alert path. adminRestoreBalance
+      // bypassed it for months; round-4 audit P0 #5. Threshold value matches
+      // the one defined locally in adminGrantChips above (1_000_000).
+      const CHIP_GRANT_ALERT_THRESHOLD = 1_000_000;
+      if (CHIP_AMOUNT >= CHIP_GRANT_ALERT_THRESHOLD) {
+        console.warn(`[AntiCheat] LARGE CHIP GRANT ALERT: admin ${auth.username} restored ${CHIP_AMOUNT} chips to userId=${auth.userId}`);
+      }
       await getPool().query(
         `UPDATE users SET chips = chips + $1, stars = stars + $2 WHERE id = $3`,
         [CHIP_AMOUNT, STAR_AMOUNT, auth.userId]
@@ -7689,6 +7813,38 @@ function startTournamentGame(tournamentId: string): void {
     }
   }
 
+  // === Push notification: tournament_start ===
+  // Fan out to every registered human player on this tournament. Uses
+  // Promise.allSettled so one bad subscription can't block the rest.
+  // dedupeKey on the API side (60s window) prevents same-key replay.
+  try {
+    const tName = tournament.config.name;
+    const notifyTargets: Promise<void>[] = [];
+    for (let i = 0; i < tournament.players.length && i < 9; i++) {
+      const tp = tournament.players[i];
+      const auth = authSessions.get(tp.socketId);
+      const uid = auth?.userId;
+      if (!uid) continue; // skip unauthenticated / bots
+      notifyTargets.push(
+        notifyPlayer(
+          uid,
+          'tournament_start',
+          'Tournament starting',
+          `${tName} is starting now — you're seated at Table 1`,
+          {
+            priority: 'urgent',
+            metadata: { gameId: tableId, tournamentId, seatNumber: i, tableNum: 1 },
+          }
+        )
+      );
+    }
+    if (notifyTargets.length > 0) {
+      void Promise.allSettled(notifyTargets);
+    }
+  } catch (err) {
+    console.warn('[notifyPlayer tournament_start] hook failed:', (err as Error)?.message);
+  }
+
   // Fill remaining seats with AI
   fillWithAI(table, tableId);
   ensureTableProgressListener(table, tableId);
@@ -7707,6 +7863,33 @@ function startTournamentGame(tournamentId: string): void {
         t.config.ante = data.ante;
       }
       io.to(`table:${tableId}`).emit('blindLevelUp', data);
+
+      // === Push notification: blind_level_up ===
+      // Fan out to every human seat at this tournament table. Fire-and-forget;
+      // notification failure must never break the blind-up state machine.
+      try {
+        const t2 = tableManager.getTable(tableId);
+        if (t2) {
+          const newLevel = data?.level ?? 0;
+          const tableLabel = t2.config.tableName || 'your table';
+          for (let i = 0; i < t2.seats.length; i++) {
+            const seat = t2.seats[i];
+            if (!seat || seat.state !== 'occupied') continue;
+            if (seat.isAI || !seat.playerName) continue;
+            const uid = userIdForSeat(tableId, i);
+            if (!uid) continue;
+            void notifyPlayer(
+              uid,
+              'blind_level_up',
+              'Blinds increasing',
+              `Level ${newLevel} now in play at ${tableLabel}`,
+              { priority: 'normal', metadata: { gameId: tableId, tournamentId, level: newLevel } }
+            );
+          }
+        }
+      } catch (err) {
+        console.warn('[notifyPlayer blind_level_up] hook failed:', (err as Error)?.message);
+      }
     }
     if (event === 'tournamentFinished') {
       io.to(`table:${tableId}`).emit('tournamentFinished', data);
@@ -7871,6 +8054,37 @@ function startMultiTableTournament(
           totalPlayers: playerCount,
           tableCount,
         });
+
+        // === Push notification: tournament_start ===
+        // Fire-and-forget per registered human. Promise.allSettled wraps
+        // the (currently single-human) fan-out so a failing subscription
+        // never blocks tournament startup.
+        try {
+          const auth = authSessions.get(humanSocketId);
+          const uid = auth?.userId;
+          if (uid) {
+            const tableNum = tableIdx + 1;
+            void Promise.allSettled([
+              notifyPlayer(
+                uid,
+                'tournament_start',
+                'Tournament starting',
+                `${tournament.config.name} is starting now — you're seated at Table ${tableNum}`,
+                {
+                  priority: 'urgent',
+                  metadata: {
+                    gameId: tid,
+                    tournamentId,
+                    seatNumber: seatIdx,
+                    tableNum,
+                  },
+                }
+              ),
+            ]);
+          }
+        } catch (err) {
+          console.warn('[notifyPlayer tournament_start] hook failed:', (err as Error)?.message);
+        }
       }
     }
 
@@ -7904,6 +8118,33 @@ function startMultiTableTournament(
           t.config.ante = data.ante;
         }
         io.to(`table:${tid}`).emit('blindLevelUp', data);
+
+        // === Push notification: blind_level_up ===
+        // Fan out to every human seat at this tournament table. Fire-and-forget;
+        // notification failure must never break the blind-up state machine.
+        try {
+          const t2 = tableManager.getTable(tid);
+          if (t2) {
+            const newLevel = data?.level ?? 0;
+            const tableLabel = t2.config.tableName || 'your table';
+            for (let i = 0; i < t2.seats.length; i++) {
+              const seat = t2.seats[i];
+              if (!seat || seat.state !== 'occupied') continue;
+              if (seat.isAI || !seat.playerName) continue;
+              const uid = userIdForSeat(tid, i);
+              if (!uid) continue;
+              void notifyPlayer(
+                uid,
+                'blind_level_up',
+                'Blinds increasing',
+                `Level ${newLevel} now in play at ${tableLabel}`,
+                { priority: 'normal', metadata: { gameId: tid, tournamentId, level: newLevel } }
+              );
+            }
+          }
+        } catch (err) {
+          console.warn('[notifyPlayer blind_level_up] hook failed:', (err as Error)?.message);
+        }
       }
     }
     if (event === 'playerEliminated') {
