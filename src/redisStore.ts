@@ -31,6 +31,17 @@ export function isRedisReady(): boolean {
 }
 
 /**
+ * Ping Redis (returns 'PONG' on success). Used by /api/health to detect a
+ * dead/disconnected Redis even when our `ready` flag hasn't been flipped yet.
+ * Resolves to 'SKIP' when Redis is not configured (so health checks don't
+ * fail on local dev / instances without REDIS_URL set).
+ */
+export async function pingRedis(): Promise<string> {
+  if (!isRedisReady() || !client) return 'SKIP';
+  return await client.ping();
+}
+
+/**
  * Connect to Redis if REDIS_URL is set. Safe to call multiple times —
  * only connects once. Returns true if connection succeeds, false on
  * any failure (including missing URL).

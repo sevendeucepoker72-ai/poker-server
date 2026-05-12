@@ -22,6 +22,7 @@ import {
   scanHands,
   flushAll as flushAllHandSnapshots,
   isRedisReady as isHandStoreReady,
+  pingRedis,
 } from './redisStore';
 // Re-export GamePhase values for draw/stud phase checks
 const DrawPhases = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
@@ -47,6 +48,10 @@ import { VariantType } from './game/variants/PokerVariant';
 import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, loadDurableProgress } from './auth/authManager';
 import { validateOAuthToken } from './auth/oauthValidator';
 import { notifyPlayer } from './notifyClient';
+// 2026-05-12 audit: pino logger import. Hot-path console.log calls are
+// being migrated to log.debug so they mute under production pino level
+// (info+) without losing the field structure for ops/debug builds.
+import { log } from './logger';
 import {
   initClubTables,
   createClub,
@@ -110,6 +115,28 @@ import {
   CLUB_LEVEL_THRESHOLDS,
   CLUB_LEVEL_PERKS,
 } from './clubs/clubManager';
+
+// ========== Sentry (optional, prod-only crash reporting) ==========
+// Initialized BEFORE the express app + socket.io server so any synchronous
+// throw during startup is captured. Loaded via require() so the dependency
+// is genuinely optional — if @sentry/node isn't installed (local dev) the
+// try/catch swallows the load error and Sentry stays null.
+let Sentry: any = null;
+if (process.env.SENTRY_DSN) {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const sentryMod = require('@sentry/node');
+    sentryMod.init({
+      dsn: process.env.SENTRY_DSN,
+      environment: process.env.NODE_ENV || 'development',
+      tracesSampleRate: 0.1,
+    });
+    Sentry = sentryMod;
+    console.log('[Sentry] Initialized');
+  } catch (e: any) {
+    console.warn('[Sentry] Init failed (module missing?):', e?.message);
+  }
+}
 
 // ========== Server Setup ==========
 
@@ -348,8 +375,12 @@ const ipSeatedSlots = new Map<string, Set<string>>();
 const chipVelocity = new Map<number, { chipsAtStart: number; sessionStartAt: number; handsThisSession: number; lastActionMs: number[] }>();
 // Bot detection: socketId -> list of action response times in ms
 const actionTimings = new Map<string, number[]>();
-// Action nonce tracking: tableId:seatIndex -> last nonce used
-const actionNonces = new Map<string, string>();
+// Action nonce tracking: tableId:seatIndex -> { last nonce used, last-write timestamp }
+// The key is NOT a socket id — it's a table:seat composite, so the periodic
+// sweeper must age entries by timestamp (not by socket-liveness), otherwise
+// it nukes every entry on the first pass and silently disables replay
+// protection. See sweeper below + /actions handler at write site.
+const actionNonces = new Map<string, { nonce: string; ts: number }>();
 // Chip velocity auto-ban counter: userId -> { count, lastAlertAt }
 // Decays by 1 every CHIP_VELOCITY_DECAY_MS of quiet time so a user who
 // got 2 false-positive alerts months ago isn't auto-banned on alert #3
@@ -434,7 +465,14 @@ setInterval(() => {
   for (const [sid, ts] of lastChatTime)     { if (now - ts > RATE_MAP_TTL_MS && !io.sockets.sockets.get(sid)) lastChatTime.delete(sid); }
   // actionTimings: drop if socket is gone
   for (const sid of actionTimings.keys())   { if (!io.sockets.sockets.get(sid)) actionTimings.delete(sid); }
-  for (const sid of actionNonces.keys())    { if (!io.sockets.sockets.get(sid)) actionNonces.delete(sid); }
+  // actionNonces: keyed by tableId:seatIndex (NOT socket id) — age by timestamp.
+  // 10-minute TTL: an action older than 10 min can't realistically replay
+  // because the table state has moved well past it. (Originally this loop
+  // tested against io.sockets.sockets.get(key) and deleted EVERY entry on
+  // every pass, silently disabling replay protection — see Map comment above.)
+  for (const [key, entry] of actionNonces) {
+    if (now - entry.ts > 10 * 60 * 1000) actionNonces.delete(key);
+  }
   // chipVelocity: drop entries with no recent activity. Shortened from
   // 4h idle to 30min — the map doesn't need to live past the user's
   // active poker session. Long-tail retention was the main contributor
@@ -595,8 +633,22 @@ app.get('/api/tables', (_req, res) => {
   res.json(tables);
 });
 
-app.get('/api/health', (_req, res) => {
-  res.json({ status: 'ok', tables: tableManager.getTableList().length });
+app.get('/api/health', async (_req, res) => {
+  // A real liveness check: ping the DB + Redis (if configured) under a 1.5s
+  // budget. A 200 here means the process can actually serve traffic; the
+  // previous always-200 endpoint let Railway happily route requests at an
+  // instance whose DB pool had died.
+  try {
+    const tDb = getPool().query('SELECT 1');
+    const tRedis = pingRedis();
+    const timeout = new Promise<never>((_, rej) =>
+      setTimeout(() => rej(new Error('healthcheck timeout')), 1500),
+    );
+    await Promise.race([Promise.all([tDb, tRedis]), timeout]);
+    res.json({ status: 'ok', tables: tableManager.getTableList().length });
+  } catch (e: any) {
+    res.status(503).json({ status: 'unhealthy', error: e?.message || String(e) });
+  }
 });
 
 // ========== Provably-fair shuffle verification ==========
@@ -1267,7 +1319,8 @@ function broadcastGameState(tableId: string): void {
         const seat = t.seats[activeSeat];
         if (!seat || !seat.playerName || seat.folded) return;
         const callAmt = t.currentBetToMatch - (seat.currentBet || 0);
-        console.log(`[Timer] Seat ${activeSeat} (${seat.playerName}) timed out — ${callAmt > 0 ? 'folding' : 'checking'}`);
+        // 2026-05-12 audit: throttled to debug, was console.log
+        log.debug(`[Timer] Seat ${activeSeat} (${seat.playerName}) timed out — ${callAmt > 0 ? 'folding' : 'checking'}`);
         if (callAmt > 0) {
           t.playerFold(activeSeat);
         } else {
@@ -1448,6 +1501,14 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     recordRevealedCommitment(tableId, { ...c, revealedAt: Date.now() });
   });
 
+  // Pre-hand commitment: clients receive the SHA-256 hash BEFORE the hand
+  // starts so they can later verify it matches the seed revealed at hand
+  // completion. Without this emit the fairness contract is broken — players
+  // would only ever see the post-hand seed with nothing to compare it to.
+  table.on('deckCommitment', (c: { hash: string; handNumber: number }) => {
+    io.to(`table:${tableId}`).emit('deckCommitment', { ...c, committedAt: Date.now() });
+  });
+
   // Emit hand history to all human players at the table (Part 3)
   table.on('handHistory', (history: HandHistoryRecord) => {
     const serializeCard = (c: Card) => ({
@@ -1575,7 +1636,8 @@ function trimExcessAI(
     table.standUp(i);
     if (profiles) profiles.delete(i);
   }
-  console.log(`[LiveRoom] trimExcessAI ${tableId}: removed ${toRemove} AI seats (was ${occupied}, cap ${targetMaxOccupied}, phase ${table.currentPhase})`);
+  // 2026-05-12 audit: throttled to debug, was console.log
+  log.debug(`[LiveRoom] trimExcessAI ${tableId}: removed ${toRemove} AI seats (was ${occupied}, cap ${targetMaxOccupied}, phase ${table.currentPhase})`);
 }
 
 function scheduleAIAction(tableId: string): void {
@@ -1858,7 +1920,8 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
   if (sock) {
     sock.emit('moveSeatComplete', { tableId, newSeat: target });
   }
-  console.log(`[MoveSeat] ${playerName} moved to seat ${target} on ${tableId} (${chipCount} chips)`);
+  // 2026-05-12 audit: throttled to debug, was console.log
+  log.debug(`[MoveSeat] ${playerName} moved to seat ${target} on ${tableId} (${chipCount} chips)`);
   return true;
 }
 
@@ -2102,7 +2165,8 @@ setInterval(() => {
       if (before !== after) trimmedTables++;
     }
     if (trimmedTables > 0) {
-      console.log(`[LiveRoom] heartbeat: ${trimmedTables} table(s) changed occupancy`);
+      // 2026-05-12 audit: throttled to debug, was console.log
+      log.debug(`[LiveRoom] heartbeat: ${trimmedTables} table(s) changed occupancy`);
     }
   } catch (err) {
     console.error('[LiveRoom] heartbeat error:', (err as Error).message);
@@ -2690,12 +2754,20 @@ io.on('connection', (socket: Socket) => {
       }
       if (slots.size === 0) ipSeatedSlots.delete(ip);
     }
-    actionNonces.delete(socket.id);
+    // NOTE: actionNonces is keyed by tableId:seatIndex, not socket.id —
+    // disconnect cleanup happens via the timestamp sweeper above (10-min TTL).
     actionTimings.delete(socket.id);
     tokenLoginAttempts.delete(socket.id);
     lastEmoteTime.delete(socket.id);
     lastReactionTime.delete(socket.id);
     lastChatTime.delete(socket.id);
+    // Spectator cleanup: explicit stopSpectating is the happy path, but a tab
+    // close fires only `disconnect`, leaving stale socket ids in the per-table
+    // Set and inflating the broadcasted spectatorCount forever.
+    for (const [tableId, specs] of spectators) {
+      if (specs.delete(socket.id) && specs.size === 0) spectators.delete(tableId);
+    }
+    lastSentState.delete(socket.id);
   });
 
   console.log(`Player connected: ${socket.id}`);
@@ -2704,7 +2776,9 @@ io.on('connection', (socket: Socket) => {
 
   socket.on('login', async (data: { phone?: string; username?: string; password: string }) => {
     const phone = data.phone || data.username || '';
-    console.log(`[Auth] Login attempt: phone="${phone}", hasPassword=${!!data?.password}`);
+    // Phone is PII — log only the last 4 digits so the audit trail is useful
+    // for support without exposing the full number in shared log aggregators.
+    console.log(`[Auth] Login attempt: phone="****${String(phone).slice(-4)}", hasPassword=${!!data?.password}`);
     const result = await loginUserAsync(phone, data.password);
     console.log(`[Auth] Login result: success=${result.success}, error=${result.error || 'none'}`);
     if (result.success && result.userData) {
@@ -3273,6 +3347,7 @@ Give feedback in this JSON format:
       );
     } catch (err: any) {
       console.error('[OAuth] oauthLogin error:', err);
+      if (Sentry) Sentry.captureException(err, { tags: { area: 'auth.oauthLogin' } });
       socket.emit('loginResult', { success: false, error: 'Authentication failed' });
     }
   });
@@ -3632,6 +3707,7 @@ Give feedback in this JSON format:
       sendProgressToPlayer(socket.id);
     } catch (err: any) {
       console.error('[adminRestoreBalance]', err);
+      if (Sentry) Sentry.captureException(err, { tags: { area: 'chip.adminRestoreBalance' } });
       socket.emit('adminRestoreBalanceResult', { success: false, error: 'Server error' });
     }
   });
@@ -4582,6 +4658,7 @@ Give feedback in this JSON format:
             // log + audit loud so an operator can manually restore. Matches
             // the joinTable path's error handling at ~line 4255.
             console.error(`[Buy-in] QUICKPLAY_REFUND failed for userId=${authForJoin.userId}, amount=${buyIn}:`, e);
+            if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.quickplayRefund' }, extra: { userId: authForJoin.userId, buyIn } });
             auditLog(authForJoin.username, 'QUICKPLAY_REFUND_FAILED', { tableId: chosenTableId, buyIn, error: String(e) });
           }
         }
@@ -4612,10 +4689,12 @@ Give feedback in this JSON format:
       // Auto-start hand if not in progress
       const inProgress = table.isHandInProgress();
       const occupied = table.getOccupiedSeatCount();
-      console.log(`[QP] inProgress=${inProgress}, occupied=${occupied}, phase=${table.currentPhase}`);
+      // 2026-05-12 audit: throttled to debug, was console.log
+      log.debug(`[QP] inProgress=${inProgress}, occupied=${occupied}, phase=${table.currentPhase}`);
       if (!inProgress && occupied >= 2) {
         const started = table.startNewHand();
-        console.log(`[QP] startNewHand result: ${started}, phase now: ${table.currentPhase}, cards: ${table.seats[targetSeat].holeCards.length}`);
+        // 2026-05-12 audit: throttled to debug, was console.log
+        log.debug(`[QP] startNewHand result: ${started}, phase now: ${table.currentPhase}, cards: ${table.seats[targetSeat].holeCards.length}`);
       }
 
       socket.emit(
@@ -5796,7 +5875,8 @@ Give feedback in this JSON format:
     seat.eliminated = false;
     broadcastGameState(session.tableId);
     socket.emit('rebuyComplete', { success: true, newStack: requested, added: topUpAmount });
-    console.log(`[Rebuy] ${seat.playerName} topped up by ${topUpAmount} to ${requested}`);
+    // 2026-05-12 audit: throttled to debug, was console.log
+    log.debug(`[Rebuy] ${seat.playerName} topped up by ${topUpAmount} to ${requested}`);
   })(); });
 
   // ========== Seat move (cash tables only) ==========
@@ -5945,15 +6025,17 @@ Give feedback in this JSON format:
       }
 
       // Nonce replay prevention (keyed per table:seat so multi-table players
-      // can't replay a nonce from one table at another)
+      // can't replay a nonce from one table at another). Stamped with ts so
+      // the periodic sweeper can age entries out — the previous keys-only
+      // shape (string) defeated the sweeper and silently disabled this guard.
       if (data.nonce) {
         const nonceKey = `${session.tableId}:${session.seatIndex}`;
-        const lastNonce = actionNonces.get(nonceKey);
-        if (lastNonce === data.nonce) {
+        const lastEntry = actionNonces.get(nonceKey);
+        if (lastEntry && lastEntry.nonce === data.nonce) {
           socket.emit('error', { message: 'Duplicate action' });
           return;
         }
-        actionNonces.set(nonceKey, data.nonce);
+        actionNonces.set(nonceKey, { nonce: data.nonce, ts: Date.now() });
       }
 
       // Bot detection: track action timings
@@ -7472,6 +7554,7 @@ function handlePlayerLeave(socket: Socket): void {
         })
         .catch((e: any) => {
           console.error(`[handlePlayerLeave cash-out ${auth.userId}] amount=${chipsToReturn}`, e?.message || e);
+          if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.cashOut' }, extra: { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn } });
           auditLog(auth.username, 'CASH_OUT_FAILED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, error: String(e?.message || e) });
         });
     }
@@ -8238,6 +8321,7 @@ async function gracefulShutdown(signal: string) {
     console.log('[Shutdown] State preserved. Exiting.');
   } catch (err: any) {
     console.error('[Shutdown] fatal error during flush:', err?.message);
+    if (Sentry) Sentry.captureException(err, { tags: { area: 'shutdown.flush' } });
   } finally {
     // Give the logger a moment, then exit so Railway can finish the redeploy.
     setTimeout(() => process.exit(0), 500);

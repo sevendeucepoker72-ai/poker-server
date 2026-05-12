@@ -4,6 +4,7 @@ import {
 } from './PlayerProgress';
 import {
   persistStars as dbPersistStars,
+  deductStars as dbDeductStars,
   loadDurableProgress,
   loadInventory,
   loadProgress as dbLoadProgress,
@@ -804,8 +805,29 @@ export class ProgressionManager {
     if (progress.ownedThemes.includes(themeId)) return { success: false, error: 'Already owned' };
     if (progress.stars < cost) return { success: false, error: 'Not enough stars' };
 
+    // 2026-05-12 audit fix: this used to call `this.persistStars(progress)`
+    // after `progress.stars -= cost`. After the round-1 GREATEST ratchet
+    // change in persistStars (`SET stars = GREATEST(stars, $1)`) the DB
+    // refused to lower the value — user kept their stars AND got the theme.
+    // Use the atomic deduct path instead, which uses
+    // `UPDATE ... SET stars = stars - $1 WHERE stars >= $1`. Returns false
+    // on insufficient DB-side balance (defense-in-depth against in-memory
+    // drift from the live DB row).
+    const dbUid = progress.userId;
+    if (typeof dbUid === 'number' && dbUid > 0) {
+      dbDeductStars(dbUid, cost).then((ok) => {
+        if (!ok) {
+          // DB had less than the in-memory snapshot — roll back in-memory.
+          progress.stars += cost;
+          const idx = progress.ownedThemes.indexOf(themeId);
+          if (idx >= 0) progress.ownedThemes.splice(idx, 1);
+          console.warn(`[purchaseTheme ${progress.userId}] DB deduct rejected for ${cost} stars on ${themeId}; rolled back in-memory`);
+        }
+      }).catch((e) => {
+        console.warn(`[purchaseTheme ${progress.userId}] deductStars threw:`, e?.message);
+      });
+    }
     progress.stars -= cost;
-    this.persistStars(progress);
     progress.ownedThemes.push(themeId);
     return { success: true };
   }
