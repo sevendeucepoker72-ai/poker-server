@@ -4505,6 +4505,21 @@ Give feedback in this JSON format:
         }
       }
 
+      // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
+      // A socket that did `spectate` → `joinTable` would remain in the
+      // `spectators` Map AND get added to `playerSessions`. The next
+      // broadcastGameState then ran both loops and emitted two `gameState`
+      // events to the same socket — the second (spectator) emit carried
+      // `yourCards: []` and clobbered the seated-player emit, so the user
+      // saw their hole cards flicker / clear mid-hand. handlePlayerLeave
+      // already scrubs spectators (line ~7750), but it early-returns when
+      // there's no playerSessions entry — so a spectator-only socket
+      // calling joinTable skipped that cleanup entirely. Scrub here BEFORE
+      // any other state changes so every joinTable entrant exits cleanly.
+      for (const [tid, s] of spectators) {
+        if (s.delete(socket.id) && s.size === 0) spectators.delete(tid);
+      }
+
       // If player already has a session, leave old table first
       const existingSession = playerSessions.get(socket.id);
       if (existingSession) {
@@ -4674,6 +4689,14 @@ Give feedback in this JSON format:
     'quickPlay',
     (data: { playerName: string; avatar?: string }) => { (async () => {
       const { playerName } = data;
+
+      // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
+      // See joinTable handler above for the full rationale — same bug
+      // applies to quickPlay because handlePlayerLeave early-returns
+      // for spectator-only sockets.
+      for (const [tid, s] of spectators) {
+        if (s.delete(socket.id) && s.size === 0) spectators.delete(tid);
+      }
 
       // If the player already has a session on a table, leave it first
       const existingSession = playerSessions.get(socket.id);
@@ -5819,6 +5842,13 @@ Give feedback in this JSON format:
         if (!authSessions.has(socket.id)) {
           socket.emit('error', { message: 'Authentication could not be established — please sign in and try again.' });
           return;
+        }
+
+        // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
+        // See joinTable handler for the full rationale — same bug
+        // applies on this seat-after-auth path.
+        for (const [tid, s] of spectators) {
+          if (s.delete(socket.id) && s.size === 0) spectators.delete(tid);
         }
 
         // 2) Pick lowest-stakes Texas Hold'em table (Beginner's Table)

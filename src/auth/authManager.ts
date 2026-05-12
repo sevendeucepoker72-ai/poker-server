@@ -116,8 +116,18 @@ export async function initDB(): Promise<void> {
   // Without these, pool.connect() could wait on the default kernel TCP
   // timeout (~2 min), leaving login sockets hanging past the client's
   // 10–15s timeout with no error surfaced.
+  //
+  // 2026-05-12 round-5 audit P1: declare `max` explicitly. node-postgres
+  // defaults to 10 if omitted, but a silent default makes the connection
+  // budget invisible at code-review time — anyone planning capacity has
+  // to know off-hand that pg's default is 10 and double-check it didn't
+  // change between versions. Setting it here means a future reviewer can
+  // see "Railway DB headroom = 10 connections per poker-server replica"
+  // without leaving the file, and bumping it (e.g. for scale-out) is a
+  // visible diff rather than a config addition.
   pool = new Pool({
     connectionString: dbUrl,
+    max: 10,                          // explicit pg default; visible to review
     connectionTimeoutMillis: 5_000,   // give up acquiring a conn after 5s
     idleTimeoutMillis: 30_000,        // recycle idle conns after 30s
     statement_timeout: 8_000,         // any single query aborts after 8s

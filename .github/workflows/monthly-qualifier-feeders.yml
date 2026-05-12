@@ -30,6 +30,18 @@ on:
         required: false
         default: 'manual run'
 
+# 2026-05-12 round-5 — prevent schedule + workflow_dispatch overlap.
+# Matches the pattern used by all 11 mono-repo cron YAMLs (birthday,
+# comeback, finish-stale-weeklies, invoice, notification-log-prune,
+# prune-auth-events, prune-pending-welcome-sms, prune-user-audit-log,
+# rank-snapshot, vip-expiring, weekly-digest). Without this, a manual
+# workflow_dispatch run that overlaps the 06:00 UTC schedule could fire
+# the qualifier feeders twice and double-populate monthly_venue_points /
+# attendance_direct_seats for the same month.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   run-feeders:
     runs-on: ubuntu-latest
