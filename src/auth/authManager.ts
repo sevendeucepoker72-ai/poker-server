@@ -541,25 +541,36 @@ export async function isUserAdmin(userId: number): Promise<boolean> {
   return rows[0]?.is_admin === true;
 }
 
-// Character whitelist for display names. Intentionally strict:
-//   letters (Unicode, so "João" / "Владимир" / "美琪" are fine),
-//   digits, spaces, hyphen, underscore, period, apostrophe.
-// No angle brackets, quotes, semicolons, backticks, HTML entities — those
-// have been the XSS/injection vectors in the wild when names get echoed
-// back unescaped (chat lines, leaderboard, hand history, etc.).
-// `u` flag enables \p{L}/\p{N}; `v` would be newer, but Node runtimes we
-// target don't all support it.
-const DISPLAY_NAME_RE = /^[\p{L}\p{N} _.'-]+$/u;
+// Character whitelist for display names.
+//
+// 2026-05-13 — narrowed from Unicode-letter whitelist to ASCII-only per
+// product decision. The prior \p{L}/\p{N} regex was deliberately
+// permissive to support international names (João, Владимир, 美琪) but
+// the lack of a script restriction allowed users to set sentence-length
+// CJK display names that were unreadable to most players and didn't
+// fit in leaderboard / chat / hand-history layouts. Going forward,
+// display names must be plain ASCII letters/digits with the same
+// basic punctuation as before.
+//
+// Existing rows that violate this rule are NOT auto-rewritten — they
+// stay as-is until the user next edits, at which point they'll be
+// forced to pick a conforming name. Admin can rewrite via the
+// admin-app users page if a specific row needs immediate moderation.
+//
+// No angle brackets, quotes, semicolons, backticks, HTML entities —
+// those have been the XSS/injection vectors in the wild when names
+// get echoed back unescaped (chat lines, leaderboard, hand history).
+const DISPLAY_NAME_RE = /^[A-Za-z0-9 _.'-]+$/;
 
 export async function setDisplayName(userId: number, name: string): Promise<{ success: boolean; error?: string }> {
   const trimmed = (name || '').trim();
   if (trimmed.length < 2 || trimmed.length > 20) return { success: false, error: 'Name must be 2-20 characters' };
   if (!DISPLAY_NAME_RE.test(trimmed)) {
-    return { success: false, error: 'Name can only contain letters, numbers, spaces, and _ . - \'' };
+    return { success: false, error: 'Name can only contain English letters, numbers, spaces, and _ . - \'' };
   }
   // Reject all-whitespace / all-punctuation names (would pass the regex
   // but look blank when rendered). Require at least one letter OR digit.
-  if (!/[\p{L}\p{N}]/u.test(trimmed)) {
+  if (!/[A-Za-z0-9]/.test(trimmed)) {
     return { success: false, error: 'Name must contain at least one letter or number' };
   }
   // Check if name is already taken by another user
