@@ -5683,29 +5683,105 @@ Give feedback in this JSON format:
         }
         const meJson: any = await meRes.json();
         const masterUser = meJson?.data || meJson;
-        const phone = masterUser.phoneNumber || masterUser.phone_number;
+        // 2026-05-19 — `/users/:id/me` is called UNAUTHENTICATED here, which
+        // returns the public-safe shape (post-2026-05-07 PII hardening) — it
+        // intentionally omits phoneNumber. The previous code used
+        // `masterUser.phoneNumber || masterUser.phone_number` which evaluated
+        // to undefined, then the INSERT below set username = $1 = undefined
+        // and Postgres rejected with `null value in column "username"
+        // violates not-null constraint`. The catch at the bottom would
+        // emit loginResult({success:false}) but by then the spinner was
+        // also racing the client's 15s "Connection timed out" UI, and
+        // some users saw both — for many users the loginResult never
+        // arrived at all because the socket had already churned (Railway
+        // scale-up, network blip — same socket-race family as BUG 5
+        // earlier this session).
+        //
+        // Fix: fall back to `username` (the master API's stable identifier,
+        // always present in the public-safe shape — `josh.hall2`,
+        // `jacob.barshay`, etc.) when phone isn't available. The local
+        // users table just needs a unique key in the `username` column;
+        // it doesn't care whether it's a phone number or a slug.
+        // Existing rows that were created with phoneNumber-as-username
+        // continue to match because the lookup is the same key the
+        // master API returned to the original session (and player web's
+        // bridge handoff uses the same username slug).
+        const phone = masterUser.phoneNumber || masterUser.phone_number || masterUser.username;
         const displayName = masterUser.firstName
           ? `${masterUser.firstName} ${(masterUser.lastName || '')[0] || ''}.`.trim()
           : masterUser.username || phone;
+        if (!phone) {
+          // Final defense: if BOTH phone and username are missing, the
+          // public-safe shape must have changed shape on us. Surface a
+          // clear error instead of letting the INSERT NPE.
+          socket.emit('loginResult', {
+            success: false,
+            error: 'Master API user shape missing username — please retry',
+          });
+          console.error('[authWithTicket] master /me public-safe shape missing both phoneNumber and username:', masterUser);
+          return;
+        }
 
-        // 3. Lookup or insert local user. We key on the master phone number
-        //    (same convention as syncMasterUser in authManager.ts). We do NOT
-        //    overwrite an existing password_hash on upsert — only insert when
-        //    absent so a ticket-login never invalidates the user's password.
+        // 3. Lookup or insert local user.
+        //
+        // 2026-05-19 — augmented the lookup to also match by masterUserId in
+        // the stats JSONB. The 2026-05-07 PII hardening of /users/:id/me
+        // means our unauthenticated `meRes` no longer returns phoneNumber,
+        // so for users who previously logged in via authenticateWithMasterAPI
+        // (which DID get phoneNumber and stored that as the local username),
+        // a fresh authWithTicket would now miss their existing row (lookup
+        // by username='josh.hall2' wouldn't match the existing
+        // username='7202780636') and create a duplicate. Look up by
+        // masterUserId first — that's stable across both code paths.
         const bcrypt = require('bcryptjs');
         const placeholderHash = bcrypt.hashSync(
           `ticket-placeholder-${remoteUserId}-${Date.now()}`,
           10
         );
-        const { rows } = await getPool().query(
-          `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
-             VALUES ($1, $2, $3, 10000, 1, 0, $4)
-             ON CONFLICT (LOWER(username)) DO UPDATE
-               SET display_name = COALESCE(users.display_name, $2)
-           RETURNING *`,
-          [phone, displayName, placeholderHash, JSON.stringify({ masterPhone: phone, masterUsername: masterUser.username, masterUserId: remoteUserId })]
-        );
-        const localUser = rows[0];
+
+        let localUser: any = null;
+        // 3a. Prefer matching by masterUserId in stats JSONB — works regardless
+        // of whether the row was originally keyed by phone or by username.
+        try {
+          const byMasterId = await getPool().query(
+            `SELECT * FROM users WHERE stats->>'masterUserId' = $1 LIMIT 1`,
+            [String(remoteUserId)]
+          );
+          if (byMasterId.rows.length > 0) {
+            localUser = byMasterId.rows[0];
+            // Refresh stats to keep masterPhone (when known) and
+            // masterUsername fields in sync without nuking other JSONB keys.
+            try {
+              const merged = {
+                ...(typeof localUser.stats === 'object' ? localUser.stats : {}),
+                masterUserId: String(remoteUserId),
+                masterUsername: masterUser.username,
+                ...(phone && phone !== masterUser.username ? { masterPhone: phone } : {}),
+              };
+              await getPool().query(
+                `UPDATE users SET stats = $1, display_name = COALESCE(display_name, $2) WHERE id = $3`,
+                [JSON.stringify(merged), displayName, localUser.id]
+              );
+              localUser.stats = merged;
+              localUser.display_name = localUser.display_name || displayName;
+            } catch { /* non-fatal */ }
+          }
+        } catch (e: any) {
+          console.warn('[authWithTicket] masterUserId lookup failed (non-fatal):', e?.message || e);
+        }
+
+        // 3b. Fall back to UPSERT by username if no masterUserId match.
+        if (!localUser) {
+          const { rows } = await getPool().query(
+            `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
+               VALUES ($1, $2, $3, 10000, 1, 0, $4)
+               ON CONFLICT (LOWER(username)) DO UPDATE
+                 SET display_name = COALESCE(users.display_name, $2)
+             RETURNING *`,
+            [phone, displayName, placeholderHash, JSON.stringify({ masterPhone: phone, masterUsername: masterUser.username, masterUserId: remoteUserId })]
+          );
+          localUser = rows[0];
+        }
 
         // 4. Set auth session + emit loginResult in the shape the client expects.
         authSessions.set(socket.id, { userId: localUser.id, username: localUser.username });
