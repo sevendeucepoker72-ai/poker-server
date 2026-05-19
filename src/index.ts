@@ -5742,6 +5742,11 @@ Give feedback in this JSON format:
         let localUser: any = null;
         // 3a. Prefer matching by masterUserId in stats JSONB — works regardless
         // of whether the row was originally keyed by phone or by username.
+        //
+        // 2026-05-19 — relies on the partial functional index
+        // `idx_users_stats_master_user_id` (created in authManager.ts:initDB).
+        // Without that index this is a sequential scan that adds visible
+        // latency on Railway cold-start.
         try {
           const byMasterId = await getPool().query(
             `SELECT * FROM users WHERE stats->>'masterUserId' = $1 LIMIT 1`,
@@ -5749,22 +5754,37 @@ Give feedback in this JSON format:
           );
           if (byMasterId.rows.length > 0) {
             localUser = byMasterId.rows[0];
-            // Refresh stats to keep masterPhone (when known) and
-            // masterUsername fields in sync without nuking other JSONB keys.
-            try {
-              const merged = {
-                ...(typeof localUser.stats === 'object' ? localUser.stats : {}),
-                masterUserId: String(remoteUserId),
-                masterUsername: masterUser.username,
-                ...(phone && phone !== masterUser.username ? { masterPhone: phone } : {}),
-              };
-              await getPool().query(
-                `UPDATE users SET stats = $1, display_name = COALESCE(display_name, $2) WHERE id = $3`,
-                [JSON.stringify(merged), displayName, localUser.id]
-              );
-              localUser.stats = merged;
-              localUser.display_name = localUser.display_name || displayName;
-            } catch { /* non-fatal */ }
+            // 2026-05-19 — only run the JSONB UPDATE if something actually
+            // changed (masterUsername drifted, missing masterPhone, missing
+            // display_name). Previously this UPDATE fired on EVERY
+            // authWithTicket, which is once per Play Online click — pure
+            // overhead on the hot path of a deep-link sign-in. Now the
+            // common case (returning user, no drift) skips the write and
+            // the deep-link consumer's 15s timeout has more headroom on
+            // top of Railway cold-start.
+            const existingStats: any = typeof localUser.stats === 'object' && localUser.stats
+              ? localUser.stats
+              : {};
+            const wantMasterPhone = phone && phone !== masterUser.username ? phone : undefined;
+            const driftedUsername = existingStats.masterUsername !== masterUser.username;
+            const driftedPhone = wantMasterPhone != null && existingStats.masterPhone !== wantMasterPhone;
+            const missingDisplay = !localUser.display_name && displayName;
+            if (driftedUsername || driftedPhone || missingDisplay) {
+              try {
+                const merged = {
+                  ...existingStats,
+                  masterUserId: String(remoteUserId),
+                  masterUsername: masterUser.username,
+                  ...(wantMasterPhone ? { masterPhone: wantMasterPhone } : {}),
+                };
+                await getPool().query(
+                  `UPDATE users SET stats = $1, display_name = COALESCE(display_name, $2) WHERE id = $3`,
+                  [JSON.stringify(merged), displayName, localUser.id]
+                );
+                localUser.stats = merged;
+                localUser.display_name = localUser.display_name || displayName;
+              } catch { /* non-fatal */ }
+            }
           }
         } catch (e: any) {
           console.warn('[authWithTicket] masterUserId lookup failed (non-fatal):', e?.message || e);

@@ -179,6 +179,21 @@ export async function initDB(): Promise<void> {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences   JSONB NOT NULL DEFAULT '{}'`).catch(() => {});
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_stars ON users(stars)`).catch(() => {});
 
+  // 2026-05-19 — fast lookup of local user row by the master-API userId
+  // baked into stats JSONB. Required by authWithTicket's masterUserId
+  // lookup (added 2026-05-19 BUG 6 fix in index.ts:5743) to avoid a full
+  // table scan on every Play Online click. Without this index, the
+  // `stats->>'masterUserId'` filter is sequential, which adds visible
+  // latency on top of Railway cold-start during sign-in via the deep-
+  // link bridge — user reports the "Signing you in…" spinner sitting
+  // longer than before. Functional expression index is the canonical
+  // form for JSONB key lookups.
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_users_stats_master_user_id
+       ON users ((stats->>'masterUserId'))
+       WHERE stats->>'masterUserId' IS NOT NULL`
+  ).catch(() => {});
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_inventory (
       user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
