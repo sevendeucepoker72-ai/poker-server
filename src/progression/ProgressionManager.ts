@@ -1275,6 +1275,16 @@ export class ProgressionManager {
       stars: progress.stars,
       dailyLoginStreak: progress.dailyLoginStreak,
       lastLoginDate: progress.lastLoginDate,
+      // 2026-05-19 audit — also emit under the client-side field names.
+      // Client `progressStore.setDurableState` + LoginRewards.jsx read
+      // `progress.loginStreak` / `progress.lastLoginClaimDate`. The
+      // initial /durableState event uses those (matches), but every
+      // subsequent /playerProgress event was sending only the server
+      // field names — so re-opening the daily-rewards modal after a
+      // claim re-read stale loginStreak=0. Sending both names keeps
+      // the durable + per-hand progress paths consistent.
+      loginStreak: progress.dailyLoginStreak,
+      lastLoginClaimDate: progress.lastLoginDate,
       lastDailyBonusClaimed: progress.lastDailyBonusClaimed,
       equippedCardBack: progress.equippedCardBack,
       equippedTableTheme: progress.equippedTableTheme,
