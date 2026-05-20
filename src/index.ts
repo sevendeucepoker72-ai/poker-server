@@ -706,7 +706,21 @@ async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<Quali
     // Fetch ALL credits (including redeemed) — credits stay valid until the
     // player actually plays in the tournament. Redemption on the master API
     // side is just a registration marker, not a consumption marker.
-    const res = await fetch(`${masterApi}/qualifier-credits`);
+    //
+    // 2026-05-20 — send X-Internal-Token so master-API includes
+    // phone_number in the response. The 2026-05-06 round-3 PII strip
+    // removed phone_number from /qualifier-credits' public shape, which
+    // silently broke this lookup (we key by phone) and made every
+    // .online player look unqualified even when they held credits. See
+    // poker-api/src/handlers/qualifierCredits.js:isInternalCaller and
+    // CLAUDE.md Pattern A. The same shared secret authenticates poker-
+    // server's /notify calls — env var is already provisioned on
+    // Railway. If unset, we still get the public PII-stripped shape and
+    // the cache silently populates empty, which is the prior behaviour.
+    const internalToken = process.env.INTERNAL_NOTIFY_TOKEN || '';
+    const headers: Record<string, string> = {};
+    if (internalToken) headers['X-Internal-Token'] = internalToken;
+    const res = await fetch(`${masterApi}/qualifier-credits`, { headers });
     const data: any = await res.json();
     if (!data.success || !data.credits) return [];
 
