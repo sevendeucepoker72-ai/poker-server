@@ -154,6 +154,31 @@ const io = new Server(httpServer, {
   },
   // Limit incoming message size to 16KB — prevents large-payload DoS
   maxHttpBufferSize: 16 * 1024,
+  // 2026-05-26 — bump ping/pong cadence above socket.io defaults.
+  //
+  // Defaults: pingInterval=25000ms, pingTimeout=20000ms. For a tab in
+  // foreground that's plenty — the pong fires in <100ms. But Chrome
+  // throttles hidden-tab JS to ~1Hz timers, which starves socket.io's
+  // pong-handler event loop. The 20s timeout is enough to lose pongs
+  // from a user who tabbed away to read chat / glance at another window
+  // for half a minute, after which the server force-closes with
+  // `transport close`, the client's reconnect loop kicks in, and the
+  // action-timer in the meantime auto-folds the user.
+  //
+  // Earned 2026-05-26: live-reproduced on .online via agent-controlled
+  // tab (always `visibilityState: 'hidden'`). Sockets lived only
+  // 30–100s before the server reaped them. Bumping pingInterval to 20s
+  // and pingTimeout to 45s gives backgrounded tabs ~65s of grace
+  // before any disconnect, which covers a typical "tab away to check
+  // chat then come back" window without leaving genuinely dead sockets
+  // around longer than ~1 min.
+  //
+  // Real cost: dead sockets sit in memory ~45s longer before cleanup
+  // fires. Trivial — poker-server has 49 concurrent users and Railway
+  // 1GB RAM; the extra retention is bounded by MAX_CONNECTIONS_PER_IP
+  // (5) and per-socket state is small.
+  pingInterval: 20_000,
+  pingTimeout: 45_000,
 });
 
 const PORT = parseInt(process.env.PORT || '3001');
