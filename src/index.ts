@@ -1193,11 +1193,23 @@ function getGameStateForPlayer(
   // Add missed-blind info for this player. Now sourced directly from the
   // seat object (seat.deadBlindOwedChips + seat.missedBlind) — single
   // source of truth after the audit refactor.
+  //
+  // 2026-05-26 — explicitly send `null` when the debt clears, not just
+  // omit the field. The poker-3d delta-merge protocol treats absent
+  // keys as "unchanged" (see App.jsx gameState handler), so omitting
+  // the field left the stale `missedBlinds` value persisted in the
+  // client's store, which kept rendering the "POST BLINDS: 50" panel
+  // across multiple post-resolution hands. Sending null overwrites it
+  // and the GameHUD's `missedBlindsAmount > 0` gate evaluates falsy.
   if (playerSeatIndex >= 0) {
     const seat = table.seats[playerSeatIndex];
     if (seat && (seat.deadBlindOwedChips || 0) > 0) {
       stateObj.missedBlinds = seat.deadBlindOwedChips;
       stateObj.missedBlindType = seat.missedBlind; // 'small' | 'big' | 'both'
+    } else {
+      // Explicitly clear via the delta protocol — null overwrites to null.
+      stateObj.missedBlinds = null;
+      stateObj.missedBlindType = null;
     }
   }
 
