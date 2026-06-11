@@ -1680,12 +1680,30 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
 // every table. 5 = roughly half a 9-max, feels like a "busy" cash game.
 const CASH_TABLE_TARGET_OCCUPIED = 5;
 
+// 2026-06-11: AI seats may only be added or removed BETWEEN hands. Mutating the
+// roster mid-hand (trimming a folded bot, or a join/leave event firing a refill
+// during a live hand) makes opponents appear to vanish / "change seats" while a
+// hand is in progress. The seat GEOMETRY is stable — confirmed by instrumenting
+// the live client (zero mid-hand seat-position moves over 300+ samples); the
+// churn was the only cause. Every AI seat add/remove path funnels through this
+// guard so the on-table roster is frozen from the deal through HandComplete.
+// autoStartNextHand only runs at HandComplete, so the between-hands top-up to
+// target (CASH_TABLE_TARGET_OCCUPIED) still fires normally.
+function aiSeatsMutableNow(table: PokerTable): boolean {
+  return (
+    table.currentPhase === GamePhase.WaitingForPlayers ||
+    table.currentPhase === GamePhase.HandComplete
+  );
+}
+
 function fillWithAI(
   table: PokerTable,
   tableId: string,
   difficulty: Difficulty = 'hard',
   targetMaxOccupied: number = CASH_TABLE_TARGET_OCCUPIED
 ): void {
+  // No mid-hand roster changes — defer fills to the between-hands window.
+  if (!aiSeatsMutableNow(table)) return;
   if (!aiProfiles.has(tableId)) {
     aiProfiles.set(tableId, new Map());
   }
@@ -1732,27 +1750,23 @@ function fillWithAI(
 }
 
 // Trim excess AI when a table is over the occupancy cap.
-// Safe between-hands: WaitingForPlayers / HandComplete always OK.
-// Safe mid-hand ONLY for folded AI seats (they're already out of the hand,
-// standing them up changes nothing about the active action).
-// Never touches humans. Logs what it does.
+// BETWEEN HANDS ONLY — never mid-hand. Removing a bot during a live hand (even
+// a folded one) makes opponents appear to vanish / change seats, which is the
+// "players changing seats mid-hand" report. Deferred to the HandComplete window
+// (autoStartNextHand + the heartbeat both trim there). Never touches humans.
 function trimExcessAI(
   table: PokerTable,
   tableId: string,
   targetMaxOccupied: number = CASH_TABLE_TARGET_OCCUPIED
 ): void {
+  // No mid-hand roster changes — defer trims to the between-hands window.
+  if (!aiSeatsMutableNow(table)) return;
   const occupied = table.getOccupiedSeatCount();
   if (occupied <= targetMaxOccupied) return;
-  const betweenHands =
-    table.currentPhase === GamePhase.WaitingForPlayers ||
-    table.currentPhase === GamePhase.HandComplete;
   const aiSeats: number[] = [];
   for (let i = 0; i < MAX_SEATS; i++) {
     const s = table.seats[i];
     if (s.state !== 'occupied' || !s.isAI) continue;
-    // Between hands: any AI is fair game. Mid-hand: only folded AI so
-    // we don't interrupt a live betting round.
-    if (!betweenHands && !s.folded) continue;
     aiSeats.push(i);
   }
   const toRemove = Math.min(occupied - targetMaxOccupied, aiSeats.length);
@@ -2264,6 +2278,8 @@ function activateBombPotIfPending(tableId: string, table: PokerTable): boolean {
 const LIVE_ROOM_MIN_OCCUPIED = 3;
 
 function backfillAIToMin(table: PokerTable, tableId: string, min: number): void {
+  // No mid-hand roster changes — defer backfill to the between-hands window.
+  if (!aiSeatsMutableNow(table)) return;
   if (!aiProfiles.has(tableId)) aiProfiles.set(tableId, new Map());
   const profiles = aiProfiles.get(tableId)!;
   const usedNames = new Set<string>();
