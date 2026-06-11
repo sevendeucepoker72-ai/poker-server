@@ -3686,7 +3686,11 @@ Give feedback in this JSON format:
               if (tracker) tracker.delete(reserved.seatIndex);
               syncSitOutToTable(reserved.tableId);
               const reSeat = table.seats[reserved.seatIndex];
-              if (reSeat) {
+              // 2026-06-11 audit E5: only forgive dead-blind debt for a
+              // genuine connectivity blip. If the player was SITTING OUT when
+              // they dropped, they legitimately owe the accrued dead blinds —
+              // preserve them so a drop+reconnect can't dodge owed blinds.
+              if (reSeat && !reserved.sittingOut) {
                 reSeat.deadBlindOwedChips = 0;
                 reSeat.missedBlind = 'none';
               }
@@ -3762,7 +3766,8 @@ Give feedback in this JSON format:
             if (tracker) tracker.delete(reserved.seatIndex);
             syncSitOutToTable(reserved.tableId);
             const reSeatLegacy = table.seats[reserved.seatIndex];
-            if (reSeatLegacy) {
+            // E5: preserve owed dead blinds if they were sitting out (no dodge).
+            if (reSeatLegacy && !reserved.sittingOut) {
               reSeatLegacy.deadBlindOwedChips = 0;
               reSeatLegacy.missedBlind = 'none';
             }
@@ -8036,7 +8041,33 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
 
           console.log(`[Reserve] Seat ${session.seatIndex} on table ${session.tableId} reserved for user ${authSession.userId} (${session.playerName})`);
 
-          // Don't call handlePlayerLeave — seat stays reserved
+          // 2026-06-11 audit E4: only the MAIN seat is reserved here. Any
+          // ADDITIONAL-table seats are NOT reserved, and this branch returns
+          // before handlePlayerLeave's multi-table cleanup ever runs — so they
+          // lingered occupied (auto-folding, unreconnectable). Cash them out +
+          // stand up before the early return. (Tournament stacks are skipped
+          // by creditSeatStackToWallet's guard, so this only affects cash.)
+          const multiD = multiTableSessions.get(socket.id);
+          if (multiD) {
+            for (const ms of multiD) {
+              const mt = tableManager.getTable(ms.tableId);
+              if (mt) {
+                if (mt.isHandInProgress() && mt.activeSeatIndex === ms.seatIndex) {
+                  try { mt.playerFold(ms.seatIndex); } catch {}
+                }
+                const mSeat = mt.seats[ms.seatIndex];
+                if (mSeat && mSeat.state === 'occupied' && !mSeat.isAI) {
+                  creditSeatStackToWallet(authSession.userId, authSession.username, ms.tableId, mSeat, 'additional_table_disconnect');
+                }
+                mt.standUp(ms.seatIndex);
+              }
+              socket.leave(`table:${ms.tableId}`);
+              broadcastGameState(ms.tableId);
+            }
+            multiTableSessions.delete(socket.id);
+          }
+
+          // Don't call handlePlayerLeave — main seat stays reserved
           playerSessions.delete(socket.id);
           authSessions.delete(socket.id);
           lastSentState.delete(socket.id); lastSentJson.delete(socket.id);
