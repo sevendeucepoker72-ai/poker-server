@@ -178,3 +178,62 @@ describe('Betting round completion — cardless seat bug', () => {
     expect((t as any).isBettingRoundComplete()).toBe(true);
   });
 });
+
+describe('refundUncalledBets — C16: must NOT refund folded-player dead money', () => {
+  // 2026-06-11 gameplay-audit C16. The whole-hand "safety net"
+  // refundUncalledBets() used to refund (topNonFolded.totalInvested -
+  // secondNonFolded.totalInvested) to the top non-folded player. That
+  // difference can be money a SINCE-FOLDED player legitimately matched in
+  // an earlier round (dead money that belongs in the pot), NOT an uncalled
+  // bet. The bug let a capped short all-in scoop a side pot it was
+  // ineligible for. The function is now a no-op; the per-round
+  // refundUncalledBetThisRound() is the correct mechanism. This guard
+  // asserts the whole-hand net never moves chips again.
+  test('does not refund when a folded player matched the difference', () => {
+    const t = makeTable();
+    seatPlayers(t, 3); // 5000 each
+    // A: live, invested 200 across the hand.
+    t.seats[0].folded = false;
+    t.seats[0].totalInvestedThisHand = 200;
+    t.seats[0].chipCount = 4800;
+    // C: live, short all-in, invested 100.
+    t.seats[1].folded = false;
+    t.seats[1].totalInvestedThisHand = 100;
+    t.seats[1].chipCount = 0;
+    // B: FOLDED, but matched A's 200 in an earlier round (dead money in pot).
+    t.seats[2].folded = true;
+    t.seats[2].totalInvestedThisHand = 200;
+    t.seats[2].chipCount = 4800;
+
+    (t as any).refundUncalledBets();
+
+    // The old buggy net would have refunded 100 to A (4800 -> 4900) and
+    // dropped A.totalInvested to 100, short-paying the pot. With the no-op,
+    // nothing moves: the 100 stays in the pot for the side-pot calc.
+    expect(t.seats[0].chipCount).toBe(4800);
+    expect(t.seats[0].totalInvestedThisHand).toBe(200);
+    expect(t.seats[1].chipCount).toBe(0);
+    expect(t.seats[1].totalInvestedThisHand).toBe(100);
+  });
+
+  test('genuine uncalled bets are handled per-round, not by the whole-hand net', () => {
+    // Sanity: the per-round refund returns a true uncalled bet (top
+    // currentBet over the second) to the non-folded top player.
+    const t = makeTable();
+    seatPlayers(t, 2);
+    t.seats[0].folded = false;
+    t.seats[0].currentBet = 300; // shoved
+    t.seats[0].chipCount = 700;
+    t.seats[0].totalInvestedThisHand = 300;
+    t.seats[1].folded = true;     // folded to the shove
+    t.seats[1].currentBet = 50;
+    t.seats[1].chipCount = 950;
+    t.seats[1].totalInvestedThisHand = 50;
+
+    (t as any).refundUncalledBetThisRound();
+
+    // 250 uncalled (300 - 50) returned to seat 0.
+    expect(t.seats[0].chipCount).toBe(950);
+    expect(t.seats[0].currentBet).toBe(50);
+  });
+});

@@ -1313,28 +1313,30 @@ export class PokerTable extends EventEmitter {
   }
 
   /**
-   * Safety net: catches any leftover excess that the per-round refund missed
-   * (shouldn't happen in normal play, but protects against engine bugs).
-   * Called from determineWinners() before pot calculation.
+   * 2026-06-11 gameplay-audit finding C16 — DISABLED (now a no-op).
+   *
+   * This whole-hand "safety net" was actively WRONG and corrupted side
+   * pots. It compared the top two NON-FOLDED players by
+   * totalInvestedThisHand and refunded the difference to the top player.
+   * But that difference is NOT necessarily an uncalled bet: in a multiway
+   * pot it can be money a SINCE-FOLDED player legitimately matched in an
+   * earlier betting round (real dead money that belongs in the pot).
+   * Example: A bets 200, B calls 200 then folds on a later street, C is
+   * all-in 100. At showdown the non-folded set is {A:200, C:100}; the net
+   * refunded 100 to A — but that 100 was matched by B and should stay in
+   * the pot. Result: pot short-paid, a capped short all-in scooped a side
+   * pot it was ineligible for.
+   *
+   * The per-round refundUncalledBetThisRound() (called at the end of every
+   * betting round) is the correct mechanism: it compares currentBet WITHIN
+   * a round, where a folded player's contribution still counts as matched,
+   * and it covers the all-in-overbet case (top.currentBet - second.currentBet
+   * returned to the non-folded top). Nothing genuine reaches showdown
+   * uncalled, so this whole-hand net only ever did harm. Kept as a no-op so
+   * the determineWinners() / Omaha / Stud call sites don't need touching.
    */
   protected refundUncalledBets(): void {
-    // This is now mostly a no-op because refundUncalledBetThisRound() handles
-    // the real cases per round. Kept as a safety net.
-    const invested = this.seats
-      .filter(s => s.state === 'occupied' && !s.eliminated && s.totalInvestedThisHand > 0 && !s.folded)
-      .sort((a, b) => b.totalInvestedThisHand - a.totalInvestedThisHand);
-
-    if (invested.length < 2) return;
-
-    const top = invested[0];
-    const second = invested[1];
-    const excess = top.totalInvestedThisHand - second.totalInvestedThisHand;
-
-    if (excess > 0) {
-      console.warn(`[refundUncalledBets] Late refund of ${excess} to seat ${top.seatIndex} — per-round refund should have caught this`);
-      top.chipCount += excess;
-      top.totalInvestedThisHand = second.totalInvestedThisHand;
-    }
+    /* intentionally empty — see C16 note above */
   }
 
   protected determineWinners(): void {
