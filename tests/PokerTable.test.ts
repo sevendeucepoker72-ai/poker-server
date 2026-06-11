@@ -245,6 +245,77 @@ describe('refundUncalledBets — C16: must NOT refund folded-player dead money',
     t.seats[0].folded = true;
     expect((t as any).forceFoldSeat(0)).toBe(false); // already folded
   });
+});
+
+describe('Blind/button derivation — C10/R1: non-contiguous seating', () => {
+  // 2026-06-11 gameplay-audit C10. moveDealerButton/postBlinds derived the
+  // SB + button by RAW index `(bbSeat - 1)`, which lands on an EMPTY seat
+  // on a gapped table and falsely declared a dead small blind (no SB
+  // collected) + parked the button on an empty seat. The fix walks OCCUPIED
+  // seats backward (getPrevOccupiedSeat). The rotation bug only manifests on
+  // hand 2+ (hand 1 uses the first-hand branch which was already gap-aware),
+  // so each test plays at least two hands. SB=25, BB=50 ⇒ a correct hand
+  // collects 75 in blinds before any action.
+  function seatAt(t: PokerTable, indices: number[]) {
+    indices.forEach((i) => t.sitDown(i, `P${i}`, 5000, `p${i}`, false));
+  }
+
+  test('contiguous 3-handed posts SB+BB across rotations (no behavior change)', () => {
+    const t = makeTable();
+    seatAt(t, [0, 1, 2]);
+    for (let h = 0; h < 3; h++) {
+      (t as any).startNewHand();
+      expect((t as any).deadSmallBlind).toBe(false);
+      expect(t.seats[t.dealerButtonSeat].state).toBe('occupied');
+      expect(t.getTotalPot()).toBe(75);
+    }
+  });
+
+  test('gapped seats (0,3,6) post BOTH blinds on the rotation hand + button on a real seat', () => {
+    const t = makeTable();
+    seatAt(t, [0, 3, 6]);
+    for (let h = 0; h < 4; h++) {
+      (t as any).startNewHand();
+      // The pre-fix bug: hand 2+ had deadSmallBlind=true, button on an empty
+      // seat, and pot=50 (BB only). Post-fix: both blinds, real button.
+      expect((t as any).deadSmallBlind).toBe(false);
+      expect((t as any).deadButton).toBe(false);
+      expect(t.seats[t.dealerButtonSeat].state).toBe('occupied');
+      expect(t.getTotalPot()).toBe(75);
+    }
+  });
+
+  test('gapped seats (1,4,7) and (0,4,8) keep SB+BB + occupied button every hand', () => {
+    for (const layout of [[1, 4, 7], [0, 4, 8], [0, 1, 5], [2, 5, 8]]) {
+      const t = makeTable();
+      seatAt(t, layout);
+      for (let h = 0; h < 3; h++) {
+        (t as any).startNewHand();
+        expect((t as any).deadSmallBlind).toBe(false);
+        expect(t.seats[t.dealerButtonSeat].state).toBe('occupied');
+        expect(t.getTotalPot()).toBe(75);
+      }
+    }
+  });
+
+  test('heads-up (gap between the two seats) still posts SB+BB', () => {
+    const t = makeTable();
+    seatAt(t, [0, 5]);
+    for (let h = 0; h < 3; h++) {
+      (t as any).startNewHand();
+      expect(t.getTotalPot()).toBe(75);
+      expect(t.seats[t.dealerButtonSeat].state).toBe('occupied');
+    }
+  });
+
+  test('getPrevOccupiedSeat walks backward over gaps', () => {
+    const t = makeTable();
+    seatAt(t, [0, 3, 6]);
+    expect((t as any).getPrevOccupiedSeat(8)).toBe(6); // 8,7 empty → 6
+    expect((t as any).getPrevOccupiedSeat(2)).toBe(0); // 2,1 empty → 0
+    expect((t as any).getPrevOccupiedSeat(5)).toBe(3); // 5,4 empty → 3
+    expect((t as any).getPrevOccupiedSeat(3)).toBe(3); // on an occupied seat → itself
+  });
 
   test('genuine uncalled bets are handled per-round, not by the whole-hand net', () => {
     // Sanity: the per-round refund returns a true uncalled bet (top

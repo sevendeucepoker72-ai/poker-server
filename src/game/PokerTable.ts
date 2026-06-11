@@ -525,21 +525,32 @@ export class PokerTable extends EventEmitter {
     }
 
     // Multi-way: BB always advances by one occupied seat from previous BB.
-    // From there we derive SB (the seat between old BB and new BB) and button
-    // (the seat before the SB). Empty intermediate seats become dead.
+    // From there we derive SB (occupied seat before the new BB) and button
+    // (occupied seat before the SB).
+    //
+    // 2026-06-11 audit C10: derive SB + button by walking OCCUPIED seats
+    // backward (getPrevOccupiedSeat), NOT by raw index `(newBBSeat - 1)`.
+    // The raw-index math landed on an EMPTY seat whenever seating is
+    // non-contiguous (gaps from mid-table stand-ups or explicit seat picks),
+    // which falsely set deadSmallBlind (no SB collected from anyone) and
+    // parked the button on an empty seat — the post-button player then
+    // played for free every orbit. A backward occupancy walk always lands
+    // on the real player. With this, a seating GAP never produces a dead
+    // blind/button (a "moving button" — the simplified, fair online
+    // convention); the dead-blind flags stay false here and are reserved
+    // for genuine bust handling if ever reintroduced. Contiguous seating is
+    // unchanged: getPrevOccupiedSeat(newBBSeat-1) === newBBSeat-1 when that
+    // seat is occupied.
     const newBBSeat = this.getNextOccupiedSeat(this.previousBigBlindSeat + 1);
     if (newBBSeat === -1) return;
 
-    // Walk seats between previousBigBlindSeat and newBBSeat
-    // Slot before newBBSeat is the SB slot. If empty -> dead SB.
-    const sbSlot = (newBBSeat - 1 + MAX_SEATS) % MAX_SEATS;
-    const sbOccupied = this.seats[sbSlot]?.state === 'occupied';
-    this.deadSmallBlind = !sbOccupied;
+    const sbSlot = this.getPrevOccupiedSeat(newBBSeat - 1 + MAX_SEATS);
+    const buttonSlot = this.getPrevOccupiedSeat(sbSlot - 1 + MAX_SEATS);
 
-    // Button slot is the seat before the SB slot.
-    const buttonSlot = (sbSlot - 1 + MAX_SEATS) % MAX_SEATS;
-    const buttonOccupied = this.seats[buttonSlot]?.state === 'occupied';
-    this.deadButton = !buttonOccupied;
+    // SB/button now always reference real occupied seats; no dead blind
+    // from a seating gap.
+    this.deadSmallBlind = false;
+    this.deadButton = false;
 
     this.dealerButtonSeat = buttonSlot;
     this.previousBigBlindSeat = newBBSeat;
@@ -566,9 +577,13 @@ export class PokerTable extends EventEmitter {
       if (this.deadSmallBlind) {
         sbSeat = -1;
       } else {
-        sbSeat = (bbSeat - 1 + MAX_SEATS) % MAX_SEATS;
-        // Defensive: if for some reason sbSlot points to an empty seat, mark dead
-        if (this.seats[sbSeat]?.state !== 'occupied') {
+        // 2026-06-11 audit C10: backward OCCUPANCY walk, not raw `(bbSeat-1)`.
+        // The raw index landed on an empty seat on non-contiguous tables and
+        // then declared a dead SB, so no SB was collected — the post-button
+        // player played for free. getPrevOccupiedSeat lands on the real SB.
+        sbSeat = this.getPrevOccupiedSeat(bbSeat - 1 + MAX_SEATS);
+        // Defensive: only a 1-handed table (no other occupied seat) yields -1.
+        if (sbSeat === -1 || this.seats[sbSeat]?.state !== 'occupied') {
           sbSeat = -1;
           this.deadSmallBlind = true;
         }
@@ -796,9 +811,15 @@ export class PokerTable extends EventEmitter {
         // Heads-up: dealer (SB) acts first pre-flop
         this.activeSeatIndex = this.dealerButtonSeat;
       } else {
-        // UTG: next after BB
-        const sbSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
-        const bbSeat = this.getNextOccupiedSeat(sbSeat + 1);
+        // UTG: next playing seat after the BB. 2026-06-11 audit R1: anchor
+        // off previousBigBlindSeat — the seat that ACTUALLY posted the BB
+        // (set by moveDealerButton) — instead of re-deriving BB by walking
+        // forward from the button. On a non-contiguous / moved-button table
+        // the fresh button walk could land on a different seat than the real
+        // BB poster, skipping true UTG and robbing the BB of its option.
+        const bbSeat = this.previousBigBlindSeat >= 0
+          ? this.previousBigBlindSeat
+          : this.getNextOccupiedSeat(this.getNextOccupiedSeat(this.dealerButtonSeat + 1) + 1);
         this.activeSeatIndex = this.getNextPlayingSeat(bbSeat + 1);
       }
     } else {
@@ -1695,6 +1716,29 @@ export class PokerTable extends EventEmitter {
   getNextOccupiedSeat(from: number): number {
     for (let i = 0; i < MAX_SEATS; i++) {
       const idx = (from + i) % MAX_SEATS;
+      const seat = this.seats[idx];
+      if (seat.state === 'occupied' && !seat.eliminated && seat.chipCount >= 0) {
+        return idx;
+      }
+    }
+    return -1;
+  }
+
+  /**
+   * 2026-06-11 audit C10: backward mirror of getNextOccupiedSeat. Walks
+   * DOWN from `from` (wrapping) to the first occupied, non-eliminated seat.
+   * The blind/button derivation needs this to find the SB (occupied seat
+   * before the BB) and button (occupied seat before the SB) on tables with
+   * GAPS between occupied seats. The old code used raw index math
+   * `(bbSeat - 1 + MAX_SEATS) % MAX_SEATS`, which lands on an EMPTY seat
+   * whenever seating is non-contiguous and then falsely declared a dead
+   * small blind / parked the button on an empty seat — so the post-button
+   * player played for free every orbit. A backward occupancy walk lands on
+   * the real player.
+   */
+  getPrevOccupiedSeat(from: number): number {
+    for (let i = 0; i < MAX_SEATS; i++) {
+      const idx = (from - i + MAX_SEATS * (i + 1)) % MAX_SEATS;
       const seat = this.seats[idx];
       if (seat.state === 'occupied' && !seat.eliminated && seat.chipCount >= 0) {
         return idx;
