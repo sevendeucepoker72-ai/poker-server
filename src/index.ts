@@ -666,6 +666,10 @@ const aiTimeouts = new Map<string, { handle: NodeJS.Timeout; seatIndex: number }
 const bombPotPending = new Map<string, boolean>();
 // tableId -> true means current hand is a bomb pot (skip preflop betting)
 const bombPotActive = new Map<string, boolean>();
+// 2026-06-11 audit M1: per-table bomb-pot cooldown. Anyone seated could
+// previously force 2×BB antes EVERY hand (griefing on public cash tables).
+const bombPotCooldownUntil = new Map<string, number>();
+const BOMB_POT_COOLDOWN_MS = 5 * 60 * 1000;
 
 // ========== Dealer's Choice Tracking ==========
 // tableId -> { enabled, orbitCount, currentVariantIndex }
@@ -2669,6 +2673,19 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
         try {
           const result = tournamentManager.eliminatePlayer(tournamentId, seat.playerId, eliminatorId);
           if (result && result.bountyPayout && eliminatorId) {
+            // 2026-06-11 audit R3: actually CREDIT the bounty to the
+            // eliminator's tournament stack — previously it was only emitted as
+            // a UI event + counter, so the bounty mechanic did nothing. These
+            // are tournament chips (wallet-isolated), so it's a play-chip
+            // reward, not a wallet mint. The eliminator won the busting pot on
+            // THIS table, so their seat is here.
+            for (let j = 0; j < MAX_SEATS; j++) {
+              const es = table.seats[j];
+              if (es?.playerId === eliminatorId && es.state === 'occupied') {
+                es.chipCount += result.bountyPayout;
+                break;
+              }
+            }
             // Notify eliminator
             for (const [sid, s] of playerSessions) {
               if (s.playerId === eliminatorId) {
@@ -6910,7 +6927,18 @@ Give feedback in this JSON format:
     const tableId = data?.tableId || session.tableId;
     if (session.tableId !== tableId) return;
 
-    // Verify the player is at this table (owner/manager check could be added)
+    // 2026-06-11 audit M1: rate-limit bomb pots so a seated griefer can't force
+    // 2×BB antes every hand on a public cash table. One per 5 min per table.
+    // (Full owner-only / private-only gating would need table-ownership
+    // metadata these auto-created cash tables don't carry — cooldown is the
+    // high-impact mitigation.)
+    const nowMs = Date.now();
+    const cdUntil = bombPotCooldownUntil.get(tableId) || 0;
+    if (nowMs < cdUntil) {
+      socket.emit('error', { message: `Bomb pot on cooldown — try again in ${Math.ceil((cdUntil - nowMs) / 1000)}s` });
+      return;
+    }
+    bombPotCooldownUntil.set(tableId, nowMs + BOMB_POT_COOLDOWN_MS);
     bombPotPending.set(tableId, true);
 
     // Notify all players at the table
