@@ -4710,6 +4710,18 @@ Give feedback in this JSON format:
         }
       }
 
+      // 2026-06-11 audit C6: clamp the CLIENT-supplied buy-in. PokerTable.sitDown
+      // only enforced the minimum, so a crafted joinTable payload could seat an
+      // arbitrarily large stack, distorting table economics / SPR. (Not a mint —
+      // it's the player's own wallet chips, deducted + credited back — but a
+      // fairness issue.) TableConfig has no maxBuyIn field, so the cap is a
+      // generous heuristic: 10× the table minimum. A missing/zero buy-in
+      // defaults to the minimum.
+      if (table) {
+        const cap = table.config.minBuyIn * 10;
+        buyIn = Math.max(table.config.minBuyIn, Math.min(buyIn || table.config.minBuyIn, cap));
+      }
+
       // Validate buy-in against DB balance for authenticated users. In
       // testing mode, ensureChipsForBuyIn auto-tops-up below-buyin balances
       // so no one ever hits "Insufficient chips" while we're iterating.
@@ -6920,11 +6932,25 @@ Give feedback in this JSON format:
       handlePlayerLeave(socket);
     }
 
+    // 2026-06-11 audit C2: real buy-in. An authed player pays the starting
+    // stack from their wallet (and is credited the remaining stack on leave
+    // via handlePlayerLeave) — without this deduct, the free stack was minted
+    // on cash-out. Guests have no auth session, so handlePlayerLeave never
+    // credits them: they stay wallet-isolated (free practice, no mint).
+    const HEADS_UP_BUYIN = 1000;
+    const authHU = authSessions.get(socket.id);
+    if (authHU) {
+      const dbChips = await ensureChipsForBuyIn(authHU.userId, authHU.username, HEADS_UP_BUYIN);
+      if (HEADS_UP_BUYIN > dbChips) { socket.emit('error', { message: 'Not enough chips for the 1,000 buy-in' }); return; }
+      if (!(await deductChips(authHU.userId, HEADS_UP_BUYIN))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
+      auditLog(authHU.username, 'QUICK_BUYIN_DEDUCT', { mode: 'headsUp', buyIn: HEADS_UP_BUYIN });
+    }
+
     const tableId = tableManager.createHeadsUpTable(`Heads-Up Snap: ${playerName}`);
     const table = tableManager.getTable(tableId)!;
 
     const playerId = `player-${uuidv4()}`;
-    table.sitDown(0, playerName, 1000, playerId, false);
+    table.sitDown(0, playerName, HEADS_UP_BUYIN, playerId, false);
 
     const session: PlayerSession = {
       socketId: socket.id,
@@ -7023,6 +7049,20 @@ Give feedback in this JSON format:
       handlePlayerLeave(socket);
     }
 
+    // 2026-06-11 audit C2: real buy-in (500). Authed players pay from the
+    // wallet; the winner's consolidated stack is credited back on leave via
+    // handlePlayerLeave (3×500 in → up to 1500 out, no mint). The "prize" the
+    // client shows is display-only — chips ARE the stack. Guests are
+    // wallet-isolated (no auth → no credit on leave).
+    const SPINGO_BUYIN = 500;
+    const authSG = authSessions.get(socket.id);
+    if (authSG) {
+      const dbChips = await ensureChipsForBuyIn(authSG.userId, authSG.username, SPINGO_BUYIN);
+      if (SPINGO_BUYIN > dbChips) { socket.emit('error', { message: 'Not enough chips for the 500 Spin & Go buy-in' }); return; }
+      if (!(await deductChips(authSG.userId, SPINGO_BUYIN))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
+      auditLog(authSG.username, 'QUICK_BUYIN_DEDUCT', { mode: 'spinGo', buyIn: SPINGO_BUYIN });
+    }
+
     // Random multiplier: 2x (60%), 3x (25%), 5x (10%), 10x (4%), 25x (1%)
     const roll = Math.random() * 100;
     let multiplier = 2;
@@ -7037,12 +7077,12 @@ Give feedback in this JSON format:
       3,
       10,
       20,
-      500
+      SPINGO_BUYIN
     );
     const table = tableManager.getTable(tableId)!;
 
     const playerId = `player-${uuidv4()}`;
-    table.sitDown(0, playerName, 500, playerId, false);
+    table.sitDown(0, playerName, SPINGO_BUYIN, playerId, false);
 
     const session: PlayerSession = {
       socketId: socket.id,
@@ -7148,17 +7188,28 @@ Give feedback in this JSON format:
       handlePlayerLeave(socket);
     }
 
+    // 2026-06-11 audit C2: real buy-in (1000). Authed players pay from the
+    // wallet (credited back on leave); guests stay wallet-isolated.
+    const AOF_BUYIN = 1000;
+    const authAOF = authSessions.get(socket.id);
+    if (authAOF) {
+      const dbChips = await ensureChipsForBuyIn(authAOF.userId, authAOF.username, AOF_BUYIN);
+      if (AOF_BUYIN > dbChips) { socket.emit('error', { message: 'Not enough chips for the 1,000 buy-in' }); return; }
+      if (!(await deductChips(authAOF.userId, AOF_BUYIN))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
+      auditLog(authAOF.username, 'QUICK_BUYIN_DEDUCT', { mode: 'allInOrFold', buyIn: AOF_BUYIN });
+    }
+
     const tableId = tableManager.createQuickTable(
       'All-In or Fold',
       6,
       10,
       20,
-      1000
+      AOF_BUYIN
     );
     const table = tableManager.getTable(tableId)!;
 
     const playerId = `player-${uuidv4()}`;
-    table.sitDown(0, playerName, 1000, playerId, false);
+    table.sitDown(0, playerName, AOF_BUYIN, playerId, false);
 
     const session: PlayerSession = {
       socketId: socket.id,
@@ -7234,6 +7285,18 @@ Give feedback in this JSON format:
     }
 
     const config = venueConfigs[venue];
+
+    // 2026-06-11 audit C2: real buy-in. Career seats the player with
+    // config.buyIn (up to 500k at WSOP); an authed player pays it from the
+    // wallet and is credited the remaining stack on leave (without this the
+    // stack was minted on cash-out). Guests stay wallet-isolated.
+    const authCareer = authSessions.get(socket.id);
+    if (authCareer) {
+      const dbChips = await ensureChipsForBuyIn(authCareer.userId, authCareer.username, config.buyIn);
+      if (config.buyIn > dbChips) { socket.emit('error', { message: `Not enough chips for the ${config.name} buy-in (${config.buyIn.toLocaleString()})` }); return; }
+      if (!(await deductChips(authCareer.userId, config.buyIn))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
+      auditLog(authCareer.username, 'QUICK_BUYIN_DEDUCT', { mode: 'career', venue: config.name, buyIn: config.buyIn });
+    }
 
     // Stage 3 is the boss stage - harder AI
     const stageDifficulty: Difficulty =
@@ -7536,14 +7599,37 @@ Give feedback in this JSON format:
       return;
     }
 
+    // 2026-06-11 audit C9+C6: this path previously seated an additional cash
+    // table for FREE (no deductChips). Combined with the cash-out credit on
+    // leave (also added in C9) that's a mint. Make it a real cash buy-in:
+    // clamp the client buy-in to the table's [minBuyIn, maxBuyIn] (C6) and
+    // deduct it. The remaining stack is credited back on leave (multi-table
+    // cleanup in handlePlayerLeave).
+    const effectiveBuyIn = Math.max(
+      table.config.minBuyIn,
+      Math.min(buyIn || table.config.minBuyIn, table.config.minBuyIn * 10) // C6: 10× heuristic cap (no maxBuyIn field)
+    );
+    const authAdd = authSessions.get(socket.id);
+    if (authAdd) {
+      const dbChips = await ensureChipsForBuyIn(authAdd.userId, authAdd.username, effectiveBuyIn);
+      if (effectiveBuyIn > dbChips) { socket.emit('error', { message: 'Insufficient chips for the additional-table buy-in' }); return; }
+      if (!(await deductChips(authAdd.userId, effectiveBuyIn))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
+      auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN', { tableId, buyIn: effectiveBuyIn });
+    }
+
     const playerId = `player-${uuidv4()}`;
     // Ghost-seat defense (multi-table / joinTableAsPlayer path).
     {
       const authNow = authSessions.get(socket.id);
       if (authNow) clearGhostSeatsForUser(authNow.userId, tableId, socket.id, targetSeat);
     }
-    const success = table.sitDown(targetSeat, playerName, buyIn, playerId, false);
+    const success = table.sitDown(targetSeat, playerName, effectiveBuyIn, playerId, false);
     if (!success) {
+      // Refund the buy-in we just deducted — we never seated them.
+      if (authAdd) {
+        await addChipsToUser(authAdd.userId, effectiveBuyIn);
+        auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN_REFUND', { tableId, buyIn: effectiveBuyIn });
+      }
       socket.emit('error', { message: 'Could not join table' });
       return;
     }
@@ -7912,8 +7998,14 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
       }
     }
 
-    if (authSession) authSessions.delete(socket.id);
+    // 2026-06-11 audit C9: call handlePlayerLeave FIRST, then delete the auth
+    // session. handlePlayerLeave's cash-out paths (main seat + additional
+    // tables) read authSessions.get(socket.id) to know whom to credit;
+    // deleting auth beforehand made those credits silently no-op. (The
+    // common seated-disconnect case already returns early via the reserve
+    // branch above; this guards the multi-table / fallthrough cases.)
     handlePlayerLeave(socket);
+    if (authSession) authSessions.delete(socket.id);
     // Clear delta tracking so a reconnect gets a fresh full state
     lastSentState.delete(socket.id); lastSentJson.delete(socket.id);
   });
@@ -8084,11 +8176,22 @@ function handlePlayerLeave(socket: Socket): void {
   // Clean up multi-table sessions
   const multiSessions = multiTableSessions.get(socket.id);
   if (multiSessions) {
+    const authForMulti = authSessions.get(socket.id);
     for (const ms of multiSessions) {
       const mt = tableManager.getTable(ms.tableId);
       if (mt) {
         if (mt.isHandInProgress() && mt.activeSeatIndex === ms.seatIndex) {
           mt.playerFold(ms.seatIndex);
+        }
+        // 2026-06-11 audit C9: credit the additional-table stack back to the
+        // wallet before teardown. joinAdditionalTable deducts a real buy-in
+        // for each extra seat; the old code stood these seats up WITHOUT
+        // crediting, so a multi-tabling player silently LOST every
+        // additional-table stack on leave (only the main seat was cashed
+        // out). Mirrors handlePlayerLeave's main-seat cash-out.
+        const mSeat = mt.seats[ms.seatIndex];
+        if (authForMulti && mSeat && mSeat.state === 'occupied' && !mSeat.isAI) {
+          creditSeatStackToWallet(authForMulti.userId, authForMulti.username, ms.tableId, mSeat, 'additional_table_leave');
         }
         mt.standUp(ms.seatIndex);
       }
@@ -8866,13 +8969,22 @@ async function gracefulShutdown(signal: string) {
   try {
     // 1. Cash out every seated human player and flush their progress.
     const seenUserIds = new Set<number>();
+    // 2026-06-11 audit C3: dedupe the cash-out by PHYSICAL seat
+    // (tableId:seatIndex), not just by userId. seenUserIds prevents the
+    // active-vs-reserved double, but a single seat referenced by two live
+    // sessions (a stale ghost socket + the real one, mid-reconnect) would
+    // otherwise be credited TWICE. Crediting per distinct seat also still
+    // pays a legitimately multi-seated user for each of their seats.
+    const creditedSeats = new Set<string>();
     for (const [socketId, session] of playerSessions) {
       try {
         const auth = authSessions.get(socketId);
         if (!auth) continue;
         const table = tableManager.getTable(session.tableId);
         const seat = table?.seats?.[session.seatIndex];
-        if (seat && seat.state === 'occupied' && seat.chipCount > 0) {
+        const seatKey = `${session.tableId}:${session.seatIndex}`;
+        if (seat && seat.state === 'occupied' && seat.chipCount > 0 && !creditedSeats.has(seatKey)) {
+          creditedSeats.add(seatKey);
           await addChipsToUser(auth.userId, seat.chipCount);
           console.log(`[Shutdown] Cashed out ${seat.chipCount} chips for user ${auth.userId} (seat ${session.seatIndex})`);
         }
@@ -8913,7 +9025,9 @@ async function gracefulShutdown(signal: string) {
         const table = tableManager.getTable(reserved.tableId);
         const seat = table?.seats?.[reserved.seatIndex];
         const chips = seat?.chipCount ?? reserved.chips ?? 0;
-        if (chips > 0) {
+        const seatKey = `${reserved.tableId}:${reserved.seatIndex}`;
+        if (chips > 0 && !creditedSeats.has(seatKey)) {
+          creditedSeats.add(seatKey);
           await addChipsToUser(userId, chips);
           console.log(`[Shutdown] Cashed out ${chips} reserved chips for user ${userId}`);
         }
