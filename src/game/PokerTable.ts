@@ -836,6 +836,34 @@ export class PokerTable extends EventEmitter {
     return true;
   }
 
+  /**
+   * 2026-06-11 audit C7: mark a seat folded WITHOUT the active-seat guard
+   * and WITHOUT advancing the turn. Used only when a player LEAVES the
+   * table mid-hand and it is NOT their turn. We must fold them so the
+   * table doesn't wedge waiting on a gone player (getNextActiveSeat skips
+   * folded seats), but we must NOT advanceTurn (it isn't their turn — the
+   * real actor keeps the action) and the caller must NOT tear the seat
+   * down yet (their committed chips stay in the live pot until showdown;
+   * see handlePlayerLeave's deferred removal + processPendingSeatRemovals).
+   * If it IS their turn, callers use playerFold() instead so the turn
+   * advances normally. No-ops on an empty/already-folded seat.
+   */
+  forceFoldSeat(seatIndex: number): boolean {
+    if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
+    const seat = this.seats[seatIndex];
+    if (seat.state !== 'occupied' || seat.folded) return false;
+    seat.folded = true;
+    seat.lastAction = PlayerAction.Fold;
+    seat.hasActedSinceLastFullRaise = true;
+    this.actionLog.push({
+      seatIndex,
+      playerName: seat.playerName,
+      action: 'folded (left table)',
+    });
+    this.emit('playerAction', { seatIndex, action: PlayerAction.Fold, amount: 0 });
+    return true;
+  }
+
   playerCheck(seatIndex: number): boolean {
     if (!this.isValidAction(seatIndex)) return false;
 

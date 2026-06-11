@@ -216,6 +216,36 @@ describe('refundUncalledBets — C16: must NOT refund folded-player dead money',
     expect(t.seats[1].totalInvestedThisHand).toBe(100);
   });
 
+  test('C7: forceFoldSeat marks folded without advancing the turn or wiping committed chips', () => {
+    const t = makeTable();
+    seatPlayers(t, 3);
+    (t as any).startNewHand?.();
+    const active = t.activeSeatIndex;
+    // Pick a seat that is NOT the active actor.
+    const victim = [0, 1, 2].find((i) => i !== active)!;
+    t.seats[victim].totalInvestedThisHand = 200; // chips committed to the pot
+    t.seats[victim].folded = false;
+
+    const ok = (t as any).forceFoldSeat(victim);
+
+    expect(ok).toBe(true);
+    expect(t.seats[victim].folded).toBe(true);
+    // Turn did NOT advance — the real actor still has the action.
+    expect(t.activeSeatIndex).toBe(active);
+    // Committed chips remain on the seat for the pot award (not wiped).
+    expect(t.seats[victim].totalInvestedThisHand).toBe(200);
+    // getNextActiveSeat skips the force-folded seat (no wedge).
+    expect((t as any).getNextActiveSeat(victim)).not.toBe(victim);
+  });
+
+  test('C7: forceFoldSeat no-ops on an empty or already-folded seat', () => {
+    const t = makeTable();
+    seatPlayers(t, 2);
+    expect((t as any).forceFoldSeat(5)).toBe(false); // empty seat
+    t.seats[0].folded = true;
+    expect((t as any).forceFoldSeat(0)).toBe(false); // already folded
+  });
+
   test('genuine uncalled bets are handled per-round, not by the whole-hand net', () => {
     // Sanity: the per-round refund returns a true uncalled bet (top
     // currentBet over the second) to the non-folded top player.

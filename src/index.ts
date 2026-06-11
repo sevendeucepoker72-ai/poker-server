@@ -480,6 +480,33 @@ async function ensureChipsForBuyIn(
 // the table becomes empty / a player disconnects before the timer fires.
 const pendingAutoStartTimers = new Map<string, NodeJS.Timeout>();
 
+// 2026-06-11 audit C7: seats whose player LEFT mid-hand while still holding
+// chips in the LIVE pot. We can't standUp immediately — SidePotManager
+// only counts state==='occupied' seats, so wiping the seat (createEmptySeat)
+// erases their committed chips from the pot and short-pays the winner.
+// Instead handlePlayerLeave folds them (keeps their dead money in the pot,
+// frees the action) and records the seat here; processPendingSeatRemovals()
+// — called from the handResult hook AFTER pots are awarded — credits the
+// remaining stack back to the wallet and stands the seat up.
+//   tableId -> seatIndex -> { who to credit }
+const pendingSeatRemovalAfterHand = new Map<string, Map<number, { userId: number; username: string }>>();
+
+function processPendingSeatRemovals(tableId: string): void {
+  const pending = pendingSeatRemovalAfterHand.get(tableId);
+  if (!pending || pending.size === 0) return;
+  pendingSeatRemovalAfterHand.delete(tableId);
+  const table = tableManager.getTable(tableId);
+  if (!table) return;
+  for (const [seatIndex, who] of pending) {
+    const seat = table.seats[seatIndex];
+    if (seat && seat.state === 'occupied' && !seat.isAI) {
+      creditSeatStackToWallet(who.userId, who.username, tableId, seat, 'leave_after_hand');
+      table.standUp(seatIndex);
+    }
+  }
+  broadcastGameState(tableId);
+}
+
 // Periodic sweeper: prunes stale entries from rate-limit maps so long-running
 // servers don't accumulate unbounded memory from abandoned sockets.
 const RATE_MAP_TTL_MS = 10 * 60 * 1000; // 10 minutes
@@ -1522,6 +1549,11 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   table.on('handResult', async (data: { results: any[]; handNumber: number }) => {
     incrementHandsPlayed();
     handleHandComplete(tableId, data.results);
+    // 2026-06-11 audit C7: the pot has now been awarded (determineWinners
+    // ran before this event), so any seat we kept alive only to preserve
+    // its committed chips in the pot can be torn down: credit the remaining
+    // stack to the wallet + standUp.
+    processPendingSeatRemovals(tableId);
 
     // Chip velocity monitoring
     for (const result of data.results) {
@@ -7923,12 +7955,32 @@ function handlePlayerLeave(socket: Socket): void {
 
   const table = tableManager.getTable(session.tableId);
   if (table) {
-    // If hand is in progress, fold first
-    if (
+    // 2026-06-11 audit C7: decide whether this seat's teardown must be
+    // DEFERRED to hand-end. If the player is leaving mid-hand while still
+    // holding chips in the live pot (totalInvestedThisHand > 0, not folded),
+    // an immediate standUp would erase their pot contribution (calculatePots
+    // only sees occupied seats) and short-pay the winner. In that case we
+    // fold them now (dead money stays in the pot) and keep the seat until
+    // the hand resolves; processPendingSeatRemovals() does the credit+standUp.
+    const leavingSeatEarly = table.seats[session.seatIndex];
+    const deferRemoval =
       table.isHandInProgress() &&
-      table.activeSeatIndex === session.seatIndex
-    ) {
-      table.playerFold(session.seatIndex);
+      !!leavingSeatEarly &&
+      leavingSeatEarly.state === 'occupied' &&
+      !leavingSeatEarly.isAI &&
+      !leavingSeatEarly.folded &&
+      (leavingSeatEarly.totalInvestedThisHand || 0) > 0;
+
+    // Fold first if the hand is live. Active seat → playerFold (advances the
+    // turn). Non-active deferred leaver → forceFoldSeat (mark folded WITHOUT
+    // advancing, so the real actor keeps the action and the table doesn't
+    // wedge waiting on a gone player).
+    if (table.isHandInProgress()) {
+      if (table.activeSeatIndex === session.seatIndex) {
+        table.playerFold(session.seatIndex);
+      } else if (deferRemoval) {
+        table.forceFoldSeat(session.seatIndex);
+      }
     }
 
     // Clear sit-out tracker + any dead-blind debt on the vacated seat
@@ -7955,55 +8007,73 @@ function handlePlayerLeave(socket: Socket): void {
     // can manually reconcile from the audit trail. Still fire-and-forget
     // because we can't block the user's standUp on a DB retry loop — but
     // the failure is permanently recorded.
-    const auth = authSessions.get(socket.id);
-    const chipsToReturn = leavingSeat?.chipCount || 0;
-    if (auth && chipsToReturn > 0) {
-      addChipsToUser(auth.userId, chipsToReturn)
-        .then((ok) => {
-          if (!ok) {
-            console.error(`[handlePlayerLeave] addChipsToUser returned false for userId=${auth.userId}, amount=${chipsToReturn}`);
-            auditLog(auth.username, 'CASH_OUT_FAILED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, reason: 'addChipsToUser_returned_false' });
-          } else {
-            auditLog(auth.username, 'CASH_OUT', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn });
-          }
-        })
-        .catch((e: any) => {
-          console.error(`[handlePlayerLeave cash-out ${auth.userId}] amount=${chipsToReturn}`, e?.message || e);
-          if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.cashOut' }, extra: { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn } });
-          auditLog(auth.username, 'CASH_OUT_FAILED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, error: String(e?.message || e) });
-        });
-    }
-
-    table.standUp(session.seatIndex);
-
-    // Check if any human players remain
-    const humanCount = table.seats.filter(
-      (s) => s.state === 'occupied' && !s.isAI
-    ).length;
-
-    if (humanCount === 0) {
-      // Remove all AI players
-      for (let i = 0; i < MAX_SEATS; i++) {
-        if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
-          table.standUp(i);
-        }
+    if (deferRemoval) {
+      // C7: do NOT credit/standUp yet — the seat stays occupied+folded so
+      // its committed chips remain in the pot for the award. Record who to
+      // credit; processPendingSeatRemovals() (handResult hook) finishes the
+      // teardown after the hand resolves.
+      const authDefer = authSessions.get(socket.id);
+      if (authDefer) {
+        let m = pendingSeatRemovalAfterHand.get(session.tableId);
+        if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(session.tableId, m); }
+        m.set(session.seatIndex, { userId: authDefer.userId, username: authDefer.username });
+      } else {
+        // No auth to credit (shouldn't happen for a seated player) — fall
+        // back to immediate teardown rather than stranding the seat forever.
+        table.standUp(session.seatIndex);
       }
-      aiProfiles.delete(session.tableId);
-
-      // Clear any AI timeouts
-      const timeoutKey = session.tableId;
-      if (aiTimeouts.has(timeoutKey)) {
-        clearTimeout(aiTimeouts.get(timeoutKey)!.handle);
-        aiTimeouts.delete(timeoutKey);
-      }
-      // Cancel any pending auto-start hand timer — table is empty
-      const pendingStart = pendingAutoStartTimers.get(session.tableId);
-      if (pendingStart) {
-        clearTimeout(pendingStart);
-        pendingAutoStartTimers.delete(session.tableId);
-      }
-    } else {
       broadcastGameState(session.tableId);
+    } else {
+      const auth = authSessions.get(socket.id);
+      const chipsToReturn = leavingSeat?.chipCount || 0;
+      if (auth && chipsToReturn > 0) {
+        addChipsToUser(auth.userId, chipsToReturn)
+          .then((ok) => {
+            if (!ok) {
+              console.error(`[handlePlayerLeave] addChipsToUser returned false for userId=${auth.userId}, amount=${chipsToReturn}`);
+              auditLog(auth.username, 'CASH_OUT_FAILED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, reason: 'addChipsToUser_returned_false' });
+            } else {
+              auditLog(auth.username, 'CASH_OUT', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn });
+            }
+          })
+          .catch((e: any) => {
+            console.error(`[handlePlayerLeave cash-out ${auth.userId}] amount=${chipsToReturn}`, e?.message || e);
+            if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.cashOut' }, extra: { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn } });
+            auditLog(auth.username, 'CASH_OUT_FAILED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, error: String(e?.message || e) });
+          });
+      }
+
+      table.standUp(session.seatIndex);
+
+      // Check if any human players remain
+      const humanCount = table.seats.filter(
+        (s) => s.state === 'occupied' && !s.isAI
+      ).length;
+
+      if (humanCount === 0) {
+        // Remove all AI players
+        for (let i = 0; i < MAX_SEATS; i++) {
+          if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
+            table.standUp(i);
+          }
+        }
+        aiProfiles.delete(session.tableId);
+
+        // Clear any AI timeouts
+        const timeoutKey = session.tableId;
+        if (aiTimeouts.has(timeoutKey)) {
+          clearTimeout(aiTimeouts.get(timeoutKey)!.handle);
+          aiTimeouts.delete(timeoutKey);
+        }
+        // Cancel any pending auto-start hand timer — table is empty
+        const pendingStart = pendingAutoStartTimers.get(session.tableId);
+        if (pendingStart) {
+          clearTimeout(pendingStart);
+          pendingAutoStartTimers.delete(session.tableId);
+        }
+      } else {
+        broadcastGameState(session.tableId);
+      }
     }
 
     socket.leave(`table:${session.tableId}`);
