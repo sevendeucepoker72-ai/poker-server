@@ -7855,6 +7855,19 @@ Give feedback in this JSON format:
       minBuyIn: data.minBuyIn || 1000,
     }, (data.variant as any) || 'texas-holdem');
 
+    // 2026-06-11 audit M2: the createPrivateTable payload advertised straddle /
+    // runItTwice / bombPot toggles but the handler dropped all three silently.
+    // bombPot has a real mechanism (bombPotPending → activateBombPotIfPending),
+    // so honor it for the table's first hand. straddle + runItTwice are not yet
+    // implemented — log when requested so it's visible rather than a silent
+    // no-op (a host who toggled them deserves to know they did nothing).
+    if (data.bombPot) {
+      bombPotPending.set(tableId, true);
+    }
+    if (data.straddle || data.runItTwice) {
+      log.warn(`[createPrivateTable] ${tableId}: requested unimplemented option(s) ${[data.straddle && 'straddle', data.runItTwice && 'runItTwice'].filter(Boolean).join(', ')} — ignored`);
+    }
+
     // Simple invite code = first 8 chars of tableId
     const inviteCode = tableId.slice(0, 8).toUpperCase();
 
