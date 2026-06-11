@@ -255,6 +255,12 @@ const turnStartedAtMap = new Map<string, number>();
 // this keeps a stable "prior seat" reference so a subsequent broadcast
 // can tell if the active seat really changed or not.
 const turnStartedSeatMap = new Map<string, number>();
+// 2026-06-11 audit R11: the handNumber the turn timer was last armed for.
+// A new hand whose first actor is the SAME seat that acted last in the prior
+// hand has priorSeatForStart === activeSeat, so the seat-change check alone
+// would skip arming the timer — leaving an unresponsive first actor able to
+// stall the table forever. Comparing handNumber catches that case.
+const turnStartedHandMap = new Map<string, number>();
 
 // Delta state tracking: socketId -> last full state sent to that client
 const lastSentState = new Map<string, Record<string, any>>();
@@ -1389,7 +1395,12 @@ function broadcastGameState(tableId: string): void {
     const existing = turnTimers.get(tableId);
     const activeSeat = table.activeSeatIndex;
     const priorSeatForStart = turnStartedSeatMap.get(tableId);
-    const seatChanged = priorSeatForStart !== activeSeat;
+    // 2026-06-11 audit R11: a NEW HAND counts as a turn change even when its
+    // first actor is the same seat that acted last in the prior hand — without
+    // this the timer never armed for that opening turn and an idle player
+    // stalled the table.
+    const handChanged = turnStartedHandMap.get(tableId) !== table.handNumber;
+    const seatChanged = priorSeatForStart !== activeSeat || handChanged;
 
     if (seatChanged) {
       if (existing) clearTimeout(existing.timeout);
@@ -1405,6 +1416,7 @@ function broadcastGameState(tableId: string): void {
       const turnId = ++globalTurnId;
       turnStartedAtMap.set(tableId, Date.now());
       turnStartedSeatMap.set(tableId, activeSeat);
+      turnStartedHandMap.set(tableId, table.handNumber); // R11: remember the hand we armed for
       const timeout = setTimeout(() => {
         const entry = turnTimers.get(tableId);
         if (!entry || entry.turnId !== turnId) return; // stale timer
@@ -2131,64 +2143,75 @@ function autoStartNextHand(tableId: string): void {
   // Start new hand
   const started = table.startNewHand();
   if (started) {
-    // Bomb Pot: if pending, activate it for this hand
-    if (bombPotPending.get(tableId)) {
-      bombPotPending.delete(tableId);
-      bombPotActive.set(tableId, true);
-
-      // All players post 2x big blind as ante
-      const bombAnte = table.config.bigBlind * 2;
-      for (let i = 0; i < MAX_SEATS; i++) {
-        const seat = table.seats[i];
-        if (seat.state === 'occupied' && !seat.folded && !seat.eliminated) {
-          const deduction = Math.min(bombAnte, seat.chipCount);
-          seat.chipCount -= deduction;
-          seat.currentBet = deduction;
-          seat.totalInvestedThisHand += deduction;
-          // 2026-06-11 audit C17: a player whose stack is fully consumed by
-          // the bomb ante is all-in for this hand. Without this flag the
-          // engine treats them as a live actor with 0 chips and auto-folds
-          // them on their turn — folding them OUT of a pot they already
-          // paid into (they can never win it). Every other deduction site
-          // in PokerTable sets allIn on a 0 stack; match that here.
-          if (seat.chipCount === 0) seat.allIn = true;
-        }
-      }
-
-      // Skip preflop: advance directly to flop
-      // Deal 3 community cards (the table already dealt hole cards in startNewHand)
-      if (table.communityCards.length === 0) {
-        // Force phase to Flop by dealing community cards
-        const deck = (table as any).deck;
-        deck.dealOne(); // burn card
-        for (let c = 0; c < 3; c++) {
-          const card = deck.dealOne();
-          if (card) table.communityCards.push(card);
-        }
-        (table as any).currentPhase = GamePhase.Flop;
-        // Ante has already been posted — reset currentBet to 0 for the post-flop betting round
-        table.currentBetToMatch = 0;
-        for (let i = 0; i < MAX_SEATS; i++) {
-          table.seats[i].currentBet = 0;
-        }
-        // Set active seat to first non-folded player after dealer
-        let startIdx = (table.dealerButtonSeat + 1) % MAX_SEATS;
-        for (let j = 0; j < MAX_SEATS; j++) {
-          const checkSeat = (startIdx + j) % MAX_SEATS;
-          const s = table.seats[checkSeat];
-          if (s.state === 'occupied' && !s.folded && !s.eliminated && s.chipCount >= 0) {
-            table.activeSeatIndex = checkSeat;
-            break;
-          }
-        }
-      }
-    } else {
-      bombPotActive.delete(tableId);
-    }
+    // Bomb Pot: if pending, activate it for this hand (E6: centralized so
+    // every hand-start path honors a pending bomb, not just this one).
+    activateBombPotIfPending(tableId, table);
 
     broadcastGameState(tableId);
     scheduleAIAction(tableId);
   }
+}
+
+/**
+ * 2026-06-11 audit E6: bomb-pot activation used to be inlined in
+ * autoStartNextHand ONLY, so a hand started via any other path (notably the
+ * live-room heartbeat's WaitingForPlayers kick-start) ignored a pending bomb
+ * pot and it fired a hand late. Centralized here and called after every
+ * startNewHand that should honor a pending bomb. Returns true if a bomb pot
+ * was activated this hand.
+ */
+function activateBombPotIfPending(tableId: string, table: PokerTable): boolean {
+  if (!bombPotPending.get(tableId)) {
+    bombPotActive.delete(tableId);
+    return false;
+  }
+  bombPotPending.delete(tableId);
+  bombPotActive.set(tableId, true);
+
+  // All players post 2x big blind as ante
+  const bombAnte = table.config.bigBlind * 2;
+  for (let i = 0; i < MAX_SEATS; i++) {
+    const seat = table.seats[i];
+    if (seat.state === 'occupied' && !seat.folded && !seat.eliminated) {
+      const deduction = Math.min(bombAnte, seat.chipCount);
+      seat.chipCount -= deduction;
+      seat.currentBet = deduction;
+      seat.totalInvestedThisHand += deduction;
+      // 2026-06-11 audit C17: a player whose stack is fully consumed by the
+      // bomb ante is all-in for this hand. Without this flag the engine treats
+      // them as a live actor with 0 chips and auto-folds them on their turn —
+      // folding them OUT of a pot they already paid into. Match every other
+      // deduction site, which sets allIn on a 0 stack.
+      if (seat.chipCount === 0) seat.allIn = true;
+    }
+  }
+
+  // Skip preflop: advance directly to flop (hole cards already dealt in startNewHand).
+  if (table.communityCards.length === 0) {
+    const deck = (table as any).deck;
+    deck.dealOne(); // burn card
+    for (let c = 0; c < 3; c++) {
+      const card = deck.dealOne();
+      if (card) table.communityCards.push(card);
+    }
+    (table as any).currentPhase = GamePhase.Flop;
+    // Ante posted — reset currentBet to 0 for the post-flop betting round.
+    table.currentBetToMatch = 0;
+    for (let i = 0; i < MAX_SEATS; i++) {
+      table.seats[i].currentBet = 0;
+    }
+    // First non-folded player after the dealer acts first post-flop.
+    const startIdx = (table.dealerButtonSeat + 1) % MAX_SEATS;
+    for (let j = 0; j < MAX_SEATS; j++) {
+      const checkSeat = (startIdx + j) % MAX_SEATS;
+      const s = table.seats[checkSeat];
+      if (s.state === 'occupied' && !s.folded && !s.eliminated && s.chipCount >= 0) {
+        table.activeSeatIndex = checkSeat;
+        break;
+      }
+    }
+  }
+  return true;
 }
 
 // ========== Live-Room Heartbeat ==========
@@ -2258,6 +2281,8 @@ function ensureCashTableRunning(tableId: string): void {
   ) {
     const started = table.startNewHand();
     if (started) {
+      // E6: honor a pending bomb pot started while the table was idle.
+      activateBombPotIfPending(tableId, table);
       broadcastGameState(tableId);
       scheduleAIAction(tableId);
       console.log(`[LiveRoom] Auto-started hand on ${tableId} (occupied=${table.getOccupiedSeatCount()})`);
