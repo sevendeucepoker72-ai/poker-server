@@ -2708,6 +2708,8 @@ function clearGhostSeatsForUser(userId: number, tableId: string, excludeSocketId
       }
       // Remember the name for step 3 (in case OTHER dead seats also match)
       userDisplayName = userDisplayName || seat.playerName;
+      // C8: return the stack to the wallet before destroying the seat.
+      creditSeatStackToWallet(otherAuth.userId, otherAuth.username, tableId, seat, 'ghost_seat_session_scan');
       table.standUp(otherSession.seatIndex);
       cleared++;
     }
@@ -2728,6 +2730,8 @@ function clearGhostSeatsForUser(userId: number, tableId: string, excludeSocketId
     const rSeat = table.seats[reserved.seatIndex];
     if (rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
       userDisplayName = userDisplayName || rSeat.playerName;
+      // C8: return the reserved seat's stack to the wallet before teardown.
+      creditSeatStackToWallet(userId, userUsername || rSeat.playerName || '', tableId, rSeat, 'ghost_seat_reserved');
       table.standUp(reserved.seatIndex);
       cleared++;
     }
@@ -2750,6 +2754,10 @@ function clearGhostSeatsForUser(userId: number, tableId: string, excludeSocketId
       if (table.isHandInProgress() && table.activeSeatIndex === i) {
         try { table.playerFold(i); } catch {}
       }
+      // C8: return the orphaned seat's stack to the wallet before teardown.
+      // All name-matched seats belong to this userId (that's the match
+      // criterion), so crediting userId is correct.
+      creditSeatStackToWallet(userId, userUsername || s.playerName || '', tableId, s, 'ghost_seat_name_scan');
       table.standUp(i);
       cleared++;
     }
@@ -7878,6 +7886,36 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
     lastSentState.delete(socket.id); lastSentJson.delete(socket.id);
   });
 });
+
+// 2026-06-11 audit C8: credit a seat's at-table stack back to the user's
+// wallet before the seat is torn down. Mirrors the inline cash-out in
+// handlePlayerLeave (fire-and-forget additive credit + auditable
+// success/failure). Used by clearGhostSeatsForUser, which previously
+// stood up occupied seats WITHOUT crediting — destroying a real, wallet-
+// backed stack (e.g. an OAuth reconnect to a different seat that bypassed
+// handlePlayerLeave). Safe against double-credit: callers only invoke it
+// on seats still state==='occupied' (handlePlayerLeave sets them 'empty'),
+// so a seat already cashed out won't be credited twice.
+function creditSeatStackToWallet(
+  userId: number, username: string, tableId: string, seat: any, reason: string
+): void {
+  const chips = (seat && seat.chipCount) || 0;
+  if (chips <= 0) return;
+  addChipsToUser(userId, chips)
+    .then((ok: boolean) => {
+      if (!ok) {
+        console.error(`[creditSeatStackToWallet] addChipsToUser false userId=${userId} amount=${chips} (${reason})`);
+        auditLog(username, 'CASH_OUT_FAILED', { userId, tableId, amount: chips, reason: reason + '_returned_false' });
+      } else {
+        auditLog(username, 'CASH_OUT', { userId, tableId, amount: chips, reason });
+      }
+    })
+    .catch((e: any) => {
+      console.error(`[creditSeatStackToWallet ${userId}] amount=${chips} (${reason})`, e?.message || e);
+      if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.cashOut' }, extra: { userId, tableId, amount: chips, reason } });
+      auditLog(username, 'CASH_OUT_FAILED', { userId, tableId, amount: chips, error: String(e?.message || e) });
+    });
+}
 
 function handlePlayerLeave(socket: Socket): void {
   const session = playerSessions.get(socket.id);
