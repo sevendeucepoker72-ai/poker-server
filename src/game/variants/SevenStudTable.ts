@@ -134,11 +134,19 @@ export class SevenStudTable extends PokerTable {
   /**
    * Override: use stud/razz evaluation.
    */
-  protected evaluatePlayerHand(holeCards: Card[], _communityCards: Card[]): HandResult {
+  protected evaluatePlayerHand(holeCards: Card[], communityCards: Card[]): HandResult {
+    // 2026-06-11 audit R5: 8-handed stud can exhaust the 52-card deck on 7th
+    // street (8×7=56 > 52). When it does, dealStudCards turns a single shared
+    // COMMUNITY card and every remaining player counts it as their 7th card —
+    // so include it in the evaluation. For a normal hand communityCards is
+    // empty, making this a no-op (the usual 7 hole cards).
+    const cards = communityCards && communityCards.length > 0
+      ? [...holeCards, ...communityCards]
+      : holeCards;
     if (this.variant.isRazz) {
-      return evaluateRazzHand(holeCards);
+      return evaluateRazzHand(cards);
     }
-    return evaluateHand(holeCards);
+    return evaluateHand(cards);
   }
 
   /**
@@ -485,14 +493,27 @@ export class SevenStudTable extends PokerTable {
     }
 
     if (phase === 'SeventhStreet') {
-      // 1 face-down card
-      for (const seat of activePlayers) {
-        const vis = this.cardVisibility.get(seat.seatIndex) || [];
-        const card = this.deck.dealOne();
-        if (card) {
-          seat.holeCards.push(card);
-          vis.push(false);
-          this.cardVisibility.set(seat.seatIndex, vis);
+      // 2026-06-11 audit R5: 8-handed stud can exhaust the 52-card deck before
+      // every remaining player gets an individual 7th card (8×7=56 > 52). TDA:
+      // when the deck can't deal one card per active player, turn a SINGLE
+      // face-up community card that all remaining players share as their 7th
+      // card instead (evaluatePlayerHand folds it into each hand).
+      if (this.deck.cardsRemaining() < activePlayers.length) {
+        const community = this.deck.dealOne();
+        if (community) {
+          this.communityCards.push(community);
+          this.emit('communityCard', { card: community, total: this.communityCards.length });
+        }
+      } else {
+        // 1 face-down card each
+        for (const seat of activePlayers) {
+          const vis = this.cardVisibility.get(seat.seatIndex) || [];
+          const card = this.deck.dealOne();
+          if (card) {
+            seat.holeCards.push(card);
+            vis.push(false);
+            this.cardVisibility.set(seat.seatIndex, vis);
+          }
         }
       }
     } else {

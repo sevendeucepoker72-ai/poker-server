@@ -439,6 +439,32 @@ describe('Stud — C13 ante/bring-in (not SB/BB) + R4 action order by exposed ha
     expect(t.scoreExposedBoard(trips5)).toBeGreaterThan(t.scoreExposedBoard(pair8));
     expect(t.scoreExposedBoard(aKQ)).toBeGreaterThan(t.scoreExposedBoard(aKJ));
   });
+
+  test('R5: evaluatePlayerHand folds in the shared community card (6 hole + 1 = 7)', () => {
+    const t = new SevenStudTable(scfg(0), false, false) as any;
+    const hole = [
+      { suit: 0, rank: 7 }, { suit: 1, rank: 7 },
+      { suit: 0, rank: 2 }, { suit: 1, rank: 4 },
+      { suit: 2, rank: 9 }, { suit: 3, rank: 11 },
+    ]; // a pair of 7s among the 6 individual cards
+    const withCommunity = t.evaluatePlayerHand(hole, [{ suit: 2, rank: 7 }]); // 3rd 7 → trips
+    const withoutCommunity = t.evaluatePlayerHand(hole, []);
+    expect(withCommunity.handRank).toBeGreaterThan(withoutCommunity.handRank);
+  });
+
+  test('R5: 7th street with an exhausted deck deals ONE shared community card', () => {
+    const t = new SevenStudTable(scfg(0), false, false) as any;
+    seatPlayers(t, 4);
+    t.startNewHand(); // populates + shuffles the deck, deals 3rd street (3 cards each)
+    // Drain the deck so it cannot deal 4 individual 7th-street cards.
+    t.deck.currentIndex = t.deck.cards.length - 1; // 1 remaining < 4 active players
+    const before = t.communityCards.length;
+    t.dealStudCards('SeventhStreet');
+    expect(t.communityCards.length).toBe(before + 1); // exactly one shared card turned
+    for (const s of t.seats.filter((x: any) => x.state === 'occupied' && !x.folded)) {
+      expect(s.holeCards.length).toBe(3); // no individual 7th card was dealt
+    }
+  });
 });
 
 describe('Variant rehydrate — C14/C15/R9: snapshot preserves variant state across redeploy', () => {
