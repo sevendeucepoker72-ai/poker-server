@@ -3740,6 +3740,17 @@ Give feedback in this JSON format:
   });
 
   socket.on('loadProgress', async (data: { userId: number }) => {
+    // 2026-06-10 audit (IDOR fix): loadProgress previously trusted the
+    // client-supplied userId with no auth check, so any authenticated
+    // socket could read ANY user's progression (xp/level/stats/stars/
+    // inventory) by enumerating sequential userIds. Gate it the same
+    // way saveProgress (directly below) already does — caller may only
+    // load their OWN progress.
+    const auth = authSessions.get(socket.id);
+    if (!auth || auth.userId !== data.userId) {
+      socket.emit('error', { message: 'Unauthorized' });
+      return;
+    }
     const result = await loadProgress(data.userId);
     socket.emit('progressLoaded', result);
   });
@@ -6321,6 +6332,11 @@ Give feedback in this JSON format:
     (data: {
       type: 'fold' | 'check' | 'call' | 'raise' | 'allIn';
       amount?: number;
+      // 2026-06-10 audit: required (was optional). The handler now
+      // rejects actions with no nonce — the sanctioned client always
+      // sends one. Kept as `string | undefined` at runtime via the
+      // explicit guard below since socket payloads aren't type-checked
+      // at the boundary, but the contract is: nonce is mandatory.
       nonce?: string;
     }) => {
       const session = playerSessions.get(socket.id);
@@ -6339,7 +6355,20 @@ Give feedback in this JSON format:
       // can't replay a nonce from one table at another). Stamped with ts so
       // the periodic sweeper can age entries out — the previous keys-only
       // shape (string) defeated the sweeper and silently disabled this guard.
-      if (data.nonce) {
+      //
+      // 2026-06-10 audit: the nonce is now REQUIRED. Previously the whole
+      // block was gated on `if (data.nonce)`, so an action sent without a
+      // nonce skipped replay protection entirely. The sanctioned client
+      // path (poker-3d socketService.emitPlayerAction) ALWAYS attaches a
+      // nonce via makeNonce(), on both the immediate-send and the
+      // reconnect-queue-flush branches — so a missing nonce means a non-
+      // sanctioned or tampered caller. Reject it rather than process an
+      // un-deduped action.
+      if (!data.nonce) {
+        socket.emit('error', { message: 'Missing action nonce' });
+        return;
+      }
+      {
         const nonceKey = `${session.tableId}:${session.seatIndex}`;
         const lastEntry = actionNonces.get(nonceKey);
         if (lastEntry && lastEntry.nonce === data.nonce) {

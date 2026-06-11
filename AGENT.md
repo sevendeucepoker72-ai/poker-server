@@ -12,8 +12,10 @@
 - **Source:** `C:/Users/josh2/Downloads/developer setup/poker-server/`
 - **Stack:** Node.js + TypeScript + Socket.io + Express (for REST)
 - **Hosting:** Railway service `poker-server` (project ID `64b09936-5cd3-4bc8-834c-b77acb5d7605`)
-- **Database:** SQLite at `/data/poker.db` (ephemeral — no persistent volume)
-- **Cache:** Redis via `REDIS_URL` env var (hand-state snapshots)
+- **Region:** **US East (Virginia)** since 2026-05-20. Was EU West (Amsterdam) before. Volume-attached services (`Postgres-dCcH`, `Redis-8Erh`) live in the same region. See SITES.md §2 for the deprecated EU services kept for 24h rollback.
+- **Plan:** Railway **Pro** since 2026-05-20 (was Hobby; Hobby plan was the first to be paused during platform incidents and Hobby's deploy queue blocked our same-day hotfix path).
+- **Database:** Postgres 18 SSL via `DATABASE_URL` env var. Currently references `${{Postgres-dCcH.DATABASE_URL}}`. (The poker-server in-memory state IS still ephemeral; "Database" here refers to the master-API-shared `users` table + per-user progression in Postgres, NOT a per-process SQLite.)
+- **Cache:** Redis via `REDIS_URL` env var (hand-state snapshots). Currently references `${{Redis-8Erh.REDIS_URL}}`.
 
 ## Files an agent must read before editing
 
@@ -116,6 +118,16 @@ git checkout <prior-sha> && railway up --service poker-server
 - **`base: '/'`** is poker-3d frontend config, not this server. This
   server has no Vite.
 - **Tournament rebalance does NOT re-check socket liveness post-disconnect.**
-  Known issue, unfixed (low priority).
-- **`chipVelocityAlerts` count never decays.** False-positive auto-bans
-  next session for some users. Known issue, unfixed.
+  Known issue, unfixed (low priority). (2026-06-10 audit note: the
+  rebalance path at index.ts:~8411 DOES now check
+  `io.sockets.sockets.get(tp.socketId)` before mutating; the residual
+  race is a socket dropping between the check and the mutation, which
+  reconnect recovery resolves. Effectively low-severity.)
+- **`chipVelocityAlerts` count decay — FIXED (2026-06-10 audit
+  verified).** `incrementChipVelocityAlert` (index.ts:419) applies
+  retroactive decay (`count - floor(idle / 24h)`) on every alert, and
+  that function is the ONLY consumer of the count (the auto-ban at
+  index.ts:~1552 reads `incrementChipVelocityAlert()`'s return). A user
+  with 2 stale alerts + 48h idle gets recomputed to 1 on their next
+  alert, NOT banned. No stale-read path exists. The previous "never
+  decays" note was stale.

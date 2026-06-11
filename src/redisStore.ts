@@ -59,7 +59,13 @@ export async function connectRedis(): Promise<boolean> {
   connectAttempted = true;
 
   if (!process.env.REDIS_URL) {
-    console.log('[redisStore] REDIS_URL not set — hand persistence disabled');
+    // 2026-06-10 audit: elevated from console.log to console.warn so this
+    // is visible in Railway's log filter. Without REDIS_URL, in-progress
+    // hands are LOST on every redeploy (rehydration becomes a no-op) — an
+    // operator who forgets to set it on a fresh service only finds out
+    // when a player reports a vanished hand. A warn-level line surfaces it
+    // at deploy time instead.
+    console.warn('[redisStore] ⚠️  REDIS_URL not set — hand-state persistence DISABLED. In-progress hands will NOT survive a redeploy. Set REDIS_URL on Railway.');
     return false;
   }
 
