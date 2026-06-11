@@ -429,7 +429,13 @@ function countOuts(holeCards: Card[], communityCards: Card[]): number {
 // Round a chip amount to the nearest big-blind multiple for clean bet sizing
 function roundToBB(amount: number, bigBlind: number): number {
   if (bigBlind <= 0) return amount;
-  return Math.round(amount / bigBlind) * bigBlind;
+  // 2026-06-11 audit M4: round UP to the nearest big blind, not to the nearest.
+  // Every raise site passes Math.max(getMinRaise(), …) as `amount`; rounding to
+  // the NEAREST BB could land BELOW getMinRaise (e.g. min 160, BB 50 → 150),
+  // and the engine then rejects the sub-minimum raise and silently downgrades
+  // it to a call. Ceiling keeps the rounded size >= the (already min-gated)
+  // input, so an intended raise stays a raise.
+  return Math.ceil(amount / bigBlind) * bigBlind;
 }
 
 // GTO-influenced bet sizing
@@ -854,15 +860,18 @@ function preFlopStrategy(
       }
       return { action: PlayerAction.Check, raiseAmount: 0 };
     }
+    // 2026-06-11 audit M3: shove monsters FIRST. The `>= 0.60 → Call` below
+    // used to shadow this branch (0.88 is also >= 0.60), so the all-in was
+    // dead code and FISH never shoved a monster preflop.
+    if (handStrength >= 0.88) {
+      return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    }
     // Calls way too wide
     if (handStrength >= 0.22 && callAmount <= seat.chipCount * 0.10) {
       return { action: PlayerAction.Call, raiseAmount: 0 };
     }
     if (handStrength >= 0.60) {
       return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
-    if (handStrength >= 0.88) {
-      return { action: PlayerAction.AllIn, raiseAmount: 0 };
     }
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
@@ -1230,7 +1239,11 @@ function postFlopStrategy(
     // But consider raising sometimes (merge/balanced)
     if (effectiveStrength > 0.6 && Math.random() < 0.3 * profile.aggressionFactor / 3) {
       const raiseSize = roundToBB(Math.max(table.getMinRaise(), Math.round(totalPot * 0.6)), bigBlind);
-      if (raiseSize + callAmount <= seat.chipCount) {
+      // 2026-06-11 audit M5: raiseSize is the TOTAL bet (it already includes
+      // the call), so the old `raiseSize + callAmount` over-counted the cost
+      // and made the bot fold/call when it could afford the raise. Match the
+      // other raise sites, which gate on `raiseAmount <= chipCount`.
+      if (raiseSize <= seat.chipCount) {
         return { action: PlayerAction.Raise, raiseAmount: raiseSize };
       }
     }
