@@ -2650,7 +2650,18 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
         if (seat?.playerId) winnerPlayerIds.add(seat.playerId);
       }
     }
+    // 2026-06-11 audit R2: when multiple players bust the SAME hand, finish
+    // position — and now the real funded prize payout — must be decided by
+    // PRE-HAND stack (the bigger stack outlasted more, so finishes higher),
+    // not raw seat-index order. eliminatePlayer assigns worsening positions in
+    // call order, so eliminate the SHORTEST pre-hand stack FIRST (worst place).
+    const bustedSeatIdx: number[] = [];
     for (let i = 0; i < MAX_SEATS; i++) {
+      const s = table.seats[i];
+      if (s?.state === 'occupied' && s.chipCount <= 0 && !s.eliminated) bustedSeatIdx.push(i);
+    }
+    bustedSeatIdx.sort((a, b) => (table.startChips.get(a) || 0) - (table.startChips.get(b) || 0));
+    for (const i of bustedSeatIdx) {
       const seat = table.seats[i];
       if (seat?.state === 'occupied' && seat.chipCount <= 0 && !seat.eliminated) {
         seat.eliminated = true;
