@@ -14,6 +14,7 @@ import { CardDeck } from '../src/game/CardDeck';
 import { FiveCardDrawTable } from '../src/game/variants/FiveCardDrawTable';
 import { BadugiTable } from '../src/game/variants/BadugiTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
+import { ShortDeckTable } from '../src/game/variants/ShortDeckTable';
 import { SidePotManager } from '../src/game/SidePotManager';
 import {
   evaluate27LowHand,
@@ -366,6 +367,45 @@ describe('Blind/button derivation — C10/R1: non-contiguous seating', () => {
     // 250 uncalled (300 - 50) returned to seat 0.
     expect(t.seats[0].chipCount).toBe(950);
     expect(t.seats[0].currentBet).toBe(50);
+  });
+});
+
+describe('Variant rehydrate — C14/C15/R9: snapshot preserves variant state across redeploy', () => {
+  const vcfg = (id = 'v'): any => ({
+    tableId: id, tableName: 'V', smallBlind: 25, bigBlind: 50, ante: 0,
+    minBuyIn: 1000, maxPlayers: 9,
+  });
+
+  test('C14: ShortDeck round-trips its 36-card deck + index', () => {
+    const t = new ShortDeckTable(vcfg());
+    (t as any)._shortDeckCards = Array.from({ length: 36 }, (_, i) => ({ suit: i % 4, rank: 6 + (i % 9) }));
+    (t as any)._shortDeckIndex = 7;
+    const t2 = new ShortDeckTable(vcfg());
+    t2.rehydrateFromSnapshot(t.serializeSnapshot());
+    expect((t2 as any)._shortDeckCards.length).toBe(36);
+    expect((t2 as any)._shortDeckIndex).toBe(7);
+  });
+
+  test('C15: FiveCardDraw round-trips draw progress (no double-draw after restart)', () => {
+    const t = new FiveCardDrawTable(vcfg(), true);
+    t.drawsCompleted = new Set([0, 2, 4]);
+    (t as any).drawRound = 2;
+    t.currentDrawPhase = 'Draw2' as any;
+    const t2 = new FiveCardDrawTable(vcfg(), true);
+    t2.rehydrateFromSnapshot(t.serializeSnapshot());
+    expect(Array.from(t2.drawsCompleted).sort()).toEqual([0, 2, 4]);
+    expect((t2 as any).drawRound).toBe(2);
+    expect(t2.currentDrawPhase).toBe('Draw2');
+  });
+
+  test('R9: SevenStud round-trips card visibility', () => {
+    const t = new SevenStudTable(vcfg(), false, false);
+    t.cardVisibility.set(0, [false, false, true]);
+    t.cardVisibility.set(3, [false, false, true, true]);
+    const t2 = new SevenStudTable(vcfg(), false, false);
+    t2.rehydrateFromSnapshot(t.serializeSnapshot());
+    expect(t2.cardVisibility.get(0)).toEqual([false, false, true]);
+    expect(t2.cardVisibility.get(3)).toEqual([false, false, true, true]);
   });
 });
 

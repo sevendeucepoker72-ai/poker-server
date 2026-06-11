@@ -8,6 +8,7 @@ import {
   PlayerAction,
   Seat,
   TableConfig,
+  PokerTableSnapshot,
 } from '../PokerTable';
 import { FiveCardDrawVariant } from './FiveCardDrawVariant';
 import { PokerVariant, VariantPhase } from './PokerVariant';
@@ -84,6 +85,36 @@ export class FiveCardDrawTable extends PokerTable {
       return (a: HandResult, b: HandResult) => -compare27Hands(a, b);
     }
     return super.getHandComparator();
+  }
+
+  /**
+   * 2026-06-11 audit C15: draw-round progress (drawsCompleted / currentDrawPhase
+   * / drawRound / discardPile) is NOT base-class state, so a Railway redeploy
+   * mid-hand lost it — letting a player draw AGAIN in the same draw round after
+   * restart (hand improvement). Persist + restore it. (BadugiTable extends this
+   * class, so this covers Badugi's draw rounds too.)
+   */
+  serializeSnapshot(): PokerTableSnapshot {
+    const snap = super.serializeSnapshot();
+    (snap as any).variantState = {
+      ...((snap as any).variantState || {}),
+      drawsCompleted: Array.from(this.drawsCompleted),
+      currentDrawPhase: this.currentDrawPhase,
+      drawRound: this.drawRound,
+      discardPile: this.discardPile,
+    };
+    return snap;
+  }
+
+  rehydrateFromSnapshot(snap: PokerTableSnapshot): void {
+    super.rehydrateFromSnapshot(snap);
+    const vs = (snap as any).variantState;
+    if (vs) {
+      if (Array.isArray(vs.drawsCompleted)) this.drawsCompleted = new Set(vs.drawsCompleted);
+      if (vs.currentDrawPhase !== undefined) this.currentDrawPhase = vs.currentDrawPhase;
+      if (typeof vs.drawRound === 'number') this.drawRound = vs.drawRound;
+      if (Array.isArray(vs.discardPile)) this.discardPile = vs.discardPile;
+    }
   }
 
   /**

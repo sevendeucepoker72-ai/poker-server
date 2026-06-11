@@ -10,6 +10,7 @@ import {
   HandWinResult,
   WinnerInfo,
   ShowdownHandInfo,
+  PokerTableSnapshot,
 } from '../PokerTable';
 import { SevenCardStudVariant } from './SevenCardStudVariant';
 import { PokerVariant, VariantPhase, StudCardInfo } from './PokerVariant';
@@ -123,6 +124,32 @@ export class SevenStudTable extends PokerTable {
       return (a: HandResult, b: HandResult) => -compareRazzHands(a, b);
     }
     return super.getHandComparator();
+  }
+
+  /**
+   * 2026-06-11 audit R9: cardVisibility (which stud cards are face-up) + the
+   * stud street progress are NOT base-class state. After a Railway redeploy
+   * mid-hand, all up-cards rendered hidden and the bring-in / high-board logic
+   * read an empty up-card set. Persist + restore them.
+   */
+  serializeSnapshot(): PokerTableSnapshot {
+    const snap = super.serializeSnapshot();
+    (snap as any).variantState = {
+      cardVisibility: Array.from(this.cardVisibility.entries()),
+      currentStudPhase: this.currentStudPhase,
+      studStreetIndex: (this as any).studStreetIndex,
+    };
+    return snap;
+  }
+
+  rehydrateFromSnapshot(snap: PokerTableSnapshot): void {
+    super.rehydrateFromSnapshot(snap);
+    const vs = (snap as any).variantState;
+    if (vs) {
+      if (Array.isArray(vs.cardVisibility)) this.cardVisibility = new Map(vs.cardVisibility);
+      if (vs.currentStudPhase !== undefined) this.currentStudPhase = vs.currentStudPhase;
+      if (typeof vs.studStreetIndex === 'number') (this as any).studStreetIndex = vs.studStreetIndex;
+    }
   }
 
   /**

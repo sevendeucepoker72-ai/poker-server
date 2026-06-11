@@ -5,6 +5,7 @@ import { evaluateShortDeckHand } from '../HandEvaluatorExtensions';
 import {
   PokerTable,
   TableConfig,
+  PokerTableSnapshot,
 } from '../PokerTable';
 import { ShortDeckVariant } from './ShortDeckVariant';
 import { PokerVariant } from './PokerVariant';
@@ -30,6 +31,35 @@ export class ShortDeckTable extends PokerTable {
     this.variantName = 'Short Deck (6+)';
     this.holeCardCount = 2;
     this.bettingStructure = 'no-limit';
+  }
+
+  /**
+   * 2026-06-11 audit C14/R8: the 36-card short deck lives in _shortDeckCards
+   * (NOT this.deck), so the base snapshot didn't persist it. After a Railway
+   * redeploy mid-hand, the deck was empty → no further cards dealt, board
+   * stopped growing, hand resolved on a short board with the wrong winner.
+   * Persist + restore the short-deck array + index + commitment alongside the
+   * base snapshot (carried in a variantState bag that survives the JSON
+   * round-trip to Redis without touching the base interface).
+   */
+  serializeSnapshot(): PokerTableSnapshot {
+    const snap = super.serializeSnapshot();
+    (snap as any).variantState = {
+      shortDeckCards: this._shortDeckCards,
+      shortDeckIndex: this._shortDeckIndex,
+      shortDeckCommitment: this._shortDeckCommitment,
+    };
+    return snap;
+  }
+
+  rehydrateFromSnapshot(snap: PokerTableSnapshot): void {
+    super.rehydrateFromSnapshot(snap);
+    const vs = (snap as any).variantState;
+    if (vs) {
+      if (Array.isArray(vs.shortDeckCards)) this._shortDeckCards = vs.shortDeckCards;
+      if (typeof vs.shortDeckIndex === 'number') this._shortDeckIndex = vs.shortDeckIndex;
+      if (vs.shortDeckCommitment) this._shortDeckCommitment = vs.shortDeckCommitment;
+    }
   }
 
   /**
