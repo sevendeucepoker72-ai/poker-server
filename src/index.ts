@@ -231,6 +231,13 @@ const playerSessions = new Map<string, PlayerSession>();
 const turnTimers = new Map<string, { timeout: ReturnType<typeof setTimeout>; seatIndex: number; turnId: number }>();
 let globalTurnId = 0;
 const TURN_TIMEOUT_MS = 30000; // 30 seconds
+// 2026-06-11 audit R10: draw phases (5-card draw / 2-7 triple draw / Badugi)
+// have no per-seat turn — the phase just waits for everyone to draw — so the
+// per-turn betting timer above never covers them. Without a clock an
+// unresponsive HUMAN freezes the table (AI auto-draw, but the phase waits for
+// the human's playerDraw that never arrives). One draw-phase timer per table,
+// keyed by (handNumber, phase) so it's idempotent across re-broadcasts.
+const drawTimers = new Map<string, { timeout: ReturnType<typeof setTimeout>; handNumber: number; phase: GamePhase }>();
 const TURN_WARNING_LEAD_MS = 10000; // fire warning 10s before timeout
 
 // Push-notification "prior seat" tracker: tableId -> last seat we already
@@ -1800,6 +1807,34 @@ function scheduleAIAction(tableId: string): void {
           }
         }
       }
+    }
+
+    // 2026-06-11 audit R10: arm a draw-phase clock for HUMAN players (the AI
+    // loop above auto-draws bots). One per (hand, phase) so the many
+    // scheduleAIAction re-entries don't stack timers; on fire, stand-pat
+    // (draw 0) any non-AI player who hasn't drawn so the phase completes
+    // instead of hanging forever on an unresponsive human.
+    const armedHand = drawTable.handNumber;
+    const dphase = drawTable.currentPhase;
+    const existingDraw = drawTimers.get(tableId);
+    const sameDraw = !!existingDraw && existingDraw.handNumber === armedHand && existingDraw.phase === dphase;
+    if (!sameDraw) {
+      if (existingDraw) clearTimeout(existingDraw.timeout);
+      const drawTimeout = setTimeout(() => {
+        const t = tableManager.getTable(tableId);
+        if (!(t instanceof FiveCardDrawTable)) return;
+        if (t.handNumber !== armedHand || t.currentPhase !== dphase) return; // stale: phase/hand moved on
+        let forced = false;
+        for (const s of t.seats) {
+          if (!s.isAI && s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated && !t.drawsCompleted.has(s.seatIndex)) {
+            t.playerDraw(s.seatIndex, []); // stand pat — timed out
+            forced = true;
+          }
+        }
+        if (forced) broadcastGameState(tableId);
+        scheduleAIAction(tableId);
+      }, TURN_TIMEOUT_MS);
+      drawTimers.set(tableId, { timeout: drawTimeout, handNumber: armedHand, phase: dphase });
     }
     return;
   }
