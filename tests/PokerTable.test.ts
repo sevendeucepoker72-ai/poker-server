@@ -370,6 +370,29 @@ describe('Blind/button derivation — C10/R1: non-contiguous seating', () => {
   });
 });
 
+describe('playerRaise — E2: no illegal re-raise after a short all-in (TDA Rule 41)', () => {
+  test('a seat that already acted cannot voluntarily re-raise over a non-reopening short all-in', () => {
+    const t = makeTable();
+    seatPlayers(t, 3); // 5000 each
+    t.currentPhase = GamePhase.PreFlop;
+    t.activeSeatIndex = 0;
+    t.seats[0].folded = false; t.seats[0].allIn = false; t.seats[0].eliminated = false;
+    t.seats[0].currentBet = 100;
+    t.currentBetToMatch = 150; // a short all-in bumped the bet to 150...
+    t.lastRaiseAmount = 50;     // ...by less than a full raise → action NOT reopened
+    t.seats[0].hasActedSinceLastFullRaise = true; // seat 0 already acted this round
+
+    // Voluntary re-raise is illegal — call/fold only.
+    expect((t as any).playerRaise(0, 1000)).toBe(false);
+    expect(t.seats[0].currentBet).toBe(100); // unchanged — the raise was rejected
+
+    // Control: when the action WAS reopened (flag reset by a full raise), the
+    // same raise is legal again.
+    t.seats[0].hasActedSinceLastFullRaise = false;
+    expect((t as any).playerRaise(0, 1000)).toBe(true);
+  });
+});
+
 describe('Variant rehydrate — C14/C15/R9: snapshot preserves variant state across redeploy', () => {
   const vcfg = (id = 'v'): any => ({
     tableId: id, tableName: 'V', smallBlind: 25, bigBlind: 50, ante: 0,

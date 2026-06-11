@@ -986,6 +986,19 @@ export class PokerTable extends EventEmitter {
     if (!this.isValidAction(seatIndex)) return false;
 
     const seat = this.seats[seatIndex];
+
+    // 2026-06-11 audit E2 (TDA Rule 41): a player who has ALREADY acted since
+    // the last FULL raise may only call or fold when a sub-minimum (short)
+    // all-in puts more in front of them — that short all-in does NOT reopen the
+    // betting. A full raise would have reset hasActedSinceLastFullRaise=false
+    // for this seat (see below), so if it's still true while they're facing a
+    // raise (currentBetToMatch > their currentBet), the action wasn't reopened
+    // to them and a voluntary re-raise is illegal. (All-in is always allowed —
+    // that path is playerAllIn, not here.)
+    if (seat.hasActedSinceLastFullRaise && this.currentBetToMatch > seat.currentBet) {
+      return false;
+    }
+
     const minRaise = this.getMinRaise();
 
     // TDA: Opening bet must be at least one big blind
