@@ -439,16 +439,19 @@ function auditLog(actorUsername: string, action: string, details: Record<string,
 
 // ========== Testing-mode unlimited chip refills ==========
 //
-// While the .online room is still in testing we want every player to be
-// able to sit at any table regardless of their current DB balance. Rather
-// than granting a huge starting stack up front (which would distort
-// progression testing) we auto-top-up ON-DEMAND: any buy-in path that
-// finds `dbChips < buyIn` calls ensureChipsForBuyIn which credits the
-// user enough to cover the buy-in plus a small buffer, then proceeds.
+// On-demand auto-top-up: any buy-in path that finds `dbChips < buyIn`
+// calls ensureChipsForBuyIn which credits the user enough to cover the
+// buy-in plus a buffer, then proceeds.
 //
-// Disable for production by setting UNLIMITED_CHIPS_TESTING=0 on Railway.
-// Default ENABLED so a fresh deploy just works for live testers.
-const UNLIMITED_CHIPS_TESTING = process.env.UNLIMITED_CHIPS_TESTING !== '0';
+// 2026-06-11 gameplay-audit finding C1: this is a CHIP FAUCET — the
+// surplus (target = max(buyIn*2, 50000)) is farmable via buy-in →
+// cash-out round-trips, and .online chips gate championship qualifiers
+// (real value). Default flipped to OFF (secure-by-default, matching the
+// ADMIN_AUTH_ENFORCE pattern): the faucet is enabled ONLY when
+// UNLIMITED_CHIPS_TESTING=1 is explicitly set on Railway. A fresh /
+// production deploy now has NO faucet. Set =1 on Railway only for a
+// dedicated test environment, never on the live room.
+const UNLIMITED_CHIPS_TESTING = process.env.UNLIMITED_CHIPS_TESTING === '1';
 async function ensureChipsForBuyIn(
   userId: number,
   username: string,
@@ -2106,6 +2109,13 @@ function autoStartNextHand(tableId: string): void {
           seat.chipCount -= deduction;
           seat.currentBet = deduction;
           seat.totalInvestedThisHand += deduction;
+          // 2026-06-11 audit C17: a player whose stack is fully consumed by
+          // the bomb ante is all-in for this hand. Without this flag the
+          // engine treats them as a live actor with 0 chips and auto-folds
+          // them on their turn — folding them OUT of a pot they already
+          // paid into (they can never win it). Every other deduction site
+          // in PokerTable sets allIn on a 0 stack; match that here.
+          if (seat.chipCount === 0) seat.allIn = true;
         }
       }
 
@@ -6166,6 +6176,15 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'Seat not occupied' });
       return;
     }
+    // 2026-06-11 audit C4: rebuy is a CASH-TABLE action only. In a
+    // tournament a busted player is eliminated and their seat/stack is
+    // owned by TournamentManager; a self-serve rebuy would let them
+    // un-eliminate with a client-chosen stack and corrupt standings +
+    // payouts. Mirror the moveSeat tournament gate.
+    if (tournamentTables.has(session.tableId)) {
+      socket.emit('error', { message: 'Rebuys are disabled in tournaments' });
+      return;
+    }
     // Don't allow rebuys in the middle of a hand while the player is
     // still in the pot — the stack is committed. Rebuy between hands or
     // while folded/sat-out only.
@@ -6193,10 +6212,28 @@ Give feedback in this JSON format:
       }
       auditLog(authForRebuy.username, 'REBUY_DEDUCT', { tableId: session.tableId, topUpAmount, newStack: requested });
     }
-    seat.chipCount = requested;
+    // 2026-06-11 audit C5: a hand can auto-start during the awaits above
+    // (ensureChipsForBuyIn / deductChips are DB round-trips). If it did,
+    // the player may have already posted a blind out of seat.chipCount —
+    // a flat `seat.chipCount = requested` would erase that posted blind
+    // while it sits in the live pot, MINTING table chips. Two guards:
+    //   (a) if a live hand started under us and the player is now in it,
+    //       abort the top-up (their stack is committed) — the chips were
+    //       already deducted from the wallet, so credit them back.
+    //   (b) otherwise add the top-up ADDITIVELY rather than assigning a
+    //       flat target, so any concurrent stack change is preserved.
+    if (table.isHandInProgress() && !seat.folded) {
+      if (authForRebuy) {
+        await addChipsToUser(authForRebuy.userId, topUpAmount);
+        auditLog(authForRebuy.username, 'REBUY_REFUND_HAND_STARTED', { tableId: session.tableId, topUpAmount });
+      }
+      socket.emit('error', { message: 'Hand started before rebuy completed — try again between hands' });
+      return;
+    }
+    seat.chipCount += topUpAmount;
     seat.eliminated = false;
     broadcastGameState(session.tableId);
-    socket.emit('rebuyComplete', { success: true, newStack: requested, added: topUpAmount });
+    socket.emit('rebuyComplete', { success: true, newStack: seat.chipCount, added: topUpAmount });
     // 2026-05-12 audit: throttled to debug, was console.log
     log.debug(`[Rebuy] ${seat.playerName} topped up by ${topUpAmount} to ${requested}`);
   })(); });
