@@ -409,7 +409,14 @@ export class PokerTable extends EventEmitter {
       s => s.state === 'occupied' && !s.eliminated && s.chipCount > 0
     );
 
-    if (occupiedSeats.length < 2) {
+    // 2026-06-11 audit C11/C12 (full exclusion): a SITTING-OUT player is not in
+    // the hand, so they don't count toward the 2-player minimum. Without this,
+    // a table with 1 active player + 1 sitting-out would start a hand in which
+    // the sit-out seat is pre-folded below, leaving 1 live player — the hand
+    // instantly resolves and the auto-starter loops it. Require >= 2 players
+    // who are actually playing.
+    const activeNonSitOut = occupiedSeats.filter(s => !this._sittingOutSeats.has(s.seatIndex));
+    if (activeNonSitOut.length < 2) {
       return false;
     }
 
@@ -422,7 +429,13 @@ export class PokerTable extends EventEmitter {
         seat.totalInvestedThisHand = 0;
         seat.holeCards = [];
         seat.lastAction = PlayerAction.None;
-        seat.folded = false;
+        // 2026-06-11 audit C11/C12 (full exclusion): a sitting-out player is
+        // not in this hand — start them FOLDED so every folded-aware path
+        // (turn rotation, isBettingRoundComplete, showdown) skips them. Their
+        // blinds were already handled as DEAD in postBlinds (batch 5b), and the
+        // start gate above guarantees >= 2 non-sit-out players, so this can't
+        // produce a 1-player hand.
+        seat.folded = this._sittingOutSeats.has(seat.seatIndex);
         seat.allIn = false;
         seat.hasActedSinceLastFullRaise = false;
 
@@ -723,7 +736,12 @@ export class PokerTable extends EventEmitter {
         if (
           this.seats[seat].state === 'occupied' &&
           !this.seats[seat].eliminated &&
-          this.seats[seat].chipCount >= 0
+          this.seats[seat].chipCount >= 0 &&
+          // C11/C12 full exclusion: don't deal to a sitting-out (pre-folded)
+          // seat — they're not in the hand. (Functional exclusion is the
+          // folded flag set in startNewHand; this also stops them being
+          // visibly "dealt in".)
+          !this.seats[seat].folded
         ) {
           const card = this.deck.dealOne();
           if (card) {

@@ -393,6 +393,29 @@ describe('playerRaise — E2: no illegal re-raise after a short all-in (TDA Rule
   });
 });
 
+describe('C11/C12 full exclusion — sit-out players are not dealt in / get no turn', () => {
+  test('a sitting-out seat starts folded, is dealt no cards, and is never the actor', () => {
+    const t = makeTable();
+    seatPlayers(t, 3); // seats 0,1,2
+    (t as any)._sittingOutSeats = new Set([1]); // seat 1 sits out
+    (t as any).startNewHand();
+    expect(t.seats[1].folded).toBe(true);
+    expect(t.seats[1].holeCards.length).toBe(0);   // not dealt in
+    expect(t.activeSeatIndex).not.toBe(1);          // never given a turn
+    // the two genuinely-active players are in the hand
+    expect(t.seats[0].folded).toBe(false);
+    expect(t.seats[2].folded).toBe(false);
+    expect(t.seats[0].holeCards.length).toBeGreaterThan(0);
+  });
+
+  test('a hand does NOT start with only 1 non-sit-out player', () => {
+    const t = makeTable();
+    seatPlayers(t, 2); // seats 0,1
+    (t as any)._sittingOutSeats = new Set([1]); // only seat 0 is actually playing
+    expect((t as any).startNewHand()).toBe(false);
+  });
+});
+
 describe('Stud — C13 ante/bring-in (not SB/BB) + R4 action order by exposed hand', () => {
   const scfg = (ante = 0): any => ({
     tableId: 'stud', tableName: 'S', smallBlind: 25, bigBlind: 50, ante,
