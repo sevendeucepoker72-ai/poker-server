@@ -28,6 +28,10 @@ export interface TournamentPlayer {
   finishPosition: number;
   bounties: number; // number of players knocked out
   bountyEarnings: number; // total chips earned from bounties
+  // 2026-06-11 tournament economy: wallet user id of a PAYING human entrant
+  // (undefined for AI fill / unauthenticated). Prize credits on finish go to
+  // this id; only entrants with a userId paid the entry fee and fund the pool.
+  userId?: number;
 }
 
 export type TournamentStatus = 'registering' | 'running' | 'finished';
@@ -45,6 +49,11 @@ export interface Tournament {
   eliminationOrder: string[]; // playerIds in elimination order
   turboMode: boolean; // fast AI actions for stress testing
   playerTableMap: Map<string, string>; // playerId → tableId mapping
+  // 2026-06-11 tournament economy: the prize pool is FUNDED by collected
+  // entry fees (sum of buyIn over paying human entrants), NOT the template
+  // `prizePool` constant. Payouts are distributed from this — guaranteeing
+  // Σpayouts ≤ Σcollected, so the tournament can never mint chips.
+  collectedEntryFees: number;
 }
 
 export const DEFAULT_BLIND_LEVELS: BlindLevel[] = [
@@ -203,6 +212,7 @@ export class TournamentManager {
       eliminationOrder: [],
       turboMode: false,
       playerTableMap: new Map(),
+      collectedEntryFees: 0,
     };
 
     this.tournaments.set(tournamentId, tournament);
@@ -230,7 +240,7 @@ export class TournamentManager {
     return list;
   }
 
-  registerPlayer(tournamentId: string, playerId: string, playerName: string, socketId: string): { success: boolean; error?: string } {
+  registerPlayer(tournamentId: string, playerId: string, playerName: string, socketId: string, userId?: number): { success: boolean; error?: string } {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament) return { success: false, error: 'Tournament not found' };
     if (tournament.status !== 'registering') return { success: false, error: 'Tournament not open for registration' };
@@ -246,9 +256,31 @@ export class TournamentManager {
       finishPosition: 0,
       bounties: 0,
       bountyEarnings: 0,
+      userId,
     });
 
+    // 2026-06-11 tournament economy: a PAYING human entrant (has a userId and
+    // the table has a buy-in) funds the prize pool by exactly their entry fee.
+    // The caller (registerTournament in index.ts) has already deducted this
+    // from their wallet before calling — keep the two in lockstep so the pool
+    // equals real collected chips (Σpayouts ≤ Σcollected ⇒ never mints).
+    if (userId !== undefined && tournament.config.buyIn > 0) {
+      tournament.collectedEntryFees += tournament.config.buyIn;
+    }
+
     return { success: true };
+  }
+
+  /**
+   * Refund a player's contribution to the collected pool (used when the
+   * caller deducted the entry fee but then could not complete registration /
+   * seating, and has refunded the wallet). Keeps collectedEntryFees in lockstep
+   * with real wallet chips.
+   */
+  refundEntryFee(tournamentId: string, userId?: number): void {
+    const tournament = this.tournaments.get(tournamentId);
+    if (!tournament || userId === undefined || tournament.config.buyIn <= 0) return;
+    tournament.collectedEntryFees = Math.max(0, tournament.collectedEntryFees - tournament.config.buyIn);
   }
 
   unregisterPlayer(tournamentId: string, playerId: string): boolean {
@@ -387,8 +419,13 @@ export class TournamentManager {
       alivePlayers[0].finishPosition = 1;
     }
 
-    // Calculate payouts: 1st: 50%, 2nd: 30%, 3rd: 20%
-    const prizePool = tournament.config.prizePool;
+    // 2026-06-11 tournament economy: pay out the FUNDED pool (collected entry
+    // fees), NOT the advertised template prizePool. 50/30/20 sums to 100%, so
+    // Σpayouts ≤ collected (floor rounding leaves a few chips unclaimed — a
+    // tiny sink, never a mint). index.ts credits only results that carry a
+    // userId (paying humans); payout shares landing on AI / unpaid finishers
+    // are simply not credited (additional sink), preserving the invariant.
+    const prizePool = tournament.collectedEntryFees;
     const payouts: Record<number, number> = {
       1: Math.floor(prizePool * 0.50),
       2: Math.floor(prizePool * 0.30),
@@ -400,6 +437,7 @@ export class TournamentManager {
       playerName: p.playerName,
       position: p.finishPosition,
       payout: payouts[p.finishPosition] || 0,
+      userId: p.userId,
     }));
 
     this.emitEvent(tournamentId, 'tournamentFinished', {

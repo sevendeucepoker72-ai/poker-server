@@ -7513,7 +7513,25 @@ Give feedback in this JSON format:
     const playerId = session?.playerId || `player-${uuidv4()}`;
     const playerName = data.playerName || session?.playerName || 'Player';
 
-    const result = tournamentManager.registerPlayer(data.tournamentId, playerId, playerName, socket.id);
+    // 2026-06-11 tournament economy: real entry fee. If the tournament has a
+    // buy-in, the player must be logged in and pay it from their wallet — this
+    // FUNDS the prize pool (TournamentManager.collectedEntryFees), and the
+    // userId lets prizes credit back on finish. Free tournaments (buyIn 0) skip
+    // the deduct. The deducted fee + the pool increment in registerPlayer stay
+    // in lockstep so Σpayouts ≤ Σcollected (never mints).
+    const tourn = tournamentManager.getTournament(data.tournamentId);
+    if (!tourn) { socket.emit('error', { message: 'Tournament not found' }); return; }
+    const entryFee = tourn.config.buyIn || 0;
+    const authT = authSessions.get(socket.id);
+    if (entryFee > 0) {
+      if (!authT) { socket.emit('error', { message: 'Log in to enter a buy-in tournament' }); return; }
+      const dbChips = await ensureChipsForBuyIn(authT.userId, authT.username, entryFee);
+      if (entryFee > dbChips) { socket.emit('error', { message: `Not enough chips for the ${entryFee.toLocaleString()} entry fee` }); return; }
+      if (!(await deductChips(authT.userId, entryFee))) { socket.emit('error', { message: 'Could not deduct entry fee — try again' }); return; }
+      auditLog(authT.username, 'TOURNAMENT_ENTRY_DEDUCT', { tournamentId: data.tournamentId, entryFee });
+    }
+
+    const result = tournamentManager.registerPlayer(data.tournamentId, playerId, playerName, socket.id, authT?.userId);
     if (result.success) {
       socket.emit('tournamentRegistered', { tournamentId: data.tournamentId });
 
@@ -7522,6 +7540,12 @@ Give feedback in this JSON format:
         startTournamentGame(data.tournamentId);
       }
     } else {
+      // Registration failed AFTER the deduct — refund the wallet. (registerPlayer
+      // only increments the pool on success, so the pool needs no back-out here.)
+      if (entryFee > 0 && authT) {
+        await addChipsToUser(authT.userId, entryFee);
+        auditLog(authT.username, 'TOURNAMENT_ENTRY_REFUND', { tournamentId: data.tournamentId, entryFee });
+      }
       socket.emit('error', { message: result.error || 'Registration failed' });
     }
 
@@ -8025,6 +8049,19 @@ function creditSeatStackToWallet(
 ): void {
   const chips = (seat && seat.chipCount) || 0;
   if (chips <= 0) return;
+  // 2026-06-11 audit (tournament economy): NEVER credit a tournament-table
+  // stack to the wallet. Tournament stacks are tournament chips, not
+  // wallet-funded — entry is a separate buy-in/fee and payouts come from the
+  // prize pool by finish position. Crediting the stack on leave/bust both
+  // MINTS chips (the stack was never deducted) AND, because these are
+  // multi-table tournaments that rebalance, lets a player EXTRACT chips still
+  // in play by leaving mid-tournament with a doubled-up stack. The prize
+  // payout path (handleTournamentFinished) is the only sanctioned tournament
+  // wallet credit.
+  if (tournamentTables.has(tableId)) {
+    auditLog(username, 'TOURNAMENT_STACK_NOT_CASHED', { userId, tableId, reason, chips });
+    return;
+  }
   addChipsToUser(userId, chips)
     .then((ok: boolean) => {
       if (!ok) {
@@ -8118,7 +8155,15 @@ function handlePlayerLeave(socket: Socket): void {
     } else {
       const auth = authSessions.get(socket.id);
       const chipsToReturn = leavingSeat?.chipCount || 0;
-      if (auth && chipsToReturn > 0) {
+      // 2026-06-11 audit (tournament economy): do NOT cash out a tournament-
+      // table stack — it's tournament chips, not wallet-funded. Crediting it
+      // mints chips / lets a player extract chips still in play. See the same
+      // guard in creditSeatStackToWallet. Prizes are paid by finish position.
+      const isTournamentSeat = tournamentTables.has(session.tableId);
+      if (isTournamentSeat && auth && chipsToReturn > 0) {
+        auditLog(auth.username, 'TOURNAMENT_STACK_NOT_CASHED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, reason: 'handlePlayerLeave' });
+      }
+      if (auth && chipsToReturn > 0 && !isTournamentSeat) {
         addChipsToUser(auth.userId, chipsToReturn)
           .then((ok) => {
             if (!ok) {
@@ -8346,6 +8391,7 @@ function startTournamentGame(tournamentId: string): void {
       }
     }
     if (event === 'tournamentFinished') {
+      payTournamentPrizes(data); // credit funded prize payouts (mint-free, idempotent)
       io.to(`table:${tableId}`).emit('tournamentFinished', data);
     }
     if (event === 'playerEliminated') {
@@ -8609,6 +8655,7 @@ function startMultiTableTournament(
       handleTableRebalance(tournamentId);
     }
     if (event === 'tournamentFinished') {
+      payTournamentPrizes(data); // credit funded prize payouts (mint-free, idempotent)
       for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
         io.to(`table:${tid}`).emit('tournamentFinished', data);
       }
@@ -8623,6 +8670,31 @@ function startMultiTableTournament(
  * Handle table rebalancing after a player is eliminated.
  * Breaks the smallest table when alive players fit in fewer tables.
  */
+// 2026-06-11 tournament economy: credit funded prize payouts to wallets when
+// a tournament finishes. The payouts come from TournamentManager's
+// collectedEntryFees pool (Σpayouts ≤ Σcollected — mint-free); we credit only
+// results that carry a userId (paying humans). Idempotent per tournamentId so
+// a duplicate tournamentFinished event can't double-pay.
+const paidOutTournaments = new Set<string>();
+function payTournamentPrizes(data: { tournamentId?: string; results?: Array<{ playerId: string; playerName: string; position: number; payout: number; userId?: number }> }): void {
+  const tid = data?.tournamentId;
+  if (!tid || paidOutTournaments.has(tid)) return;
+  paidOutTournaments.add(tid);
+  for (const r of data?.results || []) {
+    if (r.userId === undefined || !(r.payout > 0)) continue;
+    addChipsToUser(r.userId, r.payout)
+      .then((ok: boolean) => {
+        auditLog(r.playerName || String(r.userId), ok ? 'TOURNAMENT_PRIZE' : 'TOURNAMENT_PRIZE_FAILED',
+          { userId: r.userId, tournamentId: tid, position: r.position, payout: r.payout });
+      })
+      .catch((e: any) => {
+        console.error(`[TournamentPrize ${r.userId}] payout=${r.payout}`, e?.message || e);
+        if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.tournamentPrize' }, extra: { userId: r.userId, tournamentId: tid, payout: r.payout } });
+        auditLog(r.playerName || String(r.userId), 'TOURNAMENT_PRIZE_FAILED', { userId: r.userId, tournamentId: tid, payout: r.payout, error: String(e?.message || e) });
+      });
+  }
+}
+
 function handleTableRebalance(tournamentId: string): void {
   const rebalance = tournamentManager.checkRebalance(tournamentId);
   if (!rebalance) return;
@@ -8983,7 +9055,10 @@ async function gracefulShutdown(signal: string) {
         const table = tableManager.getTable(session.tableId);
         const seat = table?.seats?.[session.seatIndex];
         const seatKey = `${session.tableId}:${session.seatIndex}`;
-        if (seat && seat.state === 'occupied' && seat.chipCount > 0 && !creditedSeats.has(seatKey)) {
+        // Tournament stacks are NOT wallet-funded — never cash them out (would
+        // mint). They persist with the tournament (or are lost if the
+        // tournament can't rehydrate), but they must not hit the wallet.
+        if (seat && seat.state === 'occupied' && seat.chipCount > 0 && !creditedSeats.has(seatKey) && !tournamentTables.has(session.tableId)) {
           creditedSeats.add(seatKey);
           await addChipsToUser(auth.userId, seat.chipCount);
           console.log(`[Shutdown] Cashed out ${seat.chipCount} chips for user ${auth.userId} (seat ${session.seatIndex})`);
@@ -9026,7 +9101,7 @@ async function gracefulShutdown(signal: string) {
         const seat = table?.seats?.[reserved.seatIndex];
         const chips = seat?.chipCount ?? reserved.chips ?? 0;
         const seatKey = `${reserved.tableId}:${reserved.seatIndex}`;
-        if (chips > 0 && !creditedSeats.has(seatKey)) {
+        if (chips > 0 && !creditedSeats.has(seatKey) && !tournamentTables.has(reserved.tableId)) {
           creditedSeats.add(seatKey);
           await addChipsToUser(userId, chips);
           console.log(`[Shutdown] Cashed out ${chips} reserved chips for user ${userId}`);
