@@ -343,10 +343,16 @@ export class TournamentManager {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament || tournament.status !== 'running') return;
 
-    tournament.currentBlindLevel++;
-    if (tournament.currentBlindLevel >= tournament.config.blindLevels.length) {
-      tournament.currentBlindLevel = tournament.config.blindLevels.length - 1;
+    // 2026-06-11 audit E3: STOP at the final level. The old code clamped
+    // currentBlindLevel to the max but then ALWAYS rescheduled — so at the top
+    // level it fired forever, re-emitting blindLevelUp (and the per-level push
+    // notification) every `duration`. Once we're at the last level, don't
+    // increment, emit, or reschedule again.
+    if (tournament.currentBlindLevel >= tournament.config.blindLevels.length - 1) {
+      return;
     }
+
+    tournament.currentBlindLevel++;
 
     const newLevel = tournament.config.blindLevels[tournament.currentBlindLevel];
     this.emitEvent(tournamentId, 'blindLevelUp', {

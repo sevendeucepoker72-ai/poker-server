@@ -1478,7 +1478,11 @@ export class PokerTable extends EventEmitter {
       for (const info of nonFolded) {
         const seat = this.seats[info.seatIndex];
         const allCards = [...seat.holeCards, ...this.communityCards];
-        if (allCards.length >= 5 || (!this.usesCommunityCards() && seat.holeCards.length >= 5)) {
+        // 2026-06-11 audit R7: non-community variants evaluate from hole cards
+        // alone; Badugi has only 4 (a complete hand), so the `>= 5` gate hid
+        // its showdown cards + hand name. Use `>= 4` for non-community games
+        // (Badugi 4, draw 5, stud 7 all qualify).
+        if (allCards.length >= 5 || (!this.usesCommunityCards() && seat.holeCards.length >= 4)) {
           // Defensive: `evaluatePlayerHand` CAN return null in variant
           // subclasses under edge cases (Omaha hi-lo with no qualifying
           // low, or a bugged hole-card array). A null result here used to
@@ -1636,7 +1640,8 @@ export class PokerTable extends EventEmitter {
         .filter(s => s.state === 'occupied' && !s.eliminated)
         .map(s => {
           const allCards = [...s.holeCards, ...this.communityCards];
-          const handRes = (allCards.length >= 5 || (!this.usesCommunityCards() && s.holeCards.length >= 5)) && !s.folded
+          // R7: `>= 4` for non-community games so 4-card Badugi evaluates.
+          const handRes = (allCards.length >= 5 || (!this.usesCommunityCards() && s.holeCards.length >= 4)) && !s.folded
             ? this.evaluatePlayerHand(s.holeCards, this.communityCards) : null;
           return {
             seatIndex: s.seatIndex,

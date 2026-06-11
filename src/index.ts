@@ -4251,7 +4251,11 @@ Give feedback in this JSON format:
   socket.on('createClubTournament', async (data: { clubId: number; config: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = createClubTournament(auth.userId, data.clubId, data.config);
+    // 2026-06-11 audit R13: signature is (clubId, managerId, config). This was
+    // called (managerId, clubId, ...) — swapped — so getMemberRole(clubId=userId,
+    // managerId=clubId) never matched, and EVERY owner/manager got "Only owners
+    // and managers can create tournaments".
+    const result = createClubTournament(data.clubId, auth.userId, data.config);
     if (result.success) {
       socket.emit('clubTournamentCreated', result);
     } else {
@@ -6773,6 +6777,14 @@ Give feedback in this JSON format:
     session.sittingOut = false;
     const tracker = sitOutTracker.get(session.tableId);
     if (tracker) tracker.delete(session.seatIndex);
+    // 2026-06-11 audit R12: push the cleared sit-out state into the engine.
+    // Without this, the table's _sittingOutSeats still held this seat, so
+    // markSittingOutBlinds kept accruing dead-blind debt against a player who
+    // already came back (and the C11/C12 dead-blind skip kept treating them as
+    // out). syncSitOutToTable rebuilds _sittingOutSeats from the live trackers.
+    // (Their EXISTING owed dead blinds are intentionally preserved — they pay
+    // those on their first hand back, standard missed-blind rule.)
+    syncSitOutToTable(session.tableId);
 
     socket.emit('sitOutToggled', { sittingOut: false, reason: 'back' });
   });

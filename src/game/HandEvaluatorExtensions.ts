@@ -729,16 +729,19 @@ function evaluate27FiveCards(cards: Card[]): HandResult {
     else if (count >= 2) { hasPair = true; pairCount++; }
   }
 
-  // Assign badness: lower = better
-  // 0 = no made hand (best), 1 = pair, 2 = two pair, 3 = trips/full house, 4 = quads
-  // 5 = straight, 6 = flush, 7 = full house, 8 = straight flush
+  // Assign badness: lower = better. 2026-06-11 audit R6: must follow standard
+  // high-hand strength order (in 2-7 the lowest high-hand wins, so "badness"
+  // === high-hand rank). The old order scored trips=5 / flush=4 / straight=3,
+  // i.e. trips as WORSE than a straight or flush — wrong. Correct order:
+  // high(0) < pair(1) < two pair(2) < trips(3) < straight(4) < flush(5) <
+  // full house(6) < quads(7) < straight flush(8).
   let badnessRank = 0;
-  if (hasQuads) badnessRank = 7;
-  else if (hasTrips && hasPair) badnessRank = 6; // full house
-  else if (flushCheck && straightCheck) badnessRank = 8; // straight flush
-  else if (hasTrips) badnessRank = 5;
-  else if (flushCheck) badnessRank = 4;
-  else if (straightCheck) badnessRank = 3;
+  if (flushCheck && straightCheck) badnessRank = 8; // straight flush (worst)
+  else if (hasQuads) badnessRank = 7;
+  else if (hasTrips && hasPair) badnessRank = 6;    // full house
+  else if (flushCheck) badnessRank = 5;
+  else if (straightCheck) badnessRank = 4;
+  else if (hasTrips) badnessRank = 3;
   else if (pairCount >= 2) badnessRank = 2;
   else if (hasPair) badnessRank = 1;
 

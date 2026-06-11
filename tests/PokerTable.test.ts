@@ -392,6 +392,16 @@ describe('Lowball pot award — G2/G3: best LOW hand wins, not worst', () => {
     expect(cmp(paired, nut)).toBeLessThan(0);
   });
 
+  test('R6: 2-7 made-hand badness follows high-hand order (trips < straight < flush)', () => {
+    // lower handRank ("badness") = better low. Pre-fix, trips scored 5 — worse
+    // than a straight(3)/flush(4). Correct: trips(3) < straight(4) < flush(5).
+    const trips = evaluate27LowHand([card(0, 9), card(1, 9), card(2, 9), card(3, 4), card(0, 2)]);
+    const straight = evaluate27LowHand([card(0, 6), card(1, 5), card(2, 4), card(3, 3), card(0, 2)]);
+    const flush = evaluate27LowHand([card(0, 9), card(0, 7), card(0, 5), card(0, 3), card(0, 2)]);
+    expect(trips.handRank).toBeLessThan(straight.handRank);
+    expect(straight.handRank).toBeLessThan(flush.handRank);
+  });
+
   test('Five Card Draw (high) still ranks the better HIGH hand as the winner', () => {
     const cmp = (new FiveCardDrawTable(cfg(), false) as any).getHandComparator();
     const trips = evalHigh([card(0, 9), card(1, 9), card(2, 9), card(3, 3), card(0, 2)]);
