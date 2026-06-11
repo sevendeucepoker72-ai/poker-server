@@ -1,6 +1,6 @@
 import { Card } from '../Card';
 import { HandResult } from '../HandEvaluator';
-import { evaluateBadugiHand } from '../HandEvaluatorExtensions';
+import { evaluateBadugiHand, compareBadugiHands } from '../HandEvaluatorExtensions';
 import { TableConfig } from '../PokerTable';
 import { FiveCardDrawTable } from './FiveCardDrawTable';
 
@@ -36,5 +36,18 @@ export class BadugiTable extends FiveCardDrawTable {
   /** Override: use Badugi evaluation. */
   protected evaluatePlayerHand(holeCards: Card[], _communityCards: Card[]): HandResult {
     return evaluateBadugiHand(holeCards);
+  }
+
+  /**
+   * 2026-06-11 audit G3: Badugi is lowball — best rainbow set wins. Unlike
+   * compare27Hands/compareRazzHands, compareBadugiHands ALREADY returns
+   * POSITIVE when `a` is better (bigger size wins; ties broken by lower
+   * cards), so it matches awardPots' positive-wins contract directly — no
+   * inversion. We must override here because the parent FiveCardDrawTable
+   * (constructed with isTripleDraw=true) would otherwise return the 2-7
+   * comparator, which is wrong for Badugi hands.
+   */
+  protected getHandComparator(): (a: HandResult, b: HandResult) => number {
+    return compareBadugiHands;
   }
 }

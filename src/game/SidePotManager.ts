@@ -191,7 +191,8 @@ export class SidePotManager {
     seats: SeatInfo[],
     communityCards: Card[],
     dealerSeat: number,
-    evaluator?: (hole: Card[], community: Card[]) => HandResult
+    evaluator?: (hole: Card[], community: Card[]) => HandResult,
+    comparator?: (a: HandResult, b: HandResult) => number
   ): AwardPotsResult {
     const winnings = new Map<number, number>();
     const perPot: PotWinResult[] = [];
@@ -202,6 +203,14 @@ export class SidePotManager {
       const allCards = [...hole, ...community];
       return evaluateHand(allCards);
     });
+
+    // 2026-06-11 audit G2/G3: ranking comparator. Contract matches compareTo —
+    // returns POSITIVE when `a` is the better (winning) hand. Default is
+    // high-hand-wins. Lowball variants (2-7 Triple Draw, Razz, Badugi) inject
+    // a low comparator so the best LOW hand sorts first. Previously this was
+    // hardcoded to compareTo: lowball tables evaluated the low hand correctly
+    // (via the evaluator) but ranked it high-wins, awarding the WORST hand.
+    const cmp = comparator || compareTo;
 
     // Memoize evaluations per seatIndex — a player's hand rank doesn't change
     // between pots, so re-evaluating for every side pot is wasteful.
@@ -269,13 +278,13 @@ export class SidePotManager {
         continue;
       }
 
-      // Find the best hand
-      handResults.sort((a, b) => compareTo(b.result, a.result));
+      // Find the best hand (cmp: positive = better, so descending sort puts best first)
+      handResults.sort((a, b) => cmp(b.result, a.result));
       const bestResult = handResults[0].result;
 
       // Find all players who tie with the best hand
       const winners = handResults.filter(
-        hr => compareTo(hr.result, bestResult) === 0
+        hr => cmp(hr.result, bestResult) === 0
       );
 
       // Split pot among winners

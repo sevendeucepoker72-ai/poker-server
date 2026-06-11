@@ -1388,6 +1388,20 @@ export class PokerTable extends EventEmitter {
     /* intentionally empty — see C16 note above */
   }
 
+  /**
+   * 2026-06-11 audit G2/G3: the comparator used to RANK showdown hands when
+   * awarding pots (passed into SidePotManager.awardPots). Contract matches
+   * compareTo — returns POSITIVE when `a` is the better (winning) hand. The
+   * base game is high-hand-wins. Lowball variants (2-7 Triple Draw, Razz,
+   * Badugi) override this so the best LOW hand wins the pot. They already
+   * evaluate the low hand correctly via evaluatePlayerHand(); without this
+   * hook awardPots ranked those low results with the HIGH comparator and
+   * awarded the pot to the WORST hand.
+   */
+  protected getHandComparator(): (a: HandResult, b: HandResult) => number {
+    return compareTo;
+  }
+
   protected determineWinners(): void {
     this.currentPhase = GamePhase.Showdown;
 
@@ -1511,7 +1525,8 @@ export class PokerTable extends EventEmitter {
         seatInfos,
         this.communityCards,
         this.dealerButtonSeat,
-        evaluator
+        evaluator,
+        this.getHandComparator()
       );
 
       // Credit chips to each winner

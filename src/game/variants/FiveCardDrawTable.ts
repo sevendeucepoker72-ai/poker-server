@@ -1,6 +1,6 @@
 import { Card } from '../Card';
 import { evaluateHand, HandResult } from '../HandEvaluator';
-import { evaluate27LowHand } from '../HandEvaluatorExtensions';
+import { evaluate27LowHand, compare27Hands } from '../HandEvaluatorExtensions';
 import {
   PokerTable,
   MAX_SEATS,
@@ -69,6 +69,21 @@ export class FiveCardDrawTable extends PokerTable {
       return evaluate27LowHand(holeCards);
     }
     return evaluateHand(holeCards);
+  }
+
+  /**
+   * 2026-06-11 audit G2: 2-7 Triple Draw is LOWBALL — the best low hand wins.
+   * compare27Hands returns NEGATIVE when `a` is the better low (lower badness
+   * / lower cards), so invert it to awardPots' positive-wins contract.
+   * Regular Five Card Draw is high-hand-wins (inherits compareTo).
+   * NOTE: BadugiTable extends this class with isTripleDraw=true but overrides
+   * this method, so Badugi never reaches the 2-7 branch here.
+   */
+  protected getHandComparator(): (a: HandResult, b: HandResult) => number {
+    if (this.variant.isTripleDraw) {
+      return (a: HandResult, b: HandResult) => -compare27Hands(a, b);
+    }
+    return super.getHandComparator();
   }
 
   /**

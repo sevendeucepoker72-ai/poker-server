@@ -11,6 +11,17 @@
  */
 import { PokerTable, GamePhase, MAX_SEATS } from '../src/game/PokerTable';
 import { CardDeck } from '../src/game/CardDeck';
+import { FiveCardDrawTable } from '../src/game/variants/FiveCardDrawTable';
+import { BadugiTable } from '../src/game/variants/BadugiTable';
+import { SevenStudTable } from '../src/game/variants/SevenStudTable';
+import { SidePotManager } from '../src/game/SidePotManager';
+import {
+  evaluate27LowHand,
+  evaluateBadugiHand,
+  evaluateRazzHand,
+  compare27Hands,
+} from '../src/game/HandEvaluatorExtensions';
+import { evaluateHand as evalHigh } from '../src/game/HandEvaluator';
 
 function makeTable(): PokerTable {
   return new PokerTable({
@@ -336,5 +347,72 @@ describe('Blind/button derivation — C10/R1: non-contiguous seating', () => {
     // 250 uncalled (300 - 50) returned to seat 0.
     expect(t.seats[0].chipCount).toBe(950);
     expect(t.seats[0].currentBet).toBe(50);
+  });
+});
+
+describe('Lowball pot award — G2/G3: best LOW hand wins, not worst', () => {
+  // 2026-06-11 gameplay-audit G2/G3. SidePotManager.awardPots hardcoded the
+  // HIGH comparator (compareTo), so lowball variants — which evaluate the low
+  // hand correctly via evaluatePlayerHand — had their results ranked high-wins
+  // and the pot awarded to the WORST hand. Fix: a getHandComparator() hook per
+  // variant, threaded into awardPots. The three low comparators use DIFFERENT
+  // sign conventions (compare27Hands/compareRazzHands: negative=better;
+  // compareBadugiHands: positive=better), so each variant's wiring is verified
+  // independently here — a flipped sign would re-award the worst hand.
+  const card = (suit: number, rank: number) => ({ suit, rank } as any);
+  const cfg = (): any => ({
+    tableId: 'lowball-test', tableName: 'LB', smallBlind: 25, bigBlind: 50,
+    minBuyIn: 1000, maxBuyIn: 10000, maxPlayers: 9,
+  });
+
+  test('2-7 Triple Draw: comparator ranks the better low as the winner', () => {
+    const cmp = (new FiveCardDrawTable(cfg(), true) as any).getHandComparator();
+    const nut = evaluate27LowHand([card(0, 7), card(1, 5), card(2, 4), card(3, 3), card(0, 2)]); // 7-low
+    const paired = evaluate27LowHand([card(0, 9), card(1, 9), card(2, 5), card(3, 3), card(0, 2)]); // pair (bad)
+    expect(cmp(nut, paired)).toBeGreaterThan(0);
+    expect(cmp(paired, nut)).toBeLessThan(0);
+  });
+
+  test('Five Card Draw (high) still ranks the better HIGH hand as the winner', () => {
+    const cmp = (new FiveCardDrawTable(cfg(), false) as any).getHandComparator();
+    const trips = evalHigh([card(0, 9), card(1, 9), card(2, 9), card(3, 3), card(0, 2)]);
+    const pair = evalHigh([card(0, 9), card(1, 9), card(2, 5), card(3, 3), card(0, 2)]);
+    expect(cmp(trips, pair)).toBeGreaterThan(0); // unchanged: high-wins
+  });
+
+  test('Badugi: comparator ranks the bigger rainbow set as the winner', () => {
+    const cmp = (new BadugiTable(cfg()) as any).getHandComparator();
+    const four = evaluateBadugiHand([card(0, 2), card(1, 3), card(2, 4), card(3, 5)]); // 4-card badugi
+    const three = evaluateBadugiHand([card(0, 2), card(0, 3), card(1, 4), card(2, 5)]); // dup suit → 3-card
+    expect(cmp(four, three)).toBeGreaterThan(0);
+    expect(cmp(three, four)).toBeLessThan(0);
+  });
+
+  test('Razz: comparator ranks the better low as the winner', () => {
+    const cmp = (new SevenStudTable(cfg(), true, false) as any).getHandComparator(); // isRazz
+    const wheel = evaluateRazzHand([card(0, 14), card(1, 2), card(2, 3), card(3, 4), card(0, 5)]); // A-5 wheel
+    const paired = evaluateRazzHand([card(0, 9), card(1, 9), card(2, 8), card(3, 7), card(0, 6)]); // pair (bad)
+    expect(cmp(wheel, paired)).toBeGreaterThan(0);
+    expect(cmp(paired, wheel)).toBeLessThan(0);
+  });
+
+  test('awardPots with the low comparator pays the best low; default (high) would pay the worst', () => {
+    const mgr = new SidePotManager();
+    const seats = [
+      { seatIndex: 0, chipCount: 0, totalInvestedThisHand: 100, folded: false, allIn: false,
+        holeCards: [card(0, 7), card(1, 5), card(2, 4), card(3, 3), card(0, 2)], state: 'occupied' }, // nut low
+      { seatIndex: 1, chipCount: 0, totalInvestedThisHand: 100, folded: false, allIn: false,
+        holeCards: [card(0, 9), card(1, 9), card(2, 5), card(3, 3), card(0, 2)], state: 'occupied' }, // pair (bad)
+    ] as any;
+    const evaluator = (hole: any) => evaluate27LowHand(hole);
+    const lowCmp = (a: any, b: any) => -compare27Hands(a, b);
+
+    const fixed = mgr.awardPots(seats, [], 0, evaluator, lowCmp);
+    expect(fixed.winnings.get(0)).toBe(200); // nut low scoops the 200 pot
+    expect(fixed.winnings.get(1) || 0).toBe(0);
+
+    // Demonstrate the bug the fix closes: default high comparator pays the WORST hand.
+    const buggy = mgr.awardPots(seats, [], 0, evaluator);
+    expect(buggy.winnings.get(1)).toBe(200);
   });
 });

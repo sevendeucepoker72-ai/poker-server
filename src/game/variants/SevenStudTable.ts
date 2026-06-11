@@ -1,6 +1,6 @@
 import { Card, Rank } from '../Card';
 import { evaluateHand, HandResult, compareTo } from '../HandEvaluator';
-import { evaluateRazzHand } from '../HandEvaluatorExtensions';
+import { evaluateRazzHand, compareRazzHands } from '../HandEvaluatorExtensions';
 import { SidePotManager } from '../SidePotManager';
 import {
   PokerTable,
@@ -107,6 +107,22 @@ export class SevenStudTable extends PokerTable {
       return evaluateRazzHand(holeCards);
     }
     return evaluateHand(holeCards);
+  }
+
+  /**
+   * 2026-06-11 audit G2: Razz is lowball — best low hand wins. Razz forces
+   * isHiLo=false, so it runs the BASE determineWinners → awardPots path;
+   * without this override that path ranked Razz hands with the HIGH
+   * comparator and awarded the WORST hand. compareRazzHands returns NEGATIVE
+   * when `a` is the better low, so invert to the positive-wins contract.
+   * Regular Seven Card Stud is high (inherits compareTo). Stud Hi-Lo has its
+   * own determineWinners override and never reaches this comparator.
+   */
+  protected getHandComparator(): (a: HandResult, b: HandResult) => number {
+    if (this.variant.isRazz) {
+      return (a: HandResult, b: HandResult) => -compareRazzHands(a, b);
+    }
+    return super.getHandComparator();
   }
 
   /**
