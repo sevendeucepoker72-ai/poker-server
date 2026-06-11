@@ -393,6 +393,54 @@ describe('playerRaise — E2: no illegal re-raise after a short all-in (TDA Rule
   });
 });
 
+describe('Stud — C13 ante/bring-in (not SB/BB) + R4 action order by exposed hand', () => {
+  const scfg = (ante = 0): any => ({
+    tableId: 'stud', tableName: 'S', smallBlind: 25, bigBlind: 50, ante,
+    minBuyIn: 1000, maxPlayers: 9,
+  });
+
+  test('C13: startNewHand posts NO SB/BB — betting line starts at 0 for the bring-in', () => {
+    const t = new SevenStudTable(scfg(0), false, false);
+    seatPlayers(t, 3);
+    (t as any).startNewHand();
+    // The whole point: currentBetToMatch === 0 so the ThirdStreet bring-in
+    // branch fires. A posted BB would have left this at 50.
+    expect(t.currentBetToMatch).toBe(0);
+    const occupied = t.seats.filter(s => s.state === 'occupied');
+    for (const s of occupied) {
+      expect(s.currentBet).toBe(0);              // no live SB/BB posted
+      expect(s.totalInvestedThisHand).toBe(0);   // nothing forced yet (ante 0, bring-in posted on action)
+      expect(s.holeCards.length).toBe(3);        // 2 down + 1 up dealt
+    }
+    expect(t.activeSeatIndex).toBeGreaterThanOrEqual(0); // a bring-in actor was chosen
+  });
+
+  test('C13: with an ante configured, every active seat antes; line still starts at 0', () => {
+    const t = new SevenStudTable(scfg(50), false, false);
+    seatPlayers(t, 3, 5000);
+    (t as any).startNewHand();
+    expect(t.currentBetToMatch).toBe(0);
+    const occupied = t.seats.filter(s => s.state === 'occupied');
+    for (const s of occupied) {
+      expect(s.totalInvestedThisHand).toBe(50); // ante only (bring-in not auto-posted at deal)
+      expect(s.chipCount).toBe(4950);           // ante deducted from stack
+      expect(s.currentBet).toBe(0);             // ante is dead money, not a bet
+    }
+  });
+
+  test('R4: exposed-board score ranks a pair over ace-high, trips over a pair, and kickers', () => {
+    const t = new SevenStudTable(scfg(0), false, false) as any;
+    const pair8 = [{ suit: 0, rank: 8 }, { suit: 1, rank: 8 }];
+    const aceHigh = [{ suit: 0, rank: 14 }, { suit: 1, rank: 13 }];
+    const trips5 = [{ suit: 0, rank: 5 }, { suit: 1, rank: 5 }, { suit: 2, rank: 5 }];
+    const aKQ = [{ suit: 0, rank: 14 }, { suit: 1, rank: 13 }, { suit: 2, rank: 12 }];
+    const aKJ = [{ suit: 0, rank: 14 }, { suit: 1, rank: 13 }, { suit: 2, rank: 11 }];
+    expect(t.scoreExposedBoard(pair8)).toBeGreaterThan(t.scoreExposedBoard(aceHigh));
+    expect(t.scoreExposedBoard(trips5)).toBeGreaterThan(t.scoreExposedBoard(pair8));
+    expect(t.scoreExposedBoard(aKQ)).toBeGreaterThan(t.scoreExposedBoard(aKJ));
+  });
+});
+
 describe('Variant rehydrate — C14/C15/R9: snapshot preserves variant state across redeploy', () => {
   const vcfg = (id = 'v'): any => ({
     tableId: id, tableName: 'V', smallBlind: 25, bigBlind: 50, ante: 0,

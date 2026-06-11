@@ -101,6 +101,37 @@ export class SevenStudTable extends PokerTable {
   }
 
   /**
+   * 2026-06-11 audit C13: Stud/Razz are ANTE + BRING-IN games, not blind
+   * games. The base postBlinds posted SB/BB and set currentBetToMatch =
+   * bigBlind, which (a) charged two seats blinds they never owe and (b)
+   * DISABLED the third-street bring-in branch in playerRaise above — that
+   * branch keys on `currentBetToMatch === 0`, so a non-zero blind silently
+   * routed third street through normal no-limit raise rules.
+   *
+   * Override to post ONLY the ante (if the table is configured with one) and
+   * leave currentBetToMatch at 0. The low-door-card player (getStudFirstActor)
+   * is the first actor and posts the bring-in as their action. Antes mirror
+   * the base: they hit chipCount + totalInvestedThisHand only (never currentBet
+   * or the pot accumulator), so the betting line still starts clean at 0.
+   */
+  protected postBlinds(): void {
+    if (this.config.ante > 0) {
+      for (const seatIdx of this.getActivePlayerSeats()) {
+        const seat = this.seats[seatIdx];
+        const anteAmount = Math.min(this.config.ante, seat.chipCount);
+        if (anteAmount > 0) {
+          seat.chipCount -= anteAmount;
+          seat.totalInvestedThisHand += anteAmount;
+          if (seat.chipCount === 0) seat.allIn = true;
+          this.emit('blindPosted', { seatIndex: seatIdx, amount: anteAmount, type: 'ante' });
+        }
+      }
+    }
+    // No SB/BB; currentBetToMatch stays 0 (reset in startNewHand) so the
+    // ThirdStreet bring-in/complete validation fires.
+  }
+
+  /**
    * Override: use stud/razz evaluation.
    */
   protected evaluatePlayerHand(holeCards: Card[], _communityCards: Card[]): HandResult {
@@ -638,24 +669,49 @@ export class SevenStudTable extends PokerTable {
       return target.seatIndex;
     }
 
-    // 4th+ street: highest (Stud) or lowest (Razz) showing hand acts first
+    // 4th+ street: the best EXPOSED poker hand acts first (Stud), or the
+    // lowest exposed board (Razz). 2026-06-11 audit R4: this previously
+    // compared only the single highest face-up card, so a split pair showing
+    // (e.g. 8-8) did NOT act before a player showing a lone Ace — wrong per
+    // TDA (a pair showing beats ace-high). Score the up-cards as a partial
+    // poker hand (trips > pair > high card, then kickers) and pick the max
+    // (Stud) / min (Razz).
     let target = activePlayers[0];
+    let bestScore = this.scoreExposedBoard(this.getFaceUpCards(target.seatIndex));
     for (const seat of activePlayers) {
-      const faceUp = this.getFaceUpCards(seat.seatIndex);
-      const targetFaceUp = this.getFaceUpCards(target.seatIndex);
-
-      // Simple comparison: compare highest face-up card
-      const maxRank = faceUp.length > 0 ? Math.max(...faceUp.map(c => c.rank)) : 0;
-      const targetMaxRank = targetFaceUp.length > 0 ? Math.max(...targetFaceUp.map(c => c.rank)) : 0;
-
-      if (this.variant.isRazz) {
-        // Razz: lowest showing hand acts first
-        if (maxRank < targetMaxRank) target = seat;
-      } else {
-        // Stud: highest showing hand acts first
-        if (maxRank > targetMaxRank) target = seat;
+      const score = this.scoreExposedBoard(this.getFaceUpCards(seat.seatIndex));
+      if (this.variant.isRazz ? score < bestScore : score > bestScore) {
+        target = seat;
+        bestScore = score;
       }
     }
     return target.seatIndex;
+  }
+
+  /**
+   * Score a set of exposed (face-up) cards as a partial poker hand for Stud
+   * action order. The made tier (trips=3 > pair=2 > high=1) dominates, then
+   * the rank of that group, then the descending kickers. Lets the BEST board
+   * act first (Stud) or the LOWEST act first (Razz) — not just the single
+   * highest card. Not a full hand evaluator; only a total order over boards.
+   */
+  private scoreExposedBoard(cards: Card[]): number {
+    if (!cards || cards.length === 0) return 0;
+    const counts = new Map<number, number>();
+    for (const c of cards) counts.set(c.rank, (counts.get(c.rank) || 0) + 1);
+    let maxCount = 1;
+    let groupRank = 0;
+    for (const [rank, n] of counts) {
+      if (n > maxCount || (n === maxCount && rank > groupRank)) {
+        maxCount = n;
+        groupRank = rank;
+      }
+    }
+    const ranksDesc = cards.map(c => c.rank).sort((a, b) => b - a);
+    let score = maxCount * 1e12 + groupRank * 1e9;
+    for (let i = 0; i < ranksDesc.length && i < 4; i++) {
+      score += ranksDesc[i] * Math.pow(20, 3 - i);
+    }
+    return score;
   }
 }
