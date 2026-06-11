@@ -319,6 +319,25 @@ describe('Blind/button derivation — C10/R1: non-contiguous seating', () => {
     }
   });
 
+  test('C11/C12: a sitting-out player is charged nothing (no live blind, no debt collection)', () => {
+    const t = makeTable();
+    [0, 1, 2].forEach((i) => t.sitDown(i, `P${i}`, 5000, `p${i}`, false));
+    // P2 sits out, and carries a pre-existing dead-blind debt.
+    (t as any)._sittingOutSeats = new Set([2]);
+    t.seats[2].deadBlindOwedChips = 50;
+
+    for (let h = 0; h < 5; h++) {
+      (t as any).startNewHand();
+      // The sit-out player's stack must NEVER be drained while sitting out —
+      // no live blind posted, and the accrued debt is NOT collected until they
+      // return. Pre-fix, they were charged both (live blind + debt) every orbit.
+      expect(t.seats[2].chipCount).toBe(5000);
+    }
+    // The table still functions: the two ACTIVE players funded blinds this hand
+    // (at most one blind position can be the single sit-out seat → dead).
+    expect(t.seats[0].totalInvestedThisHand + t.seats[1].totalInvestedThisHand).toBeGreaterThan(0);
+  });
+
   test('getPrevOccupiedSeat walks backward over gaps', () => {
     const t = makeTable();
     seatAt(t, [0, 3, 6]);

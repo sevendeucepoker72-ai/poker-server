@@ -590,6 +590,21 @@ export class PokerTable extends EventEmitter {
       }
     }
 
+    // 2026-06-11 audit C11/C12: a SITTING-OUT player must not post a LIVE
+    // blind. markSittingOutBlinds() (run earlier in startNewHand) already
+    // recorded their dead-blind DEBT for when they return; charging a live
+    // blind here too would (a) drain a player who isn't in the hand and
+    // (b) double-charge them (live blind + accrued debt). Treat a sit-out
+    // blind position as a DEAD blind — skip the live post. currentBetToMatch
+    // still ends up at the big blind below, so live players must call it.
+    if (sbSeat !== -1 && this._sittingOutSeats.has(sbSeat)) {
+      this.deadSmallBlind = true;
+      sbSeat = -1;
+    }
+    if (bbSeat !== -1 && this._sittingOutSeats.has(bbSeat)) {
+      bbSeat = -1;
+    }
+
     // TDA Rule 6-9: Handle missed blinds — players returning with debt
     // auto-pay from their stack at the start of the hand (if they have
     // enough). Uses `deadBlindOwedChips` as the authoritative amount
@@ -598,6 +613,11 @@ export class PokerTable extends EventEmitter {
     for (const seatIdx of activePlayers) {
       const seat = this.seats[seatIdx];
       const owed = seat.deadBlindOwedChips || 0;
+      // C11/C12: do NOT collect dead-blind debt from a player who is STILL
+      // sitting out — their debt is paid on the first hand AFTER they return.
+      // Without this, markSittingOutBlinds accrues the debt and this loop
+      // immediately pays it back out, draining a sitting-out player.
+      if (this._sittingOutSeats.has(seatIdx)) continue;
       if (owed > 0 && seatIdx !== sbSeat && seatIdx !== bbSeat) {
         const postAmount = Math.min(owed, seat.chipCount);
         if (postAmount > 0) {
