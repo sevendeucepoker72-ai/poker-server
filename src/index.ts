@@ -3672,7 +3672,7 @@ Give feedback in this JSON format:
       );
       const { rows } = await getPool().query(
         `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
-           VALUES ($1, $2, $3, 10000, 1, 0, $4)
+           VALUES ($1, $2, $3, 50000, 1, 0, $4)
            ON CONFLICT (LOWER(username)) DO UPDATE
              SET display_name = COALESCE(users.display_name, $2)
          RETURNING *`,
@@ -5732,6 +5732,37 @@ Give feedback in this JSON format:
     }
   });
 
+  // 2026-06-12 — Unlimited "broke refill". A player who has lost their bankroll
+  // (under the cheapest cash table's 5,000 min buy-in) can claim +5,000 to keep
+  // playing — unlimited, but ONLY when broke. You cannot stockpile: each refill
+  // is just enough for one low-stakes buy-in, and you can't claim again until
+  // you're under 5,000 again. This is NOT the farmable UNLIMITED_CHIPS_TESTING
+  // faucet (which tops up to 50k and is off in prod). Server-authoritative grant.
+  socket.on('claimRefill', async () => {
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx) { socket.emit('refillResult', { success: false, error: 'Not authenticated' }); return; }
+      const REFILL_THRESHOLD = 5000; // = cheapest cash table min buy-in
+      const REFILL_AMOUNT = 5000;
+      const current = await getUserChips(ctx.userId);
+      if (current >= REFILL_THRESHOLD) {
+        socket.emit('refillResult', { success: false, error: 'not_broke', chips: current });
+        return;
+      }
+      const ok = await addChipsToUser(ctx.userId, REFILL_AMOUNT);
+      if (!ok) { socket.emit('refillResult', { success: false, error: 'grant_failed' }); return; }
+      const newBalance = current + REFILL_AMOUNT;
+      try { const p = progressionManager.getProgress(ctx.playerId); if (p) p.chips += REFILL_AMOUNT; } catch {}
+      const uname = authSessions.get(socket.id)?.username || String(ctx.userId);
+      auditLog(uname, 'BROKE_REFILL', { old: current, added: REFILL_AMOUNT, newBalance });
+      socket.emit('refillResult', { success: true, added: REFILL_AMOUNT, chips: newBalance });
+      sendProgressToPlayer(socket.id);
+    } catch (err: any) {
+      console.error('claimRefill error:', err);
+      socket.emit('refillResult', { success: false, error: 'server_error' });
+    }
+  });
+
   // Daily spin — server-validated one-per-day with stars included in reward table.
   socket.on('claimDailySpinServer', async () => {
     try {
@@ -6155,7 +6186,7 @@ Give feedback in this JSON format:
         if (!localUser) {
           const { rows } = await getPool().query(
             `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
-               VALUES ($1, $2, $3, 10000, 1, 0, $4)
+               VALUES ($1, $2, $3, 50000, 1, 0, $4)
                ON CONFLICT (LOWER(username)) DO UPDATE
                  SET display_name = COALESCE(users.display_name, $2)
              RETURNING *`,

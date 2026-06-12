@@ -14,7 +14,7 @@ const JWT_SECRET = process.env.JWT_SECRET || 'american-pub-poker-jwt-secret-2024
 const JWT_EXPIRES_IN = '7d';
 const BCRYPT_ROUNDS = 10;
 
-const DEFAULT_CHIPS = 10000;
+const DEFAULT_CHIPS = 50000; // 2026-06-12 — starting bankroll raised 10k -> 50k
 const DEFAULT_LEVEL = 1;
 const DEFAULT_XP = 0;
 
