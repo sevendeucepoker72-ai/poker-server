@@ -3080,6 +3080,21 @@ io.on('connection', (socket: Socket) => {
     });
   });
 
+  // 2026-06-12 — On-demand full-state resync. The 3D render loop pauses while a
+  // tab is backgrounded, so on return the table can look a few frames stale
+  // (delta compression means the next delta may not repaint everything). The
+  // client emits this on visibilitychange->visible to snap straight to the live
+  // hand. force=true sends a complete frame, not a delta. Read-only + per-socket.
+  socket.on('requestState', () => {
+    try {
+      const session = playerSessions.get(socket.id);
+      if (!session) return;
+      const table = tableManager.getTable(session.tableId);
+      if (!table) return;
+      emitGameState(socket, getGameStateForPlayer(table, session.seatIndex), true);
+    } catch { /* best-effort resync */ }
+  });
+
   // ========== Qualifier Tournament Registration ==========
 
   // Register for a qualifier tournament
