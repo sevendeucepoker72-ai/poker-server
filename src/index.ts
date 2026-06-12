@@ -556,7 +556,11 @@ setInterval(() => {
 }, 60_000).unref?.();
 
 // Auth session tracking: socketId -> userId
-const authSessions = new Map<string, { userId: number; username: string }>();
+// 2026-06-12 — masterUserId (the OIDC sub = master-API users.id) is the key
+// qualifier credits are keyed on; userId is poker-server's OWN local users.id.
+// Stored at oauthLogin so getQualifications can match the master id, not the
+// local int. phone kept as a display/fallback match key.
+const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string }>();
 
 /**
  * Resolve the human userId currently occupying a (tableId, seatIndex). Returns
@@ -3045,14 +3049,25 @@ io.on('connection', (socket: Socket) => {
   // (formatting) and spoofable. Any payload the client sends is ignored.
   socket.on('getQualifications', async () => {
     const auth = authSessions.get(socket.id);
-    const userId = auth?.userId ? String(auth.userId) : '';
-    if (!userId) { socket.emit('qualifications', { weekly: false, monthly: false }); return; }
+    // 2026-06-12 — match on the MASTER user id (= qualifier_credits.player_id =
+    // OIDC sub), NOT the session userId. The session userId is poker-server's
+    // OWN local users.id (an INTEGER keyed by phone); qualifier player_ids are
+    // master-API UUIDs, so a local-int-vs-master-UUID compare never matched.
+    // oauthLogin now stashes masterUserId (the sub). Phone is a fallback for
+    // any session that predates the stash.
+    const masterId = auth?.masterUserId ? String(auth.masterUserId) : '';
+    const phone = auth?.phone ? String(auth.phone) : '';
+    if (!masterId && !phone) { socket.emit('qualifications', { weekly: false, monthly: false }); return; }
     const [weekly, monthly] = await Promise.all([
       getQualifiedPlayers('weekly'),
       getQualifiedPlayers('monthly'),
     ]);
-    const weeklyEntry = weekly.find(p => p.playerId === userId);
-    const monthlyEntry = monthly.find(p => p.playerId === userId);
+    const match = (list: QualifiedPlayer[]) => list.find((p) =>
+      (masterId && String(p.playerId) === masterId) ||
+      (phone && p.phone && String(p.phone) === phone)
+    );
+    const weeklyEntry = match(weekly);
+    const monthlyEntry = match(monthly);
     socket.emit('qualifications', {
       weekly: weeklyEntry ? { qualified: true, credits: weeklyEntry.creditCount, venue: weeklyEntry.venueName } : false,
       monthly: monthlyEntry ? { qualified: true, credits: monthlyEntry.creditCount, venue: monthlyEntry.venueName } : false,
@@ -3673,7 +3688,12 @@ Give feedback in this JSON format:
         phoneNumber: String(phone),
       };
 
-      authSessions.set(socket.id, { userId, username: localUser.username });
+      authSessions.set(socket.id, {
+        userId,
+        username: localUser.username,
+        masterUserId: String(oauthResult.sub),  // master-API users.id = qualifier player_id
+        phone: String(phone),
+      });
       socket.emit('loginResult', {
         success: true,
         token: data.accessToken,
