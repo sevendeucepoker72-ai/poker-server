@@ -194,6 +194,44 @@ export async function initDB(): Promise<void> {
        WHERE stats->>'masterUserId' IS NOT NULL`
   ).catch(() => {});
 
+  // 2026-06-12 — One-time bankroll top-up to match the new 50k start.
+  // The starting bankroll was raised 10k -> 50k (DEFAULT_CHIPS above); per
+  // product, EXISTING players are floored to 50k too. This MUST run exactly
+  // once — an unconditional boot top-up would re-mint 50k for every broke
+  // player on EVERY restart and defeat the broke-refill economy (claimRefill
+  // is the only ongoing path back to chips). The one_time_ops sentinel makes
+  // it run-once and race-safe across replicas: the INSERT ... ON CONFLICT DO
+  // NOTHING RETURNING row is won by exactly one booting instance. `WHERE
+  // chips < 50000` is a ratchet — it only ever RAISES a wallet, never lowers
+  // a player who already has more (CLAUDE.md "user data MUST persist"). By
+  // the time this runs the old instance's SIGTERM cash-out has already
+  // flushed every seated stack into users.chips, so there is no on-table
+  // balance to double-count.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS one_time_ops (
+      op_id   TEXT PRIMARY KEY,
+      ran_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      detail  JSONB
+    )
+  `).catch((e: any) => console.warn('[Auth] one_time_ops:', e.message));
+  try {
+    const claim = await pool.query(
+      `INSERT INTO one_time_ops (op_id) VALUES ('topup_all_to_50k_2026_06_12')
+         ON CONFLICT (op_id) DO NOTHING
+       RETURNING op_id`
+    );
+    if (claim.rowCount === 1) {
+      const upd = await pool.query(`UPDATE users SET chips = 50000 WHERE chips < 50000`);
+      await pool.query(
+        `UPDATE one_time_ops SET detail = $1 WHERE op_id = 'topup_all_to_50k_2026_06_12'`,
+        [JSON.stringify({ raised: upd.rowCount, floor: 50000 })]
+      );
+      console.log(`[Auth] one-time top-up: raised ${upd.rowCount} player(s) below 50k to 50,000 chips`);
+    }
+  } catch (e: any) {
+    console.warn('[Auth] one-time 50k top-up skipped:', e.message);
+  }
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_inventory (
       user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
