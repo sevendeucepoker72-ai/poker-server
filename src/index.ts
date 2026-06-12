@@ -758,7 +758,8 @@ app.get('/api/fairness/:tableId/:handNumber', (req, res) => {
 // cached in memory. The frontend checks qualification status on login.
 
 interface QualifiedPlayer {
-  phone: string;
+  playerId: string;       // 2026-06-12 — master user id (= .online OIDC sub). THE match key.
+  phone?: string;         // display only; may be undefined post-PII-strip. No longer matched on.
   firstName: string;
   lastName: string;
   tier: string;           // 'weekly' | 'monthly'
@@ -779,16 +780,14 @@ async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<Quali
     // player actually plays in the tournament. Redemption on the master API
     // side is just a registration marker, not a consumption marker.
     //
-    // 2026-05-20 — send X-Internal-Token so master-API includes
-    // phone_number in the response. The 2026-05-06 round-3 PII strip
-    // removed phone_number from /qualifier-credits' public shape, which
-    // silently broke this lookup (we key by phone) and made every
-    // .online player look unqualified even when they held credits. See
-    // poker-api/src/handlers/qualifierCredits.js:isInternalCaller and
-    // CLAUDE.md Pattern A. The same shared secret authenticates poker-
-    // server's /notify calls — env var is already provisioned on
-    // Railway. If unset, we still get the public PII-stripped shape and
-    // the cache silently populates empty, which is the prior behaviour.
+    // 2026-06-12 — we key qualified players by player_id (master user id),
+    // which /qualifier-credits returns to EVERY caller, so the lookup no
+    // longer depends on phone_number. We still send X-Internal-Token to
+    // enrich rows with phone_number for display, but matching does NOT
+    // require it: if the token is unset we get the PII-stripped shape and
+    // still populate the cache correctly (keyed by player_id).
+    // (Prior 2026-05-20 behaviour keyed by phone and broke outright when the
+    // 2026-05-06 PII strip removed phone_number — see CLAUDE.md Pattern A.)
     const internalToken = process.env.INTERNAL_NOTIFY_TOKEN || '';
     const headers: Record<string, string> = {};
     if (internalToken) headers['X-Internal-Token'] = internalToken;
@@ -796,17 +795,20 @@ async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<Quali
     const data: any = await res.json();
     if (!data.success || !data.credits) return [];
 
-    // Group credits by phone+tier and count
+    // Group credits by master user-id + tier and count. Key on player_id
+    // (the .online OIDC subject) — NOT phone_number, which was brittle
+    // (exact-string match, null phones skipped, broke on the PII strip).
     const byKey = new Map<string, QualifiedPlayer>();
     for (const c of data.credits) {
-      if (c.tier !== tier || !c.phone_number) continue;
-      const key = `${c.phone_number}-${c.tier}`;
+      if (c.tier !== tier || !c.player_id) continue;
+      const key = `${c.player_id}-${c.tier}`;
       const existing = byKey.get(key);
       if (existing) {
         existing.creditCount++;
       } else {
         byKey.set(key, {
-          phone: c.phone_number,
+          playerId: String(c.player_id),
+          phone: c.phone_number,   // display only; undefined when PII-stripped
           firstName: c.first_name || '',
           lastName: c.last_name || '',
           tier: c.tier,
@@ -3036,16 +3038,21 @@ io.on('connection', (socket: Socket) => {
     }
   });
 
-  // Qualifier status: client checks if the logged-in player is qualified
-  socket.on('getQualifications', async (data: { phone: string }) => {
-    const phone = (data?.phone || '').trim();
-    if (!phone) { socket.emit('qualifications', { weekly: false, monthly: false }); return; }
+  // Qualifier status: the logged-in player checks if they're qualified.
+  // 2026-06-12 — match on the AUTHENTICATED session's userId (master user id),
+  // not a client-supplied phone. The socket's auth session (set at login)
+  // already holds the trusted userId; the old client-phone match was brittle
+  // (formatting) and spoofable. Any payload the client sends is ignored.
+  socket.on('getQualifications', async () => {
+    const auth = authSessions.get(socket.id);
+    const userId = auth?.userId ? String(auth.userId) : '';
+    if (!userId) { socket.emit('qualifications', { weekly: false, monthly: false }); return; }
     const [weekly, monthly] = await Promise.all([
       getQualifiedPlayers('weekly'),
       getQualifiedPlayers('monthly'),
     ]);
-    const weeklyEntry = weekly.find(p => p.phone === phone);
-    const monthlyEntry = monthly.find(p => p.phone === phone);
+    const weeklyEntry = weekly.find(p => p.playerId === userId);
+    const monthlyEntry = monthly.find(p => p.playerId === userId);
     socket.emit('qualifications', {
       weekly: weeklyEntry ? { qualified: true, credits: weeklyEntry.creditCount, venue: weeklyEntry.venueName } : false,
       monthly: monthlyEntry ? { qualified: true, credits: monthlyEntry.creditCount, venue: monthlyEntry.venueName } : false,
