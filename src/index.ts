@@ -3715,6 +3715,82 @@ Give feedback in this JSON format:
         masterUserId: String(oauthResult.sub),  // master-API users.id = qualifier player_id
         phone: String(phone),
       });
+
+      // 2026-06-12 — SEAT RECOVERY on the .online PRIMARY login/reconnect path.
+      // oauthLogin previously had NONE (only tokenLogin did), so every reconnect
+      // orphaned the player's seat (stuck "ghost") and never put them back. This
+      // mirrors tokenLogin's proven restore. Seats carry no userId — only
+      // playerName — so the post-restart orphan match is by name + "no live
+      // session on that seat" (same approach as clearGhostSeatsForUser). Wrapped
+      // in try/catch so a recovery miss can never break login itself.
+      try {
+        const recoverName = localUser.display_name || localUser.username;
+        // (a) Post-restart orphan recovery: a Railway redeploy wipes the
+        // in-memory reservedSeats Map, but the seat survives in Redis-rehydrated
+        // table state. Find the player's orphaned seat (their name, no live
+        // session pointing at it) and synthesize a reservation so (b) claims it.
+        if (!reservedSeats.has(userId) && recoverName) {
+          let found = false;
+          for (const t of tableManager.getTableList()) {
+            const table = tableManager.getTable(t.tableId);
+            if (!table) continue;
+            for (let i = 0; i < table.seats.length; i++) {
+              const seat = table.seats[i];
+              if (seat.state !== 'occupied' || seat.isAI) continue;
+              if (seat.playerName !== recoverName) continue;
+              let liveSession = false;
+              for (const [sid, sess] of playerSessions) {
+                if (sid === socket.id) continue;
+                if (sess.tableId === t.tableId && sess.seatIndex === i) { liveSession = true; break; }
+              }
+              if (liveSession) continue;
+              reservedSeats.set(userId, {
+                userId, tableId: t.tableId, seatIndex: i,
+                playerName: seat.playerName, chips: seat.chipCount,
+                avatar: (progress.userData as any)?.avatar ?? undefined,
+                expiresAt: Date.now() + 60_000, cleanupTimer: undefined,
+              } as any);
+              console.log(`[OAuth Reconnect] orphan-seat recovery (name): user ${userId} (${recoverName}) -> ${t.tableId} seat ${i}`);
+              found = true; break;
+            }
+            if (found) break;
+          }
+        }
+        // (b) Restore the reserved seat (the normal reconnect path).
+        const reserved = reservedSeats.get(userId);
+        if (reserved && reserved.expiresAt > Date.now()) {
+          const rTable = tableManager.getTable(reserved.tableId);
+          const rSeat = rTable?.seats?.[reserved.seatIndex];
+          if (rTable && rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
+            if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
+            reservedSeats.delete(userId);
+            // Guarantee EXACTLY ONE seat: clear any OTHER seats this user holds
+            // on this table (sessions + name-matched orphans) before claiming the
+            // restored one. Kills the "two of me" duplicate; stacks are credited
+            // back to the wallet inside clearGhostSeatsForUser.
+            clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex);
+            playerSessions.set(socket.id, {
+              socketId: socket.id, tableId: reserved.tableId, seatIndex: reserved.seatIndex,
+              playerName: reserved.playerName, playerId: `user_${userId}`,
+              trainingEnabled: false, sittingOut: false, avatar: reserved.avatar,
+            } as PlayerSession);
+            socket.join(`table:${reserved.tableId}`);
+            const tracker = sitOutTracker.get(reserved.tableId);
+            if (tracker) tracker.delete(reserved.seatIndex);
+            syncSitOutToTable(reserved.tableId);
+            if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
+            socket.emit('reconnectedToTable', { tableId: reserved.tableId, seatIndex: reserved.seatIndex });
+            emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
+            broadcastGameState(reserved.tableId);
+            console.log(`[OAuth Reserve] user ${userId} reconnected to seat ${reserved.seatIndex}`);
+          } else {
+            reservedSeats.delete(userId);
+          }
+        }
+      } catch (e: any) {
+        console.warn(`[OAuth seat-recovery] user ${userId}:`, e?.message);
+      }
+
       socket.emit('loginResult', {
         success: true,
         token: data.accessToken,
