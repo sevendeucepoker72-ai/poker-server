@@ -795,7 +795,13 @@ async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<Quali
     const internalToken = process.env.INTERNAL_NOTIFY_TOKEN || '';
     const headers: Record<string, string> = {};
     if (internalToken) headers['X-Internal-Token'] = internalToken;
-    const res = await fetch(`${masterApi}/qualifier-credits`, { headers });
+    // 2026-06-12 — fetch ALL credits (?limit=50000). The master default limit
+    // is 1000; the promotion already holds 1371 credits (951 weekly + 420
+    // monthly) and grows, so the default truncated by earned_at and the gate
+    // undercounted qualified players (324 weekly / 209 monthly seen as 248 /
+    // 132). 50000 covers the whole promotion; revisit with a dedicated
+    // distinct-qualified-players endpoint if credit volume ever approaches it.
+    const res = await fetch(`${masterApi}/qualifier-credits?limit=50000`, { headers });
     const data: any = await res.json();
     if (!data.success || !data.credits) return [];
 
