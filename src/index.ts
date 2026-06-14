@@ -6010,6 +6010,15 @@ Give feedback in this JSON format:
         const MASTER_API_BASE =
           process.env.MASTER_API_URL ||
           'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+        // 2026-06-14 — send the shared bypass key on the unauth /users/:id/me
+        // fetch so it keeps returning the public-safe shape after the master
+        // API flips REQUIRE_AUTH_ENFORCE=1 (otherwise it 401s — Pattern A).
+        // Requires AUTH_SERVER_BYPASS_KEY on Railway = the master API's value.
+        // No header (no-op) until then, so safe to ship ahead of the env var.
+        const AUTH_SERVER_BYPASS_KEY = process.env.AUTH_SERVER_BYPASS_KEY || '';
+        const meBypassInit: RequestInit | undefined = AUTH_SERVER_BYPASS_KEY
+          ? { headers: { 'X-Auth-Server-Key': AUTH_SERVER_BYPASS_KEY } }
+          : undefined;
 
         // 6s hard timeout for every Master API hop. Without this the fetch
         // hangs on Node's default TCP timeout (~2 min) whenever the master
@@ -6060,7 +6069,7 @@ Give feedback in this JSON format:
         // 2. Fetch master user details
         let meRes;
         try {
-          meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`);
+          meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`, meBypassInit);
         } catch (err: any) {
           const isTimeout = err?.name === 'AbortError';
           socket.emit('loginResult', {
@@ -6254,6 +6263,15 @@ Give feedback in this JSON format:
         const MASTER_API_BASE =
           process.env.MASTER_API_URL ||
           'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+        // 2026-06-14 — send the shared bypass key on the unauth /users/:id/me
+        // fetch so it keeps returning the public-safe shape after the master
+        // API flips REQUIRE_AUTH_ENFORCE=1 (otherwise it 401s — Pattern A).
+        // Requires AUTH_SERVER_BYPASS_KEY on Railway = the master API's value.
+        // No header (no-op) until then, so safe to ship ahead of the env var.
+        const AUTH_SERVER_BYPASS_KEY = process.env.AUTH_SERVER_BYPASS_KEY || '';
+        const meBypassInit: RequestInit | undefined = AUTH_SERVER_BYPASS_KEY
+          ? { headers: { 'X-Auth-Server-Key': AUTH_SERVER_BYPASS_KEY } }
+          : undefined;
         // 6s hard timeout — see authWithTicket handler for rationale.
         const fetchWithTimeout = async (url: string, init?: RequestInit, ms = 6000) => {
           const ac = new AbortController();
@@ -6304,7 +6322,7 @@ Give feedback in this JSON format:
         // closes that gap: waitlist seat ALWAYS comes with a real auth session.
         if (!authSessions.has(socket.id)) {
           try {
-            const meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`);
+            const meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`, meBypassInit);
             if (meRes.ok) {
               const meJson: any = await meRes.json();
               const masterUser = meJson?.data || meJson;
