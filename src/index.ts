@@ -3666,27 +3666,46 @@ Give feedback in this JSON format:
 
   // ========== Staking Marketplace ==========
   const stakingOffers: Map<string, any> = (global as any).__stakingOffers || ((global as any).__stakingOffers = new Map());
-  socket.on('createStake', async (data: { tournamentId: string; totalPct: number; pricePerPct: number; playerName: string }) => {
+  // Staking marketplace — a SOCIAL "back a player for % of winnings" board.
+  // No chips/stars move here (pure in-memory offers), so it's not an economy
+  // exploit surface. Phase 4 hardening: require an authenticated session and
+  // derive the seller/backer name SERVER-SIDE from auth.username — never trust
+  // a client-supplied playerName/buyerName (was identity-spoofable + anon).
+  socket.on('createStake', async (data: { tournamentId: string; totalPct: number; pricePerPct: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) { socket.emit('error', { message: 'Sign in to create a staking offer' }); return; }
     if (!data.tournamentId || typeof data.totalPct !== 'number' || data.totalPct <= 0 || data.totalPct > 100) {
       socket.emit('error', { message: 'Invalid staking offer' }); return;
     }
-    if (typeof data.pricePerPct !== 'number' || data.pricePerPct <= 0) {
+    if (typeof data.pricePerPct !== 'number' || data.pricePerPct <= 0 || data.pricePerPct > 1_000_000) {
       socket.emit('error', { message: 'Invalid price per percent' }); return;
     }
     const id = uuidv4();
-    const offer = { id, ...data, remaining: data.totalPct, backers: [], createdAt: Date.now() };
+    const offer = {
+      id,
+      tournamentId: String(data.tournamentId).slice(0, 64),
+      totalPct: data.totalPct,
+      pricePerPct: data.pricePerPct,
+      playerName: auth.username,        // server-derived identity, not client-supplied
+      sellerId: auth.userId,
+      remaining: data.totalPct,
+      backers: [] as { name: string; pct: number }[],
+      createdAt: Date.now(),
+    };
     stakingOffers.set(id, offer);
     io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
     socket.emit('stakeCreated', { id });
   });
-  socket.on('buyStake', async (data: { offerId: string; pct: number; buyerName: string }) => {
+  socket.on('buyStake', async (data: { offerId: string; pct: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) { socket.emit('buyStakeResult', { success: false, error: 'Sign in to back a player' }); return; }
     if (!data.offerId || typeof data.pct !== 'number' || data.pct <= 0) {
       socket.emit('buyStakeResult', { success: false, error: 'Invalid purchase' }); return;
     }
     const offer = stakingOffers.get(data.offerId);
     if (!offer || offer.remaining < data.pct) { socket.emit('buyStakeResult', { success: false, error: 'Offer unavailable' }); return; }
     offer.remaining -= data.pct;
-    offer.backers.push({ name: data.buyerName || 'Anonymous', pct: data.pct });
+    offer.backers.push({ name: auth.username, pct: data.pct }); // server-derived backer identity
     if (offer.remaining <= 0) stakingOffers.delete(data.offerId);
     io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
     socket.emit('buyStakeResult', { success: true });
@@ -6599,7 +6618,13 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'Cannot rebuy while in a live hand — wait for the hand to finish' });
       return;
     }
-    const requested = Math.max(table.config.minBuyIn, data?.amount || table.config.minBuyIn);
+    // 2026-06-19 Phase 4: clamp the client-supplied rebuy target to
+    // [minBuyIn, minBuyIn*10], matching the joinTable audit-C6 cap. Not a mint
+    // (it's the player's own wallet, deducted + balance-checked below) but
+    // without an upper bound a crafted rebuy could seat an oversized stack and
+    // distort table economics / SPR — the same fairness issue C6 addressed.
+    const maxBuyIn = table.config.minBuyIn * 10;
+    const requested = Math.min(maxBuyIn, Math.max(table.config.minBuyIn, data?.amount || table.config.minBuyIn));
     // How much are we actually trying to top up to?
     const topUpAmount = Math.max(0, requested - seat.chipCount);
     if (topUpAmount <= 0) {
@@ -8297,7 +8322,11 @@ Give feedback in this JSON format:
       return;
     }
 
-    const actualBuyIn = Math.max(table.config.minBuyIn, buyIn || table.config.minBuyIn);
+    // 2026-06-19 Phase 4: clamp the client buy-in to [minBuyIn, minBuyIn*10],
+    // matching joinTable's audit-C6 cap (this invite path only enforced the
+    // minimum). Own-wallet + balance-checked below, so not a mint — this is the
+    // same table-economics/SPR fairness bound.
+    const actualBuyIn = Math.min(table.config.minBuyIn * 10, Math.max(table.config.minBuyIn, buyIn || table.config.minBuyIn));
 
     // Server-authoritative chip deduction for authenticated users — previously
     // this path bypassed deductChips entirely, letting a player multi-table
@@ -8409,49 +8438,15 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
   });
 
   // ── Prediction market ─────────────────────────────────────────────────
-  const predictionBets = new Map<string, { socketId: string; outcome: string; amount: number }[]>();
-
-  socket.on('marketBet', async (data: { marketId: string; handId: string; outcome: string; amount: number }) => {
-    if (!data.marketId || !data.handId || !data.outcome || typeof data.amount !== 'number' || data.amount <= 0) return;
-    const key = `${data.marketId}:${data.handId}`;
-    const existing = predictionBets.get(key) || [];
-    existing.push({ socketId: socket.id, outcome: data.outcome, amount: data.amount });
-    predictionBets.set(key, existing);
-  });
-
-  socket.on('marketResolve', async (data: { marketId: string; handId: string; winningOutcome: string }) => {
-    if (!data.marketId || !data.handId || !data.winningOutcome) return;
-    const key = `${data.marketId}:${data.handId}`;
-    const bets = predictionBets.get(key);
-    if (!bets || bets.length === 0) return;
-
-    const totalPool = bets.reduce((sum, b) => sum + b.amount, 0);
-    const winners = bets.filter((b) => b.outcome === data.winningOutcome);
-    const totalWinnerStake = winners.reduce((sum, b) => sum + b.amount, 0);
-
-    if (winners.length === 0) {
-      // No winners — refund all bettors
-      for (const bet of bets) {
-        const s = io.sockets.sockets.get(bet.socketId);
-        if (s) s.emit('marketResult', { marketId: data.marketId, handId: data.handId, refund: bet.amount, payout: 0 });
-      }
-    } else {
-      // Pay winners proportionally from total pool
-      for (const bet of winners) {
-        const payout = Math.floor((bet.amount / totalWinnerStake) * totalPool);
-        const s = io.sockets.sockets.get(bet.socketId);
-        if (s) s.emit('marketResult', { marketId: data.marketId, handId: data.handId, payout, refund: 0 });
-      }
-      // Losers get nothing (their bets funded the pool)
-      const loserSocketIds = new Set(bets.filter((b) => b.outcome !== data.winningOutcome).map((b) => b.socketId));
-      for (const sid of loserSocketIds) {
-        const s = io.sockets.sockets.get(sid);
-        if (s) s.emit('marketResult', { marketId: data.marketId, handId: data.handId, payout: 0, refund: 0 });
-      }
-    }
-
-    predictionBets.delete(key);
-  });
+  // 2026-06-19 Phase 4: the old `marketBet`/`marketResolve` socket handlers
+  // were REMOVED. They took the wager `amount` from the client, never
+  // deducted it, had no auth/identity gate, and let ANY socket resolve a
+  // market and declare the winning outcome — emitting a `marketResult`
+  // payout. They were dead the moment Phase 3c replaced the client with the
+  // server-authoritative `placePredictionBet` / `predictionSettled` path
+  // (see social/predictionManager.ts) — nothing emits `marketBet` anymore.
+  // Leaving an unauthenticated, client-amount payout path wired up is a
+  // latent chip-mint, so it's deleted rather than left dormant.
 
   socket.on('disconnect', async () => {
     console.log(`Player disconnected: ${socket.id}`);
