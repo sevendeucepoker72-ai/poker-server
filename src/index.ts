@@ -7992,22 +7992,30 @@ Give feedback in this JSON format:
   // ========== Theme Shop ==========
 
   socket.on('purchaseTheme', async (data: { themeId: string }) => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
+    // 2026-06-19 fix: ThemeShop is opened from the LOBBY (not seated), so gate
+    // on the auth session, not playerSessions (a table seat) — previously every
+    // lobby purchase silently no-op'd. And the cost table now keys off the REAL
+    // client theme ids; the old keys (gold/neon/classic/…) matched NONE of the
+    // client's (classic_blue/casino_royale/…), so every buy fell through to the
+    // flat `?? 400` regardless of the price shown.
+    const ctx = await ensureHydrated(socket);
+    if (!ctx) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
-    // Cost is looked up server-side — never trust cost from the client
+    // Cost is looked up server-side — never trust cost from the client.
     const THEME_COSTS: Record<string, number> = {
-      gold: 500, neon: 300, classic: 200, dark: 250, ocean: 350, royal: 600,
+      classic_blue: 0, casino_royale: 500, midnight_purple: 300,
+      ocean_breeze: 400, royal_gold: 800, neon_vegas: 600,
     };
     const cost = THEME_COSTS[data.themeId] ?? 400;
 
-    const result = progressionManager.purchaseTheme(session.playerId, data.themeId, cost);
+    const result = progressionManager.purchaseTheme(ctx.playerId, data.themeId, cost);
     if (result.success) {
       socket.emit('themePurchased', { themeId: data.themeId });
     } else {
       socket.emit('error', { message: result.error || 'Purchase failed' });
     }
-    sendProgressToPlayer(socket.id);
+    const cp = progressionManager.getClientProgress(ctx.playerId);
+    if (cp) socket.emit('playerProgress', cp);
   });
 
   socket.on('purchaseBattlePass', async (_data: unknown, callback?: (ack: { success: boolean; error?: string }) => void) => {
@@ -8026,16 +8034,20 @@ Give feedback in this JSON format:
   });
 
   socket.on('equipTheme', async (data: { themeId: string }) => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
+    // 2026-06-19 fix: same as purchaseTheme — equip is invoked from the lobby,
+    // so gate on the auth session and push progress directly (sendProgressToPlayer
+    // no-ops without a table seat).
+    const ctx = await ensureHydrated(socket);
+    if (!ctx) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
-    const result = progressionManager.equipTheme(session.playerId, data.themeId);
+    const result = progressionManager.equipTheme(ctx.playerId, data.themeId);
     if (result.success) {
       socket.emit('themeEquipped', { themeId: data.themeId });
     } else {
       socket.emit('error', { message: result.error || 'Equip failed' });
     }
-    sendProgressToPlayer(socket.id);
+    const cp = progressionManager.getClientProgress(ctx.playerId);
+    if (cp) socket.emit('playerProgress', cp);
   });
 
   // ========== Detailed Stats ==========
