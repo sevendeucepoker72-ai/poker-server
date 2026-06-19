@@ -1,6 +1,4 @@
-import Database from 'better-sqlite3';
-import path from 'path';
-import fs from 'fs';
+import { getPool } from '../auth/authManager';
 
 // ========== Types ==========
 
@@ -206,52 +204,50 @@ export interface ScheduledTable {
 }
 
 // ========== Database ==========
+//
+// Migrated 2026-06-19 from ephemeral better-sqlite3 to the durable Postgres
+// pool (authManager.getPool()). Two bugs fixed by this migration:
+//   1. Clubs data was wiped on every Railway redeploy (SQLite file on an
+//      ephemeral FS with no volume).
+//   2. clubManager queried a `users` table it never created, so member
+//      names showed 'Unknown' and invites failed. Username/displayName now
+//      resolve against the REAL Postgres `users` table owned by authManager
+//      (columns: id, username, display_name).
+//
+// Boolean-ish columns are kept as INTEGER (0/1) so all existing comparison
+// logic (isActive === 1, isPinned, recurring ? 1 : 0, etc.) is unchanged.
 
-let db: Database.Database;
+export async function initClubTables(): Promise<void> {
+  const pool = getPool();
 
-function getDB(): Database.Database {
-  if (db) return db;
-  const dbPath = path.join(__dirname, '..', '..', 'data', 'poker.db');
-  const dataDir = path.dirname(dbPath);
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
-  db = new Database(dbPath);
-  db.pragma('journal_mode = WAL');
-  return db;
-}
-
-export function initClubTables(): void {
-  const d = getDB();
-
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS clubs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubCode TEXT UNIQUE NOT NULL,
       name TEXT NOT NULL,
       description TEXT DEFAULT '',
       ownerId INTEGER NOT NULL,
       settings TEXT DEFAULT '{}',
-      createdAt TEXT DEFAULT (datetime('now'))
+      createdAt TIMESTAMPTZ DEFAULT now()
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_members (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       userId INTEGER NOT NULL,
       role TEXT NOT NULL DEFAULT 'member',
-      joinedAt TEXT DEFAULT (datetime('now')),
+      joinedAt TIMESTAMPTZ DEFAULT now(),
       status TEXT NOT NULL DEFAULT 'active',
       UNIQUE(clubId, userId),
       FOREIGN KEY (clubId) REFERENCES clubs(id) ON DELETE CASCADE
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_tables (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       tableName TEXT NOT NULL,
       variant TEXT NOT NULL DEFAULT 'texas-holdem',
@@ -266,23 +262,23 @@ export function initClubTables(): void {
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       userId INTEGER NOT NULL,
       username TEXT NOT NULL,
       message TEXT NOT NULL,
       type TEXT NOT NULL DEFAULT 'chat',
       isPinned INTEGER NOT NULL DEFAULT 0,
-      createdAt TEXT DEFAULT (datetime('now')),
+      createdAt TIMESTAMPTZ DEFAULT now(),
       FOREIGN KEY (clubId) REFERENCES clubs(id) ON DELETE CASCADE
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_stats (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       userId INTEGER NOT NULL,
       username TEXT NOT NULL,
@@ -291,26 +287,26 @@ export function initClubTables(): void {
       chipsLost INTEGER NOT NULL DEFAULT 0,
       biggestPot INTEGER NOT NULL DEFAULT 0,
       tournamentsWon INTEGER NOT NULL DEFAULT 0,
-      updatedAt TEXT DEFAULT (datetime('now')),
+      updatedAt TIMESTAMPTZ DEFAULT now(),
       UNIQUE(clubId, userId),
       FOREIGN KEY (clubId) REFERENCES clubs(id) ON DELETE CASCADE
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_activity (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       type TEXT NOT NULL,
       data TEXT NOT NULL DEFAULT '{}',
-      createdAt TEXT DEFAULT (datetime('now')),
+      createdAt TIMESTAMPTZ DEFAULT now(),
       FOREIGN KEY (clubId) REFERENCES clubs(id) ON DELETE CASCADE
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_tournaments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       name TEXT NOT NULL,
       format TEXT NOT NULL DEFAULT 'freezeout',
@@ -326,20 +322,20 @@ export function initClubTables(): void {
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_tournament_registrations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       tournamentId INTEGER NOT NULL,
       userId INTEGER NOT NULL,
-      registeredAt TEXT DEFAULT (datetime('now')),
+      registeredAt TIMESTAMPTZ DEFAULT now(),
       UNIQUE(tournamentId, userId),
       FOREIGN KEY (tournamentId) REFERENCES club_tournaments(id) ON DELETE CASCADE
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_challenges (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       challengerId INTEGER NOT NULL,
       challengerName TEXT NOT NULL,
@@ -348,14 +344,14 @@ export function initClubTables(): void {
       stakes INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'pending',
       winnerId INTEGER DEFAULT NULL,
-      createdAt TEXT DEFAULT (datetime('now')),
+      createdAt TIMESTAMPTZ DEFAULT now(),
       FOREIGN KEY (clubId) REFERENCES clubs(id) ON DELETE CASCADE
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS scheduled_tables (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       tableConfig TEXT NOT NULL DEFAULT '{}',
       scheduledTime TEXT NOT NULL,
@@ -367,9 +363,9 @@ export function initClubTables(): void {
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS blind_structures (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       name TEXT NOT NULL,
       levels TEXT NOT NULL DEFAULT '[]',
@@ -379,37 +375,37 @@ export function initClubTables(): void {
   `);
 
   // ── Feature 10: Club Invitations ──
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_invitations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       clubId INTEGER NOT NULL,
       clubName TEXT NOT NULL,
       inviterId INTEGER NOT NULL,
       inviterName TEXT NOT NULL,
       invitedUsername TEXT NOT NULL,
       status TEXT NOT NULL DEFAULT 'pending',
-      createdAt TEXT DEFAULT (datetime('now')),
+      createdAt TIMESTAMPTZ DEFAULT now(),
       FOREIGN KEY (clubId) REFERENCES clubs(id) ON DELETE CASCADE
     )
   `);
 
   // ── Feature 11: Club Unions ──
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS club_unions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       name TEXT NOT NULL,
       description TEXT DEFAULT '',
       leaderClubId INTEGER NOT NULL,
-      createdAt TEXT DEFAULT (datetime('now'))
+      createdAt TIMESTAMPTZ DEFAULT now()
     )
   `);
 
-  d.exec(`
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS union_members (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id SERIAL PRIMARY KEY,
       unionId INTEGER NOT NULL,
       clubId INTEGER NOT NULL,
-      joinedAt TEXT DEFAULT (datetime('now')),
+      joinedAt TIMESTAMPTZ DEFAULT now(),
       status TEXT NOT NULL DEFAULT 'active',
       UNIQUE(unionId, clubId),
       FOREIGN KEY (unionId) REFERENCES club_unions(id) ON DELETE CASCADE
@@ -417,87 +413,96 @@ export function initClubTables(): void {
   `);
 
   // ── Feature 13: Club Badges - add badge column ──
-  try {
-    d.exec(`ALTER TABLE clubs ADD COLUMN badge TEXT DEFAULT '♠'`);
-  } catch (_e) { /* column already exists */ }
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS badge TEXT DEFAULT '♠'`).catch(() => {});
 
   // ── Feature 14: Referral Codes - add referral_code column ──
-  try {
-    d.exec(`ALTER TABLE club_members ADD COLUMN referral_code TEXT DEFAULT NULL`);
-  } catch (_e) { /* column already exists */ }
+  await pool.query(`ALTER TABLE club_members ADD COLUMN IF NOT EXISTS referral_code TEXT DEFAULT NULL`).catch(() => {});
 
   // ── Feature 15: Club Levels - add clubXp and clubLevel columns ──
-  try {
-    d.exec(`ALTER TABLE clubs ADD COLUMN clubXp INTEGER DEFAULT 0`);
-  } catch (_e) { /* column already exists */ }
-  try {
-    d.exec(`ALTER TABLE clubs ADD COLUMN clubLevel INTEGER DEFAULT 1`);
-  } catch (_e) { /* column already exists */ }
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS clubXp INTEGER DEFAULT 0`).catch(() => {});
+  await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS clubLevel INTEGER DEFAULT 1`).catch(() => {});
 
   console.log('[Clubs] Database tables initialized (with social features)');
 }
 
 // ========== Helpers ==========
 
-function generateClubCode(): string {
-  const d = getDB();
+async function generateClubCode(): Promise<string> {
+  const pool = getPool();
   let code: string;
   let attempts = 0;
   do {
     code = String(Math.floor(100000 + Math.random() * 900000));
-    const existing = d.prepare('SELECT id FROM clubs WHERE clubCode = ?').get(code);
+    const existing = (await pool.query('SELECT id FROM clubs WHERE clubCode = $1', [code])).rows[0] ?? null;
     if (!existing) return code;
     attempts++;
   } while (attempts < 100);
   throw new Error('Could not generate unique club code');
 }
 
-function getUsername(userId: number): string {
-  const d = getDB();
-  const user = d.prepare('SELECT username FROM users WHERE id = ?').get(userId) as { username: string } | undefined;
+async function getUsername(userId: number): Promise<string> {
+  const pool = getPool();
+  const user = (await pool.query(
+    'SELECT COALESCE(display_name, username) AS username FROM users WHERE id = $1',
+    [userId]
+  )).rows[0] as { username: string } | undefined;
   return user?.username || 'Unknown';
 }
 
-function getMemberRole(clubId: number, userId: number): string | null {
-  const d = getDB();
-  const row = d.prepare('SELECT role FROM club_members WHERE clubId = ? AND userId = ? AND status = ?').get(clubId, userId, 'active') as { role: string } | undefined;
+async function getMemberRole(clubId: number, userId: number): Promise<string | null> {
+  const pool = getPool();
+  const row = (await pool.query(
+    'SELECT role FROM club_members WHERE clubId = $1 AND userId = $2 AND status = $3',
+    [clubId, userId, 'active']
+  )).rows[0] as { role: string } | undefined;
   return row?.role || null;
 }
 
-function getClubById(clubId: number): Club | null {
-  const d = getDB();
-  const row = d.prepare('SELECT * FROM clubs WHERE id = ?').get(clubId) as any;
-  if (!row) return null;
+// NOTE on identifier case: Postgres folds unquoted column names to
+// lowercase, so a column created as `clubCode` comes back on the result
+// row as `clubcode`. We map result rows explicitly (lowercase keys →
+// camelCase fields) rather than spreading, so the public return shapes are
+// identical to the old better-sqlite3 versions.
+function rowToClub(row: any): Club {
   return {
-    ...row,
+    id: row.id,
+    clubCode: row.clubcode,
+    name: row.name,
+    description: row.description,
+    ownerId: row.ownerid,
     settings: JSON.parse(row.settings || '{}'),
+    createdAt: row.createdat,
   };
 }
 
-function getClubByCode(code: string): Club | null {
-  const d = getDB();
-  const row = d.prepare('SELECT * FROM clubs WHERE clubCode = ?').get(code) as any;
+async function getClubById(clubId: number): Promise<Club | null> {
+  const pool = getPool();
+  const row = (await pool.query('SELECT * FROM clubs WHERE id = $1', [clubId])).rows[0] as any;
   if (!row) return null;
-  return {
-    ...row,
-    settings: JSON.parse(row.settings || '{}'),
-  };
+  return rowToClub(row);
+}
+
+async function getClubByCode(code: string): Promise<Club | null> {
+  const pool = getPool();
+  const row = (await pool.query('SELECT * FROM clubs WHERE clubCode = $1', [code])).rows[0] as any;
+  if (!row) return null;
+  return rowToClub(row);
 }
 
 // ========== Club Operations ==========
 
-export function createClub(
+export async function createClub(
   ownerId: number,
   name: string,
   description: string,
   settings: Partial<ClubSettings>
-): { success: boolean; error?: string; club?: ClubInfo } {
+): Promise<{ success: boolean; error?: string; club?: ClubInfo }> {
   if (!name || name.trim().length < 2) {
     return { success: false, error: 'Club name must be at least 2 characters' };
   }
 
-  const d = getDB();
-  const clubCode = generateClubCode();
+  const pool = getPool();
+  const clubCode = await generateClubCode();
   const fullSettings: ClubSettings = {
     rake: settings.rake ?? 0,
     maxMembers: settings.maxMembers ?? 100,
@@ -506,16 +511,18 @@ export function createClub(
   };
 
   try {
-    const result = d.prepare(
-      'INSERT INTO clubs (clubCode, name, description, ownerId, settings) VALUES (?, ?, ?, ?, ?)'
-    ).run(clubCode, name.trim(), description?.trim() || '', ownerId, JSON.stringify(fullSettings));
+    const result = await pool.query(
+      'INSERT INTO clubs (clubCode, name, description, ownerId, settings) VALUES ($1, $2, $3, $4, $5) RETURNING id',
+      [clubCode, name.trim(), description?.trim() || '', ownerId, JSON.stringify(fullSettings)]
+    );
 
-    const clubId = result.lastInsertRowid as number;
+    const clubId = result.rows[0].id as number;
 
     // Add owner as member
-    d.prepare(
-      'INSERT INTO club_members (clubId, userId, role, status) VALUES (?, ?, ?, ?)'
-    ).run(clubId, ownerId, 'owner', 'active');
+    await pool.query(
+      'INSERT INTO club_members (clubId, userId, role, status) VALUES ($1, $2, $3, $4)',
+      [clubId, ownerId, 'owner', 'active']
+    );
 
     return {
       success: true,
@@ -525,7 +532,7 @@ export function createClub(
         name: name.trim(),
         description: description?.trim() || '',
         ownerId,
-        ownerName: getUsername(ownerId),
+        ownerName: await getUsername(ownerId),
         settings: fullSettings,
         memberCount: 1,
         createdAt: new Date().toISOString(),
@@ -537,19 +544,19 @@ export function createClub(
   }
 }
 
-export function joinClub(
+export async function joinClub(
   userId: number,
   clubCode: string
-): { success: boolean; error?: string; club?: ClubInfo; status?: string } {
-  const club = getClubByCode(clubCode);
+): Promise<{ success: boolean; error?: string; club?: ClubInfo; status?: string }> {
+  const club = await getClubByCode(clubCode);
   if (!club) {
     return { success: false, error: 'Club not found. Check the code and try again.' };
   }
 
-  const d = getDB();
+  const pool = getPool();
 
   // Check if already a member
-  const existing = d.prepare('SELECT * FROM club_members WHERE clubId = ? AND userId = ?').get(club.id, userId) as any;
+  const existing = (await pool.query('SELECT * FROM club_members WHERE clubId = $1 AND userId = $2', [club.id, userId])).rows[0] as any;
   if (existing) {
     if (existing.status === 'active') {
       return { success: false, error: 'You are already a member of this club' };
@@ -564,7 +571,7 @@ export function joinClub(
 
   // Check member limit
   const settings = club.settings;
-  const memberCount = (d.prepare('SELECT COUNT(*) as cnt FROM club_members WHERE clubId = ? AND status = ?').get(club.id, 'active') as any).cnt;
+  const memberCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND status = $2', [club.id, 'active'])).rows[0] as any).cnt;
   if (memberCount >= settings.maxMembers) {
     return { success: false, error: 'This club is full' };
   }
@@ -572,11 +579,12 @@ export function joinClub(
   const status = settings.requireApproval ? 'pending' : 'active';
 
   try {
-    d.prepare(
-      'INSERT INTO club_members (clubId, userId, role, status) VALUES (?, ?, ?, ?)'
-    ).run(club.id, userId, 'member', status);
+    await pool.query(
+      'INSERT INTO club_members (clubId, userId, role, status) VALUES ($1, $2, $3, $4)',
+      [club.id, userId, 'member', status]
+    );
 
-    const newCount = (d.prepare('SELECT COUNT(*) as cnt FROM club_members WHERE clubId = ? AND status = ?').get(club.id, 'active') as any).cnt;
+    const newCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND status = $2', [club.id, 'active'])).rows[0] as any).cnt;
 
     return {
       success: true,
@@ -587,7 +595,7 @@ export function joinClub(
         name: club.name,
         description: club.description,
         ownerId: club.ownerId,
-        ownerName: getUsername(club.ownerId),
+        ownerName: await getUsername(club.ownerId),
         settings: club.settings,
         memberCount: newCount,
         createdAt: club.createdAt,
@@ -599,43 +607,43 @@ export function joinClub(
   }
 }
 
-export function leaveClub(
+export async function leaveClub(
   userId: number,
   clubId: number
-): { success: boolean; error?: string } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
 
   if (club.ownerId === userId) {
     return { success: false, error: 'Owners cannot leave their own club. Transfer ownership or delete the club.' };
   }
 
-  const d = getDB();
-  const result = d.prepare('DELETE FROM club_members WHERE clubId = ? AND userId = ?').run(clubId, userId);
-  if (result.changes === 0) {
+  const pool = getPool();
+  const result = await pool.query('DELETE FROM club_members WHERE clubId = $1 AND userId = $2', [clubId, userId]);
+  if (result.rowCount === 0) {
     return { success: false, error: 'You are not a member of this club' };
   }
 
   return { success: true };
 }
 
-export function getClubInfo(
+export async function getClubInfo(
   clubId: number,
   requesterId?: number
-): { success: boolean; error?: string; club?: ClubInfo } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; club?: ClubInfo }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
 
-  const d = getDB();
-  const memberCount = (d.prepare('SELECT COUNT(*) as cnt FROM club_members WHERE clubId = ? AND status = ?').get(clubId, 'active') as any).cnt;
+  const pool = getPool();
+  const memberCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND status = $2', [clubId, 'active'])).rows[0] as any).cnt;
 
   let myRole: string | undefined;
   if (requesterId) {
-    myRole = getMemberRole(clubId, requesterId) || undefined;
+    myRole = (await getMemberRole(clubId, requesterId)) || undefined;
   }
 
   // Get badge and level from raw row
-  const rawRow = d.prepare('SELECT badge, clubXp, clubLevel FROM clubs WHERE id = ?').get(clubId) as any;
+  const rawRow = (await pool.query('SELECT badge, clubXp, clubLevel FROM clubs WHERE id = $1', [clubId])).rows[0] as any;
 
   return {
     success: true,
@@ -645,113 +653,116 @@ export function getClubInfo(
       name: club.name,
       description: club.description,
       ownerId: club.ownerId,
-      ownerName: getUsername(club.ownerId),
+      ownerName: await getUsername(club.ownerId),
       settings: club.settings,
       memberCount,
       createdAt: club.createdAt,
       myRole,
       badge: rawRow?.badge || '♠',
-      clubLevel: rawRow?.clubLevel || 1,
-      clubXp: rawRow?.clubXp || 0,
+      clubLevel: rawRow?.clublevel || 1,
+      clubXp: rawRow?.clubxp || 0,
     },
   };
 }
 
-export function getClubMembers(
+export async function getClubMembers(
   clubId: number
-): { success: boolean; error?: string; members?: ClubMember[] } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; members?: ClubMember[] }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
 
-  const d = getDB();
-  const rows = d.prepare(
-    `SELECT cm.*, u.username FROM club_members cm
+  const pool = getPool();
+  const rows = (await pool.query(
+    `SELECT cm.*, COALESCE(u.display_name, u.username) AS username FROM club_members cm
      LEFT JOIN users u ON cm.userId = u.id
-     WHERE cm.clubId = ?
+     WHERE cm.clubId = $1
      ORDER BY
        CASE cm.role WHEN 'owner' THEN 0 WHEN 'manager' THEN 1 ELSE 2 END,
-       cm.joinedAt ASC`
-  ).all(clubId) as any[];
+       cm.joinedAt ASC`,
+    [clubId]
+  )).rows as any[];
 
   const members: ClubMember[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
-    userId: r.userId,
+    clubId: r.clubid,
+    userId: r.userid,
     username: r.username,
     role: r.role,
-    joinedAt: r.joinedAt,
+    joinedAt: r.joinedat,
     status: r.status,
   }));
 
   return { success: true, members };
 }
 
-export function getMyClubs(
+export async function getMyClubs(
   userId: number
-): { success: boolean; clubs: ClubInfo[] } {
-  const d = getDB();
-  const rows = d.prepare(
+): Promise<{ success: boolean; clubs: ClubInfo[] }> {
+  const pool = getPool();
+  const rows = (await pool.query(
     `SELECT c.*, cm.role as myRole,
-      (SELECT COUNT(*) FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount
+      (SELECT COUNT(*)::int FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount
      FROM clubs c
      JOIN club_members cm ON c.id = cm.clubId
-     WHERE cm.userId = ? AND cm.status = 'active'
-     ORDER BY cm.joinedAt DESC`
-  ).all(userId) as any[];
+     WHERE cm.userId = $1 AND cm.status = 'active'
+     ORDER BY cm.joinedAt DESC`,
+    [userId]
+  )).rows as any[];
 
-  const clubs: ClubInfo[] = rows.map((r) => ({
+  const clubs: ClubInfo[] = await Promise.all(rows.map(async (r) => ({
     id: r.id,
-    clubCode: r.clubCode,
+    clubCode: r.clubcode,
     name: r.name,
     description: r.description,
-    ownerId: r.ownerId,
-    ownerName: getUsername(r.ownerId),
+    ownerId: r.ownerid,
+    ownerName: await getUsername(r.ownerid),
     settings: JSON.parse(r.settings || '{}'),
-    memberCount: r.memberCount,
-    createdAt: r.createdAt,
-    myRole: r.myRole,
+    memberCount: r.membercount,
+    createdAt: r.createdat,
+    myRole: r.myrole,
     badge: r.badge || '♠',
-    clubLevel: r.clubLevel || 1,
-    clubXp: r.clubXp || 0,
-  }));
+    clubLevel: r.clublevel || 1,
+    clubXp: r.clubxp || 0,
+  })));
 
   return { success: true, clubs };
 }
 
-export function approveMember(
+export async function approveMember(
   managerId: number,
   clubId: number,
   userId: number
-): { success: boolean; error?: string } {
-  const managerRole = getMemberRole(clubId, managerId);
+): Promise<{ success: boolean; error?: string }> {
+  const managerRole = await getMemberRole(clubId, managerId);
   if (!managerRole || (managerRole !== 'owner' && managerRole !== 'manager')) {
     return { success: false, error: 'Only owners and managers can approve members' };
   }
 
-  const d = getDB();
-  const result = d.prepare(
-    'UPDATE club_members SET status = ? WHERE clubId = ? AND userId = ? AND status = ?'
-  ).run('active', clubId, userId, 'pending');
+  const pool = getPool();
+  const result = await pool.query(
+    'UPDATE club_members SET status = $1 WHERE clubId = $2 AND userId = $3 AND status = $4',
+    ['active', clubId, userId, 'pending']
+  );
 
-  if (result.changes === 0) {
+  if (result.rowCount === 0) {
     return { success: false, error: 'No pending request found for this user' };
   }
 
   return { success: true };
 }
 
-export function removeMember(
+export async function removeMember(
   managerId: number,
   clubId: number,
   userId: number
-): { success: boolean; error?: string } {
-  const managerRole = getMemberRole(clubId, managerId);
+): Promise<{ success: boolean; error?: string }> {
+  const managerRole = await getMemberRole(clubId, managerId);
   if (!managerRole || (managerRole !== 'owner' && managerRole !== 'manager')) {
     return { success: false, error: 'Only owners and managers can remove members' };
   }
 
   // Managers can't remove owners or other managers
-  const targetRole = getMemberRole(clubId, userId);
+  const targetRole = await getMemberRole(clubId, userId);
   if (targetRole === 'owner') {
     return { success: false, error: 'Cannot remove the club owner' };
   }
@@ -759,35 +770,36 @@ export function removeMember(
     return { success: false, error: 'Only the owner can remove managers' };
   }
 
-  const d = getDB();
-  d.prepare('UPDATE club_members SET status = ? WHERE clubId = ? AND userId = ?').run('banned', clubId, userId);
+  const pool = getPool();
+  await pool.query('UPDATE club_members SET status = $1 WHERE clubId = $2 AND userId = $3', ['banned', clubId, userId]);
   return { success: true };
 }
 
-export function promoteToManager(
+export async function promoteToManager(
   ownerId: number,
   clubId: number,
   userId: number
-): { success: boolean; error?: string } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
   if (club.ownerId !== ownerId) {
     return { success: false, error: 'Only the club owner can promote members' };
   }
 
-  const d = getDB();
-  const result = d.prepare(
-    'UPDATE club_members SET role = ? WHERE clubId = ? AND userId = ? AND status = ?'
-  ).run('manager', clubId, userId, 'active');
+  const pool = getPool();
+  const result = await pool.query(
+    'UPDATE club_members SET role = $1 WHERE clubId = $2 AND userId = $3 AND status = $4',
+    ['manager', clubId, userId, 'active']
+  );
 
-  if (result.changes === 0) {
+  if (result.rowCount === 0) {
     return { success: false, error: 'Member not found or not active' };
   }
 
   return { success: true };
 }
 
-export function createClubTable(
+export async function createClubTable(
   managerId: number,
   clubId: number,
   config: {
@@ -799,8 +811,8 @@ export function createClubTable(
     maxBuyIn?: number;
     maxSeats?: number;
   }
-): { success: boolean; error?: string; table?: ClubTable } {
-  const role = getMemberRole(clubId, managerId);
+): Promise<{ success: boolean; error?: string; table?: ClubTable }> {
+  const role = await getMemberRole(clubId, managerId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can create tables' };
   }
@@ -809,7 +821,7 @@ export function createClubTable(
     return { success: false, error: 'Table name must be at least 2 characters' };
   }
 
-  const d = getDB();
+  const pool = getPool();
   const sb = config.smallBlind || 5;
   const bb = config.bigBlind || 10;
   const minBuy = config.minBuyIn || bb * 20;
@@ -818,13 +830,14 @@ export function createClubTable(
   const variant = config.variant || 'texas-holdem';
 
   try {
-    const result = d.prepare(
+    const result = await pool.query(
       `INSERT INTO club_tables (clubId, tableName, variant, smallBlind, bigBlind, minBuyIn, maxBuyIn, maxSeats)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(clubId, config.tableName.trim(), variant, sb, bb, minBuy, maxBuy, maxSeats);
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      [clubId, config.tableName.trim(), variant, sb, bb, minBuy, maxBuy, maxSeats]
+    );
 
     const tableRow: ClubTable = {
-      id: result.lastInsertRowid as number,
+      id: result.rows[0].id as number,
       clubId,
       tableName: config.tableName.trim(),
       variant,
@@ -843,56 +856,57 @@ export function createClubTable(
   }
 }
 
-export function getClubTables(
+export async function getClubTables(
   clubId: number
-): { success: boolean; error?: string; tables?: ClubTable[] } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; tables?: ClubTable[] }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
 
-  const d = getDB();
-  const rows = d.prepare(
-    'SELECT * FROM club_tables WHERE clubId = ? AND isActive = 1'
-  ).all(clubId) as any[];
+  const pool = getPool();
+  const rows = (await pool.query(
+    'SELECT * FROM club_tables WHERE clubId = $1 AND isActive = 1',
+    [clubId]
+  )).rows as any[];
 
   const tables: ClubTable[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
-    tableName: r.tableName,
+    clubId: r.clubid,
+    tableName: r.tablename,
     variant: r.variant,
-    smallBlind: r.smallBlind,
-    bigBlind: r.bigBlind,
-    minBuyIn: r.minBuyIn,
-    maxBuyIn: r.maxBuyIn,
-    maxSeats: r.maxSeats,
-    isActive: r.isActive === 1,
-    tableId: r.tableId || undefined,
+    smallBlind: r.smallblind,
+    bigBlind: r.bigblind,
+    minBuyIn: r.minbuyin,
+    maxBuyIn: r.maxbuyin,
+    maxSeats: r.maxseats,
+    isActive: r.isactive === 1,
+    tableId: r.tableid || undefined,
   }));
 
   return { success: true, tables };
 }
 
-export function updateClubTableId(clubTableId: number, runtimeTableId: string): void {
-  const d = getDB();
-  d.prepare('UPDATE club_tables SET tableId = ? WHERE id = ?').run(runtimeTableId, clubTableId);
+export async function updateClubTableId(clubTableId: number, runtimeTableId: string): Promise<void> {
+  const pool = getPool();
+  await pool.query('UPDATE club_tables SET tableId = $1 WHERE id = $2', [runtimeTableId, clubTableId]);
 }
 
-export function removeClubTable(clubTableId: number): void {
-  const d = getDB();
-  d.prepare('UPDATE club_tables SET isActive = 0 WHERE id = ?').run(clubTableId);
+export async function removeClubTable(clubTableId: number): Promise<void> {
+  const pool = getPool();
+  await pool.query('UPDATE club_tables SET isActive = 0 WHERE id = $1', [clubTableId]);
 }
 
-export function updateClubSettings(
+export async function updateClubSettings(
   ownerId: number,
   clubId: number,
   newSettings: Partial<ClubSettings> & { name?: string; description?: string }
-): { success: boolean; error?: string; club?: ClubInfo } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; club?: ClubInfo }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
   if (club.ownerId !== ownerId) {
     return { success: false, error: 'Only the club owner can update settings' };
   }
 
-  const d = getDB();
+  const pool = getPool();
   const updatedSettings: ClubSettings = {
     rake: newSettings.rake ?? club.settings.rake,
     maxMembers: newSettings.maxMembers ?? club.settings.maxMembers,
@@ -903,11 +917,12 @@ export function updateClubSettings(
   const updatedName = newSettings.name?.trim() || club.name;
   const updatedDesc = newSettings.description !== undefined ? newSettings.description.trim() : club.description;
 
-  d.prepare(
-    'UPDATE clubs SET name = ?, description = ?, settings = ? WHERE id = ?'
-  ).run(updatedName, updatedDesc, JSON.stringify(updatedSettings), clubId);
+  await pool.query(
+    'UPDATE clubs SET name = $1, description = $2, settings = $3 WHERE id = $4',
+    [updatedName, updatedDesc, JSON.stringify(updatedSettings), clubId]
+  );
 
-  const memberCount = (d.prepare('SELECT COUNT(*) as cnt FROM club_members WHERE clubId = ? AND status = ?').get(clubId, 'active') as any).cnt;
+  const memberCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND status = $2', [clubId, 'active'])).rows[0] as any).cnt;
 
   return {
     success: true,
@@ -917,7 +932,7 @@ export function updateClubSettings(
       name: updatedName,
       description: updatedDesc,
       ownerId,
-      ownerName: getUsername(ownerId),
+      ownerName: await getUsername(ownerId),
       settings: updatedSettings,
       memberCount,
       createdAt: club.createdAt,
@@ -925,98 +940,100 @@ export function updateClubSettings(
   };
 }
 
-export function deleteClub(
+export async function deleteClub(
   ownerId: number,
   clubId: number
-): { success: boolean; error?: string } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
   if (club.ownerId !== ownerId) {
     return { success: false, error: 'Only the club owner can delete the club' };
   }
 
-  const d = getDB();
-  d.prepare('DELETE FROM club_members WHERE clubId = ?').run(clubId);
-  d.prepare('DELETE FROM club_tables WHERE clubId = ?').run(clubId);
-  d.prepare('DELETE FROM clubs WHERE id = ?').run(clubId);
+  const pool = getPool();
+  await pool.query('DELETE FROM club_members WHERE clubId = $1', [clubId]);
+  await pool.query('DELETE FROM club_tables WHERE clubId = $1', [clubId]);
+  await pool.query('DELETE FROM clubs WHERE id = $1', [clubId]);
 
   return { success: true };
 }
 
-export function searchClubs(
+export async function searchClubs(
   query: string
-): { success: boolean; clubs: ClubInfo[] } {
-  const d = getDB();
-  const rows = d.prepare(
+): Promise<{ success: boolean; clubs: ClubInfo[] }> {
+  const pool = getPool();
+  const rows = (await pool.query(
     `SELECT c.*,
-      (SELECT COUNT(*) FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount
+      (SELECT COUNT(*)::int FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount
      FROM clubs c
-     WHERE c.name LIKE ? AND json_extract(c.settings, '$.isPrivate') = 0
+     WHERE c.name ILIKE $1 AND (c.settings::jsonb ->> 'isPrivate') = 'false'
      ORDER BY memberCount DESC
-     LIMIT 20`
-  ).all(`%${query}%`) as any[];
+     LIMIT 20`,
+    [`%${query}%`]
+  )).rows as any[];
 
-  const clubs: ClubInfo[] = rows.map((r) => ({
+  const clubs: ClubInfo[] = await Promise.all(rows.map(async (r) => ({
     id: r.id,
-    clubCode: r.clubCode,
+    clubCode: r.clubcode,
     name: r.name,
     description: r.description,
-    ownerId: r.ownerId,
-    ownerName: getUsername(r.ownerId),
+    ownerId: r.ownerid,
+    ownerName: await getUsername(r.ownerid),
     settings: JSON.parse(r.settings || '{}'),
-    memberCount: r.memberCount,
-    createdAt: r.createdAt,
-  }));
+    memberCount: r.membercount,
+    createdAt: r.createdat,
+  })));
 
   return { success: true, clubs };
 }
 
-export function isClubMember(clubId: number, userId: number): boolean {
-  const role = getMemberRole(clubId, userId);
+export async function isClubMember(clubId: number, userId: number): Promise<boolean> {
+  const role = await getMemberRole(clubId, userId);
   return role !== null;
 }
 
-export function getClubTableById(clubTableId: number): ClubTable | null {
-  const d = getDB();
-  const row = d.prepare('SELECT * FROM club_tables WHERE id = ?').get(clubTableId) as any;
+export async function getClubTableById(clubTableId: number): Promise<ClubTable | null> {
+  const pool = getPool();
+  const row = (await pool.query('SELECT * FROM club_tables WHERE id = $1', [clubTableId])).rows[0] as any;
   if (!row) return null;
   return {
     id: row.id,
-    clubId: row.clubId,
-    tableName: row.tableName,
+    clubId: row.clubid,
+    tableName: row.tablename,
     variant: row.variant,
-    smallBlind: row.smallBlind,
-    bigBlind: row.bigBlind,
-    minBuyIn: row.minBuyIn,
-    maxBuyIn: row.maxBuyIn,
-    maxSeats: row.maxSeats,
-    isActive: row.isActive === 1,
-    tableId: row.tableId || undefined,
+    smallBlind: row.smallblind,
+    bigBlind: row.bigblind,
+    minBuyIn: row.minbuyin,
+    maxBuyIn: row.maxbuyin,
+    maxSeats: row.maxseats,
+    isActive: row.isactive === 1,
+    tableId: row.tableid || undefined,
   };
 }
 
 // ========== Club Messages ==========
 
-export function sendClubMessage(
+export async function sendClubMessage(
   clubId: number,
   userId: number,
   username: string,
   message: string,
   type: 'chat' | 'announcement' | 'system' = 'chat'
-): { success: boolean; error?: string; message?: ClubMessage } {
+): Promise<{ success: boolean; error?: string; message?: ClubMessage }> {
   if (!message || message.trim().length === 0) {
     return { success: false, error: 'Message cannot be empty' };
   }
 
-  const d = getDB();
+  const pool = getPool();
   try {
     const isPinned = type === 'announcement' ? 1 : 0;
-    const result = d.prepare(
-      'INSERT INTO club_messages (clubId, userId, username, message, type, isPinned) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(clubId, userId, username, message.trim(), type, isPinned);
+    const result = await pool.query(
+      'INSERT INTO club_messages (clubId, userId, username, message, type, isPinned) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [clubId, userId, username, message.trim(), type, isPinned]
+    );
 
     const msg: ClubMessage = {
-      id: result.lastInsertRowid as number,
+      id: result.rows[0].id as number,
       clubId,
       userId,
       username,
@@ -1033,74 +1050,78 @@ export function sendClubMessage(
   }
 }
 
-export function getClubMessages(
+export async function getClubMessages(
   clubId: number,
   limit: number = 50
-): { success: boolean; messages: ClubMessage[] } {
-  const d = getDB();
-  const rows = d.prepare(
-    'SELECT * FROM club_messages WHERE clubId = ? ORDER BY createdAt DESC LIMIT ?'
-  ).all(clubId, limit) as any[];
+): Promise<{ success: boolean; messages: ClubMessage[] }> {
+  const pool = getPool();
+  const rows = (await pool.query(
+    'SELECT * FROM club_messages WHERE clubId = $1 ORDER BY createdAt DESC LIMIT $2',
+    [clubId, limit]
+  )).rows as any[];
 
   const messages: ClubMessage[] = rows.reverse().map((r) => ({
     id: r.id,
-    clubId: r.clubId,
-    userId: r.userId,
+    clubId: r.clubid,
+    userId: r.userid,
     username: r.username,
     message: r.message,
     type: r.type,
-    isPinned: r.isPinned,
-    createdAt: r.createdAt,
+    isPinned: r.ispinned,
+    createdAt: r.createdat,
   }));
 
   return { success: true, messages };
 }
 
-export function pinMessage(
+export async function pinMessage(
   clubId: number,
   messageId: number
-): { success: boolean; error?: string } {
-  const d = getDB();
-  const result = d.prepare(
-    'UPDATE club_messages SET isPinned = 1 WHERE id = ? AND clubId = ?'
-  ).run(messageId, clubId);
-  if (result.changes === 0) {
+): Promise<{ success: boolean; error?: string }> {
+  const pool = getPool();
+  const result = await pool.query(
+    'UPDATE club_messages SET isPinned = 1 WHERE id = $1 AND clubId = $2',
+    [messageId, clubId]
+  );
+  if (result.rowCount === 0) {
     return { success: false, error: 'Message not found' };
   }
   return { success: true };
 }
 
-export function unpinMessage(
+export async function unpinMessage(
   clubId: number,
   messageId: number
-): { success: boolean; error?: string } {
-  const d = getDB();
-  const result = d.prepare(
-    'UPDATE club_messages SET isPinned = 0 WHERE id = ? AND clubId = ?'
-  ).run(messageId, clubId);
-  if (result.changes === 0) {
+): Promise<{ success: boolean; error?: string }> {
+  const pool = getPool();
+  const result = await pool.query(
+    'UPDATE club_messages SET isPinned = 0 WHERE id = $1 AND clubId = $2',
+    [messageId, clubId]
+  );
+  if (result.rowCount === 0) {
     return { success: false, error: 'Message not found' };
   }
   return { success: true };
 }
 
-export function getAnnouncements(
+export async function getAnnouncements(
   clubId: number
-): { success: boolean; announcements: ClubMessage[] } {
-  const d = getDB();
-  const rows = d.prepare(
-    "SELECT * FROM club_messages WHERE clubId = ? AND (type = 'announcement' OR isPinned = 1) ORDER BY createdAt DESC LIMIT 10"
-  ).all(clubId) as any[];
+): Promise<{ success: boolean; announcements: ClubMessage[] }> {
+  const pool = getPool();
+  const rows = (await pool.query(
+    "SELECT * FROM club_messages WHERE clubId = $1 AND (type = 'announcement' OR isPinned = 1) ORDER BY createdAt DESC LIMIT 10",
+    [clubId]
+  )).rows as any[];
 
   const announcements: ClubMessage[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
-    userId: r.userId,
+    clubId: r.clubid,
+    userId: r.userid,
     username: r.username,
     message: r.message,
     type: r.type,
-    isPinned: r.isPinned,
-    createdAt: r.createdAt,
+    isPinned: r.ispinned,
+    createdAt: r.createdat,
   }));
 
   return { success: true, announcements };
@@ -1108,87 +1129,92 @@ export function getAnnouncements(
 
 // ========== Club Stats / Leaderboard ==========
 
-export function updateClubStats(
+export async function updateClubStats(
   clubId: number,
   userId: number,
   data: { handsPlayed?: number; chipsWon?: number; chipsLost?: number; biggestPot?: number; tournamentsWon?: number }
-): { success: boolean } {
-  const d = getDB();
-  const username = getUsername(userId);
+): Promise<{ success: boolean }> {
+  const pool = getPool();
+  const username = await getUsername(userId);
 
-  const existing = d.prepare('SELECT * FROM club_stats WHERE clubId = ? AND userId = ?').get(clubId, userId) as any;
+  const existing = (await pool.query('SELECT * FROM club_stats WHERE clubId = $1 AND userId = $2', [clubId, userId])).rows[0] as any;
 
   if (!existing) {
-    d.prepare(
-      'INSERT INTO club_stats (clubId, userId, username, handsPlayed, chipsWon, chipsLost, biggestPot, tournamentsWon) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-    ).run(clubId, userId, username, data.handsPlayed || 0, data.chipsWon || 0, data.chipsLost || 0, data.biggestPot || 0, data.tournamentsWon || 0);
+    await pool.query(
+      'INSERT INTO club_stats (clubId, userId, username, handsPlayed, chipsWon, chipsLost, biggestPot, tournamentsWon) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
+      [clubId, userId, username, data.handsPlayed || 0, data.chipsWon || 0, data.chipsLost || 0, data.biggestPot || 0, data.tournamentsWon || 0]
+    );
   } else {
-    const hp = (existing.handsPlayed || 0) + (data.handsPlayed || 0);
-    const cw = (existing.chipsWon || 0) + (data.chipsWon || 0);
-    const cl = (existing.chipsLost || 0) + (data.chipsLost || 0);
-    const bp = Math.max(existing.biggestPot || 0, data.biggestPot || 0);
-    const tw = (existing.tournamentsWon || 0) + (data.tournamentsWon || 0);
+    const hp = (existing.handsplayed || 0) + (data.handsPlayed || 0);
+    const cw = (existing.chipswon || 0) + (data.chipsWon || 0);
+    const cl = (existing.chipslost || 0) + (data.chipsLost || 0);
+    const bp = Math.max(existing.biggestpot || 0, data.biggestPot || 0);
+    const tw = (existing.tournamentswon || 0) + (data.tournamentsWon || 0);
 
-    d.prepare(
-      "UPDATE club_stats SET handsPlayed = ?, chipsWon = ?, chipsLost = ?, biggestPot = ?, tournamentsWon = ?, username = ?, updatedAt = datetime('now') WHERE clubId = ? AND userId = ?"
-    ).run(hp, cw, cl, bp, tw, username, clubId, userId);
+    await pool.query(
+      "UPDATE club_stats SET handsPlayed = $1, chipsWon = $2, chipsLost = $3, biggestPot = $4, tournamentsWon = $5, username = $6, updatedAt = now() WHERE clubId = $7 AND userId = $8",
+      [hp, cw, cl, bp, tw, username, clubId, userId]
+    );
   }
 
   return { success: true };
 }
 
-export function getClubLeaderboard(
+export async function getClubLeaderboard(
   clubId: number,
   period: 'today' | 'week' | 'alltime' = 'alltime'
-): { success: boolean; leaderboard: ClubStat[] } {
-  const d = getDB();
+): Promise<{ success: boolean; leaderboard: ClubStat[] }> {
+  const pool = getPool();
 
   // For simplicity, alltime uses club_stats directly.
   // period filtering would require per-hand timestamped data; approximate with updatedAt
   let dateFilter = '';
   if (period === 'today') {
-    dateFilter = "AND updatedAt >= datetime('now', '-1 day')";
+    dateFilter = "AND updatedAt >= now() - interval '1 day'";
   } else if (period === 'week') {
-    dateFilter = "AND updatedAt >= datetime('now', '-7 days')";
+    dateFilter = "AND updatedAt >= now() - interval '7 days'";
   }
 
-  const rows = d.prepare(
-    `SELECT * FROM club_stats WHERE clubId = ? ${dateFilter} ORDER BY chipsWon DESC LIMIT 50`
-  ).all(clubId) as any[];
+  const rows = (await pool.query(
+    `SELECT * FROM club_stats WHERE clubId = $1 ${dateFilter} ORDER BY chipsWon DESC LIMIT 50`,
+    [clubId]
+  )).rows as any[];
 
   const leaderboard: ClubStat[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
-    userId: r.userId,
+    clubId: r.clubid,
+    userId: r.userid,
     username: r.username,
-    handsPlayed: r.handsPlayed,
-    chipsWon: r.chipsWon,
-    chipsLost: r.chipsLost,
-    biggestPot: r.biggestPot,
-    tournamentsWon: r.tournamentsWon,
-    updatedAt: r.updatedAt,
+    handsPlayed: r.handsplayed,
+    chipsWon: r.chipswon,
+    chipsLost: r.chipslost,
+    biggestPot: r.biggestpot,
+    tournamentsWon: r.tournamentswon,
+    updatedAt: r.updatedat,
   }));
 
   return { success: true, leaderboard };
 }
 
-export function getClubStatistics(
+export async function getClubStatistics(
   clubId: number
-): { success: boolean; statistics: { totalMembers: number; totalHandsPlayed: number; biggestPotEver: number; mostActivePlayer: string; clubAge: string } } {
-  const d = getDB();
+): Promise<{ success: boolean; statistics: { totalMembers: number; totalHandsPlayed: number; biggestPotEver: number; mostActivePlayer: string; clubAge: string } }> {
+  const pool = getPool();
 
-  const totalMembers = (d.prepare('SELECT COUNT(*) as cnt FROM club_members WHERE clubId = ? AND status = ?').get(clubId, 'active') as any).cnt;
+  const totalMembers = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND status = $2', [clubId, 'active'])).rows[0] as any).cnt;
 
-  const statsAgg = d.prepare(
-    'SELECT COALESCE(SUM(handsPlayed), 0) as totalHands, COALESCE(MAX(biggestPot), 0) as bigPot FROM club_stats WHERE clubId = ?'
-  ).get(clubId) as any;
+  const statsAgg = (await pool.query(
+    'SELECT COALESCE(SUM(handsPlayed), 0)::int as totalHands, COALESCE(MAX(biggestPot), 0)::int as bigPot FROM club_stats WHERE clubId = $1',
+    [clubId]
+  )).rows[0] as any;
 
-  const mostActive = d.prepare(
-    'SELECT username FROM club_stats WHERE clubId = ? ORDER BY handsPlayed DESC LIMIT 1'
-  ).get(clubId) as any;
+  const mostActive = (await pool.query(
+    'SELECT username FROM club_stats WHERE clubId = $1 ORDER BY handsPlayed DESC LIMIT 1',
+    [clubId]
+  )).rows[0] as any;
 
-  const club = d.prepare('SELECT createdAt FROM clubs WHERE id = ?').get(clubId) as any;
-  const clubCreated = club?.createdAt || '';
+  const club = (await pool.query('SELECT createdAt FROM clubs WHERE id = $1', [clubId])).rows[0] as any;
+  const clubCreated = club?.createdat || '';
   let clubAge = 'Unknown';
   if (clubCreated) {
     const diff = Date.now() - new Date(clubCreated).getTime();
@@ -1200,8 +1226,8 @@ export function getClubStatistics(
     success: true,
     statistics: {
       totalMembers,
-      totalHandsPlayed: statsAgg.totalHands,
-      biggestPotEver: statsAgg.bigPot,
+      totalHandsPlayed: statsAgg.totalhands,
+      biggestPotEver: statsAgg.bigpot,
       mostActivePlayer: mostActive?.username || 'N/A',
       clubAge,
     },
@@ -1210,16 +1236,17 @@ export function getClubStatistics(
 
 // ========== Club Activity Feed ==========
 
-export function addActivity(
+export async function addActivity(
   clubId: number,
   type: 'member_join' | 'member_leave' | 'big_win' | 'tournament' | 'announcement',
   data: Record<string, any>
-): { success: boolean } {
-  const d = getDB();
+): Promise<{ success: boolean }> {
+  const pool = getPool();
   try {
-    d.prepare(
-      'INSERT INTO club_activity (clubId, type, data) VALUES (?, ?, ?)'
-    ).run(clubId, type, JSON.stringify(data));
+    await pool.query(
+      'INSERT INTO club_activity (clubId, type, data) VALUES ($1, $2, $3)',
+      [clubId, type, JSON.stringify(data)]
+    );
     return { success: true };
   } catch (err: any) {
     console.error('[Clubs] Add activity error:', err);
@@ -1227,21 +1254,22 @@ export function addActivity(
   }
 }
 
-export function getActivityFeed(
+export async function getActivityFeed(
   clubId: number,
   limit: number = 20
-): { success: boolean; activities: ClubActivityItem[] } {
-  const d = getDB();
-  const rows = d.prepare(
-    'SELECT * FROM club_activity WHERE clubId = ? ORDER BY createdAt DESC LIMIT ?'
-  ).all(clubId, limit) as any[];
+): Promise<{ success: boolean; activities: ClubActivityItem[] }> {
+  const pool = getPool();
+  const rows = (await pool.query(
+    'SELECT * FROM club_activity WHERE clubId = $1 ORDER BY createdAt DESC LIMIT $2',
+    [clubId, limit]
+  )).rows as any[];
 
   const activities: ClubActivityItem[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
+    clubId: r.clubid,
     type: r.type,
     data: r.data,
-    createdAt: r.createdAt,
+    createdAt: r.createdat,
   }));
 
   return { success: true, activities };
@@ -1249,7 +1277,7 @@ export function getActivityFeed(
 
 // ========== Club Tournaments ==========
 
-export function createClubTournament(
+export async function createClubTournament(
   clubId: number,
   managerId: number,
   config: {
@@ -1261,8 +1289,8 @@ export function createClubTournament(
     maxPlayers?: number;
     scheduledAt: string;
   }
-): { success: boolean; error?: string; tournament?: ClubTournament } {
-  const role = getMemberRole(clubId, managerId);
+): Promise<{ success: boolean; error?: string; tournament?: ClubTournament }> {
+  const role = await getMemberRole(clubId, managerId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can create tournaments' };
   }
@@ -1270,7 +1298,7 @@ export function createClubTournament(
     return { success: false, error: 'Tournament name must be at least 2 characters' };
   }
 
-  const d = getDB();
+  const pool = getPool();
   const format = config.format || 'freezeout';
   const blindStructure = config.blindStructure || [
     { level: 1, smallBlind: 25, bigBlind: 50, ante: 0, duration: 15 },
@@ -1282,13 +1310,14 @@ export function createClubTournament(
   const maxPlayers = Math.min(200, Math.max(2, config.maxPlayers || 20));
 
   try {
-    const result = d.prepare(
+    const result = await pool.query(
       `INSERT INTO club_tournaments (clubId, name, format, blindStructure, buyIn, startingChips, maxPlayers, status, scheduledAt, createdBy)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'registering', ?, ?)`
-    ).run(clubId, config.name.trim(), format, JSON.stringify(blindStructure), buyIn, startingChips, maxPlayers, config.scheduledAt, managerId);
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'registering', $8, $9) RETURNING id`,
+      [clubId, config.name.trim(), format, JSON.stringify(blindStructure), buyIn, startingChips, maxPlayers, config.scheduledAt, managerId]
+    );
 
     const tournament: ClubTournament = {
-      id: result.lastInsertRowid as number,
+      id: result.rows[0].id as number,
       clubId,
       name: config.name.trim(),
       format,
@@ -1310,78 +1339,79 @@ export function createClubTournament(
   }
 }
 
-export function getClubTournaments(
+export async function getClubTournaments(
   clubId: number
-): { success: boolean; error?: string; tournaments?: ClubTournament[] } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; tournaments?: ClubTournament[] }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
 
-  const d = getDB();
-  const rows = d.prepare(
+  const pool = getPool();
+  const rows = (await pool.query(
     `SELECT ct.*,
-      (SELECT COUNT(*) FROM club_tournament_registrations WHERE tournamentId = ct.id) as registeredCount
+      (SELECT COUNT(*)::int FROM club_tournament_registrations WHERE tournamentId = ct.id) as registeredCount
      FROM club_tournaments ct
-     WHERE ct.clubId = ?
-     ORDER BY ct.scheduledAt DESC`
-  ).all(clubId) as any[];
+     WHERE ct.clubId = $1
+     ORDER BY ct.scheduledAt DESC`,
+    [clubId]
+  )).rows as any[];
 
   const tournaments: ClubTournament[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
+    clubId: r.clubid,
     name: r.name,
     format: r.format,
-    blindStructure: JSON.parse(r.blindStructure || '[]'),
-    buyIn: r.buyIn,
-    startingChips: r.startingChips,
-    maxPlayers: r.maxPlayers,
+    blindStructure: JSON.parse(r.blindstructure || '[]'),
+    buyIn: r.buyin,
+    startingChips: r.startingchips,
+    maxPlayers: r.maxplayers,
     status: r.status,
-    scheduledAt: r.scheduledAt,
-    startedAt: r.startedAt,
-    createdBy: r.createdBy,
-    registeredCount: r.registeredCount || 0,
+    scheduledAt: r.scheduledat,
+    startedAt: r.startedat,
+    createdBy: r.createdby,
+    registeredCount: r.registeredcount || 0,
   }));
 
   return { success: true, tournaments };
 }
 
-export function registerForClubTournament(
+export async function registerForClubTournament(
   tournamentId: number,
   userId: number
-): { success: boolean; error?: string; registered?: boolean } {
-  const d = getDB();
-  const tourney = d.prepare('SELECT * FROM club_tournaments WHERE id = ?').get(tournamentId) as any;
+): Promise<{ success: boolean; error?: string; registered?: boolean }> {
+  const pool = getPool();
+  const tourney = (await pool.query('SELECT * FROM club_tournaments WHERE id = $1', [tournamentId])).rows[0] as any;
   if (!tourney) return { success: false, error: 'Tournament not found' };
   if (tourney.status !== 'registering') return { success: false, error: 'Tournament is not accepting registrations' };
 
-  if (!isClubMember(tourney.clubId, userId)) {
+  if (!(await isClubMember(tourney.clubid, userId))) {
     return { success: false, error: 'You must be a club member to register' };
   }
 
-  const regCount = (d.prepare('SELECT COUNT(*) as cnt FROM club_tournament_registrations WHERE tournamentId = ?').get(tournamentId) as any).cnt;
-  if (regCount >= tourney.maxPlayers) {
+  const regCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_tournament_registrations WHERE tournamentId = $1', [tournamentId])).rows[0] as any).cnt;
+  if (regCount >= tourney.maxplayers) {
     return { success: false, error: 'Tournament is full' };
   }
 
-  const existing = d.prepare('SELECT id FROM club_tournament_registrations WHERE tournamentId = ? AND userId = ?').get(tournamentId, userId);
+  const existing = (await pool.query('SELECT id FROM club_tournament_registrations WHERE tournamentId = $1 AND userId = $2', [tournamentId, userId])).rows[0];
   if (existing) {
     // Unregister
-    d.prepare('DELETE FROM club_tournament_registrations WHERE tournamentId = ? AND userId = ?').run(tournamentId, userId);
+    await pool.query('DELETE FROM club_tournament_registrations WHERE tournamentId = $1 AND userId = $2', [tournamentId, userId]);
     return { success: true, registered: false };
   }
 
-  d.prepare('INSERT INTO club_tournament_registrations (tournamentId, userId) VALUES (?, ?)').run(tournamentId, userId);
+  await pool.query('INSERT INTO club_tournament_registrations (tournamentId, userId) VALUES ($1, $2)', [tournamentId, userId]);
   return { success: true, registered: true };
 }
 
-export function startClubTournament(
+export async function startClubTournament(
   tournamentId: number,
   userId: number
-): { success: boolean; error?: string } {
-  const d = getDB();
-  const tourney = d.prepare('SELECT * FROM club_tournaments WHERE id = ?').get(tournamentId) as any;
+): Promise<{ success: boolean; error?: string }> {
+  const pool = getPool();
+  const tourney = (await pool.query('SELECT * FROM club_tournaments WHERE id = $1', [tournamentId])).rows[0] as any;
   if (!tourney) return { success: false, error: 'Tournament not found' };
 
-  const role = getMemberRole(tourney.clubId, userId);
+  const role = await getMemberRole(tourney.clubid, userId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can start tournaments' };
   }
@@ -1389,40 +1419,41 @@ export function startClubTournament(
     return { success: false, error: 'Tournament cannot be started in current state' };
   }
 
-  d.prepare('UPDATE club_tournaments SET status = ?, startedAt = datetime(\'now\') WHERE id = ?').run('running', tournamentId);
+  await pool.query("UPDATE club_tournaments SET status = $1, startedAt = now() WHERE id = $2", ['running', tournamentId]);
   return { success: true };
 }
 
 // ========== Club Challenges ==========
 
-export function createChallenge(
+export async function createChallenge(
   clubId: number,
   challengerId: number,
   challengedId: number,
   stakes: number
-): { success: boolean; error?: string; challenge?: ClubChallenge } {
-  if (!isClubMember(clubId, challengerId)) {
+): Promise<{ success: boolean; error?: string; challenge?: ClubChallenge }> {
+  if (!(await isClubMember(clubId, challengerId))) {
     return { success: false, error: 'You must be a club member' };
   }
-  if (!isClubMember(clubId, challengedId)) {
+  if (!(await isClubMember(clubId, challengedId))) {
     return { success: false, error: 'Challenged player is not a club member' };
   }
   if (challengerId === challengedId) {
     return { success: false, error: 'You cannot challenge yourself' };
   }
 
-  const d = getDB();
-  const challengerName = getUsername(challengerId);
-  const challengedName = getUsername(challengedId);
+  const pool = getPool();
+  const challengerName = await getUsername(challengerId);
+  const challengedName = await getUsername(challengedId);
 
   try {
-    const result = d.prepare(
+    const result = await pool.query(
       `INSERT INTO club_challenges (clubId, challengerId, challengerName, challengedId, challengedName, stakes, status)
-       VALUES (?, ?, ?, ?, ?, ?, 'pending')`
-    ).run(clubId, challengerId, challengerName, challengedId, challengedName, stakes || 0);
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending') RETURNING id`,
+      [clubId, challengerId, challengerName, challengedId, challengedName, stakes || 0]
+    );
 
     const challenge: ClubChallenge = {
-      id: result.lastInsertRowid as number,
+      id: result.rows[0].id as number,
       clubId,
       challengerId,
       challengerName,
@@ -1441,58 +1472,59 @@ export function createChallenge(
   }
 }
 
-export function acceptChallenge(
+export async function acceptChallenge(
   challengeId: number,
   userId: number
-): { success: boolean; error?: string } {
-  const d = getDB();
-  const ch = d.prepare('SELECT * FROM club_challenges WHERE id = ?').get(challengeId) as any;
+): Promise<{ success: boolean; error?: string }> {
+  const pool = getPool();
+  const ch = (await pool.query('SELECT * FROM club_challenges WHERE id = $1', [challengeId])).rows[0] as any;
   if (!ch) return { success: false, error: 'Challenge not found' };
-  if (ch.challengedId !== userId) return { success: false, error: 'Only the challenged player can accept' };
+  if (ch.challengedid !== userId) return { success: false, error: 'Only the challenged player can accept' };
   if (ch.status !== 'pending') return { success: false, error: 'Challenge is not pending' };
 
-  d.prepare('UPDATE club_challenges SET status = ? WHERE id = ?').run('accepted', challengeId);
+  await pool.query('UPDATE club_challenges SET status = $1 WHERE id = $2', ['accepted', challengeId]);
   return { success: true };
 }
 
-export function declineChallenge(
+export async function declineChallenge(
   challengeId: number,
   userId: number
-): { success: boolean; error?: string } {
-  const d = getDB();
-  const ch = d.prepare('SELECT * FROM club_challenges WHERE id = ?').get(challengeId) as any;
+): Promise<{ success: boolean; error?: string }> {
+  const pool = getPool();
+  const ch = (await pool.query('SELECT * FROM club_challenges WHERE id = $1', [challengeId])).rows[0] as any;
   if (!ch) return { success: false, error: 'Challenge not found' };
-  if (ch.challengedId !== userId && ch.challengerId !== userId) {
+  if (ch.challengedid !== userId && ch.challengerid !== userId) {
     return { success: false, error: 'Only participants can decline/cancel a challenge' };
   }
   if (ch.status !== 'pending') return { success: false, error: 'Challenge is not pending' };
 
-  d.prepare('DELETE FROM club_challenges WHERE id = ?').run(challengeId);
+  await pool.query('DELETE FROM club_challenges WHERE id = $1', [challengeId]);
   return { success: true };
 }
 
-export function getClubChallenges(
+export async function getClubChallenges(
   clubId: number
-): { success: boolean; error?: string; challenges?: ClubChallenge[] } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; challenges?: ClubChallenge[] }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
 
-  const d = getDB();
-  const rows = d.prepare(
-    'SELECT * FROM club_challenges WHERE clubId = ? ORDER BY createdAt DESC LIMIT 50'
-  ).all(clubId) as any[];
+  const pool = getPool();
+  const rows = (await pool.query(
+    'SELECT * FROM club_challenges WHERE clubId = $1 ORDER BY createdAt DESC LIMIT 50',
+    [clubId]
+  )).rows as any[];
 
   const challenges: ClubChallenge[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
-    challengerId: r.challengerId,
-    challengerName: r.challengerName,
-    challengedId: r.challengedId,
-    challengedName: r.challengedName,
+    clubId: r.clubid,
+    challengerId: r.challengerid,
+    challengerName: r.challengername,
+    challengedId: r.challengedid,
+    challengedName: r.challengedname,
     stakes: r.stakes,
     status: r.status,
-    winnerId: r.winnerId,
-    createdAt: r.createdAt,
+    winnerId: r.winnerid,
+    createdAt: r.createdat,
   }));
 
   return { success: true, challenges };
@@ -1500,28 +1532,29 @@ export function getClubChallenges(
 
 // ========== Table Scheduling ==========
 
-export function scheduleTable(
+export async function scheduleTable(
   clubId: number,
   managerId: number,
   config: any,
   time: string,
   recurring: boolean,
   recurrencePattern?: string
-): { success: boolean; error?: string; scheduledTable?: ScheduledTable } {
-  const role = getMemberRole(clubId, managerId);
+): Promise<{ success: boolean; error?: string; scheduledTable?: ScheduledTable }> {
+  const role = await getMemberRole(clubId, managerId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can schedule tables' };
   }
 
-  const d = getDB();
+  const pool = getPool();
   try {
-    const result = d.prepare(
+    const result = await pool.query(
       `INSERT INTO scheduled_tables (clubId, tableConfig, scheduledTime, recurring, recurrencePattern, status, createdBy)
-       VALUES (?, ?, ?, ?, ?, 'scheduled', ?)`
-    ).run(clubId, JSON.stringify(config), time, recurring ? 1 : 0, recurrencePattern || null, managerId);
+       VALUES ($1, $2, $3, $4, $5, 'scheduled', $6) RETURNING id`,
+      [clubId, JSON.stringify(config), time, recurring ? 1 : 0, recurrencePattern || null, managerId]
+    );
 
     const st: ScheduledTable = {
-      id: result.lastInsertRowid as number,
+      id: result.rows[0].id as number,
       clubId,
       tableConfig: JSON.stringify(config),
       scheduledTime: time,
@@ -1538,75 +1571,76 @@ export function scheduleTable(
   }
 }
 
-export function getScheduledTables(
+export async function getScheduledTables(
   clubId: number
-): { success: boolean; error?: string; scheduledTables?: ScheduledTable[] } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; scheduledTables?: ScheduledTable[] }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
 
-  const d = getDB();
-  const rows = d.prepare(
-    'SELECT * FROM scheduled_tables WHERE clubId = ? AND status != ? ORDER BY scheduledTime ASC'
-  ).all(clubId, 'completed') as any[];
+  const pool = getPool();
+  const rows = (await pool.query(
+    'SELECT * FROM scheduled_tables WHERE clubId = $1 AND status != $2 ORDER BY scheduledTime ASC',
+    [clubId, 'completed']
+  )).rows as any[];
 
   const scheduledTables: ScheduledTable[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
-    tableConfig: r.tableConfig,
-    scheduledTime: r.scheduledTime,
+    clubId: r.clubid,
+    tableConfig: r.tableconfig,
+    scheduledTime: r.scheduledtime,
     recurring: r.recurring === 1,
-    recurrencePattern: r.recurrencePattern,
+    recurrencePattern: r.recurrencepattern,
     status: r.status,
-    createdBy: r.createdBy,
+    createdBy: r.createdby,
   }));
 
   return { success: true, scheduledTables };
 }
 
-export function activateScheduledTable(
+export async function activateScheduledTable(
   id: number,
   userId: number
-): { success: boolean; error?: string; tableConfig?: any } {
-  const d = getDB();
-  const row = d.prepare('SELECT * FROM scheduled_tables WHERE id = ?').get(id) as any;
+): Promise<{ success: boolean; error?: string; tableConfig?: any }> {
+  const pool = getPool();
+  const row = (await pool.query('SELECT * FROM scheduled_tables WHERE id = $1', [id])).rows[0] as any;
   if (!row) return { success: false, error: 'Scheduled table not found' };
 
-  const role = getMemberRole(row.clubId, userId);
+  const role = await getMemberRole(row.clubid, userId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can activate scheduled tables' };
   }
 
-  d.prepare('UPDATE scheduled_tables SET status = ? WHERE id = ?').run('active', id);
+  await pool.query('UPDATE scheduled_tables SET status = $1 WHERE id = $2', ['active', id]);
 
-  return { success: true, tableConfig: JSON.parse(row.tableConfig || '{}') };
+  return { success: true, tableConfig: JSON.parse(row.tableconfig || '{}') };
 }
 
-export function deleteScheduledTable(
+export async function deleteScheduledTable(
   id: number,
   userId: number
-): { success: boolean; error?: string } {
-  const d = getDB();
-  const row = d.prepare('SELECT * FROM scheduled_tables WHERE id = ?').get(id) as any;
+): Promise<{ success: boolean; error?: string }> {
+  const pool = getPool();
+  const row = (await pool.query('SELECT * FROM scheduled_tables WHERE id = $1', [id])).rows[0] as any;
   if (!row) return { success: false, error: 'Scheduled table not found' };
 
-  const role = getMemberRole(row.clubId, userId);
+  const role = await getMemberRole(row.clubid, userId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can delete scheduled tables' };
   }
 
-  d.prepare('DELETE FROM scheduled_tables WHERE id = ?').run(id);
+  await pool.query('DELETE FROM scheduled_tables WHERE id = $1', [id]);
   return { success: true };
 }
 
 // ========== Custom Blind Structures ==========
 
-export function createBlindStructure(
+export async function createBlindStructure(
   clubId: number,
   managerId: number,
   name: string,
   levels: BlindLevel[]
-): { success: boolean; error?: string; structure?: BlindStructure } {
-  const role = getMemberRole(clubId, managerId);
+): Promise<{ success: boolean; error?: string; structure?: BlindStructure }> {
+  const role = await getMemberRole(clubId, managerId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can create blind structures' };
   }
@@ -1617,14 +1651,15 @@ export function createBlindStructure(
     return { success: false, error: 'At least one blind level is required' };
   }
 
-  const d = getDB();
+  const pool = getPool();
   try {
-    const result = d.prepare(
-      'INSERT INTO blind_structures (clubId, name, levels, createdBy) VALUES (?, ?, ?, ?)'
-    ).run(clubId, name.trim(), JSON.stringify(levels), managerId);
+    const result = await pool.query(
+      'INSERT INTO blind_structures (clubId, name, levels, createdBy) VALUES ($1, $2, $3, $4) RETURNING id',
+      [clubId, name.trim(), JSON.stringify(levels), managerId]
+    );
 
     const structure: BlindStructure = {
-      id: result.lastInsertRowid as number,
+      id: result.rows[0].id as number,
       clubId,
       name: name.trim(),
       levels,
@@ -1638,42 +1673,43 @@ export function createBlindStructure(
   }
 }
 
-export function getBlindStructures(
+export async function getBlindStructures(
   clubId: number
-): { success: boolean; error?: string; structures?: BlindStructure[] } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; structures?: BlindStructure[] }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
 
-  const d = getDB();
-  const rows = d.prepare(
-    'SELECT * FROM blind_structures WHERE clubId = ? ORDER BY id DESC'
-  ).all(clubId) as any[];
+  const pool = getPool();
+  const rows = (await pool.query(
+    'SELECT * FROM blind_structures WHERE clubId = $1 ORDER BY id DESC',
+    [clubId]
+  )).rows as any[];
 
   const structures: BlindStructure[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
+    clubId: r.clubid,
     name: r.name,
     levels: JSON.parse(r.levels || '[]'),
-    createdBy: r.createdBy,
+    createdBy: r.createdby,
   }));
 
   return { success: true, structures };
 }
 
-export function deleteBlindStructure(
+export async function deleteBlindStructure(
   id: number,
   userId: number
-): { success: boolean; error?: string } {
-  const d = getDB();
-  const row = d.prepare('SELECT * FROM blind_structures WHERE id = ?').get(id) as any;
+): Promise<{ success: boolean; error?: string }> {
+  const pool = getPool();
+  const row = (await pool.query('SELECT * FROM blind_structures WHERE id = $1', [id])).rows[0] as any;
   if (!row) return { success: false, error: 'Blind structure not found' };
 
-  const role = getMemberRole(row.clubId, userId);
+  const role = await getMemberRole(row.clubid, userId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can delete blind structures' };
   }
 
-  d.prepare('DELETE FROM blind_structures WHERE id = ?').run(id);
+  await pool.query('DELETE FROM blind_structures WHERE id = $1', [id]);
   return { success: true };
 }
 
@@ -1681,52 +1717,57 @@ export function deleteBlindStructure(
 // Feature 10: Club Invitations
 // ═══════════════════════════════════════════
 
-function getUserIdByUsername(username: string): number | null {
-  const d = getDB();
-  const row = d.prepare('SELECT id FROM users WHERE username = ?').get(username) as { id: number } | undefined;
+async function getUserIdByUsername(username: string): Promise<number | null> {
+  const pool = getPool();
+  const row = (await pool.query(
+    'SELECT id FROM users WHERE LOWER(username) = LOWER($1)',
+    [(username || '').trim()]
+  )).rows[0] as { id: number } | undefined;
   return row?.id || null;
 }
 
-export function inviteToClub(
+export async function inviteToClub(
   clubId: number,
   inviterId: number,
   inviterName: string,
   invitedUsername: string
-): { success: boolean; error?: string; invitation?: ClubInvitation } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; invitation?: ClubInvitation }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
 
-  const role = getMemberRole(clubId, inviterId);
+  const role = await getMemberRole(clubId, inviterId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can invite players' };
   }
 
-  const invitedUserId = getUserIdByUsername(invitedUsername);
+  const invitedUserId = await getUserIdByUsername(invitedUsername);
   if (!invitedUserId) {
     return { success: false, error: 'User not found' };
   }
 
-  if (isClubMember(clubId, invitedUserId)) {
+  if (await isClubMember(clubId, invitedUserId)) {
     return { success: false, error: 'User is already a member of this club' };
   }
 
-  const d = getDB();
-  const existing = d.prepare(
-    'SELECT id FROM club_invitations WHERE clubId = ? AND invitedUsername = ? AND status = ?'
-  ).get(clubId, invitedUsername, 'pending') as any;
+  const pool = getPool();
+  const existing = (await pool.query(
+    'SELECT id FROM club_invitations WHERE clubId = $1 AND invitedUsername = $2 AND status = $3',
+    [clubId, invitedUsername, 'pending']
+  )).rows[0] as any;
   if (existing) {
     return { success: false, error: 'An invitation is already pending for this user' };
   }
 
   try {
-    const result = d.prepare(
-      'INSERT INTO club_invitations (clubId, clubName, inviterId, inviterName, invitedUsername, status) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(clubId, club.name, inviterId, inviterName, invitedUsername, 'pending');
+    const result = await pool.query(
+      'INSERT INTO club_invitations (clubId, clubName, inviterId, inviterName, invitedUsername, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
+      [clubId, club.name, inviterId, inviterName, invitedUsername, 'pending']
+    );
 
     return {
       success: true,
       invitation: {
-        id: result.lastInsertRowid as number,
+        id: result.rows[0].id as number,
         clubId,
         clubName: club.name,
         inviterId,
@@ -1742,54 +1783,56 @@ export function inviteToClub(
   }
 }
 
-export function getMyInvitations(
+export async function getMyInvitations(
   userId: number
-): { success: boolean; invitations: ClubInvitation[] } {
-  const d = getDB();
-  const username = getUsername(userId);
-  const rows = d.prepare(
-    'SELECT * FROM club_invitations WHERE invitedUsername = ? AND status = ? ORDER BY createdAt DESC'
-  ).all(username, 'pending') as any[];
+): Promise<{ success: boolean; invitations: ClubInvitation[] }> {
+  const pool = getPool();
+  const username = await getUsername(userId);
+  const rows = (await pool.query(
+    'SELECT * FROM club_invitations WHERE invitedUsername = $1 AND status = $2 ORDER BY createdAt DESC',
+    [username, 'pending']
+  )).rows as any[];
 
   const invitations: ClubInvitation[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
-    clubName: r.clubName,
-    inviterId: r.inviterId,
-    inviterName: r.inviterName,
-    invitedUsername: r.invitedUsername,
+    clubId: r.clubid,
+    clubName: r.clubname,
+    inviterId: r.inviterid,
+    inviterName: r.invitername,
+    invitedUsername: r.invitedusername,
     status: r.status,
-    createdAt: r.createdAt,
+    createdAt: r.createdat,
   }));
 
   return { success: true, invitations };
 }
 
-export function acceptInvitation(
+export async function acceptInvitation(
   invitationId: number,
   userId: number
-): { success: boolean; error?: string; club?: ClubInfo } {
-  const d = getDB();
-  const username = getUsername(userId);
-  const inv = d.prepare('SELECT * FROM club_invitations WHERE id = ? AND invitedUsername = ? AND status = ?').get(invitationId, username, 'pending') as any;
+): Promise<{ success: boolean; error?: string; club?: ClubInfo }> {
+  const pool = getPool();
+  const username = await getUsername(userId);
+  const inv = (await pool.query('SELECT * FROM club_invitations WHERE id = $1 AND invitedUsername = $2 AND status = $3', [invitationId, username, 'pending'])).rows[0] as any;
   if (!inv) return { success: false, error: 'Invitation not found or already handled' };
 
-  const club = getClubById(inv.clubId);
+  const club = await getClubById(inv.clubid);
   if (!club) return { success: false, error: 'Club no longer exists' };
 
-  if (isClubMember(inv.clubId, userId)) {
-    d.prepare('UPDATE club_invitations SET status = ? WHERE id = ?').run('accepted', invitationId);
+  if (await isClubMember(inv.clubid, userId)) {
+    await pool.query('UPDATE club_invitations SET status = $1 WHERE id = $2', ['accepted', invitationId]);
     return { success: false, error: 'You are already a member of this club' };
   }
 
   try {
-    d.prepare(
-      'INSERT INTO club_members (clubId, userId, role, status) VALUES (?, ?, ?, ?)'
-    ).run(inv.clubId, userId, 'member', 'active');
-    d.prepare('UPDATE club_invitations SET status = ? WHERE id = ?').run('accepted', invitationId);
+    await pool.query(
+      'INSERT INTO club_members (clubId, userId, role, status) VALUES ($1, $2, $3, $4)',
+      [inv.clubid, userId, 'member', 'active']
+    );
+    await pool.query('UPDATE club_invitations SET status = $1 WHERE id = $2', ['accepted', invitationId]);
 
-    const memberCount = (d.prepare('SELECT COUNT(*) as cnt FROM club_members WHERE clubId = ? AND status = ?').get(inv.clubId, 'active') as any).cnt;
-    const rawRow = d.prepare('SELECT badge, clubXp, clubLevel FROM clubs WHERE id = ?').get(inv.clubId) as any;
+    const memberCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND status = $2', [inv.clubid, 'active'])).rows[0] as any).cnt;
+    const rawRow = (await pool.query('SELECT badge, clubXp, clubLevel FROM clubs WHERE id = $1', [inv.clubid])).rows[0] as any;
 
     return {
       success: true,
@@ -1799,13 +1842,13 @@ export function acceptInvitation(
         name: club.name,
         description: club.description,
         ownerId: club.ownerId,
-        ownerName: getUsername(club.ownerId),
+        ownerName: await getUsername(club.ownerId),
         settings: club.settings,
         memberCount,
         createdAt: club.createdAt,
         badge: rawRow?.badge || '♠',
-        clubLevel: rawRow?.clubLevel || 1,
-        clubXp: rawRow?.clubXp || 0,
+        clubLevel: rawRow?.clublevel || 1,
+        clubXp: rawRow?.clubxp || 0,
       },
     };
   } catch (err: any) {
@@ -1814,36 +1857,37 @@ export function acceptInvitation(
   }
 }
 
-export function declineInvitation(
+export async function declineInvitation(
   invitationId: number,
   userId: number
-): { success: boolean; error?: string } {
-  const d = getDB();
-  const username = getUsername(userId);
-  const result = d.prepare('UPDATE club_invitations SET status = ? WHERE id = ? AND invitedUsername = ? AND status = ?').run('declined', invitationId, username, 'pending');
-  if (result.changes === 0) {
+): Promise<{ success: boolean; error?: string }> {
+  const pool = getPool();
+  const username = await getUsername(userId);
+  const result = await pool.query('UPDATE club_invitations SET status = $1 WHERE id = $2 AND invitedUsername = $3 AND status = $4', ['declined', invitationId, username, 'pending']);
+  if (result.rowCount === 0) {
     return { success: false, error: 'Invitation not found or already handled' };
   }
   return { success: true };
 }
 
-export function getClubInvitations(
+export async function getClubInvitations(
   clubId: number
-): { success: boolean; invitations: ClubInvitation[] } {
-  const d = getDB();
-  const rows = d.prepare(
-    'SELECT * FROM club_invitations WHERE clubId = ? ORDER BY createdAt DESC LIMIT 50'
-  ).all(clubId) as any[];
+): Promise<{ success: boolean; invitations: ClubInvitation[] }> {
+  const pool = getPool();
+  const rows = (await pool.query(
+    'SELECT * FROM club_invitations WHERE clubId = $1 ORDER BY createdAt DESC LIMIT 50',
+    [clubId]
+  )).rows as any[];
 
   const invitations: ClubInvitation[] = rows.map((r) => ({
     id: r.id,
-    clubId: r.clubId,
-    clubName: r.clubName,
-    inviterId: r.inviterId,
-    inviterName: r.inviterName,
-    invitedUsername: r.invitedUsername,
+    clubId: r.clubid,
+    clubName: r.clubname,
+    inviterId: r.inviterid,
+    inviterName: r.invitername,
+    invitedUsername: r.invitedusername,
     status: r.status,
-    createdAt: r.createdAt,
+    createdAt: r.createdat,
   }));
 
   return { success: true, invitations };
@@ -1853,13 +1897,13 @@ export function getClubInvitations(
 // Feature 11: Club Unions (Alliance System)
 // ═══════════════════════════════════════════
 
-export function createUnion(
+export async function createUnion(
   clubId: number,
   userId: number,
   name: string,
   description: string
-): { success: boolean; error?: string; union?: ClubUnion } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string; union?: ClubUnion }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
   if (club.ownerId !== userId) {
     return { success: false, error: 'Only the club owner can create a union' };
@@ -1868,23 +1912,26 @@ export function createUnion(
     return { success: false, error: 'Union name must be at least 2 characters' };
   }
 
-  const d = getDB();
-  const existing = d.prepare(
-    'SELECT um.id FROM union_members um WHERE um.clubId = ? AND um.status = ?'
-  ).get(clubId, 'active') as any;
+  const pool = getPool();
+  const existing = (await pool.query(
+    'SELECT um.id FROM union_members um WHERE um.clubId = $1 AND um.status = $2',
+    [clubId, 'active']
+  )).rows[0] as any;
   if (existing) {
     return { success: false, error: 'Your club is already in a union' };
   }
 
   try {
-    const result = d.prepare(
-      'INSERT INTO club_unions (name, description, leaderClubId) VALUES (?, ?, ?)'
-    ).run(name.trim(), description?.trim() || '', clubId);
+    const result = await pool.query(
+      'INSERT INTO club_unions (name, description, leaderClubId) VALUES ($1, $2, $3) RETURNING id',
+      [name.trim(), description?.trim() || '', clubId]
+    );
 
-    const unionId = result.lastInsertRowid as number;
-    d.prepare(
-      'INSERT INTO union_members (unionId, clubId, status) VALUES (?, ?, ?)'
-    ).run(unionId, clubId, 'active');
+    const unionId = result.rows[0].id as number;
+    await pool.query(
+      'INSERT INTO union_members (unionId, clubId, status) VALUES ($1, $2, $3)',
+      [unionId, clubId, 'active']
+    );
 
     return {
       success: true,
@@ -1902,78 +1949,82 @@ export function createUnion(
   }
 }
 
-export function inviteToUnion(
+export async function inviteToUnion(
   unionId: number,
   inviterClubId: number,
   targetClubId: number,
   userId: number
-): { success: boolean; error?: string } {
-  const d = getDB();
-  const union = d.prepare('SELECT * FROM club_unions WHERE id = ?').get(unionId) as any;
+): Promise<{ success: boolean; error?: string }> {
+  const pool = getPool();
+  const union = (await pool.query('SELECT * FROM club_unions WHERE id = $1', [unionId])).rows[0] as any;
   if (!union) return { success: false, error: 'Union not found' };
-  if (union.leaderClubId !== inviterClubId) {
+  if (union.leaderclubid !== inviterClubId) {
     return { success: false, error: 'Only the leader club can invite others' };
   }
-  const club = getClubById(inviterClubId);
+  const club = await getClubById(inviterClubId);
   if (!club || club.ownerId !== userId) {
     return { success: false, error: 'Only the club owner can invite to the union' };
   }
 
-  const existing = d.prepare(
-    'SELECT id FROM union_members WHERE unionId = ? AND clubId = ?'
-  ).get(unionId, targetClubId) as any;
+  const existing = (await pool.query(
+    'SELECT id FROM union_members WHERE unionId = $1 AND clubId = $2',
+    [unionId, targetClubId]
+  )).rows[0] as any;
   if (existing) {
     return { success: false, error: 'Club is already in or invited to this union' };
   }
 
-  d.prepare('INSERT INTO union_members (unionId, clubId, status) VALUES (?, ?, ?)').run(unionId, targetClubId, 'pending');
+  await pool.query('INSERT INTO union_members (unionId, clubId, status) VALUES ($1, $2, $3)', [unionId, targetClubId, 'pending']);
   return { success: true };
 }
 
-export function joinUnion(
+export async function joinUnion(
   unionId: number,
   clubId: number,
   userId: number
-): { success: boolean; error?: string } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string }> {
+  const club = await getClubById(clubId);
   if (!club || club.ownerId !== userId) {
     return { success: false, error: 'Only the club owner can join a union' };
   }
 
-  const d = getDB();
-  const invite = d.prepare(
-    'SELECT id FROM union_members WHERE unionId = ? AND clubId = ? AND status = ?'
-  ).get(unionId, clubId, 'pending') as any;
+  const pool = getPool();
+  const invite = (await pool.query(
+    'SELECT id FROM union_members WHERE unionId = $1 AND clubId = $2 AND status = $3',
+    [unionId, clubId, 'pending']
+  )).rows[0] as any;
   if (!invite) {
     return { success: false, error: 'No pending union invitation found' };
   }
 
-  d.prepare('UPDATE union_members SET status = ? WHERE unionId = ? AND clubId = ?').run('active', unionId, clubId);
+  await pool.query('UPDATE union_members SET status = $1 WHERE unionId = $2 AND clubId = $3', ['active', unionId, clubId]);
   return { success: true };
 }
 
-export function getUnionInfo(
+export async function getUnionInfo(
   clubId: number
-): { success: boolean; union?: ClubUnion & { clubs: { clubId: number; clubName: string; memberCount: number; badge: string }[] } } {
-  const d = getDB();
-  const membership = d.prepare(
-    'SELECT unionId FROM union_members WHERE clubId = ? AND status = ?'
-  ).get(clubId, 'active') as any;
+): Promise<{ success: boolean; union?: ClubUnion & { clubs: { clubId: number; clubName: string; memberCount: number; badge: string }[] } }> {
+  const pool = getPool();
+  const membership = (await pool.query(
+    'SELECT unionId FROM union_members WHERE clubId = $1 AND status = $2',
+    [clubId, 'active']
+  )).rows[0] as any;
   if (!membership) {
     return { success: true };
   }
 
-  const union = d.prepare('SELECT * FROM club_unions WHERE id = ?').get(membership.unionId) as any;
+  const union = (await pool.query('SELECT * FROM club_unions WHERE id = $1', [membership.unionid])).rows[0] as any;
   if (!union) return { success: true };
 
-  const members = d.prepare(
+  const members = (await pool.query(
     `SELECT um.clubId, c.name as clubName, c.badge,
-      (SELECT COUNT(*) FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount
+      (SELECT COUNT(*)::int FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount
      FROM union_members um
      JOIN clubs c ON um.clubId = c.id
-     WHERE um.unionId = ? AND um.status = ?
-     ORDER BY um.joinedAt ASC`
-  ).all(union.id, 'active') as any[];
+     WHERE um.unionId = $1 AND um.status = $2
+     ORDER BY um.joinedAt ASC`,
+    [union.id, 'active']
+  )).rows as any[];
 
   return {
     success: true,
@@ -1981,12 +2032,12 @@ export function getUnionInfo(
       id: union.id,
       name: union.name,
       description: union.description,
-      leaderClubId: union.leaderClubId,
-      createdAt: union.createdAt,
+      leaderClubId: union.leaderclubid,
+      createdAt: union.createdat,
       clubs: members.map((m: any) => ({
-        clubId: m.clubId,
-        clubName: m.clubName,
-        memberCount: m.memberCount,
+        clubId: m.clubid,
+        clubName: m.clubname,
+        memberCount: m.membercount,
         badge: m.badge || '♠',
       })),
     },
@@ -1997,23 +2048,25 @@ export function getUnionInfo(
 // Feature 12: Member Profiles
 // ═══════════════════════════════════════════
 
-export function getMemberProfile(
+export async function getMemberProfile(
   clubId: number,
   targetUserId: number
-): { success: boolean; error?: string; profile?: MemberProfile } {
-  const d = getDB();
-  const member = d.prepare(
-    'SELECT cm.role, cm.joinedAt, u.username FROM club_members cm LEFT JOIN users u ON cm.userId = u.id WHERE cm.clubId = ? AND cm.userId = ? AND cm.status = ?'
-  ).get(clubId, targetUserId, 'active') as any;
+): Promise<{ success: boolean; error?: string; profile?: MemberProfile }> {
+  const pool = getPool();
+  const member = (await pool.query(
+    'SELECT cm.role, cm.joinedAt, COALESCE(u.display_name, u.username) AS username FROM club_members cm LEFT JOIN users u ON cm.userId = u.id WHERE cm.clubId = $1 AND cm.userId = $2 AND cm.status = $3',
+    [clubId, targetUserId, 'active']
+  )).rows[0] as any;
   if (!member) return { success: false, error: 'Member not found' };
 
-  const stats = d.prepare(
-    'SELECT handsPlayed, chipsWon, chipsLost, biggestPot FROM club_stats WHERE clubId = ? AND userId = ?'
-  ).get(clubId, targetUserId) as any;
+  const stats = (await pool.query(
+    'SELECT handsPlayed, chipsWon, chipsLost, biggestPot FROM club_stats WHERE clubId = $1 AND userId = $2',
+    [clubId, targetUserId]
+  )).rows[0] as any;
 
-  const handsPlayed = stats?.handsPlayed || 0;
-  const chipsWon = stats?.chipsWon || 0;
-  const chipsLost = stats?.chipsLost || 0;
+  const handsPlayed = stats?.handsplayed || 0;
+  const chipsWon = stats?.chipswon || 0;
+  const chipsLost = stats?.chipslost || 0;
   const winRate = handsPlayed > 0 ? Math.round((chipsWon / (chipsWon + chipsLost || 1)) * 100) : 0;
 
   return {
@@ -2021,11 +2074,11 @@ export function getMemberProfile(
     profile: {
       username: member.username || 'Unknown',
       role: member.role,
-      joinedAt: member.joinedAt,
+      joinedAt: member.joinedat,
       handsPlayed,
       chipsWon,
       chipsLost,
-      biggestPot: stats?.biggestPot || 0,
+      biggestPot: stats?.biggestpot || 0,
       winRate,
     },
   };
@@ -2035,19 +2088,19 @@ export function getMemberProfile(
 // Feature 13: Club Badges/Logos
 // ═══════════════════════════════════════════
 
-export function updateClubBadge(
+export async function updateClubBadge(
   clubId: number,
   ownerId: number,
   badge: string
-): { success: boolean; error?: string } {
-  const club = getClubById(clubId);
+): Promise<{ success: boolean; error?: string }> {
+  const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
   if (club.ownerId !== ownerId) {
     return { success: false, error: 'Only the club owner can change the badge' };
   }
 
-  const d = getDB();
-  d.prepare('UPDATE clubs SET badge = ? WHERE id = ?').run(badge, clubId);
+  const pool = getPool();
+  await pool.query('UPDATE clubs SET badge = $1 WHERE id = $2', [badge, clubId]);
   return { success: true };
 }
 
@@ -2055,74 +2108,79 @@ export function updateClubBadge(
 // Feature 14: Referral Rewards
 // ═══════════════════════════════════════════
 
-export function generateReferralCode(
+export async function generateReferralCode(
   clubId: number,
   userId: number
-): { success: boolean; error?: string; referralCode?: string } {
-  if (!isClubMember(clubId, userId)) {
+): Promise<{ success: boolean; error?: string; referralCode?: string }> {
+  if (!(await isClubMember(clubId, userId))) {
     return { success: false, error: 'You are not a member of this club' };
   }
 
-  const d = getDB();
-  const existing = d.prepare(
-    'SELECT referral_code FROM club_members WHERE clubId = ? AND userId = ?'
-  ).get(clubId, userId) as any;
+  const pool = getPool();
+  const existing = (await pool.query(
+    'SELECT referral_code FROM club_members WHERE clubId = $1 AND userId = $2',
+    [clubId, userId]
+  )).rows[0] as any;
 
   if (existing?.referral_code) {
     return { success: true, referralCode: existing.referral_code };
   }
 
   const code = `REF-${clubId}-${userId}-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
-  d.prepare('UPDATE club_members SET referral_code = ? WHERE clubId = ? AND userId = ?').run(code, clubId, userId);
+  await pool.query('UPDATE club_members SET referral_code = $1 WHERE clubId = $2 AND userId = $3', [code, clubId, userId]);
 
   return { success: true, referralCode: code };
 }
 
-export function joinByReferral(
+export async function joinByReferral(
   referralCode: string,
   userId: number
-): { success: boolean; error?: string; club?: ClubInfo; bonusChips?: number } {
-  const d = getDB();
-  const referrer = d.prepare(
-    'SELECT cm.clubId, cm.userId as referrerId FROM club_members cm WHERE cm.referral_code = ?'
-  ).get(referralCode) as any;
+): Promise<{ success: boolean; error?: string; club?: ClubInfo; bonusChips?: number }> {
+  const pool = getPool();
+  const referrer = (await pool.query(
+    'SELECT cm.clubId, cm.userId as referrerId FROM club_members cm WHERE cm.referral_code = $1',
+    [referralCode]
+  )).rows[0] as any;
 
   if (!referrer) {
     return { success: false, error: 'Invalid referral code' };
   }
 
-  const club = getClubById(referrer.clubId);
+  const club = await getClubById(referrer.clubid);
   if (!club) return { success: false, error: 'Club not found' };
 
-  if (isClubMember(referrer.clubId, userId)) {
+  if (await isClubMember(referrer.clubid, userId)) {
     return { success: false, error: 'You are already a member of this club' };
   }
 
-  const memberCount = (d.prepare('SELECT COUNT(*) as cnt FROM club_members WHERE clubId = ? AND status = ?').get(referrer.clubId, 'active') as any).cnt;
+  const memberCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND status = $2', [referrer.clubid, 'active'])).rows[0] as any).cnt;
   if (memberCount >= club.settings.maxMembers) {
     return { success: false, error: 'This club is full' };
   }
 
   try {
-    d.prepare(
-      'INSERT INTO club_members (clubId, userId, role, status) VALUES (?, ?, ?, ?)'
-    ).run(referrer.clubId, userId, 'member', 'active');
+    await pool.query(
+      'INSERT INTO club_members (clubId, userId, role, status) VALUES ($1, $2, $3, $4)',
+      [referrer.clubid, userId, 'member', 'active']
+    );
 
-    const referrerName = getUsername(referrer.referrerId);
-    const newMemberName = getUsername(userId);
+    const referrerName = await getUsername(referrer.referrerid);
+    const newMemberName = await getUsername(userId);
 
-    d.prepare(
-      `INSERT INTO club_stats (clubId, userId, username, chipsWon) VALUES (?, ?, ?, 500)
-       ON CONFLICT(clubId, userId) DO UPDATE SET chipsWon = chipsWon + 500, updatedAt = datetime('now')`
-    ).run(referrer.clubId, referrer.referrerId, referrerName);
+    await pool.query(
+      `INSERT INTO club_stats (clubId, userId, username, chipsWon) VALUES ($1, $2, $3, 500)
+       ON CONFLICT (clubId, userId) DO UPDATE SET chipsWon = club_stats.chipsWon + 500, updatedAt = now()`,
+      [referrer.clubid, referrer.referrerid, referrerName]
+    );
 
-    d.prepare(
-      `INSERT INTO club_stats (clubId, userId, username, chipsWon) VALUES (?, ?, ?, 500)
-       ON CONFLICT(clubId, userId) DO UPDATE SET chipsWon = chipsWon + 500, updatedAt = datetime('now')`
-    ).run(referrer.clubId, userId, newMemberName);
+    await pool.query(
+      `INSERT INTO club_stats (clubId, userId, username, chipsWon) VALUES ($1, $2, $3, 500)
+       ON CONFLICT (clubId, userId) DO UPDATE SET chipsWon = club_stats.chipsWon + 500, updatedAt = now()`,
+      [referrer.clubid, userId, newMemberName]
+    );
 
-    const newCount = (d.prepare('SELECT COUNT(*) as cnt FROM club_members WHERE clubId = ? AND status = ?').get(referrer.clubId, 'active') as any).cnt;
-    const rawRow = d.prepare('SELECT badge, clubXp, clubLevel FROM clubs WHERE id = ?').get(referrer.clubId) as any;
+    const newCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND status = $2', [referrer.clubid, 'active'])).rows[0] as any).cnt;
+    const rawRow = (await pool.query('SELECT badge, clubXp, clubLevel FROM clubs WHERE id = $1', [referrer.clubid])).rows[0] as any;
 
     return {
       success: true,
@@ -2133,13 +2191,13 @@ export function joinByReferral(
         name: club.name,
         description: club.description,
         ownerId: club.ownerId,
-        ownerName: getUsername(club.ownerId),
+        ownerName: await getUsername(club.ownerId),
         settings: club.settings,
         memberCount: newCount,
         createdAt: club.createdAt,
         badge: rawRow?.badge || '♠',
-        clubLevel: rawRow?.clubLevel || 1,
-        clubXp: rawRow?.clubXp || 0,
+        clubLevel: rawRow?.clublevel || 1,
+        clubXp: rawRow?.clubxp || 0,
       },
     };
   } catch (err: any) {
@@ -2148,28 +2206,30 @@ export function joinByReferral(
   }
 }
 
-export function getReferralStats(
+export async function getReferralStats(
   clubId: number,
   userId: number
-): { success: boolean; referralCode?: string; referralCount: number; chipsEarned: number } {
-  const d = getDB();
-  const member = d.prepare(
-    'SELECT referral_code FROM club_members WHERE clubId = ? AND userId = ?'
-  ).get(clubId, userId) as any;
+): Promise<{ success: boolean; referralCode?: string; referralCount: number; chipsEarned: number }> {
+  const pool = getPool();
+  const member = (await pool.query(
+    'SELECT referral_code FROM club_members WHERE clubId = $1 AND userId = $2',
+    [clubId, userId]
+  )).rows[0] as any;
 
   if (!member?.referral_code) {
     return { success: true, referralCount: 0, chipsEarned: 0 };
   }
 
-  const stats = d.prepare(
-    'SELECT chipsWon FROM club_stats WHERE clubId = ? AND userId = ?'
-  ).get(clubId, userId) as any;
+  const stats = (await pool.query(
+    'SELECT chipsWon FROM club_stats WHERE clubId = $1 AND userId = $2',
+    [clubId, userId]
+  )).rows[0] as any;
 
   return {
     success: true,
     referralCode: member.referral_code,
     referralCount: 0,
-    chipsEarned: stats?.chipsWon || 0,
+    chipsEarned: stats?.chipswon || 0,
   };
 }
 
@@ -2177,16 +2237,16 @@ export function getReferralStats(
 // Feature 15: Club Levels
 // ═══════════════════════════════════════════
 
-export function addClubXp(
+export async function addClubXp(
   clubId: number,
   amount: number
-): { success: boolean; newLevel?: number; newXp?: number; leveledUp?: boolean } {
-  const d = getDB();
-  const club = d.prepare('SELECT clubXp, clubLevel FROM clubs WHERE id = ?').get(clubId) as any;
+): Promise<{ success: boolean; newLevel?: number; newXp?: number; leveledUp?: boolean }> {
+  const pool = getPool();
+  const club = (await pool.query('SELECT clubXp, clubLevel FROM clubs WHERE id = $1', [clubId])).rows[0] as any;
   if (!club) return { success: false };
 
-  const currentXp = (club.clubXp || 0) + amount;
-  let currentLevel = club.clubLevel || 1;
+  const currentXp = (club.clubxp || 0) + amount;
+  let currentLevel = club.clublevel || 1;
   let leveledUp = false;
 
   while (currentLevel < 20 && currentXp >= CLUB_LEVEL_THRESHOLDS[currentLevel]) {
@@ -2194,18 +2254,18 @@ export function addClubXp(
     leveledUp = true;
   }
 
-  d.prepare('UPDATE clubs SET clubXp = ?, clubLevel = ? WHERE id = ?').run(currentXp, currentLevel, clubId);
+  await pool.query('UPDATE clubs SET clubXp = $1, clubLevel = $2 WHERE id = $3', [currentXp, currentLevel, clubId]);
 
   return { success: true, newLevel: currentLevel, newXp: currentXp, leveledUp };
 }
 
-export function getClubLevel(
+export async function getClubLevel(
   clubId: number
-): { success: boolean; level: number; xp: number; nextLevelXp: number; perks: { level: number; perk: string; unlocked: boolean }[] } {
-  const d = getDB();
-  const club = d.prepare('SELECT clubXp, clubLevel FROM clubs WHERE id = ?').get(clubId) as any;
-  const level = club?.clubLevel || 1;
-  const xp = club?.clubXp || 0;
+): Promise<{ success: boolean; level: number; xp: number; nextLevelXp: number; perks: { level: number; perk: string; unlocked: boolean }[] }> {
+  const pool = getPool();
+  const club = (await pool.query('SELECT clubXp, clubLevel FROM clubs WHERE id = $1', [clubId])).rows[0] as any;
+  const level = club?.clublevel || 1;
+  const xp = club?.clubxp || 0;
   const nextLevelXp = level < 20 ? CLUB_LEVEL_THRESHOLDS[level] : CLUB_LEVEL_THRESHOLDS[19];
 
   const perks = CLUB_LEVEL_PERKS.map((p) => ({
@@ -2220,47 +2280,47 @@ export function getClubLevel(
 // Feature 16: Featured Clubs Directory
 // ═══════════════════════════════════════════
 
-export function getFeaturedClubs(): { success: boolean; clubs: ClubInfo[] } {
-  const d = getDB();
-  const rows = d.prepare(
+export async function getFeaturedClubs(): Promise<{ success: boolean; clubs: ClubInfo[] }> {
+  const pool = getPool();
+  const rows = (await pool.query(
     `SELECT c.*,
-      (SELECT COUNT(*) FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount,
-      (SELECT COALESCE(SUM(handsPlayed), 0) FROM club_stats WHERE clubId = c.id) as totalHands
+      (SELECT COUNT(*)::int FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount,
+      (SELECT COALESCE(SUM(handsPlayed), 0)::int FROM club_stats WHERE clubId = c.id) as totalHands
      FROM clubs c
-     WHERE json_extract(c.settings, '$.isPrivate') = 0
+     WHERE (c.settings::jsonb ->> 'isPrivate') = 'false'
      ORDER BY memberCount DESC, totalHands DESC
      LIMIT 10`
-  ).all() as any[];
+  )).rows as any[];
 
-  const clubs: ClubInfo[] = rows.map((r) => ({
+  const clubs: ClubInfo[] = await Promise.all(rows.map(async (r) => ({
     id: r.id,
-    clubCode: r.clubCode,
+    clubCode: r.clubcode,
     name: r.name,
     description: r.description,
-    ownerId: r.ownerId,
-    ownerName: getUsername(r.ownerId),
+    ownerId: r.ownerid,
+    ownerName: await getUsername(r.ownerid),
     settings: JSON.parse(r.settings || '{}'),
-    memberCount: r.memberCount,
-    createdAt: r.createdAt,
+    memberCount: r.membercount,
+    createdAt: r.createdat,
     badge: r.badge || '♠',
-    clubLevel: r.clubLevel || 1,
-    clubXp: r.clubXp || 0,
-  }));
+    clubLevel: r.clublevel || 1,
+    clubXp: r.clubxp || 0,
+  })));
 
   return { success: true, clubs };
 }
 
-export function getClubOfWeek(): { success: boolean; club?: ClubInfo } {
-  const d = getDB();
-  const row = d.prepare(
+export async function getClubOfWeek(): Promise<{ success: boolean; club?: ClubInfo }> {
+  const pool = getPool();
+  const row = (await pool.query(
     `SELECT c.*,
-      (SELECT COUNT(*) FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount,
-      (SELECT COALESCE(SUM(handsPlayed), 0) FROM club_stats WHERE clubId = c.id AND updatedAt >= datetime('now', '-7 days')) as weeklyHands
+      (SELECT COUNT(*)::int FROM club_members WHERE clubId = c.id AND status = 'active') as memberCount,
+      (SELECT COALESCE(SUM(handsPlayed), 0)::int FROM club_stats WHERE clubId = c.id AND updatedAt >= now() - interval '7 days') as weeklyHands
      FROM clubs c
-     WHERE json_extract(c.settings, '$.isPrivate') = 0
+     WHERE (c.settings::jsonb ->> 'isPrivate') = 'false'
      ORDER BY weeklyHands DESC, memberCount DESC
      LIMIT 1`
-  ).get() as any;
+  )).rows[0] as any;
 
   if (!row) return { success: true };
 
@@ -2268,17 +2328,17 @@ export function getClubOfWeek(): { success: boolean; club?: ClubInfo } {
     success: true,
     club: {
       id: row.id,
-      clubCode: row.clubCode,
+      clubCode: row.clubcode,
       name: row.name,
       description: row.description,
-      ownerId: row.ownerId,
-      ownerName: getUsername(row.ownerId),
+      ownerId: row.ownerid,
+      ownerName: await getUsername(row.ownerid),
       settings: JSON.parse(row.settings || '{}'),
-      memberCount: row.memberCount,
-      createdAt: row.createdAt,
+      memberCount: row.membercount,
+      createdAt: row.createdat,
       badge: row.badge || '♠',
-      clubLevel: row.clubLevel || 1,
-      clubXp: row.clubXp || 0,
+      clubLevel: row.clublevel || 1,
+      clubXp: row.clubxp || 0,
     },
   };
 }

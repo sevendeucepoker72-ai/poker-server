@@ -4337,7 +4337,7 @@ Give feedback in this JSON format:
   socket.on('createClub', async (data: { name: string; description: string; settings?: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = createClub(auth.userId, data.name, data.description, data.settings || {});
+    const result = await createClub(auth.userId, data.name, data.description, data.settings || {});
     if (result.success) {
       socket.emit('clubCreated', result);
     } else {
@@ -4348,12 +4348,12 @@ Give feedback in this JSON format:
   socket.on('joinClub', async (data: { clubCode: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = joinClub(auth.userId, data.clubCode);
+    const result = await joinClub(auth.userId, data.clubCode);
     if (result.success) {
       socket.emit('clubJoined', result);
       if (result.club && result.status === 'active') {
-        addActivity(result.club.id, 'member_join', { username: auth.username });
-        sendClubMessage(result.club.id, auth.userId, auth.username, `${auth.username} joined the club`, 'system');
+        await addActivity(result.club.id, 'member_join', { username: auth.username });
+        await sendClubMessage(result.club.id, auth.userId, auth.username, `${auth.username} joined the club`, 'system');
       }
     } else {
       socket.emit('error', { message: result.error });
@@ -4363,11 +4363,11 @@ Give feedback in this JSON format:
   socket.on('leaveClub', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = leaveClub(auth.userId, data.clubId);
+    const result = await leaveClub(auth.userId, data.clubId);
     if (result.success) {
       socket.emit('clubLeft', { clubId: data.clubId });
-      addActivity(data.clubId, 'member_leave', { username: auth.username });
-      sendClubMessage(data.clubId, auth.userId, auth.username, `${auth.username} left the club`, 'system');
+      await addActivity(data.clubId, 'member_leave', { username: auth.username });
+      await sendClubMessage(data.clubId, auth.userId, auth.username, `${auth.username} left the club`, 'system');
     } else {
       socket.emit('error', { message: result.error });
     }
@@ -4376,25 +4376,25 @@ Give feedback in this JSON format:
   socket.on('getMyClubs', async () => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('myClubs', { success: false, clubs: [] }); return; }
-    const result = getMyClubs(auth.userId);
+    const result = await getMyClubs(auth.userId);
     socket.emit('myClubs', result);
   });
 
   socket.on('getClubInfo', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
-    const result = getClubInfo(data.clubId, auth?.userId);
+    const result = await getClubInfo(data.clubId, auth?.userId);
     socket.emit('clubInfo', result);
   });
 
   socket.on('getClubMembers', async (data: { clubId: number }) => {
-    const result = getClubMembers(data.clubId);
+    const result = await getClubMembers(data.clubId);
     socket.emit('clubMembers', result);
   });
 
   socket.on('approveMember', async (data: { clubId: number; userId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = approveMember(auth.userId, data.clubId, data.userId);
+    const result = await approveMember(auth.userId, data.clubId, data.userId);
     if (result.success) {
       socket.emit('memberApproved', { clubId: data.clubId, userId: data.userId });
     } else {
@@ -4405,7 +4405,7 @@ Give feedback in this JSON format:
   socket.on('removeMember', async (data: { clubId: number; userId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = removeMember(auth.userId, data.clubId, data.userId);
+    const result = await removeMember(auth.userId, data.clubId, data.userId);
     if (result.success) {
       socket.emit('memberRemoved', { clubId: data.clubId, userId: data.userId });
     } else {
@@ -4416,7 +4416,7 @@ Give feedback in this JSON format:
   socket.on('promoteToManager', async (data: { clubId: number; userId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = promoteToManager(auth.userId, data.clubId, data.userId);
+    const result = await promoteToManager(auth.userId, data.clubId, data.userId);
     if (result.success) {
       socket.emit('memberPromoted', { clubId: data.clubId, userId: data.userId });
     } else {
@@ -4427,10 +4427,10 @@ Give feedback in this JSON format:
   socket.on('createClubTable', async (data: { clubId: number; config: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = createClubTable(auth.userId, data.clubId, data.config);
+    const result = await createClubTable(auth.userId, data.clubId, data.config);
     if (result.success && result.table) {
       // Create a real table in the TableManager
-      const clubInfoResult = getClubInfo(data.clubId);
+      const clubInfoResult = await getClubInfo(data.clubId);
       const clubName = clubInfoResult.club?.name || 'Club';
       const variant = (result.table.variant || 'texas-holdem') as VariantType;
       const tableConfig = {
@@ -4444,7 +4444,7 @@ Give feedback in this JSON format:
         ? tableManager.createTable(tableConfig)
         : tableManager.createVariantTable(tableConfig, variant);
       if (tableId) {
-        updateClubTableId(result.table.id, tableId);
+        await updateClubTableId(result.table.id, tableId);
         result.table.tableId = tableId;
       }
       socket.emit('clubTableCreated', { success: true, table: result.table });
@@ -4454,7 +4454,7 @@ Give feedback in this JSON format:
   });
 
   socket.on('getClubTables', async (data: { clubId: number }) => {
-    const result = getClubTables(data.clubId);
+    const result = await getClubTables(data.clubId);
     socket.emit('clubTables', result);
   });
 
@@ -4462,9 +4462,9 @@ Give feedback in this JSON format:
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
-    const clubTable = getClubTableById(data.clubTableId);
+    const clubTable = await getClubTableById(data.clubTableId);
     if (!clubTable) { socket.emit('error', { message: 'Club table not found' }); return; }
-    if (!isClubMember(clubTable.clubId, auth.userId)) {
+    if (!(await isClubMember(clubTable.clubId, auth.userId))) {
       socket.emit('error', { message: 'You must be a club member to join this table' });
       return;
     }
@@ -4487,14 +4487,14 @@ Give feedback in this JSON format:
   });
 
   socket.on('searchClubs', async (data: { query: string }) => {
-    const result = searchClubs(data.query || '');
+    const result = await searchClubs(data.query || '');
     socket.emit('clubSearchResults', result);
   });
 
   socket.on('updateClubSettings', async (data: { clubId: number; settings: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = updateClubSettings(auth.userId, data.clubId, data.settings);
+    const result = await updateClubSettings(auth.userId, data.clubId, data.settings);
     if (result.success) {
       socket.emit('clubSettingsUpdated', result);
     } else {
@@ -4505,7 +4505,7 @@ Give feedback in this JSON format:
   socket.on('deleteClub', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = deleteClub(auth.userId, data.clubId);
+    const result = await deleteClub(auth.userId, data.clubId);
     if (result.success) {
       socket.emit('clubDeleted', { clubId: data.clubId });
     } else {
@@ -4518,7 +4518,7 @@ Give feedback in this JSON format:
   socket.on('joinClubRoom', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) return;
-    if (!isClubMember(data.clubId, auth.userId)) return;
+    if (!(await isClubMember(data.clubId, auth.userId))) return;
     socket.join(`club:${data.clubId}`);
   });
 
@@ -4529,7 +4529,7 @@ Give feedback in this JSON format:
   socket.on('sendClubMessage', async (data: { clubId: number; message: string; type?: 'chat' | 'announcement' | 'system' }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    if (!isClubMember(data.clubId, auth.userId)) { socket.emit('error', { message: 'Not a club member' }); return; }
+    if (!(await isClubMember(data.clubId, auth.userId))) { socket.emit('error', { message: 'Not a club member' }); return; }
 
     // Rate limit: min 800ms between messages per socket (reuses lastChatTime map)
     const now = Date.now();
@@ -4545,11 +4545,11 @@ Give feedback in this JSON format:
     if (!msgText) { socket.emit('error', { message: 'Empty message' }); return; }
 
     const msgType = data.type || 'chat';
-    const result = sendClubMessage(data.clubId, auth.userId, auth.username, msgText, msgType);
+    const result = await sendClubMessage(data.clubId, auth.userId, auth.username, msgText, msgType);
     if (result.success && result.message) {
       io.to(`club:${data.clubId}`).emit('clubMessage', result.message);
       if (msgType === 'announcement') {
-        addActivity(data.clubId, 'announcement', { username: auth.username, message: data.message });
+        await addActivity(data.clubId, 'announcement', { username: auth.username, message: data.message });
       }
     } else {
       socket.emit('error', { message: result.error });
@@ -4557,19 +4557,19 @@ Give feedback in this JSON format:
   });
 
   socket.on('getClubMessages', async (data: { clubId: number; limit?: number }) => {
-    const result = getClubMessages(data.clubId, data.limit || 50);
+    const result = await getClubMessages(data.clubId, data.limit || 50);
     socket.emit('clubMessages', result);
   });
 
   socket.on('getClubAnnouncements', async (data: { clubId: number }) => {
-    const result = getAnnouncements(data.clubId);
+    const result = await getAnnouncements(data.clubId);
     socket.emit('clubAnnouncements', result);
   });
 
   socket.on('pinClubMessage', async (data: { clubId: number; messageId: number; pin: boolean }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = data.pin ? pinMessage(data.clubId, data.messageId) : unpinMessage(data.clubId, data.messageId);
+    const result = data.pin ? await pinMessage(data.clubId, data.messageId) : await unpinMessage(data.clubId, data.messageId);
     if (result.success) {
       io.to(`club:${data.clubId}`).emit('clubMessagePinned', { messageId: data.messageId, pinned: data.pin });
     } else {
@@ -4580,19 +4580,19 @@ Give feedback in this JSON format:
   // ─── Club Leaderboard & Stats ───
 
   socket.on('getClubLeaderboard', async (data: { clubId: number; period?: 'today' | 'week' | 'alltime' }) => {
-    const result = getClubLeaderboard(data.clubId, data.period || 'alltime');
+    const result = await getClubLeaderboard(data.clubId, data.period || 'alltime');
     socket.emit('clubLeaderboard', result);
   });
 
   socket.on('getClubStatistics', async (data: { clubId: number }) => {
-    const result = getClubStatistics(data.clubId);
+    const result = await getClubStatistics(data.clubId);
     socket.emit('clubStatistics', result);
   });
 
   // ─── Club Activity Feed ───
 
   socket.on('getClubActivity', async (data: { clubId: number; limit?: number }) => {
-    const result = getActivityFeed(data.clubId, data.limit || 20);
+    const result = await getActivityFeed(data.clubId, data.limit || 20);
     socket.emit('clubActivity', result);
   });
 
@@ -4605,7 +4605,7 @@ Give feedback in this JSON format:
     // called (managerId, clubId, ...) — swapped — so getMemberRole(clubId=userId,
     // managerId=clubId) never matched, and EVERY owner/manager got "Only owners
     // and managers can create tournaments".
-    const result = createClubTournament(data.clubId, auth.userId, data.config);
+    const result = await createClubTournament(data.clubId, auth.userId, data.config);
     if (result.success) {
       socket.emit('clubTournamentCreated', result);
     } else {
@@ -4614,14 +4614,14 @@ Give feedback in this JSON format:
   });
 
   socket.on('getClubTournaments', async (data: { clubId: number }) => {
-    const result = getClubTournaments(data.clubId);
+    const result = await getClubTournaments(data.clubId);
     socket.emit('clubTournaments', result);
   });
 
   socket.on('registerClubTournament', async (data: { tournamentId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = registerForClubTournament(data.tournamentId, auth.userId);
+    const result = await registerForClubTournament(data.tournamentId, auth.userId);
     if (result.success) {
       socket.emit('clubTournamentRegistered', { tournamentId: data.tournamentId, registered: result.registered });
     } else {
@@ -4632,7 +4632,7 @@ Give feedback in this JSON format:
   socket.on('startClubTournament', async (data: { tournamentId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = startClubTournament(data.tournamentId, auth.userId);
+    const result = await startClubTournament(data.tournamentId, auth.userId);
     if (result.success) {
       socket.emit('clubTournamentStarted', { tournamentId: data.tournamentId });
     } else {
@@ -4645,7 +4645,7 @@ Give feedback in this JSON format:
   socket.on('createClubChallenge', async (data: { clubId: number; challengedId: number; stakes: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = createChallenge(data.clubId, auth.userId, data.challengedId, data.stakes);
+    const result = await createChallenge(data.clubId, auth.userId, data.challengedId, data.stakes);
     if (result.success) {
       socket.emit('clubChallengeCreated', result);
     } else {
@@ -4656,7 +4656,7 @@ Give feedback in this JSON format:
   socket.on('acceptClubChallenge', async (data: { challengeId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = acceptChallenge(data.challengeId, auth.userId);
+    const result = await acceptChallenge(data.challengeId, auth.userId);
     if (result.success) {
       socket.emit('clubChallengeAccepted', { challengeId: data.challengeId });
     } else {
@@ -4667,7 +4667,7 @@ Give feedback in this JSON format:
   socket.on('declineClubChallenge', async (data: { challengeId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = declineChallenge(data.challengeId, auth.userId);
+    const result = await declineChallenge(data.challengeId, auth.userId);
     if (result.success) {
       socket.emit('clubChallengeDeclined', { challengeId: data.challengeId });
     } else {
@@ -4676,7 +4676,7 @@ Give feedback in this JSON format:
   });
 
   socket.on('getClubChallenges', async (data: { clubId: number }) => {
-    const result = getClubChallenges(data.clubId);
+    const result = await getClubChallenges(data.clubId);
     socket.emit('clubChallenges', result);
   });
 
@@ -4685,7 +4685,7 @@ Give feedback in this JSON format:
   socket.on('scheduleClubTable', async (data: { clubId: number; config: any; scheduledTime: string; recurring: boolean; recurrencePattern?: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = scheduleTable(data.clubId, auth.userId, data.config, data.scheduledTime, data.recurring, data.recurrencePattern);
+    const result = await scheduleTable(data.clubId, auth.userId, data.config, data.scheduledTime, data.recurring, data.recurrencePattern);
     if (result.success) {
       socket.emit('clubTableScheduled', result);
     } else {
@@ -4694,17 +4694,17 @@ Give feedback in this JSON format:
   });
 
   socket.on('getScheduledClubTables', async (data: { clubId: number }) => {
-    const result = getScheduledTables(data.clubId);
+    const result = await getScheduledTables(data.clubId);
     socket.emit('scheduledClubTables', result);
   });
 
   socket.on('activateScheduledClubTable', async (data: { id: number; clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = activateScheduledTable(data.id, auth.userId);
+    const result = await activateScheduledTable(data.id, auth.userId);
     if (result.success && result.tableConfig) {
       // Create the actual table
-      const clubInfoResult = getClubInfo(data.clubId);
+      const clubInfoResult = await getClubInfo(data.clubId);
       const clubName = clubInfoResult.club?.name || 'Club';
       const cfg = result.tableConfig;
       const variant = (cfg.variant || 'texas-holdem') as VariantType;
@@ -4727,7 +4727,7 @@ Give feedback in this JSON format:
   socket.on('deleteScheduledClubTable', async (data: { id: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = deleteScheduledTable(data.id, auth.userId);
+    const result = await deleteScheduledTable(data.id, auth.userId);
     if (result.success) {
       socket.emit('scheduledClubTableDeleted', { id: data.id });
     } else {
@@ -4763,7 +4763,7 @@ Give feedback in this JSON format:
       prevBB = bb;
     }
 
-    const result = createBlindStructure(data.clubId, auth.userId, data.name, data.levels);
+    const result = await createBlindStructure(data.clubId, auth.userId, data.name, data.levels);
     if (result.success) {
       socket.emit('blindStructureCreated', result);
     } else {
@@ -4772,14 +4772,14 @@ Give feedback in this JSON format:
   });
 
   socket.on('getBlindStructures', async (data: { clubId: number }) => {
-    const result = getBlindStructures(data.clubId);
+    const result = await getBlindStructures(data.clubId);
     socket.emit('blindStructures', result);
   });
 
   socket.on('deleteBlindStructure', async (data: { id: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = deleteBlindStructure(data.id, auth.userId);
+    const result = await deleteBlindStructure(data.id, auth.userId);
     if (result.success) {
       socket.emit('blindStructureDeleted', { id: data.id });
     } else {
@@ -4792,7 +4792,7 @@ Give feedback in this JSON format:
   socket.on('inviteToClub', async (data: { clubId: number; invitedUsername: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = inviteToClub(data.clubId, auth.userId, auth.username || '', data.invitedUsername);
+    const result = await inviteToClub(data.clubId, auth.userId, auth.username || '', data.invitedUsername);
     if (result.success) {
       socket.emit('invitationSent', result);
     } else {
@@ -4803,17 +4803,17 @@ Give feedback in this JSON format:
   socket.on('getMyInvitations', async () => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('myInvitations', { success: false, invitations: [] }); return; }
-    const result = getMyInvitations(auth.userId);
+    const result = await getMyInvitations(auth.userId);
     socket.emit('myInvitations', result);
   });
 
   socket.on('acceptInvitation', async (data: { invitationId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = acceptInvitation(data.invitationId, auth.userId);
+    const result = await acceptInvitation(data.invitationId, auth.userId);
     if (result.success) {
       socket.emit('invitationAccepted', result);
-      socket.emit('myClubs', getMyClubs(auth.userId));
+      socket.emit('myClubs', await getMyClubs(auth.userId));
     } else {
       socket.emit('error', { message: result.error });
     }
@@ -4822,7 +4822,7 @@ Give feedback in this JSON format:
   socket.on('declineInvitation', async (data: { invitationId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = declineInvitation(data.invitationId, auth.userId);
+    const result = await declineInvitation(data.invitationId, auth.userId);
     if (result.success) {
       socket.emit('invitationDeclined', { invitationId: data.invitationId });
     } else {
@@ -4835,7 +4835,7 @@ Give feedback in this JSON format:
   socket.on('createUnion', async (data: { clubId: number; name: string; description: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = createUnion(data.clubId, auth.userId, data.name, data.description);
+    const result = await createUnion(data.clubId, auth.userId, data.name, data.description);
     if (result.success) {
       socket.emit('unionCreated', result);
     } else {
@@ -4844,14 +4844,14 @@ Give feedback in this JSON format:
   });
 
   socket.on('getUnionInfo', async (data: { clubId: number }) => {
-    const result = getUnionInfo(data.clubId);
+    const result = await getUnionInfo(data.clubId);
     socket.emit('unionInfo', result);
   });
 
   // ── Feature 12: Member Profiles ──
 
   socket.on('getMemberProfile', async (data: { clubId: number; userId: number }) => {
-    const result = getMemberProfile(data.clubId, data.userId);
+    const result = await getMemberProfile(data.clubId, data.userId);
     socket.emit('memberProfile', result);
   });
 
@@ -4860,7 +4860,7 @@ Give feedback in this JSON format:
   socket.on('updateClubBadge', async (data: { clubId: number; badge: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = updateClubBadge(data.clubId, auth.userId, data.badge);
+    const result = await updateClubBadge(data.clubId, auth.userId, data.badge);
     if (result.success) {
       socket.emit('clubBadgeUpdated', { clubId: data.clubId, badge: data.badge });
     } else {
@@ -4873,17 +4873,17 @@ Give feedback in this JSON format:
   socket.on('generateReferralCode', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = generateReferralCode(data.clubId, auth.userId);
+    const result = await generateReferralCode(data.clubId, auth.userId);
     socket.emit('referralCode', result);
   });
 
   socket.on('joinByReferral', async (data: { referralCode: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = joinByReferral(data.referralCode, auth.userId);
+    const result = await joinByReferral(data.referralCode, auth.userId);
     if (result.success) {
       socket.emit('referralJoined', result);
-      socket.emit('myClubs', getMyClubs(auth.userId));
+      socket.emit('myClubs', await getMyClubs(auth.userId));
     } else {
       socket.emit('error', { message: result.error });
     }
@@ -4892,22 +4892,22 @@ Give feedback in this JSON format:
   socket.on('getReferralStats', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = getReferralStats(data.clubId, auth.userId);
+    const result = await getReferralStats(data.clubId, auth.userId);
     socket.emit('referralStats', result);
   });
 
   // ── Feature 15: Club Levels ──
 
   socket.on('getClubLevel', async (data: { clubId: number }) => {
-    const result = getClubLevel(data.clubId);
+    const result = await getClubLevel(data.clubId);
     socket.emit('clubLevel', result);
   });
 
   // ── Feature 16: Featured Clubs ──
 
   socket.on('getFeaturedClubs', async () => {
-    const featured = getFeaturedClubs();
-    const clubOfWeek = getClubOfWeek();
+    const featured = await getFeaturedClubs();
+    const clubOfWeek = await getClubOfWeek();
     socket.emit('featuredClubs', { ...featured, clubOfWeek: clubOfWeek.club || null });
   });
 
@@ -9535,7 +9535,7 @@ app.post('/api/tournament/simulate', (req, res) => {
 
 // ========== Initialize Auth Database ==========
 initDB().then(async () => {
-  initClubTables();
+  try { await initClubTables(); } catch (e) { console.error('[Clubs] initClubTables failed', e); }
   try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }
   try { await initPredictionTables(); } catch (e) { console.error('[prediction] initPredictionTables failed', e); }
   try { await initBracketTables(); } catch (e) { console.error('[bracket] initBracketTables failed', e); }
