@@ -117,6 +117,7 @@ import {
   CLUB_LEVEL_THRESHOLDS,
   CLUB_LEVEL_PERKS,
 } from './clubs/clubManager';
+import { initFriendTables, listFriends, sendFriendRequest, acceptFriendRequest, removeFriend } from './social/friendManager';
 
 // ========== Sentry (optional, prod-only crash reporting) ==========
 // Initialized BEFORE the express app + socket.io server so any synchronous
@@ -6993,6 +6994,66 @@ Give feedback in this JSON format:
     sendProgressToPlayer(socket.id);
   });
 
+  // ========== Friends (durable, Postgres) — Phase 3a 2026-06-18 ==========
+  const emitFriendsTo = (uid: number) => {
+    for (const [sid, a] of authSessions) if (a?.userId === uid) io.to(sid).emit('friendsChanged');
+  };
+  socket.on('getFriends', async () => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) return;
+    try {
+      const friends = await listFriends(auth.userId);
+      const online = new Set<number>(); const inGame = new Set<number>();
+      for (const [sid, a] of authSessions) {
+        if (a?.userId) { online.add(a.userId); if (playerSessions.has(sid)) inGame.add(a.userId); }
+      }
+      const withPresence = friends.map(f => ({
+        ...f,
+        presence: f.status !== 'accepted' ? 'offline'
+          : inGame.has(f.userId) ? 'in-game'
+          : online.has(f.userId) ? 'online' : 'offline',
+      }));
+      socket.emit('friendsList', { friends: withPresence });
+    } catch (e) { socket.emit('friendError', { message: 'Failed to load friends' }); }
+  });
+  socket.on('sendFriendRequest', async (data: { name?: string; userId?: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) return;
+    try {
+      let targetId = data?.userId;
+      if (!targetId && data?.name) {
+        const q = String(data.name).trim();
+        const matches = await searchUsers(q, 5);
+        const exact = matches.find(m => m.username.toLowerCase() === q.toLowerCase()) || matches[0];
+        targetId = exact?.id;
+      }
+      if (!targetId) { socket.emit('friendError', { message: 'Player not found' }); return; }
+      const res = await sendFriendRequest(auth.userId, targetId);
+      if (!res.ok) { socket.emit('friendError', { message: res.error || 'Failed' }); return; }
+      socket.emit('friendRequestSent', { status: res.status });
+      for (const [sid, a] of authSessions) if (a?.userId === targetId) io.to(sid).emit('friendRequestReceived', { from: auth.username });
+    } catch (e) { socket.emit('friendError', { message: 'Failed to send request' }); }
+  });
+  socket.on('acceptFriendRequest', async (data: { userId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId || !data?.userId) return;
+    const res = await acceptFriendRequest(auth.userId, data.userId);
+    if (res.ok) { socket.emit('friendsChanged'); emitFriendsTo(data.userId); }
+    else socket.emit('friendError', { message: res.error || 'Failed' });
+  });
+  socket.on('removeFriend', async (data: { userId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId || !data?.userId) return;
+    await removeFriend(auth.userId, data.userId);
+    socket.emit('friendsChanged'); emitFriendsTo(data.userId);
+  });
+  socket.on('inviteFriendToTable', async (data: { userId: number; tableId?: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId || !data?.userId) return;
+    for (const [sid, a] of authSessions) if (a?.userId === data.userId) io.to(sid).emit('tableInvite', { from: auth.username, tableId: data.tableId || null });
+    socket.emit('friendInviteSent', { userId: data.userId });
+  });
+
   // ========== Sit Out ==========
 
   socket.on('sitOut', async () => {
@@ -9227,6 +9288,7 @@ app.post('/api/tournament/simulate', (req, res) => {
 // ========== Initialize Auth Database ==========
 initDB().then(async () => {
   initClubTables();
+  try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }
 
   // One-time chip recovery grant for admin — compensates for the
   // "disconnect wiped my wallet" bug (fixed in commit 03b5170). Guarded
