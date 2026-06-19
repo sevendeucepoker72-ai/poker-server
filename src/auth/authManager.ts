@@ -14,9 +14,14 @@ const JWT_SECRET = process.env.JWT_SECRET || 'american-pub-poker-jwt-secret-2024
 const JWT_EXPIRES_IN = '7d';
 const BCRYPT_ROUNDS = 10;
 
-const DEFAULT_CHIPS = 50000; // 2026-06-12 — starting bankroll raised 10k -> 50k
-const DEFAULT_LEVEL = 1;
-const DEFAULT_XP = 0;
+// 2026-06-19 Phase 5: exported as the single source of truth for the new-user
+// grant. index.ts INSERT paths + the boot-time top-up ratchet import these
+// instead of re-hardcoding 50000/1/0 (which would silently drift if the
+// starting bankroll ever changes again — the exact failure mode CLAUDE.md
+// warns about).
+export const DEFAULT_CHIPS = 50000; // 2026-06-12 — starting bankroll raised 10k -> 50k
+export const DEFAULT_LEVEL = 1;
+export const DEFAULT_XP = 0;
 
 // Rate limiter (in-memory, no DB needed)
 const loginAttempts = new Map<string, { attempts: number; firstAttemptAt: number; lockedUntil: number }>();

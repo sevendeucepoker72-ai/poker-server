@@ -116,6 +116,10 @@ export interface ActionLogEntry {
   seatIndex: number;
   playerName: string;
   action: string;
+  // 2026-06-19 Phase 5: the street the action occurred on (GamePhase value
+  // e.g. 'PreFlop'/'Flop'/...). Lets the client opponent-tracker compute
+  // street-aware stats (3-bet%, fold-to-cbet%) from the shipped actionLog.
+  street?: string;
 }
 
 /** Complete hand history record */
@@ -134,6 +138,9 @@ export interface HandHistoryRecord {
   }[];
   winners: { seatIndex: number; name: string; chipsWon: number; handName: string }[];
   pots: { amount: number; winners: number[] }[];
+  // 2026-06-19 Phase 5: full street-tagged action sequence (chronological)
+  // for client-side opponent-stat tracking (3-bet%, fold-to-cbet%, AF).
+  actionLog?: ActionLogEntry[];
 }
 
 function createEmptySeat(index: number): Seat {
@@ -883,6 +890,7 @@ export class PokerTable extends EventEmitter {
       seatIndex,
       playerName: this.seats[seatIndex].playerName,
       action: 'folded',
+      street: this.currentPhase,
     });
 
     this.emit('playerAction', {
@@ -918,6 +926,7 @@ export class PokerTable extends EventEmitter {
       seatIndex,
       playerName: seat.playerName,
       action: 'folded (left table)',
+      street: this.currentPhase,
     });
     this.emit('playerAction', { seatIndex, action: PlayerAction.Fold, amount: 0 });
     return true;
@@ -947,6 +956,7 @@ export class PokerTable extends EventEmitter {
       seatIndex,
       playerName: seat.playerName,
       action: 'checked',
+      street: this.currentPhase,
     });
 
     this.emit('playerAction', {
@@ -982,6 +992,7 @@ export class PokerTable extends EventEmitter {
       seatIndex,
       playerName: seat.playerName,
       action: `called ${callAmount}`,
+      street: this.currentPhase,
     });
 
     this.emit('playerAction', {
@@ -1081,6 +1092,7 @@ export class PokerTable extends EventEmitter {
       seatIndex,
       playerName: seat.playerName,
       action: `raised to ${totalRaiseAmount}`,
+      street: this.currentPhase,
     });
 
     this.emit('playerAction', {
@@ -1139,6 +1151,7 @@ export class PokerTable extends EventEmitter {
       seatIndex,
       playerName: seat.playerName,
       action: `went all-in for ${totalBet}`,
+      street: this.currentPhase,
     });
 
     this.emit('playerAction', {
@@ -1694,6 +1707,10 @@ export class PokerTable extends EventEmitter {
         handName: w.handName,
       })),
       pots: potBreakdown,
+      // 2026-06-19 Phase 5: ship the street-tagged action sequence so the
+      // client opponent-tracker can compute real 3-bet% / fold-to-cbet% / AF.
+      // Copied because this.actionLog is reset when the next hand starts.
+      actionLog: this.actionLog.map(a => ({ ...a })),
     };
 
     // Reset totalInvestedThisHand

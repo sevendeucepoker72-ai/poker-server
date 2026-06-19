@@ -47,7 +47,7 @@ import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, loadDurableProgress } from './auth/authManager';
+import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP } from './auth/authManager';
 import { validateOAuthToken } from './auth/oauthValidator';
 import { notifyPlayer } from './notifyClient';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
@@ -3752,7 +3752,7 @@ Give feedback in this JSON format:
       );
       const { rows } = await getPool().query(
         `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
-           VALUES ($1, $2, $3, 50000, 1, 0, $4)
+           VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4)
            ON CONFLICT (LOWER(username)) DO UPDATE
              SET display_name = COALESCE(users.display_name, $2)
          RETURNING *`,
@@ -6283,7 +6283,7 @@ Give feedback in this JSON format:
         if (!localUser) {
           const { rows } = await getPool().query(
             `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
-               VALUES ($1, $2, $3, 50000, 1, 0, $4)
+               VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4)
                ON CONFLICT (LOWER(username)) DO UPDATE
                  SET display_name = COALESCE(users.display_name, $2)
              RETURNING *`,
