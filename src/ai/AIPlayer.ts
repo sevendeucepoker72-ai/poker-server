@@ -1,5 +1,6 @@
 import { Card, Rank, Suit } from '../game/Card';
 import { evaluateHand, compareTo, HandRank, HandResult } from '../game/HandEvaluator';
+import { evaluateOmahaHand } from '../game/HandEvaluatorExtensions';
 import { PokerTable, Seat, PlayerAction, GamePhase } from '../game/PokerTable';
 import { calculateEquity } from '../training/TrainingEngine';
 
@@ -302,21 +303,28 @@ function getPostFlopStrength(
   holeCards: Card[],
   communityCards: Card[],
   numOpponents: number,
-  difficulty: Difficulty
+  difficulty: Difficulty,
+  // 2026-06-19: Omaha awareness (default false → unchanged Hold'em path). Omaha
+  // REQUIRES exactly 2 hole + 3 board, so the old any-5-of-9 made bots evaluate
+  // their Omaha hands as far too strong.
+  isOmaha: boolean = false
 ): number {
   // Expert and Hard AI use actual Monte Carlo equity (but fewer sims for speed)
   if (difficulty === 'expert' || difficulty === 'hard') {
     const equity = calculateEquity(
       holeCards,
       communityCards,
-      numOpponents
+      numOpponents,
+      isOmaha
     );
     return equity / 100; // normalize to 0-1
   }
 
   // Medium/Easy use simplified evaluation
   const allCards = [...holeCards, ...communityCards];
-  const result = evaluateHand(allCards);
+  const result = (isOmaha && communityCards.length >= 3)
+    ? evaluateOmahaHand(holeCards, communityCards)
+    : evaluateHand(allCards);
 
   let score: number;
   switch (result.handRank) {
@@ -670,7 +678,8 @@ export function decideAction(
     handStrength = getPreFlopHandRank(seat.holeCards);
   } else {
     handStrength = getPostFlopStrength(
-      seat.holeCards, table.communityCards, numOpponents, profile.difficulty
+      seat.holeCards, table.communityCards, numOpponents, profile.difficulty,
+      /omaha/i.test(variantId)
     );
   }
 

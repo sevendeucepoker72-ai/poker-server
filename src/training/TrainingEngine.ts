@@ -1,6 +1,7 @@
 import { Card, Rank, Suit } from '../game/Card';
 import { CardDeck } from '../game/CardDeck';
 import { evaluateHand, compareTo, HandRank, HandResult } from '../game/HandEvaluator';
+import { evaluateOmahaHand } from '../game/HandEvaluatorExtensions';
 
 export interface TrainingData {
   equity: number; // 0-100 win probability
@@ -73,7 +74,11 @@ function shuffleArray<T>(arr: T[]): void {
 export function calculateEquity(
   holeCards: Card[],
   communityCards: Card[],
-  numOpponents: number
+  numOpponents: number,
+  // 2026-06-19: Omaha awareness (default false → unchanged Hold'em path). Omaha
+  // uses exactly-2-hole + 3-board and 4-card opponents; the old any-5/2-card
+  // model made Omaha equity meaningless.
+  omaha: boolean = false
 ): number {
   if (holeCards.length < 2) return 50;
   if (numOpponents < 1) return 100;
@@ -92,7 +97,8 @@ export function calculateEquity(
   const remainingDeck = fullDeck.filter((c) => !knownSet.has(cardKey(c)));
 
   const communityNeeded = 5 - communityCards.length;
-  const cardsNeeded = communityNeeded + numOpponents * 2;
+  const holePerOpp = omaha ? 4 : 2;
+  const cardsNeeded = communityNeeded + numOpponents * holePerOpp;
 
   for (let sim = 0; sim < NUM_SIMULATIONS; sim++) {
     // Shuffle remaining deck for this simulation
@@ -108,18 +114,21 @@ export function calculateEquity(
       simCommunity.push(remainingDeck[idx++]);
     }
 
-    // Evaluate player's hand
-    const playerCards = [...holeCards, ...simCommunity];
-    const playerResult = evaluateHand(playerCards);
+    // Evaluate player's hand (Omaha uses the 2-of-hole + 3-of-board evaluator)
+    const playerResult = omaha
+      ? evaluateOmahaHand(holeCards, simCommunity)
+      : evaluateHand([...holeCards, ...simCommunity]);
 
     // Deal and evaluate opponent hands
     let playerWins = true;
     let isTie = false;
 
     for (let opp = 0; opp < numOpponents; opp++) {
-      const oppHole = [remainingDeck[idx++], remainingDeck[idx++]];
-      const oppCards = [...oppHole, ...simCommunity];
-      const oppResult = evaluateHand(oppCards);
+      const oppHole: Card[] = [];
+      for (let h = 0; h < holePerOpp; h++) oppHole.push(remainingDeck[idx++]);
+      const oppResult = omaha
+        ? evaluateOmahaHand(oppHole, simCommunity)
+        : evaluateHand([...oppHole, ...simCommunity]);
 
       const cmp = compareTo(playerResult, oppResult);
       if (cmp < 0) {
