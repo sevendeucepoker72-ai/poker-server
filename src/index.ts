@@ -3704,7 +3704,7 @@ Give feedback in this JSON format:
   // THAT integer id for authSessions and loadProgress. The previous
   // `parseInt(oauthResult.sub, 10)` just parsed the first digit of the UUID
   // and always failed with "User not found".
-  socket.on('oauthLogin', async (data: { accessToken: string }) => {
+  socket.on('oauthLogin', async (data: { accessToken: string; skipSeatRecovery?: boolean }) => {
     if (!data?.accessToken) {
       socket.emit('loginResult', { success: false, error: 'No access token provided' });
       return;
@@ -3784,7 +3784,12 @@ Give feedback in this JSON format:
       // playerName — so the post-restart orphan match is by name + "no live
       // session on that seat" (same approach as clearGhostSeatsForUser). Wrapped
       // in try/catch so a recovery miss can never break login itself.
-      try {
+      // 3f multi-table: SECONDARY sockets pass skipSeatRecovery=true so they
+      // don't fight the PRIMARY socket over the single reservedSeats[userId]
+      // slot / name-scan recovery (which would yank a secondary onto the
+      // primary's table). The primary login path leaves skipSeatRecovery
+      // falsy, so its proven reconnect behavior is unchanged.
+      if (!data?.skipSeatRecovery) try {
         const recoverName = localUser.display_name || localUser.username;
         // (a) Post-restart orphan recovery: a Railway redeploy wipes the
         // in-memory reservedSeats Map, but the seat survives in Redis-rehydrated
