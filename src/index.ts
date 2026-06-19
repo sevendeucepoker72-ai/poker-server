@@ -118,6 +118,11 @@ import {
   CLUB_LEVEL_PERKS,
 } from './clubs/clubManager';
 import { initFriendTables, listFriends, sendFriendRequest, acceptFriendRequest, removeFriend } from './social/friendManager';
+import {
+  initPredictionTables, getWallet as getPredictionWallet, placeMarketBet, placePick,
+  getSpectatorStats, settleHand as settlePredictions, MARKET_ODDS,
+  type PredictionFacts,
+} from './social/predictionManager';
 
 // ========== Sentry (optional, prod-only crash reporting) ==========
 // Initialized BEFORE the express app + socket.io server so any synchronous
@@ -1578,6 +1583,51 @@ function recordRevealedCommitment(tableId: string, rc: RevealedCommitment) {
   });
 }
 
+// Build the authoritative prediction-market facts from the final hand state,
+// resolve all open bets/picks for the hand, and push results to each affected
+// user's sockets. Called from the handResult listener (3c). The facts are
+// derived ONLY from server state — the client cannot influence the outcome.
+async function settlePredictionsForHand(
+  table: PokerTable,
+  tableId: string,
+  data: { results: any[]; handNumber: number }
+): Promise<void> {
+  const community: any[] = (table as any).communityCards || [];
+  const flopRanks = community.slice(0, 3).map((c) => c?.rank);
+  const potAwarded = (data.results || []).reduce((s: number, r: any) => s + (r?.amount || 0), 0);
+  const showdownHands = (table as any).lastHandResult?.showdownHands || [];
+  const facts: PredictionFacts = {
+    showdown: showdownHands.length >= 2,
+    flopPaired: flopRanks.length === 3 && new Set(flopRanks).size < 3,
+    allIn: (table.seats || []).some((s: any) => s?.allIn),
+    bigPot: potAwarded > 5000,
+    riverSeen: community.length === 5,
+    foldPreflop: community.length === 0,
+  };
+  const winnerSeats: number[] = ((table as any).lastHandResult?.winners || []).map((w: any) => w.seatIndex);
+
+  const settled = await settlePredictions(tableId, data.handNumber, facts, winnerSeats);
+  if (settled.bets.size === 0 && settled.picks.size === 0) return;
+
+  // Reverse-map userId -> live socket ids (a user may have multiple tabs).
+  const sidsFor = (uid: number): string[] => {
+    const out: string[] = [];
+    for (const [sid, a] of authSessions) if (a?.userId === uid) out.push(sid);
+    return out;
+  };
+  for (const [uid, items] of settled.bets) {
+    const balance = settled.wallets.get(uid);
+    for (const sid of sidsFor(uid)) {
+      io.to(sid).emit('predictionSettled', { handNumber: data.handNumber, balance, results: items });
+    }
+  }
+  for (const [uid, p] of settled.picks) {
+    for (const sid of sidsFor(uid)) {
+      io.to(sid).emit('spectatorResult', { handNumber: data.handNumber, ...p });
+    }
+  }
+}
+
 function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   if (tableProgressListeners.has(tableId)) return;
   tableProgressListeners.add(tableId);
@@ -1585,6 +1635,12 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   table.on('handResult', async (data: { results: any[]; handNumber: number }) => {
     incrementHandsPlayed();
     handleHandComplete(tableId, data.results);
+    // Prediction games (3c): settle open market bets + spectator picks for
+    // this hand from the AUTHORITATIVE final table state, then push results.
+    // Runs before processPendingSeatRemovals so seat.allIn flags are still set.
+    settlePredictionsForHand(table, tableId, data).catch((e) =>
+      console.warn('[prediction] settle failed', e?.message)
+    );
     // 2026-06-11 audit C7: the pot has now been awarded (determineWinners
     // ran before this event), so any seat we kept alive only to preserve
     // its committed chips in the pot can be torn down: credit the remaining
@@ -7054,6 +7110,49 @@ Give feedback in this JSON format:
     socket.emit('friendInviteSent', { userId: data.userId });
   });
 
+  // ===== Prediction games (durable, server-authoritative) — Phase 3c 2026-06-18 =====
+  socket.on('getPredictionWallet', async () => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) return;
+    try {
+      const balance = await getPredictionWallet(auth.userId);
+      socket.emit('predictionWallet', { balance });
+    } catch { socket.emit('predictionError', { message: 'Failed to load wallet' }); }
+  });
+  socket.on('placePredictionBet', async (data: { tableId?: string; handId?: number; marketId?: string; outcome?: string; amount?: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) return;
+    const tableId = data?.tableId || playerSessions.get(socket.id)?.tableId;
+    const handNumber = Number(data?.handId);
+    if (!tableId || !Number.isFinite(handNumber)) { socket.emit('predictionError', { message: 'No active hand' }); return; }
+    try {
+      const res = await placeMarketBet(auth.userId, tableId, handNumber, String(data?.marketId), String(data?.outcome), Number(data?.amount));
+      if (!res.ok) { socket.emit('predictionError', { message: res.error || 'Bet rejected' }); return; }
+      socket.emit('predictionBetPlaced', { handNumber, balance: res.balance, bet: res.bet });
+    } catch { socket.emit('predictionError', { message: 'Bet failed' }); }
+  });
+  socket.on('getPredictionStats', async () => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) return;
+    try {
+      const stats = await getSpectatorStats(auth.userId);
+      socket.emit('predictionStats', { stats });
+    } catch { socket.emit('predictionError', { message: 'Failed to load stats' }); }
+  });
+  socket.on('placePrediction', async (data: { tableId?: string; handId?: number; predictedSeat?: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) return;
+    const tableId = data?.tableId || playerSessions.get(socket.id)?.tableId;
+    const handNumber = Number(data?.handId);
+    const seat = Number(data?.predictedSeat);
+    if (!tableId || !Number.isFinite(handNumber) || !Number.isFinite(seat)) { socket.emit('predictionError', { message: 'No active hand' }); return; }
+    try {
+      const res = await placePick(auth.userId, tableId, handNumber, seat);
+      if (!res.ok) { socket.emit('predictionError', { message: res.error || 'Pick rejected' }); return; }
+      socket.emit('predictionPickPlaced', { handNumber, predictedSeat: seat });
+    } catch { socket.emit('predictionError', { message: 'Pick failed' }); }
+  });
+
   // ========== Sit Out ==========
 
   socket.on('sitOut', async () => {
@@ -9289,6 +9388,7 @@ app.post('/api/tournament/simulate', (req, res) => {
 initDB().then(async () => {
   initClubTables();
   try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }
+  try { await initPredictionTables(); } catch (e) { console.error('[prediction] initPredictionTables failed', e); }
 
   // One-time chip recovery grant for admin — compensates for the
   // "disconnect wiped my wallet" bug (fixed in commit 03b5170). Guarded
