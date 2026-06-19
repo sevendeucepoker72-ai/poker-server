@@ -123,6 +123,10 @@ import {
   getSpectatorStats, settleHand as settlePredictions, MARKET_ODDS,
   type PredictionFacts,
 } from './social/predictionManager';
+import {
+  initBracketTables, getBracket, createBracket, eliminatePlayer as eliminateBracketPlayer,
+  addSideBet as addBracketSideBet,
+} from './social/bracketManager';
 
 // ========== Sentry (optional, prod-only crash reporting) ==========
 // Initialized BEFORE the express app + socket.io server so any synchronous
@@ -7153,6 +7157,50 @@ Give feedback in this JSON format:
     } catch { socket.emit('predictionError', { message: 'Pick failed' }); }
   });
 
+  // ===== Social Bracket tournaments (durable + live) — Phase 3d 2026-06-18 =====
+  const bracketRoom = (id: string) => `bracket:${String(id).toUpperCase()}`;
+  socket.on('createSocialBracket', async (data: { bracketId?: string; name?: string; theme?: string; players?: string[] }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) { socket.emit('socialBracketError', { message: 'Sign in to create a bracket' }); return; }
+    try {
+      const res = await createBracket(auth.userId, String(data?.bracketId || ''), String(data?.name || 'Bracket'), String(data?.theme || 'neon'), Array.isArray(data?.players) ? data!.players! : []);
+      if (!res.ok || !res.state) { socket.emit('socialBracketError', { message: res.error || 'Could not create' }); return; }
+      socket.join(bracketRoom(res.state.bracketId));
+      socket.emit('socialBracketRole', { bracketId: res.state.bracketId, isOrganizer: true });
+      io.to(bracketRoom(res.state.bracketId)).emit('socialBracketState', res.state);
+    } catch { socket.emit('socialBracketError', { message: 'Could not create' }); }
+  });
+  socket.on('getSocialBracket', async (data: { bracketId?: string }) => {
+    const id = String(data?.bracketId || '').toUpperCase();
+    if (!id) { socket.emit('socialBracketError', { message: 'No bracket id' }); return; }
+    try {
+      const state = await getBracket(id);
+      if (!state) { socket.emit('socialBracketError', { message: 'Bracket not found' }); return; }
+      const auth = authSessions.get(socket.id);
+      socket.join(bracketRoom(id));
+      socket.emit('socialBracketRole', { bracketId: id, isOrganizer: !!auth?.userId && auth.userId === state.createdBy });
+      socket.emit('socialBracketState', state);
+    } catch { socket.emit('socialBracketError', { message: 'Failed to load bracket' }); }
+  });
+  socket.on('socialBracketEliminate', async (data: { bracketId?: string; playerName?: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) { socket.emit('socialBracketError', { message: 'Not signed in' }); return; }
+    try {
+      const res = await eliminateBracketPlayer(String(data?.bracketId || ''), auth.userId, String(data?.playerName || ''));
+      if (!res.ok || !res.state) { socket.emit('socialBracketError', { message: res.error || 'Could not eliminate' }); return; }
+      io.to(bracketRoom(res.state.bracketId)).emit('socialBracketState', res.state);
+    } catch { socket.emit('socialBracketError', { message: 'Could not eliminate' }); }
+  });
+  socket.on('placeSocialSideBet', async (data: { bracketId?: string; target?: string; amount?: number }) => {
+    const auth = authSessions.get(socket.id);
+    const bettor = auth?.username || 'Guest';
+    try {
+      const res = await addBracketSideBet(String(data?.bracketId || ''), bettor, String(data?.target || ''), Number(data?.amount));
+      if (!res.ok || !res.state) { socket.emit('socialBracketError', { message: res.error || 'Could not place bet' }); return; }
+      io.to(bracketRoom(res.state.bracketId)).emit('socialBracketState', res.state);
+    } catch { socket.emit('socialBracketError', { message: 'Could not place bet' }); }
+  });
+
   // ========== Sit Out ==========
 
   socket.on('sitOut', async () => {
@@ -9389,6 +9437,7 @@ initDB().then(async () => {
   initClubTables();
   try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }
   try { await initPredictionTables(); } catch (e) { console.error('[prediction] initPredictionTables failed', e); }
+  try { await initBracketTables(); } catch (e) { console.error('[bracket] initBracketTables failed', e); }
 
   // One-time chip recovery grant for admin — compensates for the
   // "disconnect wiped my wallet" bug (fixed in commit 03b5170). Guarded
