@@ -454,10 +454,47 @@ function incrementChipVelocityAlert(userId: number): number {
   return newCount;
 }
 
-// Module-scope audit log (used by anti-cheat auto-ban, admin ops, and buy-in audit)
+// Module-scope audit log (used by anti-cheat auto-ban, admin ops, and buy-in audit).
+//
+// 2026-06-19 Phase-0 observability: was stdout-only — chip grants, bans, and
+// buy-in audits left NO durable, queryable trail (Cloud Run / Railway log
+// retention is short and unsearchable for forensics). Now it ALSO writes a row
+// to a durable `audit_log` Postgres table. The DB write is best-effort + fully
+// non-blocking: it never awaits on the caller's path and an audit failure can
+// never affect a chip/ban operation (it only logs + surfaces to Sentry). The
+// stdout line is kept so existing log-based tooling is unaffected.
+let _auditTableReady = false;
+async function _ensureAuditTable(): Promise<void> {
+  if (_auditTableReady) return;
+  const pool = getPool();
+  await pool.query(`CREATE TABLE IF NOT EXISTS audit_log (
+    id BIGSERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    actor TEXT,
+    action TEXT NOT NULL,
+    details JSONB
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_log_ts ON audit_log (ts DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action, ts DESC)`);
+  _auditTableReady = true;
+}
 function auditLog(actorUsername: string, action: string, details: Record<string, unknown> = {}) {
   const entry = `[AUDIT] ${new Date().toISOString()} | ${actorUsername} | ${action} | ${JSON.stringify(details)}`;
   console.log(entry);
+  // Durable, best-effort, non-blocking — fire and forget. Audit must never be
+  // on the critical path of a chip/ban mutation.
+  void (async () => {
+    try {
+      await _ensureAuditTable();
+      await getPool().query(
+        'INSERT INTO audit_log (actor, action, details) VALUES ($1, $2, $3)',
+        [actorUsername || null, action, details || {}]
+      );
+    } catch (e: any) {
+      try { if (Sentry) Sentry.captureException(e, { tags: { area: 'auditLog' }, extra: { action } }); } catch (_) {}
+      try { console.warn('[AUDIT] durable write failed (non-fatal):', e?.message); } catch (_) {}
+    }
+  })();
 }
 
 // ========== Testing-mode unlimited chip refills ==========
