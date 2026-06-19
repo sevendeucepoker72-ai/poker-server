@@ -456,13 +456,23 @@ function incrementChipVelocityAlert(userId: number): number {
 
 // Module-scope audit log (used by anti-cheat auto-ban, admin ops, and buy-in audit).
 //
-// 2026-06-19 Phase-0 observability: was stdout-only — chip grants, bans, and
-// buy-in audits left NO durable, queryable trail (Cloud Run / Railway log
-// retention is short and unsearchable for forensics). Now it ALSO writes a row
-// to a durable `audit_log` Postgres table. The DB write is best-effort + fully
-// non-blocking: it never awaits on the caller's path and an audit failure can
-// never affect a chip/ban operation (it only logs + surfaces to Sentry). The
-// stdout line is kept so existing log-based tooling is unaffected.
+// 2026-06-19 Phase-0 observability: was stdout-only — admin chip grants, restores,
+// and bans left NO durable, queryable trail. Now those FORENSIC-CRITICAL events
+// ALSO write a row to a durable `audit_log` Postgres table.
+//
+// 2026-06-19 SAME-DAY CORRECTION: my first version wrote EVERY auditLog call to
+// the DB — but auditLog also fires on every buy-in / quickplay join / per-game
+// SYSTEM event (high frequency). The shared Cloud SQL instance is db-f1-micro
+// (~25 max connections for the WHOLE platform), so a per-game-event INSERT added
+// real connection-pool pressure and plausibly aggravated the evening /public
+// 500-burst. Fix: gate the durable write to an ALLOWLIST of low-frequency,
+// forensic-critical actions (admin money/ban + qualifier credit moves). All
+// events still hit stdout; only these few also persist. (The real fix for the
+// 500s is upsizing the db-f1-micro tier — tracked separately.)
+const DURABLE_AUDIT_ACTIONS = new Set([
+  'GRANT_CHIPS', 'RESTORE_BALANCE', 'BAN_USER', 'UNBAN_USER',
+  'QUALIFIER_REENTRY_CREDIT_CONSUME', 'QUALIFIER_REENTRY_CREDIT_REFUND',
+]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
   if (_auditTableReady) return;
@@ -481,6 +491,9 @@ async function _ensureAuditTable(): Promise<void> {
 function auditLog(actorUsername: string, action: string, details: Record<string, unknown> = {}) {
   const entry = `[AUDIT] ${new Date().toISOString()} | ${actorUsername} | ${action} | ${JSON.stringify(details)}`;
   console.log(entry);
+  // Only forensic-critical, low-frequency actions get the durable DB row (see
+  // the DURABLE_AUDIT_ACTIONS note above re: the db-f1-micro connection ceiling).
+  if (!DURABLE_AUDIT_ACTIONS.has(action)) return;
   // Durable, best-effort, non-blocking — fire and forget. Audit must never be
   // on the critical path of a chip/ban mutation.
   void (async () => {
