@@ -1636,8 +1636,20 @@ export class PokerTable extends EventEmitter {
     // Note: awardPots() internally calls calculatePots() as well. This second call
     // is intentional — it provides the named pot list for the hand history record.
     // calculatePots() now includes a consistency check (Issue #3 fix) so any
-    // mismatch between pot totals and invested amounts will throw here.
-    const pots = this.sidePotManager.calculatePots(seatInfos);
+    // mismatch between pot totals and invested amounts will throw.
+    // 2026-06-19: GUARD this redundant recompute. Chips are ALREADY credited
+    // above (awardPots ran its own consistency check BEFORE paying — the correct
+    // fail point). If this purely-for-hand-history recompute threw, it would
+    // wedge the table in Showdown with chips paid and the fairness seed never
+    // revealed. Fall back to a synthetic breakdown so determineWinners always
+    // finishes (emits handResult/handHistory/deckSeedRevealed → HandComplete).
+    let pots: any[];
+    try {
+      pots = this.sidePotManager.calculatePots(seatInfos);
+    } catch (e) {
+      console.error('[PokerTable.determineWinners] pot-breakdown recompute threw post-payment; using synthetic breakdown:', (e as Error)?.message);
+      pots = [];
+    }
     // Build per-pot winner amounts from perPot details (available in multi-player path)
     // For single-player (fold) path, winnerInfos already has the right data.
     const potBreakdown = pots.map(p => {

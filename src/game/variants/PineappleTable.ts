@@ -1,7 +1,6 @@
 import { Card, Rank } from '../Card';
 import {
   PokerTable,
-  GamePhase,
   TableConfig,
 } from '../PokerTable';
 import { TexasHoldemVariant } from './TexasHoldemVariant';
@@ -58,21 +57,23 @@ export class PineappleTable extends PokerTable {
   }
 
   /**
-   * Override: deal community cards for a phase. Adds the auto-discard step
-   * at the appropriate boundary (before flop for Pineapple, before turn for
-   * Crazy Pineapple).
+   * Override the LOW-LEVEL community dealer (not dealCommunityCardsForPhase) so
+   * the forced discard fires on BOTH the normal street path AND the all-in
+   * `runOutBoard()` — runOutBoard deals via dealCommunityCards() directly and
+   * bypasses dealCommunityCardsForPhase, which previously let an all-in player
+   * reach showdown still holding all 3 hole cards (best-5-of-8 — unfair).
+   * 2026-06-19 fix. Keyed off board size so it triggers exactly once at the
+   * correct boundary: before the flop (Pineapple) / before the turn (Crazy).
+   * autoDiscardOne() is a no-op for seats already at 2 cards, so it's safe even
+   * if both paths were to reach it.
    */
-  protected dealCommunityCardsForPhase(phase: GamePhase): void {
-    // Auto-discard timing
-    if (!this.isCrazyPineapple && phase === GamePhase.Flop) {
-      // Pineapple: discard before flop is dealt
-      this.autoDiscardOne();
+  protected dealCommunityCards(count: number): void {
+    if (!this.isCrazyPineapple && this.communityCards.length === 0) {
+      this.autoDiscardOne();   // Pineapple: discard before the flop
+    } else if (this.isCrazyPineapple && this.communityCards.length === 3) {
+      this.autoDiscardOne();   // Crazy Pineapple: discard before the turn
     }
-    if (this.isCrazyPineapple && phase === GamePhase.Turn) {
-      // Crazy Pineapple: discard before turn is dealt
-      this.autoDiscardOne();
-    }
-    super.dealCommunityCardsForPhase(phase);
+    super.dealCommunityCards(count);
   }
 
   /**
