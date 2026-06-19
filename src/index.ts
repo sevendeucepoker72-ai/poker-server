@@ -1878,12 +1878,20 @@ function scheduleAIAction(tableId: string): void {
           if (!drawTable.drawsCompleted.has(seat.seatIndex)) {
             const delay = 500 + Math.floor(Math.random() * 1000);
             setTimeout(() => {
-              // Simple AI draw logic: stand pat if hand is decent, discard worst cards otherwise
-              const discardCount = Math.floor(Math.random() * 3); // 0-2 cards
-              const indices: number[] = [];
-              for (let i = 0; i < discardCount && i < seat.holeCards.length; i++) {
-                indices.push(i);
+              // 2026-06-19 fix: discard the WORST cards deterministically (keep
+              // pairs/trips/quads, else keep the two highest), capped at 3.
+              // Previously this discarded a RANDOM count of the FIRST cards, so
+              // the bot's post-draw hand had nothing to do with its betting.
+              const cards = seat.holeCards;
+              const byRank = new Map<number, number[]>();
+              cards.forEach((c: any, i: number) => { const a = byRank.get(c.rank) || []; a.push(i); byRank.set(c.rank, a); });
+              const keep = new Set<number>();
+              for (const idxs of byRank.values()) if (idxs.length >= 2) idxs.forEach((i) => keep.add(i));
+              if (keep.size === 0) {
+                // No made pair — keep the two highest cards, draw the other three.
+                [...cards.keys()].sort((a, b) => cards[b].rank - cards[a].rank).slice(0, 2).forEach((i) => keep.add(i));
               }
+              const indices: number[] = [...cards.keys()].filter((i) => !keep.has(i)).slice(0, 3);
               drawTable.playerDraw(seat.seatIndex, indices);
               broadcastGameState(tableId);
               // After all draws, the table will advance and we need to schedule next AI action
@@ -2767,10 +2775,34 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
               lastHandAt: Date.now(),
             });
 
+            // 2026-06-19 fix: also persist the COUNTER stats that feed
+            // counter-based achievements. mergeUserStats above only covers
+            // hands/biggestPot; without these, progress toward bluff/all-in/
+            // rare-hand/tournament/variant/streak achievements was held only in
+            // memory and reset to the last-saved value on every reconnect
+            // (hydrateFromDB reads exactly these keys, ProgressionManager.ts:502-513).
+            // saveProgress JSONB-merges, so other stats keys are preserved; the
+            // hydrated gate + only-go-up nature means no regression.
+            const raw = progressionManager.getProgress(session.playerId) as any;
+            const counterStats = raw ? {
+              bestStreak: raw.bestStreak,
+              bluffWins: raw.bluffWins,
+              allInWins: raw.allInWins,
+              chatMessagesSent: raw.chatMessagesSent,
+              straightFlushHits: raw.straightFlushHits,
+              fullHouseHits: raw.fullHouseHits,
+              quadsHits: raw.quadsHits,
+              royalFlushHits: raw.royalFlushHits,
+              tournamentsWon: raw.tournamentsWon,
+              tournamentsPlayed: raw.tournamentsPlayed,
+              variantsPlayed: raw.variantsPlayed,
+            } : undefined;
+
             await saveProgress(authSession.userId, {
               xp: clientProgress.xp,
               level: clientProgress.level,
               achievements: clientProgress.achievements || [],
+              ...(counterStats ? { stats: counterStats } : {}),
             }).catch((e) => console.warn(`[saveProgress hand-complete ${authSession.userId}]`, e?.message));
           } else {
             console.warn(`[hand-complete] SKIPPED save for userId=${authSession.userId} — progress not hydrated yet (would have overwritten real values with fresh-init)`);
@@ -5531,9 +5563,20 @@ Give feedback in this JSON format:
           socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
           return;
         }
+        // 2026-06-19 fix: the two DB ops aren't a single transaction, so if the
+        // chip credit fails AFTER stars are already deducted, refund the stars
+        // (otherwise: stars lost, no chips). Update the in-memory mirror only
+        // after BOTH DB ops succeed.
+        const credited = await addChipsToUser(ctx.userId, payout).catch(() => false);
+        if (!credited) {
+          try { await addStarsToUser(ctx.userId, cost); } catch { /* logged below */ }
+          auditLog('SYSTEM', 'CHIP_PACK_CREDIT_FAILED_REFUND', { userId: ctx.userId, cost, payout });
+          socket.emit('purchaseResult', { success: false, error: 'Purchase failed — stars refunded' });
+          sendProgressToPlayer(socket.id);
+          return;
+        }
         progress.stars -= cost;
         progress.chips += payout;
-        await addChipsToUser(ctx.userId, payout);
         socket.emit('purchaseResult', { success: true, itemType, itemId, cost, payout });
         sendProgressToPlayer(socket.id);
         return;
@@ -6499,18 +6542,46 @@ Give feedback in this JSON format:
         const playerId = `player-${uuidv4()}`;
         // Ghost-seat defense (authWithTicket path): clear any lingering
         // seat from a previous session before re-seating.
-        {
-          const authNow = authSessions.get(socket.id);
-          if (authNow) clearGhostSeatsForUser(authNow.userId, bestTable.tableId, socket.id, targetSeat);
+        const authNow = authSessions.get(socket.id);
+        if (authNow) clearGhostSeatsForUser(authNow.userId, bestTable.tableId, socket.id, targetSeat);
+
+        // 2026-06-19 P0 chip-mint fix: deduct the buy-in from the wallet, exactly
+        // like the normal joinTable path (index.ts:5056). This waitlist path
+        // previously seated with minBuyIn but NEVER deducted — and on leave
+        // creditSeatStackToWallet cashes the (cash-table) stack back to the
+        // wallet (it only skips tournament tables), minting >= minBuyIn per
+        // at-venue waitlist seating. Deducting here makes the seat wallet-neutral.
+        const waitlistBuyIn = table.config.minBuyIn;
+        if (authNow) {
+          const dbChips = await ensureChipsForBuyIn(authNow.userId, authNow.username, waitlistBuyIn);
+          if (waitlistBuyIn > dbChips) {
+            socket.emit('error', { message: 'Insufficient chips' });
+            return;
+          }
+          if (!(await deductChips(authNow.userId, waitlistBuyIn))) {
+            socket.emit('error', { message: 'Could not deduct chips — try again' });
+            return;
+          }
+          auditLog(authNow.username, 'BUY_IN_DEDUCT', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, reason: 'waitlist' });
         }
+
         const success = table.sitDown(
           targetSeat,
           playerName,
-          table.config.minBuyIn,
+          waitlistBuyIn,
           playerId,
           false
         );
         if (!success) {
+          // Roll back the deduction so a failed seat can't debit the player.
+          if (authNow) {
+            try {
+              await addChipsToUser(authNow.userId, waitlistBuyIn);
+              auditLog(authNow.username, 'BUY_IN_REFUND', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, reason: 'waitlist_sitDown_failed' });
+            } catch (e) {
+              auditLog(authNow.username, 'BUY_IN_REFUND_FAILED', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, error: String(e) });
+            }
+          }
           socket.emit('error', { message: 'Could not join table' });
           return;
         }
@@ -8142,6 +8213,11 @@ Give feedback in this JSON format:
 
   // Toggle tournament speed
   socket.on('setTournamentSpeed', async (data: { tournamentId: string; turbo: boolean }) => {
+    // 2026-06-19 fix: gate on admin. Previously ANY connected socket could flip
+    // ANY tournament's turbo mode (it only needed a tournamentId) — an
+    // unauthorized control over every player's tournament pace.
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
     const tournament = tournamentManager.getTournament(data.tournamentId);
     if (!tournament) return;
     tournament.turboMode = data.turbo;
@@ -9429,7 +9505,17 @@ setInterval(() => {
 
 // REST endpoint to start a simulated tournament
 app.post('/api/tournament/simulate', (req, res) => {
-  const playerCount = req.body?.playerCount || 200;
+  // 2026-06-19 fix: this was unauthenticated with an UNCAPPED playerCount —
+  // a single POST with playerCount:100000 would spin up an enormous multi-table
+  // tournament (resource-exhaustion DoS). Clamp to a sane range, and require the
+  // internal token when one is configured (no-op if the env var is unset, so a
+  // legit dev/admin caller without it still works in non-prod).
+  const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+  if (tok && req.headers['x-internal-token'] !== tok) {
+    res.status(403).json({ error: 'forbidden' });
+    return;
+  }
+  const playerCount = Math.max(2, Math.min(1000, Math.floor(Number(req.body?.playerCount) || 200)));
   const turbo = req.body?.turbo || false;
 
   const result = startMultiTableTournament(playerCount, undefined, undefined, undefined, turbo);

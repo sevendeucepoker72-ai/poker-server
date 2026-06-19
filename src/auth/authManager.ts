@@ -933,19 +933,22 @@ export async function updateLoginStreak(userId: number, streak: number): Promise
 /** Increment hands_since_last_scratch; if it crosses 20, bank a card and reset the counter. Returns whether a card was awarded. */
 export async function tickScratchProgress(userId: number): Promise<boolean> {
   try {
+    // 2026-06-19 fix: do the increment + cross-threshold reset/award in ONE
+    // atomic UPDATE. The previous two-statement version (increment, read, then a
+    // separate reset+award) let two concurrent hand-completes for the same user
+    // both read >=20 and both award → double-banked card. After this single
+    // statement, hands_since_last_scratch is 0 exactly when a card was just
+    // awarded (a +1 can never produce 0 otherwise), so that's our award signal.
     const { rows } = await pool.query(
-      `UPDATE users SET hands_since_last_scratch = hands_since_last_scratch + 1 WHERE id = $1 RETURNING hands_since_last_scratch`,
+      `UPDATE users SET
+         hands_since_last_scratch = CASE WHEN hands_since_last_scratch + 1 >= 20 THEN 0 ELSE hands_since_last_scratch + 1 END,
+         scratch_cards_available = scratch_cards_available + CASE WHEN hands_since_last_scratch + 1 >= 20 THEN 1 ELSE 0 END
+       WHERE id = $1
+       RETURNING hands_since_last_scratch`,
       [userId]
     );
     if (rows.length === 0) return false;
-    if (rows[0].hands_since_last_scratch >= 20) {
-      await pool.query(
-        `UPDATE users SET hands_since_last_scratch = 0, scratch_cards_available = scratch_cards_available + 1 WHERE id = $1`,
-        [userId]
-      );
-      return true;
-    }
-    return false;
+    return rows[0].hands_since_last_scratch === 0;
   } catch (e: any) {
     console.warn(`[tickScratchProgress ${userId}]`, e.message);
     return false;
