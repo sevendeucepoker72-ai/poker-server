@@ -6008,15 +6008,18 @@ Give feedback in this JSON format:
 
   // Achievements panel — 3-bucket summary (daily / weekly / lifetime) with
   // per-entry unlock status + reward + window end timestamps for countdown.
-  socket.on('getAchievements', () => {
-    const session = playerSessions.get(socket.id);
-    const playerId = session?.playerId;
+  socket.on('getAchievements', async () => {
+    const empty = { daily: [], weekly: [], lifetime: [], windowEndsAt: { daily: 0, weekly: 0 } };
+    // Resolve playerId from the table seat if present, else from the auth
+    // session (so the lobby Achievement Badges / panel work when not seated).
+    let playerId = playerSessions.get(socket.id)?.playerId;
     if (!playerId) {
-      socket.emit('achievementsList', { daily: [], weekly: [], lifetime: [], windowEndsAt: { daily: 0, weekly: 0 } });
-      return;
+      const ctx = await ensureHydrated(socket);
+      playerId = ctx?.playerId;
     }
+    if (!playerId) { socket.emit('achievementsList', empty); return; }
     const summary = progressionManager.getAchievementsSummary(playerId);
-    socket.emit('achievementsList', summary || { daily: [], weekly: [], lifetime: [], windowEndsAt: { daily: 0, weekly: 0 } });
+    socket.emit('achievementsList', summary || empty);
   });
 
   // Load durable extras (inventory, battle pass claims, hand history, prefs) —
