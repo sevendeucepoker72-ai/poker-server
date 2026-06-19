@@ -855,11 +855,26 @@ async function getQualifiedPlayers(tier: string): Promise<QualifiedPlayer[]> {
   return qualifiedPlayers.get(tier) || [];
 }
 
+// 2026-06-19 audit fix — server-authoritative qualifier-entry gate.
+// A player is eligible for a tier's qualifier tournaments iff they hold at
+// least one credit of that tier. Matches on the MASTER user id (= OIDC sub =
+// qualifier_credits.player_id), NEVER poker-server's local int users.id. Per
+// the master-side model (see fetchQualifiersFromMaster) a credit qualifies the
+// player until they've actually played — redemption is a registration marker,
+// not consumption — so this is a read-only check that never mutates credits.
+async function isPlayerQualified(masterId: string, tier: string): Promise<boolean> {
+  if (!masterId) return false;
+  const list = await getQualifiedPlayers(tier);
+  return list.some((p) => String(p.playerId) === masterId);
+}
+
 // REST endpoint: get qualified players for a tier
 app.get('/api/qualifiers/:tier', async (req, res) => {
   const tier = req.params.tier || 'weekly';
   const players = await getQualifiedPlayers(tier);
-  res.json({ success: true, tier, count: players.length, players });
+  // 2026-06-19 audit fix — strip phone (PII) from this unauthenticated endpoint.
+  const safe = players.map(({ phone, ...rest }) => rest);
+  res.json({ success: true, tier, count: safe.length, players: safe });
 });
 
 // REST endpoint: force refresh qualifier cache
@@ -3195,6 +3210,14 @@ io.on('connection', (socket: Socket) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Must be logged in' }); return; }
 
+    // 2026-06-19 audit fix — identity for the qualification gate is the MASTER
+    // user id (the OIDC sub stashed at oauthLogin), not the local int userId.
+    const masterId = auth.masterUserId ? String(auth.masterUserId) : '';
+    if (!masterId) {
+      socket.emit('qualifierRegistrationResult', { success: false, error: 'Your account is not fully linked yet — please sign out and back in, then try again.' });
+      return;
+    }
+
     const qualId = data.qualifierId;
     let qt = qualifierTournaments.get(qualId);
 
@@ -3246,6 +3269,18 @@ io.on('connection', (socket: Socket) => {
 
     if (qt.status !== 'registering' && !isLateReg) {
       socket.emit('qualifierRegistrationResult', { success: false, error: 'Tournament is no longer accepting registrations' });
+      return;
+    }
+
+    // 2026-06-19 audit fix (CRITICAL) — server-authoritative qualification gate.
+    // Previously NOTHING here verified qualification: the ".online You're
+    // Qualified!" button was UX-only, so any logged-in player could emit this
+    // event and be registered + auto-seated into a qualifier they never earned.
+    // Now require a credit of this tier (read-only check keyed on the master id).
+    // Placed before BOTH the re-entry and first-entry branches so it covers all
+    // entry paths.
+    if (!(await isPlayerQualified(masterId, qt.qualifierType))) {
+      socket.emit('qualifierRegistrationResult', { success: false, error: `You need a ${qt.qualifierType} qualifier credit to enter. Earn one by finishing top-5 in a live game (weekly) or finishing top-20% of your league standings (monthly).` });
       return;
     }
 
@@ -3304,19 +3339,23 @@ io.on('connection', (socket: Socket) => {
         let consumedCreditId: string | null = null;
         if (qt.requiresQualifierCredit) {
           try {
+            // 2026-06-19 audit fix — was keyed on auth.userId (local int) vs the
+            // master-UUID player_id (matched 0 rows) AND wrote the slug qualId
+            // into the UUID column redeemed_for_qualifier_id (cast error). Now
+            // keys on masterId, filters by tier, and records the qualifier in
+            // notes (a text column) instead of the UUID column.
             const credRes = await getPool().query(
               `UPDATE qualifier_credits
                   SET redeemed_at = NOW(),
-                      redeemed_for_qualifier_id = $1,
-                      notes = COALESCE(notes, '') || ' [re-entry]'
+                      notes = COALESCE(notes, '') || ' [re-entry:' || $1 || ']'
                 WHERE id = (
                   SELECT id FROM qualifier_credits
-                   WHERE player_id = $2 AND redeemed_at IS NULL
-                   ORDER BY created_at ASC
+                   WHERE player_id = $2 AND tier = $3 AND redeemed_at IS NULL
+                   ORDER BY earned_at ASC NULLS LAST, created_at ASC
                    LIMIT 1
                 )
                 RETURNING id`,
-              [qualId, auth.userId]
+              [qualId, masterId, qt.qualifierType]
             );
             if (credRes.rows.length === 0) {
               // Refund the chip buy-in we just took (if any) — the
@@ -3387,7 +3426,7 @@ io.on('connection', (socket: Socket) => {
           if (consumedCreditId) {
             try {
               await getPool().query(
-                `UPDATE qualifier_credits SET redeemed_at = NULL, redeemed_for_qualifier_id = NULL WHERE id = $1`,
+                `UPDATE qualifier_credits SET redeemed_at = NULL WHERE id = $1`,
                 [consumedCreditId]
               );
               auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_REFUND', { qualifierId: qualId, creditId: consumedCreditId, reason: 'no_seat' });
