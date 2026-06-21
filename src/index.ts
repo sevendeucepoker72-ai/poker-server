@@ -207,6 +207,50 @@ if (process.env.REDIS_URL) {
   }).catch(() => console.warn('[Redis] @socket.io/redis-adapter not available'));
 }
 
+// ---------------------------------------------------------------------------
+// Auth-error telemetry (observability ONLY)
+// ---------------------------------------------------------------------------
+// Best-effort, throttled reporter that forwards .online token / ticket /
+// waitlist auth FAILURES to the central auth_events sink (the Auth Health page
+// + watchdog). This NEVER changes an auth decision, validation, or socket
+// flow — it only fires alongside the existing failure emits.
+//
+// - Fire-and-forget: never awaited in the socket hot path, never throws.
+// - Throttled: each eventType posts at most once per ~2s so an outage storm
+//   coalesces (the watchdog needs presence/volume trend, not every failure).
+// - Reuses the SAME shared key env var (AUTH_SERVER_BYPASS_KEY) + base URL
+//   (MASTER_API_URL) the unauth /users/:id/me fetches already use. If the key
+//   env is missing, it no-ops silently.
+const AUTH_EVENT_THROTTLE_MS = 2000;
+const authEventLastSent = new Map<string, number>();
+function reportAuthEvent(eventType: string, detail: Record<string, any>): void {
+  try {
+    const key = process.env.AUTH_SERVER_BYPASS_KEY || '';
+    if (!key) return; // no shared key configured — no-op silently
+    const now = Date.now();
+    const last = authEventLastSent.get(eventType) || 0;
+    if (now - last < AUTH_EVENT_THROTTLE_MS) return; // throttle storms
+    authEventLastSent.set(eventType, now);
+
+    const base =
+      process.env.MASTER_API_URL ||
+      'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+    // Fire-and-forget — do NOT await; swallow every failure. Uses the same
+    // global fetch the other master-API calls in this file rely on.
+    fetch(`${base}/auth-events/log`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Auth-Server-Key': key,
+        },
+        body: JSON.stringify({ eventType, origin: 'poker-server', detail }),
+      })
+      .catch(() => {});
+  } catch {
+    /* telemetry must never affect auth flow */
+  }
+}
+
 const tableManager = new TableManager();
 const progressionManager = new ProgressionManager();
 const tournamentManager = new TournamentManager();
@@ -3852,6 +3896,7 @@ Give feedback in this JSON format:
     try {
       const oauthResult = await validateOAuthToken(data.accessToken);
       if (!oauthResult.valid || !oauthResult.sub) {
+        reportAuthEvent('introspection_failed', { error: oauthResult.error || 'invalid', via: 'oauthLogin' });
         socket.emit('loginResult', { success: false, error: oauthResult.error || 'Invalid token' });
         return;
       }
@@ -6271,17 +6316,20 @@ Give feedback in this JSON format:
           return;
         }
         if (!verifyRes.ok) {
+          reportAuthEvent('ticket_auth_failed', { reason: `verify_http_${verifyRes.status}` });
           socket.emit('loginResult', { success: false, error: 'Token verify failed' });
           return;
         }
         const verifyJson: any = await verifyRes.json();
         const payload = verifyJson?.data || verifyJson;
         if (!payload?.valid) {
+          reportAuthEvent('ticket_auth_failed', { reason: `invalid_token:${payload?.reason || 'unknown'}` });
           socket.emit('loginResult', { success: false, error: `Invalid token: ${payload?.reason || 'unknown'}` });
           return;
         }
         const remoteUserId = payload.payload?.userId;
         if (!remoteUserId) {
+          reportAuthEvent('ticket_auth_failed', { reason: 'token_missing_userId' });
           socket.emit('loginResult', { success: false, error: 'Token missing userId' });
           return;
         }
@@ -6299,6 +6347,7 @@ Give feedback in this JSON format:
           return;
         }
         if (!meRes.ok) {
+          reportAuthEvent('ticket_auth_failed', { reason: `me_fetch_http_${meRes.status}` });
           socket.emit('loginResult', { success: false, error: 'Could not load user' });
           return;
         }
@@ -6556,8 +6605,11 @@ Give feedback in this JSON format:
                   authSessions.set(socket.id, { userId: urows[0].id, username: urows[0].username });
                 }
               }
+            } else {
+              reportAuthEvent('waitlist_auth_failed', { reason: `me_fetch_http_${meRes.status}` });
             }
           } catch (e) {
+            reportAuthEvent('waitlist_auth_failed', { reason: 'me_fetch_error' });
             console.warn('[joinWithWaitlistContext] auth-bootstrap failed:', (e as Error).message);
           }
         }
@@ -6566,6 +6618,7 @@ Give feedback in this JSON format:
         // abort rather than seating an unauthenticated player who will then
         // silently fail on every subsequent action.
         if (!authSessions.has(socket.id)) {
+          reportAuthEvent('waitlist_auth_failed', { reason: 'no_auth_session' });
           socket.emit('error', { message: 'Authentication could not be established — please sign in and try again.' });
           return;
         }
