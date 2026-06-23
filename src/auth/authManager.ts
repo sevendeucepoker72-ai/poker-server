@@ -886,7 +886,7 @@ export async function equipItem(userId: number, itemType: string, itemId: string
 export async function hasClaimedToday(userId: number, claimType: string): Promise<boolean> {
   try {
     const { rowCount } = await pool.query(
-      `SELECT 1 FROM user_daily_claims WHERE user_id = $1 AND claim_type = $2 AND claim_date = CURRENT_DATE`,
+      `SELECT 1 FROM user_daily_claims WHERE user_id = $1 AND claim_type = $2 AND claim_date = (NOW() AT TIME ZONE 'America/Denver')::date`,
       [userId, claimType]
     );
     return (rowCount || 0) > 0;
@@ -907,7 +907,7 @@ export async function hasClaimedToday(userId: number, claimType: string): Promis
 export async function recordDailyClaim(userId: number, claimType: string, payload: any = null): Promise<boolean> {
   try {
     const { rowCount } = await pool.query(
-      `INSERT INTO user_daily_claims (user_id, claim_type, claim_date, payload) VALUES ($1, $2, CURRENT_DATE, $3)
+      `INSERT INTO user_daily_claims (user_id, claim_type, claim_date, payload) VALUES ($1, $2, (NOW() AT TIME ZONE 'America/Denver')::date, $3)
          ON CONFLICT (user_id, claim_type, claim_date) DO NOTHING`,
       [userId, claimType, payload ? JSON.stringify(payload) : null]
     );
@@ -922,7 +922,7 @@ export async function recordDailyClaim(userId: number, claimType: string, payloa
 export async function updateLoginStreak(userId: number, streak: number): Promise<void> {
   try {
     await pool.query(
-      `UPDATE users SET login_streak = $1, last_login_claim_date = CURRENT_DATE WHERE id = $2`,
+      `UPDATE users SET login_streak = $1, last_login_claim_date = (NOW() AT TIME ZONE 'America/Denver')::date WHERE id = $2`,
       [streak, userId]
     );
   } catch (e: any) {
