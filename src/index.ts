@@ -3935,31 +3935,51 @@ Give feedback in this JSON format:
     if (offer.sellerId === auth.userId) { socket.emit('buyStakeResult', { success: false, error: 'Cannot back your own offer' }); return; }
 
     const totalCost = Math.round(data.pct * offer.pricePerPct);
-    // Deduct chips from backer atomically before mutating the offer.
-    const deducted = await deductChips(auth.userId, totalCost);
-    if (!deducted) { socket.emit('buyStakeResult', { success: false, error: 'Insufficient chips' }); return; }
-
-    // Credit seller immediately.
-    await addChipsToUser(offer.sellerId, totalCost);
-
-    offer.remaining -= data.pct;
-    offer.backers.push({ name: auth.username, pct: data.pct });
-    const settled = offer.remaining <= 0;
-    if (settled) stakingOffers.delete(data.offerId);
-
+    const client = await getPool().connect();
     try {
-      if (settled) {
-        await getPool().query(`UPDATE staking_offers SET remaining = 0, backers = $1, settled_at = NOW() WHERE id = $2`, [JSON.stringify(offer.backers), data.offerId]);
-      } else {
-        await getPool().query(`UPDATE staking_offers SET remaining = $1, backers = $2 WHERE id = $3`, [offer.remaining, JSON.stringify(offer.backers), data.offerId]);
-      }
-    } catch (e: any) {
-      console.warn('[Staking] buyStake DB update failed (chips already moved):', e.message);
-    }
+      await client.query('BEGIN');
 
-    auditLog(auth.username, 'STAKING_BUY', { offerId: data.offerId, pct: data.pct, totalCost, sellerId: offer.sellerId });
-    io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
-    socket.emit('buyStakeResult', { success: true });
+      // Deduct chips from backer — atomic check-and-subtract within the transaction.
+      const { rowCount: deducted } = await client.query(
+        'UPDATE users SET chips = chips - $1 WHERE id = $2 AND chips >= $1',
+        [totalCost, auth.userId]
+      );
+      if (!deducted) {
+        await client.query('ROLLBACK');
+        socket.emit('buyStakeResult', { success: false, error: 'Insufficient chips' });
+        return;
+      }
+
+      // Credit seller within the same transaction.
+      await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [totalCost, offer.sellerId]);
+
+      // Update the offer row.
+      const newRemaining = offer.remaining - data.pct;
+      const newBackers = [...offer.backers, { name: auth.username, pct: data.pct }];
+      const settled = newRemaining <= 0;
+      if (settled) {
+        await client.query(`UPDATE staking_offers SET remaining = 0, backers = $1, settled_at = NOW() WHERE id = $2`, [JSON.stringify(newBackers), data.offerId]);
+      } else {
+        await client.query(`UPDATE staking_offers SET remaining = $1, backers = $2 WHERE id = $3`, [newRemaining, JSON.stringify(newBackers), data.offerId]);
+      }
+
+      await client.query('COMMIT');
+
+      // Only mutate in-memory state after DB commit succeeds.
+      offer.remaining = newRemaining;
+      offer.backers = newBackers;
+      if (settled) stakingOffers.delete(data.offerId);
+
+      auditLog(auth.username, 'STAKING_BUY', { offerId: data.offerId, pct: data.pct, totalCost, sellerId: offer.sellerId });
+      io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
+      socket.emit('buyStakeResult', { success: true });
+    } catch (e: any) {
+      await client.query('ROLLBACK').catch(() => {});
+      console.error('[Staking] buyStake transaction failed:', e.message);
+      socket.emit('buyStakeResult', { success: false, error: 'Purchase failed — no chips were moved' });
+    } finally {
+      client.release();
+    }
   });
 
   socket.on('getStakes', async () => {
