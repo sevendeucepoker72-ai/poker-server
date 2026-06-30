@@ -3329,6 +3329,7 @@ io.on('connection', (socket: Socket) => {
         status: 'registering',
         tournamentId: null,
         blindStructure: [],
+        requiresQualifierCredit: true,
       };
       qualifierTournaments.set(qualId, qt);
     }
@@ -3547,6 +3548,37 @@ io.on('connection', (socket: Socket) => {
     const sameIpCount = qt.players.filter(p => (p as any).ip === regIp).length;
     if (sameIpCount >= 2) {
       socket.emit('qualifierRegistrationResult', { success: false, error: 'Too many registrations from this device' });
+      return;
+    }
+
+    // Consume a qualifier credit before registering (first-entry path).
+    // Mirrors the re-entry credit-consume block above. Atomic conditional
+    // UPDATE — stamps the oldest unredeemed credit for this user+tier.
+    // If no credit exists, isPlayerQualified() would have already rejected
+    // above, but we do the consume atomically here to prevent race conditions
+    // where two simultaneous registrations both pass the read-only check.
+    try {
+      const credRes = await getPool().query(
+        `UPDATE qualifier_credits
+            SET redeemed_at = NOW(),
+                notes = COALESCE(notes, '') || ' [entry:' || $1 || ']'
+          WHERE id = (
+            SELECT id FROM qualifier_credits
+             WHERE player_id = $2 AND tier = $3 AND redeemed_at IS NULL
+             ORDER BY earned_at ASC NULLS LAST, created_at ASC
+             LIMIT 1
+          )
+          RETURNING id`,
+        [qualId, masterId, qt.qualifierType]
+      );
+      if (credRes.rows.length === 0) {
+        socket.emit('qualifierRegistrationResult', { success: false, error: 'No qualifier credits available — your credit may have already been used.' });
+        return;
+      }
+      auditLog(auth.username, 'QUALIFIER_ENTRY_CREDIT_CONSUME', { qualifierId: qualId, creditId: credRes.rows[0].id, tier: qt.qualifierType });
+    } catch (err: any) {
+      console.error('[QualifierEntry] credit consume failed:', err);
+      socket.emit('qualifierRegistrationResult', { success: false, error: 'Server error consuming qualifier credit — please try again.' });
       return;
     }
 
