@@ -3862,12 +3862,31 @@ Give feedback in this JSON format:
   });
 
   // ========== Staking Marketplace ==========
+  // In-memory cache hydrated from DB on first use. Chips move via deductChips /
+  // addChipsToUser (atomic SQL) on each buyStake — no longer purely social.
   const stakingOffers: Map<string, any> = (global as any).__stakingOffers || ((global as any).__stakingOffers = new Map());
-  // Staking marketplace — a SOCIAL "back a player for % of winnings" board.
-  // No chips/stars move here (pure in-memory offers), so it's not an economy
-  // exploit surface. Phase 4 hardening: require an authenticated session and
-  // derive the seller/backer name SERVER-SIDE from auth.username — never trust
-  // a client-supplied playerName/buyerName (was identity-spoofable + anon).
+  if (!(global as any).__stakingHydrated) {
+    (global as any).__stakingHydrated = true;
+    getPool().query(`SELECT * FROM staking_offers WHERE settled_at IS NULL ORDER BY created_at ASC`)
+      .then(({ rows }) => {
+        for (const r of rows) {
+          stakingOffers.set(r.id, {
+            id: r.id,
+            tournamentId: r.tournament_id,
+            totalPct: Number(r.total_pct),
+            pricePerPct: Number(r.price_per_pct),
+            playerName: r.player_name,
+            sellerId: r.seller_id,
+            remaining: Number(r.remaining),
+            backers: r.backers || [],
+            createdAt: new Date(r.created_at).getTime(),
+          });
+        }
+        console.log(`[Staking] Hydrated ${rows.length} open offers from DB`);
+      })
+      .catch((e: any) => console.warn('[Staking] Hydration failed:', e.message));
+  }
+
   socket.on('createStake', async (data: { tournamentId: string; totalPct: number; pricePerPct: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth?.userId) { socket.emit('error', { message: 'Sign in to create a staking offer' }); return; }
@@ -3883,16 +3902,28 @@ Give feedback in this JSON format:
       tournamentId: String(data.tournamentId).slice(0, 64),
       totalPct: data.totalPct,
       pricePerPct: data.pricePerPct,
-      playerName: auth.username,        // server-derived identity, not client-supplied
+      playerName: auth.username,        // server-derived, not client-supplied
       sellerId: auth.userId,
       remaining: data.totalPct,
       backers: [] as { name: string; pct: number }[],
       createdAt: Date.now(),
     };
-    stakingOffers.set(id, offer);
-    io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
-    socket.emit('stakeCreated', { id });
+    try {
+      await getPool().query(
+        `INSERT INTO staking_offers (id, tournament_id, total_pct, price_per_pct, remaining, seller_id, player_name, backers)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, '[]')`,
+        [id, offer.tournamentId, offer.totalPct, offer.pricePerPct, offer.remaining, offer.sellerId, offer.playerName]
+      );
+      stakingOffers.set(id, offer);
+      auditLog(auth.username, 'STAKING_OFFER_CREATED', { offerId: id, tournamentId: offer.tournamentId, totalPct: offer.totalPct, pricePerPct: offer.pricePerPct });
+      io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
+      socket.emit('stakeCreated', { id });
+    } catch (e: any) {
+      console.error('[Staking] createStake DB error:', e.message);
+      socket.emit('error', { message: 'Failed to create staking offer' });
+    }
   });
+
   socket.on('buyStake', async (data: { offerId: string; pct: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth?.userId) { socket.emit('buyStakeResult', { success: false, error: 'Sign in to back a player' }); return; }
@@ -3901,12 +3932,36 @@ Give feedback in this JSON format:
     }
     const offer = stakingOffers.get(data.offerId);
     if (!offer || offer.remaining < data.pct) { socket.emit('buyStakeResult', { success: false, error: 'Offer unavailable' }); return; }
+    if (offer.sellerId === auth.userId) { socket.emit('buyStakeResult', { success: false, error: 'Cannot back your own offer' }); return; }
+
+    const totalCost = Math.round(data.pct * offer.pricePerPct);
+    // Deduct chips from backer atomically before mutating the offer.
+    const deducted = await deductChips(auth.userId, totalCost);
+    if (!deducted) { socket.emit('buyStakeResult', { success: false, error: 'Insufficient chips' }); return; }
+
+    // Credit seller immediately.
+    await addChipsToUser(offer.sellerId, totalCost);
+
     offer.remaining -= data.pct;
-    offer.backers.push({ name: auth.username, pct: data.pct }); // server-derived backer identity
-    if (offer.remaining <= 0) stakingOffers.delete(data.offerId);
+    offer.backers.push({ name: auth.username, pct: data.pct });
+    const settled = offer.remaining <= 0;
+    if (settled) stakingOffers.delete(data.offerId);
+
+    try {
+      if (settled) {
+        await getPool().query(`UPDATE staking_offers SET remaining = 0, backers = $1, settled_at = NOW() WHERE id = $2`, [JSON.stringify(offer.backers), data.offerId]);
+      } else {
+        await getPool().query(`UPDATE staking_offers SET remaining = $1, backers = $2 WHERE id = $3`, [offer.remaining, JSON.stringify(offer.backers), data.offerId]);
+      }
+    } catch (e: any) {
+      console.warn('[Staking] buyStake DB update failed (chips already moved):', e.message);
+    }
+
+    auditLog(auth.username, 'STAKING_BUY', { offerId: data.offerId, pct: data.pct, totalCost, sellerId: offer.sellerId });
     io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
     socket.emit('buyStakeResult', { success: true });
   });
+
   socket.on('getStakes', async () => {
     socket.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
   });

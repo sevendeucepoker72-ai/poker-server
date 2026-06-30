@@ -319,6 +319,23 @@ export async function initDB(): Promise<void> {
   `).catch((e: any) => console.warn('[Auth] user_weekly_achievements:', e.message));
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_weekly_ach_user_date ON user_weekly_achievements(user_id, week_start_date DESC)`).catch(() => {});
 
+  // Staking marketplace — persisted so offers survive Railway redeploys.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS staking_offers (
+      id UUID PRIMARY KEY,
+      tournament_id TEXT NOT NULL,
+      total_pct NUMERIC NOT NULL,
+      price_per_pct NUMERIC NOT NULL,
+      remaining NUMERIC NOT NULL,
+      seller_id INTEGER NOT NULL REFERENCES users(id),
+      player_name TEXT NOT NULL,
+      backers JSONB NOT NULL DEFAULT '[]',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      settled_at TIMESTAMPTZ
+    )
+  `).catch((e: any) => console.warn('[Auth] staking_offers:', e.message));
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_staking_offers_open ON staking_offers(created_at) WHERE settled_at IS NULL`).catch(() => {});
+
   console.log('[Auth] Persistence sweep DDL applied');
 
   // Seed admin accounts
