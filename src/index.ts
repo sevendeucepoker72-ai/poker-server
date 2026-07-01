@@ -986,9 +986,12 @@ interface QualifierTournamentReg {
   qualifierId: string;
   qualifierType: string; // 'weekly' | 'monthly'
   qualifierName: string;
-  scheduledAt: string; // ISO timestamp
+  scheduledAt: string; // ISO timestamp — from master API schedule (authoritative)
   startingStack: number;
   maxPlayers: number;
+  // 2026-07-01: master API online_qualifiers.id — used to persist
+  // registrations and post results to /qualifiers/:id/results/internal.
+  masterQualifierId?: string;
   // Re-entry economics — round-4 audit P0 #4 (2026-05-12). Defaults are
   // applied at registration if the qualifier was lazily created here.
   // TODO: when a `games`-backed qualifier schema lands (with buy_in,
@@ -997,13 +1000,60 @@ interface QualifierTournamentReg {
   buyIn?: number;
   maxReEntries?: number;
   requiresQualifierCredit?: boolean;
-  players: { playerId: string; playerName: string; phone: string; socketId: string; reEntries?: number }[];
+  players: { playerId: string; masterPlayerId?: string; playerName: string; phone: string; socketId: string; reEntries?: number }[];
   status: 'registering' | 'starting' | 'running' | 'finished';
   tournamentId: string | null; // linked TournamentManager ID once started
   blindStructure: any[];
 }
 
 const qualifierTournaments = new Map<string, QualifierTournamentReg>();
+
+// Sync qualifier schedule from master API so qualifierTournaments has real
+// scheduledAt values (instead of client-side guessed dates) and masterQualifierId
+// for registration persistence and result reporting.
+async function syncQualifierSchedule(): Promise<void> {
+  const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+  if (!tok) return; // no token configured — skip
+  const base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  try {
+    const resp = await fetch(`${base}/qualifiers/schedule`, {
+      headers: { 'X-Internal-Token': tok },
+    });
+    if (!resp.ok) { console.warn('[QualifierSync] schedule fetch failed:', resp.status); return; }
+    const body = await resp.json() as { schedule?: Array<{ id: number; clientQualifierId: string; type: string; name: string; scheduledAt: string | null }> };
+    const list = body?.schedule;
+    if (!Array.isArray(list)) return;
+    for (const q of list) {
+      const mapKey = q.clientQualifierId; // e.g. 'weekly-qualifier'
+      const existing = qualifierTournaments.get(mapKey);
+      if (existing) {
+        if (q.scheduledAt) existing.scheduledAt = q.scheduledAt;
+        existing.masterQualifierId = String(q.id);
+      } else {
+        qualifierTournaments.set(mapKey, {
+          qualifierId: mapKey,
+          qualifierType: q.type,
+          qualifierName: q.name,
+          scheduledAt: q.scheduledAt || new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
+          masterQualifierId: String(q.id),
+          startingStack: 50000,
+          maxPlayers: 999,
+          requiresQualifierCredit: true,
+          players: [],
+          status: 'registering',
+          tournamentId: null,
+          blindStructure: [],
+        });
+      }
+    }
+    console.log(`[QualifierSync] synced ${list.length} qualifiers`);
+  } catch (err: any) {
+    console.warn('[QualifierSync] error:', err?.message);
+  }
+}
+// Run 5 s after startup (lets secrets load) then every 30 min
+setTimeout(() => syncQualifierSchedule(), 5000);
+setInterval(() => syncQualifierSchedule(), 30 * 60 * 1000);
 
 // REST endpoint: get qualifier tournament registrations
 app.get('/api/qualifier-tournaments', (_req, res) => {
@@ -3582,11 +3632,23 @@ io.on('connection', (socket: Socket) => {
 
     qt.players.push({
       playerId: auth.username || phone,
+      masterPlayerId: masterId,
       playerName: data.playerName || auth.username,
       phone: phone,
       socketId: socket.id,
       ip: regIp,
     } as any);
+
+    // Persist to master DB so registrations survive server restarts
+    if (qt.masterQualifierId && masterId) { // masterId declared above (OIDC sub)
+      const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+      const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+      fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+        body: JSON.stringify({ userId: masterId }),
+      }).catch(e => console.warn('[QualifierReg] persist failed:', e?.message));
+    }
 
     socket.emit('qualifierRegistrationResult', {
       success: true,
@@ -3611,7 +3673,19 @@ io.on('connection', (socket: Socket) => {
     const qt = qualifierTournaments.get(data.qualifierId);
     if (!qt || qt.status !== 'registering') return;
 
+    const removedPlayer = qt.players.find(p => p.playerId === auth.username);
     qt.players = qt.players.filter(p => p.playerId !== auth.username);
+
+    // Persist unregistration to master DB
+    if (qt.masterQualifierId && removedPlayer?.masterPlayerId) {
+      const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+      const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+      fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+        body: JSON.stringify({ userId: removedPlayer.masterPlayerId }),
+      }).catch(e => console.warn('[QualifierUnreg] persist failed:', e?.message));
+    }
 
     socket.emit('qualifierRegistrationResult', {
       success: true,
@@ -9282,6 +9356,7 @@ function startTournamentGame(tournamentId: string): void {
     }
     if (event === 'tournamentFinished') {
       payTournamentPrizes(data); // credit funded prize payouts (mint-free, idempotent)
+      postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
       io.to(`table:${tableId}`).emit('tournamentFinished', data);
     }
     if (event === 'playerEliminated') {
@@ -9633,6 +9708,7 @@ function startMultiTableTournament(
     }
     if (event === 'tournamentFinished') {
       payTournamentPrizes(data); // credit funded prize payouts (mint-free, idempotent)
+      postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
       for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
         io.to(`table:${tid}`).emit('tournamentFinished', data);
       }
@@ -9650,6 +9726,49 @@ function startMultiTableTournament(
 // 2026-06-11 tournament economy: credit funded prize payouts to wallets when
 // a tournament finishes. The payouts come from TournamentManager's
 // collectedEntryFees pool (Σpayouts ≤ Σcollected — mint-free); we credit only
+// Post qualifier results to master API for auto-awards (championship seats /
+// monthly credits). Fire-and-forget; safe to call for non-qualifier tournaments
+// (the master API matches by tournamentId against qualifierTournaments Map).
+const postedQualifierResults = new Set<string>();
+function postQualifierResults(tournamentId: string, data: { results?: Array<{ playerId: string; playerName: string; position: number; payout: number; userId?: number }> }): void {
+  if (!tournamentId || postedQualifierResults.has(tournamentId)) return;
+  // Find the qualifier that owns this tournament
+  let masterQualifierId: string | undefined;
+  for (const qt of qualifierTournaments.values()) {
+    if (qt.tournamentId === tournamentId && qt.masterQualifierId) {
+      masterQualifierId = qt.masterQualifierId;
+      break;
+    }
+  }
+  if (!masterQualifierId) return; // not a qualifier tournament
+  postedQualifierResults.add(tournamentId);
+  const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+  const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  // Find the qt for player masterPlayerId lookup
+  let qtRef: QualifierTournamentReg | undefined;
+  for (const qt of qualifierTournaments.values()) {
+    if (qt.tournamentId === tournamentId) { qtRef = qt; break; }
+  }
+  // Map to the shape recordQualifierResults expects: { playerId (OIDC sub), finishPosition, pointsAwarded }
+  const mappedResults = (data.results || [])
+    .filter(r => r.position != null)
+    .map(r => {
+      const p = qtRef?.players.find(pl => pl.playerId === r.playerId);
+      return {
+        playerId: p?.masterPlayerId || null,
+        finishPosition: r.position,
+        pointsAwarded: 0,
+      };
+    })
+    .filter(r => r.playerId); // only players we can map to master DB
+  if (mappedResults.length === 0) return;
+  fetch(`${_base}/qualifiers/${masterQualifierId}/results/internal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+    body: JSON.stringify({ results: mappedResults }),
+  }).catch(e => console.warn('[QualifierResults] post failed:', e?.message));
+}
+
 // results that carry a userId (paying humans). Idempotent per tournamentId so
 // a duplicate tournamentFinished event can't double-pay.
 const paidOutTournaments = new Set<string>();
