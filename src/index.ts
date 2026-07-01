@@ -597,6 +597,28 @@ async function ensureChipsForBuyIn(
 // the table becomes empty / a player disconnects before the timer fires.
 const pendingAutoStartTimers = new Map<string, NodeJS.Timeout>();
 
+// Single catch-all scheduler for the next hand, deduped per table. EVERY path
+// that ends a hand flows through determineWinners → handResult, and the
+// handResult listener calls this. Previously only the two action handlers
+// scheduled autoStart, so a hand ended by a turn-timeout, the wedge watchdog,
+// a sit-out/AFK auto-fold, or a leaver's fold froze the table in HandComplete
+// forever (recovery depended entirely on the client re-dealing). 2026-07-01
+// audit #6. Safe to call redundantly: clears any existing timer first, and
+// no-ops unless the table is actually in HandComplete.
+function scheduleAutoStart(tableId: string, delayMs = 1500): void {
+  const table = tableManager.getTable(tableId);
+  if (!table || table.currentPhase !== GamePhase.HandComplete) return;
+  // Finished hand no longer needs its Redis snapshot.
+  clearHandSnapshot(tableId).catch(() => {});
+  const existing = pendingAutoStartTimers.get(tableId);
+  if (existing) clearTimeout(existing);
+  const t = setTimeout(() => {
+    pendingAutoStartTimers.delete(tableId);
+    autoStartNextHand(tableId);
+  }, delayMs);
+  pendingAutoStartTimers.set(tableId, t);
+}
+
 // 2026-06-11 audit C7: seats whose player LEFT mid-hand while still holding
 // chips in the LIVE pot. We can't standUp immediately — SidePotManager
 // only counts state==='occupied' seats, so wiping the seat (createEmptySeat)
@@ -1614,7 +1636,9 @@ function broadcastGameState(tableId: string): void {
     if (shouldAutoAct) {
       setTimeout(() => {
         const t = tableManager.getTable(tableId);
-        if (t && t.activeSeatIndex === activeIdx && t.isHandInProgress()) {
+        // Skip during draw phases — the draw clock stands the player pat; a
+        // fold/check here would fire on the stale pre-draw bet-to-match (#4).
+        if (t && t.activeSeatIndex === activeIdx && t.isHandInProgress() && !DrawPhases.includes(t.currentPhase)) {
           const callAmt = t.currentBetToMatch - (t.seats[activeIdx]?.currentBet || 0);
           if (callAmt <= 0) {
             t.playerCheck(activeIdx);
@@ -1622,6 +1646,9 @@ function broadcastGameState(tableId: string): void {
             t.playerFold(activeIdx);
           }
           broadcastGameState(tableId);
+          // #4: if this auto-act advanced into a draw phase, arm the draw clock
+          // / next AI turn (see the turn-timer callback note above).
+          scheduleAIAction(tableId);
         }
       }, 500);
     }
@@ -1646,8 +1673,16 @@ function broadcastGameState(tableId: string): void {
     // stalled the table.
     const handChanged = turnStartedHandMap.get(tableId) !== table.handNumber;
     const seatChanged = priorSeatForStart !== activeSeat || handChanged;
+    // 2026-07-01 audit #4: draw phases (5-Card/Triple Draw/Badugi) have their
+    // OWN stand-pat clock (drawTimers). The betting turn-timer must never run
+    // during a draw — draw entry does not clear activeSeatIndex or reset
+    // currentBetToMatch, so this timer's callAmt is computed from the STALE
+    // pre-draw bet-to-match and force-folds a player who is merely choosing
+    // discards. Clear any timer armed before the draw (seat may be unchanged,
+    // so the seatChanged path alone wouldn't clear it) and never arm here.
+    const inDrawPhase = DrawPhases.includes(table.currentPhase);
 
-    if (seatChanged) {
+    if (seatChanged || inDrawPhase) {
       if (existing) clearTimeout(existing.timeout);
       turnTimers.delete(tableId);
       // Cancel any in-flight warning timer for the prior seat — a stale
@@ -1657,7 +1692,7 @@ function broadcastGameState(tableId: string): void {
       turnWarningTimers.delete(tableId);
     }
 
-    if (table.isHandInProgress() && activeSeat >= 0 && seatChanged) {
+    if (table.isHandInProgress() && activeSeat >= 0 && seatChanged && !inDrawPhase) {
       const turnId = ++globalTurnId;
       turnStartedAtMap.set(tableId, Date.now());
       turnStartedSeatMap.set(tableId, activeSeat);
@@ -1668,6 +1703,9 @@ function broadcastGameState(tableId: string): void {
         turnTimers.delete(tableId);
         const t = tableManager.getTable(tableId);
         if (!t || !t.isHandInProgress() || t.activeSeatIndex !== activeSeat) return;
+        // Defensive: if the phase advanced into a draw after this timer armed,
+        // do NOT fold on the stale bet-to-match — the draw clock owns it (#4).
+        if (DrawPhases.includes(t.currentPhase)) return;
         const seat = t.seats[activeSeat];
         if (!seat || !seat.playerName || seat.folded) return;
         const callAmt = t.currentBetToMatch - (seat.currentBet || 0);
@@ -1679,6 +1717,12 @@ function broadcastGameState(tableId: string): void {
           t.playerCheck(activeSeat);
         }
         broadcastGameState(tableId);
+        // 2026-07-01 audit #4: this action may have completed the betting round
+        // and advanced into a DRAW phase. scheduleAIAction is the ONLY thing
+        // that arms the draw stand-pat clock (and schedules the next AI turn);
+        // without this call a draw entered via a timeout would hang forever now
+        // that the betting timer/watchdog correctly skip draw phases.
+        scheduleAIAction(tableId);
       }, TURN_TIMEOUT_MS);
       turnTimers.set(tableId, { timeout, seatIndex: activeSeat, turnId });
 
@@ -1866,6 +1910,12 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // its committed chips in the pot can be torn down: credit the remaining
     // stack to the wallet + standUp.
     processPendingSeatRemovals(tableId);
+
+    // 2026-07-01 audit #6: schedule the next hand from the SINGLE point every
+    // completion passes through. Covers hands ended by timer/watchdog/sit-out/
+    // AFK/leave-fold that previously scheduled nothing and froze the table.
+    // Deduped — the action-path schedulers still run and simply replace this.
+    scheduleAutoStart(tableId);
 
     // Chip velocity monitoring
     for (const result of data.results) {
@@ -2399,21 +2449,31 @@ function autoStartNextHand(tableId: string): void {
 
   if (table.currentPhase !== GamePhase.HandComplete) return;
 
-  // Reload BUSTED-OUT seats only — humans AND AI — so cash tables never
-  // empty out. Previously AI at 0 chips were removed from the table, which
-  // drained it to heads-up over time. Now bots stay and get a fresh stack,
-  // same as humans. BUT reload only triggers at chipCount === 0 (truly
-  // busted), not just "below min buy-in" — that was giving free top-ups
-  // every hand to anyone short-stacked, which is not how poker works.
-  // A short stack is a real state; the player needs to play out of it
-  // or leave. Only a full bust gets the safety-net reload.
-  for (let i = 0; i < MAX_SEATS; i++) {
-    const seat = table.seats[i];
-    if (seat.state !== 'occupied') continue;
-    if (seat.chipCount <= 0) {
-      seat.chipCount = table.config.minBuyIn;
-      seat.eliminated = false;
-      console.log(`[Reload] ${seat.playerName} (${seat.isAI ? 'AI' : 'human'}) busted → reloaded to ${table.config.minBuyIn}`);
+  // Reload BUSTED-OUT seats. Two HARD rules earned 2026-07-01 (.online audit
+  // #3) — the old loop reloaded every busted seat (human + AI, cash + tourney)
+  // to minBuyIn with no wallet deduction and un-eliminated it:
+  //
+  //  1. NEVER reload on a TOURNAMENT table. A busted tournament seat is an
+  //     ELIMINATION — handleHandComplete already set eliminated=true and
+  //     recorded the finish position. Un-eliminating + refilling it resurrects
+  //     the player as a zombie who keeps acting while the tournament thinks
+  //     they're out, distorting stacks. The tournament flow (eliminatePlayer +
+  //     rebalance) owns the seat lifecycle; leave busted seats alone here.
+  //  2. NEVER free-reload a HUMAN cash seat. Its stack is wallet-backed, so a
+  //     free minBuyIn top-up MINTS chips (later cashable to users.chips via any
+  //     teardown/reserve-expiry path) and enables a dump-to-partner + auto-
+  //     reload collusion mint. A busted human stays at 0 and rebuys from their
+  //     wallet (the rebuy handler, which deducts) or leaves. AI seats have no
+  //     wallet, so a free reload only keeps the ring table populated — kept.
+  if (!tournamentTables.has(tableId)) {
+    for (let i = 0; i < MAX_SEATS; i++) {
+      const seat = table.seats[i];
+      if (seat.state !== 'occupied') continue;
+      if (seat.chipCount <= 0 && seat.isAI) {
+        seat.chipCount = table.config.minBuyIn;
+        seat.eliminated = false;
+        console.log(`[Reload] AI ${seat.playerName} busted → reloaded to ${table.config.minBuyIn}`);
+      }
     }
   }
 
@@ -2696,6 +2756,14 @@ setInterval(() => {
       const table = tableManager.getTable(t.tableId);
       if (!table) continue;
       if (!table.isHandInProgress()) {
+        wedgeWatchdog.delete(t.tableId);
+        continue;
+      }
+      // 2026-07-01 audit #4: draw phases have their own stand-pat clock. The
+      // watchdog's callAmt-based force-fold would wrongly fold a player who is
+      // mid-discard, on the stale pre-draw currentBetToMatch. Skip + reset the
+      // tracker so a long (but legitimate) draw isn't seen as a wedge.
+      if (DrawPhases.includes(table.currentPhase)) {
         wedgeWatchdog.delete(t.tableId);
         continue;
       }
@@ -8750,6 +8818,18 @@ Give feedback in this JSON format:
         !leavingSeat.folded &&
         (leavingSeat.totalInvestedThisHand || 0) > 0;
 
+      // 2026-07-01 audit #7: register the deferred-removal entry BEFORE folding.
+      // A fold that ends the hand (heads-up on this table) runs
+      // processPendingSeatRemovals SYNCHRONOUSLY inside playerFold; if the entry
+      // isn't registered yet it's missed and the stack is stranded on a
+      // occupied+folded ghost seat (worse: the next startNewHand treats it as a
+      // live player). Register first.
+      if (deferRemoval && auth) {
+        let m = pendingSeatRemovalAfterHand.get(session.tableId);
+        if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(session.tableId, m); }
+        m.set(session.seatIndex, { userId: auth.userId, username: auth.username });
+      }
+
       if (table.isHandInProgress()) {
         if (table.activeSeatIndex === session.seatIndex) {
           table.playerFold(session.seatIndex);
@@ -8758,12 +8838,13 @@ Give feedback in this JSON format:
         }
       }
 
-      if (deferRemoval && auth) {
-        // Keep the seat until the hand resolves so committed chips stay in the
-        // pot; processPendingSeatRemovals() credits the stack + stands up.
-        let m = pendingSeatRemovalAfterHand.get(session.tableId);
-        if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(session.tableId, m); }
-        m.set(session.seatIndex, { userId: auth.userId, username: auth.username });
+      if (deferRemoval) {
+        // Entry registered above. If the fold already ended the hand,
+        // processPendingSeatRemovals credited + stood up the seat already.
+        if (!auth && table.seats[session.seatIndex]?.state === 'occupied') {
+          // No auth to credit (shouldn't happen) — tear down rather than strand.
+          table.standUp(session.seatIndex);
+        }
       } else {
         // Between hands / folded / no committed chips: credit the stack back to
         // the wallet now (tournament-safe helper skips tournament stacks), then
@@ -9178,6 +9259,21 @@ function handlePlayerLeave(socket: Socket): void {
       !leavingSeatEarly.folded &&
       (leavingSeatEarly.totalInvestedThisHand || 0) > 0;
 
+    // 2026-07-01 audit #7: register the deferred-removal entry BEFORE folding.
+    // If the fold ends the hand (heads-up, or last live opponent), playerFold
+    // runs determineWinners → handResult → processPendingSeatRemovals()
+    // SYNCHRONOUSLY inside the fold call. If the entry isn't registered yet it
+    // is missed, and the seat's stack is stranded (occupied+folded, never
+    // credited, never stood up) on a table that may never see another
+    // handResult — lost on the next redeploy. Registering first means the
+    // synchronous teardown credits + stands it up immediately.
+    const authForDefer = authSessions.get(socket.id);
+    if (deferRemoval && authForDefer) {
+      let m = pendingSeatRemovalAfterHand.get(session.tableId);
+      if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(session.tableId, m); }
+      m.set(session.seatIndex, { userId: authForDefer.userId, username: authForDefer.username });
+    }
+
     // Fold first if the hand is live. Active seat → playerFold (advances the
     // turn). Non-active deferred leaver → forceFoldSeat (mark folded WITHOUT
     // advancing, so the real actor keeps the action and the table doesn't
@@ -9215,16 +9311,12 @@ function handlePlayerLeave(socket: Socket): void {
     // because we can't block the user's standUp on a DB retry loop — but
     // the failure is permanently recorded.
     if (deferRemoval) {
-      // C7: do NOT credit/standUp yet — the seat stays occupied+folded so
-      // its committed chips remain in the pot for the award. Record who to
-      // credit; processPendingSeatRemovals() (handResult hook) finishes the
-      // teardown after the hand resolves.
-      const authDefer = authSessions.get(socket.id);
-      if (authDefer) {
-        let m = pendingSeatRemovalAfterHand.get(session.tableId);
-        if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(session.tableId, m); }
-        m.set(session.seatIndex, { userId: authDefer.userId, username: authDefer.username });
-      } else {
+      // C7: the committed chips stay in the pot until the hand resolves. The
+      // pending-removal entry was registered BEFORE the fold above (#7), so if
+      // the fold already ended the hand, processPendingSeatRemovals() has
+      // credited + stood the seat up already (it is now 'empty'). If the hand
+      // is still live, the entry waits for the next handResult.
+      if (!authForDefer && table.seats[session.seatIndex]?.state === 'occupied') {
         // No auth to credit (shouldn't happen for a seated player) — fall
         // back to immediate teardown rather than stranding the seat forever.
         table.standUp(session.seatIndex);
