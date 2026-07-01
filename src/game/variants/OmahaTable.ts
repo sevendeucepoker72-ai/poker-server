@@ -52,6 +52,17 @@ export class OmahaTable extends PokerTable {
     }
     this.holeCardCount = numHoleCards;
     this.bettingStructure = 'pot-limit';
+
+    // Deck-safety seat cap (52-card deck, 3 burns + 5 board = 8 shared cards):
+    //   4-card Omaha: 4×9 + 8 = 44 ≤ 52  → full 9-handed ring is safe
+    //   5-card Omaha: 5×8 + 8 = 48 ≤ 52  → cap at 8
+    //   6-card Omaha: 6×6 + 8 = 44 ≤ 52  → cap at 6 (6×7=42+8=50 also fits
+    //                 but 6 leaves headroom for dead cards; 6×9=62 > 52 hangs)
+    if (numHoleCards >= 6) {
+      this.maxOccupiableSeats = 6;
+    } else if (numHoleCards === 5) {
+      this.maxOccupiableSeats = 8;
+    }
   }
 
   /**

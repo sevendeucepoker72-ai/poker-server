@@ -238,7 +238,11 @@ export class TableManager {
       // Determine variant info from table type
       let variant: VariantType = 'texas-holdem';
       let variantName = "Texas Hold'em";
-      let maxSeats = 9;
+      // maxSeats is now sourced from the table's own deck-safety seat cap
+      // (PokerTable.maxOccupiableSeats) so the advertised count and the
+      // server-enforced sitDown() cap can never drift apart. Omaha variants
+      // now correctly report 6/8 instead of a hang-inducing 9.
+      const maxSeats = table.maxOccupiableSeats;
 
       // Order matters: BadugiTable extends FiveCardDrawTable, so check
       // subclasses first.
@@ -253,17 +257,14 @@ export class TableManager {
       } else if (table instanceof BadugiTable) {
         variant = 'badugi';
         variantName = 'Badugi';
-        maxSeats = 6;
       } else if (table instanceof FiveCardDrawTable) {
         const fdTable = table as FiveCardDrawTable;
         variant = fdTable.variant.type;
         variantName = fdTable.variant.name;
-        maxSeats = 6;
       } else if (table instanceof SevenStudTable) {
         const ssTable = table as SevenStudTable;
         variant = (ssTable.variantId as VariantType) || ssTable.variant.type;
         variantName = ssTable.variantName || ssTable.variant.name;
-        maxSeats = 8;
       } else if (table instanceof PineappleTable) {
         const pTable = table as PineappleTable;
         variant = (pTable.variantId as VariantType) || 'pineapple';

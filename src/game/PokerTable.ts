@@ -205,6 +205,17 @@ export class PokerTable extends EventEmitter {
   public holeCardCount: number = 2;
   public bettingStructure: 'no-limit' | 'pot-limit' | 'fixed-limit' = 'no-limit';
 
+  /**
+   * Per-table physical seat cap. Defaults to the full ring (MAX_SEATS = 9),
+   * but high-hole-card variants MUST reduce it so the 52-card deck can never
+   * be exhausted mid-hand: 6-card Omaha 9-handed needs 6×9 hole + 8 board/burn
+   * = 62 > 52. Deck exhaustion used to spin runOutBoard() forever and freeze
+   * the entire event loop (every table on the process). sitDown() enforces
+   * this; getTableList() advertises it so the client renders the right count.
+   * Earned 2026-07-01 .online audit.
+   */
+  public maxOccupiableSeats: number = MAX_SEATS;
+
   constructor(config: TableConfig) {
     super();
     this.config = config;
@@ -227,6 +238,11 @@ export class PokerTable extends EventEmitter {
     isAI: boolean = false
   ): boolean {
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
+    // Deck-safety seat cap: high-hole-card variants (5/6-card Omaha) reduce
+    // maxOccupiableSeats below the physical ring so the deck can't be
+    // exhausted mid-hand. Reject seats beyond the cap for every join path
+    // (human, AI fill, quick-play), not just the lobby-advertised count.
+    if (seatIndex >= this.maxOccupiableSeats) return false;
     if (this.seats[seatIndex].state !== 'empty') return false;
     if (buyIn < this.config.minBuyIn) return false;
 
@@ -835,8 +851,13 @@ export class PokerTable extends EventEmitter {
   }
 
   protected dealCommunityCards(count: number): void {
-    // Burn one card first
-    this.deck.dealOne();
+    // Burn one card first — but only when the deck can still afford the burn
+    // plus the cards we actually need. In near-exhausted decks (pathological
+    // deep-multiway in 5/6-card Omaha) skip the burn so the last real cards
+    // still reach the board instead of being wasted.
+    if (this.deck.cardsRemaining() > count) {
+      this.deck.dealOne();
+    }
 
     for (let i = 0; i < count; i++) {
       const card = this.deck.dealOne();
@@ -1329,6 +1350,7 @@ export class PokerTable extends EventEmitter {
   protected runOutBoard(): void {
     // Deal remaining community cards without betting
     while (this.communityCards.length < 5) {
+      const before = this.communityCards.length;
       switch (this.communityCards.length) {
         case 0:
           this.currentPhase = GamePhase.Flop;
@@ -1348,6 +1370,12 @@ export class PokerTable extends EventEmitter {
           break;
       }
       this.emit('phaseChanged', { phase: this.currentPhase });
+      // Deck-exhaustion guard: if the deal made zero progress the deck is
+      // empty. Break instead of looping forever — an empty-deck runout used
+      // to hang the whole event loop. The seat caps above make this
+      // unreachable in practice; this is the last-resort safety net so a
+      // short board proceeds to showdown rather than freezing the server.
+      if (this.communityCards.length === before) break;
     }
 
     this.currentPhase = GamePhase.Showdown;

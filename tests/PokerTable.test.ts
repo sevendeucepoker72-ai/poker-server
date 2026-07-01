@@ -15,6 +15,7 @@ import { FiveCardDrawTable } from '../src/game/variants/FiveCardDrawTable';
 import { BadugiTable } from '../src/game/variants/BadugiTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
 import { ShortDeckTable } from '../src/game/variants/ShortDeckTable';
+import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SidePotManager } from '../src/game/SidePotManager';
 import {
   evaluate27LowHand,
@@ -603,5 +604,64 @@ describe('Lowball pot award — G2/G3: best LOW hand wins, not worst', () => {
     // Demonstrate the bug the fix closes: default high comparator pays the WORST hand.
     const buggy = mgr.awardPots(seats, [], 0, evaluator);
     expect(buggy.winnings.get(1)).toBe(200);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Deck-safety seat caps (2026-07-01 .online audit). High-hole-card variants
+// MUST cap seats below the 9-handed ring so the 52-card deck can't be
+// exhausted mid-hand — an empty-deck runOutBoard() used to spin forever and
+// freeze the entire event loop. "6-Card Omaha" is a real default lobby table
+// that kept maxSeats:9 (6×9 + 8 board/burn = 62 > 52).
+// ─────────────────────────────────────────────────────────────────────────
+describe('Deck-safety seat caps — Omaha/draw/stud cannot overfill the deck', () => {
+  const cfg = {
+    tableId: 'cap-test', tableName: 'Cap', smallBlind: 25, bigBlind: 50,
+    minBuyIn: 1000, maxBuyIn: 100000, maxPlayers: 9,
+  } as any;
+
+  test('6-card Omaha caps at 6 seats and sitDown rejects beyond the cap', () => {
+    const t = new OmahaTable(cfg, false, 6);
+    expect(t.maxOccupiableSeats).toBe(6);
+    // Seats 0..5 accept players; seat 6+ is rejected (would exhaust the deck).
+    for (let i = 0; i < 6; i++) {
+      expect(t.sitDown(i, `p${i}`, 10000, `id${i}`, false)).toBe(true);
+    }
+    expect(t.sitDown(6, 'overflow', 10000, 'idx', false)).toBe(false);
+    expect(t.sitDown(8, 'overflow', 10000, 'idy', false)).toBe(false);
+    expect(t.getOccupiedSeatCount()).toBe(6);
+  });
+
+  test('5-card Omaha caps at 8, 4-card Omaha stays full ring (9)', () => {
+    expect(new OmahaTable(cfg, false, 5).maxOccupiableSeats).toBe(8);
+    expect(new OmahaTable(cfg, false, 4).maxOccupiableSeats).toBe(MAX_SEATS);
+    expect(new OmahaTable(cfg, true, 4).maxOccupiableSeats).toBe(MAX_SEATS);
+  });
+
+  test('draw/badugi cap at 6 and stud caps at 8 (advertised == enforced)', () => {
+    expect(new FiveCardDrawTable(cfg, false).maxOccupiableSeats).toBe(6);
+    expect(new BadugiTable(cfg).maxOccupiableSeats).toBe(6);
+    expect(new SevenStudTable(cfg, false, false).maxOccupiableSeats).toBe(8);
+  });
+
+  test('a fully seated 6-card Omaha runs a full hand to showdown without hanging', () => {
+    const t = new OmahaTable(cfg, false, 6);
+    for (let i = 0; i < 6; i++) t.sitDown(i, `p${i}`, 10000, `id${i}`, false);
+    t.startNewHand();
+    // Drive everyone all-in so the engine runs the board out (runOutBoard).
+    // The test simply completing proves the loop terminates (no deck-exhaustion
+    // hang); Jest's per-test timeout would fire if it spun forever.
+    let guard = 0;
+    while (t.currentPhase !== GamePhase.Showdown &&
+           t.currentPhase !== GamePhase.HandComplete &&
+           t.currentPhase !== GamePhase.WaitingForPlayers &&
+           guard++ < 200) {
+      const seat = t.activeSeatIndex;
+      if (seat < 0) break;
+      t.playerAllIn(seat);
+    }
+    // Board never exceeds 5 cards and we reached a terminal phase.
+    expect(t.communityCards.length).toBeLessThanOrEqual(5);
+    expect(guard).toBeLessThan(200);
   });
 });

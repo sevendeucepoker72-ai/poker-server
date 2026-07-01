@@ -46,6 +46,10 @@ export class FiveCardDrawTable extends PokerTable {
     this.variantName = isTripleDraw ? '2-7 Triple Draw' : 'Five Card Draw';
     this.holeCardCount = 5;
     this.bettingStructure = isTripleDraw ? 'fixed-limit' : 'no-limit';
+    // Deck-safety cap (matches the historically advertised lobby count):
+    // 5 hole each + up to 5-card draws per player exhausts the 52-card deck
+    // well before 9-handed. Triple Draw (3 draw rounds) is even tighter.
+    this.maxOccupiableSeats = 6;
   }
 
   /**

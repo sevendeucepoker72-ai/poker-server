@@ -53,6 +53,10 @@ export class SevenStudTable extends PokerTable {
     }
     this.holeCardCount = 7;
     this.bettingStructure = 'fixed-limit';
+    // Deck-safety cap (matches the historically advertised lobby count):
+    // 8×7 = 56 > 52, so 8-handed already relies on the shared-7th-card
+    // community fallback below; 9-handed would overrun it. Cap at 8.
+    this.maxOccupiableSeats = 8;
   }
 
   /**
