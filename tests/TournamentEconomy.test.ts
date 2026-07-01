@@ -111,3 +111,54 @@ describe('Tournament economy — funded, mint-free prize pool', () => {
     }
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Staking settlement split (Batch 5c, 2026-07-01 .online audit). Backers who
+// bought a % of a player's tournament action must receive their share of the
+// prize, and the seller keeps the rest — the total paid must ALWAYS equal the
+// prize (chips are never minted or destroyed).
+// ─────────────────────────────────────────────────────────────────────────
+import { computeStakingSplit } from '../src/game/staking';
+
+describe('Staking split — chip conservation', () => {
+  const sum = (s: ReturnType<typeof computeStakingSplit>) =>
+    s.sellerAmount + s.backerPayouts.reduce((a, b) => a + b.amount, 0);
+
+  test('conserves the prize exactly across a range of splits', () => {
+    const cases: Array<[number, { userId: number; name: string; pct: number }[]]> = [
+      [10000, [{ userId: 2, name: 'b1', pct: 50 }]],
+      [10000, [{ userId: 2, name: 'b1', pct: 25 }, { userId: 3, name: 'b2', pct: 25 }]],
+      [7777,  [{ userId: 2, name: 'b1', pct: 33 }, { userId: 3, name: 'b2', pct: 33 }, { userId: 4, name: 'b3', pct: 34 }]],
+      [1,     [{ userId: 2, name: 'b1', pct: 99 }]], // rounding floor → backer 0, seller keeps 1
+      [10000, []],                                    // no backers → seller keeps all
+    ];
+    for (const [payout, backers] of cases) {
+      const split = computeStakingSplit(payout, backers);
+      expect(sum(split)).toBe(payout);       // exact conservation
+      expect(split.sellerAmount).toBeGreaterThanOrEqual(0);
+      split.backerPayouts.forEach((b) => expect(b.amount).toBeGreaterThan(0));
+    }
+  });
+
+  test('oversold action (Σpct > 100) is capped — backers never exceed the prize', () => {
+    const split = computeStakingSplit(10000, [
+      { userId: 2, name: 'b1', pct: 80 },
+      { userId: 3, name: 'b2', pct: 80 }, // 160% sold — must scale to 100%
+    ]);
+    expect(sum(split)).toBe(10000);
+    expect(split.sellerAmount).toBeGreaterThanOrEqual(0);
+    const toBackers = split.backerPayouts.reduce((a, b) => a + b.amount, 0);
+    expect(toBackers).toBeLessThanOrEqual(10000);
+  });
+
+  test('unresolvable backer (userId<=0) is not paid; their share stays with the seller', () => {
+    const split = computeStakingSplit(10000, [
+      { userId: 0, name: 'ghost', pct: 50 }, // can't resolve → not paid
+      { userId: 3, name: 'b2', pct: 25 },
+    ]);
+    expect(sum(split)).toBe(10000);
+    expect(split.backerPayouts.find((b) => b.name === 'ghost')).toBeUndefined();
+    expect(split.backerPayouts.find((b) => b.userId === 3)?.amount).toBe(2500);
+    expect(split.sellerAmount).toBe(7500); // 10000 - 2500 (ghost's 50% stays with seller)
+  });
+});

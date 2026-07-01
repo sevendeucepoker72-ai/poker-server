@@ -15,6 +15,7 @@ import {
   HandHistoryRecord,
   PokerTableSnapshot,
 } from './game/PokerTable';
+import { computeStakingSplit } from './game/staking';
 import {
   connectRedis as connectHandStore,
   snapshotHand,
@@ -4124,7 +4125,7 @@ Give feedback in this JSON format:
       playerName: auth.username,        // server-derived, not client-supplied
       sellerId: auth.userId,
       remaining: data.totalPct,
-      backers: [] as { name: string; pct: number }[],
+      backers: [] as { name: string; userId?: number; pct: number }[],
       createdAt: Date.now(),
     };
     try {
@@ -4172,9 +4173,10 @@ Give feedback in this JSON format:
       // Credit seller within the same transaction.
       await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [totalCost, offer.sellerId]);
 
-      // Update the offer row.
+      // Update the offer row. Record the backer's userId (Batch 5c) so
+      // settlement can pay them reliably without a name lookup.
       const newRemaining = offer.remaining - data.pct;
-      const newBackers = [...offer.backers, { name: auth.username, pct: data.pct }];
+      const newBackers = [...offer.backers, { name: auth.username, userId: auth.userId, pct: data.pct }];
       const settled = newRemaining <= 0;
       if (settled) {
         await client.query(`UPDATE staking_offers SET remaining = 0, backers = $1, settled_at = NOW() WHERE id = $2`, [JSON.stringify(newBackers), data.offerId]);
@@ -9869,7 +9871,7 @@ function startTournamentGame(tournamentId: string): void {
       }
     }
     if (event === 'tournamentFinished') {
-      payTournamentPrizes(data); // credit funded prize payouts (mint-free, idempotent)
+      void payTournamentPrizes(data).catch(() => {}); // funded prize payouts + staking settlement (mint-free, idempotent)
       postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
       io.to(`table:${tableId}`).emit('tournamentFinished', data);
     }
@@ -10221,7 +10223,7 @@ function startMultiTableTournament(
       handleTableRebalance(tournamentId);
     }
     if (event === 'tournamentFinished') {
-      payTournamentPrizes(data); // credit funded prize payouts (mint-free, idempotent)
+      void payTournamentPrizes(data).catch(() => {}); // funded prize payouts + staking settlement (mint-free, idempotent)
       postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
       for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
         io.to(`table:${tid}`).emit('tournamentFinished', data);
@@ -10286,22 +10288,97 @@ function postQualifierResults(tournamentId: string, data: { results?: Array<{ pl
 // results that carry a userId (paying humans). Idempotent per tournamentId so
 // a duplicate tournamentFinished event can't double-pay.
 const paidOutTournaments = new Set<string>();
-function payTournamentPrizes(data: { tournamentId?: string; results?: Array<{ playerId: string; playerName: string; position: number; payout: number; userId?: number }> }): void {
+async function payTournamentPrizes(data: { tournamentId?: string; results?: Array<{ playerId: string; playerName: string; position: number; payout: number; userId?: number }> }): Promise<void> {
   const tid = data?.tournamentId;
   if (!tid || paidOutTournaments.has(tid)) return;
   paidOutTournaments.add(tid);
   for (const r of data?.results || []) {
     if (r.userId === undefined || !(r.payout > 0)) continue;
-    addChipsToUser(r.userId, r.payout)
-      .then((ok: boolean) => {
-        auditLog(r.playerName || String(r.userId), ok ? 'TOURNAMENT_PRIZE' : 'TOURNAMENT_PRIZE_FAILED',
-          { userId: r.userId, tournamentId: tid, position: r.position, payout: r.payout });
-      })
-      .catch((e: any) => {
-        console.error(`[TournamentPrize ${r.userId}] payout=${r.payout}`, e?.message || e);
-        if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.tournamentPrize' }, extra: { userId: r.userId, tournamentId: tid, payout: r.payout } });
-        auditLog(r.playerName || String(r.userId), 'TOURNAMENT_PRIZE_FAILED', { userId: r.userId, tournamentId: tid, payout: r.payout, error: String(e?.message || e) });
-      });
+
+    // Batch 5c — staking settlement. If this player SOLD action in this
+    // tournament, each backer receives their pct of the prize and the seller
+    // keeps the remainder. The total paid always equals r.payout (no mint /
+    // no destruction): sellerAmount = payout − Σ(payable backer amounts), and
+    // any backer we can't resolve to a userId leaves their share with the
+    // seller. DB-idempotent via paid_out_at so a re-fire can't double-pay
+    // backers.
+    let sellerAmount = r.payout;
+    const backerPayouts: { userId: number; name: string; amount: number; pct: number }[] = [];
+    try {
+      const { rows } = await getPool().query(
+        `SELECT id, backers FROM staking_offers WHERE tournament_id = $1 AND seller_id = $2 AND paid_out_at IS NULL`,
+        [tid, r.userId]
+      );
+      if (rows.length > 0) {
+        const offerIds: string[] = [];
+        const collected: { userId: number; name: string; pct: number }[] = [];
+        for (const row of rows) {
+          offerIds.push(row.id);
+          const backers = Array.isArray(row.backers) ? row.backers : [];
+          for (const b of backers) {
+            const pct = Number(b.pct) || 0;
+            if (pct <= 0) continue;
+            collected.push({ userId: Number(b.userId) || 0, name: String(b.name || ''), pct });
+          }
+        }
+        // Resolve legacy (userId-less) backers by username.
+        for (const b of collected) {
+          if (!b.userId && b.name) {
+            const ur = await getPool().query('SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1', [b.name]);
+            if (ur.rows.length) b.userId = Number(ur.rows[0].id);
+          }
+        }
+        // Pure conservation-safe split (tested in TournamentEconomy.test.ts).
+        const split = computeStakingSplit(r.payout, collected);
+        sellerAmount = split.sellerAmount;
+        backerPayouts.push(...split.backerPayouts);
+        // Mark these offers settled so a re-fire can't pay backers twice.
+        await getPool().query(`UPDATE staking_offers SET paid_out_at = NOW() WHERE id = ANY($1::uuid[])`, [offerIds]);
+      }
+    } catch (e: any) {
+      // On any staking-lookup error, fall back to paying the seller the full
+      // prize (never strand chips) and skip backer payouts this run.
+      console.error(`[Staking settle ${tid}/${r.userId}]`, e?.message || e);
+      sellerAmount = r.payout;
+      backerPayouts.length = 0;
+    }
+
+    if (sellerAmount > 0) {
+      addChipsToUser(r.userId, sellerAmount)
+        .then((ok: boolean) => {
+          auditLog(r.playerName || String(r.userId), ok ? 'TOURNAMENT_PRIZE' : 'TOURNAMENT_PRIZE_FAILED',
+            { userId: r.userId, tournamentId: tid, position: r.position, payout: sellerAmount, staked: backerPayouts.length > 0 });
+        })
+        .catch((e: any) => {
+          console.error(`[TournamentPrize ${r.userId}] payout=${sellerAmount}`, e?.message || e);
+          if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.tournamentPrize' }, extra: { userId: r.userId, tournamentId: tid, payout: sellerAmount } });
+          auditLog(r.playerName || String(r.userId), 'TOURNAMENT_PRIZE_FAILED', { userId: r.userId, tournamentId: tid, payout: sellerAmount, error: String(e?.message || e) });
+        });
+    }
+    for (const b of backerPayouts) {
+      addChipsToUser(b.userId, b.amount)
+        .then((ok: boolean) => {
+          auditLog(b.name || String(b.userId), ok ? 'STAKING_PAYOUT' : 'STAKING_PAYOUT_FAILED',
+            { userId: b.userId, tournamentId: tid, sellerId: r.userId, pct: b.pct, amount: b.amount });
+          // Notify online backers so they see the payout (chips are already
+          // credited to the DB; this just surfaces it). Offline backers see it
+          // on next load via the fresh balance.
+          if (ok) {
+            for (const [sid, a] of authSessions) {
+              if (a.userId === b.userId) {
+                io.to(sid).emit('stakingPayout', { amount: b.amount, sellerName: r.playerName || '', tournamentId: tid });
+                const pid = playerSessions.get(sid)?.playerId;
+                if (pid) { const p = progressionManager.getProgress(pid); if (p) p.chips = (p.chips || 0) + b.amount; }
+                sendProgressToPlayer(sid);
+              }
+            }
+          }
+        })
+        .catch((e: any) => {
+          console.error(`[StakingPayout ${b.userId}] amount=${b.amount}`, e?.message || e);
+          auditLog(b.name || String(b.userId), 'STAKING_PAYOUT_FAILED', { userId: b.userId, tournamentId: tid, amount: b.amount, error: String(e?.message || e) });
+        });
+    }
   }
 }
 

@@ -350,6 +350,11 @@ export async function initDB(): Promise<void> {
     )
   `).catch((e: any) => console.warn('[Auth] staking_offers:', e.message));
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_staking_offers_open ON staking_offers(created_at) WHERE settled_at IS NULL`).catch(() => {});
+  // Batch 5c: paid_out_at marks a staking offer whose backers have been paid
+  // their share of the seller's tournament prize (distinct from settled_at =
+  // "fully sold"). NULL = not yet settled. Makes staking payout idempotent.
+  await pool.query(`ALTER TABLE staking_offers ADD COLUMN IF NOT EXISTS paid_out_at TIMESTAMPTZ`).catch(() => {});
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_staking_offers_unpaid ON staking_offers(tournament_id, seller_id) WHERE paid_out_at IS NULL`).catch(() => {});
 
   console.log('[Auth] Persistence sweep DDL applied');
 
