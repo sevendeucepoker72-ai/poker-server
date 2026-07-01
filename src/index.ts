@@ -7486,8 +7486,22 @@ Give feedback in this JSON format:
     const session = playerSessions.get(socket.id);
     if (!session) return;
 
+    const ctx = await ensureHydrated(socket);
+    if (!ctx) { socket.emit('error', { message: 'Not authenticated' }); return; }
+
     const result = progressionManager.claimMissionReward(session.playerId, data.missionId);
-    if (result.success) {
+    if (result.success && result.reward) {
+      // Durable, exactly-once reward persistence (M8 + F1, 2026-07-01 audit).
+      // The manager grants in-memory for instant UI but does NOT touch the DB;
+      // mission.claimed is in-memory and resets on a Railway redeploy. Gate the
+      // DB write on the daily-claim ledger so a redeploy + re-claim can't
+      // re-mint. Mirrors claimDailyBonus. On the dup path (redeploy re-claim)
+      // the in-memory grant is transient and corrected on the next hydrate.
+      const firstToday = await recordDailyClaim(ctx.userId, `mission:${data.missionId}`, null);
+      if (firstToday) {
+        if (result.reward.chips > 0) await addChipsToUser(ctx.userId, result.reward.chips);
+        if (result.reward.stars) await addStarsToUser(ctx.userId, result.reward.stars);
+      }
       socket.emit('missionClaimed', { missionId: data.missionId, reward: result.reward });
     }
     sendProgressToPlayer(socket.id);

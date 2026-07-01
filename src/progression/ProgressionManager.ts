@@ -5,6 +5,9 @@ import {
 import {
   persistStars as dbPersistStars,
   deductStars as dbDeductStars,
+  addChipsToUser as dbAddChipsToUser,
+  addStarsToUser as dbAddStarsToUser,
+  saveProgress as dbSaveProgress,
   loadDurableProgress,
   loadInventory,
   loadProgress as dbLoadProgress,
@@ -574,6 +577,45 @@ export class ProgressionManager {
     );
   }
 
+  /**
+   * Persist a chip REWARD durably to users.chips via the atomic-additive
+   * addChipsToUser. The reward paths (level-up, achievements, daily bonus,
+   * royal flush) previously only did `progress.chips += X` IN MEMORY — never
+   * written to the DB, so hydrateFromDB / a Railway redeploy overwrote it and
+   * the reward vanished (F1, 2026-07-01 .online audit — the "user data MUST
+   * persist" P0 class). Fire-and-forget + hydrated gate mirror persistStars.
+   * Atomic additive, so it needs no ratchet and never double-counts (each
+   * caller is idempotent by achievement/level/daily-claim; missions are gated
+   * on the daily-claim ledger in the handler — see claimMission).
+   */
+  private persistChipReward(progress: PlayerProgress, amount: number): void {
+    if (!progress.userId || amount <= 0) return;
+    if (!progress.hydrated) {
+      console.warn(`[persistChipReward ${progress.userId}] SKIPPED — not hydrated`);
+      return;
+    }
+    dbAddChipsToUser(progress.userId, amount).catch((e) =>
+      console.warn(`[ProgressionManager.persistChipReward ${progress.userId}]`, e?.message)
+    );
+  }
+
+  /**
+   * Persist a star REWARD durably via atomic-additive addStarsToUser. Replaces
+   * the incremental persistStars(GREATEST-snapshot) calls in reward paths,
+   * which could silently drop a concurrent additive star grant (F4). GREATEST
+   * is right for a full-balance resync, wrong for an incremental grant.
+   */
+  private persistStarReward(progress: PlayerProgress, amount: number): void {
+    if (!progress.userId || amount <= 0) return;
+    if (!progress.hydrated) {
+      console.warn(`[persistStarReward ${progress.userId}] SKIPPED — not hydrated`);
+      return;
+    }
+    dbAddStarsToUser(progress.userId, amount).catch((e) =>
+      console.warn(`[ProgressionManager.persistStarReward ${progress.userId}]`, e?.message)
+    );
+  }
+
   // Consume pending events (levelUp, achievements, missionComplete)
   consumeEvents(playerId: string): ProgressEvent[] {
     const events = this.pendingEvents.get(playerId) || [];
@@ -605,6 +647,14 @@ export class ProgressionManager {
     }
     progress.xp += amount;
 
+    // Accumulate the level-up reward across all levels crossed in this call,
+    // then persist ONCE (atomic-additive) plus the level bump. Persisting the
+    // reward chips/stars is the F1 fix; persisting the level immediately is
+    // what keeps it exactly-once — otherwise a redeploy before the next
+    // saveProgress would rehydrate the OLD level, let the player re-cross the
+    // same threshold, and re-collect the same level's chips (a mint).
+    let leveledChips = 0;
+    let leveledStars = 0;
     while (progress.level < MAX_LEVEL && progress.xp >= progress.xpToNextLevel) {
       progress.xp -= progress.xpToNextLevel;
       progress.level++;
@@ -616,7 +666,8 @@ export class ProgressionManager {
       const bonusStars = milestoneStarsBonus(progress.level);
       progress.chips += baseChips;
       progress.stars += baseStars + bonusStars;
-      this.persistStars(progress);
+      leveledChips += baseChips;
+      leveledStars += baseStars + bonusStars;
 
       this.pushEvent(playerId, {
         type: 'levelUp',
@@ -633,6 +684,19 @@ export class ProgressionManager {
     if (progress.level >= MAX_LEVEL) {
       progress.xp = 0;
       progress.xpToNextLevel = Infinity;
+    }
+
+    if (leveledChips > 0 || leveledStars > 0) {
+      this.persistChipReward(progress, leveledChips);
+      this.persistStarReward(progress, leveledStars);
+      // Ratchet the new level (+ current xp) to the DB now so the reward can
+      // never be re-collected after a redeploy. saveProgress uses GREATEST on
+      // level and strips chips at the boundary — safe.
+      if (progress.userId && progress.hydrated) {
+        dbSaveProgress(progress.userId, { level: progress.level, xp: progress.xp }).catch((e) =>
+          console.warn(`[ProgressionManager.levelUp persist ${progress.userId}]`, e?.message)
+        );
+      }
     }
   }
 
@@ -946,7 +1010,8 @@ export class ProgressionManager {
         progress.achievements.push('royal_flush');
         progress.chips += achDef.reward.chips;
         progress.stars += (achDef.reward.stars || 0);
-        this.persistStars(progress);
+        this.persistChipReward(progress, achDef.reward.chips);
+        this.persistStarReward(progress, achDef.reward.stars || 0);
         this.addXP(playerId, achDef.reward.xp);
 
         this.pushEvent(playerId, {
@@ -1019,10 +1084,14 @@ export class ProgressionManager {
     progress.chips += mission.reward.chips;
     if (mission.reward.stars) {
       progress.stars += mission.reward.stars;
-      this.persistStars(progress);
     }
     this.addXP(playerId, mission.reward.xp);
 
+    // NOTE: chips/stars are persisted to the DB by the claimMission socket
+    // handler, gated on recordDailyClaim('mission:'+id). Mission.claimed is
+    // in-memory only and resets on a Railway redeploy, so persisting here
+    // would let a redeploy + re-claim re-mint the reward (M8). The daily-claim
+    // ledger is the durable exactly-once gate. Do NOT persist chips here.
     return { success: true, reward: mission.reward };
   }
 
@@ -1053,7 +1122,11 @@ export class ProgressionManager {
 
     progress.chips += bonusChips;
     progress.stars += bonusStars;
-    this.persistStars(progress);
+    // Durable persistence (F1/F4). The handler already gated this on
+    // recordDailyClaim('daily_bonus') so it runs at most once/day — safe to
+    // persist chips+stars additively.
+    this.persistChipReward(progress, bonusChips);
+    this.persistStarReward(progress, bonusStars);
 
     return {
       success: true,
@@ -1077,9 +1150,10 @@ export class ProgressionManager {
       if (achDef.check(progress)) {
         progress.achievements.push(achDef.id);
         progress.chips += achDef.reward.chips;
+        this.persistChipReward(progress, achDef.reward.chips);
         if (achDef.reward.stars) {
           progress.stars += achDef.reward.stars;
-          this.persistStars(progress);
+          this.persistStarReward(progress, achDef.reward.stars);
         }
         this.addXP(playerId, achDef.reward.xp);
         this.pushEvent(playerId, {
@@ -1101,9 +1175,10 @@ export class ProgressionManager {
       if (achDef.check(progress)) {
         progress.dailyAchievementsToday.push(achDef.id);
         progress.chips += achDef.reward.chips;
+        this.persistChipReward(progress, achDef.reward.chips);
         if (achDef.reward.stars) {
           progress.stars += achDef.reward.stars;
-          this.persistStars(progress);
+          this.persistStarReward(progress, achDef.reward.stars);
         }
         this.addXP(playerId, achDef.reward.xp);
         if (progress.userId) {
@@ -1128,9 +1203,10 @@ export class ProgressionManager {
       if (achDef.check(progress)) {
         progress.weeklyAchievementsThisWeek.push(achDef.id);
         progress.chips += achDef.reward.chips;
+        this.persistChipReward(progress, achDef.reward.chips);
         if (achDef.reward.stars) {
           progress.stars += achDef.reward.stars;
-          this.persistStars(progress);
+          this.persistStarReward(progress, achDef.reward.stars);
         }
         this.addXP(playerId, achDef.reward.xp);
         if (progress.userId) {
