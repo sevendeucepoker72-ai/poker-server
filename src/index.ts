@@ -10373,10 +10373,28 @@ async function gracefulShutdown(signal: string) {
         // Tournament stacks are NOT wallet-funded — never cash them out (would
         // mint). They persist with the tournament (or are lost if the
         // tournament can't rehydrate), but they must not hit the wallet.
-        if (seat && seat.state === 'occupied' && seat.chipCount > 0 && !creditedSeats.has(seatKey) && !tournamentTables.has(session.tableId)) {
-          creditedSeats.add(seatKey);
-          await addChipsToUser(auth.userId, seat.chipCount);
-          console.log(`[Shutdown] Cashed out ${seat.chipCount} chips for user ${auth.userId} (seat ${session.seatIndex})`);
+        if (seat && seat.state === 'occupied' && !creditedSeats.has(seatKey) && !tournamentTables.has(session.tableId)) {
+          // 2026-07-01 audit #1: refund the FULL table stake. Mid-hand the pot
+          // has NOT been awarded yet (determineWinners sets phase=HandComplete),
+          // so chips already committed this hand (totalInvestedThisHand) would be
+          // DESTROYED on a mid-hand redeploy — Redis rehydration is dead
+          // (per-process table UUIDs never match a saved snapshot, so nothing
+          // restores them). Abandon the hand and refund stack + investment; this
+          // is chip-conserving (every player gets back exactly what they had on
+          // the table). At HandComplete/WaitingForPlayers the pot is already in
+          // chipCount, so invested is NOT added (would double-credit the winner).
+          //
+          // INVARIANT: if you ever make table IDs stable to revive rehydration,
+          // you MUST drop the totalInvestedThisHand term here — restoring the
+          // hand AND refunding its pot would double-credit.
+          const inHand = !!table && table.isHandInProgress();
+          const invested = inHand ? (seat.totalInvestedThisHand || 0) : 0;
+          const refund = seat.chipCount + invested;
+          if (refund > 0) {
+            creditedSeats.add(seatKey);
+            await addChipsToUser(auth.userId, refund);
+            console.log(`[Shutdown] Cashed out ${refund} chips (stack ${seat.chipCount}${invested > 0 ? ` + pot ${invested}` : ''}) for user ${auth.userId} (seat ${session.seatIndex})`);
+          }
         }
         const prog = progressionManager.getClientProgress(session.playerId) as any;
         if (prog && prog.hydrated) {
@@ -10414,12 +10432,17 @@ async function gracefulShutdown(signal: string) {
       try {
         const table = tableManager.getTable(reserved.tableId);
         const seat = table?.seats?.[reserved.seatIndex];
-        const chips = seat?.chipCount ?? reserved.chips ?? 0;
+        // #1: include the in-hand pot investment so a mid-hand redeploy refunds
+        // (not destroys) the reserved player's committed chips. See the seated
+        // loop above for the full rationale + the rehydration invariant.
+        const inHand = !!table && table.isHandInProgress();
+        const invested = inHand ? (seat?.totalInvestedThisHand || 0) : 0;
+        const chips = (seat?.chipCount ?? reserved.chips ?? 0) + invested;
         const seatKey = `${reserved.tableId}:${reserved.seatIndex}`;
         if (chips > 0 && !creditedSeats.has(seatKey) && !tournamentTables.has(reserved.tableId)) {
           creditedSeats.add(seatKey);
           await addChipsToUser(userId, chips);
-          console.log(`[Shutdown] Cashed out ${chips} reserved chips for user ${userId}`);
+          console.log(`[Shutdown] Cashed out ${chips} reserved chips (invested ${invested}) for user ${userId}`);
         }
       } catch (e: any) {
         console.warn(`[Shutdown] reserved flush failed for user ${userId}:`, e?.message);
