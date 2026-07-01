@@ -2357,13 +2357,15 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
 
   // Sit down at the new seat with the preserved stack. `sitDown`'s buy-in
   // argument becomes the new chip count, so we pass the EXACT snapshot to
-  // preserve every chip.
-  const success = table.sitDown(target, playerName, chipCount, playerId, false);
+  // preserve every chip. allowBelowMin=true: this is a relocation, not a
+  // buy-in — a stack below minBuyIn (normal after losses) must still move,
+  // else both sitDowns fail and the stack is destroyed (audit #5).
+  const success = table.sitDown(target, playerName, chipCount, playerId, false, true);
   if (!success) {
     // Extremely rare — sitDown shouldn't fail on an empty seat — but fall
     // back by attempting to return to the original seat with the same stack.
     console.warn(`[MoveSeat] sitDown failed for ${playerName} on seat ${target}; restoring to ${session.seatIndex}`);
-    table.sitDown(session.seatIndex, playerName, chipCount, playerId, false);
+    table.sitDown(session.seatIndex, playerName, chipCount, playerId, false, true);
     return false;
   }
 
@@ -7817,6 +7819,7 @@ Give feedback in this JSON format:
         no_debt: 'You don\'t currently owe any dead blinds.',
         insufficient_chips: 'Not enough chips to post the owed blinds. Rebuy first.',
         invalid_seat: 'Invalid seat.',
+        not_in_hand: 'Your owed blinds will be posted automatically when the next hand starts.',
       };
       socket.emit('missedBlindsError', {
         code: result.reason,
@@ -8731,10 +8734,43 @@ Give feedback in this JSON format:
     const session = sessions[idx];
     const table = tableManager.getTable(session.tableId);
     if (table) {
-      if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
-        table.playerFold(session.seatIndex);
+      const auth = authSessions.get(socket.id);
+      const leavingSeat = table.seats[session.seatIndex];
+
+      // 2026-07-01 audit #2: the old code did a bare standUp with NO wallet
+      // credit, DESTROYING the player's entire buy-in on this secondary table
+      // (joinAdditionalTable deducted it at sit-down), and removed a live seat
+      // mid-hand (erasing its pot contribution → short-paying the winner).
+      // Mirror handlePlayerLeave's defer-vs-credit decision exactly.
+      const deferRemoval =
+        table.isHandInProgress() &&
+        !!leavingSeat &&
+        leavingSeat.state === 'occupied' &&
+        !leavingSeat.isAI &&
+        !leavingSeat.folded &&
+        (leavingSeat.totalInvestedThisHand || 0) > 0;
+
+      if (table.isHandInProgress()) {
+        if (table.activeSeatIndex === session.seatIndex) {
+          table.playerFold(session.seatIndex);
+        } else if (deferRemoval) {
+          table.forceFoldSeat(session.seatIndex);
+        }
       }
-      table.standUp(session.seatIndex);
+
+      if (deferRemoval && auth) {
+        // Keep the seat until the hand resolves so committed chips stay in the
+        // pot; processPendingSeatRemovals() credits the stack + stands up.
+        let m = pendingSeatRemovalAfterHand.get(session.tableId);
+        if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(session.tableId, m); }
+        m.set(session.seatIndex, { userId: auth.userId, username: auth.username });
+      } else {
+        // Between hands / folded / no committed chips: credit the stack back to
+        // the wallet now (tournament-safe helper skips tournament stacks), then
+        // stand up.
+        if (auth) creditSeatStackToWallet(auth.userId, auth.username, session.tableId, leavingSeat, 'leave_additional_table');
+        table.standUp(session.seatIndex);
+      }
       broadcastGameState(session.tableId);
     }
 

@@ -665,3 +665,45 @@ describe('Deck-safety seat caps — Omaha/draw/stud cannot overfill the deck', (
     expect(guard).toBeLessThan(200);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Pot-limit all-in cap (2026-07-01 .online audit #9). playerAllIn ignored
+// getMaxRaise, so a deep stack could shove its whole stack as an illegal
+// over-pot bet in PLO/PLO8/fixed-limit, setting currentBetToMatch far above
+// the legal maximum. It must cap the raise at the pot and keep the remainder.
+// ─────────────────────────────────────────────────────────────────────────
+describe('Pot-limit all-in is capped at the pot, not the whole stack (#9)', () => {
+  const cfg = {
+    tableId: 'plo-cap', tableName: 'PLO', smallBlind: 25, bigBlind: 50,
+    minBuyIn: 1000, maxBuyIn: 100000, maxPlayers: 9,
+  } as any;
+
+  test('deep PLO stack "all-in" is clamped to the pot and keeps chips', () => {
+    const t = new OmahaTable(cfg, false, 4); // Pot-Limit Omaha
+    t.sitDown(0, 'A', 50000, 'a', false);
+    t.sitDown(1, 'B', 50000, 'b', false);
+    t.startNewHand();
+    const actor = t.activeSeatIndex;
+    expect(actor).toBeGreaterThanOrEqual(0);
+
+    t.playerAllIn(actor);
+
+    // The bet was capped at the pot (~150) — NOT a 50,000 over-pot shove.
+    expect(t.currentBetToMatch).toBeLessThan(2000);
+    // The player kept the bulk of their stack and is NOT actually all-in.
+    expect(t.seats[actor].chipCount).toBeGreaterThan(40000);
+    expect(t.seats[actor].allIn).toBe(false);
+  });
+
+  test('no-limit all-in still shoves the whole stack (regression guard)', () => {
+    const t = makeTable(); // no-limit Hold'em, getMaxRaise = Infinity
+    t.sitDown(0, 'A', 8000, 'a', false);
+    t.sitDown(1, 'B', 8000, 'b', false);
+    t.startNewHand();
+    const actor = t.activeSeatIndex;
+    t.playerAllIn(actor);
+    // Whole stack committed; player is all-in with zero chips.
+    expect(t.seats[actor].chipCount).toBe(0);
+    expect(t.seats[actor].allIn).toBe(true);
+  });
+});

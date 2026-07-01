@@ -235,7 +235,8 @@ export class PokerTable extends EventEmitter {
     playerName: string,
     buyIn: number,
     playerId: string,
-    isAI: boolean = false
+    isAI: boolean = false,
+    allowBelowMin: boolean = false
   ): boolean {
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
     // Deck-safety seat cap: high-hole-card variants (5/6-card Omaha) reduce
@@ -244,7 +245,12 @@ export class PokerTable extends EventEmitter {
     // (human, AI fill, quick-play), not just the lobby-advertised count.
     if (seatIndex >= this.maxOccupiableSeats) return false;
     if (this.seats[seatIndex].state !== 'empty') return false;
-    if (buyIn < this.config.minBuyIn) return false;
+    // A seat MOVE relocates an existing stack — it is not a fresh buy-in, so it
+    // must NOT be blocked by minBuyIn (a player whose stack fell below the
+    // minimum after losses would otherwise have their whole stack destroyed
+    // when both the move and the fallback-restore sitDown fail — 2026-07-01
+    // audit #5). Callers relocating a stack pass allowBelowMin=true.
+    if (!allowBelowMin && buyIn < this.config.minBuyIn) return false;
 
     const seat = this.seats[seatIndex];
     seat.state = 'occupied';
@@ -406,6 +412,12 @@ export class PokerTable extends EventEmitter {
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return { ok: false, reason: 'invalid_seat' };
     const seat = this.seats[seatIndex];
     if (!seat || seat.state === 'empty') return { ok: false, reason: 'invalid_seat' };
+    // Only meaningful DURING a live hand. Between hands (HandComplete /
+    // WaitingForPlayers) startNewHand() resets totalInvestedThisHand to 0, so
+    // chips deducted here would leave the stack and enter no pot — destroyed.
+    // Leave the debt intact (don't clearDeadBlind); it's collected
+    // automatically when the next hand deals. 2026-07-01 audit #8.
+    if (!this.isHandInProgress()) return { ok: false, reason: 'not_in_hand' };
     const owed = seat.deadBlindOwedChips || 0;
     if (owed <= 0) return { ok: false, reason: 'no_debt' };
     if (seat.chipCount < owed) return { ok: false, reason: 'insufficient_chips' };
@@ -1135,7 +1147,27 @@ export class PokerTable extends EventEmitter {
     if (!this.isValidAction(seatIndex)) return false;
 
     const seat = this.seats[seatIndex];
-    const allInAmount = seat.chipCount;
+    const stack = seat.chipCount;
+    let allInAmount = stack;
+
+    // Pot-limit / fixed-limit cap (2026-07-01 .online audit #9). A whole-stack
+    // "all-in" that would RAISE beyond the max legal raise is not a legal bet
+    // in a capped structure — the player can only put in up to the cap and
+    // keeps the remainder (so they are NOT actually all-in). Previously
+    // playerAllIn ignored getMaxRaise entirely, so a deep stack could shove
+    // 50,000 into a 200 pot-limit pot, setting an illegal currentBetToMatch
+    // that opponents had to match or fold to. No-limit getMaxRaise is Infinity
+    // so this is a no-op there. Only caps a RAISE (stack exceeds the call).
+    const callAmount = Math.max(0, this.currentBetToMatch - seat.currentBet);
+    if (stack > callAmount) {
+      const maxRaiseTotal = this.getMaxRaise(seatIndex);
+      if (maxRaiseTotal !== Infinity) {
+        // Never cap below the call — a player must always be able to call all-in.
+        const maxAdditional = Math.max(callAmount, maxRaiseTotal - seat.currentBet);
+        if (allInAmount > maxAdditional) allInAmount = maxAdditional;
+      }
+    }
+    const trulyAllIn = allInAmount >= stack;
     const totalBet = seat.currentBet + allInAmount;
 
     // Check if this constitutes a raise
@@ -1163,21 +1195,23 @@ export class PokerTable extends EventEmitter {
 
     seat.totalInvestedThisHand += allInAmount;
     seat.currentBet += allInAmount;
-    seat.chipCount = 0;
-    seat.allIn = true;
-    seat.lastAction = PlayerAction.AllIn;
+    seat.chipCount = stack - allInAmount;
+    // In a capped structure the bet may have been clamped below the full stack;
+    // the player keeps the remainder and is a normal (non-all-in) actor.
+    seat.allIn = trulyAllIn;
+    seat.lastAction = trulyAllIn ? PlayerAction.AllIn : PlayerAction.Raise;
     seat.hasActedSinceLastFullRaise = true;
 
     this.actionLog.push({
       seatIndex,
       playerName: seat.playerName,
-      action: `went all-in for ${totalBet}`,
+      action: trulyAllIn ? `went all-in for ${totalBet}` : `raised to ${totalBet} (pot-limit cap)`,
       street: this.currentPhase,
     });
 
     this.emit('playerAction', {
       seatIndex,
-      action: PlayerAction.AllIn,
+      action: trulyAllIn ? PlayerAction.AllIn : PlayerAction.Raise,
       amount: totalBet,
     });
 
