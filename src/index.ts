@@ -1000,13 +1000,75 @@ interface QualifierTournamentReg {
   buyIn?: number;
   maxReEntries?: number;
   requiresQualifierCredit?: boolean;
-  players: { playerId: string; masterPlayerId?: string; playerName: string; phone: string; socketId: string; reEntries?: number }[];
+  players: { playerId: string; masterPlayerId?: string; playerName: string; phone: string; socketId: string; reEntries?: number; consumedCreditId?: string }[];
   status: 'registering' | 'starting' | 'running' | 'finished';
   tournamentId: string | null; // linked TournamentManager ID once started
   blindStructure: any[];
 }
 
 const qualifierTournaments = new Map<string, QualifierTournamentReg>();
+
+// ────────────────────────────────────────────────────────────────────────
+// Qualifier-credit consume/refund over HTTP to the master API.
+//
+// qualifier_credits lives ONLY in the master Cloud SQL database. poker-server
+// runs against its own Railway Postgres, so it CANNOT run SQL against that
+// table — the previous local `UPDATE qualifier_credits ...` threw "relation
+// does not exist" on every registration and no one could enter a qualifier.
+// These helpers call the internalAuth-gated master endpoints instead. Both
+// fail closed (return not-consumed / not-refunded) on any transport error;
+// callers must distinguish `consumed:false` (no credit / not qualified) from
+// `error` (transport) so a DB blip doesn't look like "no credit".
+// Earned 2026-07-01 .online audit.
+// ────────────────────────────────────────────────────────────────────────
+async function consumeQualifierCreditOnMaster(
+  masterId: string,
+  tier: string,
+  qualifierSlug: string,
+  label: 'entry' | 're-entry'
+): Promise<{ consumed: boolean; creditId?: string; error?: string }> {
+  const base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 6000);
+  try {
+    const res = await fetch(`${base}/qualifier-credits/consume/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Token': tok },
+      body: JSON.stringify({ playerId: masterId, tier, qualifierId: qualifierSlug, label }),
+      signal: ac.signal,
+    });
+    if (!res.ok) return { consumed: false, error: `http_${res.status}` };
+    const data: any = await res.json().catch(() => ({}));
+    return { consumed: !!data.consumed, creditId: data.creditId };
+  } catch (e: any) {
+    return { consumed: false, error: e?.name === 'AbortError' ? 'timeout' : String(e?.message || e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function refundQualifierCreditOnMaster(creditId: string): Promise<boolean> {
+  const base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 6000);
+  try {
+    const res = await fetch(`${base}/qualifier-credits/refund/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Token': tok },
+      body: JSON.stringify({ creditId }),
+      signal: ac.signal,
+    });
+    if (!res.ok) return false;
+    const data: any = await res.json().catch(() => ({}));
+    return !!data.refunded;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 // Sync qualifier schedule from master API so qualifierTournaments has real
 // scheduledAt values (instead of client-side guessed dates) and masterQualifierId
@@ -3478,54 +3540,30 @@ io.on('connection', (socket: Socket) => {
         // buy-in and abort.
         let consumedCreditId: string | null = null;
         if (qt.requiresQualifierCredit) {
-          try {
-            // 2026-06-19 audit fix — was keyed on auth.userId (local int) vs the
-            // master-UUID player_id (matched 0 rows) AND wrote the slug qualId
-            // into the UUID column redeemed_for_qualifier_id (cast error). Now
-            // keys on masterId, filters by tier, and records the qualifier in
-            // notes (a text column) instead of the UUID column.
-            const credRes = await getPool().query(
-              `UPDATE qualifier_credits
-                  SET redeemed_at = NOW(),
-                      notes = COALESCE(notes, '') || ' [re-entry:' || $1 || ']'
-                WHERE id = (
-                  SELECT id FROM qualifier_credits
-                   WHERE player_id = $2 AND tier = $3 AND redeemed_at IS NULL
-                   ORDER BY earned_at ASC NULLS LAST, created_at ASC
-                   LIMIT 1
-                )
-                RETURNING id`,
-              [qualId, masterId, qt.qualifierType]
-            );
-            if (credRes.rows.length === 0) {
-              // Refund the chip buy-in we just took (if any) — the
-              // re-entry isn't happening.
-              if (buyIn > 0) {
-                try {
-                  await addChipsToUser(auth.userId, buyIn);
-                  auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND', { qualifierId: qualId, buyIn, reason: 'no_credit' });
-                } catch (e) {
-                  auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND_FAILED', { qualifierId: qualId, buyIn, error: String(e) });
-                }
-              }
-              socket.emit('qualifierRegistrationResult', { success: false, error: 'No qualifier credits available for re-entry' });
-              return;
-            }
-            consumedCreditId = credRes.rows[0].id;
-            auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_CONSUME', { qualifierId: qualId, creditId: consumedCreditId });
-          } catch (err: any) {
-            // Refund the buy-in on DB error — never leave a player out
-            // of pocket without a re-entry.
+          // Consume a credit via the master API (see consumeQualifierCreditOnMaster).
+          // qualifier_credits lives only in the master DB — poker-server can't
+          // touch it directly. On no-credit OR transport error we refund the
+          // buy-in and abort so a player is never charged for a re-entry that
+          // didn't happen.
+          const consumeRes = await consumeQualifierCreditOnMaster(masterId, qt.qualifierType, qualId, 're-entry');
+          if (!consumeRes.consumed) {
             if (buyIn > 0) {
               try {
                 await addChipsToUser(auth.userId, buyIn);
-                auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND', { qualifierId: qualId, buyIn, reason: 'credit_db_error' });
-              } catch (_) { /* logged below */ }
+                auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND', { qualifierId: qualId, buyIn, reason: consumeRes.error ? 'credit_error' : 'no_credit' });
+              } catch (e) {
+                auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND_FAILED', { qualifierId: qualId, buyIn, error: String(e) });
+              }
             }
-            console.error('[QualifierReEntry] credit consume failed:', err);
-            socket.emit('qualifierRegistrationResult', { success: false, error: 'Server error consuming qualifier credit' });
+            if (consumeRes.error) console.error('[QualifierReEntry] credit consume failed:', consumeRes.error);
+            socket.emit('qualifierRegistrationResult', {
+              success: false,
+              error: consumeRes.error ? 'Server error consuming qualifier credit — please try again.' : 'No qualifier credits available for re-entry',
+            });
             return;
           }
+          consumedCreditId = consumeRes.creditId || null;
+          auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_CONSUME', { qualifierId: qualId, creditId: consumedCreditId });
         }
 
         // (d) NOW re-seat. Find a table with empty seats.
@@ -3536,7 +3574,12 @@ io.on('connection', (socket: Socket) => {
           if (!table) continue;
           for (let s = 0; s < 9; s++) {
             if (table.seats[s].state !== 'empty') continue;
-            table.sitDown(s, existingEntry.playerName, startingStack, existingEntry.playerId, false);
+            // Only mark seated when sitDown actually succeeds. Previously the
+            // return was ignored and seated=true set unconditionally — a
+            // sitDown that failed (deck-safety cap, race) would strand the
+            // player "seated" on an empty seat AND keep the consumed credit
+            // (no refund fires because the no-seat rollback below is skipped).
+            if (!table.sitDown(s, existingEntry.playerName, startingStack, existingEntry.playerId, false)) continue;
             tournamentManager.setPlayerTable(qt.tournamentId!, existingEntry.playerId, tid);
             // Un-eliminate the player in tournament manager
             const tp = tournament.players.find(p => p.playerId === existingEntry.playerId);
@@ -3564,15 +3607,12 @@ io.on('connection', (socket: Socket) => {
             }
           }
           if (consumedCreditId) {
-            try {
-              await getPool().query(
-                `UPDATE qualifier_credits SET redeemed_at = NULL WHERE id = $1`,
-                [consumedCreditId]
-              );
-              auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_REFUND', { qualifierId: qualId, creditId: consumedCreditId, reason: 'no_seat' });
-            } catch (e) {
-              auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: consumedCreditId, error: String(e) });
-            }
+            const refunded = await refundQualifierCreditOnMaster(consumedCreditId);
+            auditLog(
+              auth.username,
+              refunded ? 'QUALIFIER_REENTRY_CREDIT_REFUND' : 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED',
+              { qualifierId: qualId, creditId: consumedCreditId, reason: 'no_seat' }
+            );
           }
           socket.emit('qualifierRegistrationResult', { success: false, error: 'No seats available for re-entry' });
           return;
@@ -3596,38 +3636,28 @@ io.on('connection', (socket: Socket) => {
       return;
     }
 
-    // Consume a qualifier credit before registering (first-entry path).
-    // Mirrors the re-entry credit-consume block above. Atomic conditional
-    // UPDATE — stamps the oldest unredeemed credit for this user+tier.
-    // If no credit exists, isPlayerQualified() would have already rejected
-    // above, but we do the consume atomically here to prevent race conditions
-    // where two simultaneous registrations both pass the read-only check.
-    try {
-      const credRes = await getPool().query(
-        `UPDATE qualifier_credits
-            SET redeemed_at = NOW(),
-                notes = COALESCE(notes, '') || ' [entry:' || $1 || ']'
-          WHERE id = (
-            SELECT id FROM qualifier_credits
-             WHERE player_id = $2 AND tier = $3 AND redeemed_at IS NULL
-             ORDER BY earned_at ASC NULLS LAST, created_at ASC
-             LIMIT 1
-          )
-          RETURNING id`,
-        [qualId, masterId, qt.qualifierType]
-      );
-      if (credRes.rows.length === 0) {
-        socket.emit('qualifierRegistrationResult', { success: false, error: 'No qualifier credits available — your credit may have already been used.' });
+    // Consume a qualifier credit before registering (first-entry path) via the
+    // master API — mirrors the re-entry block above. The consume is atomic
+    // server-side (oldest unredeemed credit for this user+tier) so two
+    // simultaneous registrations can't both pass the read-only isPlayerQualified
+    // check and double-enter. Gated on requiresQualifierCredit for correctness
+    // (all live qualifiers set it true today).
+    let entryCreditId: string | null = null;
+    if (qt.requiresQualifierCredit) {
+      const consumeRes = await consumeQualifierCreditOnMaster(masterId, qt.qualifierType, qualId, 'entry');
+      if (!consumeRes.consumed) {
+        if (consumeRes.error) console.error('[QualifierEntry] credit consume failed:', consumeRes.error);
+        socket.emit('qualifierRegistrationResult', {
+          success: false,
+          error: consumeRes.error ? 'Server error consuming qualifier credit — please try again.' : 'No qualifier credits available — your credit may have already been used.',
+        });
         return;
       }
-      auditLog(auth.username, 'QUALIFIER_ENTRY_CREDIT_CONSUME', { qualifierId: qualId, creditId: credRes.rows[0].id, tier: qt.qualifierType });
+      entryCreditId = consumeRes.creditId || null;
+      auditLog(auth.username, 'QUALIFIER_ENTRY_CREDIT_CONSUME', { qualifierId: qualId, creditId: entryCreditId, tier: qt.qualifierType });
       // Bust the in-memory qualifier cache so a second registration attempt
       // within the 5-min window doesn't see the now-stale "still qualified" list.
       lastQualifierFetch = 0;
-    } catch (err: any) {
-      console.error('[QualifierEntry] credit consume failed:', err);
-      socket.emit('qualifierRegistrationResult', { success: false, error: 'Server error consuming qualifier credit — please try again.' });
-      return;
     }
 
     qt.players.push({
@@ -3637,6 +3667,8 @@ io.on('connection', (socket: Socket) => {
       phone: phone,
       socketId: socket.id,
       ip: regIp,
+      // Remember the consumed credit so unregister can refund it (NEW-3 fix).
+      consumedCreditId: entryCreditId || undefined,
     } as any);
 
     // Persist to master DB so registrations survive server restarts
@@ -3675,6 +3707,20 @@ io.on('connection', (socket: Socket) => {
 
     const removedPlayer = qt.players.find(p => p.playerId === auth.username);
     qt.players = qt.players.filter(p => p.playerId !== auth.username);
+
+    // Refund the qualifier credit that registration consumed (NEW-3 fix,
+    // 2026-07-01). Previously register→unregister permanently burned the
+    // credit, leaving the player unqualified with nothing to show for it.
+    if (removedPlayer?.consumedCreditId) {
+      const cid = removedPlayer.consumedCreditId;
+      refundQualifierCreditOnMaster(cid)
+        .then(refunded => auditLog(
+          auth.username,
+          refunded ? 'QUALIFIER_UNREG_CREDIT_REFUND' : 'QUALIFIER_UNREG_CREDIT_REFUND_FAILED',
+          { qualifierId: data.qualifierId, creditId: cid }
+        ))
+        .catch(() => { /* audited above on the false branch */ });
+    }
 
     // Persist unregistration to master DB
     if (qt.masterQualifierId && removedPlayer?.masterPlayerId) {
@@ -6310,6 +6356,33 @@ Give feedback in this JSON format:
         return;
       }
 
+      const progress = progressionManager.getProgress(ctx.playerId)!;
+      // 2026-05-11 stats audit — hydrated gate. A claim firing during the
+      // async hydrate window would modify in-memory stars that get clobbered
+      // when hydrate finishes and overwrites with DB state — reward lost until
+      // next login. Checked BEFORE the idempotency insert (moved 2026-07-01)
+      // so a rejected claim never marks the tier claimed-but-ungranted.
+      if (!progress.hydrated) {
+        socket.emit('battlePassTierClaimed', { success: false, error: 'NOT_HYDRATED' });
+        return;
+      }
+
+      // 🚨 Server-authoritative tier-unlock gate (earned 2026-07-01 .online
+      // audit). Tiers unlock at 500 season XP each — this MUST match the
+      // client's BattlePass.jsx XP_PER_TIER. Previously the handler validated
+      // only that tierId was an integer 1–50 and hadn't been claimed, with NO
+      // earned-XP check: a crafted socket.emit('claimBattlePassTier',{tierId:50})
+      // paid ~11,000 chips via addChipsToUser (permanent DB write), and looping
+      // tiers 1–50 harvested the whole season's chips+stars from a level-1
+      // account. The only "unlock" was client-side UI. Gate the payout here.
+      const BP_XP_PER_TIER = 500;
+      const seasonXp = progressionManager.getSeasonXp(ctx.playerId);
+      const unlockedTier = Math.floor(seasonXp / BP_XP_PER_TIER);
+      if (tierId > unlockedTier) {
+        socket.emit('battlePassTierClaimed', { success: false, error: 'tier_locked', tierId, unlockedTier });
+        return;
+      }
+
       const ok = await dbClaimBattlePassTier(ctx.userId, seasonId, tierId);
       if (!ok) {
         socket.emit('battlePassTierClaimed', { success: false, error: 'already_claimed', tierId });
@@ -6321,15 +6394,6 @@ Give feedback in this JSON format:
       // progress. Reverse order could leave UI showing a reward that never
       // landed in users.chips / users.stars if the DB write failed. Audit
       // logs on failure so ops can reconcile.
-      const progress = progressionManager.getProgress(ctx.playerId)!;
-      // 2026-05-11 stats audit — added hydrated gate. Pre-fix, a claim
-      // firing during the async hydrate window would modify in-memory stars
-      // that got clobbered when hydrate finished and overwrote with DB
-      // state — the claim reward was effectively lost until next login.
-      if (!progress.hydrated) {
-        socket.emit('battlePassTierClaimed', { success: false, error: 'NOT_HYDRATED' });
-        return;
-      }
       const chips = tierId % 5 === 0 ? 0 : 1000 + tierId * 200;
       const stars = tierId % 5 === 0 ? 25 + tierId : 0;
       if (chips > 0) {

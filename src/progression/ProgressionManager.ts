@@ -1252,6 +1252,33 @@ export class ProgressionManager {
   }
 
   // Returns a sanitized version for sending to client (no internal tracking fields)
+  /**
+   * Cumulative ("season") XP: total XP earned to reach the current level plus
+   * progress into it. The server keeps no separate season-XP counter, so we
+   * reconstruct it from the SAME level curve the client uses. Battle-pass
+   * tiers unlock at 500 XP each; getClientProgress emits this as `totalXp`
+   * (which the client's BattlePass UI reads) and claimBattlePassTier gates on
+   * it so a tier can only be claimed once its XP is actually earned.
+   * Earned 2026-07-01 .online audit — the claim handler previously had no
+   * unlock check at all (crafted tierId minted chips), and the server never
+   * sent totalXp so the legit UI always showed tier 0.
+   */
+  private seasonXpFor(progress: { level: number; xp: number }): number {
+    let total = Math.max(0, progress.xp || 0);
+    for (let lvl = 1; lvl < progress.level; lvl++) {
+      const req = xpRequiredForLevel(lvl);
+      if (!Number.isFinite(req)) break;
+      total += req;
+    }
+    return total;
+  }
+
+  getSeasonXp(playerId: string): number {
+    const progress = this.progressMap.get(playerId);
+    if (!progress) return 0;
+    return this.seasonXpFor(progress);
+  }
+
   getClientProgress(playerId: string): object | null {
     const progress = this.progressMap.get(playerId);
     if (!progress) return null;
@@ -1263,6 +1290,8 @@ export class ProgressionManager {
       level: progress.level,
       xp: progress.xp,
       xpToNextLevel: progress.xpToNextLevel,
+      // Cumulative season XP for the battle-pass UI (client reads totalXp).
+      totalXp: this.seasonXpFor(progress),
       totalHandsPlayed: progress.totalHandsPlayed,
       handsWon: progress.handsWon,
       biggestPot: progress.biggestPot,
