@@ -725,27 +725,36 @@ export interface LeaderboardEntry {
 }
 
 export async function getLeaderboard(limit = 50, period = 'alltime'): Promise<LeaderboardEntry[]> {
-  const { rows } = await pool.query('SELECT username, chips, level, stats FROM users WHERE banned = FALSE ORDER BY chips DESC LIMIT $1', [limit]);
-
   const now = Date.now();
   let cutoff = 0;
   if (period === 'daily') cutoff = now - 86400000;
   else if (period === 'weekly') cutoff = now - 7 * 86400000;
   else if (period === 'season') cutoff = new Date(new Date().getFullYear(), new Date().getMonth(), 1).getTime();
 
-  const entries: LeaderboardEntry[] = [];
-  let rank = 1;
+  // For time-filtered periods we must fetch a large pool first, then filter by activity
+  // window and re-rank within it. Capping at top-N by chips before filtering would silently
+  // exclude active players who happen to sit outside the chip-count top-N.
+  const fetchLimit = cutoff > 0 ? 5000 : limit;
+  const { rows } = await pool.query(
+    'SELECT username, chips, level, stats FROM users WHERE banned = FALSE ORDER BY chips DESC LIMIT $1',
+    [fetchLimit]
+  );
+
+  const candidates: LeaderboardEntry[] = [];
   for (const row of rows) {
     let stats: Record<string, any> = {};
     try { stats = JSON.parse(row.stats || '{}'); } catch { /* ignore */ }
     if (cutoff > 0 && (stats.lastHandAt || 0) < cutoff) continue;
     const handsPlayed = stats.handsPlayed || stats.totalHandsPlayed || 0;
     const handsWon = stats.handsWon || 0;
-    entries.push({ rank: rank++, username: row.username, chips: row.chips, level: row.level,
+    candidates.push({ rank: 0, username: row.username, chips: row.chips, level: row.level,
       handsPlayed, handsWon, winRate: handsPlayed > 0 ? Math.round((handsWon / handsPlayed) * 1000) / 10 : 0,
       biggestPot: stats.biggestPot || 0 });
   }
-  return entries;
+
+  // Re-sort by chips within the filtered window, then assign ranks
+  candidates.sort((a, b) => b.chips - a.chips);
+  return candidates.slice(0, limit).map((e, i) => ({ ...e, rank: i + 1 }));
 }
 
 export async function searchUsers(query: string, limit = 10): Promise<Array<{ id: number; username: string; chips: number; level: number }>> {
