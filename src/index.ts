@@ -884,9 +884,10 @@ const QUALIFIER_CACHE_MS = 5 * 60 * 1000; // 5-minute cache
 async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<QualifiedPlayer[]> {
   try {
     const masterApi = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
-    // Fetch ALL credits (including redeemed) — credits stay valid until the
-    // player actually plays in the tournament. Redemption on the master API
-    // side is just a registration marker, not a consumption marker.
+    // Fetch ONLY unredeemed credits — a credit is consumed (redeemed_at stamped)
+    // the moment a player registers for a tournament, so redeemed credits must
+    // be excluded from the gate or the same credit passes the gate repeatedly.
+    // unredeemedOnly=true maps to WHERE qc.redeemed_at IS NULL on the master API.
     //
     // 2026-06-12 — we key qualified players by player_id (master user id),
     // which /qualifier-credits returns to EVERY caller, so the lookup no
@@ -905,7 +906,7 @@ async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<Quali
     // undercounted qualified players (324 weekly / 209 monthly seen as 248 /
     // 132). 50000 covers the whole promotion; revisit with a dedicated
     // distinct-qualified-players endpoint if credit volume ever approaches it.
-    const res = await fetch(`${masterApi}/qualifier-credits?limit=50000`, { headers });
+    const res = await fetch(`${masterApi}/qualifier-credits?limit=50000&unredeemedOnly=true`, { headers });
     const data: any = await res.json();
     if (!data.success || !data.credits) return [];
 
@@ -3576,6 +3577,9 @@ io.on('connection', (socket: Socket) => {
         return;
       }
       auditLog(auth.username, 'QUALIFIER_ENTRY_CREDIT_CONSUME', { qualifierId: qualId, creditId: credRes.rows[0].id, tier: qt.qualifierType });
+      // Bust the in-memory qualifier cache so a second registration attempt
+      // within the 5-min window doesn't see the now-stale "still qualified" list.
+      lastQualifierFetch = 0;
     } catch (err: any) {
       console.error('[QualifierEntry] credit consume failed:', err);
       socket.emit('qualifierRegistrationResult', { success: false, error: 'Server error consuming qualifier credit — please try again.' });
