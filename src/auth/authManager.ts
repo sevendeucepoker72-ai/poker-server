@@ -2,13 +2,28 @@ import { Pool } from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
-// JWT secret
-if (!process.env.JWT_SECRET) {
-  if (process.env.NODE_ENV === 'production') {
-    console.error('[Auth] FATAL: JWT_SECRET env var is not set in production.');
-    process.exit(1);
+// JWT secret. H1 (2026-07-01 audit): the old guard keyed the fatal check on
+// NODE_ENV==='production' ONLY, but Railway uses nixpacks and does NOT set
+// NODE_ENV — so on Railway a missing JWT_SECRET silently fell through to the
+// PUBLIC hardcoded fallback, letting anyone forge a legacy HS256 tokenLogin JWT
+// (jwt.sign({userId:1,...}, '<public fallback>')) = full account takeover.
+//
+// We deliberately do NOT process.exit() here: a hard exit would crash-loop a
+// LIVE Railway deploy if the var were simply forgotten. Instead we detect the
+// production-like environment the same way oauthValidator does, and when we're
+// running on the fallback secret in prod we DISABLE legacy HS256 token
+// verification (getUserFromToken returns invalid) so the weak secret can't be
+// used to forge tokens. OAuth (RS256) login is unaffected. Setting JWT_SECRET
+// re-enables legacy tokens and is still the correct fix.
+const JWT_IS_PRODUCTION = process.env.NODE_ENV === 'production' || !!process.env.RAILWAY_ENVIRONMENT;
+const JWT_USING_FALLBACK = !process.env.JWT_SECRET;
+export const JWT_LEGACY_DISABLED = JWT_USING_FALLBACK && JWT_IS_PRODUCTION;
+if (JWT_USING_FALLBACK) {
+  if (JWT_IS_PRODUCTION) {
+    console.error('[Auth] SECURITY: JWT_SECRET is not set in a production-like environment — legacy HS256 token auth is DISABLED (token-forgery guard). Set JWT_SECRET to re-enable it.');
+  } else {
+    console.warn('[Auth] WARNING: JWT_SECRET env var not set. Using insecure dev fallback.');
   }
-  console.warn('[Auth] WARNING: JWT_SECRET env var not set. Using insecure fallback.');
 }
 const JWT_SECRET = process.env.JWT_SECRET || 'american-pub-poker-jwt-secret-2024-dev-only';
 const JWT_EXPIRES_IN = '7d';
@@ -515,6 +530,11 @@ export async function loginUserAsync(username: string, password: string): Promis
 
 export async function getUserFromToken(token: string): Promise<AuthResult> {
   try {
+    // H1 forgery guard: if we're running on the public fallback secret in a
+    // production-like env, refuse ALL legacy HS256 tokens — they'd be
+    // trivially forgeable. Clients use OAuth (validated separately), so this
+    // only blocks the exploitable path. See the JWT_SECRET note at top.
+    if (JWT_LEGACY_DISABLED) return { success: false, error: 'Legacy token auth disabled' };
     const decoded = jwt.verify(token, JWT_SECRET) as { userId: number; username: string; tokenVersion?: number };
     const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [decoded.userId]);
     if (rows.length === 0) return { success: false, error: 'User not found' };
@@ -687,6 +707,27 @@ export async function deductChips(userId: number, amount: number): Promise<boole
 
 export async function addChipsToUser(userId: number, chips: number): Promise<boolean> {
   try { await pool.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [chips, userId]); return true; } catch { return false; }
+}
+
+/**
+ * Atomic "broke refill": add `amount` chips ONLY if the user is currently below
+ * `threshold`. Returns the new balance, or null if not applied (not broke, or a
+ * concurrent refill already fired). Closes the claimRefill TOCTOU (audit H6,
+ * 2026-07-01) where a read-then-add let two concurrent emits both pass the
+ * broke check and each add the refill. The `chips < threshold` predicate lives
+ * INSIDE the UPDATE so exactly one of N concurrent calls can match.
+ */
+export async function refillBrokeUser(userId: number, threshold: number, amount: number): Promise<number | null> {
+  try {
+    const { rows } = await pool.query(
+      'UPDATE users SET chips = chips + $1 WHERE id = $2 AND chips < $3 RETURNING chips',
+      [amount, userId, threshold]
+    );
+    return rows.length ? Number(rows[0].chips) : null;
+  } catch (e: any) {
+    console.warn(`[refillBrokeUser ${userId}]`, e?.message);
+    return null;
+  }
 }
 
 export async function bumpTokenVersion(userId: number): Promise<void> {

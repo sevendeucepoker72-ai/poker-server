@@ -449,7 +449,7 @@ async function getUsername(userId: number): Promise<string> {
   return user?.username || 'Unknown';
 }
 
-async function getMemberRole(clubId: number, userId: number): Promise<string | null> {
+export async function getMemberRole(clubId: number, userId: number): Promise<string | null> {
   const pool = getPool();
   const row = (await pool.query(
     'SELECT role FROM club_members WHERE clubId = $1 AND userId = $2 AND status = $3',

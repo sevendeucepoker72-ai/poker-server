@@ -47,7 +47,7 @@ import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP } from './auth/authManager';
+import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP } from './auth/authManager';
 import { validateOAuthToken } from './auth/oauthValidator';
 import { notifyPlayer } from './notifyClient';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
@@ -114,6 +114,7 @@ import {
   getClubLevel,
   getFeaturedClubs,
   getClubOfWeek,
+  getMemberRole,
   CLUB_LEVEL_THRESHOLDS,
   CLUB_LEVEL_PERKS,
 } from './clubs/clubManager';
@@ -4373,10 +4374,40 @@ Give feedback in this JSON format:
     // Try OAuth2 RS256 token first, then fall back to legacy HS256 JWT
     const oauthResult = await validateOAuthToken(data.token);
     if (oauthResult.valid && oauthResult.sub) {
-      const userId = parseInt(oauthResult.sub, 10);
+      // H2 fix (2026-07-01 audit): resolve the LOCAL user by phone/username
+      // (upsert), NOT parseInt(sub). The OAuth `sub` is the MASTER users.id (a
+      // UUID); parseInt(sub) reinterpreted its leading digits as a LOCAL integer
+      // user id and logged the socket in as an UNRELATED account (the exact bug
+      // oauthLogin's comment says was fixed there but tokenLogin never was).
+      // Mirror oauthLogin's upsert-by-phone; also stamp masterUserId + phone so
+      // qualifier features work for tokenLogin users too.
+      const _tlPhone = oauthResult.phone || oauthResult.username;
+      if (!_tlPhone) {
+        socket.emit('tokenLoginResult', { success: false, message: 'Token missing phone/username claim' });
+        return;
+      }
+      const _tlDisplayName = oauthResult.username || String(_tlPhone);
+      const _tlBcrypt = require('bcryptjs');
+      const _tlHash = _tlBcrypt.hashSync(`oauth-placeholder-${oauthResult.sub}-${Date.now()}`, 10);
+      const { rows: _tlRows } = await getPool().query(
+        `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
+           VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4)
+           ON CONFLICT (LOWER(username)) DO UPDATE
+             SET display_name = COALESCE(users.display_name, $2)
+         RETURNING *`,
+        [String(_tlPhone), _tlDisplayName, _tlHash,
+         JSON.stringify({ masterPhone: _tlPhone, masterUsername: oauthResult.username, masterUserId: oauthResult.sub })]
+      );
+      const _tlLocalUser = _tlRows[0];
+      const userId = _tlLocalUser.id;
       const progress = await loadProgress(userId);
       if (progress.success && progress.userData) {
-        authSessions.set(socket.id, { userId, username: progress.userData.username });
+        authSessions.set(socket.id, {
+          userId,
+          username: _tlLocalUser.username,
+          masterUserId: String(oauthResult.sub),
+          phone: String(_tlPhone),
+        });
 
         // Post-restart seat recovery: Railway redeploy wipes in-memory
         // state (including reservedSeats Map). But table state was
@@ -4816,6 +4847,11 @@ Give feedback in this JSON format:
   });
 
   socket.on('getClubMembers', async (data: { clubId: number }) => {
+    // H4: the full roster (usernames + per-member stats) is club-internal —
+    // require membership. Club discovery/preview uses getClubInfo (count only),
+    // not this. (requireClubMember is defined below in the same connection
+    // scope; this deferred callback runs after it's initialized.)
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getClubMembers(data.clubId);
     socket.emit('clubMembers', result);
   });
@@ -4985,7 +5021,23 @@ Give feedback in this JSON format:
     }
   });
 
+  // Gate a PRIVATE club read/mutation on active membership (audit H4/H5,
+  // 2026-07-01). Returns the caller's role in the club, or null after emitting
+  // an error. Previously the whole get* batch (chat, activity, member stats)
+  // and pinClubMessage had zero membership checks, so any socket could
+  // enumerate a clubId and read private chat history / member rosters / stats,
+  // or pin/unpin arbitrary messages in a club it doesn't belong to.
+  const requireClubMember = async (clubId: number): Promise<string | null> => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return null; }
+    if (!Number.isFinite(Number(clubId))) { socket.emit('error', { message: 'Invalid club' }); return null; }
+    const role = await getMemberRole(Number(clubId), auth.userId);
+    if (!role) { socket.emit('error', { message: 'You must be a member of this club' }); return null; }
+    return role;
+  };
+
   socket.on('getClubMessages', async (data: { clubId: number; limit?: number }) => {
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getClubMessages(data.clubId, data.limit || 50);
     socket.emit('clubMessages', result);
   });
@@ -4996,8 +5048,15 @@ Give feedback in this JSON format:
   });
 
   socket.on('pinClubMessage', async (data: { clubId: number; messageId: number; pin: boolean }) => {
-    const auth = authSessions.get(socket.id);
-    if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
+    // H5: pinning is a moderation action — require an elevated club role, not
+    // just any authenticated socket. Previously any logged-in user could pin/
+    // unpin messages in any club (IDOR), broadcast to that club's room.
+    const role = await requireClubMember(data.clubId);
+    if (!role) return;
+    if (role !== 'owner' && role !== 'manager') {
+      socket.emit('error', { message: 'Only club owners/managers can pin messages' });
+      return;
+    }
     const result = data.pin ? await pinMessage(data.clubId, data.messageId) : await unpinMessage(data.clubId, data.messageId);
     if (result.success) {
       io.to(`club:${data.clubId}`).emit('clubMessagePinned', { messageId: data.messageId, pinned: data.pin });
@@ -5014,6 +5073,7 @@ Give feedback in this JSON format:
   });
 
   socket.on('getClubStatistics', async (data: { clubId: number }) => {
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getClubStatistics(data.clubId);
     socket.emit('clubStatistics', result);
   });
@@ -5021,6 +5081,7 @@ Give feedback in this JSON format:
   // ─── Club Activity Feed ───
 
   socket.on('getClubActivity', async (data: { clubId: number; limit?: number }) => {
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getActivityFeed(data.clubId, data.limit || 20);
     socket.emit('clubActivity', result);
   });
@@ -5280,6 +5341,9 @@ Give feedback in this JSON format:
   // ── Feature 12: Member Profiles ──
 
   socket.on('getMemberProfile', async (data: { clubId: number; userId: number }) => {
+    // H4: a member's per-club stats (chipsWon/Lost, biggestPot) are private to
+    // the club — require the caller to be a member before disclosing them.
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getMemberProfile(data.clubId, data.userId);
     socket.emit('memberProfile', result);
   });
@@ -6266,6 +6330,18 @@ Give feedback in this JSON format:
       const chips = CHIPS_BY_DAY[day] || 0;
       const stars = STARS_BY_DAY[day] || 0;
 
+      // H6 fix (2026-07-01 audit): record the claim FIRST. recordDailyClaim is
+      // an atomic INSERT ... ON CONFLICT DO NOTHING and returns true ONLY for
+      // the first claim today. A concurrent second tab gets false and bails
+      // BEFORE any grant. Previously the grant ran before this INSERT, so two
+      // simultaneous emits both passed the read-only hasClaimedToday check and
+      // double-credited chips + stars.
+      const firstLoginClaim = await recordDailyClaim(ctx.userId, 'login', { day, chips, stars });
+      if (!firstLoginClaim) {
+        socket.emit('dailyLoginClaimed', { success: false, error: 'already_claimed' });
+        return;
+      }
+
       const progress = progressionManager.getProgress(ctx.playerId)!;
       progress.chips += chips;
       progress.stars += stars;
@@ -6279,7 +6355,6 @@ Give feedback in this JSON format:
         }
       }
       await updateLoginStreak(ctx.userId, newStreak);
-      await recordDailyClaim(ctx.userId, 'login', { day, chips, stars });
 
       socket.emit('dailyLoginClaimed', { success: true, day, streak: newStreak, chips, stars });
       sendProgressToPlayer(socket.id);
@@ -6301,17 +6376,19 @@ Give feedback in this JSON format:
       if (!ctx) { socket.emit('refillResult', { success: false, error: 'Not authenticated' }); return; }
       const REFILL_THRESHOLD = 5000; // = cheapest cash table min buy-in
       const REFILL_AMOUNT = 5000;
-      const current = await getUserChips(ctx.userId);
-      if (current >= REFILL_THRESHOLD) {
+      // H6 fix (2026-07-01): atomic check-and-add. The old read-then-add let
+      // two concurrent broke-state emits both pass the `current < threshold`
+      // check and each add 5,000 (+10,000). refillBrokeUser puts the predicate
+      // inside the UPDATE so exactly one concurrent call applies.
+      const newBalance = await refillBrokeUser(ctx.userId, REFILL_THRESHOLD, REFILL_AMOUNT);
+      if (newBalance == null) {
+        const current = await getUserChips(ctx.userId);
         socket.emit('refillResult', { success: false, error: 'not_broke', chips: current });
         return;
       }
-      const ok = await addChipsToUser(ctx.userId, REFILL_AMOUNT);
-      if (!ok) { socket.emit('refillResult', { success: false, error: 'grant_failed' }); return; }
-      const newBalance = current + REFILL_AMOUNT;
-      try { const p = progressionManager.getProgress(ctx.playerId); if (p) p.chips += REFILL_AMOUNT; } catch {}
+      try { const p = progressionManager.getProgress(ctx.playerId); if (p) p.chips = newBalance; } catch {}
       const uname = authSessions.get(socket.id)?.username || String(ctx.userId);
-      auditLog(uname, 'BROKE_REFILL', { old: current, added: REFILL_AMOUNT, newBalance });
+      auditLog(uname, 'BROKE_REFILL', { added: REFILL_AMOUNT, newBalance });
       socket.emit('refillResult', { success: true, added: REFILL_AMOUNT, chips: newBalance });
       sendProgressToPlayer(socket.id);
     } catch (err: any) {
@@ -9001,18 +9078,41 @@ Give feedback in this JSON format:
   });
 
   // ── Session recap — generate LLM recap at session end ─────────────────
+  const recapLastRequest = new Map<number, number>();
   socket.on('requestSessionRecap', async (data: {
     handsPlayed: number; netChips: number; winRate: number;
     biggestPot: number; sessionMinutes: number;
   }) => {
     try {
-      const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+      // 2026-07-01 audit H3: this handler was UNAUTHENTICATED and unthrottled
+      // while calling the Anthropic API on every emit — an unbounded LLM-spend
+      // DoS from a single socket. Gate on auth + a per-user rate limit + an
+      // API-key check, exactly like coachHand. Also coerce every client stat to
+      // a plain number since they are interpolated raw into the prompt.
+      const auth = authSessions.get(socket.id);
+      if (!auth) { socket.emit('sessionRecapResult', { success: false, error: 'Not authenticated' }); return; }
+      const now = Date.now();
+      const last = recapLastRequest.get(auth.userId) || 0;
+      if (now - last < 30_000) {
+        socket.emit('sessionRecapResult', { success: false, error: 'Please wait before requesting another recap' });
+        return;
+      }
+      recapLastRequest.set(auth.userId, now);
+      const apiKey = process.env.ANTHROPIC_API_KEY;
+      if (!apiKey) { socket.emit('sessionRecapResult', { success: false }); return; }
+      const anthropic = new Anthropic({ apiKey });
+      const num = (v: any) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+      const handsPlayed = num(data?.handsPlayed);
+      const netChips = num(data?.netChips);
+      const winRate = num(data?.winRate);
+      const biggestPot = num(data?.biggestPot);
+      const sessionMinutes = num(data?.sessionMinutes);
       const prompt = `You are a poker coach writing a brief post-session analysis. Session stats:
-- Hands: ${data.handsPlayed}
-- Net: ${data.netChips > 0 ? '+' : ''}${data.netChips} chips
-- Win rate: ${data.winRate}%
-- Biggest pot: ${data.biggestPot} chips
-- Duration: ${data.sessionMinutes} minutes
+- Hands: ${handsPlayed}
+- Net: ${netChips > 0 ? '+' : ''}${netChips} chips
+- Win rate: ${winRate}%
+- Biggest pot: ${biggestPot} chips
+- Duration: ${sessionMinutes} minutes
 
 Write exactly 3 short paragraphs (2-3 sentences each):
 1. What went well (or a silver lining if losing session)
