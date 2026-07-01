@@ -517,6 +517,9 @@ function incrementChipVelocityAlert(userId: number): number {
 const DURABLE_AUDIT_ACTIONS = new Set([
   'GRANT_CHIPS', 'RESTORE_BALANCE', 'BAN_USER', 'UNBAN_USER',
   'QUALIFIER_REENTRY_CREDIT_CONSUME', 'QUALIFIER_REENTRY_CREDIT_REFUND',
+  // Batch 5 admin actions — chip/privilege/ban mutations need a durable trail.
+  'ADMIN_ADJUST_CHIPS', 'ADMIN_IP_BAN', 'ADMIN_TOGGLE_ADMIN',
+  'ADMIN_FORCE_CLOSE_TABLE', 'ADMIN_KICK',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -688,6 +691,24 @@ setInterval(() => {
 // Stored at oauthLogin so getQualifications can match the master id, not the
 // local int. phone kept as a display/fallback match key.
 const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string }>();
+
+// Admin operational state (2026-07-01 Batch 5 — real backends for the admin
+// panel). In-memory by design: an IP ban / maintenance toggle is an
+// incident-response tool that should reset on redeploy (a persistent IP ban
+// belongs in the master admin). Both are checked at connection time.
+const bannedIPs = new Set<string>();
+let maintenanceMode = false;
+
+// Resolve the REAL client IP. Railway (and most PaaS) put an edge proxy in
+// front, so socket.handshake.address is the proxy hop, not the client — an IP
+// ban on that would be ineffective or over-broad (banning a shared upstream
+// that many users share). Prefer the first X-Forwarded-For entry (the original
+// client), fall back to the socket address.
+function realClientIp(socket: Socket): string {
+  const xff = socket.handshake.headers['x-forwarded-for'];
+  const first = Array.isArray(xff) ? xff[0] : (typeof xff === 'string' ? xff.split(',')[0] : '');
+  return (first || '').trim() || socket.handshake.address || '';
+}
 
 /**
  * Resolve the human userId currently occupying a (tableId, seatIndex). Returns
@@ -3357,7 +3378,16 @@ io.on('connection', (socket: Socket) => {
     socket.disconnect(true);
     return;
   }
+  // Batch 5: reject IP-banned addresses (in-memory admin incident tool). Match
+  // on the real client IP (X-Forwarded-For aware), not the proxy hop.
+  if (bannedIPs.has(realClientIp(socket))) {
+    socket.emit('error', { message: 'Access denied' });
+    socket.disconnect(true);
+    return;
+  }
   ipSockets.add(socket.id);
+  // Let a late-joining client show the maintenance banner if it's on.
+  if (maintenanceMode) socket.emit('maintenanceMode', { enabled: true });
 
   socket.on('disconnect', async () => {
     ipSockets.delete(socket.id);
@@ -4788,6 +4818,184 @@ Give feedback in this JSON format:
     auditLog(auth.username, 'UNBAN_USER', { targetUserId: data.userId });
     unbanUserDB(data.userId);
     socket.emit('userUnbanned', { userId: data.userId });
+  });
+
+  // ── Batch 5 (2026-07-01): real backends for the .online AdminDashboard
+  //    actions that previously emitted unhandled events + faked success. All
+  //    admin-gated (isUserAdmin) + audited, matching the handlers above.
+
+  // Helper: every live socket belonging to a target userId.
+  const socketsForUser = (targetUserId: number): string[] => {
+    const ids: string[] = [];
+    for (const [sid, a] of authSessions) if (a.userId === targetUserId) ids.push(sid);
+    return ids;
+  };
+
+  socket.on('adminAdjustChips', async (data: { userId: number; amount: number; reason?: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const amount = Math.trunc(Number(data?.amount) || 0);
+    const targetUserId = Number(data?.userId);
+    if (!Number.isFinite(targetUserId) || amount === 0 || Math.abs(amount) > 10_000_000_000) {
+      socket.emit('adminAdjustChipsResult', { success: false, error: 'Invalid amount' });
+      return;
+    }
+    try {
+      // Additive, clamped at 0 for deductions so an adjustment can't drive a
+      // balance negative. Atomic single UPDATE.
+      const { rows } = await getPool().query(
+        'UPDATE users SET chips = GREATEST(0, chips + $1) WHERE id = $2 RETURNING chips',
+        [amount, targetUserId]
+      );
+      if (rows.length === 0) { socket.emit('adminAdjustChipsResult', { success: false, error: 'User not found' }); return; }
+      const newBalance = Number(rows[0].chips);
+      if (Math.abs(amount) >= 1_000_000) {
+        console.warn(`[AntiCheat] LARGE CHIP ADJUST: admin ${auth.username} adjusted userId=${targetUserId} by ${amount} → ${newBalance}`);
+      }
+      auditLog(auth.username, 'ADMIN_ADJUST_CHIPS', { targetUserId, amount, reason: data?.reason || '', newBalance });
+      // Reflect in the target's in-memory progress if they're online.
+      for (const sid of socketsForUser(targetUserId)) {
+        const pid = playerSessions.get(sid)?.playerId;
+        const prog = pid ? progressionManager.getProgress(pid) : null;
+        if (prog) prog.chips = newBalance;
+        sendProgressToPlayer(sid);
+      }
+      socket.emit('adminAdjustChipsResult', { success: true, userId: targetUserId, amount, newBalance });
+    } catch (err: any) {
+      console.error('[adminAdjustChips]', err);
+      socket.emit('adminAdjustChipsResult', { success: false, error: 'Server error' });
+    }
+  });
+
+  socket.on('adminKickPlayer', async (data: { userId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const targetUserId = Number(data?.userId);
+    auditLog(auth.username, 'ADMIN_KICK', { targetUserId });
+    let kicked = 0;
+    for (const sid of socketsForUser(targetUserId)) {
+      const s = io.sockets.sockets.get(sid);
+      if (!s) continue;
+      // Cash the player out of any seats (handlePlayerLeave credits + tears
+      // down) BEFORE disconnecting, so their stack isn't stranded.
+      try { handlePlayerLeave(s); } catch { /* best effort */ }
+      s.emit('kickedByAdmin', { reason: 'Removed by an administrator' });
+      s.disconnect(true);
+      kicked++;
+    }
+    socket.emit('adminKickResult', { success: true, userId: targetUserId, kicked });
+  });
+
+  socket.on('adminIPBan', async (data: { userId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const targetUserId = Number(data?.userId);
+    // Ban the account (persistent) AND block its current IP(s) for this process
+    // lifetime, then kick every live socket. A durable IP ban belongs in the
+    // master admin; this is the in-game incident-response tool.
+    const ips: string[] = [];
+    for (const sid of socketsForUser(targetUserId)) {
+      const s = io.sockets.sockets.get(sid);
+      const ip = s ? realClientIp(s) : '';
+      if (ip) { bannedIPs.add(ip); ips.push(ip); }
+      if (s) { try { handlePlayerLeave(s); } catch {} s.emit('kickedByAdmin', { reason: 'Banned by an administrator' }); s.disconnect(true); }
+    }
+    // Account ban is the reliable effect; the IP block is best-effort (shared
+    // NAT / proxy IPs can over-match — noted for the admin).
+    try { await banUserDB(targetUserId); } catch {}
+    auditLog(auth.username, 'ADMIN_IP_BAN', { targetUserId, ips });
+    socket.emit('adminIPBanResult', { success: true, userId: targetUserId, ipsBanned: ips.length });
+  });
+
+  socket.on('adminToggleAdmin', async (data: { userId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const targetUserId = Number(data?.userId);
+    // Guard against self-demote: an admin can't strip their OWN admin (avoids
+    // accidental lockout). They can still grant/revoke on OTHER accounts.
+    if (targetUserId === auth.userId) {
+      socket.emit('adminToggleAdminResult', { success: false, error: 'You cannot change your own admin status' });
+      return;
+    }
+    try {
+      const { rows } = await getPool().query(
+        'UPDATE users SET is_admin = NOT COALESCE(is_admin, FALSE) WHERE id = $1 RETURNING is_admin',
+        [targetUserId]
+      );
+      if (rows.length === 0) { socket.emit('adminToggleAdminResult', { success: false, error: 'User not found' }); return; }
+      const isAdmin = !!rows[0].is_admin;
+      auditLog(auth.username, 'ADMIN_TOGGLE_ADMIN', { targetUserId, isAdmin });
+      socket.emit('adminToggleAdminResult', { success: true, userId: targetUserId, isAdmin });
+    } catch (err: any) {
+      console.error('[adminToggleAdmin]', err);
+      socket.emit('adminToggleAdminResult', { success: false, error: 'Server error' });
+    }
+  });
+
+  socket.on('adminBroadcast', async (data: { message: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    // Sanitize: strip angle brackets + quotes, cap length. The message is
+    // rendered client-side as text (React JSX escapes); keep it plain.
+    const raw = String(data?.message || '').replace(/[<>"']/g, '').trim().slice(0, 280);
+    if (!raw) { socket.emit('adminBroadcastResult', { success: false, error: 'Empty message' }); return; }
+    auditLog(auth.username, 'ADMIN_BROADCAST', { message: raw });
+    io.emit('serverAnnouncement', { message: raw, at: Date.now() });
+    socket.emit('adminBroadcastResult', { success: true });
+  });
+
+  socket.on('adminMaintenance', async (data: { enabled: boolean }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    maintenanceMode = !!data?.enabled;
+    auditLog(auth.username, 'ADMIN_MAINTENANCE', { enabled: maintenanceMode });
+    // Tell every connected client (and late joiners, via the connection hook)
+    // so they can show a maintenance banner. This is banner-only — it does NOT
+    // refuse connections; the flag is server-authoritative and broadcast.
+    io.emit('maintenanceMode', { enabled: maintenanceMode });
+    socket.emit('adminMaintenanceResult', { success: true, enabled: maintenanceMode });
+  });
+
+  socket.on('adminForceCloseTable', async (data: { tableId: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const table = tableManager.getTable(data.tableId);
+    if (!table) { socket.emit('adminForceCloseTableResult', { success: false, error: 'Table not found' }); return; }
+    auditLog(auth.username, 'ADMIN_FORCE_CLOSE_TABLE', { tableId: data.tableId });
+    // Cash every seated HUMAN back to their wallet, then unseat + remove the
+    // table. Refund the FULL table stake — chipCount PLUS any chips already
+    // committed to a live pot (totalInvestedThisHand). creditSeatStackToWallet
+    // only refunds chipCount, so closing a table mid-hand would DESTROY the pot
+    // (same class as the shutdown #1 fix). Tournament stacks are wallet-unbacked
+    // — skip them (crediting would mint), exactly like creditSeatStackToWallet.
+    const inHand = table.isHandInProgress();
+    const isTournament = tournamentTables.has(data.tableId);
+    for (let i = 0; i < MAX_SEATS; i++) {
+      const seat = table.seats[i];
+      if (!seat || seat.state !== 'occupied') continue;
+      if (!seat.isAI && !isTournament) {
+        const uid = userIdForSeat(data.tableId, i);
+        if (uid) {
+          let uname = String(uid);
+          for (const [, a] of authSessions) if (a.userId === uid) { uname = a.username; break; }
+          const refund = seat.chipCount + (inHand ? (seat.totalInvestedThisHand || 0) : 0);
+          if (refund > 0) {
+            addChipsToUser(uid, refund)
+              .then((ok) => auditLog(uname, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: uid, tableId: data.tableId, amount: refund, reason: 'admin_force_close' }))
+              .catch(() => {});
+          }
+        }
+      } else if (!seat.isAI && isTournament) {
+        auditLog(String(userIdForSeat(data.tableId, i) || ''), 'TOURNAMENT_STACK_NOT_CASHED', { tableId: data.tableId, reason: 'admin_force_close' });
+      }
+      table.standUp(i);
+    }
+    // Clear timers + boot everyone from the room.
+    const at = turnTimers.get(data.tableId); if (at) { clearTimeout(at.timeout); turnTimers.delete(data.tableId); }
+    const pa = pendingAutoStartTimers.get(data.tableId); if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(data.tableId); }
+    io.to(`table:${data.tableId}`).emit('tableClosedByAdmin', { tableId: data.tableId });
+    tableManager.removeTable(data.tableId);
+    socket.emit('adminForceCloseTableResult', { success: true, tableId: data.tableId });
   });
 
   // ========== End Admin Events ==========
