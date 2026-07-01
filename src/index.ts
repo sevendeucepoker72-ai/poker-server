@@ -1060,15 +1060,9 @@ setInterval(() => {
       socketId: p.socketId,
     }));
 
-    // Create multi-table tournament with registered players + AI fill
-    const playerCount = Math.max(qt.players.length, 18); // minimum 2 tables
-    const result = startMultiTableTournament(
-      playerCount,
-      humanPlayers[0]?.socketId,
-      humanPlayers[0]?.id,
-      humanPlayers[0]?.name,
-      turbo,
-    );
+    // Real players only — no AI fill
+    const playerCount = qt.players.length;
+    const result = startQualifierTournament(humanPlayers, qt.startingStack || 50000, turbo);
 
     if (result) {
       qt.status = 'running';
@@ -9328,6 +9322,93 @@ const AI_NAMES_POOL = [
   'Rosa','Sara','Tina','Wanda','Yoko','Zoe','Bret','Chip','Doug','Earl',
   'Glen','Hans','Juan','Kurt','Lars','Milo','Nate','Phil','Russ','Stan',
 ];
+
+/**
+ * Start a qualifier tournament with only the real registered players — no AI fill.
+ * Wires up each player's socket session so they receive table broadcasts.
+ * Returns the same shape as startMultiTableTournament so the caller's
+ * notification loop is unchanged.
+ */
+function startQualifierTournament(
+  players: { id: string; name: string; socketId: string }[],
+  startingStack: number = 50000,
+  turbo: boolean = false,
+): { tournamentId: string; tableIds: string[]; tableCount: number } | null {
+  if (players.length < 2) return null;
+  const seatsPerTable = 9;
+  const tableCount = Math.max(1, Math.ceil(players.length / seatsPerTable));
+
+  const tournamentId = tournamentManager.createTournament({
+    name: 'Qualifier Tournament',
+    buyIn: 0,
+    prizePool: 0,
+    maxPlayers: players.length,
+    startInterval: 0,
+    blindLevels: DEFAULT_BLIND_LEVELS,
+  });
+
+  const tournament = tournamentManager.getTournament(tournamentId);
+  if (!tournament) return null;
+
+  for (const p of players) {
+    tournamentManager.registerPlayer(tournamentId, p.id, p.name, p.socketId);
+  }
+
+  const startResult = tournamentManager.startTournament(tournamentId);
+  if (!startResult) return null;
+
+  for (const tp of tournament.players) {
+    tp.chips = startingStack;
+  }
+  tournament.turboMode = turbo;
+
+  const tableIds: string[] = [];
+  const blinds = startResult.blinds;
+
+  for (let t = 0; t < tableCount; t++) {
+    const tid = tableManager.createQuickTable(
+      `Qualifier Table ${t + 1}`,
+      seatsPerTable,
+      blinds.sb,
+      blinds.bb,
+      startingStack,
+    );
+    tableIds.push(tid);
+    tournamentTables.set(tid, tournamentId);
+    if (turbo) fastModeTables.set(tid, true);
+  }
+
+  tournamentManager.setTableIds(tournamentId, tableIds);
+
+  // Seat all players round-robin — no AI
+  for (let i = 0; i < players.length; i++) {
+    const p = players[i];
+    const tableIdx = i % tableCount;
+    const tid = tableIds[tableIdx];
+    const seatIdx = Math.floor(i / tableCount);
+    const table = tableManager.getTable(tid);
+    if (!table || seatIdx >= seatsPerTable) continue;
+
+    table.sitDown(seatIdx, p.name, startingStack, p.id, false);
+    tournamentManager.setPlayerTable(tournamentId, p.id, tid);
+
+    // Wire socket session so the player receives table state broadcasts
+    const sess: PlayerSession = {
+      socketId: p.socketId,
+      tableId: tid,
+      seatIndex: seatIdx,
+      playerName: p.name,
+      playerId: p.id,
+      trainingEnabled: false,
+      sittingOut: false,
+    };
+    playerSessions.set(p.socketId, sess);
+    const sock = io.sockets.sockets.get(p.socketId);
+    if (sock) sock.join(`table:${tid}`);
+  }
+
+  return { tournamentId, tableIds, tableCount };
+}
 
 /**
  * Start a multi-table tournament simulation.
