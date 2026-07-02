@@ -356,6 +356,24 @@ export async function initDB(): Promise<void> {
   await pool.query(`ALTER TABLE staking_offers ADD COLUMN IF NOT EXISTS paid_out_at TIMESTAMPTZ`).catch(() => {});
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_staking_offers_unpaid ON staking_offers(tournament_id, seller_id) WHERE paid_out_at IS NULL`).catch(() => {});
 
+  // Batch 5b: promo ENTRY CODES. Admins generate codes; a player redeems one to
+  // receive a qualifier credit (issued on the master). Previously the whole
+  // system was client-side sessionStorage and codes were unredeemable.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS online_entry_codes (
+      code           TEXT PRIMARY KEY,
+      qualifier_type TEXT,                          -- 'weekly' | 'monthly' | null
+      promotion_name TEXT,
+      expires_at     TIMESTAMPTZ,
+      created_by     INTEGER REFERENCES users(id),
+      created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      redeemed_by    INTEGER REFERENCES users(id),
+      redeemed_at    TIMESTAMPTZ,
+      master_credit_id TEXT
+    )
+  `).catch((e: any) => console.warn('[Auth] online_entry_codes:', e.message));
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_entry_codes_open ON online_entry_codes(created_at) WHERE redeemed_by IS NULL`).catch(() => {});
+
   console.log('[Auth] Persistence sweep DDL applied');
 
   // Seed admin accounts

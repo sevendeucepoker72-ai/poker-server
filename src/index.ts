@@ -1115,6 +1115,33 @@ async function refundQualifierCreditOnMaster(creditId: string): Promise<boolean>
   }
 }
 
+// Batch 5b — issue a qualifier credit on the master when a player redeems a
+// promo entry code. Deduped on `note` (= the code) master-side. Returns the
+// new credit id, or null on any transport error (caller rolls back the redeem).
+async function issueQualifierCreditOnMaster(masterId: string, tier: string, note: string): Promise<{ issued: boolean; alreadyIssued?: boolean; creditId?: string; error?: string }> {
+  const base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 6000);
+  try {
+    const res = await fetch(`${base}/qualifier-credits/issue/internal`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Token': tok },
+      body: JSON.stringify({ playerId: masterId, tier, note }),
+      signal: ac.signal,
+    });
+    if (!res.ok) return { issued: false, error: `http_${res.status}` };
+    const data: any = await res.json().catch(() => ({}));
+    // issued:false WITHOUT an error = the master's note-dedup already has this
+    // credit (idempotent). Surface it so the caller treats a retry as success.
+    return { issued: !!data.issued, alreadyIssued: data.issued === false, creditId: data.creditId };
+  } catch (e: any) {
+    return { issued: false, error: e?.name === 'AbortError' ? 'timeout' : String(e?.message || e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // Sync qualifier schedule from master API so qualifierTournaments has real
 // scheduledAt values (instead of client-side guessed dates) and masterQualifierId
 // for registration persistence and result reporting.
@@ -5000,6 +5027,140 @@ Give feedback in this JSON format:
     socket.emit('adminForceCloseTableResult', { success: true, tableId: data.tableId });
   });
 
+  // ── Batch 5b (2026-07-01): promo ENTRY CODES. Admin generates codes
+  //    (persisted); a player redeems one to get a qualifier credit on the
+  //    master. Previously client-side sessionStorage → unredeemable.
+  const ENTRY_CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const genEntryCode = (): string => {
+    let s = '';
+    // Non-crypto is fine — uniqueness is enforced by the PK + a retry.
+    for (let i = 0; i < 8; i++) s += ENTRY_CODE_CHARS[Math.floor(Math.random() * ENTRY_CODE_CHARS.length)];
+    return s;
+  };
+
+  socket.on('adminGenerateCodes', async (data: { count?: number; qualifierType?: string; promotionName?: string; expiresAt?: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const count = Math.min(Math.max(1, Math.floor(Number(data?.count) || 1)), 500);
+    const qualifierType = data?.qualifierType === 'monthly' ? 'monthly' : (data?.qualifierType === 'weekly' ? 'weekly' : null);
+    const promotionName = data?.promotionName ? String(data.promotionName).replace(/[<>"']/g, '').slice(0, 60) : null;
+    const expiresAt = data?.expiresAt ? new Date(data.expiresAt) : null;
+    const created: string[] = [];
+    try {
+      for (let i = 0; i < count; i++) {
+        // Retry on the rare PK collision.
+        let inserted = false;
+        for (let attempt = 0; attempt < 5 && !inserted; attempt++) {
+          const code = genEntryCode();
+          try {
+            await getPool().query(
+              `INSERT INTO online_entry_codes (code, qualifier_type, promotion_name, expires_at, created_by)
+               VALUES ($1, $2, $3, $4, $5)`,
+              [code, qualifierType, promotionName, expiresAt && !isNaN(expiresAt.getTime()) ? expiresAt : null, auth.userId]
+            );
+            created.push(code);
+            inserted = true;
+          } catch { /* collision — retry */ }
+        }
+      }
+      auditLog(auth.username, 'ADMIN_GENERATE_CODES', { count: created.length, qualifierType, promotionName });
+      socket.emit('adminCodesGenerated', { success: true, codes: created, qualifierType, promotionName });
+    } catch (err: any) {
+      console.error('[adminGenerateCodes]', err);
+      socket.emit('adminCodesGenerated', { success: false, error: 'Server error' });
+    }
+  });
+
+  socket.on('adminGetCodes', async () => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    try {
+      const { rows } = await getPool().query(
+        `SELECT code, qualifier_type, promotion_name, expires_at, created_at, redeemed_by, redeemed_at
+         FROM online_entry_codes ORDER BY created_at DESC LIMIT 500`
+      );
+      socket.emit('adminCodesList', { codes: rows });
+    } catch (err: any) {
+      console.error('[adminGetCodes]', err);
+      socket.emit('adminCodesList', { codes: [] });
+    }
+  });
+
+  socket.on('adminRevokeCode', async (data: { code: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    try {
+      // Only unredeemed codes can be revoked (deleted).
+      const { rowCount } = await getPool().query(
+        `DELETE FROM online_entry_codes WHERE code = $1 AND redeemed_by IS NULL`,
+        [String(data?.code || '').trim().toUpperCase()]
+      );
+      auditLog(auth.username, 'ADMIN_REVOKE_CODE', { code: data?.code, revoked: (rowCount || 0) > 0 });
+      socket.emit('adminCodeRevoked', { success: (rowCount || 0) > 0, code: data?.code });
+    } catch (err: any) {
+      socket.emit('adminCodeRevoked', { success: false, error: 'Server error' });
+    }
+  });
+
+  // Player: redeem a promo entry code → a qualifier credit on the master.
+  socket.on('redeemEntryCode', async (data: { code: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('redeemEntryCodeResult', { success: false, error: 'Sign in to redeem a code' }); return; }
+    const masterId = auth.masterUserId;
+    if (!masterId) { socket.emit('redeemEntryCodeResult', { success: false, error: 'Your account is not fully linked yet' }); return; }
+    const code = String(data?.code || '').trim().toUpperCase();
+    if (!code) { socket.emit('redeemEntryCodeResult', { success: false, error: 'Enter a code' }); return; }
+    try {
+      // Atomically claim the code. It succeeds if the code is unredeemed OR is
+      // already claimed BY THIS SAME USER (a retry after a transport failure) —
+      // NEVER for a different user. Combined with the note-deduped master issue
+      // this guarantees 1 code → exactly 1 credit → 1 owner, even across
+      // retries. Critically we do NOT roll the claim back on issue failure:
+      // rolling back would make the code reclaimable by a DIFFERENT player
+      // while the credit (if the write actually committed) still belongs to the
+      // first — that could leak a second credit. Leaving it claimed lets only
+      // THIS user retry, and the master dedup makes the retry idempotent.
+      const claim = await getPool().query(
+        `UPDATE online_entry_codes
+            SET redeemed_by = $1, redeemed_at = NOW()
+          WHERE code = $2 AND (redeemed_by IS NULL OR redeemed_by = $1)
+            AND (expires_at IS NULL OR expires_at > NOW())
+          RETURNING qualifier_type`,
+        [auth.userId, code]
+      );
+      if (claim.rows.length === 0) {
+        // Distinguish not-found/expired/used-by-someone-else for a helpful message.
+        const look = await getPool().query(`SELECT redeemed_by, expires_at FROM online_entry_codes WHERE code = $1`, [code]);
+        const reason = look.rows.length === 0 ? 'Code not found'
+          : (look.rows[0].redeemed_by && look.rows[0].redeemed_by !== auth.userId) ? 'Code already used'
+          : 'Code expired';
+        socket.emit('redeemEntryCodeResult', { success: false, error: reason });
+        return;
+      }
+      const tier = claim.rows[0].qualifier_type || 'weekly';
+      // Issue the qualifier credit on the master (deduped on the code). A master
+      // 'already_issued' means the credit for THIS code already exists — since
+      // only this user can hold this code, that's an idempotent success.
+      const issued = await issueQualifierCreditOnMaster(masterId, tier, `[entry-code:${code}]`);
+      if (!issued.issued && !issued.alreadyIssued) {
+        // Genuine transport error — the credit likely wasn't granted. Leave the
+        // code claimed by this user (NOT rolled back) so they can safely retry;
+        // a retry is idempotent via the master note-dedup.
+        socket.emit('redeemEntryCodeResult', { success: false, error: 'Server error — please try again' });
+        return;
+      }
+      if (issued.creditId) {
+        await getPool().query(`UPDATE online_entry_codes SET master_credit_id = $1 WHERE code = $2`, [issued.creditId, code]);
+      }
+      lastQualifierFetch = 0; // bust the qualification cache so the new credit shows
+      auditLog(auth.username, 'REDEEM_ENTRY_CODE', { code, tier, creditId: issued.creditId, alreadyIssued: !!issued.alreadyIssued });
+      socket.emit('redeemEntryCodeResult', { success: true, tier, code });
+    } catch (err: any) {
+      console.error('[redeemEntryCode]', err);
+      socket.emit('redeemEntryCodeResult', { success: false, error: 'Server error' });
+    }
+  });
+
   // ========== End Admin Events ==========
 
   // ========== Club Events ==========
@@ -7074,7 +7235,11 @@ Give feedback in this JSON format:
         }
 
         // 4. Set auth session + emit loginResult in the shape the client expects.
-        authSessions.set(socket.id, { userId: localUser.id, username: localUser.username });
+        // Stamp masterUserId + phone so ticket-login users can use qualifiers /
+        // redeem entry codes (2026-07-01: fixes the original NEW-4 gap AND the
+        // 5b ticket-user lockout — the master id was written to DB stats but not
+        // the in-memory session).
+        authSessions.set(socket.id, { userId: localUser.id, username: localUser.username, masterUserId: String(remoteUserId), phone: String(phone) });
         const userData = {
           id: localUser.id,
           username: localUser.username,
