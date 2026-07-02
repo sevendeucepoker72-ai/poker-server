@@ -707,3 +707,39 @@ describe('Pot-limit all-in is capped at the pot, not the whole stack (#9)', () =
     expect(t.seats[actor].allIn).toBe(true);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// All-fold refund (2026-07-01 Hold'em audit #1). When every seat ends folded
+// (blind posters leave mid-hand → force-folded, then the last live seat folds),
+// determineWinners had no nonFolded===0 branch and the reset deleted the pot's
+// blinds/antes. It must instead refund each seat its own stake — chips conserved.
+// ─────────────────────────────────────────────────────────────────────────
+describe('All-fold degenerate hand — refunds stakes, destroys no chips (#1)', () => {
+  test('every seat folded → each stake refunded, total chips unchanged', () => {
+    const t = makeTable(); // 25/50, minBuyIn 1000
+    t.sitDown(0, 'A', 5000, 'a', false);
+    t.sitDown(1, 'B', 5000, 'b', false);
+    t.sitDown(2, 'C', 5000, 'c', false);
+    t.startNewHand();
+
+    const occupied = () => t.seats.filter((s) => s.state === 'occupied');
+    // chipCount + committed pot chips = total money on the table (constant).
+    const stakeTotal = () => occupied().reduce((sum, s) => sum + s.chipCount + s.totalInvestedThisHand, 0);
+    const before = stakeTotal();
+    expect(before).toBe(15000); // 3 × 5000 buy-in
+
+    // Force-fold every non-active seat (no turn advance), then fold the active
+    // seat — that fold resolves the hand with zero non-folded players.
+    const active = t.activeSeatIndex;
+    expect(active).toBeGreaterThanOrEqual(0);
+    for (let i = 0; i < MAX_SEATS; i++) {
+      if (t.seats[i].state === 'occupied' && i !== active && !t.seats[i].folded) t.forceFoldSeat(i);
+    }
+    t.playerFold(active);
+
+    // Hand resolved; every stake refunded to chipCount, nothing destroyed.
+    const afterChips = occupied().reduce((sum, s) => sum + s.chipCount, 0);
+    expect(afterChips).toBe(before);                    // no chips lost
+    expect(occupied().every((s) => s.totalInvestedThisHand === 0)).toBe(true);
+  });
+});

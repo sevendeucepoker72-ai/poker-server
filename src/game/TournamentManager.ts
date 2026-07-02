@@ -34,7 +34,7 @@ export interface TournamentPlayer {
   userId?: number;
 }
 
-export type TournamentStatus = 'registering' | 'running' | 'finished';
+export type TournamentStatus = 'registering' | 'running' | 'finished' | 'cancelled';
 
 export interface Tournament {
   config: TournamentConfig;
@@ -43,6 +43,7 @@ export interface Tournament {
   currentBlindLevel: number;
   blindTimer: NodeJS.Timeout | null;
   nextStartTime: number; // timestamp
+  createdAt: number; // timestamp registration opened (for the stalled-tournament sweep)
   tableId: string | null;
   tableIds: string[]; // multi-table: all active table IDs
   startedAt: number;
@@ -206,6 +207,7 @@ export class TournamentManager {
       currentBlindLevel: 0,
       blindTimer: null,
       nextStartTime: template.startInterval > 0 ? now + template.startInterval : 0,
+      createdAt: now,
       tableId: null,
       tableIds: [],
       startedAt: 0,
@@ -222,6 +224,7 @@ export class TournamentManager {
   getTournamentList(): object[] {
     const list: object[] = [];
     for (const [id, t] of this.tournaments) {
+      if (t.status === 'cancelled') continue; // don't surface cancelled tournaments
       const currentBlinds = t.config.blindLevels[t.currentBlindLevel] || t.config.blindLevels[0];
       list.push({
         tournamentId: id,
@@ -288,6 +291,69 @@ export class TournamentManager {
     if (!tournament || tournament.status !== 'registering') return false;
     tournament.players = tournament.players.filter((p) => p.playerId !== playerId);
     return true;
+  }
+
+  /**
+   * Find buy-in tournaments STUCK in registration that can never start, so the
+   * caller can cancel + refund every entrant (2026-07-01 audit #3 — otherwise a
+   * tournament that never reaches its start threshold leaves entry fees debited
+   * with no reclaim). Only flags tournaments with a real entry fee and ≥1
+   * registrant. Two stall shapes:
+   *   - timed (startInterval > 0): past nextStartTime + grace with < 2 players.
+   *   - on-demand (startInterval === 0): older than STALL_MS and still below the
+   *     min(4, maxPlayers) start threshold.
+   */
+  checkStalledTournaments(): string[] {
+    const STALL_MS = 30 * 60 * 1000; // 30 min
+    const GRACE_MS = 5 * 60 * 1000;  // 5 min past the scheduled start
+    const now = Date.now();
+    const stalled: string[] = [];
+    for (const [id, t] of this.tournaments) {
+      if (t.status !== 'registering') continue;
+      if ((t.config.buyIn || 0) <= 0) continue;   // nothing to refund
+      if (t.players.length === 0) continue;         // nobody to strand
+      if (t.config.startInterval > 0) {
+        if (now >= t.nextStartTime + GRACE_MS && t.players.length < 2) stalled.push(id);
+      } else {
+        const threshold = Math.min(4, t.config.maxPlayers);
+        if (now - t.createdAt >= STALL_MS && t.players.length < threshold) stalled.push(id);
+      }
+    }
+    return stalled;
+  }
+
+  /**
+   * Cancel a still-registering tournament and return its registrants (with
+   * userId + the per-entrant refund amount) so the caller can refund wallets.
+   * Sets status to 'cancelled' and zeroes the collected pool. Idempotent.
+   */
+  cancelTournament(tournamentId: string): { playerId: string; userId?: number; refund: number }[] {
+    const tournament = this.tournaments.get(tournamentId);
+    if (!tournament || tournament.status !== 'registering') return [];
+    const entryFee = tournament.config.buyIn || 0;
+    const registrants = tournament.players.map((p) => ({
+      playerId: p.playerId,
+      userId: p.userId,
+      refund: (entryFee > 0 && p.userId !== undefined) ? entryFee : 0,
+    }));
+    tournament.status = 'cancelled';
+    tournament.players = [];
+    tournament.collectedEntryFees = 0;
+
+    // B1 fix (2026-07-01 review): recreate the template for the next round so a
+    // stalled-and-cancelled tournament REAPPEARS in the lobby — otherwise the
+    // type is filtered out of getTournamentList forever (until process restart).
+    // Mirrors finishTournament's recreate; gated on a real template name so
+    // ad-hoc qualifier/simulated tournaments are NOT resurrected.
+    const template = TOURNAMENT_TEMPLATES.find((t) => t.name === tournament.config.name);
+    if (template) {
+      setTimeout(() => {
+        this.tournaments.delete(tournamentId);
+        this.createTournament(template);
+      }, 10000);
+    }
+
+    return registrants;
   }
 
   canStart(tournamentId: string): boolean {

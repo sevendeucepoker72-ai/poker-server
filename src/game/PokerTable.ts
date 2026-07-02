@@ -523,6 +523,18 @@ export class PokerTable extends EventEmitter {
 
     this.emit('handStarted', { handNumber: this.handNumber, dealerSeat: this.dealerButtonSeat });
 
+    // #13 (2026-07-01 audit): if the opening actor(s) are all-in — e.g. both
+    // heads-up players posted short all-in blinds, or antes busted everyone —
+    // no one can act. Complete the round and run the board out to showdown
+    // instead of stalling (mirrors advanceToNextStreet's post-first-actor
+    // check). isBettingRoundComplete is false when at least one seat can still
+    // act (e.g. HU short-SB all-in with a live BB), so this only fires when the
+    // betting is genuinely closed.
+    if (this.isBettingRoundComplete()) {
+      this.accumulateInvestments();
+      this.advanceToNextStreet();
+    }
+
     return true;
   }
 
@@ -693,9 +705,21 @@ export class PokerTable extends EventEmitter {
     // Post antes first
     if (this.config.ante > 0) {
       for (const seat of activePlayers) {
+        // #8 (2026-07-01 audit): skip sitting-out seats — they're pre-folded and
+        // out of the hand, so charging them the ante drains a non-participant
+        // (the SB/BB/dead-blind loops all have this guard; the ante loop lacked
+        // it). getActivePlayerSeats includes sit-outs (tracked separately), so
+        // the explicit guard is required here.
+        if (this._sittingOutSeats.has(seat)) continue;
         const anteAmount = Math.min(this.config.ante, this.seats[seat].chipCount);
         this.seats[seat].chipCount -= anteAmount;
         this.seats[seat].totalInvestedThisHand += anteAmount;
+        // #4 (2026-07-01 audit): an ante that takes the player's whole stack
+        // leaves them all-in — set the flag like every other deduction site
+        // (SB, BB, dead-blind, postOwedBlindsNow). Without it a 0-chip seat is
+        // treated as a live actor and stalls the table until the turn timer
+        // force-folds it out of a pot it already anted for.
+        if (this.seats[seat].chipCount === 0) this.seats[seat].allIn = true;
         // Antes don't count toward currentBet
       }
     }
@@ -884,10 +908,11 @@ export class PokerTable extends EventEmitter {
     const activePlayers = this.getActivePlayerSeats();
     const isHeadsUp = activePlayers.length === 2;
 
+    let first: number;
     if (this.currentPhase === GamePhase.PreFlop) {
       if (isHeadsUp) {
         // Heads-up: dealer (SB) acts first pre-flop
-        this.activeSeatIndex = this.dealerButtonSeat;
+        first = this.dealerButtonSeat;
       } else {
         // UTG: next playing seat after the BB. 2026-06-11 audit R1: anchor
         // off previousBigBlindSeat — the seat that ACTUALLY posted the BB
@@ -898,12 +923,28 @@ export class PokerTable extends EventEmitter {
         const bbSeat = this.previousBigBlindSeat >= 0
           ? this.previousBigBlindSeat
           : this.getNextOccupiedSeat(this.getNextOccupiedSeat(this.dealerButtonSeat + 1) + 1);
-        this.activeSeatIndex = this.getNextPlayingSeat(bbSeat + 1);
+        first = this.getNextPlayingSeat(bbSeat + 1);
       }
     } else {
       // Post-flop: first active player after dealer
-      this.activeSeatIndex = this.getNextPlayingSeat(this.dealerButtonSeat + 1);
+      first = this.getNextPlayingSeat(this.dealerButtonSeat + 1);
     }
+
+    // #13 (2026-07-01 audit): the computed opening actor may be UNABLE to act —
+    // e.g. a heads-up button/SB that posted a short all-in blind, or any seat
+    // that an ante busted to all-in (#4). Skip to the next seat that can
+    // actually act (getNextActiveSeat excludes all-in/folded/chipless in both
+    // passes) so the hand doesn't stall waiting on an all-in player until the
+    // watchdog fires. Returns -1 when nobody can act (all all-in) — the callers
+    // (startNewHand / advanceToNextStreet) then detect the completed round and
+    // run the board out.
+    if (first !== -1) {
+      const seat = this.seats[first];
+      if (!seat || seat.folded || seat.allIn || seat.eliminated || seat.chipCount <= 0 || seat.holeCards.length === 0) {
+        first = this.getNextActiveSeat(first);
+      }
+    }
+    this.activeSeatIndex = first;
 
     if (this.activeSeatIndex !== -1) {
       this.emit('turnChanged', { seatIndex: this.activeSeatIndex });
@@ -1555,7 +1596,28 @@ export class PokerTable extends EventEmitter {
     const showdownHands: ShowdownHandInfo[] = [];
     const winnerInfos: WinnerInfo[] = [];
 
-    if (nonFolded.length === 1) {
+    if (nonFolded.length === 0) {
+      // Degenerate ALL-FOLD (2026-07-01 audit #1). Every seat is folded at
+      // resolution — reachable when blind/ante posters leave mid-hand and are
+      // force-folded (their posted chips stay in the pot), then the last live
+      // seat folds (manually, or via turn-timeout / AFK / disconnect auto-fold,
+      // none of which guard against the actor being the last live seat).
+      // No winner exists, so REFUND each seat its own stake instead of
+      // destroying the pot — the reset loop below zeroes totalInvestedThisHand,
+      // which previously deleted the blinds/antes outright. Chip-conserving:
+      // Σ refunded === Σ invested.
+      for (const s of seatInfos) {
+        if (s.totalInvestedThisHand > 0) {
+          this.seats[s.seatIndex].chipCount += s.totalInvestedThisHand;
+        }
+      }
+      // Deliberately push NOTHING to `results` / winnerInfos / showdownHands:
+      // nobody WON this hand, and the handResult listener's handleHandComplete
+      // treats every positive-amount `results` entry as a win (bumping handsWon,
+      // streaks, biggestPot, win-XP, missions, and tournament bounties). A
+      // refund is not a win — the chips were credited straight back above.
+      // (2026-07-01 review fix.)
+    } else if (nonFolded.length === 1) {
       // Last player standing wins everything
       const totalPot = seatInfos.reduce((sum, s) => sum + s.totalInvestedThisHand, 0);
       const winner = nonFolded[0];

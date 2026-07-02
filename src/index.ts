@@ -729,6 +729,15 @@ function userIdForSeat(tableId: string, seatIndex: number): number | undefined {
 // Tournament table mapping: tableId -> tournamentId
 const tournamentTables = new Map<string, string>();
 
+// Quick-play / heads-up tables (2026-07-01 audit #5). These modes manage their
+// own fixed roster at creation (e.g. exactly 1 opponent for a Heads-Up Snap).
+// The ring-table AI machinery (autoStartNextHand fill/trim + the 12s heartbeat)
+// must NOT touch them — otherwise it backfills a 3rd–5th AI into a heads-up
+// match, silently making it multi-handed while the winner logic reads only
+// seats 0/1. Populated by every quick-play create path, cleared in
+// cleanupQuickTable, and consulted by the fill/trim/heartbeat paths.
+const quickTables = new Set<string>();
+
 // Fast mode tracking per table (#12)
 const fastModeTables = new Map<string, boolean>();
 
@@ -2497,6 +2506,12 @@ function autoStartNextHand(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
 
+  // #7 (2026-07-01 audit) defensive: guarantee the hand-complete listener is
+  // attached before dealing the next hand. ensureTableProgressListener is a
+  // no-op if already registered; this covers any table (e.g. rehydrated or
+  // AI-only) that reached here without a join path having wired it.
+  ensureTableProgressListener(table, tableId);
+
   if (table.currentPhase !== GamePhase.HandComplete) return;
 
   // Reload BUSTED-OUT seats. Two HARD rules earned 2026-07-01 (.online audit
@@ -2555,17 +2570,19 @@ function autoStartNextHand(tableId: string): void {
   // HandComplete window if we immediately transition back to PreFlop via the
   // 3s timer. Trim excess AI here too so tables packed by the old behavior
   // drop back to the target within one hand.
-  if (!tournamentTables.has(tableId)) {
+  if (!tournamentTables.has(tableId) && !quickTables.has(tableId)) {
     trimExcessAI(table, tableId, CASH_TABLE_TARGET_OCCUPIED);
   }
 
   // Refill AI seats if needed (fill now respects CASH_TABLE_TARGET_OCCUPIED
   // by default, so this is a no-op at or above cap). Skip for tournament
-  // tables — they manage their own seating via the rebalance flow.
+  // tables — they manage their own seating via the rebalance flow — and for
+  // quick/heads-up tables (#5) which have a fixed roster (else a heads-up match
+  // gets backfilled to 5-handed at the first hand boundary).
   const humanCount = table.seats.filter(
     (s) => s.state === 'occupied' && !s.isAI
   ).length;
-  if (humanCount > 0 && !tournamentTables.has(tableId)) {
+  if (humanCount > 0 && !tournamentTables.has(tableId) && !quickTables.has(tableId)) {
     fillWithAI(table, tableId);
   }
 
@@ -2721,6 +2738,9 @@ function ensureCashTableRunning(tableId: string): void {
   if (!table) return;
   // Skip tournament tables — those run on a different schedule.
   if (tournamentTables.has(tableId)) return;
+  // Skip quick-play / heads-up tables (#5) — they have a fixed roster; the ring
+  // heartbeat would backfill AI and break their 2-seat winner logic.
+  if (quickTables.has(tableId)) return;
 
   // Trim excess AI FIRST so we don't flip-flop: if autoStartNextHand /
   // legacy fillWithAI packed the table to 9/9, drop back to the target
@@ -3366,15 +3386,46 @@ const careerTables = new Map<string, { venue: number; stage: number }>();
 function cleanupQuickTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (table) {
+    // 2026-07-01 audit #2: credit each seated HUMAN's stack back to their wallet
+    // BEFORE standUp erases it. The buy-in was deducted at join, and a natural
+    // quick-game end (timer / elimination) runs neither handlePlayerLeave nor
+    // the disconnect-reserve credit — so without this the player's final stack
+    // (which includes their winnings) AND their buy-in vanished. Refund the FULL
+    // stake incl. any mid-hand pot chips (same pattern as gracefulShutdown /
+    // adminForceCloseTable). Chip-conserving: crediting winner + loser stacks
+    // sums to the total bought in.
+    const inHand = table.isHandInProgress();
+    const isTournament = tournamentTables.has(tableId);
     for (let i = 0; i < MAX_SEATS; i++) {
-      if (table.seats[i].state === 'occupied') {
-        table.standUp(i);
+      const seat = table.seats[i];
+      if (!seat || seat.state !== 'occupied') continue;
+      if (!seat.isAI && !isTournament) {
+        const uid = userIdForSeat(tableId, i);
+        if (uid) {
+          let uname = String(uid);
+          for (const [, a] of authSessions) if (a.userId === uid) { uname = a.username; break; }
+          const refund = seat.chipCount + (inHand ? (seat.totalInvestedThisHand || 0) : 0);
+          if (refund > 0) {
+            addChipsToUser(uid, refund)
+              .then((ok) => auditLog(uname, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: uid, tableId, amount: refund, reason: 'quick_game_end' }))
+              .catch(() => {});
+          }
+        }
       }
+      table.standUp(i);
     }
   }
   aiProfiles.delete(tableId);
   tableManager.removeTable(tableId);
   tableProgressListeners.delete(tableId);
+  quickTables.delete(tableId); // #5
+
+  // #12 (2026-07-01 audit): clear the turn/warning/autostart timer entries for
+  // this table so they don't fire against a removed table (guarded no-ops, but
+  // leaked map entries otherwise).
+  const tt = turnTimers.get(tableId); if (tt) { clearTimeout(tt.timeout); turnTimers.delete(tableId); }
+  const tw = turnWarningTimers.get(tableId); if (tw) { clearTimeout(tw.timeout); turnWarningTimers.delete(tableId); }
+  const pa = pendingAutoStartTimers.get(tableId); if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(tableId); }
 
   const timers = quickGameTimers.get(tableId);
   if (timers) {
@@ -3416,6 +3467,23 @@ io.on('connection', (socket: Socket) => {
   ipSockets.add(socket.id);
   // Let a late-joining client show the maintenance banner if it's on.
   if (maintenanceMode) socket.emit('maintenanceMode', { enabled: true });
+
+  // #12 (2026-07-01 audit): per-socket rate limit for the quick-play create
+  // handlers (quickHeadsUp / quickSpinGo / quickAllInOrFold / startCareerGame).
+  // They're unauthenticated + each spins up a table (and, for Spin&Go, a
+  // repeating blind interval); a guest looping the emit could grow tables +
+  // live intervals unbounded from one socket. Returns true if the caller
+  // should abort. 3s cooldown is generous for a real UI.
+  let lastQuickPlayCreate = 0;
+  const quickPlayRateLimited = (): boolean => {
+    const now = Date.now();
+    if (now - lastQuickPlayCreate < 3000) {
+      socket.emit('error', { message: 'Please wait a moment before starting another game.' });
+      return true;
+    }
+    lastQuickPlayCreate = now;
+    return false;
+  };
 
   socket.on('disconnect', async () => {
     ipSockets.delete(socket.id);
@@ -5021,9 +5089,12 @@ Give feedback in this JSON format:
     }
     // Clear timers + boot everyone from the room.
     const at = turnTimers.get(data.tableId); if (at) { clearTimeout(at.timeout); turnTimers.delete(data.tableId); }
+    const aw = turnWarningTimers.get(data.tableId); if (aw) { clearTimeout(aw.timeout); turnWarningTimers.delete(data.tableId); } // #12
     const pa = pendingAutoStartTimers.get(data.tableId); if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(data.tableId); }
     io.to(`table:${data.tableId}`).emit('tableClosedByAdmin', { tableId: data.tableId });
     tableManager.removeTable(data.tableId);
+    tableProgressListeners.delete(data.tableId); // #7: don't leak the listener key
+    quickTables.delete(data.tableId);
     socket.emit('adminForceCloseTableResult', { success: true, tableId: data.tableId });
   });
 
@@ -8463,6 +8534,7 @@ Give feedback in this JSON format:
 
   // Heads-Up Snap: 2 players, 5-minute fast game
   socket.on('quickHeadsUp', async (data: { playerName: string }) => {
+    if (quickPlayRateLimited()) return; // #12
     const { playerName } = data;
 
     // Leave existing table if any
@@ -8486,6 +8558,7 @@ Give feedback in this JSON format:
     }
 
     const tableId = tableManager.createHeadsUpTable(`Heads-Up Snap: ${playerName}`);
+    quickTables.add(tableId); // #5: exclude from ring AI fill/heartbeat
     const table = tableManager.getTable(tableId)!;
 
     const playerId = `player-${uuidv4()}`;
@@ -8581,6 +8654,7 @@ Give feedback in this JSON format:
 
   // Spin & Go: 3 players, random prize multiplier
   socket.on('quickSpinGo', async (data: { playerName: string }) => {
+    if (quickPlayRateLimited()) return; // #12
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -8618,6 +8692,7 @@ Give feedback in this JSON format:
       20,
       SPINGO_BUYIN
     );
+    quickTables.add(tableId); // #5: exclude from ring AI fill/heartbeat
     const table = tableManager.getTable(tableId)!;
 
     const playerId = `player-${uuidv4()}`;
@@ -8720,6 +8795,7 @@ Give feedback in this JSON format:
 
   // All-In or Fold
   socket.on('quickAllInOrFold', async (data: { playerName: string }) => {
+    if (quickPlayRateLimited()) return; // #12
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -8745,6 +8821,7 @@ Give feedback in this JSON format:
       20,
       AOF_BUYIN
     );
+    quickTables.add(tableId); // #5: exclude from ring AI fill/heartbeat
     const table = tableManager.getTable(tableId)!;
 
     const playerId = `player-${uuidv4()}`;
@@ -8799,6 +8876,7 @@ Give feedback in this JSON format:
   // ========== Career Mode ==========
 
   socket.on('startCareerGame', async (data: { venue: number; stage: number }) => {
+    if (quickPlayRateLimited()) return; // #12
     const { venue, stage } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -8850,6 +8928,7 @@ Give feedback in this JSON format:
       config.blinds[1],
       config.buyIn
     );
+    quickTables.add(tableId); // #5: exclude from ring AI fill/heartbeat
     const table = tableManager.getTable(tableId)!;
 
     const playerId = `player-${uuidv4()}`;
@@ -9151,6 +9230,35 @@ Give feedback in this JSON format:
     }
 
     // Broadcast updated list
+    io.emit('tournamentList', tournamentManager.getTournamentList());
+  });
+
+  // Unregister from a still-registering tournament and REFUND the entry fee
+  // (2026-07-01 audit #3 — previously there was no reclaim path, so a paid
+  // entry into a tournament that never filled was permanently stranded).
+  socket.on('leaveTournament', async (data: { tournamentId: string }) => {
+    const session = playerSessions.get(socket.id);
+    const authT = authSessions.get(socket.id);
+    const tourn = tournamentManager.getTournament(data.tournamentId);
+    if (!tourn) { socket.emit('error', { message: 'Tournament not found' }); return; }
+    if (tourn.status !== 'registering') { socket.emit('error', { message: 'Cannot unregister after the tournament has started' }); return; }
+    // Prefer the caller's EXACT playerId registration (a user with two tabs can
+    // have two rows — registerPlayer dedups on playerId only); fall back to a
+    // userId match only if no playerId row exists.
+    const reg = (session?.playerId && tourn.players.find((p) => p.playerId === session.playerId))
+      || (authT && tourn.players.find((p) => p.userId === authT.userId))
+      || undefined;
+    if (!reg) { socket.emit('tournamentUnregistered', { tournamentId: data.tournamentId, refunded: 0 }); return; }
+    const entryFee = tourn.config.buyIn || 0;
+    const removed = tournamentManager.unregisterPlayer(data.tournamentId, reg.playerId);
+    let refunded = 0;
+    if (removed && entryFee > 0 && reg.userId !== undefined) {
+      tournamentManager.refundEntryFee(data.tournamentId, reg.userId);
+      const ok = await addChipsToUser(reg.userId, entryFee);
+      refunded = ok ? entryFee : 0;
+      auditLog(authT?.username || String(reg.userId), ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId: data.tournamentId, entryFee, reason: 'unregister' });
+    }
+    socket.emit('tournamentUnregistered', { tournamentId: data.tournamentId, refunded });
     io.emit('tournamentList', tournamentManager.getTournamentList());
   });
 
@@ -9762,6 +9870,18 @@ function creditSeatStackToWallet(
     });
 }
 
+// #6 (2026-07-01 audit): release the same-IP anti-collusion slot on VOLUNTARY
+// leave. The `${socketId}:${tableId}` slot was added on join and cleared only
+// on socket disconnect — but the client's leave-to-lobby flow keeps the socket
+// open, so a stale slot survived and falsely blocked the player from re-seating
+// ("Another connection from your network is already seated") until a refresh.
+function releaseSeatedSlot(socketId: string, tableId: string): void {
+  const slot = `${socketId}:${tableId}`;
+  for (const [ip, slots] of ipSeatedSlots) {
+    if (slots.delete(slot) && slots.size === 0) ipSeatedSlots.delete(ip);
+  }
+}
+
 function handlePlayerLeave(socket: Socket): void {
   const session = playerSessions.get(socket.id);
   if (!session) return;
@@ -9911,7 +10031,20 @@ function handlePlayerLeave(socket: Socket): void {
     socket.leave(`table:${session.tableId}`);
   }
 
+  releaseSeatedSlot(socket.id, session.tableId); // #6: free the same-IP slot
   playerSessions.delete(socket.id);
+
+  // #12 (2026-07-01 audit): if this was the last human on an ephemeral
+  // quick-play table, tear it down now (table + its blind interval) instead of
+  // leaking it — a Spin&Go's blindInterval otherwise fires forever on an
+  // abandoned empty table. Guarded to quick tables; ring/tournament tables are
+  // untouched.
+  if (quickTables.has(session.tableId)) {
+    const qt = tableManager.getTable(session.tableId);
+    if (qt && !qt.seats.some((s) => s.state === 'occupied' && !s.isAI)) {
+      cleanupQuickTable(session.tableId);
+    }
+  }
 
   // Clean up multi-table sessions
   const multiSessions = multiTableSessions.get(socket.id);
@@ -10039,8 +10172,13 @@ function startTournamentGame(tournamentId: string): void {
     console.warn('[notifyPlayer tournament_start] hook failed:', (err as Error)?.message);
   }
 
-  // Fill remaining seats with AI
-  fillWithAI(table, tableId);
+  // #9 (2026-07-01 audit): do NOT backfill AI here. AI seated by fillWithAI are
+  // never added to tournament.players, so eliminatePlayer/finishTournament
+  // (which count registered players) fired while AI still had chips — the
+  // tournament ended early and mispaid positions. Tournaments run with their
+  // registered entrants only, matching the "real players only" direction
+  // already applied to qualifier tournaments (commit 12c0fcb). startTournament
+  // guarantees >= 2 registered players, so the table always has a live game.
   ensureTableProgressListener(table, tableId);
 
   table.startNewHand();
@@ -10102,6 +10240,23 @@ setInterval(() => {
   for (const id of ready) {
     startTournamentGame(id);
   }
+  // 2026-07-01 audit #3: cancel + refund tournaments STUCK in registration that
+  // can never start (never reached the min-player threshold), so paid entry
+  // fees are never permanently stranded even if entrants don't manually leave.
+  for (const id of tournamentManager.checkStalledTournaments()) {
+    const registrants = tournamentManager.cancelTournament(id);
+    for (const r of registrants) {
+      if (r.userId !== undefined && r.refund > 0) {
+        addChipsToUser(r.userId, r.refund)
+          .then((ok) => auditLog(String(r.userId), ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId: id, amount: r.refund, reason: 'tournament_cancelled_stalled' }))
+          .catch(() => {});
+      }
+    }
+    if (registrants.length > 0) {
+      console.warn(`[Tournament] cancelled stalled tournament ${id}, refunded ${registrants.length} entrant(s)`);
+    }
+  }
+  io.emit('tournamentList', tournamentManager.getTournamentList());
 }, 10000);
 
 // ========== Multi-Table Tournament Simulation ==========
@@ -10700,6 +10855,7 @@ function handleTableRebalance(tournamentId: string): void {
   // Mark it for cleanup
   setTimeout(() => {
     tableManager.removeTable(breakTableId);
+    tableProgressListeners.delete(breakTableId); // #7: don't leak the listener key
   }, 5000);
 
   // Broadcast updated state to remaining tables
@@ -10895,6 +11051,15 @@ httpServer.listen(PORT, async () => {
         try {
           table.rehydrateFromSnapshot(snap);
           rehydrated++;
+          // #7 (2026-07-01 audit): re-attach the hand-complete listener BEFORE
+          // resuming. tableProgressListeners is empty after a fresh process, and
+          // neither broadcastGameState nor scheduleAIAction registers it — so
+          // without this a rehydrated hand's determineWinners emits (handResult,
+          // deckSeedRevealed, handHistory) hit ZERO listeners: fairness reveal +
+          // DB chip persistence + XP + prediction settlement + pending-seat
+          // teardown are all silently skipped, and a human-reserved table wedges
+          // in HandComplete.
+          ensureTableProgressListener(table, tableId);
           // Restore turn + AI scheduler so play continues from where it
           // left off. broadcastGameState handles timer arming; the
           // scheduler kicks the AI whose turn it is.
