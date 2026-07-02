@@ -9053,6 +9053,56 @@ Give feedback in this JSON format:
     socket.emit('detailedStats', stats);
   });
 
+  // Batch 5d: real player profile by username. PlayerProfile.jsx emitted
+  // requestProfile but there was no handler, so viewing another player's
+  // profile hung on "Loading…" (or showed a fabricated buildMockProfile).
+  // Returns the player's REAL public stats. Auth-gated (viewers must be signed
+  // in) and returns only non-PII profile fields (no chips/email/phone).
+  socket.on('requestProfile', async (data: { username: string }) => {
+    if (!authSessions.get(socket.id)) return; // signed-in viewers only
+    const uname = String(data?.username || '').trim();
+    if (!uname) return;
+    const emptyProfile = {
+      username: uname, level: 1, elo: 500, wins: 0, losses: 0, totalHands: 0,
+      winRate: '0.0', netChips: 0, vpip: 0, pfr: 0, vipTier: 'Bronze', vipXp: 0,
+      unlockedAchievements: [] as string[], sessionHistory: null, handHistory: [] as any[],
+    };
+    try {
+      const { rows } = await getPool().query(
+        `SELECT username, level, stats, achievements FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1`,
+        [uname]
+      );
+      if (rows.length === 0) { socket.emit('profileData', { ...emptyProfile, notFound: true }); return; }
+      const u = rows[0];
+      let stats: any = {};
+      try { stats = typeof u.stats === 'string' ? JSON.parse(u.stats || '{}') : (u.stats || {}); } catch { /* keep {} */ }
+      let achievements: string[] = [];
+      try { achievements = Array.isArray(u.achievements) ? u.achievements : JSON.parse(u.achievements || '[]'); } catch { /* keep [] */ }
+      const totalHands = stats.handsPlayed || stats.totalHandsPlayed || 0;
+      const wins = stats.handsWon || 0;
+      socket.emit('profileData', {
+        username: u.username,
+        level: u.level || 1,
+        elo: stats.elo || 500,
+        wins,
+        losses: Math.max(0, totalHands - wins),
+        totalHands,
+        winRate: totalHands > 0 ? ((wins / totalHands) * 100).toFixed(1) : '0.0',
+        netChips: stats.netChips || 0,
+        vpip: stats.vpip || 0,
+        pfr: stats.pfr || 0,
+        vipTier: stats.vipTier || 'Bronze',
+        vipXp: stats.vipXp || 0,
+        unlockedAchievements: achievements,
+        sessionHistory: null,
+        handHistory: [],
+      });
+    } catch (err: any) {
+      console.error('[requestProfile]', err?.message || err);
+      socket.emit('profileData', emptyProfile);
+    }
+  });
+
   // ========== Tournament System ==========
 
   socket.on('getTournaments', async () => {
