@@ -2891,6 +2891,30 @@ setInterval(() => {
             return `${i}:${s.folded?'F':''}${s.allIn?'A':''}cb=${s.currentBet || 0}h=${s.hasActedSinceLastFullRaise?'1':'0'}${s.holeCards.length === 0 ? 'nc' : ''}`;
           }).join(' ');
           console.warn(`[WedgeWatchdog] diag phase=${table.currentPhase} b2m=${table.currentBetToMatch} active=${activeSeat} | ${diag}`);
+          // 2026-07-05 — STRUCTURED ALERT. Post single-source-of-truth (nextActor/roundSettled),
+          // the fuzz harness proves random hands can't wedge — so a watchdog firing now means a
+          // REAL transition bug escaped the tests. Emit a greppable JSON event (alertable via a
+          // log-based metric) carrying the full seat state so it's a reproducible bug report, and
+          // capture it as the next fuzz regression case rather than staying a silent recovery.
+          try {
+            console.error(JSON.stringify({
+              event: 'wedge_watchdog_fired',
+              tableId: t.tableId,
+              reason,
+              phase: String(table.currentPhase),
+              activeSeat,
+              currentBetToMatch: table.currentBetToMatch,
+              seatStuckMs: seatStuck,
+              potPhaseStuckMs: potPhaseStuck,
+              handNumber: (table as any).handNumber ?? null,
+              seats: table.seats.slice(0, 9).map((s, i) => ({
+                i, st: s.state, folded: s.folded, allIn: s.allIn,
+                cb: s.currentBet || 0, chips: s.chipCount || 0,
+                acted: s.hasActedSinceLastFullRaise, cards: s.holeCards.length,
+              })),
+              ts: Date.now(),
+            }));
+          } catch { /* never let alerting throw */ }
 
           let forced = false;
           if (seat && seat.state === 'occupied' && !seat.folded && !seat.allIn) {
