@@ -938,11 +938,8 @@ export class PokerTable extends EventEmitter {
     // watchdog fires. Returns -1 when nobody can act (all all-in) — the callers
     // (startNewHand / advanceToNextStreet) then detect the completed round and
     // run the board out.
-    if (first !== -1) {
-      const seat = this.seats[first];
-      if (!seat || seat.folded || seat.allIn || seat.eliminated || seat.chipCount <= 0 || seat.holeCards.length === 0) {
-        first = this.getNextActiveSeat(first);
-      }
+    if (first !== -1 && !this.canAct(this.seats[first])) {
+      first = this.getNextActiveSeat(first);
     }
     this.activeSeatIndex = first;
 
@@ -1261,102 +1258,175 @@ export class PokerTable extends EventEmitter {
   }
 
   // ========== Turn Management ==========
+  //
+  // 2026-07-05 SINGLE SOURCE OF TRUTH. Every "who acts next / is the betting round
+  // done / who's still in the hand" question resolves through the getters below —
+  // playersInHand / actingPlayers / owes / nextActor / roundSettled. Previously these
+  // were re-derived with ~6 subtly-different inline filters across advanceTurn,
+  // isBettingRoundComplete, advanceToNextStreet, setFirstActivePlayer, getNextActiveSeat;
+  // every historical stall was two of those disagreeing. Now they cannot disagree:
+  // nextActor() and roundSettled() are both defined in terms of owes()/actingPlayers(),
+  // so a stall is definable and impossible — it's just "nextActor==-1 but we didn't advance."
 
-  protected advanceTurn(): void {
-    // Check if only one player left (everyone else folded)
-    const playingSeats = this.seats.filter(
+  /** Seats still contesting the pot this hand: dealt in, not folded, not eliminated. INCLUDES all-in. */
+  protected playersInHand(): Seat[] {
+    return this.seats.filter(
+      s => s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0
+    );
+  }
+
+  /** Seats that can still make a betting DECISION: in the hand, not all-in, with chips + cards. */
+  protected actingPlayers(): Seat[] {
+    return this.seats.filter(
       s =>
         s.state === 'occupied' &&
         !s.folded &&
-        !s.eliminated
+        !s.eliminated &&
+        !s.allIn &&
+        s.chipCount > 0 &&
+        s.holeCards.length > 0
     );
+  }
 
-    if (playingSeats.length <= 1) {
-      // Last player standing wins
+  /** Can this seat legally be handed the action right now? (The actingPlayers predicate for one seat.) */
+  protected canAct(s: Seat | undefined): boolean {
+    return (
+      !!s &&
+      s.state === 'occupied' &&
+      !s.folded &&
+      !s.eliminated &&
+      !s.allIn &&
+      s.chipCount > 0 &&
+      s.holeCards.length > 0
+    );
+  }
+
+  /**
+   * Does the seat still OWE a decision this betting round? True if it can act AND either it
+   * hasn't matched the current bet, OR it hasn't acted since the last full raise (the latter
+   * gives the big blind its option and a limped-around field its check).
+   */
+  protected owes(seatIndex: number): boolean {
+    const s = this.seats[seatIndex];
+    if (!this.canAct(s)) return false;
+    return s.currentBet < this.currentBetToMatch || !s.hasActedSinceLastFullRaise;
+  }
+
+  /**
+   * THE next-actor authority. Walks forward from `fromExclusive`+1 and returns the first seat
+   * that still owes a decision, or -1 if the round is settled. Callers pass the just-acted seat
+   * (default: activeSeatIndex). To evaluate a fresh street's first actor INCLUSIVELY, callers
+   * check owes(candidate) first (see advanceTurn / setFirstActivePlayer).
+   */
+  protected nextActor(fromExclusive: number = this.activeSeatIndex): number {
+    for (let i = 1; i <= MAX_SEATS; i++) {
+      const idx = (((fromExclusive + i) % MAX_SEATS) + MAX_SEATS) % MAX_SEATS;
+      if (this.owes(idx)) return idx;
+    }
+    return -1;
+  }
+
+  /**
+   * THE round-complete authority. Settled when NO acting player owes a decision — i.e. every
+   * seat that can still act has matched the bet AND acted since the last full raise. 0 acting
+   * players => settled (all-in/folded). isBettingRoundComplete() is a thin alias for this.
+   */
+  protected roundSettled(): boolean {
+    for (const s of this.actingPlayers()) {
+      if (s.currentBet < this.currentBetToMatch) return false;
+      if (!s.hasActedSinceLastFullRaise) return false;
+    }
+    return true;
+  }
+
+  /**
+   * Cheap structural invariants, asserted after every transition. In tests they THROW (turning a
+   * silent wedge into a minimal repro); in prod they log + emit 'invariantViolation' (never throw
+   * into live gameplay). Because nextActor()/roundSettled() derive from the same owes()/actingPlayers(),
+   * a violation here means a real transition bug escaped the property tests — investigate, don't paper over.
+   */
+  protected assertInvariants(reason: string): void {
+    const problems: string[] = [];
+    const live = this.isHandInProgress() && this.currentPhase !== GamePhase.Showdown;
+    if (live && !this.roundSettled()) {
+      // Round is open => by construction some acting player owes => nextActor must find one.
+      if (this.nextActor(this.activeSeatIndex) === -1) {
+        problems.push('round open but nextActor()==-1 (wedge)');
+      }
+      // The seated actor must actually be able to act.
+      if (this.activeSeatIndex >= 0 && !this.canAct(this.seats[this.activeSeatIndex])) {
+        problems.push(`activeSeatIndex ${this.activeSeatIndex} cannot act while round is open`);
+      }
+    }
+    // No occupied seat may be "over" the current bet-to-match.
+    for (const s of this.seats) {
+      if (s.state === 'occupied' && s.currentBet > this.currentBetToMatch) {
+        problems.push(`seat ${s.seatIndex} currentBet ${s.currentBet} > toMatch ${this.currentBetToMatch}`);
+      }
+    }
+    if (problems.length === 0) return;
+    const msg = `[assertInvariants:${reason}] ${problems.join('; ')}`;
+    if (process.env.NODE_ENV === 'test') throw new Error(msg);
+    try {
+      this.emit('invariantViolation', {
+        reason,
+        problems,
+        phase: this.currentPhase,
+        activeSeatIndex: this.activeSeatIndex,
+        currentBetToMatch: this.currentBetToMatch,
+      });
+      console.error(msg);
+    } catch {
+      /* never let observability throw into gameplay */
+    }
+  }
+
+  protected advanceTurn(): void {
+    // ≤1 player left IN the hand → award immediately (last player standing, or the
+    // all-folded refund path). Uses the canonical playersInHand() set (dealt-in, not
+    // folded/eliminated, INCLUDING all-in) — a cardless mid-hand joiner is not in the hand.
+    if (this.playersInHand().length <= 1) {
       this.accumulateInvestments();
       this.determineWinners();
       return;
     }
 
-    // Check if betting round is complete
-    if (this.isBettingRoundComplete()) {
+    // THE single next-actor decision. nextActor() returns the one seat still owing a
+    // decision, or -1 when the round is settled (equivalent to roundSettled()==true, since
+    // both derive from owes()/actingPlayers() — they cannot disagree). No separate
+    // isBettingRoundComplete + getNextActiveSeat that can wedge by disagreeing.
+    const next = this.nextActor(this.activeSeatIndex);
+    if (next === -1) {
+      // Betting round settled — advance the street (overridable per variant: Draw/Stud).
       this.accumulateInvestments();
       this.advanceToNextStreet();
       return;
     }
 
-    // Find next active player
-    const nextSeat = this.getNextActiveSeat(this.activeSeatIndex + 1);
-    if (nextSeat === -1) {
-      // No more active players - advance
-      this.accumulateInvestments();
-      this.advanceToNextStreet();
-      return;
-    }
-
-    this.activeSeatIndex = nextSeat;
+    this.activeSeatIndex = next;
     this.emit('turnChanged', { seatIndex: this.activeSeatIndex });
+    this.assertInvariants('advanceTurn');
   }
 
+  /**
+   * Betting-round-complete. Now a thin alias for the single authority roundSettled() so every
+   * caller (base + variants + tests) agrees on ONE definition. The old inline version had its
+   * own seat filter + single-player special-case; roundSettled() subsumes both exactly (0 acting
+   * => settled; 1 acting who hasn't matched-or-acted => not settled; all matched+acted => settled).
+   */
   protected isBettingRoundComplete(): boolean {
-    // A seat must have hole cards to be "playing" this round. Otherwise
-    // a user who joined mid-hand sits `state === 'occupied'` but with no
-    // cards, counted as playing, and the round never completes because
-    // their hasActed flag is stuck at false. 2026-04-22 root-cause fix
-    // for pre-flop wedges where the hand was stuck on the active seat
-    // because a cardless newcomer was blocking round-complete.
-    const playingSeats = this.seats.filter(
-      s =>
-        s.state === 'occupied' &&
-        !s.folded &&
-        !s.allIn &&
-        !s.eliminated &&
-        s.holeCards.length > 0
-    );
-
-    // If no one can act (all folded or all-in), betting is complete
-    if (playingSeats.length === 0) return true;
-
-    // If only one player can act and they've matched, round is complete
-    if (playingSeats.length === 1) {
-      const seat = playingSeats[0];
-      // If no one has bet, and this player hasn't acted, they should get a chance
-      if (!seat.hasActedSinceLastFullRaise && this.currentBetToMatch === 0) {
-        return false;
-      }
-      if (seat.currentBet >= this.currentBetToMatch && seat.hasActedSinceLastFullRaise) {
-        return true;
-      }
-    }
-
-    // All playing seats must have: matched the current bet AND acted since last full raise
-    for (const seat of playingSeats) {
-      if (seat.currentBet < this.currentBetToMatch) return false;
-      if (!seat.hasActedSinceLastFullRaise) return false;
-    }
-
-    return true;
+    return this.roundSettled();
   }
 
   protected advanceToNextStreet(): void {
     // Check if we need to run out the board (only 0 or 1 non-all-in, non-folded players)
-    const activePlayers = this.seats.filter(
-      s =>
-        s.state === 'occupied' &&
-        !s.folded &&
-        !s.allIn &&
-        !s.eliminated
-    );
-
-    const allInPlayers = this.seats.filter(
-      s =>
-        s.state === 'occupied' &&
-        !s.folded &&
-        s.allIn &&
-        !s.eliminated
-    );
-
-    const totalContesting = activePlayers.length + allInPlayers.length;
+    // Canonical sets (single source of truth): actingPlayers can still bet; playersInHand still
+    // contest the pot (INCLUDING all-in). They are disjoint and their union is playersInHand,
+    // so totalContesting = playersInHand().length. Sourcing the runout decision from the same
+    // getters as nextActor()/roundSettled() means the turn loop and the street loop can't disagree.
+    const activePlayers = this.actingPlayers();
+    const allInPlayers = this.playersInHand().filter(s => s.allIn);
+    const totalContesting = this.playersInHand().length;
 
     // Use getNextPhase() to determine next street (overridable by variants)
     const nextPhase = this.getNextPhase();
@@ -1372,10 +1442,7 @@ export class PokerTable extends EventEmitter {
       // But if there are all-in players, we need to run out the board
       if (allInPlayers.length > 0 || (activePlayers.length === 0 && allInPlayers.length === 0)) {
         // Check if there are at least 2 players total (including all-in) to contest
-        const contestingPlayers = this.seats.filter(
-          s => s.state === 'occupied' && !s.folded && !s.eliminated
-        );
-        if (contestingPlayers.length >= 2) {
+        if (this.playersInHand().length >= 2) {
           this.runOutBoard();
           return;
         }
@@ -2027,19 +2094,11 @@ export class PokerTable extends EventEmitter {
     // (the old behaviour). Better to burn one 30s timer than freeze
     // the whole table indefinitely. Fixed 2026-04-22 after live
     // gameplay audit observed a frozen Beginner's Table.
+    // Strict pass uses the canonical canAct() predicate (== the actingPlayers set) so this
+    // helper can never disagree with nextActor()/roundSettled().
     for (let i = 0; i < MAX_SEATS; i++) {
       const idx = (from + i) % MAX_SEATS;
-      const seat = this.seats[idx];
-      if (
-        seat.state === 'occupied' &&
-        !seat.folded &&
-        !seat.allIn &&
-        !seat.eliminated &&
-        seat.chipCount > 0 &&
-        seat.holeCards.length > 0
-      ) {
-        return idx;
-      }
+      if (this.canAct(this.seats[idx])) return idx;
     }
     // Loose fallback — returns -1 only if truly no one can act.
     for (let i = 0; i < MAX_SEATS; i++) {
