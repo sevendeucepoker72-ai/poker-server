@@ -8,6 +8,7 @@ import {
   addChipsToUser as dbAddChipsToUser,
   addStarsToUser as dbAddStarsToUser,
   saveProgress as dbSaveProgress,
+  commitLevelUpReward as dbCommitLevelUpReward,
   loadDurableProgress,
   loadInventory,
   loadProgress as dbLoadProgress,
@@ -698,14 +699,14 @@ export class ProgressionManager {
     }
 
     if (leveledChips > 0 || leveledStars > 0) {
-      this.persistChipReward(progress, leveledChips);
-      this.persistStarReward(progress, leveledStars);
-      // Ratchet the new level (+ current xp) to the DB now so the reward can
-      // never be re-collected after a redeploy. saveProgress uses GREATEST on
-      // level and strips chips at the boundary — safe.
+      // 2026-07-05 audit P3 fix: credit the level-up chips/stars AND ratchet the
+      // level in ONE atomic UPDATE (gated on the level advancing) instead of three
+      // independent fire-and-forget writes. Previously a crash between the chip
+      // credit and the level ratchet let a rehydrate reload the OLD level, re-cross
+      // the threshold, and re-mint the reward. dbCommitLevelUpReward is exactly-once.
       if (progress.userId && progress.hydrated) {
-        dbSaveProgress(progress.userId, { level: progress.level, xp: progress.xp }).catch((e) =>
-          console.warn(`[ProgressionManager.levelUp persist ${progress.userId}]`, e?.message)
+        dbCommitLevelUpReward(progress.userId, leveledChips, leveledStars, progress.level, progress.xp).catch((e) =>
+          console.warn(`[ProgressionManager.levelUp commit ${progress.userId}]`, e?.message)
         );
       }
     }

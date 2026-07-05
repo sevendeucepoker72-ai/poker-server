@@ -422,6 +422,14 @@ export async function initClubTables(): Promise<void> {
   await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS clubXp INTEGER DEFAULT 0`).catch(() => {});
   await pool.query(`ALTER TABLE clubs ADD COLUMN IF NOT EXISTS clubLevel INTEGER DEFAULT 1`).catch(() => {});
 
+  // ── 2026-07-05 audit P3 fixes ──
+  // referred_by: who referred this member (joinByReferral) so getReferralStats can
+  // count real referrals instead of hardcoding 0.
+  await pool.query(`ALTER TABLE club_members ADD COLUMN IF NOT EXISTS referred_by INTEGER DEFAULT NULL`).catch(() => {});
+  // invited_user_id: stable identity for a pending invite so it survives the invitee
+  // renaming their display name (accept/decline/list matched by mutable username).
+  await pool.query(`ALTER TABLE club_invitations ADD COLUMN IF NOT EXISTS invited_user_id INTEGER DEFAULT NULL`).catch(() => {});
+
   console.log('[Clubs] Database tables initialized (with social features)');
 }
 
@@ -1760,8 +1768,10 @@ export async function inviteToClub(
 
   try {
     const result = await pool.query(
-      'INSERT INTO club_invitations (clubId, clubName, inviterId, inviterName, invitedUsername, status) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-      [clubId, club.name, inviterId, inviterName, invitedUsername, 'pending']
+      // 2026-07-05 audit P3 fix: store the resolved invited_user_id (already looked
+      // up above) as the stable join key so the invite survives a display-name change.
+      'INSERT INTO club_invitations (clubId, clubName, inviterId, inviterName, invitedUsername, status, invited_user_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id',
+      [clubId, club.name, inviterId, inviterName, invitedUsername, 'pending', invitedUserId]
     );
 
     return {
@@ -1788,9 +1798,12 @@ export async function getMyInvitations(
 ): Promise<{ success: boolean; invitations: ClubInvitation[] }> {
   const pool = getPool();
   const username = await getUsername(userId);
+  // 2026-07-05 audit P3 fix: match by the stable invited_user_id; fall back to the
+  // username only for legacy rows created before the column existed (invited_user_id
+  // IS NULL), so a rename no longer orphans a pending invite.
   const rows = (await pool.query(
-    'SELECT * FROM club_invitations WHERE invitedUsername = $1 AND status = $2 ORDER BY createdAt DESC',
-    [username, 'pending']
+    'SELECT * FROM club_invitations WHERE (invited_user_id = $1 OR (invited_user_id IS NULL AND invitedUsername = $2)) AND status = $3 ORDER BY createdAt DESC',
+    [userId, username, 'pending']
   )).rows as any[];
 
   const invitations: ClubInvitation[] = rows.map((r) => ({
@@ -1813,7 +1826,8 @@ export async function acceptInvitation(
 ): Promise<{ success: boolean; error?: string; club?: ClubInfo }> {
   const pool = getPool();
   const username = await getUsername(userId);
-  const inv = (await pool.query('SELECT * FROM club_invitations WHERE id = $1 AND invitedUsername = $2 AND status = $3', [invitationId, username, 'pending'])).rows[0] as any;
+  // 2026-07-05 audit P3 fix: match by stable invited_user_id (username fallback for legacy rows).
+  const inv = (await pool.query('SELECT * FROM club_invitations WHERE id = $1 AND (invited_user_id = $2 OR (invited_user_id IS NULL AND invitedUsername = $3)) AND status = $4', [invitationId, userId, username, 'pending'])).rows[0] as any;
   if (!inv) return { success: false, error: 'Invitation not found or already handled' };
 
   const club = await getClubById(inv.clubid);
@@ -1863,7 +1877,8 @@ export async function declineInvitation(
 ): Promise<{ success: boolean; error?: string }> {
   const pool = getPool();
   const username = await getUsername(userId);
-  const result = await pool.query('UPDATE club_invitations SET status = $1 WHERE id = $2 AND invitedUsername = $3 AND status = $4', ['declined', invitationId, username, 'pending']);
+  // 2026-07-05 audit P3 fix: match by stable invited_user_id (username fallback for legacy rows).
+  const result = await pool.query('UPDATE club_invitations SET status = $1 WHERE id = $2 AND (invited_user_id = $3 OR (invited_user_id IS NULL AND invitedUsername = $4)) AND status = $5', ['declined', invitationId, userId, username, 'pending']);
   if (result.rowCount === 0) {
     return { success: false, error: 'Invitation not found or already handled' };
   }
@@ -2160,8 +2175,10 @@ export async function joinByReferral(
 
   try {
     await pool.query(
-      'INSERT INTO club_members (clubId, userId, role, status) VALUES ($1, $2, $3, $4)',
-      [referrer.clubid, userId, 'member', 'active']
+      // 2026-07-05 audit P3 fix: record who referred this member so getReferralStats
+      // can count real referrals instead of hardcoding 0.
+      'INSERT INTO club_members (clubId, userId, role, status, referred_by) VALUES ($1, $2, $3, $4, $5)',
+      [referrer.clubid, userId, 'member', 'active', referrer.referrerid]
     );
 
     const referrerName = await getUsername(referrer.referrerid);
@@ -2220,16 +2237,20 @@ export async function getReferralStats(
     return { success: true, referralCount: 0, chipsEarned: 0 };
   }
 
-  const stats = (await pool.query(
-    'SELECT chipsWon FROM club_stats WHERE clubId = $1 AND userId = $2',
-    [clubId, userId]
-  )).rows[0] as any;
+  // 2026-07-05 audit P3 fix: count REAL referrals (members whose referred_by is this
+  // user) instead of hardcoding 0, and report the actual referral chips earned
+  // (a deterministic 500 per successful referral, per joinByReferral) rather than
+  // club_stats.chipsWon, which also accumulates from every other stat path.
+  const referralCount = ((await pool.query(
+    'SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND referred_by = $2 AND status = $3',
+    [clubId, userId, 'active']
+  )).rows[0] as any).cnt;
 
   return {
     success: true,
     referralCode: member.referral_code,
-    referralCount: 0,
-    chipsEarned: stats?.chipswon || 0,
+    referralCount,
+    chipsEarned: referralCount * 500,
   };
 }
 

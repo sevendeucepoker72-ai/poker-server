@@ -66,7 +66,18 @@ export interface StudCardInfo {
 
 /**
  * Interface that all poker variants implement.
- * The main PokerTable delegates variant-specific behavior to these methods.
+ *
+ * ⚠️ 2026-07-05 audit note — READ BEFORE editing a variant class to fix a bug.
+ * The live engine (PokerTable and its *Table subclasses) reads the DATA properties
+ * of these variant objects (holeCardCount, communityCardCount, bettingStructure,
+ * isHiLo, deckSize, etc.) but does NOT call the behavioral METHODS below
+ * (getMaxRaise, evaluateHand, getNextPhase, isBettingPhase, isDrawPhase,
+ * getCommunityCardCount, createDeck). Those method bodies are currently unreachable
+ * reference implementations — a repo-wide grep finds zero callers. Betting-cap,
+ * hand-evaluation, phase-progression and deck logic all live in PokerTable.ts and
+ * the *Table.ts subclasses (e.g. OmahaTable, SevenStudTable, FiveCardDrawTable).
+ * If you "fix" a raise-cap or hand-eval bug by editing one of these methods it will
+ * have NO EFFECT — make the change in the corresponding *Table.ts engine class.
  */
 export interface PokerVariant {
   /** Full display name */

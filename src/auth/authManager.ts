@@ -733,6 +733,35 @@ export async function addChipsToUser(userId: number, chips: number): Promise<boo
 }
 
 /**
+ * Atomically commit a level-up reward: credit chips + stars AND ratchet the level
+ * in a SINGLE UPDATE, gated on the level actually advancing (`level < $newLevel`).
+ * 2026-07-05 audit P3 fix: ProgressionManager.addXP used to credit the chips
+ * (addChipsToUser) and ratchet the level (saveProgress) as two independent
+ * fire-and-forget writes; a crash between them let a rehydrate reload the OLD
+ * level, re-cross the threshold, and re-mint that level's chips. Doing both in one
+ * statement with the level-advance guard makes it exactly-once: either both land
+ * (level up + credited once) or neither (retried on rehydrate), and a retry after
+ * a successful commit is a no-op because `level < $newLevel` is then false.
+ */
+export async function commitLevelUpReward(
+  userId: number, chips: number, stars: number, newLevel: number, xp: number
+): Promise<void> {
+  try {
+    await pool.query(
+      `UPDATE users
+          SET chips = chips + $1,
+              stars = stars + $2,
+              level = GREATEST(level, $3),
+              xp = $4
+        WHERE id = $5 AND level < $3`,
+      [chips, stars, newLevel, xp, userId]
+    );
+  } catch (e: any) {
+    console.warn(`[commitLevelUpReward ${userId}]`, e?.message);
+  }
+}
+
+/**
  * Atomic "broke refill": add `amount` chips ONLY if the user is currently below
  * `threshold`. Returns the new balance, or null if not applied (not broke, or a
  * concurrent refill already fired). Closes the claimRefill TOCTOU (audit H6,

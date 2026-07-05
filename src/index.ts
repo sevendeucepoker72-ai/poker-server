@@ -4329,22 +4329,36 @@ Give feedback in this JSON format:
       // Credit seller within the same transaction.
       await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [totalCost, offer.sellerId]);
 
-      // Update the offer row. Record the backer's userId (Batch 5c) so
-      // settlement can pay them reliably without a name lookup.
-      const newRemaining = offer.remaining - data.pct;
-      const newBackers = [...offer.backers, { name: auth.username, userId: auth.userId, pct: data.pct }];
-      const settled = newRemaining <= 0;
-      if (settled) {
-        await client.query(`UPDATE staking_offers SET remaining = 0, backers = $1, settled_at = NOW() WHERE id = $2`, [JSON.stringify(newBackers), data.offerId]);
-      } else {
-        await client.query(`UPDATE staking_offers SET remaining = $1, backers = $2 WHERE id = $3`, [newRemaining, JSON.stringify(newBackers), data.offerId]);
+      // Update the offer row. 2026-07-05 audit P3 fix: decrement `remaining`
+      // ATOMICALLY in SQL with a `remaining >= $pct` guard, and append the backer
+      // via jsonb concat, instead of computing an absolute value from the possibly-
+      // stale in-memory `offer.remaining`. Two concurrent buys of the same offer
+      // used to both read remaining=100 and each write an absolute value, over-
+      // selling past 100%. The guard now serializes them: the loser gets 0 rows.
+      const newBacker = { name: auth.username, userId: auth.userId, pct: data.pct };
+      const { rows: updRows, rowCount: updCount } = await client.query(
+        `UPDATE staking_offers
+            SET remaining = remaining - $1,
+                backers = COALESCE(backers, '[]'::jsonb) || $2::jsonb,
+                settled_at = CASE WHEN remaining - $1 <= 0 THEN NOW() ELSE settled_at END
+          WHERE id = $3 AND remaining >= $1
+          RETURNING remaining`,
+        [data.pct, JSON.stringify([newBacker]), data.offerId]
+      );
+      if (!updCount) {
+        // A concurrent buy consumed the share first — the offer is over-subscribed.
+        await client.query('ROLLBACK');
+        socket.emit('buyStakeResult', { success: false, error: 'Offer unavailable' });
+        return;
       }
+      const dbRemaining = Number(updRows[0].remaining);
+      const settled = dbRemaining <= 0;
 
       await client.query('COMMIT');
 
-      // Only mutate in-memory state after DB commit succeeds.
-      offer.remaining = newRemaining;
-      offer.backers = newBackers;
+      // Reconcile in-memory cache from the authoritative DB value.
+      offer.remaining = dbRemaining;
+      offer.backers = [...offer.backers, newBacker];
       if (settled) stakingOffers.delete(data.offerId);
 
       auditLog(auth.username, 'STAKING_BUY', { offerId: data.offerId, pct: data.pct, totalCost, sellerId: offer.sellerId });
@@ -4401,16 +4415,24 @@ Give feedback in this JSON format:
         10
       );
       const { rows } = await getPool().query(
-        `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
-           VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4)
+        // 2026-07-05 audit P3 fix: persist is_admin from the master OAuth result so
+        // admins signing in via the primary OIDC flow can actually use admin socket
+        // handlers (isUserAdmin reads users.is_admin). Previously only the password-
+        // login syncMasterUser path wrote it, so OIDC admins got is_admin=false and
+        // every admin action 403'd. Grant-only (`$5 OR users.is_admin`) — never
+        // revokes an existing admin from this path, so it can't break a legit admin.
+        `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
+           VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4, $5)
            ON CONFLICT (LOWER(username)) DO UPDATE
-             SET display_name = COALESCE(users.display_name, $2)
+             SET display_name = COALESCE(users.display_name, $2),
+                 is_admin = ($5 OR users.is_admin)
          RETURNING *`,
         [
           String(phone),
           displayName,
           placeholderHash,
           JSON.stringify({ masterPhone: phone, masterUsername: oauthResult.username, masterUserId: oauthResult.sub }),
+          !!oauthResult.isAdmin,
         ]
       );
       const localUser = rows[0];
@@ -4578,13 +4600,17 @@ Give feedback in this JSON format:
       const _tlBcrypt = require('bcryptjs');
       const _tlHash = _tlBcrypt.hashSync(`oauth-placeholder-${oauthResult.sub}-${Date.now()}`, 10);
       const { rows: _tlRows } = await getPool().query(
-        `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
-           VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4)
+        // 2026-07-05 audit P3 fix: persist is_admin (grant-only) so OIDC admins can
+        // use admin handlers — mirrors the oauthLogin fix above.
+        `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
+           VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4, $5)
            ON CONFLICT (LOWER(username)) DO UPDATE
-             SET display_name = COALESCE(users.display_name, $2)
+             SET display_name = COALESCE(users.display_name, $2),
+                 is_admin = ($5 OR users.is_admin)
          RETURNING *`,
         [String(_tlPhone), _tlDisplayName, _tlHash,
-         JSON.stringify({ masterPhone: _tlPhone, masterUsername: oauthResult.username, masterUserId: oauthResult.sub })]
+         JSON.stringify({ masterPhone: _tlPhone, masterUsername: oauthResult.username, masterUserId: oauthResult.sub }),
+         !!oauthResult.isAdmin]
       );
       const _tlLocalUser = _tlRows[0];
       const userId = _tlLocalUser.id;
