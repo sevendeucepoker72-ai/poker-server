@@ -175,6 +175,21 @@ export class PokerTable extends EventEmitter {
   public handNumber: number = 0;
   public lastRaiseAmount: number = 0;
 
+  /**
+   * Monotonic decision-point version (2026-07-05). Bumped by the emit()
+   * override below on exactly the three events that redefine what the active
+   * player is being asked to decide: 'turnChanged' (whose turn / what they
+   * face), 'phaseChanged' (street), and 'handStarted' (new hand). The client
+   * echoes the stateVersion it acted on; the server rejects an action whose
+   * echoed version is older than the current one (a "call 100" sent against a
+   * decision point that has since moved on — timeout-fold, disconnect, etc.).
+   * Only-increases, so a rehydrate/restart resetting it to a lower value is
+   * safe: the reject rule is `echoed < current`, so a stale-high echo just
+   * fails open (accepts) rather than falsely rejecting. Persisted in the
+   * snapshot so it survives a Railway restart.
+   */
+  public stateVersion: number = 0;
+
   /** TDA Rule 33 (Dead Button): track previous BB position so blinds advance
    * by exactly one occupied seat per hand even when players bust. */
   public previousBigBlindSeat: number = -1;
@@ -226,6 +241,25 @@ export class PokerTable extends EventEmitter {
     for (let i = 0; i < MAX_SEATS; i++) {
       this.seats.push(createEmptySeat(i));
     }
+  }
+
+  /**
+   * Single choke point for stateVersion (2026-07-05). Every decision-point
+   * change in the engine already flows through one of these three emits, so
+   * bumping here — rather than at each of the ~5 call sites — cannot be
+   * missed by a future edit and stays consistent with the single-source-of-
+   * truth authority. All bumps for a given transition happen BEFORE the
+   * broadcast that carries the new version to clients (the engine is
+   * quiescent while waiting on the active player), so over-bumping within one
+   * transition never causes a false stale-reject — only an asynchronous event
+   * (timeout-fold, disconnect) can bump between broadcast and action, which is
+   * exactly the case we WANT to reject.
+   */
+  emit(event: string | symbol, ...args: any[]): boolean {
+    if (event === 'turnChanged' || event === 'phaseChanged' || event === 'handStarted') {
+      this.stateVersion++;
+    }
+    return super.emit(event, ...args);
   }
 
   // ========== Seat Management ==========
@@ -2153,6 +2187,7 @@ export class PokerTable extends EventEmitter {
       activeSeatIndex: this.activeSeatIndex,
       currentBetToMatch: this.currentBetToMatch,
       lastRaiseAmount: this.lastRaiseAmount,
+      stateVersion: this.stateVersion,
       lastAggressorSeat: this.lastAggressorSeat,
       previousBigBlindSeat: this.previousBigBlindSeat,
       deadSmallBlind: this.deadSmallBlind,
@@ -2196,6 +2231,11 @@ export class PokerTable extends EventEmitter {
     this.activeSeatIndex = snap.activeSeatIndex;
     this.currentBetToMatch = snap.currentBetToMatch;
     this.lastRaiseAmount = snap.lastRaiseAmount;
+    // Restore the decision-point version if the snapshot carries it (older
+    // snapshots won't — a rehydrate resetting it lower is safe; see field doc).
+    // rehydrate itself will re-emit phaseChanged/turnChanged during resume,
+    // so seed from the snapshot then let those bumps continue monotonically.
+    if (typeof snap.stateVersion === 'number') this.stateVersion = snap.stateVersion;
     this.lastAggressorSeat = snap.lastAggressorSeat;
     this.previousBigBlindSeat = snap.previousBigBlindSeat;
     this.deadSmallBlind = snap.deadSmallBlind;
@@ -2232,6 +2272,8 @@ export interface PokerTableSnapshot {
   activeSeatIndex: number;
   currentBetToMatch: number;
   lastRaiseAmount: number;
+  /** Decision-point version — optional for backward-compat with older snapshots. */
+  stateVersion?: number;
   lastAggressorSeat: number;
   previousBigBlindSeat: number;
   deadSmallBlind: boolean;

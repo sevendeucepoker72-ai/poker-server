@@ -1457,6 +1457,11 @@ function getGameStateForPlayer(
     dealerButtonSeat: table.dealerButtonSeat,
     currentBetToMatch: table.currentBetToMatch,
     handNumber: table.handNumber,
+    // Monotonic decision-point version (2026-07-05). The client stores this
+    // and echoes it back in emitPlayerAction; the action handler rejects an
+    // action whose echoed version is older than the current one (stale click
+    // against a decision point that already moved on). See PokerTable.emit().
+    stateVersion: table.stateVersion,
     smallBlind: table.config.smallBlind,
     bigBlind: table.config.bigBlind,
     minRaise: table.getMinRaise(),
@@ -1635,9 +1640,121 @@ function getGameStateForPlayer(
   return stateObj;
 }
 
+// 2026-07-05 — turn-timer arming, extracted from broadcastGameState into a single
+// named function and tied to the engine's 'turnChanged' event (armed from the SETTLED
+// resting state after advanceTurn/nextActor picks the actor, per the platform research
+// Gap-2 recommendation). It stays idempotent (the seatChanged guard), so it is ALSO
+// called from broadcastGameState as a safety net — if 'turnChanged' were ever missed,
+// the next broadcast still arms, and a redundant call no-ops. Post single-source-of-truth,
+// activeSeatIndex is always a settled valid seat here, so the old "stale index at
+// setTimeout" wedge (which the watchdog comment used to paper over) cannot occur.
+const wiredTurnListeners = new WeakSet<object>();
+function ensureTurnTimerWired(tableId: string): void {
+  const table = tableManager.getTable(tableId) as any;
+  if (!table || wiredTurnListeners.has(table)) return;
+  wiredTurnListeners.add(table);
+  // Arm from the settled state the instant the engine changes the active seat.
+  if (typeof table.on === 'function') {
+    table.on('turnChanged', () => armTurnTimer(tableId));
+  }
+}
+function armTurnTimer(tableId: string): void {
+  const table = tableManager.getTable(tableId);
+  if (!table) return;
+  {
+    const existing = turnTimers.get(tableId);
+    const activeSeat = table.activeSeatIndex;
+    const priorSeatForStart = turnStartedSeatMap.get(tableId);
+    const handChanged = turnStartedHandMap.get(tableId) !== table.handNumber;
+    const seatChanged = priorSeatForStart !== activeSeat || handChanged;
+    const inDrawPhase = DrawPhases.includes(table.currentPhase);
+
+    if (seatChanged || inDrawPhase) {
+      if (existing) clearTimeout(existing.timeout);
+      turnTimers.delete(tableId);
+      const existingWarn = turnWarningTimers.get(tableId);
+      if (existingWarn) clearTimeout(existingWarn.timeout);
+      turnWarningTimers.delete(tableId);
+    }
+
+    if (table.isHandInProgress() && activeSeat >= 0 && seatChanged && !inDrawPhase) {
+      const turnId = ++globalTurnId;
+      turnStartedAtMap.set(tableId, Date.now());
+      turnStartedSeatMap.set(tableId, activeSeat);
+      turnStartedHandMap.set(tableId, table.handNumber);
+      const timeout = setTimeout(() => {
+        const entry = turnTimers.get(tableId);
+        if (!entry || entry.turnId !== turnId) return;
+        turnTimers.delete(tableId);
+        const t = tableManager.getTable(tableId);
+        if (!t || !t.isHandInProgress() || t.activeSeatIndex !== activeSeat) return;
+        if (DrawPhases.includes(t.currentPhase)) return;
+        const seat = t.seats[activeSeat];
+        if (!seat || !seat.playerName || seat.folded) return;
+        const callAmt = t.currentBetToMatch - (seat.currentBet || 0);
+        log.debug(`[Timer] Seat ${activeSeat} (${seat.playerName}) timed out — ${callAmt > 0 ? 'folding' : 'checking'}`);
+        if (callAmt > 0) {
+          t.playerFold(activeSeat);
+        } else {
+          t.playerCheck(activeSeat);
+        }
+        broadcastGameState(tableId);
+        scheduleAIAction(tableId);
+      }, TURN_TIMEOUT_MS);
+      turnTimers.set(tableId, { timeout, seatIndex: activeSeat, turnId });
+
+      try {
+        const priorPushSeat = lastActiveSeatByTable.get(tableId);
+        if (priorPushSeat !== activeSeat) {
+          lastActiveSeatByTable.set(tableId, activeSeat);
+          const seat = table.seats[activeSeat];
+          if (seat && !seat.isAI && !seat.folded && seat.playerName) {
+            const userId = userIdForSeat(tableId, activeSeat);
+            if (userId) {
+              void notifyPlayer(
+                userId,
+                'your_turn',
+                "It's your turn!",
+                'Tap to make your move.',
+                { priority: 'high', metadata: { gameId: tableId, seatNumber: activeSeat } }
+              );
+            }
+          }
+        }
+
+        const warnDelay = TURN_TIMEOUT_MS - TURN_WARNING_LEAD_MS;
+        if (warnDelay > 0) {
+          const warnTimeout = setTimeout(() => {
+            const entry = turnWarningTimers.get(tableId);
+            if (!entry || entry.turnId !== turnId) return;
+            turnWarningTimers.delete(tableId);
+            const t = tableManager.getTable(tableId);
+            if (!t || !t.isHandInProgress() || t.activeSeatIndex !== activeSeat) return;
+            const seatNow = t.seats[activeSeat];
+            if (!seatNow || seatNow.isAI || seatNow.folded || !seatNow.playerName) return;
+            const uid = userIdForSeat(tableId, activeSeat);
+            if (!uid) return;
+            void notifyPlayer(
+              uid,
+              'turn_warning',
+              'Time running out!',
+              'Your action clock is about to expire.',
+              { priority: 'urgent', metadata: { gameId: tableId, seatNumber: activeSeat } }
+            );
+          }, warnDelay);
+          turnWarningTimers.set(tableId, { timeout: warnTimeout, turnId });
+        }
+      } catch (err) {
+        console.warn('[notifyPlayer your_turn/turn_warning] hook failed:', (err as Error)?.message);
+      }
+    }
+  }
+}
+
 function broadcastGameState(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
+  ensureTurnTimerWired(tableId);
 
   // Send personalized state to each player at the table
   for (const [socketId, session] of playerSessions) {
@@ -1713,134 +1830,15 @@ function broadcastGameState(tableId: string): void {
     }
   }
 
-  // Server-side turn timeout: only reset the turn clock when the active
-  // seat actually CHANGES from the prior one we remembered. We track the
-  // seat-for-turnStartedAt separately from the turnTimers entry because
-  // the timer entry gets deleted when the timeout callback fires — using
-  // that as the "prior seat" source caused a bug where after the timer
-  // expired (or was cleared silently), the next broadcast saw no entry
-  // and treated it as a fresh turn, resetting the countdown to 30s on
-  // the same seat. User observed: "his turn doesn't pause no more, the
-  // turn timer just starts over when complete" (2026-04-22).
-  {
-    const existing = turnTimers.get(tableId);
-    const activeSeat = table.activeSeatIndex;
-    const priorSeatForStart = turnStartedSeatMap.get(tableId);
-    // 2026-06-11 audit R11: a NEW HAND counts as a turn change even when its
-    // first actor is the same seat that acted last in the prior hand — without
-    // this the timer never armed for that opening turn and an idle player
-    // stalled the table.
-    const handChanged = turnStartedHandMap.get(tableId) !== table.handNumber;
-    const seatChanged = priorSeatForStart !== activeSeat || handChanged;
-    // 2026-07-01 audit #4: draw phases (5-Card/Triple Draw/Badugi) have their
-    // OWN stand-pat clock (drawTimers). The betting turn-timer must never run
-    // during a draw — draw entry does not clear activeSeatIndex or reset
-    // currentBetToMatch, so this timer's callAmt is computed from the STALE
-    // pre-draw bet-to-match and force-folds a player who is merely choosing
-    // discards. Clear any timer armed before the draw (seat may be unchanged,
-    // so the seatChanged path alone wouldn't clear it) and never arm here.
-    const inDrawPhase = DrawPhases.includes(table.currentPhase);
-
-    if (seatChanged || inDrawPhase) {
-      if (existing) clearTimeout(existing.timeout);
-      turnTimers.delete(tableId);
-      // Cancel any in-flight warning timer for the prior seat — a stale
-      // 'turn_warning' for the old seat would mislead the player.
-      const existingWarn = turnWarningTimers.get(tableId);
-      if (existingWarn) clearTimeout(existingWarn.timeout);
-      turnWarningTimers.delete(tableId);
-    }
-
-    if (table.isHandInProgress() && activeSeat >= 0 && seatChanged && !inDrawPhase) {
-      const turnId = ++globalTurnId;
-      turnStartedAtMap.set(tableId, Date.now());
-      turnStartedSeatMap.set(tableId, activeSeat);
-      turnStartedHandMap.set(tableId, table.handNumber); // R11: remember the hand we armed for
-      const timeout = setTimeout(() => {
-        const entry = turnTimers.get(tableId);
-        if (!entry || entry.turnId !== turnId) return; // stale timer
-        turnTimers.delete(tableId);
-        const t = tableManager.getTable(tableId);
-        if (!t || !t.isHandInProgress() || t.activeSeatIndex !== activeSeat) return;
-        // Defensive: if the phase advanced into a draw after this timer armed,
-        // do NOT fold on the stale bet-to-match — the draw clock owns it (#4).
-        if (DrawPhases.includes(t.currentPhase)) return;
-        const seat = t.seats[activeSeat];
-        if (!seat || !seat.playerName || seat.folded) return;
-        const callAmt = t.currentBetToMatch - (seat.currentBet || 0);
-        // 2026-05-12 audit: throttled to debug, was console.log
-        log.debug(`[Timer] Seat ${activeSeat} (${seat.playerName}) timed out — ${callAmt > 0 ? 'folding' : 'checking'}`);
-        if (callAmt > 0) {
-          t.playerFold(activeSeat);
-        } else {
-          t.playerCheck(activeSeat);
-        }
-        broadcastGameState(tableId);
-        // 2026-07-01 audit #4: this action may have completed the betting round
-        // and advanced into a DRAW phase. scheduleAIAction is the ONLY thing
-        // that arms the draw stand-pat clock (and schedules the next AI turn);
-        // without this call a draw entered via a timeout would hang forever now
-        // that the betting timer/watchdog correctly skip draw phases.
-        scheduleAIAction(tableId);
-      }, TURN_TIMEOUT_MS);
-      turnTimers.set(tableId, { timeout, seatIndex: activeSeat, turnId });
-
-      // === Push notification: your_turn ===
-      // Fire-and-forget on every real seat transition, for human players
-      // only. We use lastActiveSeatByTable (separate from turnTimers) as
-      // the prior-seat reference — per the 551c785 -> 9128699 regression
-      // note, using a turnTimers entry would be unsafe because the entry
-      // is deleted by the async timeout callback.
-      try {
-        const priorPushSeat = lastActiveSeatByTable.get(tableId);
-        if (priorPushSeat !== activeSeat) {
-          lastActiveSeatByTable.set(tableId, activeSeat);
-          const seat = table.seats[activeSeat];
-          if (seat && !seat.isAI && !seat.folded && seat.playerName) {
-            const userId = userIdForSeat(tableId, activeSeat);
-            if (userId) {
-              void notifyPlayer(
-                userId,
-                'your_turn',
-                "It's your turn!",
-                'Tap to make your move.',
-                { priority: 'high', metadata: { gameId: tableId, seatNumber: activeSeat } }
-              );
-            }
-          }
-        }
-
-        // === Push notification: turn_warning ===
-        // Sibling timer: fires ~10s before the action clock expires.
-        // Stale-check via turnId (rolls each new turn) so a clock that
-        // already advanced doesn't surface a misleading warning.
-        const warnDelay = TURN_TIMEOUT_MS - TURN_WARNING_LEAD_MS;
-        if (warnDelay > 0) {
-          const warnTimeout = setTimeout(() => {
-            const entry = turnWarningTimers.get(tableId);
-            if (!entry || entry.turnId !== turnId) return; // stale
-            turnWarningTimers.delete(tableId);
-            const t = tableManager.getTable(tableId);
-            if (!t || !t.isHandInProgress() || t.activeSeatIndex !== activeSeat) return;
-            const seatNow = t.seats[activeSeat];
-            if (!seatNow || seatNow.isAI || seatNow.folded || !seatNow.playerName) return;
-            const uid = userIdForSeat(tableId, activeSeat);
-            if (!uid) return;
-            void notifyPlayer(
-              uid,
-              'turn_warning',
-              'Time running out!',
-              'Your action clock is about to expire.',
-              { priority: 'urgent', metadata: { gameId: tableId, seatNumber: activeSeat } }
-            );
-          }, warnDelay);
-          turnWarningTimers.set(tableId, { timeout: warnTimeout, turnId });
-        }
-      } catch (err) {
-        console.warn('[notifyPlayer your_turn/turn_warning] hook failed:', (err as Error)?.message);
-      }
-    }
-  }
+  // Server-side turn timeout arming — now a single named function
+  // (armTurnTimer) tied to the engine's 'turnChanged' event via
+  // ensureTurnTimerWired() above. Kept here too as an idempotent safety
+  // net: if a 'turnChanged' emit were ever missed, the next broadcast
+  // still arms the clock, and a redundant call no-ops on the seatChanged
+  // guard. See the armTurnTimer definition for the full history (the
+  // "his turn doesn't pause no more" 2026-04-22 regression, R11 new-hand
+  // arming, and the #4 draw-phase skip).
+  armTurnTimer(tableId);
 
   // Hand-state checkpoint: snapshot to Redis so a Railway restart can
   // rehydrate this exact table state. Only persist while a hand is
@@ -7880,6 +7878,11 @@ Give feedback in this JSON format:
       // explicit guard below since socket payloads aren't type-checked
       // at the boundary, but the contract is: nonce is mandatory.
       nonce?: string;
+      // 2026-07-05: the decision-point version the client acted on (echoed
+      // from getGameStateForPlayer.stateVersion). Optional for backward-compat
+      // with clients that don't send it yet — the guard below only rejects
+      // when it IS present and strictly older than the table's current version.
+      stateVersion?: number;
     }) => {
       const session = playerSessions.get(socket.id);
       if (!session) {
@@ -7937,6 +7940,26 @@ Give feedback in this JSON format:
       // Validate it's this player's turn
       if (table.activeSeatIndex !== session.seatIndex) {
         socket.emit('error', { message: 'Not your turn' });
+        return;
+      }
+
+      // 2026-07-05 stale-action guard. "Not your turn" above catches the case
+      // where the seat changed, but NOT the case where it's still your seat's
+      // turn yet the decision point moved underneath you — e.g. an async
+      // timeout-fold ended the hand and a new one dealt you back into the
+      // active seat on a different street/bet, while your click was in flight.
+      // The client echoes the stateVersion it rendered; reject if the engine
+      // has since advanced past it, and push fresh authoritative state so the
+      // client re-renders the real decision. Enforced only when the client
+      // actually sends a version — older clients fall through (warn-mode
+      // rollout), and a stale-HIGH echo (post-restart) fails open by design.
+      if (typeof data.stateVersion === 'number' && data.stateVersion < table.stateVersion) {
+        socket.emit('error', {
+          message: 'Stale action — the table has moved on',
+          code: 'STALE_STATE',
+          stateVersion: table.stateVersion,
+        });
+        emitGameState(socket, getGameStateForPlayer(table, session.seatIndex, session.trainingEnabled), true);
         return;
       }
 
