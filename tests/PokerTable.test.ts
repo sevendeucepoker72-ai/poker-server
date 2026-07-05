@@ -452,6 +452,24 @@ describe('Stud — C13 ante/bring-in (not SB/BB) + R4 action order by exposed ha
     }
   });
 
+  test('2026-07-05 P1 fix: a sitting-out seat is NOT charged the Stud ante', () => {
+    const t = new SevenStudTable(scfg(50), false, false);
+    seatPlayers(t, 4, 5000);
+    (t as any).setSittingOutSeats([1]); // seat 1 sits out this hand
+    (t as any).startNewHand();
+    // The bug drained the ante (50) from the sitting-out non-participant every
+    // hand; the seat must keep its full stack now.
+    expect(t.seats[1].chipCount).toBe(5000);
+    expect(t.seats[1].totalInvestedThisHand).toBe(0);
+    // Every other occupied seat still antes normally.
+    const active = t.seats.filter((s, i) => s.state === 'occupied' && i !== 1);
+    expect(active.length).toBeGreaterThanOrEqual(2);
+    for (const s of active) {
+      expect(s.totalInvestedThisHand).toBe(50);
+      expect(s.chipCount).toBe(4950);
+    }
+  });
+
   test('R4: exposed-board score ranks a pair over ace-high, trips over a pair, and kickers', () => {
     const t = new SevenStudTable(scfg(0), false, false) as any;
     const pair8 = [{ suit: 0, rank: 8 }, { suit: 1, rank: 8 }];

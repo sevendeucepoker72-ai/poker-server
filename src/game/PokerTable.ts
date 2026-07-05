@@ -365,6 +365,14 @@ export class PokerTable extends EventEmitter {
   public setSittingOutSeats(indices: Iterable<number>): void {
     this._sittingOutSeats = new Set(indices);
   }
+  /**
+   * Whether a seat is sitting out this hand. Exposed to subclasses (e.g.
+   * SevenStudTable) that re-implement postBlinds and must apply the same
+   * sit-out guard the base ante/blind loops use (_sittingOutSeats is private).
+   */
+  protected isSittingOut(seatIndex: number): boolean {
+    return this._sittingOutSeats.has(seatIndex);
+  }
 
   /**
    * Mark seats in _sittingOutSeats that would naturally be due SB/BB this

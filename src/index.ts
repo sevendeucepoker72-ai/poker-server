@@ -2641,15 +2641,27 @@ function activateBombPotIfPending(tableId: string, table: PokerTable): boolean {
   bombPotPending.delete(tableId);
   bombPotActive.set(tableId, true);
 
-  // All players post 2x big blind as ante
+  // All players post 2x big blind as an EQUAL ante.
   const bombAnte = table.config.bigBlind * 2;
   for (let i = 0; i < MAX_SEATS; i++) {
     const seat = table.seats[i];
     if (seat.state === 'occupied' && !seat.folded && !seat.eliminated) {
+      // 2026-07-05 audit P2 fix: activateBombPotIfPending runs AFTER
+      // startNewHand -> postBlinds, so the SB/BB have already paid their blinds
+      // (and any ante) into totalInvestedThisHand/currentBet. Charging the bomb
+      // ante on top made the two blind seats contribute blind + ante while every
+      // other seat contributed only the ante — a bomb pot must be an EQUAL wager.
+      // Refund each seat's already-posted contribution (no real betting has
+      // happened yet — this is immediately post-startNewHand) so the ante below
+      // is the sole, equal contribution for every seat.
+      seat.chipCount += seat.totalInvestedThisHand;
+      seat.totalInvestedThisHand = 0;
+      seat.currentBet = 0;
+      seat.allIn = false;
       const deduction = Math.min(bombAnte, seat.chipCount);
       seat.chipCount -= deduction;
       seat.currentBet = deduction;
-      seat.totalInvestedThisHand += deduction;
+      seat.totalInvestedThisHand = deduction;
       // 2026-06-11 audit C17: a player whose stack is fully consumed by the
       // bomb ante is all-in for this hand. Without this flag the engine treats
       // them as a live actor with 0 chips and auto-folds them on their turn —
@@ -2673,15 +2685,27 @@ function activateBombPotIfPending(tableId: string, table: PokerTable): boolean {
     for (let i = 0; i < MAX_SEATS; i++) {
       table.seats[i].currentBet = 0;
     }
-    // First non-folded player after the dealer acts first post-flop.
+    // First player after the dealer who can ACTUALLY act goes first post-flop.
+    // 2026-07-05 audit P1 fix: the old predicate `s.chipCount >= 0` is ALWAYS
+    // true, so it could seat the action on a seat that went all-in on the bomb
+    // ante — an actor who cannot act, wedging the table until the watchdog fired.
+    // Skip all-in / chipless / cardless seats (the engine's own canAct test).
     const startIdx = (table.dealerButtonSeat + 1) % MAX_SEATS;
+    let seated = false;
     for (let j = 0; j < MAX_SEATS; j++) {
       const checkSeat = (startIdx + j) % MAX_SEATS;
       const s = table.seats[checkSeat];
-      if (s.state === 'occupied' && !s.folded && !s.eliminated && s.chipCount >= 0) {
+      if (s.state === 'occupied' && !s.folded && !s.eliminated && !s.allIn && s.chipCount > 0 && s.holeCards.length > 0) {
         table.activeSeatIndex = checkSeat;
+        seated = true;
         break;
       }
+    }
+    // If NOBODY can act (every remaining player went all-in on the ante), don't
+    // leave the table with no valid actor — hand the board runout to the engine's
+    // canonical all-in progression (mirrors startNewHand's post-first-actor check).
+    if (!seated) {
+      (table as any).advanceToNextStreet();
     }
   }
   return true;
@@ -9311,12 +9335,19 @@ Give feedback in this JSON format:
 
   // Start a simulated multi-table tournament
   socket.on('startSimulatedTournament', async (data: { playerCount?: number; turbo?: boolean }) => {
+    // 2026-07-05 audit P1 fix: this spins up ceil(playerCount/9) live bot tables,
+    // each with autonomous game-loop timers. It was gated only on `if (!auth)`
+    // (any logged-in user), while its sibling setTournamentSpeed below is
+    // admin-gated — so any authenticated player could emit this with a huge
+    // playerCount and exhaust the process (resource-exhaustion DoS). Require
+    // admin AND clamp playerCount to the UI's advertised 18–500 range.
     const auth = authSessions.get(socket.id);
-    if (!auth) { socket.emit('error', { message: 'Must be logged in' }); return; }
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
 
     const session = playerSessions.get(socket.id);
-    const playerCount = data?.playerCount || 200;
+    const playerCount = Math.min(Math.max(18, Math.floor(Number(data?.playerCount) || 200)), 500);
     const turbo = data?.turbo || false;
+    auditLog(auth.username, 'START_SIM_TOURNAMENT', { playerCount, turbo });
 
     const result = startMultiTableTournament(
       playerCount,
@@ -10415,6 +10446,11 @@ function startQualifierTournament(
     if (sock) sock.join(`table:${tid}`);
   }
 
+  // 2026-07-05 audit P0 fix: deal the first hand + attach the progress listener,
+  // AI scheduler, and tournament-event handlers. Without this the qualifier
+  // tables sat at WaitingForPlayers forever (no cards, no blinds, no payouts).
+  bootstrapTournamentTables(tournamentId, tableIds);
+
   return { tournamentId, tableIds, tableCount };
 }
 
@@ -10422,6 +10458,80 @@ function startQualifierTournament(
  * Start a multi-table tournament simulation.
  * Creates `playerCount` AI bots + optionally 1 human player.
  */
+// 2026-07-05 audit P0 fix: shared tournament-table bootstrap. Previously this
+// block was inlined ONLY in startMultiTableTournament; startQualifierTournament
+// seated its players and returned WITHOUT dealing a hand / attaching the progress
+// listener / scheduling AI / wiring tournament events, so every qualifier
+// tournament froze at WaitingForPlayers forever. Both start paths now call this
+// one helper so the two can never diverge again.
+function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): void {
+  // Set up each table: listeners, start hands
+  for (const tid of tableIds) {
+    const table = tableManager.getTable(tid);
+    if (!table) continue;
+    ensureTableProgressListener(table, tid);
+    table.startNewHand();
+    broadcastGameState(tid);
+    scheduleAIAction(tid);
+  }
+
+  // Listen for blind level changes → apply to ALL tables
+  tournamentManager.onEvent(tournamentId, (event, data) => {
+    if (event === 'blindLevelUp') {
+      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
+        const t = tableManager.getTable(tid);
+        if (t) {
+          t.config.smallBlind = data.sb;
+          t.config.bigBlind = data.bb;
+          t.config.ante = data.ante;
+        }
+        io.to(`table:${tid}`).emit('blindLevelUp', data);
+
+        // === Push notification: blind_level_up ===
+        // Fan out to every human seat at this tournament table. Fire-and-forget;
+        // notification failure must never break the blind-up state machine.
+        try {
+          const t2 = tableManager.getTable(tid);
+          if (t2) {
+            const newLevel = data?.level ?? 0;
+            const tableLabel = t2.config.tableName || 'your table';
+            for (let i = 0; i < t2.seats.length; i++) {
+              const seat = t2.seats[i];
+              if (!seat || seat.state !== 'occupied') continue;
+              if (seat.isAI || !seat.playerName) continue;
+              const uid = userIdForSeat(tid, i);
+              if (!uid) continue;
+              void notifyPlayer(
+                uid,
+                'blind_level_up',
+                'Blinds increasing',
+                `Level ${newLevel} now in play at ${tableLabel}`,
+                { priority: 'normal', metadata: { gameId: tid, tournamentId, level: newLevel } }
+              );
+            }
+          }
+        } catch (err) {
+          console.warn('[notifyPlayer blind_level_up] hook failed:', (err as Error)?.message);
+        }
+      }
+    }
+    if (event === 'playerEliminated') {
+      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
+        io.to(`table:${tid}`).emit('playerEliminated', data);
+      }
+      // Check table rebalancing after elimination
+      handleTableRebalance(tournamentId);
+    }
+    if (event === 'tournamentFinished') {
+      void payTournamentPrizes(data).catch(() => {}); // funded prize payouts + staking settlement (mint-free, idempotent)
+      postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
+      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
+        io.to(`table:${tid}`).emit('tournamentFinished', data);
+      }
+    }
+  });
+}
+
 function startMultiTableTournament(
   playerCount: number = 200,
   humanSocketId?: string,
@@ -10582,71 +10692,8 @@ function startMultiTableTournament(
     }
   }
 
-  // Set up each table: listeners, start hands
-  for (const tid of tableIds) {
-    const table = tableManager.getTable(tid);
-    if (!table) continue;
-    ensureTableProgressListener(table, tid);
-    table.startNewHand();
-    broadcastGameState(tid);
-    scheduleAIAction(tid);
-  }
-
-  // Listen for blind level changes → apply to ALL tables
-  tournamentManager.onEvent(tournamentId, (event, data) => {
-    if (event === 'blindLevelUp') {
-      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
-        const t = tableManager.getTable(tid);
-        if (t) {
-          t.config.smallBlind = data.sb;
-          t.config.bigBlind = data.bb;
-          t.config.ante = data.ante;
-        }
-        io.to(`table:${tid}`).emit('blindLevelUp', data);
-
-        // === Push notification: blind_level_up ===
-        // Fan out to every human seat at this tournament table. Fire-and-forget;
-        // notification failure must never break the blind-up state machine.
-        try {
-          const t2 = tableManager.getTable(tid);
-          if (t2) {
-            const newLevel = data?.level ?? 0;
-            const tableLabel = t2.config.tableName || 'your table';
-            for (let i = 0; i < t2.seats.length; i++) {
-              const seat = t2.seats[i];
-              if (!seat || seat.state !== 'occupied') continue;
-              if (seat.isAI || !seat.playerName) continue;
-              const uid = userIdForSeat(tid, i);
-              if (!uid) continue;
-              void notifyPlayer(
-                uid,
-                'blind_level_up',
-                'Blinds increasing',
-                `Level ${newLevel} now in play at ${tableLabel}`,
-                { priority: 'normal', metadata: { gameId: tid, tournamentId, level: newLevel } }
-              );
-            }
-          }
-        } catch (err) {
-          console.warn('[notifyPlayer blind_level_up] hook failed:', (err as Error)?.message);
-        }
-      }
-    }
-    if (event === 'playerEliminated') {
-      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
-        io.to(`table:${tid}`).emit('playerEliminated', data);
-      }
-      // Check table rebalancing after elimination
-      handleTableRebalance(tournamentId);
-    }
-    if (event === 'tournamentFinished') {
-      void payTournamentPrizes(data).catch(() => {}); // funded prize payouts + staking settlement (mint-free, idempotent)
-      postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
-      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
-        io.to(`table:${tid}`).emit('tournamentFinished', data);
-      }
-    }
-  });
+  // Set up each table (listeners, deal first hand, AI, tournament-event wiring).
+  bootstrapTournamentTables(tournamentId, tableIds);
 
   console.log(`[Tournament] Started ${playerCount}-player tournament ${tournamentId} across ${tableCount} tables`);
   return { tournamentId, tableIds, tableCount };

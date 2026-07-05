@@ -121,6 +121,11 @@ export class SevenStudTable extends PokerTable {
   protected postBlinds(): void {
     if (this.config.ante > 0) {
       for (const seatIdx of this.getActivePlayerSeats()) {
+        // 2026-07-05 audit P1 fix: getActivePlayerSeats() includes sitting-out
+        // seats (they're tracked separately), so without this guard the Stud/Razz
+        // ante drained a non-participant's stack every hand — the base ante loop
+        // has the identical guard (PokerTable '#8' fix); this override lacked it.
+        if (this.isSittingOut(seatIdx)) continue;
         const seat = this.seats[seatIdx];
         const anteAmount = Math.min(this.config.ante, seat.chipCount);
         if (anteAmount > 0) {
