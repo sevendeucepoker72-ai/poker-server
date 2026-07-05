@@ -761,3 +761,49 @@ describe('All-fold degenerate hand — refunds stakes, destroys no chips (#1)', 
     expect(occupied().every((s) => s.totalInvestedThisHand === 0)).toBe(true);
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// wentToShowdown flag (2026-07-05 audit): a hand won uncontested (everyone
+// folds to one player) must NOT reveal any hole cards — the winner never
+// showed. Only a contested showdown (>= 2 tabled) reveals hands.
+// ─────────────────────────────────────────────────────────────────────────
+describe('wentToShowdown — no hole-card leak on uncontested wins (2026-07-05)', () => {
+  test('won by fold → wentToShowdown false and NO hole cards in the hand history', () => {
+    const t = makeTable();
+    t.sitDown(0, 'A', 5000, 'a', false);
+    t.sitDown(1, 'B', 5000, 'b', false);
+    t.sitDown(2, 'C', 5000, 'c', false);
+    let history: any = null;
+    t.on('handHistory', (h: any) => { history = h; });
+    t.startNewHand();
+    // Fold the active player until only one remains → won without a showdown.
+    let guard = 0;
+    while (t.currentPhase !== GamePhase.HandComplete && guard++ < 20) {
+      const a = t.activeSeatIndex;
+      if (a < 0) break;
+      t.playerFold(a);
+    }
+    expect(t.currentPhase).toBe(GamePhase.HandComplete);
+    expect(t.wentToShowdown).toBe(false);
+    // The uncontested winner never showed — every player's cards stay hidden.
+    expect(history).toBeTruthy();
+    for (const p of history.players) {
+      expect(p.holeCards).toBeNull();
+    }
+  });
+
+  test('contested showdown (both all-in) → wentToShowdown true', () => {
+    const t = makeTable();
+    t.sitDown(0, 'A', 5000, 'a', false);
+    t.sitDown(1, 'B', 5000, 'b', false);
+    t.startNewHand();
+    let guard = 0;
+    while (t.currentPhase !== GamePhase.HandComplete && guard++ < 20) {
+      const a = t.activeSeatIndex;
+      if (a < 0) break;
+      if (!t.playerAllIn(a)) { if (!t.playerCall(a)) t.playerCheck(a); }
+    }
+    expect(t.currentPhase).toBe(GamePhase.HandComplete);
+    expect(t.wentToShowdown).toBe(true); // 2 players tabled their hands
+  });
+});

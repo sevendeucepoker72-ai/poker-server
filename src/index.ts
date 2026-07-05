@@ -1417,12 +1417,15 @@ function getGameStateForPlayer(
       seatData.totalCardCount = seat.holeCards.length;
     }
 
-    // During showdown, reveal non-folded hands
+    // During showdown, reveal non-folded hands — but ONLY on a genuine contested
+    // showdown. 2026-07-05 audit fix: a hand won uncontested (everyone folds to one
+    // player) previously broadcast the winner's hole cards to the whole table even
+    // though they never showed. wentToShowdown is true only when >= 2 players tabled.
     if (
       table.currentPhase === GamePhase.Showdown ||
       table.currentPhase === GamePhase.HandComplete
     ) {
-      if (!seat.folded && seat.holeCards.length > 0) {
+      if (table.wentToShowdown && !seat.folded && seat.holeCards.length > 0) {
         seatData.holeCards = seat.holeCards.map((c) => ({
           suit: c.suit,
           rank: c.rank,
@@ -3229,12 +3232,17 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // record busted players so finish positions and bounty payouts are correct.
   const tournamentId = tournamentTables.get(tableId);
   if (tournamentId) {
-    // Identify winners of this hand to credit as bounty eliminators
-    const winnerPlayerIds = new Set<string>();
+    // Identify this hand's pot winners IN POT ORDER (results are emitted main-pot
+    // first, then each side pot). 2026-07-05 audit P2 fix: previously the FIRST
+    // winner was credited as the eliminator for EVERY busted player, so in a
+    // multi-way all-in with side pots one winner collected every bounty while the
+    // real eliminators got none. Each busted player is eliminated by the winner of
+    // the pot their all-in chips were in — mapped positionally below.
+    const orderedWinnerIds: string[] = [];
     for (const r of results) {
       if ((r.amount || 0) > 0) {
         const seat = table.seats[r.seatIndex];
-        if (seat?.playerId) winnerPlayerIds.add(seat.playerId);
+        if (seat?.playerId) orderedWinnerIds.push(seat.playerId);
       }
     }
     // 2026-06-11 audit R2: when multiple players bust the SAME hand, finish
@@ -3248,11 +3256,18 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       if (s?.state === 'occupied' && s.chipCount <= 0 && !s.eliminated) bustedSeatIdx.push(i);
     }
     bustedSeatIdx.sort((a, b) => (table.startChips.get(a) || 0) - (table.startChips.get(b) || 0));
+    let bustRank = 0;
     for (const i of bustedSeatIdx) {
       const seat = table.seats[i];
       if (seat?.state === 'occupied' && seat.chipCount <= 0 && !seat.eliminated) {
         seat.eliminated = true;
-        const eliminatorId = winnerPlayerIds.values().next().value;
+        // Pair the k-th shortest bust with the k-th pot winner (clamped to the
+        // last winner): the shortest all-in was in the main pot, the next in side
+        // pot 1, and so on — so distinct busts credit their true eliminators.
+        const eliminatorId = orderedWinnerIds.length > 0
+          ? orderedWinnerIds[Math.min(bustRank, orderedWinnerIds.length - 1)]
+          : undefined;
+        bustRank++;
         try {
           const result = tournamentManager.eliminatePlayer(tournamentId, seat.playerId, eliminatorId);
           if (result && result.bountyPayout && eliminatorId) {
@@ -5556,6 +5571,11 @@ Give feedback in this JSON format:
   // ─── Club Leaderboard & Stats ───
 
   socket.on('getClubLeaderboard', async (data: { clubId: number; period?: 'today' | 'week' | 'alltime' }) => {
+    // 2026-07-05 audit P2 fix: membership-gate club-scoped reads. This returned a
+    // private club's member usernames + chip win/loss stats to ANY authenticated
+    // socket with the clubId (the H4/H5 membership-check pattern was applied to
+    // getClubMessages/getClubStatistics/getActivityFeed but not here).
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getClubLeaderboard(data.clubId, data.period || 'alltime');
     socket.emit('clubLeaderboard', result);
   });
@@ -5592,6 +5612,9 @@ Give feedback in this JSON format:
   });
 
   socket.on('getClubTournaments', async (data: { clubId: number }) => {
+    // 2026-07-05 audit P2 fix: membership-gate (was leaking a private club's
+    // tournament configs/buy-ins/participants to any authenticated caller).
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getClubTournaments(data.clubId);
     socket.emit('clubTournaments', result);
   });
@@ -5654,6 +5677,9 @@ Give feedback in this JSON format:
   });
 
   socket.on('getClubChallenges', async (data: { clubId: number }) => {
+    // 2026-07-05 audit P2 fix: membership-gate (was leaking a private club's
+    // pending/accepted challenge participants + stakes to any authenticated caller).
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getClubChallenges(data.clubId);
     socket.emit('clubChallenges', result);
   });
@@ -5750,6 +5776,9 @@ Give feedback in this JSON format:
   });
 
   socket.on('getBlindStructures', async (data: { clubId: number }) => {
+    // 2026-07-05 audit P2 fix: membership-gate (was leaking a private club's
+    // custom blind structures to any authenticated caller).
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getBlindStructures(data.clubId);
     socket.emit('blindStructures', result);
   });
@@ -5822,6 +5851,9 @@ Give feedback in this JSON format:
   });
 
   socket.on('getUnionInfo', async (data: { clubId: number }) => {
+    // 2026-07-05 audit P2 fix: membership-gate (was leaking a private club's
+    // union member-club list to any authenticated caller).
+    if (!(await requireClubMember(data.clubId))) return;
     const result = await getUnionInfo(data.clubId);
     socket.emit('unionInfo', result);
   });
@@ -6904,6 +6936,17 @@ Give feedback in this JSON format:
       else if (roll < 0.75) reward = { chips: 2500, stars: 0, label: '2,500 chips' };
       else                  reward = { chips: 10000, stars: 0, label: '🎰 10,000 chips' };
 
+      // 2026-07-05 audit P2 fix: record the claim FIRST (atomic INSERT ... ON
+      // CONFLICT DO NOTHING) and bail if it loses, exactly like the claimDailyLogin
+      // H6 fix. The read-only hasClaimedToday above is only a fast-path — two
+      // concurrent emits both passed it and double-credited the spin because the
+      // grant used to run BEFORE this atomic INSERT.
+      const firstSpinClaim = await recordDailyClaim(ctx.userId, 'spin', reward);
+      if (!firstSpinClaim) {
+        socket.emit('dailySpinClaimed', { success: false, error: 'already_claimed' });
+        return;
+      }
+
       const progress = progressionManager.getProgress(ctx.playerId)!;
       progress.chips += reward.chips;
       progress.stars += reward.stars;
@@ -6914,7 +6957,6 @@ Give feedback in this JSON format:
           auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: reward.stars, path: 'daily_spin' });
         }
       }
-      await recordDailyClaim(ctx.userId, 'spin', reward);
 
       socket.emit('dailySpinClaimed', { success: true, reward });
       sendProgressToPlayer(socket.id);
@@ -9169,7 +9211,12 @@ Give feedback in this JSON format:
     const playerId = session?.playerId;
     if (!playerId) { respond({ success: false, error: 'Not in a session' }); return; }
     const BATTLE_PASS_COST = 950;
-    const result = progressionManager.purchaseTheme(playerId, '__battlepass_premium__', BATTLE_PASS_COST);
+    // 2026-07-05 audit P2 fix: use the AUTHORITATIVE atomic charge. purchaseTheme
+    // returned success from the in-memory snapshot and deducted stars fire-and-
+    // forget, so the premium entitlement (mergeUserStats below) could be granted
+    // even when the real DB star charge failed. purchaseThemeAtomic awaits the DB
+    // deduct and only reports success when the charge actually landed.
+    const result = await progressionManager.purchaseThemeAtomic(playerId, '__battlepass_premium__', BATTLE_PASS_COST);
     if (!result.success) { respond({ success: false, error: result.error }); return; }
     await mergeUserStats(auth.userId, { battlePassPremium: true });
     sendProgressToPlayer(socket.id);

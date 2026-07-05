@@ -540,6 +540,17 @@ export class ProgressionManager {
     if (durable) {
       progress.stars = durable.stars;
       progress.dailyLoginStreak = durable.loginStreak;
+      // 2026-07-05 audit P2 fix: seed lastLoginDate from the durable claim date.
+      // This was the ONLY progress field hydrateFromDB never reloaded, so after
+      // every server restart the next claimDailyBonus saw lastLoginDate='' and hit
+      // its "!== today -> reset streak to 1" branch, overwriting the correctly-
+      // hydrated dailyLoginStreak and paying the day-1 bonus instead of the earned
+      // amount. lastDailyBonusClaimed is deliberately left unseeded — the real
+      // once-per-day lock is the atomic user_daily_claims row in the socket handler,
+      // and seeding it from the login-claim date could wrongly block a same-day claim.
+      if (durable.lastLoginClaimDate) {
+        progress.lastLoginDate = durable.lastLoginClaimDate;
+      }
       // Don't clobber equippedCardBack / equippedTableTheme here — those are
       // sourced from user_inventory via loadInventory below.
     }
@@ -890,6 +901,31 @@ export class ProgressionManager {
       }).catch((e) => {
         console.warn(`[purchaseTheme ${progress.userId}] deductStars threw:`, e?.message);
       });
+    }
+    progress.stars -= cost;
+    progress.ownedThemes.push(themeId);
+    return { success: true };
+  }
+
+  /**
+   * Authoritative variant of purchaseTheme (2026-07-05 audit P2 fix). purchaseTheme
+   * returns success from the IN-MEMORY snapshot and fires the DB star deduction
+   * fire-and-forget, rolling back in-memory only if it later fails — so a caller
+   * that grants an entitlement on the back of the charge (purchaseBattlePass) could
+   * hand out the entitlement for free when the DB row had fewer stars than the
+   * in-memory value (drift, e.g. right after a redeploy). This variant AWAITS the DB
+   * deduct and only commits the in-memory spend + returns success if it succeeded.
+   */
+  async purchaseThemeAtomic(playerId: string, themeId: string, cost: number): Promise<{ success: boolean; error?: string }> {
+    const progress = this.progressMap.get(playerId);
+    if (!progress) return { success: false, error: 'Player not found' };
+    if (progress.ownedThemes.includes(themeId)) return { success: false, error: 'Already owned' };
+    if (progress.stars < cost) return { success: false, error: 'Not enough stars' };
+    const dbUid = progress.userId;
+    if (typeof dbUid === 'number' && dbUid > 0) {
+      let ok = false;
+      try { ok = await dbDeductStars(dbUid, cost); } catch { ok = false; }
+      if (!ok) return { success: false, error: 'Not enough stars' };
     }
     progress.stars -= cost;
     progress.ownedThemes.push(themeId);

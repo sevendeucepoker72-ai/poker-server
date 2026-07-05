@@ -201,6 +201,15 @@ export class PokerTable extends EventEmitter {
   /** Persists until next hand starts - contains showdown results for display */
   public lastHandResult: LastHandResult | null = null;
 
+  /**
+   * True only when the hand reached a genuine CONTESTED showdown (>= 2 non-folded
+   * players tabled their hands). Reset each hand; set in determineWinners. Consumers
+   * (getGameStateForPlayer reveal, hand-history serialize) must NOT reveal hole cards
+   * for a hand won uncontested (everyone folds to one player) — that player never
+   * showed and their cards must stay hidden. 2026-07-05 audit fix.
+   */
+  public wentToShowdown: boolean = false;
+
   /** Action log for the current hand (for hand history) */
   public actionLog: ActionLogEntry[] = [];
 
@@ -528,6 +537,7 @@ export class PokerTable extends EventEmitter {
     this.lastRaiseAmount = this.config.bigBlind;
     this.lastAggressorSeat = -1;
     this.actionLog = [];
+    this.wentToShowdown = false; // set true only on a contested showdown (>= 2 tabled)
 
     // Capture starting chip counts for hand history
     this.startChips = new Map();
@@ -1749,6 +1759,9 @@ export class PokerTable extends EventEmitter {
         bestFiveCards: [],
       });
     } else {
+      // Contested showdown: >= 2 non-folded players table their hands. Only here
+      // are hole cards legitimately revealed to the table / hand history (2026-07-05).
+      this.wentToShowdown = true;
       // Evaluate all non-folded hands once and cache — reused for showdownHands,
       // awardPots evaluator, and winnerInfos to avoid triple evaluation per player.
       const handResultCache = new Map<number, HandResult>();
@@ -1935,7 +1948,10 @@ export class PokerTable extends EventEmitter {
           return {
             seatIndex: s.seatIndex,
             name: s.playerName,
-            holeCards: s.folded ? null : (s.holeCards.length > 0 ? [...s.holeCards] : null),
+            // 2026-07-05 audit fix: never expose hole cards for a hand won
+            // uncontested (no showdown) — the winner never showed. Only reveal
+            // non-folded hands when the hand actually reached a contested showdown.
+            holeCards: (s.folded || !this.wentToShowdown) ? null : (s.holeCards.length > 0 ? [...s.holeCards] : null),
             startChips: this.startChips.get(s.seatIndex) || 0,
             endChips: s.chipCount,
             actions: this.actionLog
