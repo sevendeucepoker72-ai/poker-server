@@ -374,6 +374,21 @@ export async function initDB(): Promise<void> {
   `).catch((e: any) => console.warn('[Auth] online_entry_codes:', e.message));
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_entry_codes_open ON online_entry_codes(created_at) WHERE redeemed_by IS NULL`).catch(() => {});
 
+  // Promotions — named, date-ranged campaigns that entry codes / qualifiers are
+  // scoped to. Previously client sessionStorage only (never shared, lost on tab
+  // close). Now server-persisted so all admins see the same promotions.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS online_promotions (
+      id          SERIAL PRIMARY KEY,
+      name        TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      start_date  TEXT,
+      end_date    TEXT,
+      created_by  INTEGER REFERENCES users(id),
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `).catch((e: any) => console.warn('[Auth] online_promotions:', e.message));
+
   console.log('[Auth] Persistence sweep DDL applied');
 
   // Seed admin accounts

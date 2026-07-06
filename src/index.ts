@@ -5401,6 +5401,60 @@ Give feedback in this JSON format:
     }
   });
 
+  // ── Promotions (server-persisted; was client sessionStorage only) ──
+  const emitPromotions = async (sock: Socket) => {
+    const { rows } = await getPool().query(
+      `SELECT id, name, description, start_date, end_date, created_at FROM online_promotions ORDER BY created_at DESC LIMIT 200`
+    );
+    sock.emit('adminPromotions', rows.map((r: any) => ({
+      id: r.id, name: r.name, description: r.description || '',
+      startDate: r.start_date || '', endDate: r.end_date || '',
+    })));
+  };
+
+  socket.on('getPromotions', async () => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    try { await emitPromotions(socket); } catch { socket.emit('adminPromotions', []); }
+  });
+
+  socket.on('savePromotion', async (data: { id?: number | string; name: string; description?: string; startDate?: string; endDate?: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const name = String(data?.name || '').trim();
+    if (!name) { socket.emit('error', { message: 'Promotion name required' }); return; }
+    try {
+      const numericId = typeof data.id === 'number' ? data.id : parseInt(String(data.id || ''), 10);
+      if (Number.isFinite(numericId) && numericId > 0) {
+        await getPool().query(
+          `UPDATE online_promotions SET name=$1, description=$2, start_date=$3, end_date=$4 WHERE id=$5`,
+          [name, data.description || '', data.startDate || null, data.endDate || null, numericId]
+        );
+      } else {
+        await getPool().query(
+          `INSERT INTO online_promotions (name, description, start_date, end_date, created_by) VALUES ($1,$2,$3,$4,$5)`,
+          [name, data.description || '', data.startDate || null, data.endDate || null, auth.userId]
+        );
+      }
+      auditLog(auth.username, 'ADMIN_SAVE_PROMOTION', { name });
+      await emitPromotions(socket);
+    } catch (err: any) {
+      console.error('[savePromotion]', err);
+      socket.emit('error', { message: 'Failed to save promotion' });
+    }
+  });
+
+  socket.on('deletePromotion', async (data: { id: number | string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    try {
+      const numericId = typeof data.id === 'number' ? data.id : parseInt(String(data.id || ''), 10);
+      await getPool().query(`DELETE FROM online_promotions WHERE id = $1`, [numericId]);
+      auditLog(auth.username, 'ADMIN_DELETE_PROMOTION', { id: data?.id });
+      await emitPromotions(socket);
+    } catch { socket.emit('error', { message: 'Failed to delete promotion' }); }
+  });
+
   // Player: redeem a promo entry code → a qualifier credit on the master.
   socket.on('redeemEntryCode', async (data: { code: string }) => {
     const auth = authSessions.get(socket.id);
