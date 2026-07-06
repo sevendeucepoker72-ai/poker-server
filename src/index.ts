@@ -702,6 +702,16 @@ const authSessions = new Map<string, { userId: number; username: string; masterU
 const bannedIPs = new Set<string>();
 let maintenanceMode = false;
 
+// Live activity ticker — a rolling buffer of REAL recent events (big pot wins,
+// tournament finishes) broadcast to the lobby, replacing the fabricated ticker.
+const recentActivity: string[] = [];
+function pushActivity(text: string): void {
+  if (!text) return;
+  recentActivity.unshift(text);
+  if (recentActivity.length > 15) recentActivity.length = 15;
+  io.emit('activityFeed', recentActivity.slice());
+}
+
 // Maintenance gate. When an admin enables maintenance mode, block NEW game
 // joins/starts (in-progress hands finish naturally — we never yank a player out
 // of a live hand). Returns true and notifies the client when the action should
@@ -3173,6 +3183,16 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       progressionManager.recordHandWon(session.playerId, potSize, handRank, wasAllIn);
       progressionManager.recordPositionResult(session.playerId, posCategory, true);
 
+      // Live activity ticker: surface notable real wins (big pots, rare hands).
+      const winnerName = seat?.playerName || session.playerName;
+      if (winnerName && potSize >= 10000) {
+        pushActivity(`🏆 ${winnerName} won ${potSize.toLocaleString()} chips`);
+      } else if (winnerName && handRank === HandRank.RoyalFlush) {
+        pushActivity(`👑 ${winnerName} hit a ROYAL FLUSH!`);
+      } else if (winnerName && handRank === HandRank.StraightFlush) {
+        pushActivity(`🃏 ${winnerName} hit a straight flush!`);
+      }
+
       // Check for royal flush achievement
       if (handRank === HandRank.RoyalFlush) {
         progressionManager.recordRoyalFlush(session.playerId);
@@ -3612,6 +3632,7 @@ io.on('connection', (socket: Socket) => {
   ipSockets.add(socket.id);
   // Let a late-joining client show the maintenance banner if it's on.
   if (maintenanceMode) socket.emit('maintenanceMode', { enabled: true });
+  if (recentActivity.length) socket.emit('activityFeed', recentActivity.slice());
 
   // #12 (2026-07-01 audit): per-socket rate limit for the quick-play create
   // handlers (quickHeadsUp / quickSpinGo / quickAllInOrFold / startCareerGame).
@@ -11032,6 +11053,10 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
   for (const r of data?.results || []) {
     if (r.playerId) progressionManager.recordTournamentResult(r.playerId, r.position);
   }
+
+  // Live activity ticker: announce the tournament winner (real human only).
+  const champ = (data?.results || []).find((r) => r.position === 1 && r.userId !== undefined);
+  if (champ?.playerName) pushActivity(`♠ ${champ.playerName} won a tournament!`);
 
   for (const r of data?.results || []) {
     if (r.userId === undefined || !(r.payout > 0)) continue;

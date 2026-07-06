@@ -685,6 +685,12 @@ export class ProgressionManager {
     if (xpBooster && xpBooster.expiresAt > Date.now()) {
       amount = Math.round(amount * (xpBooster.mult || 1));
     }
+    // Apply the VIP loyalty tier XP-rate perk (Silver 1.5x / Gold 2x / Platinum
+    // 3x), computed from the player's cumulative season XP BEFORE this gain so it
+    // matches the tier the client's VIPPanel displays. This was an advertised
+    // perk that did nothing. Stacks with the consumable XP booster above.
+    const vipRate = this.vipXpRate(progress);
+    if (vipRate > 1) amount = Math.round(amount * vipRate);
     progress.xp += amount;
 
     // Accumulate the level-up reward across all levels crossed in this call,
@@ -1484,6 +1490,19 @@ export class ProgressionManager {
       total += req;
     }
     return total;
+  }
+
+  /**
+   * VIP loyalty tier XP-rate multiplier by cumulative season XP. Thresholds
+   * MIRROR the client VIPPanel (Bronze <1k = 1x, Silver 1k = 1.5x, Gold 5k = 2x,
+   * Platinum 20k = 3x) so the perk matches the tier the player is shown.
+   */
+  private vipXpRate(progress: PlayerProgress): number {
+    const total = this.seasonXpFor(progress);
+    if (total >= 20000) return 3;
+    if (total >= 5000) return 2;
+    if (total >= 1000) return 1.5;
+    return 1;
   }
 
   getSeasonXp(playerId: string): number {
