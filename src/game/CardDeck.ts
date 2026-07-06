@@ -75,6 +75,17 @@ export class CardDeck {
     return this.cards.length - this.currentIndex;
   }
 
+  // Read/restore the deal pointer. Used by rabbit hunt to simulate the
+  // remaining board off the committed deck order and then rewind, leaving the
+  // deck untouched (the hand is already over, but this keeps it side-effect free).
+  getDealIndex(): number {
+    return this.currentIndex;
+  }
+
+  setDealIndex(i: number): void {
+    this.currentIndex = Math.max(0, Math.min(i, this.cards.length));
+  }
+
   get commitment(): DeckCommitment | null {
     return this._commitment;
   }

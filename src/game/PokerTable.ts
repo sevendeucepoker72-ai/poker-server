@@ -956,6 +956,38 @@ export class PokerTable extends EventEmitter {
     }
   }
 
+  /**
+   * Rabbit hunt: reveal the community cards that WOULD have come had the hand
+   * played to the river, when it ended early (everyone folded pre-river). Deals
+   * the remaining streets off the committed deck order using the SAME burn rule
+   * as dealCommunityCards, then rewinds the deal pointer so the deck is left
+   * untouched. Returns [] for non-community games or an already-complete board.
+   * MUST only be called after the hand is over — revealing mid-hand would leak
+   * future board cards to players still in the pot.
+   */
+  computeRabbitBoard(): Card[] {
+    if (!this.usesCommunityCards()) return [];
+    if (this.communityCards.length >= 5) return [];
+
+    const savedIndex = this.deck.getDealIndex();
+    const board: Card[] = [];
+    const dealStreet = (count: number) => {
+      if (this.deck.cardsRemaining() > count) this.deck.dealOne(); // burn (same condition)
+      for (let i = 0; i < count; i++) {
+        const c = this.deck.dealOne();
+        if (c) board.push(c);
+      }
+    };
+
+    let have = this.communityCards.length;
+    if (have < 3) { dealStreet(3); have = 3; } // flop
+    if (have < 4) { dealStreet(1); have = 4; } // turn
+    if (have < 5) { dealStreet(1); }           // river
+
+    this.deck.setDealIndex(savedIndex); // rewind — non-mutating
+    return board;
+  }
+
   protected setFirstActivePlayer(): void {
     const activePlayers = this.getActivePlayerSeats();
     const isHeadsUp = activePlayers.length === 2;

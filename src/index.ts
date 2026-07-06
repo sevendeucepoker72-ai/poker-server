@@ -700,6 +700,19 @@ const authSessions = new Map<string, { userId: number; username: string; masterU
 const bannedIPs = new Set<string>();
 let maintenanceMode = false;
 
+// Maintenance gate. When an admin enables maintenance mode, block NEW game
+// joins/starts (in-progress hands finish naturally — we never yank a player out
+// of a live hand). Returns true and notifies the client when the action should
+// be blocked. Kept synchronous + free of the async admin check so it can guard
+// hot game-entry handlers cheaply; an admin who needs to test simply turns
+// maintenance back off from the admin app.
+function blockedByMaintenance(socket: Socket): boolean {
+  if (!maintenanceMode) return false;
+  socket.emit('maintenanceMode', { enabled: true });
+  socket.emit('error', { message: 'The server is under maintenance. New games are paused — please try again shortly.' });
+  return true;
+}
+
 // Resolve the REAL client IP. Railway (and most PaaS) put an edge proxy in
 // front, so socket.handshake.address is the proxy hop, not the client — an IP
 // ban on that would be ineffective or over-broad (banning a shared upstream
@@ -5978,6 +5991,7 @@ Give feedback in this JSON format:
       avatar?: string;
       expectedVariant?: string;
     }) => { (async () => {
+      if (blockedByMaintenance(socket)) return;
       let { tableId, playerName, seatIndex, buyIn } = data;
       const table = tableManager.getTable(tableId);
 
@@ -6213,6 +6227,7 @@ Give feedback in this JSON format:
   socket.on(
     'quickPlay',
     (data: { playerName: string; avatar?: string }) => { (async () => {
+      if (blockedByMaintenance(socket)) return;
       const { playerName } = data;
 
       // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
@@ -8682,6 +8697,7 @@ Give feedback in this JSON format:
   // Heads-Up Snap: 2 players, 5-minute fast game
   socket.on('quickHeadsUp', async (data: { playerName: string }) => {
     if (quickPlayRateLimited()) return; // #12
+    if (blockedByMaintenance(socket)) return;
     const { playerName } = data;
 
     // Leave existing table if any
@@ -8802,6 +8818,7 @@ Give feedback in this JSON format:
   // Spin & Go: 3 players, random prize multiplier
   socket.on('quickSpinGo', async (data: { playerName: string }) => {
     if (quickPlayRateLimited()) return; // #12
+    if (blockedByMaintenance(socket)) return;
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -8943,6 +8960,7 @@ Give feedback in this JSON format:
   // All-In or Fold
   socket.on('quickAllInOrFold', async (data: { playerName: string }) => {
     if (quickPlayRateLimited()) return; // #12
+    if (blockedByMaintenance(socket)) return;
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -9024,6 +9042,7 @@ Give feedback in this JSON format:
 
   socket.on('startCareerGame', async (data: { venue: number; stage: number }) => {
     if (quickPlayRateLimited()) return; // #12
+    if (blockedByMaintenance(socket)) return;
     const { venue, stage } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -9284,6 +9303,25 @@ Give feedback in this JSON format:
     socket.emit('detailedStats', stats);
   });
 
+  // ========== Rabbit Hunt ==========
+  // Reveal the board that WOULD have come when a hand ends before the river.
+  // The client (GameHUD) shows this after the player folds. Gated to
+  // HandComplete ONLY — revealing while the hand is live would leak future
+  // community cards to players still in the pot. Reads the committed deck order
+  // and rewinds, so it's side-effect free and consistent with the fairness reveal.
+  socket.on('rabbitHunt', () => {
+    const session = playerSessions.get(socket.id);
+    if (!session) return;
+    const table = tableManager.getTable(session.tableId);
+    if (!table) return;
+    if (table.currentPhase !== GamePhase.HandComplete) return;
+    const board = table.computeRabbitBoard();
+    if (!board.length) return;
+    socket.emit('rabbitHuntResult', {
+      cards: board.map((c) => ({ suit: c.suit, rank: c.rank, display: cardToString(c) })),
+    });
+  });
+
   // Batch 5d: real player profile by username. PlayerProfile.jsx emitted
   // requestProfile but there was no handler, so viewing another player's
   // profile hung on "Loading…" (or showed a fabricated buildMockProfile).
@@ -9341,6 +9379,7 @@ Give feedback in this JSON format:
   });
 
   socket.on('registerTournament', async (data: { tournamentId: string; playerName: string }) => {
+    if (blockedByMaintenance(socket)) return;
     const session = playerSessions.get(socket.id);
     const playerId = session?.playerId || `player-${uuidv4()}`;
     const playerName = data.playerName || session?.playerName || 'Player';
