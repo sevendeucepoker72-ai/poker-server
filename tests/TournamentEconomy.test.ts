@@ -110,6 +110,34 @@ describe('Tournament economy — funded, mint-free prize pool', () => {
       jest.useRealTimers();
     }
   });
+
+  // 2026-07-05 product decision: FREEROLLS (buyIn 0) are house-sponsored and pay
+  // the advertised prizePool (previously $0 because nothing funded them). Buy-in
+  // events are unaffected (still pay the funded pool — see tests above).
+  test('freeroll (buyIn 0) pays the advertised prizePool to a human winner, house-funded', () => {
+    jest.useFakeTimers();
+    try {
+      const tm = new TournamentManager();
+      const id = tm.createTournament(makeTemplate({ buyIn: 0, prizePool: 1000 }));
+      tm.registerPlayer(id, 'human', 'Solo', 's1', 999); // human, no fee (freeroll)
+      tm.registerPlayer(id, 'ai1', 'Bot1', 's2');
+      tm.registerPlayer(id, 'ai2', 'Bot2', 's3');
+      expect(tm.getTournament(id)!.collectedEntryFees).toBe(0); // freeroll collects nothing
+
+      let results: any[] = [];
+      tm.onEvent(id, (event, data) => { if (event === 'tournamentFinished') results = data.results; });
+      tm.startTournament(id);
+      tm.eliminatePlayer(id, 'ai1');
+      tm.eliminatePlayer(id, 'ai2'); // human survives → 1st
+
+      const humanPayout = results.find((r) => r.userId === 999)?.payout || 0;
+      // 1st = 50% of the advertised 1,000 pool = 500, house-funded despite $0 collected.
+      expect(humanPayout).toBe(500);
+    } finally {
+      jest.clearAllTimers();
+      jest.useRealTimers();
+    }
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────

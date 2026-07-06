@@ -226,11 +226,17 @@ export class TournamentManager {
     for (const [id, t] of this.tournaments) {
       if (t.status === 'cancelled') continue; // don't surface cancelled tournaments
       const currentBlinds = t.config.blindLevels[t.currentBlindLevel] || t.config.blindLevels[0];
+      const isFreeroll = (t.config.buyIn || 0) === 0;
       list.push({
         tournamentId: id,
         name: t.config.name,
         buyIn: t.config.buyIn,
         prizePool: t.config.prizePool,
+        // What will ACTUALLY be paid: freerolls are house-funded to the
+        // advertised pool; buy-in events pay the collected entry fees (grows as
+        // players register). Lets the client show the real, honest prize pool.
+        fundedPool: isFreeroll ? (t.config.prizePool || 0) : t.collectedEntryFees,
+        isFreeroll,
         maxPlayers: t.config.maxPlayers,
         registeredPlayers: t.players.length,
         status: t.status,
@@ -491,13 +497,19 @@ export class TournamentManager {
       alivePlayers[0].finishPosition = 1;
     }
 
-    // 2026-06-11 tournament economy: pay out the FUNDED pool (collected entry
-    // fees), NOT the advertised template prizePool. 50/30/20 sums to 100%, so
-    // Σpayouts ≤ collected (floor rounding leaves a few chips unclaimed — a
-    // tiny sink, never a mint). index.ts credits only results that carry a
-    // userId (paying humans); payout shares landing on AI / unpaid finishers
-    // are simply not credited (additional sink), preserving the invariant.
-    const prizePool = tournament.collectedEntryFees;
+    // Tournament economy (product decision 2026-07-05):
+    //  • FREEROLLS (buyIn 0) are HOUSE-SPONSORED — pay the advertised prizePool.
+    //    Previously they collected $0 in fees and therefore paid $0, so an
+    //    advertised "1,000 chip freeroll" was a lie. The house now funds it: an
+    //    intentional, audited play-money mint. Only human (userId) winners are
+    //    credited in index.ts, so an all-AI freeroll mints nothing.
+    //  • BUY-IN events still pay the FUNDED pool (collected entry fees), so a
+    //    large advertised guarantee on an under-subscribed event can't trigger a
+    //    runaway house mint. Σpayouts ≤ collected for these — mint-free.
+    const isFreeroll = (tournament.config.buyIn || 0) === 0;
+    const prizePool = isFreeroll
+      ? (tournament.config.prizePool || 0)
+      : tournament.collectedEntryFees;
     const payouts: Record<number, number> = {
       1: Math.floor(prizePool * 0.50),
       2: Math.floor(prizePool * 0.30),
