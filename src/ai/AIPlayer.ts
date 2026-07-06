@@ -1027,6 +1027,23 @@ function postFlopStrategy(
   const isRiver = table.currentPhase === GamePhase.River;
   const params = ARCHETYPE_PARAMS[profile.archetype];
 
+  // ── AI intelligence upgrade: opponent-aware + multi-way bluff frequency ──
+  // Bluffing into more players is -EV, and into sticky (station/fish/maniac)
+  // pools it gets called down; foldy (nit/tag) pools can be attacked more. This
+  // is a graceful no-op until there's real data: with a single unknown opponent
+  // (mwAdj 1.0, oppBluffMult 1.0) effectiveBluffFreq === profile.bluffFrequency,
+  // so early play is unchanged. categorizeOpponent needs 10+ observed hands, fed
+  // by the session opponent model (recordOpponentObservation, index.ts).
+  const _mwAdj = getMultiWayAdjustment(numOpponents);
+  let _stickies = 0, _foldies = 0;
+  for (const _n of getActiveOpponentNames(table, seat.seatIndex)) {
+    const _c = categorizeOpponent(_n);
+    if (_c === 'station' || _c === 'fish' || _c === 'maniac') _stickies++;
+    else if (_c === 'nit' || _c === 'tag') _foldies++;
+  }
+  const _oppBluffMult = _stickies > _foldies ? 0.6 : (_foldies > _stickies ? 1.15 : 1.0);
+  const effectiveBluffFreq = Math.min(0.5, profile.bluffFrequency * _mwAdj.cbetMult * _oppBluffMult);
+
   // ============================================================
   // ARCHETYPE-SPECIFIC POSTFLOP BRANCHES
   // ============================================================
@@ -1190,8 +1207,8 @@ function postFlopStrategy(
       return { action: PlayerAction.Check, raiseAmount: 0 };
     }
 
-    // Weak hand: check or bluff
-    if (Math.random() < profile.bluffFrequency) {
+    // Weak hand: check or bluff (opponent- + multi-way-aware frequency)
+    if (Math.random() < effectiveBluffFreq) {
       // Semi-bluff with draws
       if (outs >= 8) {
         const betSize = getGTOBetSize(
@@ -1282,8 +1299,8 @@ function postFlopStrategy(
     return { action: PlayerAction.Call, raiseAmount: 0 };
   }
 
-  // Bluff-raise (expert level, balanced frequency)
-  if (profile.difficulty === 'expert' && Math.random() < profile.bluffFrequency * 0.4) {
+  // Bluff-raise (expert level, balanced frequency — opponent/multi-way-aware)
+  if (profile.difficulty === 'expert' && Math.random() < effectiveBluffFreq * 0.4) {
     // Only bluff-raise on certain board textures
     if (board.hasHighCards || board.isPaired) {
       const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.65));

@@ -38,6 +38,7 @@ import {
   decideAction,
   getThinkingDelay,
   Difficulty,
+  recordOpponentObservation,
 } from './ai/AIPlayer';
 import { ProgressionManager } from './progression/ProgressionManager';
 import { HandRank } from './game/HandEvaluator';
@@ -1975,6 +1976,30 @@ async function settlePredictionsForHand(
 function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   if (tableProgressListeners.has(tableId)) return;
   tableProgressListeners.add(tableId);
+
+  // AI opponent-modeling feed (2026-07-05): populate the session-level opponent
+  // profiles that the AI's adaptive-play upgrades consume (categorizeOpponent →
+  // balanced bluffing / thin value). Pure data collection — no behavior change
+  // on its own. Per-hand dedup so a player acting twice preflop counts VPIP/PFR
+  // once. Blinds post outside 'playerAction', so a preflop call/raise here is a
+  // genuinely voluntary action.
+  const obsVpip = new Set<string>();
+  const obsPfr = new Set<string>();
+  let obsHand = -1;
+  table.on('playerAction', (d: { seatIndex: number; action: PlayerAction; amount?: number }) => {
+    const s = table.seats[d.seatIndex];
+    if (!s || !s.playerName) return;
+    const hn = table.handNumber;
+    if (hn !== obsHand) { obsHand = hn; obsVpip.clear(); obsPfr.clear(); }
+    recordOpponentObservation(s.playerName, 'hand_start', { handNumber: hn });
+    if (table.currentPhase === GamePhase.PreFlop) {
+      const a = d.action;
+      const voluntary = a === PlayerAction.Call || a === PlayerAction.Raise || a === PlayerAction.AllIn;
+      const aggressive = a === PlayerAction.Raise || a === PlayerAction.AllIn;
+      if (voluntary && !obsVpip.has(s.playerName)) { obsVpip.add(s.playerName); recordOpponentObservation(s.playerName, 'vpip'); }
+      if (aggressive && !obsPfr.has(s.playerName)) { obsPfr.add(s.playerName); recordOpponentObservation(s.playerName, 'pfr'); }
+    }
+  });
 
   table.on('handResult', async (data: { results: any[]; handNumber: number }) => {
     incrementHandsPlayed();
