@@ -71,6 +71,13 @@ See `src/index.ts`. Key events:
 | `LOG_LEVEL` | Optional (default `info` prod) | Pino level |
 | `ADMIN_PASSWORD` | Required | per SITES.md Railway env |
 | `ADMIN_PHONE` | Required | per SITES.md Railway env |
+| `OAUTH_CLIENT_SECRET` | **Required in prod** (boot-throws if missing) | Basic-auth secret for auth-server `/token/introspection` — validates EVERY .online OAuth login (`src/auth/oauthValidator.ts`). MUST equal GCP SM `poker-prod-poker-server-client-secret`; rotate ONLY via `rotate-poker-server-secret.sh` at workspace root. Wrong-but-present value = green deploy, all logins 401 — caught by the boot/30-min preflight (`/api/health` → `authClient`) since 2026-07-06 |
+| `OAUTH_CLIENT_ID` | Optional (default `poker-server`) | Introspection client id |
+| `AUTH_SERVER_URL` | Optional (default `https://auth.americanpubpoker.online`) | Introspection base URL |
+| `AUTH_SERVER_BYPASS_KEY` | **Required in prod** (silent degradation if missing) | Sent as `X-Auth-Server-Key` on unauth master-API `/users/:id/me` fetches (ticket login, waitlist) AND gates `reportAuthEvent` auth-health telemetry — unset means telemetry is a silent no-op and those fetches break under `REQUIRE_AUTH_ENFORCE=1`. = master API's value |
+| `MASTER_API_URL` | Optional (default prod Cloud Run URL) | Master API base for user fetches + auth-event reporting |
+| `JWT_SECRET` | Required for legacy HS256 login | If unset in prod, legacy HS256 token auth is DISABLED (forgery guard, `src/auth/authManager.ts:19-28`) — OAuth login unaffected |
+| `SENTRY_DSN` | Optional | Exception capture |
 
 ## Deploy pre-flight
 

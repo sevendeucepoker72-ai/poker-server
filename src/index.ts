@@ -51,7 +51,7 @@ import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
 import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP } from './auth/authManager';
-import { validateOAuthToken } from './auth/oauthValidator';
+import { validateOAuthToken, preflightIntrospection, getPreflightStatus } from './auth/oauthValidator';
 import { notifyPlayer } from './notifyClient';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
 // being migrated to log.debug so they mute under production pino level
@@ -909,7 +909,13 @@ app.get('/api/health', async (_req, res) => {
       setTimeout(() => rej(new Error('healthcheck timeout')), 1500),
     );
     await Promise.race([Promise.all([tDb, tRedis]), timeout]);
-    res.json({ status: 'ok', tables: tableManager.getTableList().length });
+    // 2026-07-06 P1 — authClient surfaces the last introspection-credential
+    // preflight (ok | invalid_client | unreachable | unchecked | http_NNN) so
+    // secret drift is externally verifiable with a curl — Railway env isn't
+    // readable from the dev box. Informational only: a red credential must NOT
+    // 503 this endpoint (the process is healthy; tables keep serving — only
+    // new OAuth logins are affected).
+    res.json({ status: 'ok', tables: tableManager.getTableList().length, authClient: getPreflightStatus() });
   } catch (e: any) {
     res.status(503).json({ status: 'unhealthy', error: e?.message || String(e) });
   }
@@ -4560,6 +4566,16 @@ Give feedback in this JSON format:
     try {
       const oauthResult = await validateOAuthToken(data.accessToken);
       if (!oauthResult.valid || !oauthResult.sub) {
+        // 2026-07-06 P1 — a 401 from introspection is OUR credential breaking
+        // (secret drift), not the user's token. Report it as client_auth_failed
+        // (detail shape matches the auth-server's introspection.error rows so the
+        // master API's clientAuthFailures detector aggregates both sides) in
+        // ADDITION to the generic introspection_failed signal.
+        if (oauthResult.clientAuthFailed) {
+          reportAuthEvent('client_auth_failed', {
+            client_id: 'poker-server', error: 'invalid_client', endpoint: 'introspection', via: 'oauthLogin',
+          });
+        }
         reportAuthEvent('introspection_failed', { error: oauthResult.error || 'invalid', via: 'oauthLogin' });
         socket.emit('loginResult', { success: false, error: oauthResult.error || 'Invalid token' });
         return;
@@ -4749,6 +4765,19 @@ Give feedback in this JSON format:
 
     // Try OAuth2 RS256 token first, then fall back to legacy HS256 JWT
     const oauthResult = await validateOAuthToken(data.token);
+    // 2026-07-06 P1 — tokenLogin used to mask ALL introspection failures as
+    // generic legacy-token fallthrough, so a fleet-wide credential break
+    // (secret drift) had ZERO attributable telemetry on this path. Report
+    // HTTP-level failures (401 = our creds, 5xx = auth-server broken); a
+    // plain inactive/expired token stays silent — that's the normal legacy
+    // fallback and not an incident.
+    if (oauthResult.clientAuthFailed) {
+      reportAuthEvent('client_auth_failed', {
+        client_id: 'poker-server', error: 'invalid_client', endpoint: 'introspection', via: 'tokenLogin',
+      });
+    } else if (oauthResult.status && oauthResult.status >= 500) {
+      reportAuthEvent('introspection_failed', { error: oauthResult.error || 'invalid', via: 'tokenLogin' });
+    }
     if (oauthResult.valid && oauthResult.sub) {
       // H2 fix (2026-07-01 audit): resolve the LOCAL user by phone/username
       // (upsert), NOT parseInt(sub). The OAuth `sub` is the MASTER users.id (a
@@ -11719,6 +11748,48 @@ httpServer.listen(PORT, async () => {
       `  - ${table.tableName} (${table.smallBlind}/${table.bigBlind} blinds, min buy-in: ${table.minBuyIn})`
     );
   }
+
+  // 2026-07-06 P1 — credential pre-flight + drift watch. A present-but-WRONG
+  // OAUTH_CLIENT_SECRET used to ship a green deploy that 401'd every .online
+  // login until users complained. Now: one live introspection round-trip at
+  // boot (the only trustworthy equality oracle — 200 = secrets match, 401 =
+  // drift) and a re-check every 30 min (catches the OTHER side rotating while
+  // we're running). Non-fatal by design: red creds must not crash-loop the
+  // process. State transitions are logged + reported to auth-health
+  // (client_auth_failed feeds the master API's clientAuthFailures pager).
+  if (!process.env.AUTH_SERVER_BYPASS_KEY) {
+    console.warn(
+      '[preflight] AUTH_SERVER_BYPASS_KEY is NOT set — auth-health telemetry (reportAuthEvent) is a ' +
+        'silent no-op AND unauth /users/:id/me fetches (ticket login, waitlist) go out without ' +
+        'X-Auth-Server-Key. Set it on Railway to the master API value.'
+    );
+  }
+  let lastPreflightStatus: string | null = null;
+  const runCredentialPreflight = async (stage: string) => {
+    try {
+      const { ok, status } = await preflightIntrospection();
+      if (ok) {
+        if (lastPreflightStatus !== 'ok') {
+          console.log(`[preflight] auth-server introspection credentials OK (${stage})`);
+        }
+      } else if (status === 'invalid_client') {
+        console.error(
+          `[preflight] CREDENTIAL DRIFT (${stage}): auth-server rejected our client secret (401 invalid_client). ` +
+            'ALL .online OAuth logins are failing. Sync Railway OAUTH_CLIENT_SECRET with GCP secret ' +
+            'poker-prod-poker-server-client-secret (rotate-poker-server-secret.sh).'
+        );
+        reportAuthEvent('client_auth_failed', {
+          client_id: 'poker-server', error: 'invalid_client', endpoint: 'introspection', via: `preflight_${stage}`,
+        });
+      } else if (lastPreflightStatus !== status) {
+        // unreachable / http_5xx — transient auth-server trouble, not drift.
+        console.warn(`[preflight] introspection preflight ${status} (${stage}) — auth-server degraded or unreachable`);
+      }
+      lastPreflightStatus = status;
+    } catch { /* preflight must never affect boot */ }
+  };
+  runCredentialPreflight('boot');
+  setInterval(() => runCredentialPreflight('interval'), 30 * 60 * 1000).unref();
 
   // Hand-state persistence: connect to Redis, then rehydrate any
   // in-progress hands left over from the previous process. Without
