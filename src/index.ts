@@ -9492,6 +9492,20 @@ Give feedback in this JSON format:
     socket.emit('insuranceAccepted', { cashout, equityPct: Math.round(equity * 100) });
   });
 
+  // ========== Straddle ==========
+  // UTG posts 2x the big blind as a live blind bet (retains the option). The
+  // engine validates it's a genuine first-action UTG straddle; we just relay it.
+  socket.on('straddle', () => {
+    const session = playerSessions.get(socket.id);
+    if (!session) return;
+    const table = tableManager.getTable(session.tableId);
+    if (!table) return;
+    if (table.straddle(session.seatIndex)) {
+      broadcastGameState(session.tableId);
+      scheduleAIAction(session.tableId);
+    }
+  });
+
   // Batch 5d: real player profile by username. PlayerProfile.jsx emitted
   // requestProfile but there was no handler, so viewing another player's
   // profile hung on "Loading…" (or showed a fabricated buildMockProfile).

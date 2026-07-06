@@ -807,3 +807,42 @@ describe('wentToShowdown — no hole-card leak on uncontested wins (2026-07-05)'
     expect(t.wentToShowdown).toBe(true); // 2 players tabled their hands
   });
 });
+
+// UTG straddle (2026-07-05 completeness build). Straddle = the first-to-act
+// preflop player posts 2x BB as a live blind and RETAINS the option.
+describe('UTG straddle', () => {
+  test('posts 2x BB, moves action off the straddler, and retains the option', () => {
+    const table = makeTable();
+    seatPlayers(table, 4);
+    table.startNewHand();
+    expect(table.currentPhase).toBe(GamePhase.PreFlop);
+    const bb = table.config.bigBlind;
+    expect(table.currentBetToMatch).toBe(bb);
+    const utg = table.activeSeatIndex;
+
+    expect(table.straddle(utg)).toBe(true);
+    expect(table.currentBetToMatch).toBe(2 * bb);
+    expect(table.seats[utg].currentBet).toBe(2 * bb);
+    expect(table.activeSeatIndex).not.toBe(utg);            // action moved left of straddler
+    expect(table.seats[utg].hasActedSinceLastFullRaise).toBe(false); // option retained
+
+    // Everyone else calls the straddle — action must come BACK to the straddler
+    // for their option (the straddle is the new effective big blind).
+    let guard = 0;
+    while (table.activeSeatIndex !== utg && table.currentPhase === GamePhase.PreFlop && guard++ < 12) {
+      table.playerCall(table.activeSeatIndex);
+    }
+    expect(table.currentPhase).toBe(GamePhase.PreFlop);
+    expect(table.activeSeatIndex).toBe(utg);                // straddler gets the last say
+  });
+
+  test('rejected once anyone has acted (only a genuine first-action UTG straddle)', () => {
+    const table = makeTable();
+    seatPlayers(table, 4);
+    table.startNewHand();
+    const utg = table.activeSeatIndex;
+    expect(table.playerCall(utg)).toBe(true);               // UTG limps
+    const next = table.activeSeatIndex;
+    expect(table.straddle(next)).toBe(false);               // not a straddle position
+  });
+});

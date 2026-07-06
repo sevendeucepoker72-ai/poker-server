@@ -1261,6 +1261,41 @@ export class PokerTable extends EventEmitter {
   }
 
   /**
+   * UTG straddle: the first player to act preflop posts 2x the big blind as a
+   * live "blind" bet. Mechanically it's a raise to 2xBB that — UNLIKE a normal
+   * raise — retains the straddler's option to act again when the action returns
+   * (the straddle becomes the new effective big blind, so the straddler has the
+   * last say preflop). Must be the very first voluntary action of the hand
+   * (no prior action, bet-to-match still the BB) so it's a genuine UTG straddle,
+   * not a mid-street 2xBB open. Reuses playerRaise for all the pot / all-in /
+   * turn-advance bookkeeping, then flips the option flag back on.
+   */
+  straddle(seatIndex: number): boolean {
+    if (this.currentPhase !== GamePhase.PreFlop) return false;
+    if (this.activeSeatIndex !== seatIndex) return false;
+    if (this.currentBetToMatch !== this.config.bigBlind) return false;
+    // Straddle must be the FIRST voluntary action of the hand (blinds are not
+    // logged to actionLog, so an empty preflop log == nobody has acted yet).
+    if (this.actionLog.some(a => a.street === this.currentPhase)) return false;
+    const seat = this.seats[seatIndex];
+    if (!seat || seat.state !== 'occupied' || seat.folded || seat.allIn) return false;
+    const straddleAmount = 2 * this.config.bigBlind;
+    const additional = straddleAmount - seat.currentBet;
+    // Require the full straddle without going all-in (keep reopening semantics simple).
+    if (additional <= 0 || additional >= seat.chipCount) return false;
+
+    const ok = this.playerRaise(seatIndex, straddleAmount);
+    if (!ok) return false;
+
+    // The straddle's one difference from a normal raise: the straddler keeps
+    // their option, so owes() re-selects them when the action comes back around.
+    seat.hasActedSinceLastFullRaise = false;
+    const last = this.actionLog[this.actionLog.length - 1];
+    if (last && last.seatIndex === seatIndex) last.action = 'straddle';
+    return true;
+  }
+
+  /**
    * TDA Rule 41: An all-in that is less than a full raise does NOT
    * reopen betting action for players who have already acted.
    * Only a full raise (raiseSize >= lastRaiseAmount) resets action flags.
