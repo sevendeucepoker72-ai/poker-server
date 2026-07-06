@@ -9136,6 +9136,38 @@ Give feedback in this JSON format:
     // Mark as career table
     careerTables.set(tableId, { venue, stage });
 
+    // Career completion detection. The human sits at seat 0. The stage is WON
+    // when they are the last player standing (all AI busted), and LOST the
+    // moment they bust (no need to wait for the AI to finish among themselves).
+    // Mirrors the Spin&Go elimination listener. careerGameComplete drives the
+    // client's persisted career progress (previously nothing detected a win, so
+    // Career Mode progress never advanced).
+    let careerResolved = false;
+    table.on('handResult', () => {
+      setTimeout(() => {
+        if (careerResolved) return;
+        const t = tableManager.getTable(tableId);
+        if (!t) return;
+        const alive = t.seats.filter((s) => s.state === 'occupied' && s.chipCount > 0 && !s.eliminated);
+        const humanAlive = alive.some((s) => s.seatIndex === 0);
+        let done = false;
+        let won = false;
+        if (alive.length <= 1) {
+          done = true;
+          won = alive.length === 1 && alive[0].seatIndex === 0;
+        } else if (!humanAlive) {
+          // Human busted while AI keep playing — the stage is a loss for them.
+          done = true;
+          won = false;
+        }
+        if (done) {
+          careerResolved = true;
+          socket.emit('careerGameComplete', { venue, stage, won, stars: won ? 3 : 0 });
+          setTimeout(() => cleanupQuickTable(tableId), 5000);
+        }
+      }, 1000);
+    });
+
     table.startNewHand();
     broadcastGameState(tableId);
     sendProgressToPlayer(socket.id);
