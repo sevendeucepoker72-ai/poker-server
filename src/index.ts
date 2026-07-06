@@ -108,6 +108,7 @@ import {
   inviteToUnion,
   joinUnion,
   getUnionInfo,
+  getPendingUnionInvites,
   getMemberProfile,
   updateClubBadge,
   generateReferralCode,
@@ -6015,6 +6016,35 @@ Give feedback in this JSON format:
     if (!(await requireClubMember(data.clubId))) return;
     const result = await getUnionInfo(data.clubId);
     socket.emit('unionInfo', result);
+  });
+
+  // Union invite/join were fully implemented in clubManager but had no socket
+  // handlers, so a union could never grow past its leader club. Wire them up.
+  // The clubManager fns enforce leader-club + owner internally, so the auth
+  // check here is just "is signed in".
+  socket.on('inviteToUnion', async (data: { unionId: number; inviterClubId: number; targetClubId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
+    const result = await inviteToUnion(data.unionId, data.inviterClubId, data.targetClubId, auth.userId);
+    if (result.success) socket.emit('unionInviteSent', { targetClubId: data.targetClubId });
+    else socket.emit('error', { message: result.error });
+  });
+
+  socket.on('joinUnion', async (data: { unionId: number; clubId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
+    const result = await joinUnion(data.unionId, data.clubId, auth.userId);
+    if (result.success) {
+      // Immediately push the full alliance to the newly-joined club.
+      socket.emit('unionInfo', await getUnionInfo(data.clubId));
+    } else {
+      socket.emit('error', { message: result.error });
+    }
+  });
+
+  socket.on('getPendingUnionInvites', async (data: { clubId: number }) => {
+    if (!(await requireClubMember(data.clubId))) return;
+    socket.emit('pendingUnionInvites', await getPendingUnionInvites(data.clubId));
   });
 
   // ── Feature 12: Member Profiles ──

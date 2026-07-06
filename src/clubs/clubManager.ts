@@ -2059,6 +2059,32 @@ export async function getUnionInfo(
   };
 }
 
+/**
+ * Pending union invitations for a club (invitations it has received but not yet
+ * accepted). Powers the client "Pending Union Invitations" list. Column names
+ * fold to lowercase (quoteless camelCase), so read unionid / leaderclubname etc.
+ */
+export async function getPendingUnionInvites(
+  clubId: number
+): Promise<{ unionId: number; name: string; description: string; leaderClubId: number; leaderClubName: string }[]> {
+  const pool = getPool();
+  const rows = (await pool.query(
+    `SELECT um.unionId, cu.name, cu.description, cu.leaderClubId, lc.name AS leaderClubName
+       FROM union_members um
+       JOIN club_unions cu ON um.unionId = cu.id
+       JOIN clubs lc ON cu.leaderClubId = lc.id
+      WHERE um.clubId = $1 AND um.status = 'pending'`,
+    [clubId]
+  )).rows as any[];
+  return rows.map((r) => ({
+    unionId: r.unionid,
+    name: r.name,
+    description: r.description,
+    leaderClubId: r.leaderclubid,
+    leaderClubName: r.leaderclubname,
+  }));
+}
+
 // ═══════════════════════════════════════════
 // Feature 12: Member Profiles
 // ═══════════════════════════════════════════
