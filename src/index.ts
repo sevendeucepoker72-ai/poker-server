@@ -3222,6 +3222,10 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
               variantsPlayed: raw.variantsPlayed,
               vpipHands: raw.vpipHands,
               pfrHands: raw.pfrHands,
+              // Shop boosters + VIP pass — persist so they survive a restart
+              // instead of evaporating (they were in-memory only).
+              activeBoosters: raw.activeBoosters,
+              vipExpiresAt: raw.vipExpiresAt,
             } : undefined;
 
             await saveProgress(authSession.userId, {
@@ -6786,6 +6790,12 @@ Give feedback in this JSON format:
         const expiresAt = Date.now() + b.ms;
         (progress as any).activeBoosters = (progress as any).activeBoosters || {};
         (progress as any).activeBoosters[b.kind] = { mult: b.mult, expiresAt };
+        // Persist immediately so the booster survives a restart even if the
+        // player never plays a hand after buying it (JSONB-merge, gated).
+        if ((progress as any).hydrated) {
+          saveProgress(ctx.userId, { stats: { activeBoosters: (progress as any).activeBoosters } })
+            .catch((e) => console.warn(`[shop booster persist ${ctx.userId}]`, e?.message));
+        }
         socket.emit('purchaseResult', {
           success: true, itemType, itemId, cost,
           booster: { kind: b.kind, mult: b.mult, expiresAt },
@@ -6811,6 +6821,12 @@ Give feedback in this JSON format:
         const current = (progress as any).vipExpiresAt || 0;
         const base = Math.max(Date.now(), current);
         (progress as any).vipExpiresAt = base + ms;
+        // Persist immediately so the VIP pass survives a restart (was in-memory
+        // only, so it evaporated on every redeploy).
+        if ((progress as any).hydrated) {
+          saveProgress(ctx.userId, { stats: { vipExpiresAt: (progress as any).vipExpiresAt } })
+            .catch((e) => console.warn(`[shop vip persist ${ctx.userId}]`, e?.message));
+        }
         socket.emit('purchaseResult', {
           success: true, itemType, itemId, cost,
           vipExpiresAt: (progress as any).vipExpiresAt,

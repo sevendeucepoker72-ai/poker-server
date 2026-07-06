@@ -519,6 +519,17 @@ export class ProgressionManager {
           if (Array.isArray(s.variantsPlayed))         progress.variantsPlayed    = s.variantsPlayed;
           if (typeof s.vpipHands === 'number')         progress.vpipHands         = s.vpipHands;
           if (typeof s.pfrHands === 'number')          progress.pfrHands          = s.pfrHands;
+          // Restore shop boosters + VIP so they survive a restart (drop already-
+          // expired boosters so a stale one doesn't linger past its window).
+          if (s.activeBoosters && typeof s.activeBoosters === 'object') {
+            const now = Date.now();
+            const live: any = {};
+            for (const [k, v] of Object.entries(s.activeBoosters as any)) {
+              if (v && (v as any).expiresAt > now) live[k] = v;
+            }
+            (progress as any).activeBoosters = live;
+          }
+          if (typeof s.vipExpiresAt === 'number') (progress as any).vipExpiresAt = s.vipExpiresAt;
         }
       }
     } catch (e: any) {
@@ -646,6 +657,19 @@ export class ProgressionManager {
     this.pendingEvents.get(playerId)!.push(event);
   }
 
+  /**
+   * Active chip-booster multiplier, applied to chip REWARD grants only
+   * (daily bonus, missions, achievements, level-up). NEVER applied to pot
+   * winnings — that would mint chips and break table conservation. Rewards are
+   * already grants (mints), so boosting them is conservation-safe. The shop
+   * stores the booster on progress.activeBoosters.chip { mult, expiresAt }.
+   */
+  private boostChipReward(progress: PlayerProgress, amount: number): number {
+    const b = (progress as any).activeBoosters?.chip;
+    if (b && b.expiresAt > Date.now() && b.mult > 0) return Math.round(amount * b.mult);
+    return amount;
+  }
+
   addXP(playerId: string, amount: number): void {
     const progress = this.progressMap.get(playerId);
     if (!progress) return;
@@ -677,7 +701,7 @@ export class ProgressionManager {
       progress.xpToNextLevel = xpRequiredForLevel(progress.level);
 
       // Reward schedule: base per-level stars + milestone bonuses.
-      const baseChips = progress.level * 500;
+      const baseChips = this.boostChipReward(progress, progress.level * 500);
       const baseStars = progress.level * 5;
       const bonusStars = milestoneStarsBonus(progress.level);
       progress.chips += baseChips;
@@ -1230,7 +1254,7 @@ export class ProgressionManager {
     progress.lastDailyBonusClaimed = today;
 
     const streakIndex = Math.min(progress.dailyLoginStreak - 1, DAILY_BONUS_AMOUNTS.length - 1);
-    const bonusChips = DAILY_BONUS_AMOUNTS[streakIndex];
+    const bonusChips = this.boostChipReward(progress, DAILY_BONUS_AMOUNTS[streakIndex]);
     const bonusStars = progress.dailyLoginStreak * 5;
 
     progress.chips += bonusChips;
@@ -1520,6 +1544,10 @@ export class ProgressionManager {
       rankedWins: progress.rankedWins,
       rankedLosses: progress.rankedLosses,
       peakElo: progress.peakElo,
+      // Shop entitlements so the client can show real VIP status + active
+      // boosters (previously in-memory only and never sent to the client).
+      vipExpiresAt: (progress as any).vipExpiresAt || 0,
+      activeBoosters: (progress as any).activeBoosters || {},
     };
   }
 }
