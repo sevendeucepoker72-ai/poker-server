@@ -29,6 +29,11 @@ export interface PlayerProgress {
   actionCounts: Record<string, number>; // fold/check/call/raise/allin -> count
   chipHistory: number[]; // last 20 hand chip totals
   positionWins: Record<string, { wins: number; total: number }>; // early/middle/late/blind
+  // Real HUD stats — hands in which the player voluntarily put money in preflop
+  // (VPIP) and hands in which they raised preflop (PFR). Denominator is
+  // totalHandsPlayed. Aggression factor (AF) is derived from actionCounts.
+  vpipHands: number;
+  pfrHands: number;
 
   // Ranked system
   elo: number;          // ELO rating (starts at 500)

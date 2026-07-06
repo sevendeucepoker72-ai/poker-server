@@ -414,6 +414,8 @@ export class ProgressionManager {
       ownedTableThemes: ['default'],
       handsPerRank: {},
       actionCounts: { fold: 0, check: 0, call: 0, raise: 0, allin: 0 },
+      vpipHands: 0,
+      pfrHands: 0,
       chipHistory: [],
       positionWins: {
         early: { wins: 0, total: 0 },
@@ -515,6 +517,8 @@ export class ProgressionManager {
           if (typeof s.tournamentsWon === 'number')    progress.tournamentsWon    = s.tournamentsWon;
           if (typeof s.tournamentsPlayed === 'number') progress.tournamentsPlayed = s.tournamentsPlayed;
           if (Array.isArray(s.variantsPlayed))         progress.variantsPlayed    = s.variantsPlayed;
+          if (typeof s.vpipHands === 'number')         progress.vpipHands         = s.vpipHands;
+          if (typeof s.pfrHands === 'number')          progress.pfrHands          = s.pfrHands;
         }
       }
     } catch (e: any) {
@@ -718,6 +722,13 @@ export class ProgressionManager {
 
     progress.totalHandsPlayed++;
     (progress as any).lastHandAt = Date.now();
+
+    // Commit the per-hand VPIP/PFR flags set in recordAction, then reset them
+    // for the next hand. Denominator = totalHandsPlayed (just incremented).
+    if ((progress as any)._vpipThisHand) progress.vpipHands = (progress.vpipHands || 0) + 1;
+    if ((progress as any)._pfrThisHand) progress.pfrHands = (progress.pfrHands || 0) + 1;
+    (progress as any)._vpipThisHand = false;
+    (progress as any)._pfrThisHand = false;
 
     // Track variant breadth for lifetime "all_variants" + daily/weekly buckets.
     if (variantId && !progress.variantsPlayed.includes(variantId)) {
@@ -970,6 +981,17 @@ export class ProgressionManager {
     const progress = this.progressMap.get(playerId);
     if (!progress) return null;
 
+    // Derive HUD stats from the real tracked counters.
+    const th = progress.totalHandsPlayed || 0;
+    const ac = progress.actionCounts || {};
+    const passive = ac.call || 0;
+    const aggressive = (ac.raise || 0) + (ac.allin || 0);
+    const af = passive > 0
+      ? Number((aggressive / passive).toFixed(2))
+      : (aggressive > 0 ? 99 : 0);
+    const vpip = th > 0 ? Number((((progress.vpipHands || 0) / th) * 100).toFixed(1)) : 0;
+    const pfr = th > 0 ? Number((((progress.pfrHands || 0) / th) * 100).toFixed(1)) : 0;
+
     return {
       ...this.getClientProgress(playerId),
       handsPerRank: progress.handsPerRank,
@@ -982,6 +1004,12 @@ export class ProgressionManager {
       ownedThemes: progress.ownedThemes,
       bluffWins: progress.bluffWins,
       allInWins: progress.allInWins,
+      // Real HUD stats (VPIP/PFR as %, AF as ratio) computed from tracked data.
+      vpip,
+      pfr,
+      af,
+      vpipHands: progress.vpipHands || 0,
+      pfrHands: progress.pfrHands || 0,
     };
   }
 
@@ -997,6 +1025,19 @@ export class ProgressionManager {
     if (action === 'fold' || action === 'check' || action === 'call' || action === 'raise' || action === 'allIn') {
       const key = action === 'allIn' ? 'allin' : action;
       progress.actionCounts[key] = (progress.actionCounts[key] || 0) + 1;
+    }
+
+    // Real VPIP/PFR tracking — flag this hand as voluntary/raised preflop. The
+    // per-hand transient flags are committed to the persisted counters in
+    // recordHandPlayed (once per dealt hand), so a limp+call in the same hand
+    // counts once. A preflop check (BB option) or fold is NOT voluntary.
+    if (context?.phase === 'PreFlop') {
+      if (action === 'call' || action === 'raise' || action === 'allIn') {
+        (progress as any)._vpipThisHand = true;
+      }
+      if (action === 'raise' || action === 'allIn') {
+        (progress as any)._pfrThisHand = true;
+      }
     }
 
     if (action === 'allIn') {

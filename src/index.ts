@@ -3201,6 +3201,8 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
               tournamentsWon: raw.tournamentsWon,
               tournamentsPlayed: raw.tournamentsPlayed,
               variantsPlayed: raw.variantsPlayed,
+              vpipHands: raw.vpipHands,
+              pfrHands: raw.pfrHands,
             } : undefined;
 
             await saveProgress(authSession.userId, {
