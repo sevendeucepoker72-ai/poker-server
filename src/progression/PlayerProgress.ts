@@ -40,6 +40,10 @@ export interface PlayerProgress {
   flopsSeenHands: number;
   showdownHands: number;
   showdownWins: number;
+  // 3-bet stats: hands where the player faced a preflop open (3-bet opportunity)
+  // and hands where they re-raised it. 3-Bet% = threeBets / threeBetOpps.
+  threeBetOpps: number;
+  threeBets: number;
 
   // Ranked system
   elo: number;          // ELO rating (starts at 500)

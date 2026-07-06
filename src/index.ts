@@ -1996,11 +1996,12 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   const obsVpip = new Set<string>();
   const obsPfr = new Set<string>();
   let obsHand = -1;
+  let preflopRaiseCount = 0; // preflop raises seen so far this hand (for 3-bet%)
   table.on('playerAction', (d: { seatIndex: number; action: PlayerAction; amount?: number }) => {
     const s = table.seats[d.seatIndex];
     if (!s || !s.playerName) return;
     const hn = table.handNumber;
-    if (hn !== obsHand) { obsHand = hn; obsVpip.clear(); obsPfr.clear(); }
+    if (hn !== obsHand) { obsHand = hn; obsVpip.clear(); obsPfr.clear(); preflopRaiseCount = 0; }
     recordOpponentObservation(s.playerName, 'hand_start', { handNumber: hn });
     if (table.currentPhase === GamePhase.PreFlop) {
       const a = d.action;
@@ -2008,6 +2009,17 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
       const aggressive = a === PlayerAction.Raise || a === PlayerAction.AllIn;
       if (voluntary && !obsVpip.has(s.playerName)) { obsVpip.add(s.playerName); recordOpponentObservation(s.playerName, 'vpip'); }
       if (aggressive && !obsPfr.has(s.playerName)) { obsPfr.add(s.playerName); recordOpponentObservation(s.playerName, 'pfr'); }
+      // 3-bet%: a prior preflop raise already in front = a 3-bet spot; raising
+      // in that spot is a 3-bet+. preflopRaiseCount reflects raises BEFORE this
+      // action (the event fires post-apply), so increment after evaluating.
+      if (s.playerId) {
+        const facingRaise = preflopRaiseCount >= 1;
+        const isReraise = aggressive && preflopRaiseCount >= 1;
+        if (facingRaise || isReraise) {
+          progressionManager.recordPreflopRaiseContext(s.playerId, facingRaise, isReraise);
+        }
+      }
+      if (aggressive) preflopRaiseCount++;
     }
   });
 
@@ -3309,6 +3321,8 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
               flopsSeenHands: raw.flopsSeenHands,
               showdownHands: raw.showdownHands,
               showdownWins: raw.showdownWins,
+              threeBetOpps: raw.threeBetOpps,
+              threeBets: raw.threeBets,
               // Shop boosters + VIP pass — persist so they survive a restart
               // instead of evaporating (they were in-memory only).
               activeBoosters: raw.activeBoosters,

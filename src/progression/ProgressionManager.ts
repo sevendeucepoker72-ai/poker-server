@@ -419,6 +419,8 @@ export class ProgressionManager {
       flopsSeenHands: 0,
       showdownHands: 0,
       showdownWins: 0,
+      threeBetOpps: 0,
+      threeBets: 0,
       chipHistory: [],
       positionWins: {
         early: { wins: 0, total: 0 },
@@ -525,6 +527,8 @@ export class ProgressionManager {
           if (typeof s.flopsSeenHands === 'number')    progress.flopsSeenHands    = s.flopsSeenHands;
           if (typeof s.showdownHands === 'number')     progress.showdownHands     = s.showdownHands;
           if (typeof s.showdownWins === 'number')      progress.showdownWins      = s.showdownWins;
+          if (typeof s.threeBetOpps === 'number')      progress.threeBetOpps      = s.threeBetOpps;
+          if (typeof s.threeBets === 'number')         progress.threeBets         = s.threeBets;
           // Restore shop boosters + VIP so they survive a restart (drop already-
           // expired boosters so a stale one doesn't linger past its window).
           if (s.activeBoosters && typeof s.activeBoosters === 'object') {
@@ -766,6 +770,12 @@ export class ProgressionManager {
     (progress as any)._vpipThisHand = false;
     (progress as any)._pfrThisHand = false;
 
+    // Commit per-hand 3-bet flags (set by recordPreflopRaiseContext).
+    if ((progress as any)._faced3betThisHand) progress.threeBetOpps = (progress.threeBetOpps || 0) + 1;
+    if ((progress as any)._did3betThisHand) progress.threeBets = (progress.threeBets || 0) + 1;
+    (progress as any)._faced3betThisHand = false;
+    (progress as any)._did3betThisHand = false;
+
     // Track variant breadth for lifetime "all_variants" + daily/weekly buckets.
     if (variantId && !progress.variantsPlayed.includes(variantId)) {
       progress.variantsPlayed.push(variantId);
@@ -796,6 +806,19 @@ export class ProgressionManager {
    * per-hand _foldedPreflop flag set in recordAction (folded preflop = never saw
    * the flop). The flag is reset here for the next hand.
    */
+  /**
+   * Preflop 3-bet context for the HUD 3-Bet%. `facingRaise` = the player is
+   * acting with a prior preflop raise already in front of them (a 3-bet spot);
+   * `isReraise` = they raised in that spot (a 3-bet+). Sets per-hand flags
+   * committed in recordHandPlayed. Fed by the per-table playerAction listener.
+   */
+  recordPreflopRaiseContext(playerId: string, facingRaise: boolean, isReraise: boolean): void {
+    const progress = this.progressMap.get(playerId);
+    if (!progress) return;
+    if (facingRaise) (progress as any)._faced3betThisHand = true;
+    if (isReraise) (progress as any)._did3betThisHand = true;
+  }
+
   recordShowdownResult(playerId: string, flopDealt: boolean, reachedShowdown: boolean, wonAtShowdown: boolean): void {
     const progress = this.progressMap.get(playerId);
     if (!progress) return;
@@ -1085,6 +1108,8 @@ export class ProgressionManager {
     const sd = progress.showdownHands || 0;
     const wtsd = fs > 0 ? Number(((sd / fs) * 100).toFixed(1)) : null;
     const wsd = sd > 0 ? Number((((progress.showdownWins || 0) / sd) * 100).toFixed(1)) : null;
+    const tbo = progress.threeBetOpps || 0;
+    const threeBet = tbo > 0 ? Number((((progress.threeBets || 0) / tbo) * 100).toFixed(1)) : null;
 
     return {
       ...this.getClientProgress(playerId),
@@ -1104,6 +1129,7 @@ export class ProgressionManager {
       af,
       wtsd,
       wsd,
+      threeBet,
       vpipHands: progress.vpipHands || 0,
       pfrHands: progress.pfrHands || 0,
     };
