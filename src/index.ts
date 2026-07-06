@@ -1865,7 +1865,18 @@ function broadcastGameState(tableId: string): void {
           const nowHasLiveSession = [...playerSessions.values()].some(
             (s) => s.tableId === tableId && s.seatIndex === activeIdx
           );
-          if (nowHasLiveSession) return;
+          // Also spare a RECENTLY-DISCONNECTED player whose seat is still reserved.
+          // A real reconnect (socket backoff + auth) takes ~1-3s — longer than this
+          // 500ms window — so re-checking the session alone can't save them. Their
+          // seat is held in reservedSeats on disconnect; while that reserve is live
+          // they must get their FULL 30s turn clock (armTurnTimer) to come back and
+          // act, never a 500ms auto-fold. Only a genuine orphan seat — occupied,
+          // no live session, AND no live reserve (crash / non-standard path) — gets
+          // the fast auto-act; the 30s timer is the real deadline for everyone else.
+          const seatReserved = [...reservedSeats.values()].some(
+            (r) => r.tableId === tableId && r.seatIndex === activeIdx && r.expiresAt > Date.now()
+          );
+          if (nowHasLiveSession || seatReserved) return;
           const callAmt = t.currentBetToMatch - (t.seats[activeIdx]?.currentBet || 0);
           if (callAmt <= 0) {
             t.playerCheck(activeIdx);
