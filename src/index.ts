@@ -91,6 +91,8 @@ import {
   startClubTournament,
   createChallenge,
   acceptChallenge,
+  setChallengeTable,
+  resolveChallenge,
   declineChallenge,
   getClubChallenges,
   scheduleTable,
@@ -3576,6 +3578,10 @@ const careerTables = new Map<string, { venue: number; stage: number }>();
 // the client's suggested figure is never trusted.
 const insuranceCashouts = new Map<string, Array<{ seatIndex: number; playerId: string; userId?: number; cashout: number }>>();
 
+// Club-challenge heads-up tables: tableId -> the challenge being played on it.
+// The stakes are the buy-in, so chips flow through the normal join/cleanup paths.
+const challengeTables = new Map<string, { challengeId: number; challengerId: number; challengedId: number }>();
+
 function cleanupQuickTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (table) {
@@ -3631,6 +3637,7 @@ function cleanupQuickTable(tableId: string): void {
   allInOrFoldTables.delete(tableId);
   careerTables.delete(tableId);
   insuranceCashouts.delete(tableId);
+  challengeTables.delete(tableId);
 
   const timeoutKey = tableId;
   if (aiTimeouts.has(timeoutKey)) {
@@ -5818,10 +5825,52 @@ Give feedback in this JSON format:
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = await acceptChallenge(data.challengeId, auth.userId);
-    if (result.success) {
-      socket.emit('clubChallengeAccepted', { challengeId: data.challengeId });
-    } else {
-      socket.emit('error', { message: result.error });
+    if (!result.success || !result.challenge) { socket.emit('error', { message: result.error }); return; }
+    const { id: challengeId, challengerId, challengedId, stakes } = result.challenge;
+
+    // Spawn a heads-up table where the STAKES are the buy-in. Both players buy in
+    // `stakes` via the normal join path; the winner takes the 2x pot when the
+    // table tears down. No custom escrow — chips ride the proven join/cleanup
+    // machinery (so a redeploy is covered by the same graceful cash-out as any
+    // table).
+    const bb = Math.max(2, Math.floor(stakes / 50));
+    const sb = Math.max(1, Math.floor(bb / 2));
+    const tableId = tableManager.createTable({
+      tableName: 'Club Challenge',
+      smallBlind: sb, bigBlind: bb,
+      minBuyIn: stakes, maxBuyIn: stakes, maxPlayers: 2,
+    } as any);
+    if (!tableId) { socket.emit('error', { message: 'Could not start the challenge table' }); return; }
+    await setChallengeTable(challengeId, tableId);
+    challengeTables.set(tableId, { challengeId, challengerId, challengedId });
+
+    // Resolve the challenge (mark completed + winner) when the heads-up match
+    // ends, then tear the table down (cleanupQuickTable refunds the winner's 2x
+    // stack + removes it). Mirrors the career/spinGo resolution pattern.
+    const t = tableManager.getTable(tableId);
+    let resolved = false;
+    t?.on('handResult', () => {
+      setTimeout(() => {
+        if (resolved) return;
+        const tt = tableManager.getTable(tableId);
+        if (!tt) return;
+        const alive = tt.seats.filter((s) => s.state === 'occupied' && s.chipCount > 0 && !s.eliminated);
+        if (alive.length <= 1) {
+          resolved = true;
+          const winnerUid = alive.length === 1 ? (userIdForSeat(tableId, alive[0].seatIndex) ?? null) : null;
+          resolveChallenge(challengeId, winnerUid).catch(() => {});
+          io.to(`table:${tableId}`).emit('clubChallengeResolved', { challengeId, winnerId: winnerUid });
+          setTimeout(() => cleanupQuickTable(tableId), 5000);
+        }
+      }, 1000);
+    });
+
+    // Tell BOTH participants to join the table.
+    const payload = { challengeId, tableId, challengerId, challengedId, stakes };
+    for (const [sid, a] of authSessions) {
+      if (a.userId === challengerId || a.userId === challengedId) {
+        io.sockets.sockets.get(sid)?.emit('clubChallengeAccepted', payload);
+      }
     }
   });
 

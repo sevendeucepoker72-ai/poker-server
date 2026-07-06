@@ -189,6 +189,7 @@ export interface ClubChallenge {
   stakes: number;
   status: 'pending' | 'accepted' | 'playing' | 'completed';
   winnerId: number | null;
+  tableId?: string | null;
   createdAt: string;
 }
 
@@ -303,6 +304,11 @@ export async function initClubTables(): Promise<void> {
       grantedAt TIMESTAMPTZ DEFAULT now()
     )
   `);
+
+  // Club challenge: link a challenge to the heads-up table it's played on. The
+  // stakes ARE the buy-in, so chips flow through the normal join/cleanup paths
+  // (each buys in `stakes`, winner takes the 2x pot) — no custom escrow.
+  await pool.query(`ALTER TABLE club_challenges ADD COLUMN IF NOT EXISTS tableId TEXT`).catch(() => {});
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS club_activity (
@@ -1494,15 +1500,36 @@ export async function createChallenge(
 export async function acceptChallenge(
   challengeId: number,
   userId: number
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; challenge?: { id: number; clubId: number; challengerId: number; challengedId: number; stakes: number } }> {
   const pool = getPool();
   const ch = (await pool.query('SELECT * FROM club_challenges WHERE id = $1', [challengeId])).rows[0] as any;
   if (!ch) return { success: false, error: 'Challenge not found' };
   if (ch.challengedid !== userId) return { success: false, error: 'Only the challenged player can accept' };
   if (ch.status !== 'pending') return { success: false, error: 'Challenge is not pending' };
 
-  await pool.query('UPDATE club_challenges SET status = $1 WHERE id = $2', ['accepted', challengeId]);
-  return { success: true };
+  // Guarded transition so a double-accept can't spawn two tables.
+  const upd = await pool.query(
+    `UPDATE club_challenges SET status = 'playing' WHERE id = $1 AND status = 'pending' RETURNING id`,
+    [challengeId]
+  );
+  if ((upd.rowCount || 0) === 0) return { success: false, error: 'Challenge is no longer pending' };
+  return {
+    success: true,
+    challenge: { id: ch.id, clubId: ch.clubid, challengerId: ch.challengerid, challengedId: ch.challengedid, stakes: ch.stakes },
+  };
+}
+
+/** Link a now-playing challenge to its spawned heads-up table. */
+export async function setChallengeTable(challengeId: number, tableId: string): Promise<void> {
+  await getPool().query('UPDATE club_challenges SET tableId = $1 WHERE id = $2', [tableId, challengeId]).catch(() => {});
+}
+
+/** Mark a challenge finished with its winner (idempotent — only from 'playing'). */
+export async function resolveChallenge(challengeId: number, winnerId: number | null): Promise<void> {
+  await getPool().query(
+    `UPDATE club_challenges SET status = 'completed', winnerId = $1 WHERE id = $2 AND status = 'playing'`,
+    [winnerId, challengeId]
+  ).catch(() => {});
 }
 
 export async function declineChallenge(
@@ -1543,6 +1570,7 @@ export async function getClubChallenges(
     stakes: r.stakes,
     status: r.status,
     winnerId: r.winnerid,
+    tableId: r.tableid || null,
     createdAt: r.createdat,
   }));
 
