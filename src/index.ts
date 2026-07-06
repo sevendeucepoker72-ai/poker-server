@@ -41,7 +41,8 @@ import {
 } from './ai/AIPlayer';
 import { ProgressionManager } from './progression/ProgressionManager';
 import { HandRank } from './game/HandEvaluator';
-import { getFullTrainingData } from './training/TrainingEngine';
+import { getFullTrainingData, calculateEquity } from './training/TrainingEngine';
+import { insuranceCashoutAmount, insuranceSettlementDelta } from './game/insurance';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
@@ -3091,6 +3092,33 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     if (!handResultPerSeat.has(r.seatIndex)) handResultPerSeat.set(r.seatIndex, r.handResult);
   }
 
+  // All-in insurance settlement — BEFORE bust removal, so an insured player who
+  // was outdrawn keeps their locked-in cashout instead of busting. The engine
+  // already credited the pot to seat.chipCount; we adjust it so the insured
+  // seat ends with exactly `cashout` (delta>0 = house pays, delta<0 = house
+  // collects the margin). Adjusts the LIVE stack — the wallet syncs on cashout,
+  // so no double-count. Heads-up only, so no side-pot eligibility to reconcile.
+  const insCashouts = insuranceCashouts.get(tableId);
+  if (insCashouts && insCashouts.length) {
+    for (const co of insCashouts) {
+      const iseat = table.seats[co.seatIndex];
+      if (!iseat || iseat.state !== 'occupied') continue;
+      const actualWon = totalWonPerSeat.get(co.seatIndex) || 0;
+      const delta = insuranceSettlementDelta(co.cashout, actualWon);
+      iseat.chipCount = Math.max(0, iseat.chipCount + delta);
+      auditLog(co.playerId, delta >= 0 ? 'INSURANCE_PAYOUT' : 'INSURANCE_COLLECT',
+        { tableId, seatIndex: co.seatIndex, cashout: co.cashout, actualWon, delta, newStack: iseat.chipCount });
+      for (const [sid, s] of playerSessions) {
+        if (s.tableId === tableId && s.seatIndex === co.seatIndex) {
+          io.sockets.sockets.get(sid)?.emit('insuranceSettled', { cashout: co.cashout, delta, stack: iseat.chipCount });
+          break;
+        }
+      }
+    }
+    insuranceCashouts.delete(tableId);
+    broadcastGameState(tableId); // reflect the adjusted stack to all clients
+  }
+
   for (const session of humanSessions) {
     // Everyone who played gets recordHandPlayed + 5 XP. Pass variantId
     // so lifetime "all_variants" + daily/weekly variety achievements
@@ -3469,6 +3497,11 @@ const spinGoMultipliers = new Map<string, number>();
 const allInOrFoldTables = new Set<string>();
 const careerTables = new Map<string, { venue: number; stage: number }>();
 
+// All-in insurance cashouts locked in for the CURRENT hand, per table. Settled
+// at hand-complete (before bust removal) and cleared. Server-computed amount —
+// the client's suggested figure is never trusted.
+const insuranceCashouts = new Map<string, Array<{ seatIndex: number; playerId: string; userId?: number; cashout: number }>>();
+
 function cleanupQuickTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (table) {
@@ -3523,6 +3556,7 @@ function cleanupQuickTable(tableId: string): void {
   spinGoMultipliers.delete(tableId);
   allInOrFoldTables.delete(tableId);
   careerTables.delete(tableId);
+  insuranceCashouts.delete(tableId);
 
   const timeoutKey = tableId;
   if (aiTimeouts.has(timeoutKey)) {
@@ -9368,6 +9402,48 @@ Give feedback in this JSON format:
     socket.emit('rabbitHuntResult', {
       cards: board.map((c) => ({ suit: c.suit, rank: c.rank, display: cardToString(c) })),
     });
+  });
+
+  // ========== All-In Insurance (cashout) ==========
+  // A player all-in with cards to come can lock in a guaranteed cashout instead
+  // of gambling the runout. The house is the counterparty (buys their equity at
+  // a 10% discount). v1 is scoped to HEADS-UP all-ins so the total pot equals
+  // the eligible pot (no side-pot mis-pricing). The amount is computed
+  // server-side from real Monte-Carlo equity — the client's figure is ignored.
+  socket.on('acceptInsurance', () => {
+    const session = playerSessions.get(socket.id);
+    if (!session) return;
+    const table = tableManager.getTable(session.tableId);
+    if (!table) return;
+    const seat = table.seats[session.seatIndex];
+    if (!seat || seat.state !== 'occupied' || !seat.allIn || seat.folded) return;
+    // Community-card game with cards still to come.
+    const vId = String((table as any).config?.variantId || (table as any).variantId || '').toLowerCase();
+    const isCommunity = /holdem|omaha|short|royal/.test(vId) || seat.holeCards.length <= 4;
+    if (!isCommunity || table.communityCards.length >= 5) return;
+    // Exactly one live opponent (heads-up all-in) → total pot === eligible pot.
+    const liveOpponents = table.seats.filter(
+      (s, i) => i !== session.seatIndex && s.state === 'occupied' && !s.folded && !s.eliminated
+    );
+    if (liveOpponents.length !== 1) return;
+    // One cashout per seat per hand.
+    const list = insuranceCashouts.get(session.tableId) || [];
+    if (list.some((c) => c.seatIndex === session.seatIndex)) return;
+
+    const isOmaha = vId.includes('omaha');
+    const equity = calculateEquity(seat.holeCards, table.communityCards, 1, isOmaha); // 0..1
+    const pot = table.getTotalPot();
+    const cashout = insuranceCashoutAmount(pot, equity);
+    if (cashout <= 0) return;
+
+    list.push({
+      seatIndex: session.seatIndex,
+      playerId: session.playerId,
+      userId: authSessions.get(socket.id)?.userId,
+      cashout,
+    });
+    insuranceCashouts.set(session.tableId, list);
+    socket.emit('insuranceAccepted', { cashout, equityPct: Math.round(equity * 100) });
   });
 
   // Batch 5d: real player profile by username. PlayerProfile.jsx emitted
