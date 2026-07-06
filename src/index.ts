@@ -9077,7 +9077,11 @@ Give feedback in this JSON format:
     // Store multiplier for prize calculation
     spinGoMultipliers.set(tableId, multiplier);
 
-    // Listen for eliminations - last player standing wins
+    // Listen for eliminations - last player standing wins the REAL multiplier
+    // prize. Previously the multiplier was purely cosmetic: the winner was only
+    // credited their real table stack (~1500 = 3 buy-ins) while the UI advertised
+    // up to 12500 (25x) that was never paid.
+    let spinGoSettled = false; // exactly-once guard — handResult fires repeatedly
     const checkElimination = () => {
       const t = tableManager.getTable(tableId);
       if (!t) return;
@@ -9086,10 +9090,24 @@ Give feedback in this JSON format:
         (s) => s.state === 'occupied' && s.chipCount > 0 && !s.eliminated
       );
 
-      if (alive.length <= 1 && alive.length > 0) {
+      if (!spinGoSettled && alive.length <= 1 && alive.length > 0) {
+        spinGoSettled = true;
         clearInterval(blindInterval);
         const winner = alive[0];
-        const prize = multiplier * 500; // multiplier * buy-in
+        const prize = multiplier * 500; // real Spin & Go prize = multiplier x buy-in
+
+        // Credit the ADVERTISED prize (house-funded, like tournament/freeroll
+        // prizes) to the human winner, then ZERO their seat so no refund path
+        // (cleanupQuickTable / handlePlayerLeave) double-credits their table
+        // stack. Guests (no userId) stay wallet-isolated — no prize, as before.
+        const winnerUid = userIdForSeat(tableId, winner.seatIndex);
+        if (winnerUid) {
+          winner.chipCount = 0;
+          winner.totalInvestedThisHand = 0;
+          addChipsToUser(winnerUid, prize)
+            .then((ok) => auditLog(winner.playerName, ok ? 'SPINGO_PRIZE' : 'SPINGO_PRIZE_FAILED', { userId: winnerUid, tableId, multiplier, prize }))
+            .catch((e) => console.warn(`[spinGo prize ${winnerUid}]`, e?.message));
+        }
 
         io.to(`table:${tableId}`).emit('quickGameOver', {
           type: 'spinGo',
