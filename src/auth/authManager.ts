@@ -389,6 +389,17 @@ export async function initDB(): Promise<void> {
     )
   `).catch((e: any) => console.warn('[Auth] online_promotions:', e.message));
 
+  // Admin-authored qualifier configs (icon/color/stack/blinds/schedule) as a
+  // single shared JSON blob. Previously client sessionStorage only, so a custom
+  // qualifier was invisible on any other browser/admin. Single-row (id=1).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS qualifier_configs (
+      id         INTEGER PRIMARY KEY,
+      data       TEXT NOT NULL DEFAULT '[]',
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `).catch((e: any) => console.warn('[Auth] qualifier_configs:', e.message));
+
   console.log('[Auth] Persistence sweep DDL applied');
 
   // Seed admin accounts

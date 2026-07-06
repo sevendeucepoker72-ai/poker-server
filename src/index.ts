@@ -5455,6 +5455,38 @@ Give feedback in this JSON format:
     } catch { socket.emit('error', { message: 'Failed to delete promotion' }); }
   });
 
+  // ── Qualifier configs (shared admin-authored list; was client sessionStorage) ──
+  // Reading is PUBLIC (players see the qualifier list to register). Writing is
+  // admin-only. The client sends its full qualifier array; we store it as one
+  // blob and broadcast it to everyone so all browsers stay in sync.
+  socket.on('getQualifierConfigs', async () => {
+    try {
+      const { rows } = await getPool().query(`SELECT data FROM qualifier_configs WHERE id = 1`);
+      let list: any[] = [];
+      try { list = rows[0]?.data ? JSON.parse(rows[0].data) : []; } catch { list = []; }
+      socket.emit('qualifierConfigs', list);
+    } catch { socket.emit('qualifierConfigs', []); }
+  });
+
+  socket.on('saveQualifierConfigs', async (data: { qualifiers: any[] }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    if (!Array.isArray(data?.qualifiers)) { socket.emit('error', { message: 'Invalid qualifiers payload' }); return; }
+    try {
+      const json = JSON.stringify(data.qualifiers).slice(0, 500000); // sanity cap
+      await getPool().query(
+        `INSERT INTO qualifier_configs (id, data, updated_at) VALUES (1, $1, NOW())
+         ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = NOW()`,
+        [json]
+      );
+      auditLog(auth.username, 'ADMIN_SAVE_QUALIFIER_CONFIGS', { count: data.qualifiers.length });
+      io.emit('qualifierConfigs', data.qualifiers); // sync every connected client
+    } catch (err: any) {
+      console.error('[saveQualifierConfigs]', err);
+      socket.emit('error', { message: 'Failed to save qualifiers' });
+    }
+  });
+
   // Player: redeem a promo entry code → a qualifier credit on the master.
   socket.on('redeemEntryCode', async (data: { code: string }) => {
     const auth = authSessions.get(socket.id);
