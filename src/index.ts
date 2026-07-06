@@ -6084,6 +6084,32 @@ Give feedback in this JSON format:
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = await joinByReferral(data.referralCode, auth.userId);
     if (result.success) {
+      // Real referral reward: 500 REAL wallet chips to BOTH the referrer and the
+      // new member, but ONLY on a first-time grant (rewardAmount is 0 when the
+      // idempotency ledger already had this referee). Previously these 500s went
+      // to club_stats.chipsWon (a leaderboard stat), never to the wallet.
+      const amount = result.rewardAmount || 0;
+      if (amount > 0) {
+        const creditReferral = (uid?: number) => {
+          if (!uid) return;
+          // Online → in-memory + DB + live client refresh; offline → DB only.
+          let live = false;
+          for (const [sid, a] of authSessions) {
+            if (a.userId === uid) {
+              const pid = playerSessions.get(sid)?.playerId;
+              if (pid && progressionManager.creditChips(pid, amount)) {
+                sendProgressToPlayer(sid);
+                live = true;
+              }
+              break;
+            }
+          }
+          if (!live) addChipsToUser(uid, amount).catch((e) => console.warn(`[referral reward ${uid}]`, e?.message));
+          auditLog(String(uid), 'CLUB_REFERRAL_CHIP_GRANT', { amount });
+        };
+        creditReferral(result.referrerUserId);
+        creditReferral(result.refereeUserId);
+      }
       socket.emit('referralJoined', result);
       socket.emit('myClubs', await getMyClubs(auth.userId));
     } else {

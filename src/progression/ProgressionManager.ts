@@ -625,6 +625,25 @@ export class ProgressionManager {
    * caller is idempotent by achievement/level/daily-claim; missions are gated
    * on the daily-claim ledger in the handler — see claimMission).
    */
+  /**
+   * Credit REAL reward chips to an ONLINE player (referral reward, etc.):
+   * additive in-memory so their live client sees it immediately, AND additive to
+   * the DB (atomic chips = chips + amount — no ratchet needed, no clobber risk).
+   * Returns true if the player was online (had an in-memory entry). Offline
+   * players are credited DB-only by the caller via addChipsToUser.
+   */
+  creditChips(playerId: string, amount: number): boolean {
+    const progress = this.progressMap.get(playerId);
+    if (!progress || amount <= 0) return false;
+    progress.chips += amount;
+    if (progress.userId) {
+      dbAddChipsToUser(progress.userId, amount).catch((e) =>
+        console.warn(`[ProgressionManager.creditChips ${progress.userId}]`, e?.message)
+      );
+    }
+    return true;
+  }
+
   private persistChipReward(progress: PlayerProgress, amount: number): void {
     if (!progress.userId || amount <= 0) return;
     if (!progress.hydrated) {

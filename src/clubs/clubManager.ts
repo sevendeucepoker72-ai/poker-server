@@ -293,6 +293,17 @@ export async function initClubTables(): Promise<void> {
     )
   `);
 
+  // Idempotency ledger for referral REWARD chip grants — one wallet reward per
+  // referee, ever (bounds leave+rejoin farming). PK on refereeId enforces it.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS referral_reward_grants (
+      refereeId INTEGER PRIMARY KEY,
+      referrerId INTEGER NOT NULL,
+      clubId INTEGER NOT NULL,
+      grantedAt TIMESTAMPTZ DEFAULT now()
+    )
+  `);
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS club_activity (
       id SERIAL PRIMARY KEY,
@@ -2176,7 +2187,7 @@ export async function generateReferralCode(
 export async function joinByReferral(
   referralCode: string,
   userId: number
-): Promise<{ success: boolean; error?: string; club?: ClubInfo; bonusChips?: number }> {
+): Promise<{ success: boolean; error?: string; club?: ClubInfo; bonusChips?: number; referrerUserId?: number; refereeUserId?: number; rewardAmount?: number }> {
   const pool = getPool();
   const referrer = (await pool.query(
     'SELECT cm.clubId, cm.userId as referrerId FROM club_members cm WHERE cm.referral_code = $1',
@@ -2207,27 +2218,34 @@ export async function joinByReferral(
       [referrer.clubid, userId, 'member', 'active', referrer.referrerid]
     );
 
-    const referrerName = await getUsername(referrer.referrerid);
-    const newMemberName = await getUsername(userId);
-
-    await pool.query(
-      `INSERT INTO club_stats (clubId, userId, username, chipsWon) VALUES ($1, $2, $3, 500)
-       ON CONFLICT (clubId, userId) DO UPDATE SET chipsWon = club_stats.chipsWon + 500, updatedAt = now()`,
-      [referrer.clubid, referrer.referrerid, referrerName]
-    );
-
-    await pool.query(
-      `INSERT INTO club_stats (clubId, userId, username, chipsWon) VALUES ($1, $2, $3, 500)
-       ON CONFLICT (clubId, userId) DO UPDATE SET chipsWon = club_stats.chipsWon + 500, updatedAt = now()`,
-      [referrer.clubid, userId, newMemberName]
-    );
+    // Real referral reward: 500 REAL wallet chips to BOTH the referrer and the
+    // new member — but ONLY once per referee (idempotency ledger below), and NO
+    // LONGER written to club_stats.chipsWon (which polluted the club leaderboard
+    // as if the player had won 500 at a table). The wallet credit itself is done
+    // by the caller (index.ts) via ProgressionManager so a live referrer's
+    // in-memory balance + client update stay in sync. rewardGranted signals a
+    // first-time grant; a re-join (referee already in the ledger) grants nothing.
+    let rewardGranted = false;
+    try {
+      const ins = await pool.query(
+        `INSERT INTO referral_reward_grants (refereeId, referrerId, clubId) VALUES ($1, $2, $3)
+         ON CONFLICT (refereeId) DO NOTHING RETURNING refereeId`,
+        [userId, referrer.referrerid, referrer.clubid]
+      );
+      rewardGranted = (ins.rowCount || 0) > 0;
+    } catch { rewardGranted = false; }
 
     const newCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_members WHERE clubId = $1 AND status = $2', [referrer.clubid, 'active'])).rows[0] as any).cnt;
     const rawRow = (await pool.query('SELECT badge, clubXp, clubLevel FROM clubs WHERE id = $1', [referrer.clubid])).rows[0] as any;
 
     return {
       success: true,
-      bonusChips: 500,
+      bonusChips: rewardGranted ? 500 : 0,
+      // Grant metadata for the caller to credit REAL wallets (0 amount when the
+      // ledger already had this referee — idempotent).
+      referrerUserId: referrer.referrerid,
+      refereeUserId: userId,
+      rewardAmount: rewardGranted ? 500 : 0,
       club: {
         id: club.id,
         clubCode: club.clubCode,
