@@ -416,6 +416,9 @@ export class ProgressionManager {
       actionCounts: { fold: 0, check: 0, call: 0, raise: 0, allin: 0 },
       vpipHands: 0,
       pfrHands: 0,
+      flopsSeenHands: 0,
+      showdownHands: 0,
+      showdownWins: 0,
       chipHistory: [],
       positionWins: {
         early: { wins: 0, total: 0 },
@@ -519,6 +522,9 @@ export class ProgressionManager {
           if (Array.isArray(s.variantsPlayed))         progress.variantsPlayed    = s.variantsPlayed;
           if (typeof s.vpipHands === 'number')         progress.vpipHands         = s.vpipHands;
           if (typeof s.pfrHands === 'number')          progress.pfrHands          = s.pfrHands;
+          if (typeof s.flopsSeenHands === 'number')    progress.flopsSeenHands    = s.flopsSeenHands;
+          if (typeof s.showdownHands === 'number')     progress.showdownHands     = s.showdownHands;
+          if (typeof s.showdownWins === 'number')      progress.showdownWins      = s.showdownWins;
           // Restore shop boosters + VIP so they survive a restart (drop already-
           // expired boosters so a stale one doesn't linger past its window).
           if (s.activeBoosters && typeof s.activeBoosters === 'object') {
@@ -782,6 +788,22 @@ export class ProgressionManager {
     }
 
     this.checkAchievements(playerId);
+  }
+
+  /**
+   * Record the showdown outcome of a hand for the WTSD / W$SD HUD stats. Called
+   * once per seated human at hand-complete. `sawFlop` is derived from the
+   * per-hand _foldedPreflop flag set in recordAction (folded preflop = never saw
+   * the flop). The flag is reset here for the next hand.
+   */
+  recordShowdownResult(playerId: string, flopDealt: boolean, reachedShowdown: boolean, wonAtShowdown: boolean): void {
+    const progress = this.progressMap.get(playerId);
+    if (!progress) return;
+    const sawFlop = flopDealt && !(progress as any)._foldedPreflop;
+    if (sawFlop) progress.flopsSeenHands = (progress.flopsSeenHands || 0) + 1;
+    if (reachedShowdown) progress.showdownHands = (progress.showdownHands || 0) + 1;
+    if (wonAtShowdown) progress.showdownWins = (progress.showdownWins || 0) + 1;
+    (progress as any)._foldedPreflop = false;
   }
 
   /**
@@ -1056,6 +1078,13 @@ export class ProgressionManager {
       : (aggressive > 0 ? 99 : 0);
     const vpip = th > 0 ? Number((((progress.vpipHands || 0) / th) * 100).toFixed(1)) : 0;
     const pfr = th > 0 ? Number((((progress.pfrHands || 0) / th) * 100).toFixed(1)) : 0;
+    // Showdown stats. WTSD = went to showdown / saw a flop; W$SD = won at
+    // showdown / went to showdown. Null when there's no sample yet so the client
+    // shows N/A rather than a misleading 0.
+    const fs = progress.flopsSeenHands || 0;
+    const sd = progress.showdownHands || 0;
+    const wtsd = fs > 0 ? Number(((sd / fs) * 100).toFixed(1)) : null;
+    const wsd = sd > 0 ? Number((((progress.showdownWins || 0) / sd) * 100).toFixed(1)) : null;
 
     return {
       ...this.getClientProgress(playerId),
@@ -1073,6 +1102,8 @@ export class ProgressionManager {
       vpip,
       pfr,
       af,
+      wtsd,
+      wsd,
       vpipHands: progress.vpipHands || 0,
       pfrHands: progress.pfrHands || 0,
     };
@@ -1102,6 +1133,10 @@ export class ProgressionManager {
       }
       if (action === 'raise' || action === 'allIn') {
         (progress as any)._pfrThisHand = true;
+      }
+      if (action === 'fold') {
+        // Folded preflop = never saw the flop (WTSD denominator excludes these).
+        (progress as any)._foldedPreflop = true;
       }
     }
 

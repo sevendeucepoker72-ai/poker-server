@@ -3165,6 +3165,17 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     const seat = table.seats[session.seatIndex];
     const isWinner = winnerSeatIndices.has(session.seatIndex);
 
+    // Showdown HUD stats (WTSD / W$SD). saw-flop is derived inside from the
+    // per-hand _foldedPreflop flag; here we pass whether the board reached a
+    // flop, whether this player was still in at a contested showdown, and
+    // whether they won at that showdown.
+    {
+      const flopDealt = table.communityCards.length >= 3;
+      const reachedShowdown = !!(table as any).wentToShowdown && !seat?.folded;
+      const wonAtShowdown = reachedShowdown && (totalWonPerSeat.get(session.seatIndex) || 0) > 0;
+      progressionManager.recordShowdownResult(session.playerId, flopDealt, reachedShowdown, wonAtShowdown);
+    }
+
     // Determine position category
     const totalOccupied = table.seats.filter((s) => s.state === 'occupied').length;
     const seatPos = session.seatIndex;
@@ -3295,6 +3306,9 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
               variantsPlayed: raw.variantsPlayed,
               vpipHands: raw.vpipHands,
               pfrHands: raw.pfrHands,
+              flopsSeenHands: raw.flopsSeenHands,
+              showdownHands: raw.showdownHands,
+              showdownWins: raw.showdownWins,
               // Shop boosters + VIP pass — persist so they survive a restart
               // instead of evaporating (they were in-memory only).
               activeBoosters: raw.activeBoosters,

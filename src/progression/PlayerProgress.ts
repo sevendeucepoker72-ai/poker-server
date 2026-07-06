@@ -34,6 +34,12 @@ export interface PlayerProgress {
   // totalHandsPlayed. Aggression factor (AF) is derived from actionCounts.
   vpipHands: number;
   pfrHands: number;
+  // Showdown stats: hands where the player saw a flop, reached showdown, and won
+  // at showdown. WTSD = showdownHands / flopsSeenHands; W$SD = showdownWins /
+  // showdownHands.
+  flopsSeenHands: number;
+  showdownHands: number;
+  showdownWins: number;
 
   // Ranked system
   elo: number;          // ELO rating (starts at 500)
