@@ -724,4 +724,45 @@ export class TournamentManager {
       turbo: t.turboMode,
     };
   }
+
+  /**
+   * Full standings roster for the Live Bracket UI (TournamentBracket.jsx). The
+   * component treats a non-null finishPosition as ELIMINATED, so we translate
+   * the start/alive value 0 -> null. TournamentPlayer.chips is start-only, so we
+   * resolve each alive player's LIVE stack from their seat via playerTableMap +
+   * tableManager. Eliminated players report 0.
+   */
+  getTournamentStandings(tournamentId: string, tableManager: any): {
+    tournamentId: string;
+    name: string;
+    status: TournamentStatus;
+    eliminationOrder: string[];
+    players: { playerId: string; playerName: string; chipCount: number; finishPosition: number | null }[];
+  } | null {
+    const t = this.tournaments.get(tournamentId);
+    if (!t) return null;
+    const players = t.players.map((p) => {
+      const eliminated = !!p.eliminated || (p.finishPosition && p.finishPosition > 0);
+      let chipCount = 0;
+      if (!eliminated) {
+        const tid = t.playerTableMap.get(p.playerId);
+        const table = tid ? tableManager?.getTable?.(tid) : null;
+        const seat = table?.seats?.find((s: any) => s.playerId === p.playerId);
+        chipCount = seat?.chipCount ?? p.chips ?? 0;
+      }
+      return {
+        playerId: p.playerId,
+        playerName: p.playerName,
+        chipCount,
+        finishPosition: (p.finishPosition && p.finishPosition > 0) ? p.finishPosition : null,
+      };
+    });
+    return {
+      tournamentId,
+      name: t.config.name,
+      status: t.status,
+      eliminationOrder: t.eliminationOrder || [],
+      players,
+    };
+  }
 }

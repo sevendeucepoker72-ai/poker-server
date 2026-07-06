@@ -9590,6 +9590,19 @@ Give feedback in this JSON format:
     socket.emit('tournamentList', tournamentManager.getTournamentList());
   });
 
+  // Live Bracket: full standings roster (alive/eliminated + live chip counts) for
+  // the TournamentBracket UI, which otherwise renders empty (no data source).
+  // Defaults to the first running tournament so the lobby can just ask without
+  // knowing an id. The client polls this while the bracket modal is open.
+  socket.on('getTournamentStandings', (data: { tournamentId?: string }) => {
+    let tid = data?.tournamentId;
+    if (!tid) {
+      const running = (tournamentManager.getTournamentList() as any[]).find((t) => t.status === 'running');
+      tid = running?.tournamentId;
+    }
+    socket.emit('tournamentStandings', tid ? tournamentManager.getTournamentStandings(tid, tableManager) : null);
+  });
+
   socket.on('registerTournament', async (data: { tournamentId: string; playerName: string }) => {
     if (blockedByMaintenance(socket)) return;
     const session = playerSessions.get(socket.id);
