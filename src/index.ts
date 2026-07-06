@@ -1623,6 +1623,11 @@ function getGameStateForPlayer(
       const callAmount = Math.max(0, table.currentBetToMatch - seat.currentBet);
       const potSize = table.getTotalPot();
       const chipStack = seat.chipCount;
+      // Omaha family (omaha / omaha-5 / omaha-6 / omaha-hi-lo) must use exactly
+      // 2 hole cards, which changes equity + outs. Read variantId defensively
+      // (some subclasses only set it on config). Excludes pineapple (Hold'em-like).
+      const vId = String((table as any).config?.variantId || (table as any).variantId || '').toLowerCase();
+      const isOmaha = vId.includes('omaha');
 
       try {
         stateObj.trainingData = getFullTrainingData(
@@ -1632,7 +1637,8 @@ function getGameStateForPlayer(
           callAmount,
           potSize,
           chipStack,
-          table.currentPhase
+          table.currentPhase,
+          isOmaha
         );
       } catch (e) {
         // Training data calculation failed, skip
@@ -10831,6 +10837,14 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
   const tid = data?.tournamentId;
   if (!tid || paidOutTournaments.has(tid)) return;
   paidOutTournaments.add(tid);
+
+  // Progression: credit every participant with a tournament played, and the
+  // winner with a tournament won. AI players have no progress entry so this
+  // no-ops for them. Rides the paidOutTournaments guard above (runs once).
+  for (const r of data?.results || []) {
+    if (r.playerId) progressionManager.recordTournamentResult(r.playerId, r.position);
+  }
+
   for (const r of data?.results || []) {
     if (r.userId === undefined || !(r.payout > 0)) continue;
 

@@ -754,6 +754,41 @@ export class ProgressionManager {
     this.checkAchievements(playerId);
   }
 
+  /**
+   * Record a finished tournament for a participant. position 1 === winner.
+   * Called once per participant from payTournamentPrizes (rides its
+   * paidOutTournaments idempotency guard). AI players have no progress entry,
+   * so this no-ops for them. These counters feed the tournament achievements
+   * (first win / 10 wins / 50 played / weekly win) that were previously
+   * unreachable because nothing ever incremented them.
+   */
+  recordTournamentResult(playerId: string, position: number): void {
+    const progress = this.progressMap.get(playerId);
+    if (!progress) return;
+
+    progress.tournamentsPlayed = (progress.tournamentsPlayed || 0) + 1;
+    if (position === 1) {
+      progress.tournamentsWon = (progress.tournamentsWon || 0) + 1;
+      // Ensure the weekly window is current before ticking its counter.
+      this.rollAchievementWindows(progress);
+      progress.weeklyStats.tournamentsWonThisWeek = (progress.weeklyStats.tournamentsWonThisWeek || 0) + 1;
+    }
+
+    // Persist the lifetime counters durably — a win/finish must survive an
+    // immediate quit, when no further hand-complete save fires for this user.
+    // JSONB-merges; hydrated gate prevents clobbering real DB values.
+    if (progress.userId && progress.hydrated) {
+      dbSaveProgress(progress.userId, {
+        stats: {
+          tournamentsWon: progress.tournamentsWon,
+          tournamentsPlayed: progress.tournamentsPlayed,
+        },
+      }).catch((e: any) => console.warn(`[recordTournamentResult ${progress.userId}]`, e?.message));
+    }
+
+    this.checkAchievements(playerId);
+  }
+
   recordHandWon(
     playerId: string,
     potSize: number,

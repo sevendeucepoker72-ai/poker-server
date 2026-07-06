@@ -167,10 +167,26 @@ export function calculatePotOdds(callAmount: number, potSize: number): number {
  */
 export function countOuts(
   holeCards: Card[],
-  communityCards: Card[]
+  communityCards: Card[],
+  omaha: boolean = false
 ): { outs: number; drawType: string } {
   if (communityCards.length === 0 || communityCards.length >= 5) {
     return { outs: 0, drawType: 'none' };
+  }
+
+  // Omaha family: a made hand must use EXACTLY 2 hole cards, so counting draws
+  // off all 4+ hole cards together over-counts flushes/straights (e.g. three
+  // suited hole cards is NOT a flush draw). Evaluate every 2-card hole combo
+  // with the Hold'em logic and keep the best. 6 combos for 4-card Omaha.
+  if (omaha && holeCards.length > 2) {
+    let best = { outs: 0, drawType: 'none' };
+    for (let i = 0; i < holeCards.length; i++) {
+      for (let j = i + 1; j < holeCards.length; j++) {
+        const r = countOuts([holeCards[i], holeCards[j]], communityCards, false);
+        if (r.outs > best.outs) best = r;
+      }
+    }
+    return best;
   }
 
   const allCards = [...holeCards, ...communityCards];
@@ -468,11 +484,14 @@ export function getFullTrainingData(
   callAmount: number,
   potSize: number,
   chipStack: number,
-  phase: string
+  phase: string,
+  isOmaha: boolean = false
 ): TrainingData {
-  const equity = calculateEquity(holeCards, communityCards, numOpponents);
+  // Omaha changes both equity (must use exactly 2 of 4 hole cards) and out
+  // counting — without the flag the coach graded Omaha hands as Hold'em.
+  const equity = calculateEquity(holeCards, communityCards, numOpponents, isOmaha);
   const potOdds = calculatePotOdds(callAmount, potSize);
-  const { outs, drawType } = countOuts(holeCards, communityCards);
+  const { outs, drawType } = countOuts(holeCards, communityCards, isOmaha);
   const handStrength = describeHandStrength(holeCards, communityCards);
   const { action, raiseAmount, reasoning } = getSuggestedAction(
     equity,
