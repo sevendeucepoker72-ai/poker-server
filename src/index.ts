@@ -1852,6 +1852,20 @@ function broadcastGameState(tableId: string): void {
         // Skip during draw phases — the draw clock stands the player pat; a
         // fold/check here would fire on the stale pre-draw bet-to-match (#4).
         if (t && t.activeSeatIndex === activeIdx && t.isHandInProgress() && !DrawPhases.includes(t.currentPhase)) {
+          // RECONNECT GUARD (P0 2026-07-06): `shouldAutoAct` was decided up to
+          // 500ms ago from a `hasLiveSession` snapshot taken at broadcast time.
+          // A socket that dropped mid-turn and reconnected within that window has
+          // since re-bound a live session (oauthLogin restore → playerSessions.set),
+          // i.e. the human is provably back at the table. Re-check NOW and bail if
+          // a live session exists for this seat, so a reconnecting player is never
+          // auto-folded — the core "it folded me when I did nothing" bug.
+          // Genuinely-gone seats still have no session → the fold proceeds; the
+          // 30s turn timer + disconnect-time fold still prevent any deadlock, so
+          // this cannot wedge the table.
+          const nowHasLiveSession = [...playerSessions.values()].some(
+            (s) => s.tableId === tableId && s.seatIndex === activeIdx
+          );
+          if (nowHasLiveSession) return;
           const callAmt = t.currentBetToMatch - (t.seats[activeIdx]?.currentBet || 0);
           if (callAmt <= 0) {
             t.playerCheck(activeIdx);
