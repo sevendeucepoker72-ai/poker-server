@@ -8,6 +8,7 @@ import {
   OPEN_THRESHOLD, THREEBET_THRESHOLD, FOURBET_THRESHOLD, CALL_VS_RAISE_THRESHOLD,
   ARCHETYPE_RANGE_FACTOR, adjustThreshold,
 } from './preflopRanges';
+import { inPushFoldZone, nashPushPctile, nashCallPctile } from './pushFoldSolver';
 
 export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
 export type Personality =
@@ -893,19 +894,29 @@ function preFlopStrategy(
       ? { action: PlayerAction.AllIn, raiseAmount: 0 }
       : { action: PlayerAction.Raise, raiseAmount: Math.max(minRaise, amount) };
 
-  // ── Short-stack push/fold (≤ ~10bb effective): shove or fold, never limp. ──
-  // Shove range widens as the stack shrinks (Nash-lite). Stations still just call.
-  if (effBB <= 10 && profile.archetype !== 'CALLING_STATION') {
-    const shoveBase = effBB <= 5 ? 0.45 : effBB <= 7 ? 0.55 : 0.65; // top 55/45/35%
-    const shoveTh = adjustThreshold(adjustThreshold(shoveBase, factor), huFactor);
-    if (pctile >= shoveTh) return { action: PlayerAction.AllIn, raiseAmount: 0 };
-    if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
-    if (callAmount >= seat.chipCount) {
-      return pctile >= adjustThreshold(0.55, factor)
-        ? { action: PlayerAction.AllIn, raiseAmount: 0 }
-        : { action: PlayerAction.Fold, raiseAmount: 0 };
+  // ── Short-stack push/fold: shove-or-fold from the BAKED Nash lookup
+  //    (pushFoldSolver.ts — an offline-solved HU equilibrium, multiway-tightened
+  //    and validated vs published charts). Replaces the old too-tight heuristic
+  //    (which shoved only ~top 35% at 10bb; Nash is ~top 56%). The HU-vs-multiway
+  //    axis is handled by the lookup itself (playersYetToAct), so we do NOT apply
+  //    huFactor here — only the archetype `factor` as a personality overlay.
+  //    Stations still flat; nobody limps a short stack. ──
+  const playersYetToAct = Math.min(3, Math.max(1, totalActive - 1));
+  if (inPushFoldZone(effBB, playersYetToAct) && profile.archetype !== 'CALLING_STATION') {
+    const nashPush = nashPushPctile(effBB, playersYetToAct);
+    if (nashPush !== null) {
+      if (callAmount >= seat.chipCount && callAmount > 0) {
+        // Facing an all-in that covers us: use the Nash CALL threshold, not push.
+        const callTh = adjustThreshold(nashCallPctile(effBB, playersYetToAct), factor);
+        return pctile >= callTh
+          ? { action: PlayerAction.AllIn, raiseAmount: 0 }
+          : { action: PlayerAction.Fold, raiseAmount: 0 };
+      }
+      const shoveTh = adjustThreshold(nashPush, factor);
+      if (pctile >= shoveTh) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+      if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
+      return { action: PlayerAction.Fold, raiseAmount: 0 };
     }
-    return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
   // ── CALLING_STATION: calls almost everything, never raises. ──

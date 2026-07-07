@@ -152,9 +152,12 @@ export const THREEBET_THRESHOLD: Record<PosBucket, number> = {
 /** 4-bet-for-value threshold. */
 export const FOURBET_THRESHOLD = 0.965; // ~ QQ+/AK top
 
-/** How wide to flat/defend vs a single raise (call, not 3-bet), by position. */
+/** How wide to flat/defend vs a single raise (call, not 3-bet), by position.
+ * 2026-07-07 tuning: tightened the wide late-position flats (CO/BTN) — the bots
+ * were flatting too loose IP, pushing TAG VPIP into LAG territory (~40%). BB
+ * defence stays wide (correct). */
 export const CALL_VS_RAISE_THRESHOLD: Record<PosBucket, number> = {
-  EP: 0.82, MP: 0.78, CO: 0.70, BTN: 0.60, SB: 0.72, BB: 0.55,
+  EP: 0.83, MP: 0.79, CO: 0.74, BTN: 0.65, SB: 0.73, BB: 0.55,
 };
 
 /**
@@ -166,7 +169,7 @@ export const CALL_VS_RAISE_THRESHOLD: Record<PosBucket, number> = {
 export const ARCHETYPE_RANGE_FACTOR: Record<string, number> = {
   NIT: 1.10,
   ROCK: 1.06,
-  TAG: 1.00,
+  TAG: 1.06,   // 2026-07-07 tuning: was 1.00 — nudge TAG genuinely tight-aggressive (~30% VPIP, not ~40%)
   LAG: 0.86,
   MANIAC: 0.60,
   CALLING_STATION: 0.80,
