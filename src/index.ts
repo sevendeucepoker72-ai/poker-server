@@ -68,6 +68,7 @@ import {
   approveMember,
   removeMember,
   promoteToManager,
+  demoteToMember,
   createClubTable,
   getClubTables,
   updateClubSettings,
@@ -726,6 +727,14 @@ function blockedByMaintenance(socket: Socket): boolean {
   socket.emit('maintenanceMode', { enabled: true });
   socket.emit('error', { message: 'The server is under maintenance. New games are paused — please try again shortly.' });
   return true;
+}
+
+// 2026-07-07 gap-fill — the admin UI copy claims maintenance "blocks new logins",
+// but nothing enforced it. This gates the LOGIN handlers: when maintenance is on,
+// non-admins are refused a session (admins always get in so they can turn it off
+// again — fail-open for admins, fail-closed for everyone else).
+function maintenanceBlocksLogin(isAdmin: boolean): boolean {
+  return maintenanceMode && !isAdmin;
 }
 
 // Resolve the REAL client IP. Railway (and most PaaS) put an edge proxy in
@@ -4587,6 +4596,13 @@ Give feedback in this JSON format:
         return;
       }
 
+      // 2026-07-07 gap-fill — enforce maintenance mode on login (admins exempt).
+      if (maintenanceBlocksLogin(!!oauthResult.isAdmin)) {
+        socket.emit('loginResult', { success: false, error: 'The server is under maintenance. Please try again shortly.' });
+        socket.emit('maintenanceMode', { enabled: true });
+        return;
+      }
+
       const displayName = oauthResult.username || String(phone);
 
       // Upsert local poker-server user keyed on phone (= username column).
@@ -4779,6 +4795,12 @@ Give feedback in this JSON format:
       reportAuthEvent('introspection_failed', { error: oauthResult.error || 'invalid', via: 'tokenLogin' });
     }
     if (oauthResult.valid && oauthResult.sub) {
+      // 2026-07-07 gap-fill — enforce maintenance mode (admins exempt).
+      if (maintenanceBlocksLogin(!!oauthResult.isAdmin)) {
+        socket.emit('tokenLoginResult', { success: false, message: 'The server is under maintenance. Please try again shortly.' });
+        socket.emit('maintenanceMode', { enabled: true });
+        return;
+      }
       // H2 fix (2026-07-01 audit): resolve the LOCAL user by phone/username
       // (upsert), NOT parseInt(sub). The OAuth `sub` is the MASTER users.id (a
       // UUID); parseInt(sub) reinterpreted its leading digits as a LOCAL integer
@@ -5104,10 +5126,24 @@ Give feedback in this JSON format:
     const memUsage = process.memoryUsage();
     const memMB = (memUsage.heapUsed / 1024 / 1024).toFixed(1);
 
+    // 2026-07-07 gap-fill — include a `tables` array. AdminDashboard reads
+    // data.tables to populate the Force-Close-Table picker; it was never sent,
+    // so the panel always showed "No active tables" and force-close (a real,
+    // working handler) was unreachable. `id` is what the force-close button
+    // passes back as tableId.
+    const adminTableList = tableManager.getTableList();
     socket.emit('adminStats', {
       totalUsers: await getTotalUsers(),
       activeConnections: io.engine.clientsCount,
-      tablesRunning: tableManager.getTableList().length,
+      tablesRunning: adminTableList.length,
+      tables: adminTableList.map((t) => ({
+        id: t.tableId,
+        name: t.tableName,
+        players: t.playerCount,
+        blinds: `${t.smallBlind}/${t.bigBlind}`,
+        variant: t.variantName,
+        isTournament: tournamentTables.has(t.tableId),
+      })),
       handsPlayedToday,
       uptime: `${hours}h ${mins}m`,
       memoryUsage: `${memMB} MB`,
@@ -5458,10 +5494,10 @@ Give feedback in this JSON format:
   // ── Promotions (server-persisted; was client sessionStorage only) ──
   const emitPromotions = async (sock: Socket) => {
     const { rows } = await getPool().query(
-      `SELECT id, name, description, start_date, end_date, created_at FROM online_promotions ORDER BY created_at DESC LIMIT 200`
+      `SELECT id, name, description, color, start_date, end_date, created_at FROM online_promotions ORDER BY created_at DESC LIMIT 200`
     );
     sock.emit('adminPromotions', rows.map((r: any) => ({
-      id: r.id, name: r.name, description: r.description || '',
+      id: r.id, name: r.name, description: r.description || '', color: r.color || '',
       startDate: r.start_date || '', endDate: r.end_date || '',
     })));
   };
@@ -5472,22 +5508,26 @@ Give feedback in this JSON format:
     try { await emitPromotions(socket); } catch { socket.emit('adminPromotions', []); }
   });
 
-  socket.on('savePromotion', async (data: { id?: number | string; name: string; description?: string; startDate?: string; endDate?: string }) => {
+  socket.on('savePromotion', async (data: { id?: number | string; name: string; description?: string; color?: string; startDate?: string; endDate?: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
     const name = String(data?.name || '').trim();
     if (!name) { socket.emit('error', { message: 'Promotion name required' }); return; }
+    // 2026-07-07 gap-fill — persist the admin-chosen color (was dropped at every
+    // hop). Sanitize to a hex value since it's rendered as a CSS style (avoid
+    // CSS/style injection from the admin form); fall back to '' if not hex.
+    const color = /^#[0-9A-Fa-f]{3,8}$/.test(String(data?.color || '')) ? String(data.color) : '';
     try {
       const numericId = typeof data.id === 'number' ? data.id : parseInt(String(data.id || ''), 10);
       if (Number.isFinite(numericId) && numericId > 0) {
         await getPool().query(
-          `UPDATE online_promotions SET name=$1, description=$2, start_date=$3, end_date=$4 WHERE id=$5`,
-          [name, data.description || '', data.startDate || null, data.endDate || null, numericId]
+          `UPDATE online_promotions SET name=$1, description=$2, color=$3, start_date=$4, end_date=$5 WHERE id=$6`,
+          [name, data.description || '', color, data.startDate || null, data.endDate || null, numericId]
         );
       } else {
         await getPool().query(
-          `INSERT INTO online_promotions (name, description, start_date, end_date, created_by) VALUES ($1,$2,$3,$4,$5)`,
-          [name, data.description || '', data.startDate || null, data.endDate || null, auth.userId]
+          `INSERT INTO online_promotions (name, description, color, start_date, end_date, created_by) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [name, data.description || '', color, data.startDate || null, data.endDate || null, auth.userId]
         );
       }
       auditLog(auth.username, 'ADMIN_SAVE_PROMOTION', { name });
@@ -5694,6 +5734,19 @@ Give feedback in this JSON format:
     const result = await promoteToManager(auth.userId, data.clubId, data.userId);
     if (result.success) {
       socket.emit('memberPromoted', { clubId: data.clubId, userId: data.userId });
+    } else {
+      socket.emit('error', { message: result.error });
+    }
+  });
+
+  // 2026-07-07 gap-fill — demote a manager back to member (owner-only; the
+  // reverse of promoteToManager, which had no counterpart).
+  socket.on('demoteToMember', async (data: { clubId: number; userId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
+    const result = await demoteToMember(auth.userId, data.clubId, data.userId);
+    if (result.success) {
+      socket.emit('memberDemoted', { clubId: data.clubId, userId: data.userId });
     } else {
       socket.emit('error', { message: result.error });
     }
@@ -6101,8 +6154,13 @@ Give feedback in this JSON format:
     }
     let prevBB = 0;
     for (const lvl of data.levels) {
-      const sb = Number(lvl?.sb);
-      const bb = Number(lvl?.bb);
+      // 2026-07-07 gap-fill — the client sends smallBlind/bigBlind (ClubsPanel
+      // builds levels with those keys), NOT sb/bb. Reading sb/bb yielded NaN, so
+      // Number.isInteger(NaN) was always false and EVERY custom blind-structure
+      // create was rejected with "Blind amounts must be integers". The DB fn
+      // already stores smallBlind/bigBlind correctly; only this read was wrong.
+      const sb = Number(lvl?.smallBlind);
+      const bb = Number(lvl?.bigBlind);
       const ante = Number(lvl?.ante || 0);
       if (!Number.isInteger(sb) || !Number.isInteger(bb) || !Number.isInteger(ante)) {
         socket.emit('error', { message: 'Blind amounts must be integers' }); return;
@@ -7809,6 +7867,14 @@ Give feedback in this JSON format:
             [phone, displayName, placeholderHash, JSON.stringify({ masterPhone: phone, masterUsername: masterUser.username, masterUserId: remoteUserId })]
           );
           localUser = rows[0];
+        }
+
+        // 2026-07-07 gap-fill — enforce maintenance mode on ticket login too
+        // (admins exempt; fail-closed for everyone else).
+        if (maintenanceBlocksLogin(!!localUser.is_admin)) {
+          socket.emit('loginResult', { success: false, error: 'The server is under maintenance. Please try again shortly.' });
+          socket.emit('maintenanceMode', { enabled: true });
+          return;
         }
 
         // 4. Set auth session + emit loginResult in the shape the client expects.
@@ -9667,6 +9733,12 @@ Give feedback in this JSON format:
 
     const result = progressionManager.purchaseTheme(ctx.playerId, data.themeId, cost);
     if (result.success) {
+      // 2026-07-07 gap-fill — PERSIST the purchase to user_inventory. Previously
+      // purchaseTheme only pushed the theme into the in-memory progressMap and
+      // charged stars in the DB, so on the next Railway restart/rehydrate
+      // (loadInventory reads item_type='theme') the paid-for theme vanished —
+      // stars gone, theme gone. grantItem is INSERT-ON-CONFLICT idempotent.
+      await dbGrantItem(ctx.userId, 'theme', data.themeId);
       socket.emit('themePurchased', { themeId: data.themeId });
     } else {
       socket.emit('error', { message: result.error || 'Purchase failed' });
@@ -9704,6 +9776,16 @@ Give feedback in this JSON format:
 
     const result = progressionManager.equipTheme(ctx.playerId, data.themeId);
     if (result.success) {
+      // 2026-07-07 gap-fill — PERSIST the equip to user_inventory (UPDATE
+      // equipped). equipTheme mutated only in-memory, so the equipped theme
+      // reverted on restart. grantItem first is a self-heal: a user who bought
+      // a theme BEFORE the purchase-persist fix has it in-memory but has no
+      // inventory row, so equipItem (which requires ownership) would no-op —
+      // granting first (idempotent) writes the row so their equip sticks.
+      // progressionManager.equipTheme already verified ownedThemes, so this
+      // can't equip an unowned theme.
+      await dbGrantItem(ctx.userId, 'theme', data.themeId);
+      await dbEquipItem(ctx.userId, 'theme', data.themeId);
       socket.emit('themeEquipped', { themeId: data.themeId });
     } else {
       socket.emit('error', { message: result.error || 'Equip failed' });

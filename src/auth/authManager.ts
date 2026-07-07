@@ -382,12 +382,16 @@ export async function initDB(): Promise<void> {
       id          SERIAL PRIMARY KEY,
       name        TEXT NOT NULL,
       description TEXT DEFAULT '',
+      color       TEXT DEFAULT '',
       start_date  TEXT,
       end_date    TEXT,
       created_by  INTEGER REFERENCES users(id),
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `).catch((e: any) => console.warn('[Auth] online_promotions:', e.message));
+  // 2026-07-07 gap-fill — back-add color for existing DBs (CREATE IF NOT EXISTS
+  // won't alter). The admin promo editor sets a color that was silently dropped.
+  await pool.query("ALTER TABLE online_promotions ADD COLUMN IF NOT EXISTS color TEXT DEFAULT ''").catch((e: any) => console.warn('[Auth] online_promotions color:', e.message));
 
   // Admin-authored qualifier configs (icon/color/stack/blinds/schedule) as a
   // single shared JSON blob. Previously client sessionStorage only, so a custom

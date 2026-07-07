@@ -824,6 +824,36 @@ export async function promoteToManager(
   return { success: true };
 }
 
+// 2026-07-07 gap-fill — the reverse of promoteToManager. Previously a
+// mis-promoted manager was permanent (no demote path existed anywhere).
+// Owner-only; refuses to demote the owner themselves.
+export async function demoteToMember(
+  ownerId: number,
+  clubId: number,
+  userId: number
+): Promise<{ success: boolean; error?: string }> {
+  const club = await getClubById(clubId);
+  if (!club) return { success: false, error: 'Club not found' };
+  if (club.ownerId !== ownerId) {
+    return { success: false, error: 'Only the club owner can demote managers' };
+  }
+  if (club.ownerId === userId) {
+    return { success: false, error: 'Cannot demote the club owner' };
+  }
+
+  const pool = getPool();
+  const result = await pool.query(
+    'UPDATE club_members SET role = $1 WHERE clubId = $2 AND userId = $3 AND status = $4',
+    ['member', clubId, userId, 'active']
+  );
+
+  if (result.rowCount === 0) {
+    return { success: false, error: 'Member not found or not active' };
+  }
+
+  return { success: true };
+}
+
 export async function createClubTable(
   managerId: number,
   clubId: number,
