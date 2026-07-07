@@ -2130,20 +2130,36 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   // genuinely voluntary action.
   const obsVpip = new Set<string>();
   const obsPfr = new Set<string>();
+  const obs3bet = new Set<string>();  // 2026-07-07: recorded face_3bet this hand
+  const obsCbet = new Set<string>();  // 2026-07-07: recorded face_cbet this hand
   let obsHand = -1;
   let preflopRaiseCount = 0; // preflop raises seen so far this hand (for 3-bet%)
+  let preflopAggressorSeat = -1; // 2026-07-07: last preflop raiser (c-bet detection)
+  let flopCbetterSeat = -1;      // 2026-07-07: seat that made the flop c-bet
   table.on('playerAction', (d: { seatIndex: number; action: PlayerAction; amount?: number }) => {
     const s = table.seats[d.seatIndex];
     if (!s || !s.playerName) return;
     const hn = table.handNumber;
-    if (hn !== obsHand) { obsHand = hn; obsVpip.clear(); obsPfr.clear(); preflopRaiseCount = 0; }
+    if (hn !== obsHand) {
+      obsHand = hn; obsVpip.clear(); obsPfr.clear(); obs3bet.clear(); obsCbet.clear();
+      preflopRaiseCount = 0; preflopAggressorSeat = -1; flopCbetterSeat = -1;
+    }
     recordOpponentObservation(s.playerName, 'hand_start', { handNumber: hn });
+    const a = d.action;
+    const aggressive = a === PlayerAction.Raise || a === PlayerAction.AllIn;
+
     if (table.currentPhase === GamePhase.PreFlop) {
-      const a = d.action;
-      const voluntary = a === PlayerAction.Call || a === PlayerAction.Raise || a === PlayerAction.AllIn;
-      const aggressive = a === PlayerAction.Raise || a === PlayerAction.AllIn;
+      const voluntary = a === PlayerAction.Call || aggressive;
       if (voluntary && !obsVpip.has(s.playerName)) { obsVpip.add(s.playerName); recordOpponentObservation(s.playerName, 'vpip'); }
       if (aggressive && !obsPfr.has(s.playerName)) { obsPfr.add(s.playerName); recordOpponentObservation(s.playerName, 'pfr'); }
+      // 2026-07-07: facing a 3-bet+ means ≥2 preflop raises are already in front
+      // of this player (open + reraise). Record the spot and whether they fold —
+      // this feeds categorizeOpponent's fold-to-3-bet read (was hardcoded 0.6).
+      if (preflopRaiseCount >= 2 && !obs3bet.has(s.playerName)) {
+        obs3bet.add(s.playerName);
+        recordOpponentObservation(s.playerName, 'face_3bet');
+        if (a === PlayerAction.Fold) recordOpponentObservation(s.playerName, 'fold_to_3bet');
+      }
       // 3-bet%: a prior preflop raise already in front = a 3-bet spot; raising
       // in that spot is a 3-bet+. preflopRaiseCount reflects raises BEFORE this
       // action (the event fires post-apply), so increment after evaluating.
@@ -2154,12 +2170,32 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
           progressionManager.recordPreflopRaiseContext(s.playerId, facingRaise, isReraise);
         }
       }
-      if (aggressive) preflopRaiseCount++;
+      if (aggressive) { preflopRaiseCount++; preflopAggressorSeat = d.seatIndex; }
+    } else if (table.currentPhase === GamePhase.Flop) {
+      // 2026-07-07: c-bet detection. The preflop aggressor's first flop bet is a
+      // c-bet; every later flop actor is "facing the c-bet" until it's resolved.
+      if (aggressive && flopCbetterSeat === -1 && d.seatIndex === preflopAggressorSeat) {
+        flopCbetterSeat = d.seatIndex;
+      } else if (flopCbetterSeat !== -1 && d.seatIndex !== flopCbetterSeat && !obsCbet.has(s.playerName)) {
+        obsCbet.add(s.playerName);
+        recordOpponentObservation(s.playerName, 'face_cbet');
+        if (a === PlayerAction.Fold) recordOpponentObservation(s.playerName, 'fold_to_cbet');
+      }
     }
   });
 
   table.on('handResult', async (data: { results: any[]; handNumber: number }) => {
     incrementHandsPlayed();
+    // 2026-07-07 AI overhaul: record a 'showdown' observation for every player
+    // who reached a CONTESTED showdown (didn't fold), completing the session
+    // opponent model. Read from the authoritative seat state before teardown.
+    if (table.wentToShowdown) {
+      for (const s of table.seats) {
+        if (s.state === 'occupied' && !s.folded && !s.eliminated && s.playerName) {
+          recordOpponentObservation(s.playerName, 'showdown');
+        }
+      }
+    }
     handleHandComplete(tableId, data.results);
     // Prediction games (3c): settle open market bets + spectator picks for
     // this hand from the AUTHORITATIVE final table state, then push results.
@@ -2435,18 +2471,47 @@ function scheduleAIAction(tableId: string): void {
           if (!drawTable.drawsCompleted.has(seat.seatIndex)) {
             const delay = 500 + Math.floor(Math.random() * 1000);
             setTimeout(() => {
-              // 2026-06-19 fix: discard the WORST cards deterministically (keep
-              // pairs/trips/quads, else keep the two highest), capped at 3.
-              // Previously this discarded a RANDOM count of the FIRST cards, so
-              // the bot's post-draw hand had nothing to do with its betting.
+              // 2026-06-19 fix: discard the WORST cards deterministically.
+              // 2026-07-07 fix: LOWBALL-aware. The old rule kept pairs + the two
+              // HIGHEST cards — correct for high draw, but exactly BACKWARDS for
+              // 2-7 triple draw and badugi (lowball), where low, unpaired,
+              // off-suit cards are best. The bots were drawing to the worst hands.
               const cards = seat.holeCards;
-              const byRank = new Map<number, number[]>();
-              cards.forEach((c: any, i: number) => { const a = byRank.get(c.rank) || []; a.push(i); byRank.set(c.rank, a); });
+              const variantId = ((drawTable as any).variantId as string) || '';
+              const isBadugi = variantId === 'badugi';
+              const isLowball = isBadugi || variantId === 'triple-draw';
               const keep = new Set<number>();
-              for (const idxs of byRank.values()) if (idxs.length >= 2) idxs.forEach((i) => keep.add(i));
-              if (keep.size === 0) {
-                // No made pair — keep the two highest cards, draw the other three.
-                [...cards.keys()].sort((a, b) => cards[b].rank - cards[a].rank).slice(0, 2).forEach((i) => keep.add(i));
+              if (isBadugi) {
+                // Badugi: keep a LOW, RAINBOW, distinct-rank subset (best = A-2-3-4,
+                // four suits). Ace plays low. Greedily take low cards with an
+                // unseen rank AND unseen suit; draw everything else.
+                const aceLow = (c: any) => (c.rank === 14 ? 1 : c.rank); // Ace plays LOW in badugi
+                const order = [...cards.keys()].sort((a, b) => aceLow(cards[a]) - aceLow(cards[b]));
+                const seenR = new Set<number>(), seenS = new Set<number>();
+                for (const i of order) {
+                  if (!seenR.has(cards[i].rank) && !seenS.has(cards[i].suit)) {
+                    keep.add(i); seenR.add(cards[i].rank); seenS.add(cards[i].suit);
+                  }
+                }
+              } else if (isLowball) {
+                // 2-7 triple draw: ace is HIGH, so aces/pairs/high cards are the
+                // WORST. Keep the lowest distinct-rank cards (up to 5), draw the rest.
+                const dVal = (c: any) => c.rank; // 2-7: Ace(14) is HIGH → sorts last (worst)
+                const order = [...cards.keys()].sort((a, b) => dVal(cards[a]) - dVal(cards[b]));
+                const seenR = new Set<number>();
+                for (const i of order) {
+                  if (keep.size >= 5) break;
+                  if (!seenR.has(cards[i].rank)) { keep.add(i); seenR.add(cards[i].rank); }
+                }
+              } else {
+                // High draw (five-card draw): keep pairs/trips/quads, else the two
+                // highest, draw the other three.
+                const byRank = new Map<number, number[]>();
+                cards.forEach((c: any, i: number) => { const a = byRank.get(c.rank) || []; a.push(i); byRank.set(c.rank, a); });
+                for (const idxs of byRank.values()) if (idxs.length >= 2) idxs.forEach((i) => keep.add(i));
+                if (keep.size === 0) {
+                  [...cards.keys()].sort((a, b) => cards[b].rank - cards[a].rank).slice(0, 2).forEach((i) => keep.add(i));
+                }
               }
               const indices: number[] = [...cards.keys()].filter((i) => !keep.has(i)).slice(0, 3);
               drawTable.playerDraw(seat.seatIndex, indices);

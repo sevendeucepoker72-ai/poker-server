@@ -2,6 +2,7 @@ import { Card, Rank, Suit } from '../game/Card';
 import { CardDeck } from '../game/CardDeck';
 import { evaluateHand, compareTo, HandRank, HandResult } from '../game/HandEvaluator';
 import { evaluateOmahaHand } from '../game/HandEvaluatorExtensions';
+import { percentileByRanks } from '../ai/preflopRanges';
 
 export interface TrainingData {
   equity: number; // 0-100 win probability
@@ -67,6 +68,38 @@ function shuffleArray<T>(arr: T[]): void {
   }
 }
 
+/** Evaluate a hand, upgrading the SHORT-DECK ace-low wheel A-6-7-8-9 to a
+ * 9-high straight (the standard evaluator only wheels A-2-3-4-5, which don't
+ * exist in short-deck). Only fires when the normal result is below a straight. */
+function evaluateMaybeShortDeck(cards: Card[], shortDeck: boolean): HandResult {
+  const r = evaluateHand(cards);
+  if (!shortDeck || r.handRank >= HandRank.Straight) return r;
+  const ranks = new Set(cards.map((c) => c.rank));
+  const hasWheel = ranks.has(Rank.Ace) && ranks.has(Rank.Six) && ranks.has(Rank.Seven) && ranks.has(Rank.Eight) && ranks.has(Rank.Nine);
+  if (!hasWheel) return r;
+  // Straight flush if the five wheel ranks share one suit.
+  const bySuit = new Map<number, Set<number>>();
+  for (const c of cards) { let s = bySuit.get(c.suit); if (!s) { s = new Set(); bySuit.set(c.suit, s); } s.add(c.rank); }
+  for (const [, rs] of bySuit) {
+    if (rs.has(Rank.Ace) && rs.has(Rank.Six) && rs.has(Rank.Seven) && rs.has(Rank.Eight) && rs.has(Rank.Nine)) {
+      return { handRank: HandRank.StraightFlush, primaryValue: Rank.Nine, kickers: [], bestFiveCards: [], handName: '9-high Straight Flush' };
+    }
+  }
+  return { handRank: HandRank.Straight, primaryValue: Rank.Nine, kickers: [], bestFiveCards: [], handName: '9-high Straight' };
+}
+
+/** Compare two hands, applying the short-deck rule that a FLUSH beats a FULL
+ * HOUSE (the only ranking swap vs standard Hold'em). */
+function compareShortDeck(a: HandResult, b: HandResult, shortDeck: boolean): number {
+  if (shortDeck) {
+    const aF = a.handRank === HandRank.Flush, aFH = a.handRank === HandRank.FullHouse;
+    const bF = b.handRank === HandRank.Flush, bFH = b.handRank === HandRank.FullHouse;
+    if (aF && bFH) return 1;
+    if (aFH && bF) return -1;
+  }
+  return compareTo(a, b);
+}
+
 /**
  * Monte Carlo equity calculation.
  * Runs 500 simulations to estimate win probability.
@@ -78,12 +111,25 @@ export function calculateEquity(
   // 2026-06-19: Omaha awareness (default false → unchanged Hold'em path). Omaha
   // uses exactly-2-hole + 3-board and 4-card opponents; the old any-5/2-card
   // model made Omaha equity meaningless.
-  omaha: boolean = false
+  omaha: boolean = false,
+  // 2026-07-07 AI overhaul: RANGE-AWARE equity. When > 0, each opponent's hole
+  // cards are reject-sampled to a hand with preflop percentile >= oppMinPctile,
+  // instead of a uniformly-random hand. This models the fact that an opponent
+  // who has bet/raised has a STRONGER-than-random range, so the bot no longer
+  // systematically over-estimates its equity against aggression. Hold'em only
+  // (Omaha keeps the 4-random-card model). Default 0 = unchanged random-range.
+  oppMinPctile: number = 0,
+  // 2026-07-07 AI overhaul: SHORT-DECK (6+ Hold'em). Removes 2-5 (36-card deck)
+  // so straight/flush frequencies are realistic, and applies the short-deck rule
+  // that a FLUSH beats a FULL HOUSE. Was previously mis-modeled on a full 52-card
+  // deck with standard rankings, making short-deck equity simply wrong.
+  shortDeck: boolean = false
 ): number {
   if (holeCards.length < 2) return 50;
   if (numOpponents < 1) return 100;
 
   const NUM_SIMULATIONS = 500;
+  const narrow = oppMinPctile > 0 && !omaha;
   let wins = 0;
   let ties = 0;
 
@@ -92,9 +138,9 @@ export function calculateEquity(
   for (const c of holeCards) knownSet.add(cardKey(c));
   for (const c of communityCards) knownSet.add(cardKey(c));
 
-  // Build remaining deck
+  // Build remaining deck (short-deck excludes ranks below Six).
   const fullDeck = buildFullDeck();
-  const remainingDeck = fullDeck.filter((c) => !knownSet.has(cardKey(c)));
+  const remainingDeck = fullDeck.filter((c) => !knownSet.has(cardKey(c)) && (!shortDeck || c.rank >= Rank.Six));
 
   const communityNeeded = 5 - communityCards.length;
   const holePerOpp = omaha ? 4 : 2;
@@ -114,23 +160,57 @@ export function calculateEquity(
       simCommunity.push(remainingDeck[idx++]);
     }
 
-    // Evaluate player's hand (Omaha uses the 2-of-hole + 3-of-board evaluator)
+    // Evaluate player's hand (Omaha uses the 2-of-hole + 3-of-board evaluator;
+    // short-deck upgrades the A-6-7-8-9 wheel to a straight).
     const playerResult = omaha
       ? evaluateOmahaHand(holeCards, simCommunity)
-      : evaluateHand([...holeCards, ...simCommunity]);
+      : evaluateMaybeShortDeck([...holeCards, ...simCommunity], shortDeck);
 
     // Deal and evaluate opponent hands
     let playerWins = true;
     let isTie = false;
 
     for (let opp = 0; opp < numOpponents; opp++) {
+      if (narrow) {
+        // Reject-sample a 2-card combo from the undealt tail whose preflop
+        // percentile meets the opponent's assumed range floor. Two-swap
+        // select-to-front keeps the deck a valid permutation; bounded attempts
+        // avoid a pathological loop when the range is very tight.
+        const len = remainingDeck.length;
+        let qualified = false;
+        for (let t = 0; t < 32; t++) {
+          const i = idx + Math.floor(Math.random() * (len - idx));
+          const tmp1 = remainingDeck[idx]; remainingDeck[idx] = remainingDeck[i]; remainingDeck[i] = tmp1;
+          const j = (idx + 1) + Math.floor(Math.random() * (len - idx - 1));
+          const tmp2 = remainingDeck[idx + 1]; remainingDeck[idx + 1] = remainingDeck[j]; remainingDeck[j] = tmp2;
+          const c1 = remainingDeck[idx], c2 = remainingDeck[idx + 1];
+          if (percentileByRanks(c1.rank, c2.rank, c1.suit === c2.suit) >= oppMinPctile) { qualified = true; break; }
+        }
+        // 2026-07-07 review fix: if 32 tries never met a very tight range floor,
+        // do NOT leave the last RANDOM pair (that biases our equity UPWARD, since
+        // a random hand is weaker than the tight range we're supposed to face).
+        // Instead approximate the tight range with the two HIGHEST cards in the
+        // tail — a strong high-card hand — which is directionally correct.
+        if (!qualified) {
+          let hi1 = idx, hi2 = idx + 1;
+          if (remainingDeck[hi2].rank > remainingDeck[hi1].rank) { const s = hi1; hi1 = hi2; hi2 = s; }
+          for (let k = idx + 2; k < len; k++) {
+            if (remainingDeck[k].rank > remainingDeck[hi1].rank) { hi2 = hi1; hi1 = k; }
+            else if (remainingDeck[k].rank > remainingDeck[hi2].rank) { hi2 = k; }
+          }
+          // Place the two highest at idx, idx+1 (two-step swap; keep hi2 valid).
+          const a = remainingDeck[idx]; remainingDeck[idx] = remainingDeck[hi1]; remainingDeck[hi1] = a;
+          if (hi2 === idx) hi2 = hi1;
+          const b = remainingDeck[idx + 1]; remainingDeck[idx + 1] = remainingDeck[hi2]; remainingDeck[hi2] = b;
+        }
+      }
       const oppHole: Card[] = [];
       for (let h = 0; h < holePerOpp; h++) oppHole.push(remainingDeck[idx++]);
       const oppResult = omaha
         ? evaluateOmahaHand(oppHole, simCommunity)
-        : evaluateHand([...oppHole, ...simCommunity]);
+        : evaluateMaybeShortDeck([...oppHole, ...simCommunity], shortDeck);
 
-      const cmp = compareTo(playerResult, oppResult);
+      const cmp = compareShortDeck(playerResult, oppResult, shortDeck);
       if (cmp < 0) {
         playerWins = false;
         isTie = false;

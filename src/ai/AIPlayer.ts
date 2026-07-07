@@ -3,6 +3,11 @@ import { evaluateHand, compareTo, HandRank, HandResult } from '../game/HandEvalu
 import { evaluateOmahaHand } from '../game/HandEvaluatorExtensions';
 import { PokerTable, Seat, PlayerAction, GamePhase } from '../game/PokerTable';
 import { calculateEquity } from '../training/TrainingEngine';
+import {
+  getPreflopPercentile, posBucket, PosBucket,
+  OPEN_THRESHOLD, THREEBET_THRESHOLD, FOURBET_THRESHOLD, CALL_VS_RAISE_THRESHOLD,
+  ARCHETYPE_RANGE_FACTOR, adjustThreshold,
+} from './preflopRanges';
 
 export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
 export type Personality =
@@ -170,7 +175,11 @@ function analyzeBoardTexture(community: Card[]): BoardTexture {
 
   const hasHighCards = ranks.some(r => r >= Rank.King);
   const isWet = (isConnected || isTwoTone || isMonotone) && !isPaired;
-  const isDry = !isWet && isPaired;
+  // 2026-07-07 fix: a board is either wet (draw-heavy) or dry (static). The old
+  // `!isWet && isPaired` left the most common flop — a dry unpaired rainbow —
+  // as NEITHER, so every `board.isDry` branch (dry-board bluffs/sizing) silently
+  // skipped it. Dry now correctly means "not wet".
+  const isDry = !isWet;
 
   return {
     isPaired, isMonotone, isTwoTone, isConnected,
@@ -226,10 +235,63 @@ function chenFormulaScore(holeCards: Card[]): number {
   return Math.max(0, score);
 }
 
-// Normalize chen score to 0-1 range (max chen ≈ 20 for AA)
+// 2026-07-07 AI overhaul: preflop strength is now a real, equity-ranked range
+// PERCENTILE (1.0 = AA, ~0.85 = top 15%) instead of the old chen/20 heuristic
+// that compressed every non-AA hand. All preflop thresholds are on this same
+// percentile scale, so "open the top 15%" is literally `pctile >= 0.85`. The
+// chen formula is kept as a cheap fallback for the rare pre-table-warm call.
 function getPreFlopHandRank(holeCards: Card[]): number {
-  const chen = chenFormulaScore(holeCards);
-  return Math.min(1.0, chen / 20);
+  const p = getPreflopPercentile(holeCards);
+  if (p > 0) return p;
+  return Math.min(1.0, chenFormulaScore(holeCards) / 20);
+}
+
+// 2026-07-07 AI overhaul: Omaha preflop strength (4 hole cards). Omaha value
+// comes from PAIRS (especially high), being DOUBLE-SUITED, and CONNECTEDNESS
+// (rundowns), plus broadway content — trips/quads in hand are BAD (dead cards).
+// Replaces feeding Omaha hands into the 2-card Chen formula, which ignored two
+// of the four cards. Returns 0..1 (calibrated to the same rough scale as the
+// Hold'em percentile so the shared preflop thresholds still apply).
+function getOmahaPreflopStrength(hole: Card[]): number {
+  if (!hole || hole.length < 4) {
+    return hole && hole.length >= 2 ? getPreFlopHandRank(hole.slice(0, 2)) : 0.3;
+  }
+  const ranks = hole.map((c) => c.rank).sort((a, b) => b - a);
+  const rc = new Map<number, number>();
+  for (const r of ranks) rc.set(r, (rc.get(r) || 0) + 1);
+  const sc = new Map<number, number>();
+  for (const c of hole) sc.set(c.suit, (sc.get(c.suit) || 0) + 1);
+
+  let score = 0.30;
+  // Pairs: high pairs premium; trips/quads = wasted cards.
+  for (const [rank, count] of rc) {
+    if (count === 2) score += 0.02 + (rank / 14) * 0.20;
+    else if (count >= 3) score -= 0.12;
+  }
+  // Suitedness: double-suited is best; too many of one suit blocks own flushes.
+  const suitCounts = [...sc.values()].sort((a, b) => b - a);
+  if (suitCounts[0] === 2 && suitCounts[1] === 2) score += 0.14;
+  else if (suitCounts[0] === 2) score += 0.06;
+  else if (suitCounts[0] >= 3) score -= 0.06;
+  for (const [suit, cnt] of sc) {
+    if (cnt >= 2 && hole.some((c) => c.suit === suit && c.rank === Rank.Ace)) { score += 0.05; break; }
+  }
+  // Connectedness (rundowns).
+  const uniq = [...new Set(ranks)].sort((a, b) => a - b);
+  if (uniq.length >= 3) {
+    const span = uniq[uniq.length - 1] - uniq[0];
+    if (span <= 3) score += 0.14;
+    else if (span <= 5) score += 0.08;
+    else if (span <= 8) score += 0.03;
+  }
+  score += ranks.filter((r) => r >= Rank.Ten).length * 0.02;
+  // 2026-07-07 review fix: calibrate onto the Hold'em PERCENTILE scale the shared
+  // preflop thresholds expect. Omaha equities run closer together (ranges are
+  // wider), so a linear stretch lifts strong PLO hands above the open thresholds:
+  // AAKKds→~1.0, AKQJds→~0.92 (EP-open), big rundowns→~0.77 (CO/MP), KKxx→~0.73
+  // (CO/BTN), junk→~0.45 (fold). Without this, only aces cleared EP/MP and Omaha
+  // bots massively over-folded out of position.
+  return Math.max(0.10, Math.min(1, score * 1.15 + 0.10));
 }
 
 /**
@@ -307,7 +369,13 @@ function getPostFlopStrength(
   // 2026-06-19: Omaha awareness (default false → unchanged Hold'em path). Omaha
   // REQUIRES exactly 2 hole + 3 board, so the old any-5-of-9 made bots evaluate
   // their Omaha hands as far too strong.
-  isOmaha: boolean = false
+  isOmaha: boolean = false,
+  // 2026-07-07 AI overhaul: opponents' assumed range floor (preflop percentile).
+  // Threaded into calculateEquity so equity is computed vs a realistic (action-
+  // narrowed) range instead of vs uniformly-random hands.
+  oppMinPctile: number = 0,
+  // 2026-07-07: short-deck (6+ Hold'em) — 36-card deck + flush > full house.
+  shortDeck: boolean = false
 ): number {
   // Expert and Hard AI use actual Monte Carlo equity (but fewer sims for speed)
   if (difficulty === 'expert' || difficulty === 'hard') {
@@ -315,7 +383,9 @@ function getPostFlopStrength(
       holeCards,
       communityCards,
       numOpponents,
-      isOmaha
+      isOmaha,
+      oppMinPctile,
+      shortDeck
     );
     return equity / 100; // normalize to 0-1
   }
@@ -460,49 +530,43 @@ function getGTOBetSize(
 ): number {
   const minBet = bigBlind * 2;
 
-  // Polarized sizing: bet big with strong hands and bluffs, small with medium
-  let potFraction: number;
+  // 2026-07-07 AI overhaul — DE-CORRELATED sizing. The old code mapped strength
+  // almost 1:1 to size (small = a medium hand, big = strong/bluff), so a human
+  // could read the bet size. Real solvers use a small DISCRETE MENU of sizes and
+  // put value, bluffs AND merges through the SAME sizes, with mixing — so the
+  // size no longer reveals the hand. We pick a menu index biased by strength but
+  // with a genuine ±1 random walk, so strong hands sometimes bet small (trap /
+  // merge) and medium hands sometimes bet big — breaking the tell.
+  const MENU = [0.33, 0.5, 0.66, 0.85, 1.15]; // small → overbet
+  // Value (strong) and bluffs both center on the big sizes (polarized); merges
+  // (medium) center small.
+  let center: number;
+  if (handStrength > 0.82) center = 3;        // strong → ~85% pot
+  else if (handStrength > 0.55) center = 1;   // medium/merge → ~50% pot
+  else center = 3;                            // bluff → mirrors value (polarized)
+  const r = Math.random();
+  let idx = center;
+  if (r < 0.20) idx = Math.max(0, center - 1);
+  else if (r > 0.80) idx = Math.min(MENU.length - 1, center + 1);
+  // Overbet (idx 4) only for genuinely strong + aggressive personalities.
+  if (idx >= 4 && !(handStrength > 0.82 && profile.aggressionFactor > 2)) idx = 3;
+  let potFraction = MENU[idx] * (0.9 + Math.random() * 0.2); // ±10% jitter
 
-  if (handStrength > 0.85) {
-    // Very strong: overbet for value (sometimes)
-    if (Math.random() < 0.25 && profile.aggressionFactor > 2) {
-      potFraction = 1.25 + Math.random() * 0.5; // 125-175% pot overbet
-    } else {
-      potFraction = 0.66 + Math.random() * 0.34; // 66-100% pot
-    }
-  } else if (handStrength > 0.7) {
-    // Strong: standard value bet
-    potFraction = 0.55 + Math.random() * 0.2; // 55-75% pot
-  } else if (handStrength > 0.5) {
-    // Medium: smaller bet to control pot, or check sometimes
-    potFraction = 0.33 + Math.random() * 0.17; // 33-50% pot
-  } else {
-    // Bluff/semi-bluff: use same sizing as value bets (balanced)
-    potFraction = 0.55 + Math.random() * 0.2; // 55-75% pot (mirrors value range)
-  }
+  // Board texture: bigger on wet (deny equity), a touch smaller on dry/static.
+  if (board.isWet) potFraction *= 1.12;
+  else potFraction *= 0.92;
 
-  // Board texture adjustments
-  if (board.isWet) {
-    // Wet boards: bet bigger to deny equity
-    potFraction *= 1.15;
-  } else if (board.isDry) {
-    // Dry boards: smaller bets work
-    potFraction *= 0.85;
-  }
-
-  // Phase adjustments
+  // River: polarize a little more (big or small, less medium).
   if (phase === GamePhase.River) {
-    // River: polarize more (big or small, no medium)
-    if (handStrength > 0.75) potFraction *= 1.2;
-    else potFraction *= 0.8;
+    if (handStrength > 0.75) potFraction *= 1.15;
+    else potFraction *= 0.85;
   }
 
-  // Personality adjustment
-  potFraction *= 0.7 + profile.aggressionFactor * 0.15;
+  // Personality scale (aggressive players size up).
+  potFraction *= 0.8 + profile.aggressionFactor * 0.12;
 
   let betSize = Math.max(minBet, roundToBB(Math.round(potSize * potFraction), bigBlind));
   betSize = Math.min(betSize, chipStack);
-
   return betSize;
 }
 
@@ -668,6 +732,24 @@ export function decideAction(
   // ============================================================
   // Hand strength evaluation
   // ============================================================
+  // 2026-07-07 AI overhaul: infer the opponents' RANGE FLOOR from their action
+  // so postflop equity is RANGE-AWARE, not "vs random hands". Aggression ⇒ a
+  // stronger-than-random range; a passive field ⇒ near-random. Session reads
+  // sharpen it: a known nit who bets is very strong; a station is wide.
+  const oppCategory = dominantOpponentCategory(table, seatIndex);
+  let oppMinPctile = 0;
+  if (!isPreFlop && !isStudFamily && !isDrawBet) {
+    if (opponents.raiseCount >= 2) oppMinPctile = 0.80;
+    else if (opponents.raiseCount === 1 || callAmount > bigBlind) oppMinPctile = 0.62;
+    else if (callAmount > 0) oppMinPctile = 0.45;
+    if (oppMinPctile > 0) {
+      if (oppCategory === 'nit') oppMinPctile = Math.min(0.92, oppMinPctile + 0.10);
+      else if (oppCategory === 'tag') oppMinPctile = Math.min(0.88, oppMinPctile + 0.05);
+      else if (oppCategory === 'station' || oppCategory === 'fish') oppMinPctile = Math.max(0, oppMinPctile - 0.22);
+      else if (oppCategory === 'maniac') oppMinPctile = Math.max(0, oppMinPctile - 0.15);
+    }
+  }
+
   let handStrength: number;
 
   if (isStudFamily || isDrawBet) {
@@ -675,18 +757,23 @@ export function decideAction(
     // on the variant's own evaluator (or a lowball-aware one for razz/badugi/2-7).
     handStrength = getVariantHandStrength(seat.holeCards, variantId, isLowball);
   } else if (isPreFlop) {
-    handStrength = getPreFlopHandRank(seat.holeCards);
+    // Omaha uses a 4-card preflop model; Hold'em uses the equity-ranked percentile.
+    handStrength = /omaha/i.test(variantId)
+      ? getOmahaPreflopStrength(seat.holeCards)
+      : getPreFlopHandRank(seat.holeCards);
   } else {
     handStrength = getPostFlopStrength(
       seat.holeCards, table.communityCards, numOpponents, profile.difficulty,
-      /omaha/i.test(variantId)
+      /omaha/i.test(variantId), oppMinPctile, /short|six.?plus|6.?plus/i.test(variantId)
     );
   }
 
-  // Position multiplier (more refined than before)
+  // Position: postflop keeps the 0.88(EP)→1.12(LP) nudge. Preflop position is
+  // handled by position-bucketed range thresholds in preFlopStrategy (percentile
+  // scale), so don't ALSO scale the percentile there.
   const relativePosition = totalActive > 1 ? myPosition / (totalActive - 1) : 0.5;
-  const positionMult = 0.88 + relativePosition * 0.24; // 0.88 EP to 1.12 LP
-  handStrength *= positionMult;
+  const positionMult = 0.88 + relativePosition * 0.24;
+  if (!isPreFlop) handStrength *= positionMult;
   if (!isFinite(handStrength)) handStrength = 0.3;
 
   // Difficulty-based noise (expert has almost none)
@@ -709,8 +796,13 @@ export function decideAction(
   // comparison in the strategy blocks below.
   handStrength = isFinite(handStrength) ? Math.max(0, Math.min(1, handStrength)) : 0.3;
 
-  // Adjust hand strength with implied odds for drawing hands
-  const effectiveStrength = handStrength + impliedOdds;
+  // 2026-07-07 fix: for the Monte-Carlo tiers (hard/expert) equity ALREADY
+  // prices in hitting the draw, so adding full implied odds double-counted it
+  // and made bots call too wide with draws. Keep only the "extra money when I
+  // hit" premium there; easy/medium (static made-hand lookup, no draw awareness)
+  // still get the full draw bonus so they don't misprice draws entirely.
+  const mcTier = profile.difficulty === 'expert' || profile.difficulty === 'hard';
+  const effectiveStrength = handStrength + impliedOdds * (mcTier ? 0.35 : 1.0);
 
   // ============================================================
   // Expert-level adjustments
@@ -753,7 +845,7 @@ export function decideAction(
   // ============================================================
   return postFlopStrategy(
     effectiveStrength, handStrength, callAmount, totalPot, potOdds,
-    seat, table, profile, board, opponents, outs, bigBlind, numOpponents
+    seat, table, profile, board, opponents, outs, bigBlind, numOpponents, oppCategory
   );
 }
 
@@ -773,235 +865,150 @@ function preFlopStrategy(
   opponents: OpponentModel,
   bigBlind: number
 ): AIDecision {
+  // 2026-07-07 AI overhaul: `handStrength` is now a real preflop PERCENTILE
+  // (1.0 = AA, 0.85 = top 15%). Thresholds come from the solver-sized position
+  // ranges (preflopRanges.ts), archetype-widened by ARCHETYPE_RANGE_FACTOR and
+  // stack-adjusted by getStackDepthMultiplier — so the personalities derive from
+  // ONE principled range instead of scattered magic literals, short stacks
+  // tighten, and the vestigial openLimpFreq knob now actually matters.
   const params = ARCHETYPE_PARAMS[profile.archetype];
+  const pctile = handStrength;
+  const bucket = posBucket(position, totalActive);
+  const factor = ARCHETYPE_RANGE_FACTOR[profile.archetype] ?? 1.0;
+  const effBB = getEffectiveStackBB(table, seat.seatIndex);
+  const stackMult = getStackDepthMultiplier(effBB);
+  const huFactor = totalActive <= 2 ? 0.55 : 1.0; // heads-up plays FAR wider
+  const facingRaise = callAmount > bigBlind;
+  const facingThreeBet = opponents.raiseCount >= 2;
+  const minRaise = table.getMinRaise();
 
-  // ============================================================
-  // ARCHETYPE-SPECIFIC PREFLOP BRANCHES
-  // Each archetype gets a fundamentally different decision tree.
-  // ============================================================
+  // Model-derived, archetype/stack/heads-up-adjusted thresholds (percentile scale).
+  const openTh = adjustThreshold(adjustThreshold(adjustThreshold(OPEN_THRESHOLD[bucket], factor), stackMult), huFactor);
+  const threeBetTh = adjustThreshold(adjustThreshold(THREEBET_THRESHOLD[bucket], factor), huFactor);
+  const callVsRaiseTh = adjustThreshold(adjustThreshold(adjustThreshold(CALL_VS_RAISE_THRESHOLD[bucket], factor), stackMult), huFactor);
+  const fourBetTh = FOURBET_THRESHOLD;
 
-  // CALLING_STATION: never folds to a normal raise, calls everything but never raises
+  const raiseOrAllIn = (amount: number): AIDecision =>
+    Math.max(minRaise, amount) >= seat.chipCount
+      ? { action: PlayerAction.AllIn, raiseAmount: 0 }
+      : { action: PlayerAction.Raise, raiseAmount: Math.max(minRaise, amount) };
+
+  // ── Short-stack push/fold (≤ ~10bb effective): shove or fold, never limp. ──
+  // Shove range widens as the stack shrinks (Nash-lite). Stations still just call.
+  if (effBB <= 10 && profile.archetype !== 'CALLING_STATION') {
+    const shoveBase = effBB <= 5 ? 0.45 : effBB <= 7 ? 0.55 : 0.65; // top 55/45/35%
+    const shoveTh = adjustThreshold(adjustThreshold(shoveBase, factor), huFactor);
+    if (pctile >= shoveTh) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
+    if (callAmount >= seat.chipCount) {
+      return pctile >= adjustThreshold(0.55, factor)
+        ? { action: PlayerAction.AllIn, raiseAmount: 0 }
+        : { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+
+  // ── CALLING_STATION: calls almost everything, never raises. ──
   if (profile.archetype === 'CALLING_STATION') {
     if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
-    // Only fold to massive bets (> 30% of stack) AND a weak hand
-    if (callAmount > seat.chipCount * 0.30 && handStrength < 0.30) {
-      return { action: PlayerAction.Fold, raiseAmount: 0 };
+    if (callAmount > seat.chipCount * 0.30 && pctile < 0.35) return { action: PlayerAction.Fold, raiseAmount: 0 };
+    if (callAmount >= seat.chipCount) {
+      return pctile >= 0.40 ? { action: PlayerAction.AllIn, raiseAmount: 0 } : { action: PlayerAction.Fold, raiseAmount: 0 };
     }
-    if (callAmount >= seat.chipCount) return { action: PlayerAction.AllIn, raiseAmount: 0 };
     return { action: PlayerAction.Call, raiseAmount: 0 };
   }
 
-  // MANIAC: raises with anything, almost never just calls preflop
+  // ── MANIAC: raises/3-bets almost anything. ──
   if (profile.archetype === 'MANIAC') {
-    // Always raise/3-bet/4-bet unless hand is total trash (handStrength < 0.12)
-    const wantToRaise = handStrength >= 0.12 || Math.random() < 0.6;
-    if (wantToRaise) {
-      const sizeMult = 2.5 + Math.random() * 2.5; // 2.5x..5x BB
+    const wantRaise = pctile >= 0.15 || Math.random() < 0.55;
+    if (wantRaise) {
       const target = callAmount === 0
-        ? Math.round(bigBlind * sizeMult)
+        ? Math.round(bigBlind * (2.5 + Math.random() * 2.5))
         : Math.round(callAmount * (2.5 + Math.random() * 1.5));
-      const raiseAmount = Math.max(table.getMinRaise(), target);
-      if (raiseAmount >= seat.chipCount * 0.7) return { action: PlayerAction.AllIn, raiseAmount: 0 };
-      if (raiseAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount };
+      if (Math.max(minRaise, target) >= seat.chipCount * 0.7) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+      return raiseOrAllIn(target);
     }
     if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
-    return { action: PlayerAction.Fold, raiseAmount: 0 };
+    return pctile >= 0.30 ? { action: PlayerAction.Call, raiseAmount: 0 } : { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
-  // NIT: only premiums (top ~10%), folds to any 3-bet without aces/kings
-  if (profile.archetype === 'NIT') {
-    const NIT_OPEN = 0.78; // ~AQs+, TT+, AKo, JJ+
-    const NIT_CALL_RAISE = 0.85; // QQ+, AK
-    const NIT_4BET = 0.93; // KK+, AA only
-    if (callAmount === 0) {
-      if (handStrength >= NIT_OPEN) {
-        const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * 2.5));
-        return raiseAmount <= seat.chipCount
-          ? { action: PlayerAction.Raise, raiseAmount }
-          : { action: PlayerAction.AllIn, raiseAmount: 0 };
-      }
-      return { action: PlayerAction.Check, raiseAmount: 0 };
-    }
-    if (opponents.raiseCount >= 2 && handStrength < NIT_4BET) {
-      return { action: PlayerAction.Fold, raiseAmount: 0 };
-    }
-    if (handStrength >= NIT_4BET) {
-      return { action: PlayerAction.AllIn, raiseAmount: 0 };
-    }
-    if (handStrength >= NIT_CALL_RAISE) {
-      return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
-    return { action: PlayerAction.Fold, raiseAmount: 0 };
-  }
-
-  // ROCK: tight-passive, calls down with marginals, almost never raises preflop
-  if (profile.archetype === 'ROCK') {
-    if (callAmount === 0) {
-      if (handStrength >= 0.85) {
-        const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * 2.5));
-        return raiseAmount <= seat.chipCount
-          ? { action: PlayerAction.Raise, raiseAmount }
-          : { action: PlayerAction.AllIn, raiseAmount: 0 };
-      }
-      return { action: PlayerAction.Check, raiseAmount: 0 };
-    }
-    if (handStrength >= 0.50 && callAmount <= bigBlind * 4) {
-      return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
-    if (handStrength >= 0.85) {
-      return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
-    return { action: PlayerAction.Fold, raiseAmount: 0 };
-  }
-
-  // FISH: loose-passive, limps a lot, calls almost any raise with anything decent
+  // ── FISH: loose-passive; LIMPS its playables (openLimpFreq), calls too wide. ──
   if (profile.archetype === 'FISH') {
     if (callAmount === 0) {
-      // Often limp with marginal hands (very fishy behavior)
-      if (handStrength >= 0.85) {
-        const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * 3));
-        return raiseAmount <= seat.chipCount
-          ? { action: PlayerAction.Raise, raiseAmount }
-          : { action: PlayerAction.AllIn, raiseAmount: 0 };
-      }
-      if (handStrength >= 0.18) {
-        return { action: PlayerAction.Check, raiseAmount: 0 }; // limp
-      }
-      return { action: PlayerAction.Check, raiseAmount: 0 };
+      if (pctile >= openTh && Math.random() >= params.openLimpFreq) return raiseOrAllIn(Math.round(bigBlind * 3));
+      return { action: PlayerAction.Check, raiseAmount: 0 }; // limp / check back
     }
-    // 2026-06-11 audit M3: shove monsters FIRST. The `>= 0.60 → Call` below
-    // used to shadow this branch (0.88 is also >= 0.60), so the all-in was
-    // dead code and FISH never shoved a monster preflop.
-    if (handStrength >= 0.88) {
-      return { action: PlayerAction.AllIn, raiseAmount: 0 };
-    }
-    // Calls way too wide
-    if (handStrength >= 0.22 && callAmount <= seat.chipCount * 0.10) {
-      return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
-    if (handStrength >= 0.60) {
-      return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
+    if (pctile >= 0.90) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    if (pctile >= adjustThreshold(0.55, factor) && callAmount <= seat.chipCount * 0.12) return { action: PlayerAction.Call, raiseAmount: 0 };
+    if (pctile >= callVsRaiseTh) return { action: PlayerAction.Call, raiseAmount: 0 };
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
-  // LAG: 3-bets wide, raises in late position with anything decent
-  if (profile.archetype === 'LAG') {
-    const lagOpen = position >= totalActive - 3 ? 0.20 : 0.32;
-    const lag3Bet = 0.42;
+  // ── ROCK: tight-passive; calls down, almost never raises preflop. ──
+  if (profile.archetype === 'ROCK') {
     if (callAmount === 0) {
-      if (handStrength >= lagOpen) {
-        const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * (2.5 + Math.random() * 0.8)));
-        return raiseAmount <= seat.chipCount
-          ? { action: PlayerAction.Raise, raiseAmount }
-          : { action: PlayerAction.AllIn, raiseAmount: 0 };
-      }
+      if (pctile >= adjustThreshold(0.94, huFactor)) return raiseOrAllIn(Math.round(bigBlind * 2.5));
       return { action: PlayerAction.Check, raiseAmount: 0 };
     }
-    if (handStrength >= 0.85) {
-      return { action: PlayerAction.AllIn, raiseAmount: 0 };
-    }
-    if (opponents.raiseCount >= 2) {
-      // Facing 3-bet
-      if (handStrength >= 0.65) return { action: PlayerAction.Call, raiseAmount: 0 };
-      return { action: PlayerAction.Fold, raiseAmount: 0 };
-    }
-    if (handStrength >= lag3Bet) {
-      // 3-bet
-      const raiseAmount = roundToBB(Math.max(table.getMinRaise(), Math.round(callAmount * 3)), bigBlind);
-      if (raiseAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount };
-    }
-    if (handStrength >= 0.30) {
-      return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
+    if (pctile >= callVsRaiseTh) return { action: PlayerAction.Call, raiseAmount: 0 };
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
-  // TAG (default): falls through to existing GTO-leaning logic
-  const openRaiseThreshold = getOpenRaiseRange(position, totalActive);
-  const threeBetThreshold = get3BetRange(position);
+  // ── NIT: only premiums; folds to 3-bets without a 4-bet-worthy hand. ──
+  if (profile.archetype === 'NIT') {
+    if (callAmount === 0) {
+      if (pctile >= openTh) return raiseOrAllIn(Math.round(bigBlind * 2.5));
+      return { action: PlayerAction.Check, raiseAmount: 0 };
+    }
+    if (facingThreeBet && pctile < fourBetTh) return { action: PlayerAction.Fold, raiseAmount: 0 };
+    if (pctile >= fourBetTh) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    if (pctile >= threeBetTh) return { action: PlayerAction.Call, raiseAmount: 0 };
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
 
-  // No bet to match (we can check or open-raise)
+  // ── LAG / TAG (aggressive, range-based): the default balanced path. LAG's
+  // looser ARCHETYPE_RANGE_FACTOR automatically widens every threshold below. ──
+
+  // No bet to face: open-raise in range, else check.
   if (callAmount === 0) {
-    if (handStrength >= openRaiseThreshold) {
-      // Open raise: 2.5-3x BB from early, 2-2.5x from late
-      const raiseMult = position < 3 ? 2.5 + Math.random() * 0.5 : 2.0 + Math.random() * 0.5;
-      const raiseAmount = Math.max(table.getMinRaise(), Math.round(bigBlind * raiseMult));
-      if (raiseAmount <= seat.chipCount) {
-        return { action: PlayerAction.Raise, raiseAmount };
-      }
-      return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    if (pctile >= openTh) {
+      const mult = position < 3 ? 2.5 + Math.random() * 0.5 : 2.0 + Math.random() * 0.6;
+      return raiseOrAllIn(roundToBB(Math.round(bigBlind * mult), bigBlind));
     }
     return { action: PlayerAction.Check, raiseAmount: 0 };
   }
 
-  // Facing a raise
-  const facingRaise = callAmount > bigBlind;
-  const facingThreeBet = opponents.raiseCount >= 2;
-
+  // Facing a 3-bet+: 4-bet premiums, flat strong, occasional 4-bet-bluff (expert).
   if (facingThreeBet) {
-    // Facing 3-bet: need premium hands
-    if (handStrength >= 0.8) {
-      // 4-bet with premiums
-      const raiseAmount = Math.max(table.getMinRaise(), Math.round(totalPot * 2.2));
-      if (raiseAmount <= seat.chipCount) {
-        return { action: PlayerAction.Raise, raiseAmount };
-      }
-      return { action: PlayerAction.AllIn, raiseAmount: 0 };
-    }
-    if (handStrength >= 0.65) {
-      return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
-    // Occasional light 4-bet bluff (expert only)
+    if (pctile >= fourBetTh) return raiseOrAllIn(Math.round(totalPot * 2.2));
+    if (pctile >= threeBetTh) return { action: PlayerAction.Call, raiseAmount: 0 };
     if (profile.difficulty === 'expert' && Math.random() < profile.bluffFrequency * 0.3) {
-      const raiseAmount = Math.max(table.getMinRaise(), Math.round(totalPot * 2));
-      if (raiseAmount <= seat.chipCount * 0.3) {
-        return { action: PlayerAction.Raise, raiseAmount };
-      }
+      const target = Math.round(totalPot * 2.0);
+      if (Math.max(minRaise, target) <= seat.chipCount * 0.35) return raiseOrAllIn(target);
     }
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
+  // Facing a single raise: 3-bet, flat, or fold.
   if (facingRaise) {
-    // Facing single raise
-    if (handStrength >= threeBetThreshold) {
-      // 3-bet
-      const raiseAmount = roundToBB(Math.max(table.getMinRaise(), Math.round(callAmount * 3)), bigBlind);
-      if (raiseAmount <= seat.chipCount) {
-        return { action: PlayerAction.Raise, raiseAmount };
-      }
+    if (pctile >= threeBetTh) {
+      const target = roundToBB(Math.round(callAmount * 3), bigBlind);
+      return raiseOrAllIn(target);
     }
-    if (handStrength >= openRaiseThreshold * 0.85) {
+    if (pctile >= callVsRaiseTh) return { action: PlayerAction.Call, raiseAmount: 0 };
+    // Cheap speculative flat in late position.
+    if ((bucket === 'BTN' || bucket === 'CO') && pctile >= adjustThreshold(0.45, factor) && callAmount <= seat.chipCount * 0.06) {
       return { action: PlayerAction.Call, raiseAmount: 0 };
     }
-    // Consider calling with suited connectors in position
-    if (position >= totalActive - 2 && handStrength >= 0.25) {
-      if (callAmount <= seat.chipCount * 0.05) {
-        return { action: PlayerAction.Call, raiseAmount: 0 };
-      }
-    }
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
-  // Facing just the big blind (limp or raise)
-  if (handStrength >= openRaiseThreshold) {
-    const raiseMult = 2.5 + Math.random() * 0.5;
-    const raiseAmount = roundToBB(Math.max(table.getMinRaise(), Math.round(bigBlind * raiseMult)), bigBlind);
-    if (raiseAmount <= seat.chipCount) {
-      return { action: PlayerAction.Raise, raiseAmount };
-    }
+  // Facing only the big blind (limped pot / SB complete): raise in range, else complete/fold.
+  if (pctile >= openTh) {
+    const target = roundToBB(Math.round(bigBlind * (2.5 + Math.random() * 0.5)), bigBlind);
+    return raiseOrAllIn(target);
   }
-
-  // Limp with speculative hands in late position
-  if (position >= totalActive - 3 && handStrength >= 0.2) {
-    return { action: PlayerAction.Call, raiseAmount: 0 };
-  }
-
-  // VPIP threshold (personality-influenced)
-  if (handStrength >= 1.0 - profile.vpip) {
-    return { action: PlayerAction.Call, raiseAmount: 0 };
-  }
-
+  if (pctile >= callVsRaiseTh) return { action: PlayerAction.Call, raiseAmount: 0 };
   return { action: PlayerAction.Fold, raiseAmount: 0 };
 }
 
@@ -1022,27 +1029,23 @@ function postFlopStrategy(
   opponents: OpponentModel,
   outs: number,
   bigBlind: number,
-  numOpponents: number
+  numOpponents: number,
+  oppCategory: OpponentCategory
 ): AIDecision {
   const isRiver = table.currentPhase === GamePhase.River;
   const params = ARCHETYPE_PARAMS[profile.archetype];
+  const oppNames = getActiveOpponentNames(table, seat.seatIndex);
 
-  // ── AI intelligence upgrade: opponent-aware + multi-way bluff frequency ──
-  // Bluffing into more players is -EV, and into sticky (station/fish/maniac)
-  // pools it gets called down; foldy (nit/tag) pools can be attacked more. This
-  // is a graceful no-op until there's real data: with a single unknown opponent
-  // (mwAdj 1.0, oppBluffMult 1.0) effectiveBluffFreq === profile.bluffFrequency,
-  // so early play is unchanged. categorizeOpponent needs 10+ observed hands, fed
-  // by the session opponent model (recordOpponentObservation, index.ts).
-  const _mwAdj = getMultiWayAdjustment(numOpponents);
-  let _stickies = 0, _foldies = 0;
-  for (const _n of getActiveOpponentNames(table, seat.seatIndex)) {
-    const _c = categorizeOpponent(_n);
-    if (_c === 'station' || _c === 'fish' || _c === 'maniac') _stickies++;
-    else if (_c === 'nit' || _c === 'tag') _foldies++;
-  }
-  const _oppBluffMult = _stickies > _foldies ? 0.6 : (_foldies > _stickies ? 1.15 : 1.0);
-  const effectiveBluffFreq = Math.min(0.5, profile.bluffFrequency * _mwAdj.cbetMult * _oppBluffMult);
+  // 2026-07-07 AI overhaul — CROSS-STREET + EXPLOITATIVE reads:
+  //  • streetCaution: later-street bets mean a stronger (multi-barrel) range, so
+  //    require a touch more equity to continue (turn/river barrel respect).
+  //  • callDownAdj: the once-dead callDownTendency knob now actually widens/
+  //    narrows how light we call; we also call lighter vs a known maniac (bluffs).
+  //  • stickyPool/foldyPool drive exploitative value/bluff deviations below.
+  const streetCaution = isRiver ? 0.06 : (table.currentPhase === GamePhase.Turn ? 0.03 : 0);
+  const callDownAdj = (params.callDownTendency - 0.5) * 0.20 + (oppCategory === 'maniac' ? 0.10 : 0);
+  const stickyPool = oppCategory === 'station' || oppCategory === 'fish';
+  const foldyPool = oppCategory === 'nit' || oppCategory === 'tag';
 
   // ============================================================
   // ARCHETYPE-SPECIFIC POSTFLOP BRANCHES
@@ -1178,54 +1181,40 @@ function postFlopStrategy(
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
-  // TAG (default): existing GTO-leaning logic below
+  // TAG (default): balanced, adaptive, exploitative logic.
   // ============================================================
   // No bet to face: check or bet
   // ============================================================
   if (callAmount === 0) {
-    // Strong hand: bet for value
-    if (effectiveStrength > 0.65) {
-      const betSize = getGTOBetSize(
-        rawStrength, totalPot, bigBlind, seat.chipCount,
-        board, table.currentPhase, profile
-      );
-      const minRaise = table.getMinRaise();
-      if (betSize >= minRaise) {
-        return { action: PlayerAction.Raise, raiseAmount: betSize };
-      }
+    const minRaise = table.getMinRaise();
+    // Value bet — thinner vs sticky (station/fish) pools that call too much.
+    const valueTh = stickyPool ? 0.58 : 0.65;
+    if (effectiveStrength > valueTh) {
+      const betSize = getGTOBetSize(rawStrength, totalPot, bigBlind, seat.chipCount, board, table.currentPhase, profile);
+      if (betSize >= minRaise) return { action: PlayerAction.Raise, raiseAmount: betSize };
     }
 
-    // Medium hand: check (pot control)
+    // Medium hand: mostly pot-control, but take a THIN VALUE bet when the wired
+    // river logic says it's +EV (loose opponents, safe board, difficulty-scaled).
     if (effectiveStrength > 0.4) {
-      // Sometimes bet as a thin value bet (expert level)
-      if (profile.difficulty === 'expert' && Math.random() < 0.25) {
-        const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.33));
-        if (betSize <= seat.chipCount) {
-          return { action: PlayerAction.Raise, raiseAmount: betSize };
-        }
+      if (shouldThinValueBet(rawStrength, table.currentPhase, board, oppNames, profile)) {
+        const betSize = Math.max(minRaise, Math.round(totalPot * (0.33 + Math.random() * 0.12)));
+        if (betSize <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: betSize };
       }
       return { action: PlayerAction.Check, raiseAmount: 0 };
     }
 
-    // Weak hand: check or bluff (opponent- + multi-way-aware frequency)
-    if (Math.random() < effectiveBluffFreq) {
-      // Semi-bluff with draws
-      if (outs >= 8) {
-        const betSize = getGTOBetSize(
-          0.7, totalPot, bigBlind, seat.chipCount,
-          board, table.currentPhase, profile
-        );
-        const minRaise = table.getMinRaise();
-        if (betSize >= minRaise && betSize <= seat.chipCount * 0.4) {
-          return { action: PlayerAction.Raise, raiseAmount: betSize };
-        }
-      }
-      // Pure bluff on dry boards (expert/hard)
-      if (board.isDry && (profile.difficulty === 'expert' || profile.difficulty === 'hard')) {
-        const betSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.55));
-        if (betSize <= seat.chipCount * 0.25) {
-          return { action: PlayerAction.Raise, raiseAmount: betSize };
-        }
+    // Weak hand: BALANCED bluff decision (hand-strength band + board "story" +
+    // opponent pool aware). This wires shouldBluffBalanced as the real bluff
+    // engine, replacing the old raw coin-flip on effectiveBluffFreq.
+    if (shouldBluffBalanced(rawStrength, board, table.currentPhase, profile, oppNames)) {
+      // 2026-07-07 review fix: both map to getGTOBetSize's BIG (polarized) band,
+      // and the semi-bluff value (0.9) is additionally overbet-eligible, so
+      // semi-bluffs bet a touch bigger than pure bluffs (was inverted).
+      const bluffSizeStrength = outs >= 8 ? 0.9 : 0.5;
+      const betSize = getGTOBetSize(bluffSizeStrength, totalPot, bigBlind, seat.chipCount, board, table.currentPhase, profile);
+      if (betSize >= minRaise && betSize <= seat.chipCount * 0.5) {
+        return { action: PlayerAction.Raise, raiseAmount: betSize };
       }
     }
 
@@ -1233,80 +1222,58 @@ function postFlopStrategy(
   }
 
   // ============================================================
-  // Facing a bet: call, raise, or fold
+  // Facing a bet: call, raise, or fold (adaptive continue threshold)
   // ============================================================
+  const minRaise = table.getMinRaise();
+  // Continue threshold: later-street barrels earn more respect (streetCaution);
+  // callDownAdj widens it (high callDownTendency / vs a bluffy maniac); a foldy
+  // (nit/tag) pool that is BETTING has a stronger range, so tighten vs them.
+  const contTh = Math.max(0.25, 0.45 + streetCaution - callDownAdj + (foldyPool ? 0.06 : 0));
 
-  // All-in decision (calling would commit most of stack)
+  // All-in decision (calling would commit most of the stack).
   if (callAmount >= seat.chipCount * 0.6) {
-    if (effectiveStrength > 0.7) {
-      return { action: PlayerAction.AllIn, raiseAmount: 0 };
-    }
-    if (effectiveStrength > potOdds + 0.1) {
-      return { action: PlayerAction.AllIn, raiseAmount: 0 };
-    }
+    if (effectiveStrength > 0.72 + streetCaution) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    if (effectiveStrength > potOdds + 0.10 - callDownAdj) return { action: PlayerAction.AllIn, raiseAmount: 0 };
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
-  // Strong hand: raise (value raise or check-raise)
-  if (effectiveStrength > 0.75) {
-    const raiseSize = getGTOBetSize(
-      rawStrength, totalPot, bigBlind, seat.chipCount,
-      board, table.currentPhase, profile
-    );
-    const minRaise = table.getMinRaise();
+  // Strong hand: value-raise (thinner vs sticky pools that pay off light).
+  const valueRaiseTh = stickyPool ? 0.70 : 0.75;
+  if (effectiveStrength > valueRaiseTh) {
+    const raiseSize = getGTOBetSize(rawStrength, totalPot, bigBlind, seat.chipCount, board, table.currentPhase, profile);
     if (raiseSize >= minRaise && raiseSize + callAmount <= seat.chipCount) {
       return { action: PlayerAction.Raise, raiseAmount: Math.max(raiseSize, minRaise) };
     }
     return { action: PlayerAction.Call, raiseAmount: 0 };
   }
 
-  // Medium hand: call if pot odds are right
-  if (effectiveStrength > potOdds || effectiveStrength > 0.45) {
-    // But consider raising sometimes (merge/balanced)
+  // Medium hand: call if it clears pot odds OR the adaptive continue threshold.
+  if (effectiveStrength > potOdds || effectiveStrength > contTh) {
+    // Occasional merge/balanced raise with the top of the calling range.
     if (effectiveStrength > 0.6 && Math.random() < 0.3 * profile.aggressionFactor / 3) {
-      const raiseSize = roundToBB(Math.max(table.getMinRaise(), Math.round(totalPot * 0.6)), bigBlind);
-      // 2026-06-11 audit M5: raiseSize is the TOTAL bet (it already includes
-      // the call), so the old `raiseSize + callAmount` over-counted the cost
-      // and made the bot fold/call when it could afford the raise. Match the
-      // other raise sites, which gate on `raiseAmount <= chipCount`.
-      if (raiseSize <= seat.chipCount) {
-        return { action: PlayerAction.Raise, raiseAmount: raiseSize };
-      }
+      const raiseSize = roundToBB(Math.max(minRaise, Math.round(totalPot * 0.6)), bigBlind);
+      if (raiseSize <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
     return { action: PlayerAction.Call, raiseAmount: 0 };
   }
 
-  // Drawing hand: call if implied odds justify it
+  // Drawing hands: call on a price; semi-bluff-raise the biggest draws.
   if (outs >= 8 && !isRiver) {
-    // Flush/straight draw: call if getting at least 3:1
-    if (callAmount <= totalPot * 0.35) {
-      return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
-    // Semi-bluff raise with big draws
+    if (callAmount <= totalPot * 0.35) return { action: PlayerAction.Call, raiseAmount: 0 };
     if (outs >= 12 && Math.random() < profile.aggressionFactor * 0.2) {
-      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.7));
-      if (raiseSize + callAmount <= seat.chipCount * 0.4) {
-        return { action: PlayerAction.Raise, raiseAmount: raiseSize };
-      }
+      const raiseSize = Math.max(minRaise, Math.round(totalPot * 0.7));
+      if (raiseSize + callAmount <= seat.chipCount * 0.4) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
-    if (callAmount <= seat.chipCount * 0.1) {
-      return { action: PlayerAction.Call, raiseAmount: 0 };
-    }
+    if (callAmount <= seat.chipCount * 0.1) return { action: PlayerAction.Call, raiseAmount: 0 };
   }
+  if (outs >= 4 && !isRiver && callAmount <= totalPot * 0.2) return { action: PlayerAction.Call, raiseAmount: 0 };
 
-  // Gutshot or small draw on good price
-  if (outs >= 4 && !isRiver && callAmount <= totalPot * 0.2) {
-    return { action: PlayerAction.Call, raiseAmount: 0 };
-  }
-
-  // Bluff-raise (expert level, balanced frequency — opponent/multi-way-aware)
-  if (profile.difficulty === 'expert' && Math.random() < effectiveBluffFreq * 0.4) {
-    // Only bluff-raise on certain board textures
-    if (board.hasHighCards || board.isPaired) {
-      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.65));
-      if (raiseSize + callAmount <= seat.chipCount * 0.25) {
-        return { action: PlayerAction.Raise, raiseAmount: raiseSize };
-      }
+  // Balanced bluff-RAISE line, gated by shouldBluffBalanced — never into sticky
+  // pools, more vs foldy ones. Not on the river (no fold-equity draws left).
+  if (!isRiver && shouldBluffBalanced(rawStrength, board, table.currentPhase, profile, oppNames)) {
+    if (board.hasHighCards || board.isPaired || board.isDry) {
+      const raiseSize = Math.max(minRaise, Math.round(totalPot * 0.65));
+      if (raiseSize + callAmount <= seat.chipCount * 0.30) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
   }
 
@@ -1513,13 +1480,30 @@ export function getEffectiveStackBB(table: PokerTable, mySeat: number): number {
   return Math.max(1, Math.round(effective / bb));
 }
 
-/** Enumerate the non-folded opponent player names on a table. */
+/** Enumerate the non-folded opponent player names on a table.
+ * 2026-07-07: includes AI seats too (was humans-only), so bot-vs-bot tables
+ * also build reads and adapt to each other, not just humans. */
 export function getActiveOpponentNames(table: PokerTable, mySeat: number): string[] {
   const names: string[] = [];
   for (const s of table.seats) {
     if (s.seatIndex === mySeat) continue;
     if (s.state !== 'occupied' || s.folded || s.eliminated) continue;
-    if (!s.isAI && s.playerName) names.push(s.playerName);
+    if (s.playerName) names.push(s.playerName);
   }
   return names;
+}
+
+/**
+ * 2026-07-07 AI overhaul: the single most decision-relevant opponent category
+ * among the active opponents, preferring the strongest (foldiest→loosest) read.
+ * Used to make equity range-aware and to drive exploitative deviations.
+ */
+export function dominantOpponentCategory(table: PokerTable, mySeat: number): OpponentCategory {
+  const cats = getActiveOpponentNames(table, mySeat).map(categorizeOpponent);
+  // Priority: a known nit's aggression means the most; then tag; then the
+  // exploitable loose types; 'unknown' only if nothing else is known.
+  for (const want of ['nit', 'tag', 'lag', 'maniac', 'station', 'fish'] as OpponentCategory[]) {
+    if (cats.includes(want)) return want;
+  }
+  return 'unknown';
 }
