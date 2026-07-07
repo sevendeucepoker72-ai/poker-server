@@ -248,6 +248,10 @@ export class TournamentManager {
         maxPlayers: t.config.maxPlayers,
         registeredPlayers: t.players.length,
         status: t.status,
+        // 2026-07-07 gap-fill [15] — surface director pause state in the polled
+        // list so an admin watching from the LOBBY (not in the tournament's
+        // table room, where the tournamentPaused echo goes) still sees it.
+        paused: t.paused,
         nextStartTime: t.nextStartTime,
         currentBlinds: t.status === 'running' ? { sb: currentBlinds.sb, bb: currentBlinds.bb, ante: currentBlinds.ante } : null,
         blindLevel: t.currentBlindLevel + 1,
@@ -418,6 +422,12 @@ export class TournamentManager {
     const currentLevel = tournament.config.blindLevels[tournament.currentBlindLevel];
     if (!currentLevel) return;
 
+    // 2026-07-07 review fix — ALWAYS clear any pending timer before arming a new
+    // one. Without this, a redundant resume (or a double-fired resume from two
+    // admins) would leak the running timer and arm a second, double-advancing
+    // the blind level and leaving an untracked timer that pause can't cancel.
+    if (tournament.blindTimer) { clearTimeout(tournament.blindTimer); tournament.blindTimer = null; }
+
     tournament.blindTimer = setTimeout(() => {
       this.advanceBlindLevel(tournamentId);
     }, currentLevel.duration * 1000);
@@ -476,6 +486,10 @@ export class TournamentManager {
   pauseTournament(tournamentId: string, paused: boolean): boolean {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament || tournament.status !== 'running') return false;
+    // 2026-07-07 review fix — no-op if already in the requested state. Without
+    // this, a redundant resume (paused already false) would call scheduleBlindUp
+    // on a running tournament and (pre-clearTimeout-fix) leak/duplicate the timer.
+    if (tournament.paused === paused) return true;
     if (paused) {
       if (tournament.blindTimer) { clearTimeout(tournament.blindTimer); tournament.blindTimer = null; }
       tournament.paused = true;

@@ -1693,7 +1693,14 @@ export async function activateScheduledTable(
     return { success: false, error: 'Only owners and managers can activate scheduled tables' };
   }
 
-  await pool.query('UPDATE scheduled_tables SET status = $1 WHERE id = $2', ['active', id]);
+  // 2026-07-07 review fix — ATOMIC claim so a manual Activate can't double-create
+  // with the auto-fire sweep (or a double-click). Only proceed if THIS call flips
+  // the row from 'scheduled' to 'active'.
+  const { rowCount } = await pool.query(
+    `UPDATE scheduled_tables SET status = 'active' WHERE id = $1 AND status = 'scheduled'`,
+    [id]
+  );
+  if (!rowCount) return { success: false, error: 'Already activated' };
 
   return { success: true, tableConfig: JSON.parse(row.tableconfig || '{}') };
 }
@@ -1737,8 +1744,16 @@ export async function getDueScheduledTables(now: string): Promise<ScheduledTable
   }));
 }
 
-export async function markScheduledActivated(id: number): Promise<void> {
-  await getPool().query(`UPDATE scheduled_tables SET status = 'active' WHERE id = $1`, [id]);
+// 2026-07-07 review fix — ATOMIC claim. Flips 'scheduled'->'active' only if the
+// row is still 'scheduled', and returns whether THIS call won the claim. The
+// sweep calls this BEFORE creating the table, so two overlapping sweeps (slow
+// DB) can never both create a table for the same row: the loser gets false.
+export async function markScheduledActivated(id: number): Promise<boolean> {
+  const { rowCount } = await getPool().query(
+    `UPDATE scheduled_tables SET status = 'active' WHERE id = $1 AND status = 'scheduled'`,
+    [id]
+  );
+  return (rowCount || 0) > 0;
 }
 
 // Spawn the NEXT occurrence of a recurring row as a brand-new 'scheduled' row so
@@ -1751,7 +1766,15 @@ export async function rescheduleRecurring(id: number): Promise<void> {
   const base = new Date(row.scheduledtime).getTime();
   if (isNaN(base)) return;
   const stepMs = (row.recurrencepattern === 'weekly' ? 7 : 1) * 24 * 60 * 60 * 1000;
-  const nextTime = new Date(base + stepMs).toISOString();
+  // 2026-07-07 review fix — advance PAST now, not just one step from the old
+  // time. Otherwise a row whose scheduledTime is already in the past (server
+  // downtime, or a backlog) would produce a next occurrence that is STILL in the
+  // past, so the 60s sweep re-fires it every minute — spawning a spurious live
+  // table each pass — until the series slowly walks forward to the present.
+  let nextMs = base + stepMs;
+  const now = Date.now();
+  while (nextMs <= now) nextMs += stepMs;
+  const nextTime = new Date(nextMs).toISOString();
   await pool.query(
     `INSERT INTO scheduled_tables (clubId, tableConfig, scheduledTime, recurring, recurrencePattern, status, createdBy)
      VALUES ($1, $2, $3, $4, $5, 'scheduled', $6)`,

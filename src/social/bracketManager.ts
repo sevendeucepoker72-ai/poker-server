@@ -10,7 +10,7 @@
 // to win) synced to the room — NOT wired to any chip pool in v1.
 //
 // 2026-06-18 — Phase 3d of the .online remediation.
-import { getPool, addChipsToUser } from '../auth/authManager';
+import { getPool } from '../auth/authManager';
 
 export interface BracketPlayer { name: string; seed: number; out: boolean; outOrder: number | null; }
 export interface BracketSideBet { bettor: string; target: string; amount: number; settled?: boolean; payout?: number }
@@ -168,19 +168,37 @@ export async function addSideBet(
   bettorUserId?: number
 ): Promise<{ ok: boolean; error?: string; state?: BracketState; amount?: number }> {
   const pool = getPool();
-  const b = await pool.query('SELECT status FROM social_brackets WHERE bracket_id=$1', [bracketId]);
+  const b = await pool.query('SELECT status, sidebets_settled FROM social_brackets WHERE bracket_id=$1', [bracketId]);
   if (!b.rows.length) return { ok: false, error: 'Bracket not found' };
-  if (b.rows[0].status === 'complete') return { ok: false, error: 'Tournament already finished' };
+  if (b.rows[0].status === 'complete' || b.rows[0].sidebets_settled) return { ok: false, error: 'Tournament already finished' };
   const amt = Math.max(1, Math.min(1_000_000, Math.floor(Number(amount) || 0)));
   const target = await pool.query('SELECT is_out FROM social_bracket_players WHERE bracket_id=$1 AND name=$2', [bracketId, targetName]);
   if (!target.rows.length) return { ok: false, error: 'No such player' };
   if (target.rows[0].is_out) return { ok: false, error: 'That player is already out' };
-  await pool.query(
-    'INSERT INTO social_bracket_sidebets (bracket_id, bettor_name, target_name, amount, bettor_user_id) VALUES ($1,$2,$3,$4,$5)',
+  // 2026-07-07 review fix — close the escrow-into-a-just-completed-bracket race.
+  // The status/target reads above can be stale (a completing elimination can
+  // commit between them and this INSERT), which would strand the escrowed stake
+  // because settlement already claimed sidebets_settled. Make the INSERT ITSELF
+  // conditional on the bracket still being active+unsettled AND the target still
+  // in AT WRITE TIME — a single atomic statement. If the race lost, rowCount is
+  // 0 and the caller refunds the escrow.
+  const ins = await pool.query(
+    `INSERT INTO social_bracket_sidebets (bracket_id, bettor_name, target_name, amount, bettor_user_id)
+     SELECT $1,$2,$3,$4,$5
+     WHERE EXISTS (SELECT 1 FROM social_brackets WHERE bracket_id=$1 AND status='active' AND sidebets_settled=FALSE)
+       AND EXISTS (SELECT 1 FROM social_bracket_players WHERE bracket_id=$1 AND name=$3 AND is_out=FALSE)`,
     [bracketId, String(bettorName || 'Guest').slice(0, 40), String(targetName).slice(0, 40), amt, bettorUserId ?? null]
   );
-  const state = await getBracket(bracketId);
-  return { ok: true, state: state!, amount: amt };
+  if (!ins.rowCount) return { ok: false, error: 'Bracket just closed — bet not placed' };
+  // 2026-07-07 review fix — the bet is now DURABLY recorded. The follow-up state
+  // read is BEST-EFFORT: if it throws, addSideBet must NOT throw, because the
+  // caller (placeSocialSideBet) would then treat it as "never recorded" and
+  // refund the escrow — but the row survives and settles later = a chip mint.
+  // Return ok:true even with no state; the caller skips the broadcast and the
+  // next getSocialBracket refresh picks it up.
+  let state: BracketState | null = null;
+  try { state = await getBracket(bracketId); } catch { /* best-effort — bet is already recorded */ }
+  return { ok: true, state: state || undefined, amount: amt };
 }
 
 // 2026-07-07 gap-fill [24] — PARIMUTUEL settlement. Called when a bracket
@@ -194,81 +212,109 @@ export async function addSideBet(
 // with a bettor_user_id (i.e. actually escrowed) are ever paid.
 export async function settleBracketSideBets(bracketId: string): Promise<BracketChipMovement[]> {
   const pool = getPool();
-  // Atomic idempotency claim: flip sidebets_settled false->true; if no row comes
-  // back, another call already settled this bracket.
-  const claim = await pool.query(
-    `UPDATE social_brackets SET sidebets_settled=TRUE WHERE bracket_id=$1 AND status='complete' AND sidebets_settled=FALSE RETURNING bracket_id`,
-    [bracketId]
-  );
-  if (!claim.rowCount) return [];
-
-  const champRow = await pool.query(`SELECT name FROM social_bracket_players WHERE bracket_id=$1 AND is_out=FALSE ORDER BY seed ASC LIMIT 1`, [bracketId]);
-  const champion = champRow.rows[0]?.name as string | undefined;
-  // Only escrowed bets (bettor_user_id NOT NULL, unsettled) participate.
-  const bets = (await pool.query(
-    `SELECT id, bettor_user_id, target_name, amount FROM social_bracket_sidebets WHERE bracket_id=$1 AND settled=FALSE AND bettor_user_id IS NOT NULL`,
-    [bracketId]
-  )).rows as any[];
-  if (bets.length === 0) return [];
-
-  const totalPool = bets.reduce((s, b) => s + (b.amount || 0), 0);
-  const winners = champion ? bets.filter((b) => b.target_name === champion) : [];
-  const winnerStake = winners.reduce((s, b) => s + (b.amount || 0), 0);
+  // 2026-07-07 review fix — run the ENTIRE settlement in ONE transaction on a
+  // dedicated client. Previously the idempotency claim + each row-mark were
+  // separate auto-committed statements that ran BEFORE the chip credit, and
+  // addChipsToUser swallows DB errors (returns false, not throw) — so a transient
+  // credit failure permanently DESTROYED the escrowed stake with no retry path.
+  // Now: BEGIN -> claim -> credit (direct UPDATE that THROWS inside the txn on
+  // failure) -> mark rows -> COMMIT. Any failure ROLLs BACK the whole thing,
+  // including the sidebets_settled claim, so the caller can safely retry and no
+  // chips are ever destroyed. Σpayouts == Σescrowed (dust → largest winner).
+  const client = await pool.connect();
   const movements: BracketChipMovement[] = [];
+  try {
+    await client.query('BEGIN');
+    // Atomic idempotency claim under a row lock: flip sidebets_settled false->true;
+    // if no row comes back, another call already settled this bracket.
+    const claim = await client.query(
+      `UPDATE social_brackets SET sidebets_settled=TRUE WHERE bracket_id=$1 AND status='complete' AND sidebets_settled=FALSE RETURNING bracket_id`,
+      [bracketId]
+    );
+    if (!claim.rowCount) { await client.query('ROLLBACK'); return []; }
 
-  if (winners.length > 0 && winnerStake > 0) {
-    // Parimutuel proportional split of the WHOLE pool among champion backers.
-    let distributed = 0;
-    // Largest stake first so the dust remainder lands on the biggest winner.
-    winners.sort((a, b) => (b.amount || 0) - (a.amount || 0));
-    for (let i = 0; i < winners.length; i++) {
-      const w = winners[i];
-      let payout = Math.floor((w.amount / winnerStake) * totalPool);
-      if (i === 0) payout += totalPool - winners.reduce((s, x) => s + Math.floor((x.amount / winnerStake) * totalPool), 0); // dust → top winner
-      distributed += payout;
-      await pool.query('UPDATE social_bracket_sidebets SET settled=TRUE, payout=$2 WHERE id=$1', [w.id, payout]);
-      if (payout > 0) {
-        await addChipsToUser(w.bettor_user_id, payout);
-        movements.push({ userId: w.bettor_user_id, amount: payout, reason: 'sidebet_win', target: champion });
+    const champRow = await client.query(`SELECT name FROM social_bracket_players WHERE bracket_id=$1 AND is_out=FALSE ORDER BY seed ASC LIMIT 1`, [bracketId]);
+    const champion = champRow.rows[0]?.name as string | undefined;
+    // Only escrowed bets (bettor_user_id NOT NULL, unsettled) participate. FOR
+    // UPDATE locks them against a concurrent settle/refund.
+    const bets = (await client.query(
+      `SELECT id, bettor_user_id, target_name, amount FROM social_bracket_sidebets WHERE bracket_id=$1 AND settled=FALSE AND bettor_user_id IS NOT NULL FOR UPDATE`,
+      [bracketId]
+    )).rows as any[];
+    if (bets.length === 0) { await client.query('COMMIT'); return []; }
+
+    const totalPool = bets.reduce((s, b) => s + (b.amount || 0), 0);
+    const winners = champion ? bets.filter((b) => b.target_name === champion) : [];
+    const winnerStake = winners.reduce((s, b) => s + (b.amount || 0), 0);
+
+    if (winners.length > 0 && winnerStake > 0) {
+      // Parimutuel proportional split of the WHOLE pool among champion backers.
+      // Largest stake first so the dust remainder lands on the biggest winner.
+      winners.sort((a, b) => (b.amount || 0) - (a.amount || 0));
+      for (let i = 0; i < winners.length; i++) {
+        const w = winners[i];
+        let payout = Math.floor((w.amount / winnerStake) * totalPool);
+        if (i === 0) payout += totalPool - winners.reduce((s, x) => s + Math.floor((x.amount / winnerStake) * totalPool), 0); // dust → top winner
+        await client.query('UPDATE social_bracket_sidebets SET settled=TRUE, payout=$2 WHERE id=$1', [w.id, payout]);
+        if (payout > 0) {
+          await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [payout, w.bettor_user_id]);
+          movements.push({ userId: w.bettor_user_id, amount: payout, reason: 'sidebet_win', target: champion });
+        }
+      }
+      // Losing bets: settled with payout 0 (their stake funded the winners' pool).
+      for (const b of bets) {
+        if (b.target_name !== champion) {
+          await client.query('UPDATE social_bracket_sidebets SET settled=TRUE, payout=0 WHERE id=$1', [b.id]);
+        }
+      }
+    } else {
+      // Nobody backed the champion → refund every escrowed bettor their own stake.
+      for (const b of bets) {
+        await client.query('UPDATE social_bracket_sidebets SET settled=TRUE, payout=$2 WHERE id=$1', [b.id, b.amount]);
+        await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [b.amount, b.bettor_user_id]);
+        movements.push({ userId: b.bettor_user_id, amount: b.amount, reason: 'sidebet_refund' });
       }
     }
-    // Losing bets: settled with payout 0 (their stake funded the winners' pool).
-    for (const b of bets) {
-      if (b.target_name !== champion) {
-        await pool.query('UPDATE social_bracket_sidebets SET settled=TRUE, payout=0 WHERE id=$1', [b.id]);
-      }
-    }
-    void distributed;
-  } else {
-    // Nobody backed the champion → refund every escrowed bettor their own stake.
-    for (const b of bets) {
-      await pool.query('UPDATE social_bracket_sidebets SET settled=TRUE, payout=$2 WHERE id=$1', [b.id, b.amount]);
-      await addChipsToUser(b.bettor_user_id, b.amount);
-      movements.push({ userId: b.bettor_user_id, amount: b.amount, reason: 'sidebet_refund' });
-    }
+    await client.query('COMMIT');
+    return movements;
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    throw e; // nothing committed — caller can retry; escrows are never lost
+  } finally {
+    client.release();
   }
-  return movements;
 }
 
 // 2026-07-07 gap-fill [24] — refund path for an ABANDONED bracket (never
 // completed). Returns every escrowed bettor their stake and marks the bracket
-// settled so it can't also pay out later. Admin/organizer-invoked.
+// settled so it can't also pay out later. Admin/organizer-invoked. Transactional
+// for the same no-chip-destruction reason as settleBracketSideBets.
 export async function refundBracketSideBets(bracketId: string): Promise<BracketChipMovement[]> {
   const pool = getPool();
-  const claim = await pool.query(
-    `UPDATE social_brackets SET sidebets_settled=TRUE WHERE bracket_id=$1 AND sidebets_settled=FALSE RETURNING bracket_id`,
-    [bracketId]
-  );
-  if (!claim.rowCount) return [];
-  const bets = (await pool.query(
-    `SELECT id, bettor_user_id, amount FROM social_bracket_sidebets WHERE bracket_id=$1 AND settled=FALSE AND bettor_user_id IS NOT NULL`,
-    [bracketId]
-  )).rows as any[];
+  const client = await pool.connect();
   const movements: BracketChipMovement[] = [];
-  for (const b of bets) {
-    await pool.query('UPDATE social_bracket_sidebets SET settled=TRUE, payout=$2 WHERE id=$1', [b.id, b.amount]);
-    await addChipsToUser(b.bettor_user_id, b.amount);
-    movements.push({ userId: b.bettor_user_id, amount: b.amount, reason: 'sidebet_refund' });
+  try {
+    await client.query('BEGIN');
+    const claim = await client.query(
+      `UPDATE social_brackets SET sidebets_settled=TRUE WHERE bracket_id=$1 AND sidebets_settled=FALSE RETURNING bracket_id`,
+      [bracketId]
+    );
+    if (!claim.rowCount) { await client.query('ROLLBACK'); return []; }
+    const bets = (await client.query(
+      `SELECT id, bettor_user_id, amount FROM social_bracket_sidebets WHERE bracket_id=$1 AND settled=FALSE AND bettor_user_id IS NOT NULL FOR UPDATE`,
+      [bracketId]
+    )).rows as any[];
+    for (const b of bets) {
+      await client.query('UPDATE social_bracket_sidebets SET settled=TRUE, payout=$2 WHERE id=$1', [b.id, b.amount]);
+      await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [b.amount, b.bettor_user_id]);
+      movements.push({ userId: b.bettor_user_id, amount: b.amount, reason: 'sidebet_refund' });
+    }
+    await client.query('COMMIT');
+    return movements;
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    throw e;
+  } finally {
+    client.release();
   }
-  return movements;
 }

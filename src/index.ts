@@ -1274,14 +1274,26 @@ async function createTableFromScheduledConfig(clubId: number, cfg: any): Promise
 // on a 60s interval (poker-server has no cron). Each due row: create the table,
 // mark it activated, and (if recurring) queue the next occurrence. Per-row
 // try/catch so one bad row can't stall the whole sweep.
+// 2026-07-07 review fix — in-flight guard: setInterval fires the sweep every 60s
+// regardless of whether the prior run finished. Under sustained DB latency a run
+// could exceed 60s and overlap the next, and both would see the same still-
+// 'scheduled' rows. This flag drops an overlapping invocation; the per-row atomic
+// claim (markScheduledActivated) is the second line of defense.
+let sweepScheduledInFlight = false;
 async function sweepScheduledClubTables(): Promise<void> {
+  if (sweepScheduledInFlight) return;
+  sweepScheduledInFlight = true;
   try {
     const due = await getDueScheduledTables(new Date().toISOString());
     for (const row of due) {
       try {
+        // CLAIM the row atomically BEFORE any table creation. If another sweep or
+        // the manual Activate handler already flipped it to 'active', skip — this
+        // is what prevents a double-create of the same scheduled table.
+        const claimed = await markScheduledActivated(row.id);
+        if (!claimed) continue;
         const cfg = JSON.parse(row.tableConfig || '{}');
         const tableId = await createTableFromScheduledConfig(row.clubId, cfg);
-        await markScheduledActivated(row.id);
         if (row.recurring) await rescheduleRecurring(row.id);
         io.emit('scheduledClubTableActivated', { success: true, tableId, clubId: row.clubId });
         console.log(`[ClubSweep] auto-activated scheduled table ${row.id} (club ${row.clubId}) -> ${tableId}`);
@@ -1291,6 +1303,8 @@ async function sweepScheduledClubTables(): Promise<void> {
     }
   } catch (err: any) {
     console.warn('[ClubSweep] error:', err?.message);
+  } finally {
+    sweepScheduledInFlight = false;
   }
 }
 // Run 15 s after startup then every 60 s (same module-scope pattern as the
@@ -5677,30 +5691,49 @@ Give feedback in this JSON format:
       { place: 2, chips: 25000, badge: 'season_silver' },
       { place: 3, chips: 10000, badge: 'season_bronze' },
     ];
+    // 2026-07-07 review fix — run the WHOLE award in ONE transaction (ledger +
+    // chip credit + badge, all atomic) so a transient credit failure rolls back
+    // the ledger row too (previously the ledger committed first, then a failed
+    // addChipsToUser stranded the award permanently unpaid). Plus a PER-SEASON
+    // guard: if this season already has ANY award rows, refuse — otherwise a
+    // re-run after the top-3-by-chips ranking shifts would pay additional users
+    // beyond the intended three. An advisory lock serializes concurrent runs.
+    const client = await getPool().connect();
     try {
-      const { rows } = await getPool().query('SELECT id, username, chips FROM users WHERE banned = FALSE ORDER BY chips DESC LIMIT 3');
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [`season_award:${seasonKey}`]);
+      const existing = await client.query('SELECT 1 FROM season_leaderboard_awards WHERE season_key=$1 LIMIT 1', [seasonKey]);
+      if (existing.rowCount) {
+        await client.query('ROLLBACK');
+        socket.emit('seasonLeaderboardAwarded', { success: false, error: 'already_awarded', seasonKey });
+        return;
+      }
+      const { rows } = await client.query('SELECT id, username, chips FROM users WHERE banned = FALSE ORDER BY chips DESC LIMIT 3');
       const results: any[] = [];
       for (let i = 0; i < rows.length && i < REWARDS.length; i++) {
         const u = rows[i];
         const rw = REWARDS[i];
-        // Idempotency lock FIRST — if the row already exists for this season+user,
-        // skip (never double-pay). Then grant chips + badge.
-        const ins = await getPool().query(
-          `INSERT INTO season_leaderboard_awards (season_key, user_id, place, chips, badge_id) VALUES ($1,$2,$3,$4,$5)
-             ON CONFLICT (season_key, user_id) DO NOTHING RETURNING 1`,
+        await client.query(
+          `INSERT INTO season_leaderboard_awards (season_key, user_id, place, chips, badge_id) VALUES ($1,$2,$3,$4,$5)`,
           [seasonKey, u.id, rw.place, rw.chips, rw.badge]
         );
-        if (ins.rowCount === 0) { results.push({ username: u.username, place: rw.place, skipped: 'already_awarded' }); continue; }
-        const okc = await addChipsToUser(u.id, rw.chips);
-        if (!okc) auditLog('SYSTEM', 'SEASON_AWARD_CHIPS_DB_FAIL', { seasonKey, userId: u.id, amount: rw.chips });
-        await dbGrantItem(u.id, 'badge', rw.badge);
-        auditLog(auth.username, 'SEASON_LEADERBOARD_AWARD', { seasonKey, place: rw.place, userId: u.id, username: u.username, chips: rw.chips, badge: rw.badge });
+        await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [rw.chips, u.id]);
+        await client.query(
+          `INSERT INTO user_inventory (user_id, item_type, item_id) VALUES ($1,'badge',$2) ON CONFLICT (user_id, item_type, item_id) DO NOTHING`,
+          [u.id, rw.badge]
+        );
         results.push({ username: u.username, place: rw.place, chips: rw.chips, badge: rw.badge });
       }
+      await client.query('COMMIT');
+      // Audit AFTER commit — the movements are now durable.
+      for (const r of results) auditLog(auth.username, 'SEASON_LEADERBOARD_AWARD', { seasonKey, ...r });
       socket.emit('seasonLeaderboardAwarded', { success: true, seasonKey, results });
     } catch (err: any) {
+      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
       console.error('[runSeasonLeaderboardAward]', err);
       socket.emit('seasonLeaderboardAwarded', { success: false, error: 'server_error' });
+    } finally {
+      client.release();
     }
   });
 
@@ -9127,18 +9160,26 @@ Give feedback in this JSON format:
       if (!(await deductChips(auth.userId, amt))) { socket.emit('socialBracketError', { message: 'Could not place bet' }); return; }
       deducted = true;
       const res = await addBracketSideBet(String(data?.bracketId || ''), auth.username, String(data?.target || ''), amt, auth.userId);
-      if (!res.ok || !res.state) {
-        // Recording failed (bad bracket / player out / completed) — refund escrow.
+      if (!res.ok) {
+        // Recording failed (bad bracket / player out / completed / lost the
+        // just-closed race) — the bet was NOT persisted, so refund the escrow.
         await addChipsToUser(auth.userId, amt);
         deducted = false;
         socket.emit('socialBracketError', { message: res.error || 'Could not place bet' });
         return;
       }
-      auditLog(auth.username, 'BRACKET_SIDEBET_ESCROW', { bracketId: res.state.bracketId, target: data?.target, amount: amt });
-      socket.emit('socialSideBetPlaced', { bracketId: res.state.bracketId, amount: amt });
-      io.to(bracketRoom(res.state.bracketId)).emit('socialBracketState', res.state);
+      // ok:true means the bet is DURABLY recorded — the escrow legitimately
+      // belongs to it and MUST NOT be refunded, even if the state read failed
+      // (res.state may be undefined) or a later emit throws (either would refund
+      // a stake that still settles = a chip mint). Clear deducted now.
+      deducted = false;
+      const bracketId = res.state?.bracketId || String(data?.bracketId || '').toUpperCase();
+      auditLog(auth.username, 'BRACKET_SIDEBET_ESCROW', { bracketId, target: data?.target, amount: amt });
+      socket.emit('socialSideBetPlaced', { bracketId, amount: amt });
+      if (res.state) io.to(bracketRoom(res.state.bracketId)).emit('socialBracketState', res.state);
     } catch (e: any) {
-      // Any throw after the deduct MUST refund — chips are never silently lost.
+      // A throw BEFORE the bet was recorded MUST refund — chips are never lost.
+      // (Once recorded, deducted is false, so a later-emit throw won't double-refund.)
       if (deducted) { try { await addChipsToUser(auth.userId, amt); } catch {} }
       socket.emit('socialBracketError', { message: 'Could not place bet' });
     }
