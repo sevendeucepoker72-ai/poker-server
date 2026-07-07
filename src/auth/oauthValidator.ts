@@ -1,6 +1,54 @@
+import * as jose from 'jose';
+
 const AUTH_SERVER_URL = process.env.AUTH_SERVER_URL || 'https://auth.americanpubpoker.online';
 const INTROSPECTION_URL = `${AUTH_SERVER_URL}/token/introspection`;
 const CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'poker-server';
+
+// 2026-07-07 — structured JWT access tokens. poker-3d (and any client that sends
+// `resource=API_RESOURCE`) receives an RS256 JWT access token (aud=API_RESOURCE),
+// NOT an opaque one. oidc-provider REFUSES to introspect structured JWTs
+// ("unsupported_token_type", 400 "Structured JWT Tokens cannot be introspected"),
+// so the introspection path below fails those logins. We verify JWT tokens via
+// the auth-server JWKS instead (same trust root the master API's requireAuth
+// uses). Opaque tokens (bridge / ticket / legacy) still go to introspection.
+const JWKS_URL = `${AUTH_SERVER_URL}/jwks`;
+const API_RESOURCE = process.env.API_RESOURCE
+  || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+let _jwks: ReturnType<typeof jose.createRemoteJWKSet> | null = null;
+function getJwks() {
+  if (!_jwks) _jwks = jose.createRemoteJWKSet(new URL(JWKS_URL));
+  return _jwks;
+}
+// An opaque oidc-provider access token is a dotless random string; a structured
+// JWT has exactly three dot-separated segments.
+function looksLikeJwt(t: string): boolean {
+  return typeof t === 'string' && t.split('.').length === 3;
+}
+
+async function verifyJwtAccessToken(token: string): Promise<OAuthTokenResult> {
+  try {
+    const { payload } = await jose.jwtVerify(token, getJwks(), {
+      issuer: AUTH_SERVER_URL,   // matches auth-server AUTH_ISSUER
+      audience: API_RESOURCE,    // access tokens minted for the master API resource
+    });
+    const sub = typeof payload.sub === 'string' ? payload.sub : undefined;
+    if (!sub) return { valid: false, error: 'JWT missing sub' };
+    // extraTokenClaims puts username/roles/is_admin on the access token; phone is
+    // not present there, so oauthLogin's `phone || username` falls back to username.
+    return {
+      valid: true,
+      sub,
+      username: (payload.username as string) || (payload.preferred_username as string),
+      phone: (payload.phone as string) || (payload.phone_number as string),
+      isAdmin: payload.is_admin === true,
+    };
+  } catch (err: any) {
+    // Bad signature / expired / wrong issuer|aud → an invalid USER token, not a
+    // credential problem. Return invalid so the client re-authenticates. (Do NOT
+    // fall through to introspection — a JWT can't be introspected anyway.)
+    return { valid: false, error: `JWT verification failed (${err?.code || err?.message || 'invalid'})` };
+  }
+}
 
 // Fail-close the OAUTH_CLIENT_SECRET fallback. The dev value
 // ('dev-poker-server-secret') is public-knowledge and must NEVER be used to
@@ -40,6 +88,14 @@ export interface OAuthTokenResult {
 }
 
 export async function validateOAuthToken(token: string): Promise<OAuthTokenResult> {
+  // 2026-07-07 — JWT access tokens (resource=API_RESOURCE clients, incl. the
+  // primary poker-3d "Sign in" + silent-SSO flow) are verified via JWKS, not
+  // introspection (oidc-provider rejects JWT introspection). Opaque tokens
+  // (bridge / ticket / legacy) fall through to the introspection path below.
+  if (looksLikeJwt(token)) {
+    return verifyJwtAccessToken(token);
+  }
+
   // 5s hard timeout — if the auth server stalls we want to fail fast so
   // the client's `loginResult` timeout doesn't fire first with no error
   // message. Previously this fetch() had no timeout and would hang until
