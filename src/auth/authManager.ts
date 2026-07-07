@@ -280,10 +280,22 @@ export async function initDB(): Promise<void> {
       user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       season_id   TEXT    NOT NULL,
       tier_id     INTEGER NOT NULL,
+      track       TEXT    NOT NULL DEFAULT 'free',
       claimed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (user_id, season_id, tier_id)
+      PRIMARY KEY (user_id, season_id, tier_id, track)
     )
   `).catch((e: any) => console.warn('[Auth] user_battle_pass_claims:', e.message));
+  // 2026-07-07 gap-fill — make claims track-aware so the FREE and PREMIUM reward
+  // for a tier are each claimable exactly once (previously PK was (user,season,
+  // tier) → only ONE claim per tier, so a player could never collect both the
+  // free chips AND the premium cosmetic). Idempotent for existing DBs: back-add
+  // the column, then rebuild the PK to include track (existing rows default to
+  // 'free', which stays unique under the 4-col PK).
+  await pool.query("ALTER TABLE user_battle_pass_claims ADD COLUMN IF NOT EXISTS track TEXT NOT NULL DEFAULT 'free'").catch((e: any) => console.warn('[Auth] bp_claims track col:', e.message));
+  await pool.query(`DO $$ BEGIN
+    ALTER TABLE user_battle_pass_claims DROP CONSTRAINT user_battle_pass_claims_pkey;
+    ALTER TABLE user_battle_pass_claims ADD PRIMARY KEY (user_id, season_id, tier_id, track);
+  EXCEPTION WHEN others THEN NULL; END $$;`).catch((e: any) => console.warn('[Auth] bp_claims pk rebuild:', e.message));
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_hand_history (
@@ -1119,29 +1131,32 @@ export async function consumeScratchCard(userId: number): Promise<boolean> {
   }
 }
 
-/** Try to claim a battle pass tier. Returns true if newly claimed. */
-export async function claimBattlePassTier(userId: number, seasonId: string, tierId: number): Promise<boolean> {
+/** Try to claim a battle pass tier on a given track. Returns true if newly claimed.
+ *  2026-07-07 gap-fill — now track-aware (free|premium), one claim per (tier,track). */
+export async function claimBattlePassTier(userId: number, seasonId: string, tierId: number, track: 'free' | 'premium' = 'free'): Promise<boolean> {
   try {
     const { rowCount } = await pool.query(
-      `INSERT INTO user_battle_pass_claims (user_id, season_id, tier_id) VALUES ($1, $2, $3)
-         ON CONFLICT (user_id, season_id, tier_id) DO NOTHING`,
-      [userId, seasonId, tierId]
+      `INSERT INTO user_battle_pass_claims (user_id, season_id, tier_id, track) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, season_id, tier_id, track) DO NOTHING`,
+      [userId, seasonId, tierId, track]
     );
     return (rowCount || 0) > 0;
   } catch (e: any) {
-    console.warn(`[claimBattlePassTier ${userId} ${seasonId}/${tierId}]`, e.message);
+    console.warn(`[claimBattlePassTier ${userId} ${seasonId}/${tierId}/${track}]`, e.message);
     return false;
   }
 }
 
-/** List claimed battle pass tiers for a season. */
-export async function loadBattlePassClaims(userId: number, seasonId: string): Promise<number[]> {
+/** List claimed battle pass tiers for a season as `${tier}:${track}` keys
+ *  (2026-07-07 gap-fill — track-aware so the client can mark free vs premium
+ *  cells independently). Legacy rows read back as `${tier}:free`. */
+export async function loadBattlePassClaims(userId: number, seasonId: string): Promise<string[]> {
   try {
     const { rows } = await pool.query(
-      `SELECT tier_id FROM user_battle_pass_claims WHERE user_id = $1 AND season_id = $2 ORDER BY tier_id`,
+      `SELECT tier_id, track FROM user_battle_pass_claims WHERE user_id = $1 AND season_id = $2 ORDER BY tier_id`,
       [userId, seasonId]
     );
-    return rows.map((r: any) => r.tier_id);
+    return rows.map((r: any) => `${r.tier_id}:${r.track || 'free'}`);
   } catch (e: any) {
     console.warn(`[loadBattlePassClaims ${userId} ${seasonId}]`, e.message);
     return [];

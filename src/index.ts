@@ -7497,7 +7497,32 @@ Give feedback in this JSON format:
   });
 
   // Battle pass tier claim — idempotent via unique constraint.
-  socket.on('claimBattlePassTier', async (data: { seasonId: string; tierId: number; reward?: { chips?: number; stars?: number; itemType?: string; itemId?: string } }) => {
+  // 2026-07-07 gap-fill — canonical server reward table, mirrors BattlePass.jsx
+  // buildTiers() EXACTLY. NEVER trust the client's `reward` payload; the server
+  // is authoritative. FREE: tier%10→chips tier*200, else tier%5→500 chips, else
+  // +100 season XP. PREMIUM milestones grant real cosmetics (item_type/item_id
+  // that exist in the client catalogs); non-milestone premium: tier%3→1000 chips
+  // else 10 stars.
+  const bpReward = (tierId: number, track: 'free' | 'premium'):
+    | { kind: 'chips'; amount: number }
+    | { kind: 'stars'; amount: number }
+    | { kind: 'xp'; amount: number }
+    | { kind: 'item'; itemType: string; itemId: string } => {
+    if (track === 'free') {
+      if (tierId % 10 === 0) return { kind: 'chips', amount: tierId * 200 };
+      if (tierId % 5 === 0) return { kind: 'chips', amount: 500 };
+      return { kind: 'xp', amount: 100 };
+    }
+    // premium
+    if (tierId === 10) return { kind: 'item', itemType: 'card_back', itemId: 'dragon' };
+    if (tierId === 20) return { kind: 'item', itemType: 'emote', itemId: 'legendary_pack' };
+    if (tierId === 30) return { kind: 'item', itemType: 'theme', itemId: 'neon_vegas' };
+    if (tierId === 40) return { kind: 'item', itemType: 'avatar_frame', itemId: 'diamond' };
+    if (tierId === 50) return { kind: 'item', itemType: 'title', itemId: 'season_champion' };
+    if (tierId % 3 === 0) return { kind: 'chips', amount: 1000 };
+    return { kind: 'stars', amount: 10 };
+  };
+  socket.on('claimBattlePassTier', async (data: { seasonId: string; tierId: number; track?: 'free' | 'premium'; reward?: { chips?: number; stars?: number; itemType?: string; itemId?: string } }) => {
     try {
       const ctx = await ensureHydrated(socket);
       if (!ctx) { socket.emit('battlePassTierClaimed', { success: false, error: 'Not authenticated' }); return; }
@@ -7536,42 +7561,52 @@ Give feedback in this JSON format:
         return;
       }
 
-      const ok = await dbClaimBattlePassTier(ctx.userId, seasonId, tierId);
+      // 2026-07-07 gap-fill — resolve the track and gate the premium track on
+      // the battlePassPremium entitlement (bought via purchaseBattlePass, stored
+      // in users.stats). Fail-closed if the stats read fails.
+      const track: 'free' | 'premium' = data.track === 'premium' ? 'premium' : 'free';
+      if (track === 'premium') {
+        let hasPremium = false;
+        try {
+          const { rows } = await getPool().query('SELECT stats FROM users WHERE id = $1', [ctx.userId]);
+          const raw = rows[0]?.stats;
+          const s = typeof raw === 'string' ? JSON.parse(raw || '{}') : (raw || {});
+          hasPremium = s?.battlePassPremium === true;
+        } catch { /* fail-closed */ }
+        if (!hasPremium) {
+          socket.emit('battlePassTierClaimed', { success: false, error: 'premium_required', tierId });
+          return;
+        }
+      }
+
+      const ok = await dbClaimBattlePassTier(ctx.userId, seasonId, tierId, track);
       if (!ok) {
-        socket.emit('battlePassTierClaimed', { success: false, error: 'already_claimed', tierId });
+        socket.emit('battlePassTierClaimed', { success: false, error: 'already_claimed', tierId, track });
         return;
       }
 
-      // Server-side reward table per tier. Every 5th tier grants stars, rest grant chips.
-      // DB-first ordering: award chips/stars in DB BEFORE mutating in-memory
-      // progress. Reverse order could leave UI showing a reward that never
-      // landed in users.chips / users.stars if the DB write failed. Audit
-      // logs on failure so ops can reconcile.
-      const chips = tierId % 5 === 0 ? 0 : 1000 + tierId * 200;
-      const stars = tierId % 5 === 0 ? 25 + tierId : 0;
-      if (chips > 0) {
-        const ok = await addChipsToUser(ctx.userId, chips);
-        if (!ok) {
-          auditLog('SYSTEM', 'BATTLEPASS_CHIPS_DB_FAIL', { userId: ctx.userId, seasonId, tierId, amount: chips });
-          socket.emit('battlePassTierClaimed', { success: false, error: 'db_failed' });
-          return;
-        }
-        progress.chips += chips;
-      }
-      if (stars > 0) {
-        // addStarsToUser is atomic-additive (UPDATE users SET stars = stars + $1).
-        // Using the new helper instead of persistStars avoids clobbering
-        // concurrent star grants (e.g. daily rewards) with a plain SET.
-        const ok = await addStarsToUser(ctx.userId, stars);
-        if (!ok) {
-          auditLog('SYSTEM', 'BATTLEPASS_STARS_DB_FAIL', { userId: ctx.userId, seasonId, tierId, amount: stars });
-          socket.emit('battlePassTierClaimed', { success: false, error: 'db_failed' });
-          return;
-        }
-        progress.stars += stars;
+      // Grant the CANONICAL reward for (tier, track) — was hardcoded chips/stars,
+      // so premium cosmetic tiers paid chips instead of the Dragon Card Back /
+      // Neon Vegas Theme / etc. the UI advertised. DB-first: currency/item lands
+      // durably before the in-memory bump + client ack. All currency stays on the
+      // audited additive paths; cosmetics go to user_inventory via grantItem.
+      const r = bpReward(tierId, track);
+      if (r.kind === 'chips') {
+        const okc = await addChipsToUser(ctx.userId, r.amount);
+        if (!okc) { auditLog('SYSTEM', 'BATTLEPASS_CHIPS_DB_FAIL', { userId: ctx.userId, seasonId, tierId, track, amount: r.amount }); socket.emit('battlePassTierClaimed', { success: false, error: 'db_failed' }); return; }
+        progress.chips += r.amount;
+      } else if (r.kind === 'stars') {
+        const oks = await addStarsToUser(ctx.userId, r.amount);
+        if (!oks) { auditLog('SYSTEM', 'BATTLEPASS_STARS_DB_FAIL', { userId: ctx.userId, seasonId, tierId, track, amount: r.amount }); socket.emit('battlePassTierClaimed', { success: false, error: 'db_failed' }); return; }
+        progress.stars += r.amount;
+      } else if (r.kind === 'xp') {
+        progressionManager.addXP(ctx.playerId, r.amount);
+      } else if (r.kind === 'item') {
+        const granted = await dbGrantItem(ctx.userId, r.itemType, r.itemId);
+        if (granted) { const inv = await loadInventory(ctx.userId); socket.emit('inventoryUpdated', { inventory: inv }); }
       }
 
-      socket.emit('battlePassTierClaimed', { success: true, tierId, chips, stars });
+      socket.emit('battlePassTierClaimed', { success: true, tierId, track, reward: r });
       sendProgressToPlayer(socket.id);
     } catch (err: any) {
       console.error('claimBattlePassTier error:', err);
