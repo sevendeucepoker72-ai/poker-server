@@ -5157,27 +5157,29 @@ Give feedback in this JSON format:
     authSessions.delete(socket.id);
   });
 
-  socket.on('loadProgress', async (data: { userId: number }) => {
-    // 2026-06-10 audit (IDOR fix): loadProgress previously trusted the
-    // client-supplied userId with no auth check, so any authenticated
-    // socket could read ANY user's progression (xp/level/stats/stars/
-    // inventory) by enumerating sequential userIds. Gate it the same
-    // way saveProgress (directly below) already does — caller may only
-    // load their OWN progress.
+  socket.on('loadProgress', async (_data: { userId?: number } = {}) => {
+    // 2026-06-10 audit (IDOR fix) + 2026-07-07 fix: identity comes from the
+    // AUTHENTICATED socket session, never the client payload. This (a) closes
+    // the IDOR — a caller can only ever load its OWN progress — and (b) fixes
+    // the "Unauthorized" storm: the client emits no userId, so the old
+    // `auth.userId !== data.userId` check was always true (a real id !== undefined),
+    // rejecting every legitimate call.
     const auth = authSessions.get(socket.id);
-    if (!auth || auth.userId !== data.userId) {
-      socket.emit('error', { message: 'Unauthorized' });
-      return;
-    }
-    const result = await loadProgress(data.userId);
+    if (!auth) { socket.emit('error', { message: 'Unauthorized' }); return; }
+    const result = await loadProgress(auth.userId);
     socket.emit('progressLoaded', result);
   });
 
-  socket.on('saveProgress', async (data: { userId: number; chips?: number; level?: number; xp?: number; stats?: Record<string, any>; achievements?: string[] }) => {
+  socket.on('saveProgress', async (data: { userId?: number; chips?: number; level?: number; xp?: number; stats?: Record<string, any>; achievements?: string[] } = {}) => {
+    // 2026-07-07 fix: authenticate by SESSION only. The client (persistenceService
+    // _doSync) emits saveProgress with NO userId, so the old
+    // `auth.userId !== data.userId` guard was always true (!== undefined) — it
+    // rejected EVERY client-data sync with "Unauthorized" (console noise) AND
+    // meant career/missions/battle-pass/settings never persisted to the server.
+    // Identity is now auth.userId; any client-supplied userId is ignored (that's
+    // the stronger IDOR posture — never trust the client for identity).
     const auth = authSessions.get(socket.id);
-    if (!auth || auth.userId !== data.userId) {
-      socket.emit('error', { message: 'Unauthorized' }); return;
-    }
+    if (!auth) { socket.emit('error', { message: 'Unauthorized' }); return; }
     // SECURITY + DATA-SAFETY:
     // - NEVER trust the client with chips writes — saveProgress would
     //   plain-overwrite users.chips, letting the client set any balance.
@@ -5196,8 +5198,10 @@ Give feedback in this JSON format:
         return;
       }
     }
-    const { userId, chips: _ignoredChips, ...progressData } = data;
-    const success = await saveProgress(userId, progressData);
+    // Strip client-supplied userId + chips (both untrusted) and persist under
+    // the authenticated user's id.
+    const { userId: _ignoredUserId, chips: _ignoredChips, ...progressData } = data;
+    const success = await saveProgress(auth.userId, progressData);
     socket.emit('progressSaved', { success });
   });
 
