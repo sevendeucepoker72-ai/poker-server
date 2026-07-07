@@ -287,6 +287,20 @@ export async function initDB(): Promise<void> {
     )
   `).catch((e: any) => console.warn('[Auth] user_career_reward_claims:', e.message));
 
+  // 2026-07-07 gap-fill — idempotency ledger so a season leaderboard award run
+  // can NEVER double-pay a winner (admin-triggered payout, once per season+user).
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS season_leaderboard_awards (
+      season_key TEXT    NOT NULL,
+      user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      place      SMALLINT NOT NULL,
+      chips      INTEGER NOT NULL,
+      badge_id   TEXT,
+      awarded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (season_key, user_id)
+    )
+  `).catch((e: any) => console.warn('[Auth] season_leaderboard_awards:', e.message));
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_daily_claims (
       user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

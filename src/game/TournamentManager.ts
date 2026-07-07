@@ -17,6 +17,7 @@ export interface TournamentConfig {
   blindLevels: BlindLevel[];
   isBounty?: boolean; // bounty tournament — earn chips for eliminating players
   bountyAmount?: number; // chips awarded per knockout
+  startingChips?: number; // 2026-07-07 gap-fill [14] — custom starting stack (default 1000)
 }
 
 export interface TournamentPlayer {
@@ -55,6 +56,10 @@ export interface Tournament {
   // `prizePool` constant. Payouts are distributed from this — guaranteeing
   // Σpayouts ≤ Σcollected, so the tournament can never mint chips.
   collectedEntryFees: number;
+  // 2026-07-07 gap-fill [15] — live director pause. When true, the blind clock
+  // is stopped and tournament tables hold at the next hand boundary (never
+  // mid-hand). Resuming re-arms the blind timer and re-kicks the tables.
+  paused: boolean;
 }
 
 export const DEFAULT_BLIND_LEVELS: BlindLevel[] = [
@@ -79,6 +84,7 @@ export interface TournamentTemplate {
   blindLevels: BlindLevel[];
   isBounty?: boolean;
   bountyAmount?: number;
+  startingChips?: number;
 }
 
 const SNG_BLIND_LEVELS: BlindLevel[] = [
@@ -197,6 +203,7 @@ export class TournamentManager {
       blindLevels: template.blindLevels,
       isBounty: template.isBounty || false,
       bountyAmount: template.bountyAmount || 0,
+      startingChips: template.startingChips || 1000,
     };
 
     const now = Date.now();
@@ -215,6 +222,7 @@ export class TournamentManager {
       turboMode: false,
       playerTableMap: new Map(),
       collectedEntryFees: 0,
+      paused: false,
     };
 
     this.tournaments.set(tournamentId, tournament);
@@ -384,7 +392,9 @@ export class TournamentManager {
     tournament.startedAt = Date.now();
     tournament.currentBlindLevel = 0;
 
-    const startingChips = 1000;
+    // 2026-07-07 gap-fill [14] — honor a custom starting stack; defaults to 1000
+    // (every hardcoded template omits startingChips, so their behavior is unchanged).
+    const startingChips = tournament.config.startingChips || 1000;
     for (const p of tournament.players) {
       p.chips = startingChips;
       p.eliminated = false;
@@ -402,6 +412,8 @@ export class TournamentManager {
   private scheduleBlindUp(tournamentId: string): void {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament || tournament.status !== 'running') return;
+    // 2026-07-07 gap-fill [15] — never re-arm the clock while paused.
+    if (tournament.paused) return;
 
     const currentLevel = tournament.config.blindLevels[tournament.currentBlindLevel];
     if (!currentLevel) return;
@@ -412,8 +424,15 @@ export class TournamentManager {
   }
 
   private advanceBlindLevel(tournamentId: string): void {
+    this.doAdvanceLevel(tournamentId);
+  }
+
+  // 2026-07-07 gap-fill [15] — shared blind-up body so BOTH the automatic timer
+  // and a director's manual "Advance Level" run identical logic. Returns the new
+  // BlindLevel (or null if already at the top / not running).
+  private doAdvanceLevel(tournamentId: string): BlindLevel | null {
     const tournament = this.tournaments.get(tournamentId);
-    if (!tournament || tournament.status !== 'running') return;
+    if (!tournament || tournament.status !== 'running') return null;
 
     // 2026-06-11 audit E3: STOP at the final level. The old code clamped
     // currentBlindLevel to the max but then ALWAYS rescheduled — so at the top
@@ -421,7 +440,7 @@ export class TournamentManager {
     // notification) every `duration`. Once we're at the last level, don't
     // increment, emit, or reschedule again.
     if (tournament.currentBlindLevel >= tournament.config.blindLevels.length - 1) {
-      return;
+      return null;
     }
 
     tournament.currentBlindLevel++;
@@ -435,6 +454,38 @@ export class TournamentManager {
     });
 
     this.scheduleBlindUp(tournamentId);
+    return newLevel;
+  }
+
+  // 2026-07-07 gap-fill [15] — manual director "Advance Level". Clears the
+  // pending auto timer (so we don't double-advance), then advances one level via
+  // the shared body. The blindLevelUp event listener in index.ts mutates the
+  // live table blinds + broadcasts, so a manual advance rides that path too.
+  advanceLevel(tournamentId: string): BlindLevel | null {
+    const tournament = this.tournaments.get(tournamentId);
+    if (!tournament || tournament.status !== 'running' || tournament.paused) return null;
+    if (tournament.blindTimer) { clearTimeout(tournament.blindTimer); tournament.blindTimer = null; }
+    return this.doAdvanceLevel(tournamentId);
+  }
+
+  // 2026-07-07 gap-fill [15] — director pause/resume. Pausing stops the blind
+  // clock; index.ts holds the tables at the next hand boundary. Resuming re-arms
+  // the clock (v1: resets the current level's timer to a full duration — a
+  // precise remaining-time pause would need levelStartedAt tracking). Returns
+  // false if the tournament isn't running.
+  pauseTournament(tournamentId: string, paused: boolean): boolean {
+    const tournament = this.tournaments.get(tournamentId);
+    if (!tournament || tournament.status !== 'running') return false;
+    if (paused) {
+      if (tournament.blindTimer) { clearTimeout(tournament.blindTimer); tournament.blindTimer = null; }
+      tournament.paused = true;
+      this.emitEvent(tournamentId, 'tournamentPaused', { tournamentId });
+    } else {
+      tournament.paused = false;
+      this.scheduleBlindUp(tournamentId);
+      this.emitEvent(tournamentId, 'tournamentResumed', { tournamentId });
+    }
+    return true;
   }
 
   eliminatePlayer(tournamentId: string, playerId: string, eliminatorId?: string): { finished: boolean; position: number; payout: number; bountyPayout?: number } | null {

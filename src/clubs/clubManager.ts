@@ -1623,18 +1623,24 @@ export async function scheduleTable(
   }
 
   const pool = getPool();
+  // 2026-07-07 gap-fill [10] — normalize the client's datetime-local string to a
+  // full ISO string BEFORE insert. The auto-fire sweep compares scheduledTime <=
+  // now.toISOString() lexically, which is only correct when both sides share the
+  // ISO format. A naive datetime-local ("2026-07-07T14:30") is treated as
+  // server-UTC here (Railway runs UTC); acceptable for a play-money social table.
+  const isoTime = (() => { const d = new Date(time); return isNaN(d.getTime()) ? time : d.toISOString(); })();
   try {
     const result = await pool.query(
       `INSERT INTO scheduled_tables (clubId, tableConfig, scheduledTime, recurring, recurrencePattern, status, createdBy)
        VALUES ($1, $2, $3, $4, $5, 'scheduled', $6) RETURNING id`,
-      [clubId, JSON.stringify(config), time, recurring ? 1 : 0, recurrencePattern || null, managerId]
+      [clubId, JSON.stringify(config), isoTime, recurring ? 1 : 0, recurrencePattern || null, managerId]
     );
 
     const st: ScheduledTable = {
       id: result.rows[0].id as number,
       clubId,
       tableConfig: JSON.stringify(config),
-      scheduledTime: time,
+      scheduledTime: isoTime,
       recurring,
       recurrencePattern: recurrencePattern || null,
       status: 'scheduled',
@@ -1707,6 +1713,50 @@ export async function deleteScheduledTable(
 
   await pool.query('DELETE FROM scheduled_tables WHERE id = $1', [id]);
   return { success: true };
+}
+
+// 2026-07-07 gap-fill [10] — auto-fire support for scheduled/recurring tables.
+// poker-server has no cron; index.ts runs a 60s setInterval sweep that calls
+// getDueScheduledTables, creates each due table, marks it activated, and (if
+// recurring) spawns the next occurrence as a fresh row.
+export async function getDueScheduledTables(now: string): Promise<ScheduledTable[]> {
+  const pool = getPool();
+  const rows = (await pool.query(
+    `SELECT * FROM scheduled_tables WHERE status = 'scheduled' AND scheduledTime <= $1 ORDER BY scheduledTime ASC LIMIT 50`,
+    [now]
+  )).rows as any[];
+  return rows.map((r) => ({
+    id: r.id,
+    clubId: r.clubid,
+    tableConfig: r.tableconfig,
+    scheduledTime: r.scheduledtime,
+    recurring: r.recurring === 1,
+    recurrencePattern: r.recurrencepattern,
+    status: r.status,
+    createdBy: r.createdby,
+  }));
+}
+
+export async function markScheduledActivated(id: number): Promise<void> {
+  await getPool().query(`UPDATE scheduled_tables SET status = 'active' WHERE id = $1`, [id]);
+}
+
+// Spawn the NEXT occurrence of a recurring row as a brand-new 'scheduled' row so
+// the recurrence keeps going without an unbounded/mutated row. No-op for
+// non-recurring rows. nextTime = scheduledTime + (weekly ? 7d : 1d).
+export async function rescheduleRecurring(id: number): Promise<void> {
+  const pool = getPool();
+  const row = (await pool.query('SELECT * FROM scheduled_tables WHERE id = $1', [id])).rows[0] as any;
+  if (!row || row.recurring !== 1) return;
+  const base = new Date(row.scheduledtime).getTime();
+  if (isNaN(base)) return;
+  const stepMs = (row.recurrencepattern === 'weekly' ? 7 : 1) * 24 * 60 * 60 * 1000;
+  const nextTime = new Date(base + stepMs).toISOString();
+  await pool.query(
+    `INSERT INTO scheduled_tables (clubId, tableConfig, scheduledTime, recurring, recurrencePattern, status, createdBy)
+     VALUES ($1, $2, $3, $4, $5, 'scheduled', $6)`,
+    [row.clubid, row.tableconfig, nextTime, row.recurring, row.recurrencepattern || null, row.createdby]
+  );
 }
 
 // ========== Custom Blind Structures ==========

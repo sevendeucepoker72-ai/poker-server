@@ -51,6 +51,9 @@ export interface PlayerProgress {
   rankedWins: number;
   rankedLosses: number;
   peakElo: number;
+  // 2026-07-07 gap-fill — bounded ELO samples {t,elo} for the rank sparkline
+  // (real in-session trend; client shows an honest empty state until >=2 points).
+  eloHistory?: Array<{ t: number; elo: number }>;
 
   // Cosmetics
   ownedThemes: string[]; // theme IDs owned

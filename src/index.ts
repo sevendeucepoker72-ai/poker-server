@@ -100,6 +100,9 @@ import {
   getScheduledTables,
   activateScheduledTable,
   deleteScheduledTable,
+  getDueScheduledTables,
+  markScheduledActivated,
+  rescheduleRecurring,
   createBlindStructure,
   getBlindStructures,
   deleteBlindStructure,
@@ -133,7 +136,7 @@ import {
 } from './social/predictionManager';
 import {
   initBracketTables, getBracket, createBracket, eliminatePlayer as eliminateBracketPlayer,
-  addSideBet as addBracketSideBet,
+  addSideBet as addBracketSideBet, settleBracketSideBets, refundBracketSideBets,
 } from './social/bracketManager';
 
 // ========== Sentry (optional, prod-only crash reporting) ==========
@@ -490,6 +493,13 @@ const actionNonces = new Map<string, { nonce: string; ts: number }>();
 // tips them over the ban threshold on a single future alert.
 const chipVelocityAlerts = new Map<number, { count: number; lastAlertAt: number }>();
 const CHIP_VELOCITY_DECAY_MS = 24 * 60 * 60 * 1000; // 24h quiet → count -= 1
+// 2026-07-07 gap-fill [7] — LLM table commentary throttle. tableId -> last emit ts.
+// The client (TableCommentary.jsx) already listens for 'tableCommentary'; nothing
+// on the server ever emitted it. This bounds Anthropic spend: min 25s between LLM
+// calls per table, and we only fire on genuinely notable results. INERT unless
+// ANTHROPIC_API_KEY is set (same gate as session recap / coachHand).
+const tableCommentaryLastEmit = new Map<string, number>();
+const TABLE_COMMENTARY_MIN_INTERVAL_MS = 25_000;
 
 function incrementChipVelocityAlert(userId: number): number {
   const now = Date.now();
@@ -1241,6 +1251,53 @@ async function syncQualifierSchedule(): Promise<void> {
 setTimeout(() => syncQualifierSchedule(), 5000);
 setInterval(() => syncQualifierSchedule(), 30 * 60 * 1000);
 
+// 2026-07-07 gap-fill [10] — shared table-creation from a scheduled-table config.
+// Used by BOTH the manual Activate handler and the auto-fire sweep so the two
+// paths can never drift.
+async function createTableFromScheduledConfig(clubId: number, cfg: any): Promise<string> {
+  const clubInfoResult = await getClubInfo(clubId);
+  const clubName = clubInfoResult.club?.name || 'Club';
+  const variant = (cfg.variant || 'texas-holdem') as VariantType;
+  const tableConfig = {
+    tableName: `[${clubName}] ${cfg.tableName || 'Scheduled Table'}`,
+    smallBlind: cfg.smallBlind || 25,
+    bigBlind: cfg.bigBlind || 50,
+    ante: 0,
+    minBuyIn: cfg.minBuyIn || 1000,
+  };
+  return variant === 'texas-holdem'
+    ? tableManager.createTable(tableConfig)
+    : tableManager.createVariantTable(tableConfig, variant);
+}
+
+// 2026-07-07 gap-fill [10] — auto-fire due scheduled/recurring club tables. Runs
+// on a 60s interval (poker-server has no cron). Each due row: create the table,
+// mark it activated, and (if recurring) queue the next occurrence. Per-row
+// try/catch so one bad row can't stall the whole sweep.
+async function sweepScheduledClubTables(): Promise<void> {
+  try {
+    const due = await getDueScheduledTables(new Date().toISOString());
+    for (const row of due) {
+      try {
+        const cfg = JSON.parse(row.tableConfig || '{}');
+        const tableId = await createTableFromScheduledConfig(row.clubId, cfg);
+        await markScheduledActivated(row.id);
+        if (row.recurring) await rescheduleRecurring(row.id);
+        io.emit('scheduledClubTableActivated', { success: true, tableId, clubId: row.clubId });
+        console.log(`[ClubSweep] auto-activated scheduled table ${row.id} (club ${row.clubId}) -> ${tableId}`);
+      } catch (e: any) {
+        console.warn(`[ClubSweep] row ${row.id} failed:`, e?.message);
+      }
+    }
+  } catch (err: any) {
+    console.warn('[ClubSweep] error:', err?.message);
+  }
+}
+// Run 15 s after startup then every 60 s (same module-scope pattern as the
+// qualifier sync above).
+setTimeout(() => sweepScheduledClubTables(), 15000);
+setInterval(() => sweepScheduledClubTables(), 60 * 1000);
+
 // REST endpoint: get qualifier tournament registrations
 app.get('/api/qualifier-tournaments', (_req, res) => {
   const list: any[] = [];
@@ -1820,6 +1877,27 @@ function broadcastGameState(tableId: string): void {
     }
   }
 
+  // 2026-07-07 gap-fill [5] — also push personalized state to any SECONDARY
+  // (multi-table) session seated at this table. broadcastGameState previously
+  // only knew playerSessions (the primary seat), so a table opened via
+  // MultiTableTabs froze at its join snapshot. We emit a RAW full snapshot here
+  // (NOT via emitGameState) ON PURPOSE: emitGameState keys its delta baseline
+  // (lastSentState) on socket.id alone, so delta-encoding a secondary table
+  // would corrupt the socket's PRIMARY delta baseline. Full snapshots are
+  // correct and cheap for the rare multi-table case. getGameStateForPlayer
+  // stamps state.tableId + state.yourSeat, so the client routes each snapshot
+  // to the right active-table pane with no extra wiring.
+  for (const [socketId, sessions] of multiTableSessions) {
+    for (const session of sessions) {
+      if (session.tableId !== tableId) continue;
+      const socket = io.sockets.sockets.get(socketId);
+      if (!socket) continue;
+      const state: any = getGameStateForPlayer(table, session.seatIndex, session.trainingEnabled);
+      state.sittingOut = session.sittingOut || false;
+      socket.emit('gameState', { full: true, state, _serverTs: Date.now() });
+    }
+  }
+
   // Also broadcast to any spectators in the room.
   // Guard activeSeatIndex: when no hand is in progress PokerTable leaves it
   // at -1, which spectator clients can mis-use as an array index. Emit null
@@ -2129,6 +2207,35 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         }
       }
     }
+
+    // 2026-07-07 gap-fill [7] — LLM table commentary. Env-gated + throttled so it
+    // bounds Anthropic spend and stays INERT (client keeps its local fallback)
+    // when ANTHROPIC_API_KEY is unset. Built ONLY from authoritative final
+    // results — never a client payload. Fires on notable hands (big pot, all-in
+    // showdown). Silent no-op on any failure so a model hiccup can't disturb play.
+    try {
+      const apiKey = process.env.ANTHROPIC_API_KEY;
+      if (apiKey) {
+        const winner = (data.results || []).slice().sort((a, b) => (b?.chipsWon || 0) - (a?.chipsWon || 0))[0];
+        const pot = (data.results || []).reduce((s, r) => s + (r?.chipsWon > 0 ? r.chipsWon : 0), 0);
+        const notable = winner && (pot >= 2000 || table.wentToShowdown);
+        const lastEmit = tableCommentaryLastEmit.get(tableId) || 0;
+        if (notable && Date.now() - lastEmit >= TABLE_COMMENTARY_MIN_INTERVAL_MS) {
+          tableCommentaryLastEmit.set(tableId, Date.now());
+          const winnerName = String(winner.playerName || 'A player').slice(0, 24);
+          const handName = String(winner.handName || '').slice(0, 40);
+          const showdown = table.wentToShowdown ? 'at showdown' : 'when everyone folded';
+          const prompt = `You are a witty, concise poker table commentator. In ONE short sentence (max 18 words), react to this hand: ${winnerName} won a ${pot}-chip pot ${showdown}${handName ? ` with ${handName}` : ''}. Be fun and punchy, no emojis, no hashtags.`;
+          new Anthropic({ apiKey }).messages
+            .create({ model: 'claude-haiku-4-5-20251001', max_tokens: 120, messages: [{ role: 'user', content: prompt }] })
+            .then((resp: any) => {
+              const text = resp?.content?.[0]?.type === 'text' ? resp.content[0].text?.trim() : '';
+              if (text) io.to(`table:${tableId}`).emit('tableCommentary', { text, type: 'llm' });
+            })
+            .catch(() => {});
+        }
+      }
+    } catch { /* commentary is best-effort — never let it disrupt the hand */ }
   });
 
   // Capture revealed deck seeds into the fairness buffer so /api/fairness/*
@@ -2712,6 +2819,12 @@ function autoStartNextHand(tableId: string): void {
   // Tournament table guard: don't start a new hand if table has < 5 alive players
   // and there are multiple tables still in play. Wait for rebalance to fill it.
   const tId = tournamentTables.get(tableId);
+  // 2026-07-07 gap-fill [15] — director pause. Hold at the hand boundary while
+  // paused; the resume handler re-kicks each table. This never interrupts a live
+  // hand (autoStartNextHand only runs once the current hand has completed).
+  if (tId && tournamentManager.getTournament(tId)?.paused) {
+    return;
+  }
   if (tId) {
     const tourn = tournamentManager.getTournament(tId);
     if (tourn && tourn.tableIds.length > 1) {
@@ -5549,6 +5662,48 @@ Give feedback in this JSON format:
     } catch { socket.emit('error', { message: 'Failed to delete promotion' }); }
   });
 
+  // 2026-07-07 gap-fill — season leaderboard awards. The Leaderboard UI advertises
+  // real season prizes (1st 50k+Gold, 2nd 25k+Silver, 3rd 10k+Bronze) but nothing
+  // ever paid them out. Admin-triggered (NOT auto), idempotent per season+user via
+  // season_leaderboard_awards, play-money chips on the audited additive path +
+  // badge cosmetics via grantItem. Ranks the top-3 by chips (what the leaderboard
+  // shows). Amounts are SERVER constants — never from the client.
+  socket.on('runSeasonLeaderboardAward', async (data: { seasonKey?: string } = {}) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const seasonKey = (data?.seasonKey && /^\d{4}-\d{2}$/.test(data.seasonKey)) ? data.seasonKey : new Date().toISOString().slice(0, 7);
+    const REWARDS = [
+      { place: 1, chips: 50000, badge: 'season_gold' },
+      { place: 2, chips: 25000, badge: 'season_silver' },
+      { place: 3, chips: 10000, badge: 'season_bronze' },
+    ];
+    try {
+      const { rows } = await getPool().query('SELECT id, username, chips FROM users WHERE banned = FALSE ORDER BY chips DESC LIMIT 3');
+      const results: any[] = [];
+      for (let i = 0; i < rows.length && i < REWARDS.length; i++) {
+        const u = rows[i];
+        const rw = REWARDS[i];
+        // Idempotency lock FIRST — if the row already exists for this season+user,
+        // skip (never double-pay). Then grant chips + badge.
+        const ins = await getPool().query(
+          `INSERT INTO season_leaderboard_awards (season_key, user_id, place, chips, badge_id) VALUES ($1,$2,$3,$4,$5)
+             ON CONFLICT (season_key, user_id) DO NOTHING RETURNING 1`,
+          [seasonKey, u.id, rw.place, rw.chips, rw.badge]
+        );
+        if (ins.rowCount === 0) { results.push({ username: u.username, place: rw.place, skipped: 'already_awarded' }); continue; }
+        const okc = await addChipsToUser(u.id, rw.chips);
+        if (!okc) auditLog('SYSTEM', 'SEASON_AWARD_CHIPS_DB_FAIL', { seasonKey, userId: u.id, amount: rw.chips });
+        await dbGrantItem(u.id, 'badge', rw.badge);
+        auditLog(auth.username, 'SEASON_LEADERBOARD_AWARD', { seasonKey, place: rw.place, userId: u.id, username: u.username, chips: rw.chips, badge: rw.badge });
+        results.push({ username: u.username, place: rw.place, chips: rw.chips, badge: rw.badge });
+      }
+      socket.emit('seasonLeaderboardAwarded', { success: true, seasonKey, results });
+    } catch (err: any) {
+      console.error('[runSeasonLeaderboardAward]', err);
+      socket.emit('seasonLeaderboardAwarded', { success: false, error: 'server_error' });
+    }
+  });
+
   // ── Qualifier configs (shared admin-authored list; was client sessionStorage) ──
   // Reading is PUBLIC (players see the qualifier list to register). Writing is
   // admin-only. The client sends its full qualifier array; we store it as one
@@ -6109,21 +6264,9 @@ Give feedback in this JSON format:
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = await activateScheduledTable(data.id, auth.userId);
     if (result.success && result.tableConfig) {
-      // Create the actual table
-      const clubInfoResult = await getClubInfo(data.clubId);
-      const clubName = clubInfoResult.club?.name || 'Club';
-      const cfg = result.tableConfig;
-      const variant = (cfg.variant || 'texas-holdem') as VariantType;
-      const tableConfig = {
-        tableName: `[${clubName}] ${cfg.tableName || 'Scheduled Table'}`,
-        smallBlind: cfg.smallBlind || 25,
-        bigBlind: cfg.bigBlind || 50,
-        ante: 0,
-        minBuyIn: cfg.minBuyIn || 1000,
-      };
-      const tableId = variant === 'texas-holdem'
-        ? tableManager.createTable(tableConfig)
-        : tableManager.createVariantTable(tableConfig, variant);
+      // 2026-07-07 gap-fill [10] — create via the shared helper so the manual
+      // Activate button and the auto-fire sweep produce byte-identical tables.
+      const tableId = await createTableFromScheduledConfig(data.clubId, result.tableConfig);
       socket.emit('scheduledClubTableActivated', { success: true, tableId });
     } else {
       socket.emit('error', { message: result.error });
@@ -8478,8 +8621,21 @@ Give feedback in this JSON format:
       // with clients that don't send it yet — the guard below only rejects
       // when it IS present and strictly older than the table's current version.
       stateVersion?: number;
+      // 2026-07-07 gap-fill [5]: the active table the action targets. Multi-table
+      // players send this so the action applies to the right table; omitting it
+      // keeps the legacy primary-session behavior exactly.
+      tableId?: string;
     }) => {
-      const session = playerSessions.get(socket.id);
+      // 2026-07-07 gap-fill [5] — resolve the acting session by tableId (mirrors
+      // moveSeat @8479). Without this, an action taken on a SECONDARY table was
+      // applied to the player's PRIMARY table (or rejected 'Not your turn'),
+      // because the handler only ever read the primary playerSessions entry.
+      let session: PlayerSession | undefined = playerSessions.get(socket.id);
+      if (data.tableId && session?.tableId !== data.tableId) {
+        const multi = multiTableSessions.get(socket.id) || [];
+        const match = multi.find((s) => s.tableId === data.tableId);
+        if (match) session = match;
+      }
       if (!session) {
         socket.emit('error', { message: 'Not at a table' });
         return;
@@ -8926,17 +9082,92 @@ Give feedback in this JSON format:
     try {
       const res = await eliminateBracketPlayer(String(data?.bracketId || ''), auth.userId, String(data?.playerName || ''));
       if (!res.ok || !res.state) { socket.emit('socialBracketError', { message: res.error || 'Could not eliminate' }); return; }
+      // 2026-07-07 gap-fill [24] — when this elimination COMPLETES the bracket,
+      // settle the escrowed chip side bets (parimutuel). Idempotent inside
+      // settleBracketSideBets via sidebets_settled, so a double-fire can't
+      // double-pay. Credit + audit + notify each winner/refund.
+      if (res.state.status === 'complete') {
+        try {
+          const movements = await settleBracketSideBets(res.state.bracketId);
+          for (const m of movements) {
+            auditLog('SYSTEM', m.reason === 'sidebet_win' ? 'BRACKET_SIDEBET_PAYOUT' : 'BRACKET_SIDEBET_REFUND', { bracketId: res.state.bracketId, userId: m.userId, amount: m.amount, target: m.target });
+            // Push the new balance + a toast to every live tab of the winner/refundee.
+            const newChips = await getUserChips(m.userId);
+            for (const [sid, a] of authSessions) {
+              if (a?.userId === m.userId) {
+                io.to(sid).emit('socialSideBetSettled', {
+                  bracketId: res.state.bracketId,
+                  amount: m.amount,
+                  won: m.reason === 'sidebet_win',
+                  chips: newChips,
+                });
+              }
+            }
+          }
+          // Re-fetch so the broadcast carries settled/payout state.
+          const settledState = await getBracket(res.state.bracketId);
+          if (settledState) res.state = settledState;
+        } catch (e: any) { console.warn('[Bracket] settle failed:', e?.message); }
+      }
       io.to(bracketRoom(res.state.bracketId)).emit('socialBracketState', res.state);
     } catch { socket.emit('socialBracketError', { message: 'Could not eliminate' }); }
   });
   socket.on('placeSocialSideBet', async (data: { bracketId?: string; target?: string; amount?: number }) => {
     const auth = authSessions.get(socket.id);
-    const bettor = auth?.username || 'Guest';
+    // 2026-07-07 gap-fill [24] — real chips move now, so a bet requires a signed-in
+    // wallet (no more 'Guest' bets). The wager SIZE is client-supplied but clamped;
+    // the deduction is server-atomic and the payout server-computed.
+    if (!auth?.userId) { socket.emit('socialBracketError', { message: 'Sign in to place a chip side bet' }); return; }
+    const amt = Math.max(1, Math.min(1_000_000, Math.floor(Number(data?.amount) || 0)));
+    let deducted = false;
     try {
-      const res = await addBracketSideBet(String(data?.bracketId || ''), bettor, String(data?.target || ''), Number(data?.amount));
-      if (!res.ok || !res.state) { socket.emit('socialBracketError', { message: res.error || 'Could not place bet' }); return; }
+      const chips = await getUserChips(auth.userId);
+      if (amt > chips) { socket.emit('socialBracketError', { message: `Not enough chips (need ${amt.toLocaleString()})` }); return; }
+      // Escrow FIRST (atomic check-and-subtract), then record the bet.
+      if (!(await deductChips(auth.userId, amt))) { socket.emit('socialBracketError', { message: 'Could not place bet' }); return; }
+      deducted = true;
+      const res = await addBracketSideBet(String(data?.bracketId || ''), auth.username, String(data?.target || ''), amt, auth.userId);
+      if (!res.ok || !res.state) {
+        // Recording failed (bad bracket / player out / completed) — refund escrow.
+        await addChipsToUser(auth.userId, amt);
+        deducted = false;
+        socket.emit('socialBracketError', { message: res.error || 'Could not place bet' });
+        return;
+      }
+      auditLog(auth.username, 'BRACKET_SIDEBET_ESCROW', { bracketId: res.state.bracketId, target: data?.target, amount: amt });
+      socket.emit('socialSideBetPlaced', { bracketId: res.state.bracketId, amount: amt });
       io.to(bracketRoom(res.state.bracketId)).emit('socialBracketState', res.state);
-    } catch { socket.emit('socialBracketError', { message: 'Could not place bet' }); }
+    } catch (e: any) {
+      // Any throw after the deduct MUST refund — chips are never silently lost.
+      if (deducted) { try { await addChipsToUser(auth.userId, amt); } catch {} }
+      socket.emit('socialBracketError', { message: 'Could not place bet' });
+    }
+  });
+  // 2026-07-07 gap-fill [24] — refund path for an ABANDONED bracket. The
+  // organizer (created_by) or an admin can return every escrowed stake so chips
+  // are never stranded in a bracket that never crowns a champion. Idempotent via
+  // sidebets_settled inside refundBracketSideBets.
+  socket.on('refundSocialBracket', async (data: { bracketId?: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth?.userId) { socket.emit('socialBracketError', { message: 'Not signed in' }); return; }
+    const bracketId = String(data?.bracketId || '');
+    try {
+      const state = await getBracket(bracketId);
+      if (!state) { socket.emit('socialBracketError', { message: 'Bracket not found' }); return; }
+      const isAdmin = await isUserAdmin(auth.userId);
+      if (state.createdBy !== auth.userId && !isAdmin) { socket.emit('socialBracketError', { message: 'Only the organizer can refund' }); return; }
+      const movements = await refundBracketSideBets(bracketId);
+      for (const m of movements) {
+        auditLog(auth.username, 'BRACKET_SIDEBET_REFUND', { bracketId, userId: m.userId, amount: m.amount, reason: 'abandoned' });
+        const newChips = await getUserChips(m.userId);
+        for (const [sid, a] of authSessions) {
+          if (a?.userId === m.userId) io.to(sid).emit('socialSideBetSettled', { bracketId, amount: m.amount, won: false, chips: newChips });
+        }
+      }
+      const refreshed = await getBracket(bracketId);
+      if (refreshed) io.to(bracketRoom(bracketId)).emit('socialBracketState', refreshed);
+      socket.emit('socialBracketRefunded', { bracketId, refunded: movements.length });
+    } catch (e: any) { socket.emit('socialBracketError', { message: 'Could not refund' }); }
   });
 
   // ========== Sit Out ==========
@@ -10153,6 +10384,94 @@ Give feedback in this JSON format:
     for (const tid of tournament.tableIds) {
       fastModeTables.set(tid, data.turbo);
     }
+  });
+
+  // 2026-07-07 gap-fill [14] — launch a real, custom-structured tournament from
+  // the TournamentDirector wizard. Admin-gated (the platform's TD role lives in
+  // the master API, not surfaced here; gate on isUserAdmin for v1). All numbers
+  // are CLAMPED server-side — never trust the client's raw config. Creates the
+  // tournament in 'registering'; it starts via the normal canStart path once
+  // enough players register. The creator is NOT auto-entered (no surprise chip
+  // deduction) — a 0-player tournament is never swept as stalled.
+  socket.on('createCustomTournament', async (data: { config: any }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    try {
+      const cfg = data?.config || {};
+      const name = (String(cfg.name || 'Custom Tournament').replace(/[^\x20-\x7E]/g, '').trim().slice(0, 60)) || 'Custom Tournament';
+      const buyIn = Math.max(0, Math.min(Math.floor(Number(cfg.buyIn) || 0), 1_000_000));
+      const maxPlayers = Math.max(2, Math.min(Math.floor(Number(cfg.maxPlayers) || 9), 180));
+      const startingChips = Math.max(1000, Math.min(Math.floor(Number(cfg.startingChips) || 10000), 50000));
+      const isBounty = !!cfg.isPKO;
+      const bountyAmount = isBounty ? Math.max(0, Math.min(Math.floor(Number(cfg.bountyAmount) || 0), 100_000)) : 0;
+      // Blind schedule: the wizard emits { sb, bb, ante, duration(MINUTES) }. Convert
+      // to engine BlindLevel (duration in SECONDS), coerce+floor+clamp each field,
+      // cap at 40 levels, and fall back to DEFAULT_BLIND_LEVELS if empty/invalid.
+      const rawLevels = Array.isArray(cfg.blindSchedule) ? cfg.blindSchedule.slice(0, 40) : [];
+      const blindLevels = rawLevels
+        .map((l: any) => ({
+          sb: Math.max(1, Math.floor(Number(l?.sb) || 0)),
+          bb: Math.max(2, Math.floor(Number(l?.bb) || 0)),
+          ante: Math.max(0, Math.floor(Number(l?.ante) || 0)),
+          duration: Math.max(30, Math.min(Math.floor((Number(l?.duration) || 5) * 60), 3600)),
+        }))
+        .filter((l: any) => l.sb > 0 && l.bb >= l.sb);
+      const template = {
+        name,
+        buyIn,
+        prizePool: buyIn * maxPlayers, // advertised ceiling; actual pool = collected fees
+        maxPlayers,
+        startInterval: 0, // manual/on-demand start (starts via canStart on registration)
+        blindLevels: blindLevels.length > 0 ? blindLevels : DEFAULT_BLIND_LEVELS,
+        isBounty,
+        bountyAmount,
+        startingChips,
+      };
+      const tournamentId = tournamentManager.createTournament(template);
+      auditLog(auth.username, 'CREATE_CUSTOM_TOURNAMENT', { tournamentId, name, buyIn, maxPlayers, startingChips, isBounty });
+      socket.emit('customTournamentCreated', { tournamentId, name });
+      io.emit('tournamentList', tournamentManager.getTournamentList());
+    } catch (err: any) {
+      console.error('[createCustomTournament]', err);
+      socket.emit('error', { message: 'Failed to create tournament' });
+    }
+  });
+
+  // 2026-07-07 gap-fill [15] — live director controls. All admin-gated (mirror
+  // setTournamentSpeed). Pause/resume freezes the blind clock + holds tables at
+  // the next hand boundary; advance forces the next blind level; rebalance kicks
+  // the existing table-rebalance flow.
+  socket.on('pauseTournament', async (data: { tournamentId: string; paused: boolean }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const ok = tournamentManager.pauseTournament(data.tournamentId, !!data.paused);
+    if (!ok) { socket.emit('error', { message: 'Tournament not running' }); return; }
+    const tourn = tournamentManager.getTournament(data.tournamentId);
+    auditLog(auth.username, 'TOURNAMENT_PAUSE', { tournamentId: data.tournamentId, paused: !!data.paused });
+    const evt = data.paused ? 'tournamentPaused' : 'tournamentResumed';
+    for (const tid of tourn?.tableIds || []) {
+      io.to(`table:${tid}`).emit(evt, { tournamentId: data.tournamentId });
+      // On resume, re-kick any table that stalled at the hand boundary while paused.
+      if (!data.paused) scheduleAutoStart(tid);
+    }
+    io.emit('tournamentList', tournamentManager.getTournamentList());
+  });
+
+  socket.on('advanceTournamentLevel', async (data: { tournamentId: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const level = tournamentManager.advanceLevel(data.tournamentId);
+    // The blindLevelUp event listener (startTournamentGame) mutates the live table
+    // blinds + broadcasts, so a manual advance rides that path automatically.
+    auditLog(auth.username, 'TOURNAMENT_ADVANCE_LEVEL', { tournamentId: data.tournamentId, advanced: !!level });
+    io.emit('tournamentList', tournamentManager.getTournamentList());
+  });
+
+  socket.on('rebalanceTournament', async (data: { tournamentId: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    handleTableRebalance(data.tournamentId);
+    auditLog(auth.username, 'TOURNAMENT_REBALANCE', { tournamentId: data.tournamentId });
   });
 
   // ========== Multi-Table Support ==========

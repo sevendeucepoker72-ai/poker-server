@@ -1099,6 +1099,17 @@ export class ProgressionManager {
 
     if (winner.elo > winner.peakElo) winner.peakElo = winner.elo;
 
+    // 2026-07-07 gap-fill — record a bounded ELO sample for the rank sparkline
+    // so it shows a REAL trend (was a fake flat line). Capped to the last 30.
+    const now = Date.now();
+    const pushElo = (p: PlayerProgress) => {
+      if (!Array.isArray(p.eloHistory)) p.eloHistory = [];
+      p.eloHistory.push({ t: now, elo: p.elo });
+      if (p.eloHistory.length > 30) p.eloHistory = p.eloHistory.slice(-30);
+    };
+    pushElo(winner);
+    pushElo(loser);
+
     winner.rank = eloToRank(winner.elo);
     loser.rank = eloToRank(loser.elo);
 
@@ -1643,6 +1654,7 @@ export class ProgressionManager {
       rankedWins: progress.rankedWins,
       rankedLosses: progress.rankedLosses,
       peakElo: progress.peakElo,
+      eloHistory: progress.eloHistory || [],   // 2026-07-07 gap-fill — real rank trend
       // Shop entitlements so the client can show real VIP status + active
       // boosters (previously in-memory only and never sent to the client).
       vipExpiresAt: (progress as any).vipExpiresAt || 0,
