@@ -7619,8 +7619,16 @@ Give feedback in this JSON format:
     try {
       const ctx = await ensureHydrated(socket);
       if (!ctx) return;
-      await persistCustomization(ctx.userId, data || {});
-      socket.emit('customizationUpdated', { success: true, customization: data || {} });
+      // 2026-07-07 gap-fill — fail-closed avatar moderation. Photo uploads now go
+      // through the moderated POST /avatars/upload pipeline (Cloud Vision / admin
+      // queue) and render via avatarService, NOT the raw customization blob. STRIP
+      // any `photo` here so a stale/hostile client can't inject an unmoderated,
+      // table-wide image through the socket path (the client already strips it;
+      // this is the server-side backstop).
+      const clean = { ...(data || {}) };
+      if ('photo' in clean) delete clean.photo;
+      await persistCustomization(ctx.userId, clean);
+      socket.emit('customizationUpdated', { success: true, customization: clean });
     } catch (err: any) {
       console.error('updateAvatar error:', err);
     }
