@@ -50,7 +50,7 @@ import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP } from './auth/authManager';
+import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus } from './auth/oauthValidator';
 import { notifyPlayer } from './notifyClient';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
@@ -7668,15 +7668,17 @@ Give feedback in this JSON format:
     try {
       const ctx = await ensureHydrated(socket);
       if (!ctx) return;
-      const [inventory, bpClaims, durable, handHistory] = await Promise.all([
+      const [inventory, bpClaims, durable, handHistory, careerProgress] = await Promise.all([
         loadInventory(ctx.userId),
         loadBattlePassClaims(ctx.userId, data.seasonId || 'season_1_the_river'),
         loadDurableProgress(ctx.userId),
         loadHandHistory(ctx.userId, 100),
+        loadCareerProgress(ctx.userId),
       ]);
       socket.emit('durableState', {
         inventory,
         battlePassClaims: bpClaims,
+        careerProgress,
         customization: durable?.customization || {},
         preferences: durable?.preferences || {},
         stars: durable?.stars || 0,
@@ -9658,7 +9660,43 @@ Give feedback in this JSON format:
         }
         if (done) {
           careerResolved = true;
-          socket.emit('careerGameComplete', { venue, stage, won, stars: won ? 3 : 0 });
+          const stars = won ? 3 : 0;
+          // 2026-07-07 gap-fill — PERSIST progress server-side (was localStorage
+          // only → lost cross-device) and GRANT the advertised venue reward the
+          // first time the final-boss stage (stage 2) is beaten. Reward is
+          // play-money chips (audited additive) + a cosmetic (grantItem), gated
+          // once-per-venue by claimCareerReward so replays can't re-mint.
+          if (authCareer?.userId) {
+            const uid = authCareer.userId;
+            if (won) {
+              upsertCareerProgress(uid, venue, stage, stars).catch(() => {});
+              if (stage === 2) {
+                // SERVER copy of the VENUES reward table (never trust the client).
+                const CAREER_REWARDS: Array<{ chips: number; item?: { type: string; id: string } }> = [
+                  { chips: 1000 },
+                  { chips: 5000, item: { type: 'card_back', id: 'career_local_casino' } },
+                  { chips: 15000, item: { type: 'theme', id: 'career_vegas_strip' } },
+                  { chips: 50000, item: { type: 'avatar_frame', id: 'career_monte_carlo' } },
+                  { chips: 100000, item: { type: 'theme', id: 'career_macau' } },
+                  { chips: 500000, item: { type: 'card_back', id: 'career_wsop_legend' } },
+                ];
+                const rw = CAREER_REWARDS[venue];
+                if (rw) {
+                  (async () => {
+                    const firstTime = await claimCareerReward(uid, venue);
+                    if (!firstTime) return; // already paid for this venue
+                    const okc = await addChipsToUser(uid, rw.chips);
+                    if (!okc) { auditLog('SYSTEM', 'CAREER_CHIPS_DB_FAIL', { userId: uid, venue, amount: rw.chips }); }
+                    if (rw.item) await dbGrantItem(uid, rw.item.type, rw.item.id);
+                    auditLog(String(uid), 'CAREER_REWARD_GRANT', { venue, chips: rw.chips, extra: rw.item || null });
+                    try { const inv = await loadInventory(uid); socket.emit('inventoryUpdated', { inventory: inv }); } catch {}
+                    sendProgressToPlayer(socket.id);
+                  })().catch((e) => console.warn('[career reward]', e?.message));
+                }
+              }
+            }
+          }
+          socket.emit('careerGameComplete', { venue, stage, won, stars });
           setTimeout(() => cleanupQuickTable(tableId), 5000);
         }
       }, 1000);

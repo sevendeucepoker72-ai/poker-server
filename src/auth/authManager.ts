@@ -264,6 +264,29 @@ export async function initDB(): Promise<void> {
   `).catch((e: any) => console.warn('[Auth] user_inventory:', e.message));
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_user_inventory_equipped ON user_inventory(user_id, item_type) WHERE equipped = TRUE`).catch(() => {});
 
+  // 2026-07-07 gap-fill — durable Career Mode progress (was localStorage-only,
+  // lost cross-device / on cache clear — violated the "user data must persist"
+  // rule) + a once-per-venue reward claim guard so the advertised venue payout
+  // is granted exactly once even on replay.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_career_progress (
+      user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      venue        INTEGER NOT NULL,
+      stage        INTEGER NOT NULL,
+      stars        INTEGER NOT NULL DEFAULT 0,
+      completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, venue, stage)
+    )
+  `).catch((e: any) => console.warn('[Auth] user_career_progress:', e.message));
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_career_reward_claims (
+      user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      venue       INTEGER NOT NULL,
+      claimed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, venue)
+    )
+  `).catch((e: any) => console.warn('[Auth] user_career_reward_claims:', e.message));
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_daily_claims (
       user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1040,6 +1063,51 @@ export async function equipItem(userId: number, itemType: string, itemId: string
     return false;
   } finally {
     client.release();
+  }
+}
+
+// 2026-07-07 gap-fill — Career Mode durable progress + once-per-venue reward.
+/** Upsert career progress; ratchets stars up (never down) and is idempotent. */
+export async function upsertCareerProgress(userId: number, venue: number, stage: number, stars: number): Promise<void> {
+  try {
+    await pool.query(
+      `INSERT INTO user_career_progress (user_id, venue, stage, stars) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (user_id, venue, stage)
+         DO UPDATE SET stars = GREATEST(user_career_progress.stars, EXCLUDED.stars), completed_at = NOW()`,
+      [userId, venue, stage, stars]
+    );
+  } catch (e: any) {
+    console.warn(`[upsertCareerProgress ${userId} v${venue}/s${stage}]`, e.message);
+  }
+}
+
+/** Load a user's career progress as {venue, stage, stars} rows. */
+export async function loadCareerProgress(userId: number): Promise<Array<{ venue: number; stage: number; stars: number }>> {
+  try {
+    const { rows } = await pool.query(
+      `SELECT venue, stage, stars FROM user_career_progress WHERE user_id = $1 ORDER BY venue, stage`,
+      [userId]
+    );
+    return rows.map((r: any) => ({ venue: r.venue, stage: r.stage, stars: r.stars }));
+  } catch (e: any) {
+    console.warn(`[loadCareerProgress ${userId}]`, e.message);
+    return [];
+  }
+}
+
+/** Atomically claim a venue's one-time completion reward. Returns true only the
+ *  FIRST time (so the chip/cosmetic payout is granted exactly once per venue). */
+export async function claimCareerReward(userId: number, venue: number): Promise<boolean> {
+  try {
+    const { rowCount } = await pool.query(
+      `INSERT INTO user_career_reward_claims (user_id, venue) VALUES ($1, $2)
+         ON CONFLICT (user_id, venue) DO NOTHING`,
+      [userId, venue]
+    );
+    return (rowCount || 0) > 0;
+  } catch (e: any) {
+    console.warn(`[claimCareerReward ${userId} v${venue}]`, e.message);
+    return false;
   }
 }
 
