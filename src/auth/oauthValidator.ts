@@ -30,6 +30,7 @@ async function verifyJwtAccessToken(token: string): Promise<OAuthTokenResult> {
     const { payload } = await jose.jwtVerify(token, getJwks(), {
       issuer: AUTH_SERVER_URL,   // matches auth-server AUTH_ISSUER
       audience: API_RESOURCE,    // access tokens minted for the master API resource
+      typ: 'at+jwt',             // 2026-07-08 audit — RFC 9068 access tokens ONLY (never an id_token)
     });
     const sub = typeof payload.sub === 'string' ? payload.sub : undefined;
     if (!sub) return { valid: false, error: 'JWT missing sub' };
