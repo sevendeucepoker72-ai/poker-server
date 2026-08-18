@@ -8,12 +8,22 @@
 # - apps/web/poker-admin/canonical-features.txt (admin)
 # - apps/marketing/canonical-features.txt (marketing)
 #
-# NOTE: 2026-05-12 — this manifest is currently READ-ONLY INVENTORY.
-# poker-server's Railway deploy script does NOT yet grep against it. The
-# file is committed now to establish the lock surface; the deploy-side
-# enforcement will be wired in a follow-up. Per CLAUDE.md's "three layers
-# of locks" rule, having the manifest in place is layer #1 (the contract);
-# the grep step is layer #2 (enforcement).
+# ENFORCEMENT (2026-08-17): the "Canonical features manifest" step in
+# .github/workflows/ci.yml greps the BUILT `dist/` for every token below on
+# every push + PR to main, and fails the build on a miss.
+#
+# Read the previous note as a warning, not history: from 2026-05-12 until
+# 2026-08-17 this file claimed to guard against regressions while being
+# enforced by NOTHING — no `poker-server` case in the workspace `ship.sh`, no
+# deploy script of its own (Railway deploys straight from a git push), and no
+# CI step. A lock that nothing checks is worse than no lock, because it makes
+# people believe a class of regression is covered.
+#
+# NOTE ON SCOPE: CI is the enforcement point, NOT the deploy. Railway builds
+# from the pushed commit independently, so a red CI run does not physically
+# block a deploy the way the FTP/Cloud Run scripts do for the other apps.
+# Wiring a Railway pre-deploy check (or a required-status-check branch
+# protection rule on main) is the remaining gap.
 #
 # RULES:
 # - One token per line
@@ -47,12 +57,30 @@ actionNonce
 tableUpdate
 
 # ============================================================
-# Cross-site SSO bridge — poker-server consumes id tokens minted by the
-# auth-server bridge flow. Anchor on the grant-type string and the URL
-# fragment key that AuthCallback parses. CLAUDE.md Pattern A precedent.
+# Cross-site SSO bridge — poker-server's half of it.
+#
+# 2026-08-17 CORRECTION. This block used to list `bridge_id_token` and
+# `urn:apk:bridge`. Neither has EVER appeared in poker-server's source
+# (`git log -S bridge_id_token -- src/` returns nothing), because neither is
+# poker-server's: the `#bridge_id_token` fragment is parsed by poker-3d and the
+# `urn:apk:bridge` grant is exchanged between poker-3d and the auth-server.
+# poker-server only ever sees the RESULTING opaque access token, which it
+# validates by introspection. Both strings are correctly locked in
+# poker-3d/canonical-features.txt (line ~102), where the code actually lives.
+#
+# So this block was a permanently-failing assertion that nothing ever ran —
+# the first CI run of the new manifest grep flagged it immediately. Replaced
+# with the strings poker-server genuinely owns in that flow: the introspection
+# endpoint it calls, the shared key that authorises its unauth master-API
+# hops, and the socket events every .online sign-in path drives.
 # ============================================================
-bridge_id_token
-urn:apk:bridge
+/token/introspection
+X-Auth-Server-Key
+oauthLogin
+tokenLogin
+authWithTicket
+joinWithWaitlistContext
+loginResult
 
 # ============================================================
 # Chip-mutation invariants (CLAUDE.md "🚨 Chip mutations flow through
@@ -75,3 +103,114 @@ saveProgress
 [Shutdown]
 SIGTERM
 SIGINT
+
+# ============================================================
+# 2026-08-17 — .online login observability (SL-3 / LD-2).
+#
+# poker-server's auth telemetry had NEVER landed a single row
+# (`GET /poker-api/auth-events?origin=poker-server` = 0 rows, all time),
+# because a missing AUTH_SERVER_BYPASS_KEY made reportAuthEvent a SILENT
+# no-op and the POST's outcome was swallowed. That is why a week-long
+# ~66%-failure .online sign-in outage was invisible on the Auth Health
+# dashboard and why the failing branch could not be identified.
+#
+# Every loginResult failure branch now carries a machine-readable `code` and
+# writes a structured `[login-failure]` line to stdout naming the branch, and
+# `authTelemetry` on /api/health reports whether auth events can be delivered
+# at all. Losing either is a regression to blind.
+#
+# 2026-08-17 CORRECTION — these rows are NOT posted as `login_failed`.
+# poker-api's alerting computes failure/(success+failure) PER ORIGIN, and
+# poker-server never emits a success, so `login_failed` rows from here page
+# "poker-server app: 100% fail" forever; worse, its single Railway egress IP
+# trips the `isDominated` single-source guard and SILENCES the fleet-wide
+# pager. The auth_events POST is therefore opt-in via
+# ONLINE_LOGIN_FAILED_EVENT_TYPE (unset = stdout only), and the type named
+# there MUST be inside poker-api's CLIENT_EVENT_TYPES allowlist
+# (handlers/authEvents.js) — an invented type is 400'd and the row never
+# lands, which is how the original blindness went unnoticed for months.
+# ============================================================
+socket_login
+[login-failure]
+authTelemetry
+ONLINE_LOGIN_FAILED_EVENT_TYPE
+no_phone_or_username_claim
+user_upsert_failed
+# requestId echo — lets a client running several auth flows on ONE socket
+# tell its own loginResult apart from a concurrent flow's. Without it the
+# stale-token tokenLogin rejection is indistinguishable, on the wire, from
+# the bridge handoff's own answer (the outage's amplifier).
+requestId
+
+# ============================================================
+# 2026-08-17 P0 — interim account-takeover / admin-escalation guard.
+#
+# The local users row is keyed ON CONFLICT (LOWER(username)) on auth-server's
+# `username` claim, which is `[firstName, lastName].join(' ')` — a NON-UNIQUE
+# display name any player can set on themselves (the master API's updateUser
+# validates first/last name only as "string, <= 50 chars"). Without the guard,
+# renaming yourself to an admin's display name and signing in to .online binds
+# you to that admin's row: their chips, their progression, their is_admin.
+#
+# The guard refuses to bind a login to a row whose stats->>'masterUserId' names
+# a DIFFERENT master account, and stamps unowned legacy rows on adoption so they
+# become protected on first OIDC login. Deleting any of these tokens re-opens a
+# live account-takeover path — restore the code, do not delete the line.
+#
+# The REAL fix (a master_user_id column + unique index, keyed on the attested
+# `sub`) needs a Railway Postgres migration and is still outstanding.
+# ============================================================
+identity_conflict
+masterUserId
+#
+# 🚨 THE GUARD SHIPS IN WARN MODE and the mode switch is itself load-bearing.
+# Enforcing today would permanently lock out 4 KNOWN real humans (production has
+# 4 confirmed duplicate master-account pairs sharing a display name) in order to
+# close a hole with ZERO measured exposure (no admin display-name collision
+# exists across all 2,268 live master accounts). Warn mode runs the identical
+# check and logs the identical record, then binds the row exactly as before.
+# Losing the mode switch — i.e. hard-coding the refusal back in — is a
+# regression, not a hardening. See resolveIdentityGuardMode in
+# src/auth/loginIdentity.ts for the sequence that makes enforcement safe.
+ONLINE_IDENTITY_GUARD_ENFORCE
+identity-guard
+# Admin recovery. Its ABSENCE is the main reason enforcement is not safe yet:
+# no other admin handler can clear a stamp, rename a local row, or delete a
+# user, so a wrongly-stamped row was an unrecoverable lockout.
+adminClearIdentityStamp
+ADMIN_CLEAR_IDENTITY_STAMP
+# /api/health surface — makes the guard's mode and the users.stats column type
+# externally verifiable with a curl. Railway env + DB are not readable from the
+# dev box, so an un-curlable mode is an invisible one.
+identityGuard
+statsColumnType
+
+# ============================================================
+# 2026-08-17 P1 — users.stats column-type probe.
+#
+# users.stats is declared TEXT in authManager.initDB while saveProgress
+# (`COALESCE(stats,'{}'::jsonb) || $n::jsonb`), authWithTicket 3a
+# (`stats->>'masterUserId'`) and initDB's own masterUserId index all require
+# JSONB — and every one of those is wrapped in a swallowing catch, which is why
+# a three-way disagreement about a live column type produced no symptom anyone
+# could point at. The declared type proves nothing: CREATE TABLE IF NOT EXISTS
+# has not described the live table since first boot.
+#
+# The probe answers it once at boot and publishes the answer on /api/health.
+# The identity guard's durability depends on that answer, so do not remove it.
+# ============================================================
+probeStatsColumnType
+
+# ============================================================
+# 2026-08-17 P1 — joinWithWaitlistContext answers on loginResult.
+#
+# This handler emitted NO loginResult on any branch — failures went to `error`,
+# success to `gameState`. It only appeared to work because poker-3d's old
+# UNSCOPED listener accepted another auth flow's frame. Once the client scoped
+# its listeners by requestId, this flow could never be answered: a guaranteed
+# 15s watchdog timeout on every at-venue waitlist deep-link, while the server
+# had ALREADY seated the player and deducted minBuyIn — and each timeout wrote a
+# fabricated login_failed row into the same failure bucket + isDominated query
+# that the rest of this work exists to make trustworthy.
+# ============================================================
+waitlist_auth_failed

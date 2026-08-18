@@ -35,3 +35,38 @@ jobs:
 
       - name: Build
         run: npm run build
+
+      # 2026-08-17 — canonical-features.txt was enforced by NOTHING for three
+      # months while its own header claimed it guarded against regressions:
+      # there is no `poker-server` case in the workspace ship.sh, no deploy
+      # script (Railway deploys straight from a git push), and no CI grep. This
+      # step is that missing enforcement, and mirrors the algorithm the other
+      # apps' deploy scripts use (poker-3d/deploy-online.mjs): read every
+      # non-blank, non-`#` line and require it as a LITERAL substring of the
+      # built output. Fails the build on a miss.
+      #
+      # NOTE: CI is not a deploy gate here — Railway builds the pushed commit on
+      # its own. Make this a required status check on `main` to close that gap.
+      - name: Canonical features manifest
+        run: |
+          node -e '
+            const fs = require("fs"), path = require("path");
+            const manifest = "canonical-features.txt";
+            if (!fs.existsSync(manifest)) { console.error("MISSING " + manifest); process.exit(1); }
+            const tokens = fs.readFileSync(manifest, "utf8").split("\n")
+              .map(l => l.trim()).filter(l => l && !l.startsWith("#"));
+            const read = (dir) => fs.readdirSync(dir, { withFileTypes: true }).reduce((acc, e) => {
+              const full = path.join(dir, e.name);
+              return acc + (e.isDirectory() ? read(full) : (/\.js$/.test(e.name) ? fs.readFileSync(full, "utf8") : ""));
+            }, "");
+            if (!fs.existsSync("dist")) { console.error("no dist/ — build did not run"); process.exit(1); }
+            const blob = read("dist");
+            const missing = tokens.filter(t => !blob.includes(t));
+            if (missing.length) {
+              console.error("FAIL: canonical-features.txt tokens missing from dist/:");
+              for (const m of missing) console.error("  - " + m);
+              console.error("Restore the feature in source, or delete the manifest line in the SAME commit.");
+              process.exit(1);
+            }
+            console.log("canonical-features.txt: " + tokens.length + " tokens verified in dist/.");
+          '

@@ -1,6 +1,11 @@
 import { Pool } from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+// Shared reader for the users.stats column, which may arrive as a jsonb object
+// or as JSON text depending on the live column type (see probeStatsColumnType
+// in index.ts — /api/health reports the answer). Using it instead of a bare
+// JSON.parse is what stops mergeUserStats from silently wiping the column.
+import { parseStatsColumn } from './loginIdentity';
 
 // JWT secret. H1 (2026-07-01 audit): the old guard keyed the fatal check on
 // NODE_ENV==='production' ONLY, but Railway uses nixpacks and does NOT set
@@ -578,6 +583,17 @@ async function syncMasterUser(masterData: any, password: string): Promise<UserDa
   const isAdmin = masterData.roles?.includes('siteAdmin') || masterData.roles?.includes('leagueAdmin') || false;
   const hash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
 
+  // 2026-08-17 P2 — DELIBERATELY LEFT UNGUARDED (assessed, not overlooked).
+  // The P0 display-name takeover guard (see index.ts upsertOidcLocalUser and
+  // auth/loginIdentity.ts) covers the two OIDC socket-login upserts. This one
+  // and authWithTicket step 3b are the other two conflict sites and both stay
+  // as they are, because they key on `phone` — the master API's phone number,
+  // else its UNIQUE SLUG. Neither is a value a user can set to impersonate
+  // someone else, so the "rename yourself to an admin's display name" path
+  // that motivated the guard does not exist here. Adding a fail-closed refusal
+  // to the password-login path during a live sign-in outage would be a strictly
+  // worse trade. Revisit when the real `master_user_id` column lands — at that
+  // point ALL FOUR sites should key on the attested sub and this note dies.
   const { rows } = await pool.query(
     `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -879,8 +895,25 @@ export async function mergeUserStats(userId: number, patch: Record<string, any>)
   try {
     await client.query('BEGIN');
     const { rows } = await client.query('SELECT stats FROM users WHERE id = $1 FOR UPDATE', [userId]);
-    let existing: Record<string, any> = {};
-    try { existing = JSON.parse(rows[0]?.stats || '{}'); } catch { /* ignore */ }
+    // 2026-08-17 P1 — was `JSON.parse(rows[0]?.stats || '{}')` inside a
+    // swallowing try/catch. That is a SILENT FULL-COLUMN WIPE whenever the pg
+    // driver hands back an object, which it does when the column is jsonb:
+    // `JSON.parse(someObject)` stringifies to "[object Object]", throws
+    // SyntaxError, the catch leaves `existing = {}`, and the UPDATE below then
+    // writes ONLY `patch` — replacing every other key in the column. This
+    // function is named "merge" and runs on EVERY completed hand, so under the
+    // jsonb hypothesis it was quietly deleting chipRecoveryGrantApplied,
+    // starsRecoveryGrantApplied, and (newly, and much more dangerously) the
+    // `masterUserId` ownership stamp the identity guard depends on — for
+    // exactly the most active players.
+    //
+    // `parseStatsColumn` is the shared reader: object in ⇒ object out, JSON
+    // text in ⇒ parsed out, anything else ⇒ {}. Nothing depended on the old
+    // throw; the catch discarded it and fell through to the same `{}`, so this
+    // strictly restores the documented merge behaviour under jsonb and is a
+    // no-op under TEXT. See index.ts probeStatsColumnType for which one prod
+    // actually has — /api/health reports it.
+    const existing = parseStatsColumn(rows[0]?.stats);
     const merged = { ...existing, ...patch };
     await client.query('UPDATE users SET stats = $1 WHERE id = $2', [JSON.stringify(merged), userId]);
     await client.query('COMMIT');

@@ -52,6 +52,12 @@ import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
 import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus } from './auth/oauthValidator';
+import {
+  resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
+  masterIdGuardSql, isRowOwnedByOtherMaster, parseStatsColumn, mergeMasterIdentityStats,
+  resolveIdentityGuardMode, clearMasterIdentityStamp,
+  type LoginFailureCode, type IdentityGuardMode,
+} from './auth/loginIdentity';
 import { notifyPlayer } from './notifyClient';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
 // being migrated to log.debug so they mute under production pino level
@@ -232,22 +238,112 @@ if (process.env.REDIS_URL) {
 // - Reuses the SAME shared key env var (AUTH_SERVER_BYPASS_KEY) + base URL
 //   (MASTER_API_URL) the unauth /users/:id/me fetches already use. If the key
 //   env is missing, it no-ops silently.
+//
+// 2026-08-17 SL-3 — THIS REPORTER HAD NEVER LANDED A SINGLE ROW.
+// `GET /poker-api/auth-events?origin=poker-server` returned 0 rows for all
+// time. Two reasons, both fixed here:
+//   1. `if (!key) return;` was a SILENT no-op. A missing Railway
+//      AUTH_SERVER_BYPASS_KEY disabled every .online auth alarm with zero
+//      evidence anywhere — including the `client_auth_failed` pager that
+//      exists to catch "every .online login is failing fleet-wide".
+//   2. The POST's outcome was swallowed by `.catch(() => {})`, so a 403
+//      (key mismatch) or 500 looked identical to success.
+// Now: a one-shot loud console.error when unconfigured, per-attempt status
+// bookkeeping, non-2xx logged, and the whole state surfaced on /api/health as
+// `authTelemetry` so it is externally verifiable with a curl (Railway env is
+// not readable from the dev box). Still fire-and-forget; still never throws.
 const AUTH_EVENT_THROTTLE_MS = 2000;
+/** Hard ceiling on distinct throttle keys — see the prune in reportAuthEvent. */
+const AUTH_EVENT_KEY_LIMIT = 500;
 const authEventLastSent = new Map<string, number>();
+const authTelemetry = {
+  // Initialised at module load so /api/health is truthful before the first
+  // auth failure — `configured:false` means the dashboard is blind RIGHT NOW.
+  configured: !!process.env.AUTH_SERVER_BYPASS_KEY,
+  attempted: 0,
+  // 2026-08-17 — `delivered` counts ONLY rows the ingest says it PERSISTED.
+  // The previous revision counted any HTTP 200, but poker-api's logEvent
+  // returns 200 `{logged:false}` on BOTH the per-IP rate-limit drop (:264) and
+  // its own internal catch (:321) — it deliberately never 500s an audit write.
+  // Counting those as delivered let /api/health read perfectly healthy while
+  // every row was being dropped: the same "green light over a dead sink" bug
+  // this telemetry exists to expose.
+  delivered: 0,
+  /** HTTP 200 but `logged:false` — accepted and then dropped by the ingest. */
+  notPersisted: 0,
+  failed: 0,
+  droppedNoKey: 0,
+  throttled: 0,
+  /** Refusals held back because no allowlisted event type is configured. */
+  suppressedNoType: 0,
+  lastStatus: null as string | null,
+  lastAt: null as string | null,
+  lastEventType: null as string | null,
+};
+let _warnedTelemetryUnconfigured = false;
+
+/** Snapshot for /api/health — proves whether .online auth alarms can fire. */
+function getAuthTelemetryStatus() {
+  return {
+    ...authTelemetry,
+    // Empty string ⇒ socket-login refusals are stdout-only by design. See the
+    // failLogin comment block for the mono-repo follow-up that enables them.
+    loginFailureEventType: LOGIN_FAILURE_EVENT_TYPE || null,
+  };
+}
+
 function reportAuthEvent(eventType: string, detail: Record<string, any>): void {
   try {
     const key = process.env.AUTH_SERVER_BYPASS_KEY || '';
-    if (!key) return; // no shared key configured — no-op silently
+    authTelemetry.configured = !!key;
+    if (!key) {
+      authTelemetry.droppedNoKey++;
+      if (!_warnedTelemetryUnconfigured) {
+        _warnedTelemetryUnconfigured = true;
+        // eslint-disable-next-line no-console
+        console.error(
+          '[auth-telemetry] AUTH_SERVER_BYPASS_KEY is NOT set — DROPPING every .online auth event ' +
+            `(first dropped: ${eventType}). The Auth Health dashboard + client_auth_failed pager are ` +
+            'BLIND until this is set on the Railway poker-server service to the master API value.'
+        );
+      }
+      return;
+    }
     const now = Date.now();
-    const last = authEventLastSent.get(eventType) || 0;
-    if (now - last < AUTH_EVENT_THROTTLE_MS) return; // throttle storms
-    authEventLastSent.set(eventType, now);
+    // Throttle per (type + reason) rather than per type: a single bad code
+    // must not mask a DIFFERENT failure reason arriving in the same 2s.
+    //
+    // 2026-08-17 P3 — the reason component is CLAMPED and the map is BOUNDED.
+    // Some reasons interpolate variable text (`verify_http_503`,
+    // `error:getaddrinfo EAI_AGAIN …`), so an unbounded key space plus a Map
+    // that never evicts is a slow leak on a long-lived Railway process — and
+    // a leak that grows fastest during exactly the incident this telemetry is
+    // meant to survive.
+    const reason = String(
+      detail?.code || detail?.stage || detail?.reason || detail?.error || ''
+    ).slice(0, 48);
+    const tkey = `${eventType}:${reason}`;
+    const last = authEventLastSent.get(tkey) || 0;
+    if (now - last < AUTH_EVENT_THROTTLE_MS) { authTelemetry.throttled++; return; }
+    if (authEventLastSent.size > AUTH_EVENT_KEY_LIMIT) {
+      // Drop everything already outside the throttle window; those entries can
+      // no longer suppress anything. If that is not enough (a genuine key
+      // explosion), clear outright — losing throttle state is harmless, the
+      // worst case is a few duplicate rows, whereas unbounded growth is not.
+      for (const [k, t] of authEventLastSent) {
+        if (now - t >= AUTH_EVENT_THROTTLE_MS) authEventLastSent.delete(k);
+      }
+      if (authEventLastSent.size > AUTH_EVENT_KEY_LIMIT) authEventLastSent.clear();
+    }
+    authEventLastSent.set(tkey, now);
 
     const base =
       process.env.MASTER_API_URL ||
       'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
-    // Fire-and-forget — do NOT await; swallow every failure. Uses the same
-    // global fetch the other master-API calls in this file rely on.
+    authTelemetry.attempted++;
+    authTelemetry.lastEventType = eventType;
+    authTelemetry.lastAt = new Date().toISOString();
+    // Fire-and-forget — do NOT await. Failures are RECORDED, not swallowed.
     fetch(`${base}/auth-events/log`, {
         method: 'POST',
         headers: {
@@ -256,9 +352,456 @@ function reportAuthEvent(eventType: string, detail: Record<string, any>): void {
         },
         body: JSON.stringify({ eventType, origin: 'poker-server', detail }),
       })
-      .catch(() => {});
+      .then(async (r) => {
+        authTelemetry.lastStatus = String(r.status);
+        if (r.ok) {
+          // 2026-08-17 — a 200 is NOT proof of persistence. poker-api answers
+          // 200 `{logged:false}` when the per-IP ingest rate limit drops the
+          // row, and again from its own catch (it refuses to 500 an audit
+          // write). Read the body and count only `logged === true`, else
+          // /api/health can show `delivered` climbing while nothing lands.
+          let persisted = false;
+          let rateLimited = false;
+          try {
+            const body: any = await r.json();
+            const payload = body?.data || body;
+            persisted = payload?.logged === true;
+            rateLimited = payload?.rate_limited === true;
+          } catch { /* unparseable body — treat as not-persisted, below */ }
+          if (persisted) { authTelemetry.delivered++; return; }
+          authTelemetry.notPersisted++;
+          authTelemetry.lastStatus = rateLimited ? '200:rate_limited' : '200:not_logged';
+          return;
+        }
+        authTelemetry.failed++;
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[auth-telemetry] /auth-events/log rejected ${eventType}: HTTP ${r.status}` +
+            (r.status === 403 ? ' — AUTH_SERVER_BYPASS_KEY does not match the master API value.' : '')
+        );
+      })
+      .catch((e: any) => {
+        authTelemetry.failed++;
+        authTelemetry.lastStatus = `error:${e?.message || 'unknown'}`;
+      });
   } catch {
     /* telemetry must never affect auth flow */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Login-failure labelling (2026-08-17)
+// ---------------------------------------------------------------------------
+// Earned: .online sign-in was failing ~2 of every 3 attempts and the reason was
+// STRUCTURALLY undiscoverable. `loginResult{success:false}` carried a prose
+// string the client threw away, and only 1 of the 5 reject branches in
+// `oauthLogin` reported anything server-side (and that reporter was dead — see
+// SL-3 above). Every rejection now goes through this helper, so:
+//   - the wire carries a stable machine-readable `code`,
+//   - `requestId` is echoed back so a client can tell ITS OWN result apart from
+//     a concurrent flow's on the same socket (see the poker-3d fix),
+//   - and an `online_login_failed` row lands in auth_events naming the branch.
+// This changes NO auth decision — only what is emitted alongside one.
+//
+// EVENT TYPE — 2026-08-17 CORRECTION. An earlier revision of this helper posted
+// these rows as `login_failed`. That type IS on poker-api's allowlist, but
+// sending it from here POISONS the very pager this work exists to un-blind.
+// Verified by reading the deployed handler, not assumed
+// (poker-mono-repo/apps/lambdas/poker-api/src/handlers/authEvents.js):
+//
+//   • :943-946 — the per-origin alert computes `failure/(success+failure)` per
+//     origin. poker-server emits failures and NEVER a `login_success`, so its
+//     ratio is permanently 1.0 and it pages `poker-server app: 100% fail`
+//     forever once it clears 25 rows/24h (segVol is 25 in BOTH tiers).
+//   • :768-781 + :903-908 — `failSources` counts login_failed/refresh_failed
+//     rows per IP over 24h, and `isDominated` suppresses the overall,
+//     per-browser AND per-origin pages when one IP holds >50% of them.
+//     poker-server is a single Railway egress IP against a ~205/24h baseline,
+//     so a few hundred rows SILENCE THE FLEET-WIDE PAGER — the exact blindness
+//     being fixed.
+//   • poker-3d already logs its own `login_failed` (origin 'online') for the
+//     same user-visible event, so these rows also double-count the headline.
+//
+// No allowlisted type fits "the .online socket login was refused for reason X"
+// (`introspection_failed` names a different thing and carries its own alert;
+// the routine `legacy_token_invalid` branch alone would page on it daily).
+// So the auth_events POST is OFF BY DEFAULT and opt-in by env var, while the
+// diagnostic value is preserved unconditionally as a structured stdout line —
+// Railway log search, zero pager surface.
+//
+// TO TURN THE SINK ON (required follow-up, mono-repo, NOT done here):
+//   1. add `'online_login_failed'` to CLIENT_EVENT_TYPES in
+//      apps/lambdas/poker-api/src/handlers/authEvents.js (ingest 400s any type
+//      outside it, at :268 — an invented name lands NOTHING);
+//   2. do NOT add it to the success/failure buckets at :917-918 / :940-941, nor
+//      to the `failSources` query's event_type IN (...) list at :775, or it
+//      re-acquires both poisoning paths;
+//   3. then set `ONLINE_LOGIN_FAILED_EVENT_TYPE=online_login_failed` on the
+//      Railway poker-server service.
+// Until step 1 ships, leaving this unset is CORRECT, and /api/health's
+// `authTelemetry.loginFailureEventType` + `.suppressedNoType` make the
+// disabled state visible instead of silent.
+const LOGIN_FAILURE_EVENT_TYPE = (process.env.ONLINE_LOGIN_FAILED_EVENT_TYPE || '').trim();
+let _warnedLoginFailureTypeUnset = false;
+
+function failLogin(
+  socket: Socket,
+  opts: {
+    code: LoginFailureCode;
+    message: string;
+    via: string;
+    requestId?: unknown;
+    /**
+     * EXPORTABLE detail. Goes to stdout AND (when enabled) to the auth_events
+     * table via HTTP. Codes, branch names, booleans, and opaque ids ONLY.
+     * See the PII rule below — this object leaves the process.
+     */
+    detail?: Record<string, any>;
+    /**
+     * NON-exportable diagnostics: free text that may embed user-controlled or
+     * schema-revealing values (a Postgres error naming the conflicting key, a
+     * validator message, an exception string). stdout ONLY, never POSTed.
+     */
+    diag?: Record<string, any>;
+    /**
+     * 2026-08-17 P2 — emit the `loginResult` frame ONLY when the client proved
+     * it is new enough to attribute results, by sending a requestId.
+     *
+     * Set this on any branch that did NOT previously emit `loginResult`.
+     * Old cached poker-3d bundles register UN-ATTRIBUTED `loginResult`
+     * listeners whose failure path is a wholesale `clearStoredTokens()`. A
+     * frame they never used to receive is therefore not a new label — it is a
+     * credential wipe on a browser holding a live 180-day refresh token. And
+     * this is not hypothetical: bridge.js stores the OIDC access token via
+     * `setAuthToken`, so `tryLegacyAutoLogin` really does push a valid OIDC
+     * token through `tokenLogin`, whose rate-limit / maintenance branches are
+     * exactly the ones that newly answer on `loginResult`.
+     *
+     * A client that sends a requestId is running the fixed socketAuth helper,
+     * which ignores frames that aren't its own and never wipes credentials on
+     * a socket failure. Old clients keep the old wire shape.
+     */
+    onlyWhenAttributed?: boolean;
+  }
+): void {
+  const rid = normalizeRequestId(opts.requestId);
+  if (!opts.onlyWhenAttributed || rid) {
+    socket.emit('loginResult', buildLoginFailure(opts.code, opts.message, rid));
+  }
+  const detail = {
+    stage: 'socket_login', code: opts.code, via: opts.via, ...(opts.detail || {}),
+  };
+  // ALWAYS: a structured, greppable stdout record. This is the part that makes
+  // a refusal diagnosable even with the auth_events sink switched off.
+  //
+  // 🚨 PII RULE (2026-08-17 P3 — the previous revision broke its own rule).
+  // `detail` is both logged AND POSTed to auth_events, so it must carry codes
+  // and branch names only — never a token, never a claim value, never a name.
+  // It previously carried `conflict_key`, which IS a real person's display name
+  // taken straight from the `username` claim, plus `validator_error` and
+  // `db_error`, whose Postgres text can quote the offending value verbatim
+  // ("Key (username)=(Josh Hall) already exists"). Free text now goes in
+  // `diag`, which is stdout-only. Opaque ids (master `sub`, local row id) stay
+  // in `detail` — they are identifiers, not personal data, and the whole point
+  // of the conflict record is to name both sides so the owner can merge them.
+  try {
+    // eslint-disable-next-line no-console
+    console.warn(`[login-failure] ${JSON.stringify(detail)}`);
+    if (opts.diag && Object.keys(opts.diag).length) {
+      // eslint-disable-next-line no-console
+      console.warn(`[login-failure-diag] ${JSON.stringify({ code: opts.code, via: opts.via, ...opts.diag })}`);
+    }
+  } catch { /* logging must never affect auth flow */ }
+  if (LOGIN_FAILURE_EVENT_TYPE) {
+    reportAuthEvent(LOGIN_FAILURE_EVENT_TYPE, detail);
+  } else {
+    authTelemetry.suppressedNoType++;
+    if (!_warnedLoginFailureTypeUnset) {
+      _warnedLoginFailureTypeUnset = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        '[auth-telemetry] ONLINE_LOGIN_FAILED_EVENT_TYPE is unset — socket-login refusals are ' +
+          'logged to stdout only, NOT to auth_events. This is the safe default: posting them as ' +
+          '`login_failed` pages "poker-server app: 100% fail" forever AND suppresses the fleet-wide ' +
+          'pager via the single-source (isDominated) guard. Add `online_login_failed` to poker-api\'s ' +
+          'CLIENT_EVENT_TYPES first, then set this env var.'
+      );
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2026-08-17 P0 — INTERIM account-takeover / admin-escalation guard
+// ---------------------------------------------------------------------------
+// Both OIDC socket-login handlers (`oauthLogin`, `tokenLogin`) resolved the
+// local poker-server row by upserting `ON CONFLICT (LOWER(username))` on a key
+// that, in production, is auth-server's `username` claim — which is
+// `[firstName, lastName].join(' ')`, a NON-UNIQUE human display name the user
+// can freely set on themselves via the master API's `updateUser` (it validates
+// firstName/lastName only as "string, <= 50 chars"; the NAME_BAD_CHARS
+// whitelist runs in signup ONLY). Any player could therefore rename themselves
+// to an admin's display name, sign in to .online, and be bound to that admin's
+// row — inheriting its id, chips, progression and `is_admin=true`, which is
+// exactly what `isUserAdmin()` reads to gate adminGrantChips / adminRestoreBalance
+// / banUser. The benign form of the same bug already happens: two real players
+// named "John Smith" silently share one account.
+//
+// This helper detects a login that would bind to a conflicting row: one that is
+// neither unowned (legacy) nor already owned by the SAME attested `sub`.
+//
+// 🚨 IT SHIPS IN WARN MODE (ONLINE_IDENTITY_GUARD_ENFORCE unset ⇒ 'warn').
+// In warn mode the check runs, the conflict is logged in full — both master
+// ids, the local row id, its is_admin — and the login then BINDS AND PROCEEDS
+// exactly as the pre-guard code did. Zero behaviour change for users.
+// In enforce mode the same conflict is refused with `identity_conflict`.
+//
+// Why warn and not enforce, and the exact sequence for flipping it, are
+// documented on `resolveIdentityGuardMode` in src/auth/loginIdentity.ts. The
+// short version: measured exposure today is ZERO admin display-name collisions
+// across all 2,268 live master accounts, while enforcing would permanently lock
+// out 4 known real people who legitimately hold two master accounts each and
+// share a display name between them. Warn mode buys the full colliding-pair
+// list from production logs at no user cost; that list is what makes enforcing
+// safe later.
+//
+// THIS IS NOT THE REAL FIX EITHER WAY. The real fix is a `master_user_id`
+// column on poker-server's `users` table with a UNIQUE index, populated from the
+// attested `sub` and used as the conflict target — so identity never depends on
+// a mutable display string at all. That needs a Railway Postgres schema change
+// plus a backfill of every existing row, which requires Railway access this
+// change did not have. See src/auth/loginIdentity.ts for the ownership
+// predicates and the users.stats TEXT-vs-JSONB note.
+const IDENTITY_GUARD_MODE: IdentityGuardMode =
+  resolveIdentityGuardMode(process.env.ONLINE_IDENTITY_GUARD_ENFORCE);
+/** Conflicts observed since boot — surfaced on /api/health so warn mode is never silent. */
+const identityGuardStats = { conflictsSeen: 0, conflictsRefused: 0, conflictsAllowed: 0 };
+
+interface LocalUserUpsertOk {
+  ok: true;
+  user: any;
+  /**
+   * Whether this login STAMPED the row as its own. False in warn mode when the
+   * row demonstrably belongs to another master account: the login is allowed
+   * through (that is what warn mode means) but must NOT overwrite the existing
+   * owner, or it destroys the very ownership evidence being collected and
+   * starts a stamp ping-pong between the two accounts.
+   */
+  adopted: boolean;
+}
+interface LocalUserUpsertErr {
+  ok: false;
+  code: Extract<LoginFailureCode, 'identity_conflict' | 'user_row_missing' | 'user_upsert_failed'>;
+  /** Exportable — codes and opaque ids only (POSTed to auth_events). */
+  detail: Record<string, any>;
+  /** stdout-only free text (may quote user-controlled values). */
+  diag?: Record<string, any>;
+}
+
+async function upsertOidcLocalUser(args: {
+  key: string;            // local users.username key (phone claim, else username claim)
+  displayName: string;
+  sub: string;            // cryptographically-attested master user id
+  /** Human display name from the `username` claim. NOT the master's slug. */
+  masterDisplayName?: string;
+  /** Real phone number, or undefined. Set only when the phone claim was used. */
+  masterPhone?: string;
+  isAdmin: boolean;
+  via: string;            // 'oauthLogin' | 'tokenLogin' — for logs
+}): Promise<LocalUserUpsertOk | LocalUserUpsertErr> {
+  const { key, displayName, sub, masterDisplayName, masterPhone, isAdmin, via } = args;
+  const bcrypt = require('bcryptjs');
+  const placeholderHash = bcrypt.hashSync(`oauth-placeholder-${sub}-${Date.now()}`, 10);
+  // 2026-08-17 P3 — field semantics. `masterUsername` is the master API's unique
+  // SLUG and this path never receives it (auth-server's `username` claim is a
+  // display name), so it is NOT written here; writing the display name into it
+  // is what made authWithTicket rewrite the row on every single login. Likewise
+  // `masterPhone` is written only when a real phone claim produced the key.
+  // See MasterIdentityStamp in auth/loginIdentity.ts.
+  const statsJson = JSON.stringify({
+    masterUserId: sub,
+    ...(masterDisplayName ? { masterDisplayName } : {}),
+    ...(masterPhone ? { masterPhone } : {}),
+  });
+  const enforcing = IDENTITY_GUARD_MODE === 'enforce';
+
+  let rows: any[];
+  try {
+    // 2026-07-05 audit P3 fix: persist is_admin from the master OAuth result so
+    // admins signing in via the primary OIDC flow can actually use admin socket
+    // handlers (isUserAdmin reads users.is_admin). Grant-only (`$5 OR
+    // users.is_admin`) — never revokes an existing admin from this path.
+    //
+    // 2026-08-17 — the `WHERE` on DO UPDATE is the P0 guard, and it is applied
+    // ONLY in enforce mode. When present and unsatisfied, Postgres updates
+    // NOTHING for that row and `RETURNING` yields NO ROW, so we land in the
+    // zero-row branch below and refuse: fail closed, never bind to someone
+    // else's account.
+    //
+    // In WARN mode the clause is omitted, which is byte-for-byte the
+    // pre-guard statement — the ownership check then runs on the RETURNED row
+    // instead (see below). That is sound because `DO UPDATE` here only touches
+    // display_name and is_admin, so `RETURNING *`.stats is the row's
+    // pre-existing stats: exactly the value the SQL guard would have tested.
+    const guard = enforcing ? `WHERE ${masterIdGuardSql('$6')}` : '';
+    const res = await getPool().query(
+      `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
+         VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4, $5)
+         ON CONFLICT (LOWER(username)) DO UPDATE
+           SET display_name = COALESCE(users.display_name, $2),
+               is_admin = ($5 OR users.is_admin)
+         ${guard}
+       RETURNING *`,
+      [String(key), displayName, placeholderHash, statsJson, isAdmin, String(sub)]
+    );
+    rows = res.rows;
+  } catch (dbErr: any) {
+    console.error(`[OAuth] ${via} user-upsert failed:`, dbErr?.message);
+    if (Sentry) Sentry.captureException(dbErr, { tags: { area: `auth.${via}.upsert` } });
+    return {
+      ok: false,
+      code: 'user_upsert_failed',
+      // Postgres text can quote the offending value ("Key (username)=(Josh
+      // Hall) already exists"), so it is diagnostics, not exportable detail.
+      detail: {},
+      diag: { db_error: String(dbErr?.message || 'unknown').slice(0, 160) },
+    };
+  }
+
+  const user = rows[0];
+  if (user?.id) {
+    // WARN MODE ownership check. The row is already bound at this point — this
+    // decides only whether to (a) record the collision and (b) skip stamping.
+    if (!enforcing && isRowOwnedByOtherMaster(user.stats, sub)) {
+      const ownerId = String(parseStatsColumn(user.stats).masterUserId);
+      identityGuardStats.conflictsSeen++;
+      identityGuardStats.conflictsAllowed++;
+      // Same record enforce mode would log, so the colliding-pair list builds up
+      // identically either way. `key` is a real person's name — stdout only,
+      // never into the exported auth_events detail (see failLogin's PII rule).
+      console.error(
+        `[identity-guard] WARN ${via} IDENTITY CONFLICT (allowed — guard not enforcing). ` +
+          `key=${JSON.stringify(String(key))} localUserId=${user.id} localIsAdmin=${!!user.is_admin} ` +
+          `rowOwnerMasterId=${ownerId} callerMasterId=${sub}`
+      );
+      // Do NOT stamp: the row already belongs to someone else and overwriting
+      // their masterUserId would (a) destroy the ownership evidence this mode
+      // exists to collect and (b) start a stamp ping-pong between the two
+      // accounts, one write per login each.
+      return { ok: true, user, adopted: false };
+    }
+
+    // Adoption stamp. A legacy row with no masterUserId passes the guard
+    // (correctly — it must keep working for existing players), but stays
+    // UNPROTECTED until it is owned. Stamp it so that once enforcement is on,
+    // the next login of anyone else with the same display name is refused.
+    // Merge, never replace: users.stats carries unrelated keys from other
+    // subsystems.
+    try {
+      const merged = mergeMasterIdentityStats(user.stats, {
+        masterUserId: String(sub),
+        ...(masterDisplayName ? { masterDisplayName } : {}),
+        ...(masterPhone ? { masterPhone } : {}),
+      });
+      if (merged) {
+        await getPool().query('UPDATE users SET stats = $1 WHERE id = $2', [JSON.stringify(merged), user.id]);
+        user.stats = merged;
+      }
+    } catch (stampErr: any) {
+      // Non-fatal: the login itself already succeeded and the guard still
+      // protects every ALREADY-owned row. Loud, because an un-stamped row is a
+      // row this defense does not cover yet.
+      console.warn(`[OAuth] ${via} masterUserId stamp failed (row stays unowned):`, stampErr?.message);
+    }
+    return { ok: true, user, adopted: true };
+  }
+
+  // Zero rows. In enforce mode that normally means the guard refused (the
+  // conflicting row belongs to another master account); in warn mode there is
+  // no guard clause, so zero rows means something genuinely strange. Diagnose
+  // so the two codes are never conflated, and log BOTH master ids so the owner
+  // can merge the real duplicates.
+  try {
+    const { rows: existing } = await getPool().query(
+      'SELECT id, username, stats, is_admin FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1',
+      [String(key)]
+    );
+    const row = existing[0];
+    if (row && isRowOwnedByOtherMaster(row.stats, sub)) {
+      const ownerId = String(parseStatsColumn(row.stats).masterUserId);
+      identityGuardStats.conflictsSeen++;
+      identityGuardStats.conflictsRefused++;
+      console.error(
+        `[identity-guard] ENFORCE ${via} IDENTITY CONFLICT — refusing to bind login to another account. ` +
+          `key=${JSON.stringify(String(key))} localUserId=${row.id} localIsAdmin=${!!row.is_admin} ` +
+          `rowOwnerMasterId=${ownerId} callerMasterId=${sub}`
+      );
+      return {
+        ok: false,
+        code: 'identity_conflict',
+        // 2026-08-17 P3 — `conflict_key` (the colliding DISPLAY NAME, i.e. a
+        // real person's name straight from the `username` claim) used to sit
+        // here, in the object that is POSTed to the auth_events table. It is
+        // now stdout-only, above and in `diag`. The opaque ids stay: they are
+        // the whole point of the record and are not personal data.
+        detail: {
+          local_user_id: row.id,
+          row_owner_master_id: ownerId,
+          caller_master_id: String(sub),
+          row_is_admin: !!row.is_admin,
+        },
+        diag: { conflict_key: String(key).slice(0, 120) },
+      };
+    }
+    console.error(`[OAuth] ${via} upsert returned no row and no conflicting owner found. key=${JSON.stringify(String(key))}`);
+  } catch (diagErr: any) {
+    console.warn(`[OAuth] ${via} conflict diagnosis query failed:`, diagErr?.message);
+  }
+  return { ok: false, code: 'user_row_missing', detail: { caller_master_id: String(sub) } };
+}
+
+// ---------------------------------------------------------------------------
+// 2026-08-17 P1 — settle the users.stats TEXT-vs-JSONB question, permanently
+// ---------------------------------------------------------------------------
+// The column is declared `TEXT DEFAULT '{}'` in authManager.initDB, but three
+// call sites treat it as JSONB and would hard-error on TEXT:
+//   • authManager.saveProgress   `COALESCE(stats,'{}'::jsonb) || $n::jsonb`
+//   • index.ts authWithTicket 3a `stats->>'masterUserId'`
+//   • authManager.initDB's own   `CREATE INDEX ... ((stats->>'masterUserId'))`
+// Every one of those is wrapped in a swallowing catch (`.catch(() => {})`, a
+// bare `catch {}`, or a try/catch that logs "non-fatal"), which is exactly why
+// a three-way disagreement about a production column type has survived this
+// long with no symptom anyone could point at.
+//
+// The DECLARED type is not evidence: initDB uses CREATE TABLE IF NOT EXISTS, so
+// it has not described the live table since the very first boot.
+//
+// This settles it with one query at startup and puts the answer on /api/health,
+// where it is verifiable with a curl from anywhere — Railway DB access is not
+// available from the dev box, so an externally-readable answer is the point.
+// It is READ-ONLY and never throws: a probe that could take the server down
+// would be a worse bug than the ambiguity it resolves.
+let _statsColumnType: string | null = null;
+async function probeStatsColumnType(): Promise<void> {
+  try {
+    const { rows } = await getPool().query(
+      `SELECT data_type FROM information_schema.columns
+        WHERE table_name = 'users' AND column_name = 'stats'
+        LIMIT 1`
+    );
+    _statsColumnType = rows[0]?.data_type ? String(rows[0].data_type) : 'absent';
+    const expected = _statsColumnType === 'jsonb';
+    console.log(
+      `[schema] users.stats data_type = ${_statsColumnType}` +
+        (expected
+          ? ' (jsonb — saveProgress / authWithTicket / the masterUserId index are all valid)'
+          : ' — ⚠️ NOT jsonb. saveProgress\'s `COALESCE(stats,\'{}\'::jsonb)`, authWithTicket 3a\'s ' +
+            '`stats->>\'masterUserId\'` and idx_users_stats_master_user_id are ALL failing silently ' +
+            'against this column. Do not enable ONLINE_IDENTITY_GUARD_ENFORCE until this is resolved: ' +
+            'the guard depends on that stamp being readable and durable.')
+    );
+  } catch (e: any) {
+    _statsColumnType = `probe_failed:${String(e?.message || 'unknown').slice(0, 60)}`;
+    console.warn('[schema] users.stats type probe failed (non-fatal):', e?.message);
   }
 }
 
@@ -537,6 +1080,11 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // Batch 5 admin actions — chip/privilege/ban mutations need a durable trail.
   'ADMIN_ADJUST_CHIPS', 'ADMIN_IP_BAN', 'ADMIN_TOGGLE_ADMIN',
   'ADMIN_FORCE_CLOSE_TABLE', 'ADMIN_KICK',
+  // 2026-08-17 — clearing an identity stamp makes a row adoptable by a
+  // different master account, so it is an identity mutation and needs the
+  // durable trail (the audit row carries the removed masterUserId, which is
+  // what makes the action reversible).
+  'ADMIN_CLEAR_IDENTITY_STAMP',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -934,7 +1482,31 @@ app.get('/api/health', async (_req, res) => {
     // readable from the dev box. Informational only: a red credential must NOT
     // 503 this endpoint (the process is healthy; tables keep serving — only
     // new OAuth logins are affected).
-    res.json({ status: 'ok', tables: tableManager.getTableList().length, authClient: getPreflightStatus() });
+    // 2026-08-17 SL-3 — `authTelemetry` proves whether .online auth alarms can
+    // fire at all. `configured:false` (or delivered:0 with failed>0) means the
+    // Auth Health dashboard is blind and every number on it is a floor, not a
+    // count. Informational only — never 503s this endpoint.
+    // 2026-08-17 P1 — `identityGuard` sits next to authTelemetry so the guard's
+    // mode is never a silent property of the environment. `mode:'warn'` means
+    // conflicts are being COUNTED and ALLOWED, not refused; `conflictsSeen > 0`
+    // in warn mode is the operator's cue that real colliding pairs exist and
+    // must be merged before enforcement can be turned on. `statsColumnType` is
+    // the answer to the TEXT-vs-JSONB question the guard's durability rests on
+    // (see probeStatsColumnType) — anything other than `jsonb` means the
+    // adoption stamp is not trustworthy and enforce must stay off.
+    res.json({
+      status: 'ok',
+      tables: tableManager.getTableList().length,
+      authClient: getPreflightStatus(),
+      authTelemetry: getAuthTelemetryStatus(),
+      identityGuard: {
+        mode: IDENTITY_GUARD_MODE,
+        enforcing: IDENTITY_GUARD_MODE === 'enforce',
+        statsColumnType: _statsColumnType,
+        stampDurable: _statsColumnType === 'jsonb',
+        ...identityGuardStats,
+      },
+    });
   } catch (e: any) {
     res.status(503).json({ status: 'unhealthy', error: e?.message || String(e) });
   }
@@ -4759,9 +5331,19 @@ Give feedback in this JSON format:
   // THAT integer id for authSessions and loadProgress. The previous
   // `parseInt(oauthResult.sub, 10)` just parsed the first digit of the UUID
   // and always failed with "User not found".
-  socket.on('oauthLogin', async (data: { accessToken: string; skipSeatRecovery?: boolean }) => {
+  socket.on('oauthLogin', async (data: { accessToken: string; skipSeatRecovery?: boolean; requestId?: string }) => {
+    // 2026-08-17 — `requestId` is opaque to the server and echoed back on every
+    // loginResult this handler emits. poker-3d runs SEVERAL auth flows on ONE
+    // socket (bridge handoff, boot refresh, legacy tokenLogin, deep-link
+    // ticket) and they all listened to the same global `loginResult` event, so
+    // ANY flow's failure was consumed by ALL of them. Echoing the id lets each
+    // flow ignore results that aren't its own. Optional: clients that don't
+    // send one get exactly the previous payload shape.
+    const requestId = normalizeRequestId(data?.requestId);
     if (!data?.accessToken) {
-      socket.emit('loginResult', { success: false, error: 'No access token provided' });
+      failLogin(socket, {
+        code: 'no_token', message: 'No access token provided', via: 'oauthLogin', requestId,
+      });
       return;
     }
     try {
@@ -4778,54 +5360,92 @@ Give feedback in this JSON format:
           });
         }
         reportAuthEvent('introspection_failed', { error: oauthResult.error || 'invalid', via: 'oauthLogin' });
-        socket.emit('loginResult', { success: false, error: oauthResult.error || 'Invalid token' });
+        failLogin(socket, {
+          code: oauthResult.clientAuthFailed ? 'client_auth_failed' : 'token_invalid',
+          message: oauthResult.error || 'Invalid token',
+          via: 'oauthLogin',
+          requestId,
+          // Validator text is free-form and can echo the token/claims back —
+          // stdout only. See failLogin's PII rule.
+          diag: { validator_error: String(oauthResult.error || 'invalid').slice(0, 120) },
+        });
         return;
       }
 
-      const phone = oauthResult.phone || oauthResult.username;
-      if (!phone) {
-        socket.emit('loginResult', { success: false, error: 'Token missing phone/username claim' });
+      // A BRIDGED .online login (the "Play Online" handoff) arrives with an
+      // OPAQUE access token whose introspection payload carries `username` and
+      // NO `phone` — that is the normal shape, not a degraded one. See
+      // auth/loginIdentity.ts + tests/auth.loginIdentity.test.ts.
+      const identity = resolveLoginIdentity(oauthResult);
+      if (!identity.ok) {
+        // Reached when the introspection/JWT payload carried no username claim
+        // — i.e. auth-server's extraTokenClaims could not read the master API.
+        // Previously emitted NOTHING server-side, which is why this branch was
+        // un-eliminable during the 2026-08-17 outage triage.
+        failLogin(socket, {
+          code: identity.code,
+          message: 'Token missing phone/username claim',
+          via: 'oauthLogin',
+          requestId,
+          detail: { has_sub: !!oauthResult.sub },
+        });
         return;
       }
+      const phone = identity.identity.key;
 
       // 2026-07-07 gap-fill — enforce maintenance mode on login (admins exempt).
       if (maintenanceBlocksLogin(!!oauthResult.isAdmin)) {
-        socket.emit('loginResult', { success: false, error: 'The server is under maintenance. Please try again shortly.' });
+        failLogin(socket, {
+          code: 'maintenance',
+          message: 'The server is under maintenance. Please try again shortly.',
+          via: 'oauthLogin',
+          requestId,
+        });
         socket.emit('maintenanceMode', { enabled: true });
         return;
       }
 
-      const displayName = oauthResult.username || String(phone);
+      const displayName = identity.identity.displayName;
 
       // Upsert local poker-server user keyed on phone (= username column).
       // Same convention as authWithTicket + syncMasterUser in authManager.
-      const bcrypt = require('bcryptjs');
-      const placeholderHash = bcrypt.hashSync(
-        `oauth-placeholder-${oauthResult.sub}-${Date.now()}`,
-        10
-      );
-      const { rows } = await getPool().query(
-        // 2026-07-05 audit P3 fix: persist is_admin from the master OAuth result so
-        // admins signing in via the primary OIDC flow can actually use admin socket
-        // handlers (isUserAdmin reads users.is_admin). Previously only the password-
-        // login syncMasterUser path wrote it, so OIDC admins got is_admin=false and
-        // every admin action 403'd. Grant-only (`$5 OR users.is_admin`) — never
-        // revokes an existing admin from this path, so it can't break a legit admin.
-        `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
-           VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4, $5)
-           ON CONFLICT (LOWER(username)) DO UPDATE
-             SET display_name = COALESCE(users.display_name, $2),
-                 is_admin = ($5 OR users.is_admin)
-         RETURNING *`,
-        [
-          String(phone),
-          displayName,
-          placeholderHash,
-          JSON.stringify({ masterPhone: phone, masterUsername: oauthResult.username, masterUserId: oauthResult.sub }),
-          !!oauthResult.isAdmin,
-        ]
-      );
-      const localUser = rows[0];
+      //
+      // 2026-08-17 — the local-user upsert gets its OWN failure codes. It used
+      // to fall into the handler-wide catch below, which emitted a bare
+      // "Authentication failed" — indistinguishable from a genuinely bad token
+      // even though the token had already been proven valid three lines
+      // earlier. A Railway Postgres blip therefore looked exactly like a
+      // rejected credential, to users AND to triage. It also now carries the P0
+      // identity guard; see upsertOidcLocalUser.
+      const upsert = await upsertOidcLocalUser({
+        key: String(phone),
+        displayName,
+        sub: String(oauthResult.sub),
+        // `oauthResult.username` is auth-server's DISPLAY-name claim, not the
+        // master API's slug — see MasterIdentityStamp for why conflating those
+        // two made every login rewrite the row.
+        masterDisplayName: oauthResult.username,
+        masterPhone: identity.identity.source === 'phone' ? String(phone) : undefined,
+        isAdmin: !!oauthResult.isAdmin,
+        via: 'oauthLogin',
+      });
+      if (!upsert.ok) {
+        failLogin(socket, {
+          code: upsert.code,
+          message: upsert.code === 'identity_conflict'
+            // Deliberately vague to the client: naming the other account would
+            // confirm to an attacker that a given display name maps to a real
+            // (possibly admin) row. The server log carries the full detail.
+            ? 'This account could not be matched securely. Please contact support.'
+            : 'We could not load your account just now — please try again.',
+          via: 'oauthLogin',
+          requestId,
+          detail: upsert.detail,
+          diag: upsert.diag,
+        });
+        return;
+      }
+      const localUser = upsert.user;
 
       const userId = localUser.id;
       const progress = await loadProgress(userId);
@@ -4942,6 +5562,7 @@ Give feedback in this JSON format:
         success: true,
         token: data.accessToken,
         userData,
+        ...(requestId ? { requestId } : {}),
       });
       hydrateAndPushProgress(socket, userId, localUser.username).catch(() => {});
 
@@ -4951,134 +5572,316 @@ Give feedback in this JSON format:
     } catch (err: any) {
       console.error('[OAuth] oauthLogin error:', err);
       if (Sentry) Sentry.captureException(err, { tags: { area: 'auth.oauthLogin' } });
-      socket.emit('loginResult', { success: false, error: 'Authentication failed' });
+      failLogin(socket, {
+        code: 'handler_exception',
+        message: 'Authentication failed',
+        via: 'oauthLogin',
+        requestId,
+        diag: { error: String(err?.message || 'unknown').slice(0, 160) },
+      });
     }
   });
 
-  socket.on('tokenLogin', async (data: { token: string }) => {
-    // Rate limit: max 3 attempts per minute per socket
-    const now = Date.now();
-    const tlKey = socket.id;
-    const tlEntry = tokenLoginAttempts.get(tlKey) || { attempts: 0, firstAt: now };
-    if (now - tlEntry.firstAt > 60_000) {
-      tlEntry.attempts = 0;
-      tlEntry.firstAt = now;
-    }
-    tlEntry.attempts++;
-    tokenLoginAttempts.set(tlKey, tlEntry);
-    if (tlEntry.attempts > 3) {
-      socket.emit('tokenLoginResult', { success: false, message: 'Too many login attempts' });
-      return;
-    }
-
-    // Try OAuth2 RS256 token first, then fall back to legacy HS256 JWT
-    const oauthResult = await validateOAuthToken(data.token);
-    // 2026-07-06 P1 — tokenLogin used to mask ALL introspection failures as
-    // generic legacy-token fallthrough, so a fleet-wide credential break
-    // (secret drift) had ZERO attributable telemetry on this path. Report
-    // HTTP-level failures (401 = our creds, 5xx = auth-server broken); a
-    // plain inactive/expired token stays silent — that's the normal legacy
-    // fallback and not an incident.
-    if (oauthResult.clientAuthFailed) {
-      reportAuthEvent('client_auth_failed', {
-        client_id: 'poker-server', error: 'invalid_client', endpoint: 'introspection', via: 'tokenLogin',
-      });
-    } else if (oauthResult.status && oauthResult.status >= 500) {
-      reportAuthEvent('introspection_failed', { error: oauthResult.error || 'invalid', via: 'tokenLogin' });
-    }
-    if (oauthResult.valid && oauthResult.sub) {
-      // 2026-07-07 gap-fill — enforce maintenance mode (admins exempt).
-      if (maintenanceBlocksLogin(!!oauthResult.isAdmin)) {
-        socket.emit('tokenLoginResult', { success: false, message: 'The server is under maintenance. Please try again shortly.' });
-        socket.emit('maintenanceMode', { enabled: true });
-        return;
+  socket.on('tokenLogin', async (data: { token: string; requestId?: string }) => {
+    // 2026-08-17 — see oauthLogin: echoed back so a client running several auth
+    // flows on one socket can attribute this result. Critically, THIS handler's
+    // failure is the one that used to be mistaken for the bridge handoff's
+    // (both emit the bare `loginResult` event on the same socket).
+    const tlRequestId = normalizeRequestId(data?.requestId);
+    // 2026-08-17 P2 — HANDLER-LEVEL GUARD. This handler previously had NO
+    // try/catch anywhere in its body, and neither did its upsert. Socket.IO
+    // does not await listener promises, and Sentry.init only runs when
+    // SENTRY_DSN is set — so on Node >= 15 without a DSN, one rejected query
+    // (a Railway Postgres blip, a pool timeout) was an unhandled rejection and
+    // therefore a PROCESS EXIT: every seated table on the server dropped
+    // mid-hand because one person had a stale token. oauthLogin has had this
+    // guard since it was written; tokenLogin got the labels but none of the
+    // robustness.
+    try {
+      // Rate limit: max 3 attempts per minute per socket
+      const now = Date.now();
+      const tlKey = socket.id;
+      const tlEntry = tokenLoginAttempts.get(tlKey) || { attempts: 0, firstAt: now };
+      if (now - tlEntry.firstAt > 60_000) {
+        tlEntry.attempts = 0;
+        tlEntry.firstAt = now;
       }
-      // H2 fix (2026-07-01 audit): resolve the LOCAL user by phone/username
-      // (upsert), NOT parseInt(sub). The OAuth `sub` is the MASTER users.id (a
-      // UUID); parseInt(sub) reinterpreted its leading digits as a LOCAL integer
-      // user id and logged the socket in as an UNRELATED account (the exact bug
-      // oauthLogin's comment says was fixed there but tokenLogin never was).
-      // Mirror oauthLogin's upsert-by-phone; also stamp masterUserId + phone so
-      // qualifier features work for tokenLogin users too.
-      const _tlPhone = oauthResult.phone || oauthResult.username;
-      if (!_tlPhone) {
-        socket.emit('tokenLoginResult', { success: false, message: 'Token missing phone/username claim' });
-        return;
-      }
-      const _tlDisplayName = oauthResult.username || String(_tlPhone);
-      const _tlBcrypt = require('bcryptjs');
-      const _tlHash = _tlBcrypt.hashSync(`oauth-placeholder-${oauthResult.sub}-${Date.now()}`, 10);
-      const { rows: _tlRows } = await getPool().query(
-        // 2026-07-05 audit P3 fix: persist is_admin (grant-only) so OIDC admins can
-        // use admin handlers — mirrors the oauthLogin fix above.
-        `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
-           VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4, $5)
-           ON CONFLICT (LOWER(username)) DO UPDATE
-             SET display_name = COALESCE(users.display_name, $2),
-                 is_admin = ($5 OR users.is_admin)
-         RETURNING *`,
-        [String(_tlPhone), _tlDisplayName, _tlHash,
-         JSON.stringify({ masterPhone: _tlPhone, masterUsername: oauthResult.username, masterUserId: oauthResult.sub }),
-         !!oauthResult.isAdmin]
-      );
-      const _tlLocalUser = _tlRows[0];
-      const userId = _tlLocalUser.id;
-      const progress = await loadProgress(userId);
-      if (progress.success && progress.userData) {
-        authSessions.set(socket.id, {
-          userId,
-          username: _tlLocalUser.username,
-          masterUserId: String(oauthResult.sub),
-          phone: String(_tlPhone),
+      tlEntry.attempts++;
+      tokenLoginAttempts.set(tlKey, tlEntry);
+      if (tlEntry.attempts > 3) {
+        socket.emit('tokenLoginResult', { success: false, message: 'Too many login attempts' });
+        // 2026-08-17 — also answer on `loginResult`. Every client of this handler
+        // listens on loginResult ONLY, so a rate-limited attempt used to produce
+        // dead silence and the caller sat on its watchdog until it expired.
+        //
+        // ATTRIBUTED CLIENTS ONLY. This is the single most dangerous of the new
+        // frames for old bundles: tryLegacyAutoLogin fires on every boot, and a
+        // cached bundle's unattributed loginResult listener would treat this
+        // rate-limit notice as "your credential is bad" and wipe the whole
+        // token set — including the OIDC access token bridge.js stores via
+        // setAuthToken. See failLogin's onlyWhenAttributed.
+        failLogin(socket, {
+          code: 'rate_limited', message: 'Too many login attempts', via: 'tokenLogin', requestId: tlRequestId,
+          onlyWhenAttributed: true,
         });
+        return;
+      }
 
-        // Post-restart seat recovery: Railway redeploy wipes in-memory
-        // state (including reservedSeats Map). But table state was
-        // rehydrated from Redis so this user's seat still exists with
-        // their playerId. Synthesize a reservedSeats entry so the
-        // existing reconnect flow can claim the seat.
-        if (!reservedSeats.has(userId)) {
-          const expectedPlayerId = `user_${userId}`;
-          for (const t of tableManager.getTableList()) {
-            const table = tableManager.getTable(t.tableId);
-            if (!table) continue;
-            for (let i = 0; i < table.seats.length; i++) {
-              const seat = table.seats[i];
-              if (seat.state !== 'occupied' || seat.isAI) continue;
-              if (seat.playerId !== expectedPlayerId) continue;
-              // Found an orphaned seat for this user. Reserve it so the
-              // block below treats it as a normal reconnect. No cleanupTimer
-              // needed — this synthetic reservation will be consumed
-              // immediately by the reconnect code below. Previous version
-              // used a dummy `setTimeout(() => {}, 0)` which was a harmless
-              // but confusing no-op and caused audit false-positives.
-              // Consumers of cleanupTimer must guard with optional-chain.
-              reservedSeats.set(userId, {
-                userId,
-                tableId: t.tableId,
-                seatIndex: i,
-                playerName: seat.playerName,
-                chips: seat.chipCount,
-                avatar: (progress.userData as any).avatar ?? undefined,
-                expiresAt: Date.now() + 60_000,
-                cleanupTimer: undefined,
-              } as any);
-              console.log(`[Reconnect] orphan-seat recovery: user ${userId} → ${t.tableId} seat ${i}`);
-              break;
-            }
-            if (reservedSeats.has(userId)) break;
-          }
+      // Try OAuth2 RS256 token first, then fall back to legacy HS256 JWT
+      const oauthResult = await validateOAuthToken(data.token);
+      // 2026-07-06 P1 — tokenLogin used to mask ALL introspection failures as
+      // generic legacy-token fallthrough, so a fleet-wide credential break
+      // (secret drift) had ZERO attributable telemetry on this path. Report
+      // HTTP-level failures (401 = our creds, 5xx = auth-server broken); a
+      // plain inactive/expired token stays silent — that's the normal legacy
+      // fallback and not an incident.
+      if (oauthResult.clientAuthFailed) {
+        reportAuthEvent('client_auth_failed', {
+          client_id: 'poker-server', error: 'invalid_client', endpoint: 'introspection', via: 'tokenLogin',
+        });
+      } else if (oauthResult.status && oauthResult.status >= 500) {
+        reportAuthEvent('introspection_failed', { error: oauthResult.error || 'invalid', via: 'tokenLogin' });
+      }
+      if (oauthResult.valid && oauthResult.sub) {
+        // 2026-07-07 gap-fill — enforce maintenance mode (admins exempt).
+        if (maintenanceBlocksLogin(!!oauthResult.isAdmin)) {
+          socket.emit('tokenLoginResult', { success: false, message: 'The server is under maintenance. Please try again shortly.' });
+          failLogin(socket, {
+            code: 'maintenance', message: 'The server is under maintenance. Please try again shortly.',
+            via: 'tokenLogin', requestId: tlRequestId,
+            // NEW on loginResult — this branch used to answer on
+            // tokenLoginResult only. Attributed clients only. See failLogin.
+            onlyWhenAttributed: true,
+          });
+          socket.emit('maintenanceMode', { enabled: true });
+          return;
         }
+        // H2 fix (2026-07-01 audit): resolve the LOCAL user by phone/username
+        // (upsert), NOT parseInt(sub). The OAuth `sub` is the MASTER users.id (a
+        // UUID); parseInt(sub) reinterpreted its leading digits as a LOCAL integer
+        // user id and logged the socket in as an UNRELATED account (the exact bug
+        // oauthLogin's comment says was fixed there but tokenLogin never was).
+        // Mirror oauthLogin's upsert-by-phone; also stamp masterUserId + phone so
+        // qualifier features work for tokenLogin users too.
+        //
+        // 2026-08-17 P2 — this used to call `oauthResult.phone || oauthResult.username`
+        // inline while oauthLogin went through `resolveLoginIdentity`. Two handlers
+        // normalising the same claims differently is how ONE person ends up with
+        // TWO local rows (and two chip balances). Both now share the one resolver.
+        const _tlIdentity = resolveLoginIdentity(oauthResult);
+        if (!_tlIdentity.ok) {
+          socket.emit('tokenLoginResult', { success: false, message: 'Token missing phone/username claim' });
+          failLogin(socket, {
+            code: _tlIdentity.code, message: 'Token missing phone/username claim',
+            via: 'tokenLogin', requestId: tlRequestId,
+            detail: { has_sub: !!oauthResult.sub },
+            // NEW on loginResult (was tokenLoginResult only). See failLogin.
+            onlyWhenAttributed: true,
+          });
+          return;
+        }
+        const _tlPhone = _tlIdentity.identity.key;
+        const _tlDisplayName = _tlIdentity.identity.displayName;
+        // 2026-08-17 P0/P2 — same guarded upsert as oauthLogin. Previously this
+        // was a bare `await getPool().query(...)` with NO try/catch anywhere in
+        // the handler: a Postgres blip became an unhandled promise rejection, and
+        // since Socket.IO does not await listener promises and Sentry.init only
+        // runs when SENTRY_DSN is set, on Node >= 15 without a DSN that is a
+        // PROCESS EXIT — every seated table on the server dropped. It also read
+        // `_tlRows[0].id` with no null guard.
+        const _tlUpsert = await upsertOidcLocalUser({
+          key: String(_tlPhone),
+          displayName: _tlDisplayName,
+          sub: String(oauthResult.sub),
+          masterDisplayName: oauthResult.username,
+          masterPhone: _tlIdentity.identity.source === 'phone' ? String(_tlPhone) : undefined,
+          isAdmin: !!oauthResult.isAdmin,
+          via: 'tokenLogin',
+        });
+        if (!_tlUpsert.ok) {
+          socket.emit('tokenLoginResult', { success: false, message: 'Could not load your account' });
+          failLogin(socket, {
+            code: _tlUpsert.code,
+            message: _tlUpsert.code === 'identity_conflict'
+              ? 'This account could not be matched securely. Please contact support.'
+              : 'We could not load your account just now — please try again.',
+            via: 'tokenLogin',
+            requestId: tlRequestId,
+            detail: _tlUpsert.detail,
+            diag: _tlUpsert.diag,
+            // NEW on loginResult: this branch previously either fell through to
+            // the legacy path or crashed the handler. See failLogin.
+            onlyWhenAttributed: true,
+          });
+          return;
+        }
+        const _tlLocalUser = _tlUpsert.user;
+        const userId = _tlLocalUser.id;
+        const progress = await loadProgress(userId);
+        // 2026-08-17 P3 — MISLABEL FIX. When the token is a VALID OIDC token but
+        // loadProgress cannot return a row, control used to fall out of this
+        // block into the legacy HS256 fallback below. getUserFromToken then
+        // failed (an OIDC token is not a legacy JWT) and the user was told
+        // `legacy_token_invalid` — a code the client's isCredentialDead treats
+        // as proof the credential is dead, so poker-3d DISCARDED a live OIDC
+        // access token over what is actually a missing local row. Answer here
+        // with the code that describes what really happened, and never reach
+        // the legacy branch with a token we already know is OIDC.
+        if (!progress.success || !progress.userData) {
+          console.error(
+            `[tokenLogin] valid OIDC token but loadProgress failed for local userId=${userId} — ` +
+              'NOT a legacy-token problem; not falling through to the HS256 path.'
+          );
+          socket.emit('tokenLoginResult', { success: false, message: 'Could not load your account' });
+          failLogin(socket, {
+            code: 'user_row_missing',
+            message: 'We could not load your account just now — please try again.',
+            via: 'tokenLogin',
+            requestId: tlRequestId,
+            detail: { after: 'loadProgress', caller_master_id: String(oauthResult.sub) },
+            onlyWhenAttributed: true,
+          });
+          return;
+        }
+        // Always true after the guard above; kept so the block structure (and
+        // its long reconnect body) is untouched by this fix.
+        if (progress.success && progress.userData) {
+          authSessions.set(socket.id, {
+            userId,
+            username: _tlLocalUser.username,
+            masterUserId: String(oauthResult.sub),
+            phone: String(_tlPhone),
+          });
 
-        // Check for reserved seat (same reconnection logic as legacy)
+          // Post-restart seat recovery: Railway redeploy wipes in-memory
+          // state (including reservedSeats Map). But table state was
+          // rehydrated from Redis so this user's seat still exists with
+          // their playerId. Synthesize a reservedSeats entry so the
+          // existing reconnect flow can claim the seat.
+          if (!reservedSeats.has(userId)) {
+            const expectedPlayerId = `user_${userId}`;
+            for (const t of tableManager.getTableList()) {
+              const table = tableManager.getTable(t.tableId);
+              if (!table) continue;
+              for (let i = 0; i < table.seats.length; i++) {
+                const seat = table.seats[i];
+                if (seat.state !== 'occupied' || seat.isAI) continue;
+                if (seat.playerId !== expectedPlayerId) continue;
+                // Found an orphaned seat for this user. Reserve it so the
+                // block below treats it as a normal reconnect. No cleanupTimer
+                // needed — this synthetic reservation will be consumed
+                // immediately by the reconnect code below. Previous version
+                // used a dummy `setTimeout(() => {}, 0)` which was a harmless
+                // but confusing no-op and caused audit false-positives.
+                // Consumers of cleanupTimer must guard with optional-chain.
+                reservedSeats.set(userId, {
+                  userId,
+                  tableId: t.tableId,
+                  seatIndex: i,
+                  playerName: seat.playerName,
+                  chips: seat.chipCount,
+                  avatar: (progress.userData as any).avatar ?? undefined,
+                  expiresAt: Date.now() + 60_000,
+                  cleanupTimer: undefined,
+                } as any);
+                console.log(`[Reconnect] orphan-seat recovery: user ${userId} → ${t.tableId} seat ${i}`);
+                break;
+              }
+              if (reservedSeats.has(userId)) break;
+            }
+          }
+
+          // Check for reserved seat (same reconnection logic as legacy)
+          const reserved = reservedSeats.get(userId);
+          if (reserved && reserved.expiresAt > Date.now()) {
+            const table = tableManager.getTable(reserved.tableId);
+            if (table) {
+              const seat = table.seats[reserved.seatIndex];
+              if (seat && seat.state === 'occupied' && !seat.isAI) {
+                if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
+                reservedSeats.delete(userId);
+                const restoredSession: PlayerSession = {
+                  socketId: socket.id,
+                  tableId: reserved.tableId,
+                  seatIndex: reserved.seatIndex,
+                  playerName: reserved.playerName,
+                  playerId: `user_${userId}`,
+                  trainingEnabled: false,
+                  sittingOut: false,
+                  avatar: reserved.avatar,
+                };
+                playerSessions.set(socket.id, restoredSession);
+                socket.join(`table:${reserved.tableId}`);
+                // MISSED-BLINDS FIX: on reconnect, remove seat from
+                // sit-out set AND push the fresh set to the table so
+                // markSittingOutBlinds on next hand doesn't re-mark.
+                // Also clear any dead-blind debt that accumulated during
+                // the brief disconnect — the user didn't intentionally
+                // sit out; their socket just blipped (PWA background,
+                // WiFi hiccup). If they meant to sit out they'd use the
+                // explicit Sit Out button.
+                const tracker = sitOutTracker.get(reserved.tableId);
+                if (tracker) tracker.delete(reserved.seatIndex);
+                syncSitOutToTable(reserved.tableId);
+                const reSeat = table.seats[reserved.seatIndex];
+                // 2026-06-11 audit E5: only forgive dead-blind debt for a
+                // genuine connectivity blip. If the player was SITTING OUT when
+                // they dropped, they legitimately owe the accrued dead blinds —
+                // preserve them so a drop+reconnect can't dodge owed blinds.
+                if (reSeat && !reserved.sittingOut) {
+                  reSeat.deadBlindOwedChips = 0;
+                  reSeat.missedBlind = 'none';
+                }
+                socket.emit('reconnectedToTable', {
+                  tableId: reserved.tableId,
+                  seatIndex: reserved.seatIndex,
+                });
+                // Send a FORCED full state to the reconnecting socket so they
+                // get hole cards + current phase + turn info immediately, not
+                // wait for the next delta. `broadcastGameState` alone uses
+                // delta compression and can send an empty frame if nothing
+                // changed during the disconnect window.
+                const rTable = tableManager.getTable(reserved.tableId);
+                if (rTable) {
+                  emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
+                }
+                broadcastGameState(reserved.tableId);
+                console.log(`[OAuth Reserve] User ${userId} reconnected to seat ${reserved.seatIndex}`);
+              } else {
+                reservedSeats.delete(userId);
+              }
+            } else {
+              reservedSeats.delete(userId);
+            }
+          }
+
+          socket.emit('loginResult', {
+            success: true, token: data.token, userData: progress.userData,
+            ...(tlRequestId ? { requestId: tlRequestId } : {}),
+          });
+          hydrateAndPushProgress(socket, progress.userData.id, progress.userData.username).catch(() => {});
+          return;
+        }
+      }
+
+      // Legacy HS256 JWT fallback
+      const result = await getUserFromToken(data.token);
+      if (result.success && result.userData) {
+        const userId = result.userData.id;
+        authSessions.set(socket.id, { userId, username: result.userData.username });
+
+        // Check for a reserved seat and restore it
         const reserved = reservedSeats.get(userId);
         if (reserved && reserved.expiresAt > Date.now()) {
           const table = tableManager.getTable(reserved.tableId);
           if (table) {
             const seat = table.seats[reserved.seatIndex];
+            // Seat still belongs to this player (state occupied, not AI)
             if (seat && seat.state === 'occupied' && !seat.isAI) {
               if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
               reservedSeats.delete(userId);
+
+              // Re-associate socket with the session
               const restoredSession: PlayerSession = {
                 socketId: socket.id,
                 tableId: reserved.tableId,
@@ -5086,46 +5889,43 @@ Give feedback in this JSON format:
                 playerName: reserved.playerName,
                 playerId: `user_${userId}`,
                 trainingEnabled: false,
-                sittingOut: false,
+                sittingOut: reserved.sittingOut,
                 avatar: reserved.avatar,
               };
               playerSessions.set(socket.id, restoredSession);
               socket.join(`table:${reserved.tableId}`);
-              // MISSED-BLINDS FIX: on reconnect, remove seat from
-              // sit-out set AND push the fresh set to the table so
-              // markSittingOutBlinds on next hand doesn't re-mark.
-              // Also clear any dead-blind debt that accumulated during
-              // the brief disconnect — the user didn't intentionally
-              // sit out; their socket just blipped (PWA background,
-              // WiFi hiccup). If they meant to sit out they'd use the
-              // explicit Sit Out button.
+
+              // Remove from sit-out if they were marked out during disconnect
+              // (they'll sit back in since they reconnected). MUST mirror the
+              // OAuth reconnect path (line ~2866): clear the tracker entry,
+              // sync the change into the PokerTable's _sittingOutSeats set,
+              // AND zero out any dead-blind debt that accumulated during the
+              // brief disconnect. Without this, a PWA backgrounding blip on
+              // the legacy tokenLogin path left the user flagged + billed.
+              restoredSession.sittingOut = false;
               const tracker = sitOutTracker.get(reserved.tableId);
               if (tracker) tracker.delete(reserved.seatIndex);
               syncSitOutToTable(reserved.tableId);
-              const reSeat = table.seats[reserved.seatIndex];
-              // 2026-06-11 audit E5: only forgive dead-blind debt for a
-              // genuine connectivity blip. If the player was SITTING OUT when
-              // they dropped, they legitimately owe the accrued dead blinds —
-              // preserve them so a drop+reconnect can't dodge owed blinds.
-              if (reSeat && !reserved.sittingOut) {
-                reSeat.deadBlindOwedChips = 0;
-                reSeat.missedBlind = 'none';
+              const reSeatLegacy = table.seats[reserved.seatIndex];
+              // E5: preserve owed dead blinds if they were sitting out (no dodge).
+              if (reSeatLegacy && !reserved.sittingOut) {
+                reSeatLegacy.deadBlindOwedChips = 0;
+                reSeatLegacy.missedBlind = 'none';
               }
+
               socket.emit('reconnectedToTable', {
                 tableId: reserved.tableId,
                 seatIndex: reserved.seatIndex,
               });
-              // Send a FORCED full state to the reconnecting socket so they
-              // get hole cards + current phase + turn info immediately, not
-              // wait for the next delta. `broadcastGameState` alone uses
-              // delta compression and can send an empty frame if nothing
-              // changed during the disconnect window.
-              const rTable = tableManager.getTable(reserved.tableId);
-              if (rTable) {
-                emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
+
+              // Forced full state to the reconnecting socket — see the OAuth
+              // branch above for rationale.
+              const rTable2 = tableManager.getTable(reserved.tableId);
+              if (rTable2) {
+                emitGameState(socket, getGameStateForPlayer(rTable2, reserved.seatIndex), true);
               }
               broadcastGameState(reserved.tableId);
-              console.log(`[OAuth Reserve] User ${userId} reconnected to seat ${reserved.seatIndex}`);
+              console.log(`[Reserve] User ${userId} (${reserved.playerName}) reconnected to seat ${reserved.seatIndex}`);
             } else {
               reservedSeats.delete(userId);
             }
@@ -5133,88 +5933,54 @@ Give feedback in this JSON format:
             reservedSeats.delete(userId);
           }
         }
-
-        socket.emit('loginResult', { success: true, token: data.token, userData: progress.userData });
-        hydrateAndPushProgress(socket, progress.userData.id, progress.userData.username).catch(() => {});
-        return;
       }
-    }
-
-    // Legacy HS256 JWT fallback
-    const result = await getUserFromToken(data.token);
-    if (result.success && result.userData) {
-      const userId = result.userData.id;
-      authSessions.set(socket.id, { userId, username: result.userData.username });
-
-      // Check for a reserved seat and restore it
-      const reserved = reservedSeats.get(userId);
-      if (reserved && reserved.expiresAt > Date.now()) {
-        const table = tableManager.getTable(reserved.tableId);
-        if (table) {
-          const seat = table.seats[reserved.seatIndex];
-          // Seat still belongs to this player (state occupied, not AI)
-          if (seat && seat.state === 'occupied' && !seat.isAI) {
-            if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
-            reservedSeats.delete(userId);
-
-            // Re-associate socket with the session
-            const restoredSession: PlayerSession = {
-              socketId: socket.id,
-              tableId: reserved.tableId,
-              seatIndex: reserved.seatIndex,
-              playerName: reserved.playerName,
-              playerId: `user_${userId}`,
-              trainingEnabled: false,
-              sittingOut: reserved.sittingOut,
-              avatar: reserved.avatar,
-            };
-            playerSessions.set(socket.id, restoredSession);
-            socket.join(`table:${reserved.tableId}`);
-
-            // Remove from sit-out if they were marked out during disconnect
-            // (they'll sit back in since they reconnected). MUST mirror the
-            // OAuth reconnect path (line ~2866): clear the tracker entry,
-            // sync the change into the PokerTable's _sittingOutSeats set,
-            // AND zero out any dead-blind debt that accumulated during the
-            // brief disconnect. Without this, a PWA backgrounding blip on
-            // the legacy tokenLogin path left the user flagged + billed.
-            restoredSession.sittingOut = false;
-            const tracker = sitOutTracker.get(reserved.tableId);
-            if (tracker) tracker.delete(reserved.seatIndex);
-            syncSitOutToTable(reserved.tableId);
-            const reSeatLegacy = table.seats[reserved.seatIndex];
-            // E5: preserve owed dead blinds if they were sitting out (no dodge).
-            if (reSeatLegacy && !reserved.sittingOut) {
-              reSeatLegacy.deadBlindOwedChips = 0;
-              reSeatLegacy.missedBlind = 'none';
-            }
-
-            socket.emit('reconnectedToTable', {
-              tableId: reserved.tableId,
-              seatIndex: reserved.seatIndex,
-            });
-
-            // Forced full state to the reconnecting socket — see the OAuth
-            // branch above for rationale.
-            const rTable2 = tableManager.getTable(reserved.tableId);
-            if (rTable2) {
-              emitGameState(socket, getGameStateForPlayer(rTable2, reserved.seatIndex), true);
-            }
-            broadcastGameState(reserved.tableId);
-            console.log(`[Reserve] User ${userId} (${reserved.playerName}) reconnected to seat ${reserved.seatIndex}`);
-          } else {
-            reservedSeats.delete(userId);
-          }
-        } else {
-          reservedSeats.delete(userId);
-        }
+      // 2026-08-17 — THE cross-talk emitter. A stale `poker_auth_token` in a
+      // returning player's browser lands here on EVERY .online boot (poker-3d's
+      // tryLegacyAutoLogin), and this bare `loginResult{success:false}` was
+      // indistinguishable, on the wire, from the bridge handoff's own result.
+      // Now it is labelled and correlatable.
+      //
+      // NOT gated on attribution, deliberately, unlike the other new frames in
+      // this handler: this branch ALREADY emitted a bare
+      // `loginResult{success:false}` before this change (`socket.emit
+      // ('loginResult', result)`), so old bundles see exactly the shape they
+      // always saw. Adding `code` is additive and they ignore it.
+      //
+      // `legacy_token_invalid` is now truthful here: the only way to reach this
+      // line is a token that was NOT a valid OIDC token (the valid-OIDC paths
+      // all return above, including the loadProgress failure, which used to
+      // fall through and get mislabelled as a dead legacy token).
+      if (result?.success) {
+        socket.emit('loginResult', { ...result, ...(tlRequestId ? { requestId: tlRequestId } : {}) });
+      } else {
+        failLogin(socket, {
+          code: 'legacy_token_invalid',
+          message: (result as any)?.error || 'Invalid or expired token',
+          via: 'tokenLogin',
+          requestId: tlRequestId,
+        });
       }
-    }
-    socket.emit('loginResult', result);
-    // Hydrate + push progress for legacy tokenLogin path too so the
-    // UI never sits at fresh-init level:1 after a redeploy.
-    if (result.success && result.userData) {
-      hydrateAndPushProgress(socket, result.userData.id, result.userData.username).catch(() => {});
+      // Hydrate + push progress for legacy tokenLogin path too so the
+      // UI never sits at fresh-init level:1 after a redeploy.
+      if (result.success && result.userData) {
+        hydrateAndPushProgress(socket, result.userData.id, result.userData.username).catch(() => {});
+      }
+    } catch (err: any) {
+      console.error('[tokenLogin] handler error:', err);
+      if (Sentry) Sentry.captureException(err, { tags: { area: 'auth.tokenLogin' } });
+      // Answer on BOTH channels — callers listen on one or the other, and a
+      // silent handler is what leaves a client sitting on its watchdog.
+      try { socket.emit('tokenLoginResult', { success: false, message: 'Authentication failed' }); } catch {}
+      failLogin(socket, {
+        code: 'handler_exception',
+        message: 'Authentication failed',
+        via: 'tokenLogin',
+        requestId: tlRequestId,
+        diag: { error: String(err?.message || 'unknown').slice(0, 160) },
+        // NEW on loginResult — before this change an exception here took the
+        // PROCESS DOWN rather than emitting anything. See failLogin.
+        onlyWhenAttributed: true,
+      });
     }
   });
 
@@ -5540,6 +6306,75 @@ Give feedback in this JSON format:
     } catch (err: any) {
       console.error('[adminToggleAdmin]', err);
       socket.emit('adminToggleAdminResult', { success: false, error: 'Server error' });
+    }
+  });
+
+  /**
+   * 2026-08-17 P0 — RECOVERY PATH for the identity-ownership guard.
+   *
+   * Clears `stats.masterUserId` from a local row, making it adoptable again by
+   * the next OIDC login that resolves to it.
+   *
+   * WHY THIS EXISTS: the guard stamps a row with the first master account that
+   * signs into it, and refuses every other master account thereafter (in
+   * enforce mode). Two real humans who share a display name — or one human with
+   * two master accounts, of which production has at least 4 confirmed pairs —
+   * therefore produce a PERMANENT lockout for whoever signs in second. An audit
+   * of every admin socket handler (adminGrantChips, adminRestoreBalance,
+   * adminAdjustChips, adminKickPlayer, adminIPBan, adminToggleAdmin,
+   * adminBroadcast, adminMaintenance, adminForceCloseTable, adminGenerateCodes,
+   * adminGetCodes, adminRevokeCode) found NONE that could clear that stamp,
+   * rename a local row, or delete a user — and Railway Postgres is not reachable
+   * from the dev box. So before this handler, the guard's failure mode had no
+   * remedy at all. That absence is the main reason enforcement ships OFF; this
+   * handler is a precondition for ever turning it on, not a substitute for the
+   * real `master_user_id` migration.
+   *
+   * Accepts a local `userId` or an exact `username`. Clears ONLY masterUserId
+   * (a merge — every other stats key is preserved, per CLAUDE.md's "user data
+   * MUST persist"), and the removed id goes into the audit row so the action is
+   * reversible by hand.
+   */
+  socket.on('adminClearIdentityStamp', async (data: { userId?: number; username?: string }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
+    const targetUserId = data?.userId != null ? Number(data.userId) : null;
+    const targetUsername = typeof data?.username === 'string' ? data.username.trim() : '';
+    if ((targetUserId == null || !Number.isFinite(targetUserId)) && !targetUsername) {
+      socket.emit('adminClearIdentityStampResult', { success: false, error: 'Provide userId or username' });
+      return;
+    }
+    try {
+      const { rows } = targetUserId != null && Number.isFinite(targetUserId)
+        ? await getPool().query('SELECT id, username, stats, is_admin FROM users WHERE id = $1 LIMIT 1', [targetUserId])
+        : await getPool().query('SELECT id, username, stats, is_admin FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1', [targetUsername]);
+      const row = rows[0];
+      if (!row) {
+        socket.emit('adminClearIdentityStampResult', { success: false, error: 'User not found' });
+        return;
+      }
+      const { stats, clearedMasterUserId } = clearMasterIdentityStamp(row.stats);
+      if (!clearedMasterUserId) {
+        socket.emit('adminClearIdentityStampResult', {
+          success: true, userId: row.id, cleared: false,
+          message: 'Row was already unowned — nothing to clear.',
+        });
+        return;
+      }
+      await getPool().query('UPDATE users SET stats = $1 WHERE id = $2', [JSON.stringify(stats), row.id]);
+      auditLog(auth.username, 'ADMIN_CLEAR_IDENTITY_STAMP', {
+        targetUserId: row.id, clearedMasterUserId, targetIsAdmin: !!row.is_admin,
+      });
+      console.warn(
+        `[identity-guard] stamp cleared by admin=${auth.username} localUserId=${row.id} ` +
+          `previousOwnerMasterId=${clearedMasterUserId}`
+      );
+      socket.emit('adminClearIdentityStampResult', {
+        success: true, userId: row.id, cleared: true, previousMasterUserId: clearedMasterUserId,
+      });
+    } catch (err: any) {
+      console.error('[adminClearIdentityStamp]', err);
+      socket.emit('adminClearIdentityStampResult', { success: false, error: 'Server error' });
     }
   });
 
@@ -7946,15 +8781,37 @@ Give feedback in this JSON format:
    */
   socket.on(
     'authWithTicket',
-    async (data: { token: string }) => {
+    async (data: { token: string; requestId?: string }) => {
+      // 2026-08-17 P1 — the deep-link ticket flow was one of two loginResult
+      // producers left unconverted, and that made it a permanent hole rather
+      // than a transitional one: poker-3d's socketAuth.js accepts an
+      // UN-ECHOED result for back-compat, so every bare frame this handler
+      // emitted could still be consumed by whichever other auth flow happened
+      // to be in flight on the same socket (and vice versa — a stale legacy
+      // token's ~15ms rejection was shown to the user as "your link failed"
+      // while the ticket auth was still running). Every emit below now echoes
+      // `requestId` and carries a machine-readable `code`, exactly like
+      // oauthLogin.
+      //
+      // The OTHER unconverted producer was `joinWithWaitlistContext`, which
+      // emitted no `loginResult` at all — see that handler, below.
+      //
+      // NOT attribution-gated: every branch here already emitted a bare
+      // `loginResult{success:false}` before this change, so old bundles see the
+      // shape they always saw.
+      const tkRequestId = normalizeRequestId(data?.requestId);
+      const failTicket = (
+        code: LoginFailureCode, message: string, detail?: Record<string, any>,
+        diag?: Record<string, any>
+      ) => failLogin(socket, { code, message, via: 'authWithTicket', requestId: tkRequestId, detail, diag });
       try {
         if (!data?.token) {
-          socket.emit('loginResult', { success: false, error: 'Missing token' });
+          failTicket('ticket_missing', 'Missing token');
           return;
         }
         // Ticket replay guard — reject if this exact token has been used already.
         if (!markTicketUsed(data.token)) {
-          socket.emit('loginResult', { success: false, error: 'Token already used — please request a new link' });
+          failTicket('ticket_replayed', 'Token already used — please request a new link');
           return;
         }
 
@@ -7995,28 +8852,31 @@ Give feedback in this JSON format:
           });
         } catch (err: any) {
           const isTimeout = err?.name === 'AbortError';
-          socket.emit('loginResult', {
-            success: false,
-            error: isTimeout ? 'Auth service slow — please try again' : 'Auth service unreachable',
-          });
+          failTicket(
+            'ticket_verify_unreachable',
+            isTimeout ? 'Auth service slow — please try again' : 'Auth service unreachable',
+            { timeout: isTimeout }
+          );
           return;
         }
         if (!verifyRes.ok) {
           reportAuthEvent('ticket_auth_failed', { reason: `verify_http_${verifyRes.status}` });
-          socket.emit('loginResult', { success: false, error: 'Token verify failed' });
+          failTicket('ticket_verify_failed', 'Token verify failed', { http_status: verifyRes.status });
           return;
         }
         const verifyJson: any = await verifyRes.json();
         const payload = verifyJson?.data || verifyJson;
         if (!payload?.valid) {
           reportAuthEvent('ticket_auth_failed', { reason: `invalid_token:${payload?.reason || 'unknown'}` });
-          socket.emit('loginResult', { success: false, error: `Invalid token: ${payload?.reason || 'unknown'}` });
+          failTicket('ticket_invalid', `Invalid token: ${payload?.reason || 'unknown'}`, {
+            reason: String(payload?.reason || 'unknown').slice(0, 64),
+          });
           return;
         }
         const remoteUserId = payload.payload?.userId;
         if (!remoteUserId) {
           reportAuthEvent('ticket_auth_failed', { reason: 'token_missing_userId' });
-          socket.emit('loginResult', { success: false, error: 'Token missing userId' });
+          failTicket('ticket_missing_user', 'Token missing userId');
           return;
         }
 
@@ -8026,15 +8886,16 @@ Give feedback in this JSON format:
           meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`, meBypassInit);
         } catch (err: any) {
           const isTimeout = err?.name === 'AbortError';
-          socket.emit('loginResult', {
-            success: false,
-            error: isTimeout ? 'Auth service slow — please try again' : 'Could not load user',
-          });
+          failTicket(
+            'master_user_unreachable',
+            isTimeout ? 'Auth service slow — please try again' : 'Could not load user',
+            { timeout: isTimeout }
+          );
           return;
         }
         if (!meRes.ok) {
           reportAuthEvent('ticket_auth_failed', { reason: `me_fetch_http_${meRes.status}` });
-          socket.emit('loginResult', { success: false, error: 'Could not load user' });
+          failTicket('master_user_unreachable', 'Could not load user', { http_status: meRes.status });
           return;
         }
         const meJson: any = await meRes.json();
@@ -8070,10 +8931,7 @@ Give feedback in this JSON format:
           // Final defense: if BOTH phone and username are missing, the
           // public-safe shape must have changed shape on us. Surface a
           // clear error instead of letting the INSERT NPE.
-          socket.emit('loginResult', {
-            success: false,
-            error: 'Master API user shape missing username — please retry',
-          });
+          failTicket('master_user_shape', 'Master API user shape missing username — please retry');
           console.error('[authWithTicket] master /me public-safe shape missing both phoneNumber and username:', masterUser);
           return;
         }
@@ -8147,6 +9005,36 @@ Give feedback in this JSON format:
         }
 
         // 3b. Fall back to UPSERT by username if no masterUserId match.
+        //
+        // 2026-08-17 P2 — DELIBERATELY LEFT UNGUARDED. Assessed, decided, not
+        // an oversight. The P0 ownership guard covers 2 of the 4 upsert sites
+        // (`oauthLogin` + `tokenLogin`, via upsertOidcLocalUser); this one and
+        // `authManager.syncMasterUser` are the other two, and both stay as-is:
+        //
+        //   • They key on `phone` = `phoneNumber || phone_number || username`
+        //     where `username` is the master API's UNIQUE SLUG (`josh.hall2`),
+        //     not the freely-settable display name. A user cannot rename
+        //     themselves onto another account's slug, so the escalation path
+        //     that motivated the guard does not exist here.
+        //   • The value comes from the master API's /me response for a
+        //     server-verified ticket, not from a client-supplied claim.
+        //   • Adding a fail-closed guard here during a live sign-in outage
+        //     would put a NEW refusal on the deep-link path, which is the
+        //     path a first-time visitor from an SMS lands on. That is a worse
+        //     trade than the (currently unexploitable) hole it would close.
+        //
+        // KNOWN SECOND-ORDER EFFECT of the adoption stamp, accepted knowingly:
+        // step 3a above looks a row up by `stats->>'masterUserId'`. Before the
+        // stamp existed, a row ADOPTED by the OIDC path carried no masterUserId
+        // (the old ON CONFLICT DO UPDATE never wrote stats), so 3a missed it and
+        // this 3b upsert bound the user to their slug-keyed row instead. Now
+        // that adoption stamps the display-name-keyed row, 3a can start
+        // resolving to it — so a user who has BOTH rows may see their deep-link
+        // session land on the other one, with visibly different chips/level.
+        // That is the correct long-run behaviour (one human, one row) and it
+        // converges, but it is a visible change: if a player reports "my chips
+        // changed when I used the Play Online link", this is the cause, and the
+        // fix is to merge the two local rows, not to revert the stamp.
         if (!localUser) {
           const { rows } = await getPool().query(
             `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
@@ -8162,7 +9050,7 @@ Give feedback in this JSON format:
         // 2026-07-07 gap-fill — enforce maintenance mode on ticket login too
         // (admins exempt; fail-closed for everyone else).
         if (maintenanceBlocksLogin(!!localUser.is_admin)) {
-          socket.emit('loginResult', { success: false, error: 'The server is under maintenance. Please try again shortly.' });
+          failTicket('maintenance', 'The server is under maintenance. Please try again shortly.');
           socket.emit('maintenanceMode', { enabled: true });
           return;
         }
@@ -8184,7 +9072,10 @@ Give feedback in this JSON format:
           achievements: typeof localUser.achievements === 'string' ? JSON.parse(localUser.achievements || '[]') : (localUser.achievements || []),
           isAdmin: !!localUser.is_admin,
         };
-        socket.emit('loginResult', { success: true, token: data.token, userData });
+        socket.emit('loginResult', {
+          success: true, token: data.token, userData,
+          ...(tkRequestId ? { requestId: tkRequestId } : {}),
+        });
         hydrateAndPushProgress(socket, localUser.id, localUser.username).catch(() => {});
 
         console.log(
@@ -8192,7 +9083,10 @@ Give feedback in this JSON format:
         );
       } catch (err: any) {
         console.error('authWithTicket error:', err);
-        socket.emit('loginResult', { success: false, error: 'Server error authenticating ticket' });
+        if (Sentry) Sentry.captureException(err, { tags: { area: 'auth.authWithTicket' } });
+        failTicket('handler_exception', 'Server error authenticating ticket', undefined, {
+          error: String(err?.message || 'unknown').slice(0, 160),
+        });
       }
     }
   );
@@ -8202,11 +9096,39 @@ Give feedback in this JSON format:
    * "Play online while you wait". Player app issued a short-lived signed
    * token via the master API; we verify it here, then auto-seat the player
    * at the Beginner's Table (lowest blinds) with the context attached.
+   *
+   * 2026-08-17 P1 — THIS HANDLER NEVER EMITTED `loginResult` ON ANY BRANCH.
+   * Not on failure (it answered on `error`), and not on success (it answered
+   * with `gameState` + progress events). That was survivable only by accident:
+   * poker-3d's deep-link effect registered an UNFILTERED `loginResult`
+   * listener, so whatever OTHER auth flow happened to be running on the same
+   * socket — the boot refresh, the stale-token tokenLogin — supplied the frame
+   * that cleared the spinner and logged the user in.
+   *
+   * Two things then broke that accident:
+   *   • For a FIRST-TIME .online visitor arriving from an at-venue waitlist
+   *     SMS there IS no other flow, so nothing ever answered: the user watched
+   *     the spinner for 15s and got "Connection timed out" while the server
+   *     had already seated them AND deducted their buy-in (see the deduct
+   *     below). A live, user-facing break, not a theoretical one.
+   *   • The requestId-scoped client helper makes it unconditional. Scoped
+   *     listeners ignore frames that aren't their own, so this flow could
+   *     NEVER be answered, and its 15s watchdog would fire on EVERY
+   *     invocation — writing a fabricated `login_failed` /
+   *     `waitlist_ticket_timeout` row, with origin `online`, straight into the
+   *     failure bucket and the `failSources`/`isDominated` query that the rest
+   *     of this work exists to make trustworthy.
+   *
+   * So every terminal branch below now emits `loginResult` with a `code` and
+   * the echoed `requestId`, mirroring authWithTicket. The `error` emits are
+   * KEPT alongside: other, non-deep-link callers of this event rely on them,
+   * and dropping them would be an unrelated regression.
    */
   socket.on(
     'joinWithWaitlistContext',
     async (data: {
       token: string;
+      requestId?: string;
       context: {
         source?: string;
         gameId?: string | null;
@@ -8215,14 +9137,29 @@ Give feedback in this JSON format:
         startTime?: string | null;
       };
     }) => {
+      const wlRequestId = normalizeRequestId(data?.requestId);
+      /**
+       * Answer BOTH channels. `error` keeps the legacy behaviour for any
+       * non-deep-link caller; `loginResult` is what the deep-link flow waits
+       * on. Not attribution-gated: this handler previously emitted NO
+       * loginResult at all, so no cached bundle has a listener that could be
+       * newly harmed — the only clients that reach this event are ones that
+       * asked for a waitlist deep-link, and for them silence is the bug.
+       */
+      const failWaitlist = (
+        code: LoginFailureCode, message: string, detail?: Record<string, any>
+      ) => {
+        socket.emit('error', { message });
+        failLogin(socket, { code, message, via: 'joinWithWaitlistContext', requestId: wlRequestId, detail });
+      };
       try {
         if (!data || !data.token) {
-          socket.emit('error', { message: 'Missing token' });
+          failWaitlist('ticket_missing', 'Missing token');
           return;
         }
         // Ticket replay guard for the waitlist path.
         if (!markTicketUsed(data.token)) {
-          socket.emit('error', { message: 'Token already used — please request a new link' });
+          failWaitlist('ticket_replayed', 'Token already used — please request a new link');
           return;
         }
 
@@ -8258,25 +9195,32 @@ Give feedback in this JSON format:
           });
         } catch (err: any) {
           const isTimeout = err?.name === 'AbortError';
-          socket.emit('error', { message: isTimeout ? 'Auth service slow — please try again' : 'Auth service unreachable' });
+          failWaitlist(
+            'ticket_verify_unreachable',
+            isTimeout ? 'Auth service slow — please try again' : 'Auth service unreachable',
+            { timeout: isTimeout }
+          );
           return;
         }
         if (!verifyRes.ok) {
-          socket.emit('error', { message: 'Token verify failed' });
+          reportAuthEvent('waitlist_auth_failed', { reason: `verify_http_${verifyRes.status}` });
+          failWaitlist('ticket_verify_failed', 'Token verify failed', { http_status: verifyRes.status });
           return;
         }
         const verifyJson: any = await verifyRes.json();
         const payload = verifyJson?.data || verifyJson;
         if (!payload || !payload.valid) {
-          socket.emit('error', {
-            message: `Invalid token: ${payload?.reason || 'unknown'}`,
+          reportAuthEvent('waitlist_auth_failed', { reason: `invalid_token:${payload?.reason || 'unknown'}` });
+          failWaitlist('ticket_invalid', `Invalid token: ${payload?.reason || 'unknown'}`, {
+            reason: String(payload?.reason || 'unknown').slice(0, 64),
           });
           return;
         }
         const claims = payload.payload || {};
         const remoteUserId = claims.userId;
         if (!remoteUserId) {
-          socket.emit('error', { message: 'Token missing userId' });
+          reportAuthEvent('waitlist_auth_failed', { reason: 'token_missing_userId' });
+          failWaitlist('ticket_missing_user', 'Token missing userId');
           return;
         }
 
@@ -8317,7 +9261,7 @@ Give feedback in this JSON format:
         // silently fail on every subsequent action.
         if (!authSessions.has(socket.id)) {
           reportAuthEvent('waitlist_auth_failed', { reason: 'no_auth_session' });
-          socket.emit('error', { message: 'Authentication could not be established — please sign in and try again.' });
+          failWaitlist('master_user_unreachable', 'Authentication could not be established — please sign in and try again.');
           return;
         }
 
@@ -8340,13 +9284,13 @@ Give feedback in this JSON format:
         const holdem = tables.filter(isHoldem);
         holdem.sort((a, b) => a.smallBlind - b.smallBlind);
         if (holdem.length === 0) {
-          socket.emit('error', { message: 'No tables available' });
+          failWaitlist('handler_exception', 'No tables available', { stage: 'no_tables' });
           return;
         }
         const bestTable = holdem[0];
         const table = tableManager.getTable(bestTable.tableId);
         if (!table) {
-          socket.emit('error', { message: 'Table not found' });
+          failWaitlist('handler_exception', 'Table not found', { stage: 'table_missing' });
           return;
         }
 
@@ -8370,7 +9314,7 @@ Give feedback in this JSON format:
           }
         }
         if (targetSeat === -1) {
-          socket.emit('error', { message: 'No seats available' });
+          failWaitlist('handler_exception', 'No seats available', { stage: 'no_seats' });
           return;
         }
 
@@ -8395,11 +9339,11 @@ Give feedback in this JSON format:
         if (authNow) {
           const dbChips = await ensureChipsForBuyIn(authNow.userId, authNow.username, waitlistBuyIn);
           if (waitlistBuyIn > dbChips) {
-            socket.emit('error', { message: 'Insufficient chips' });
+            failWaitlist('handler_exception', 'Insufficient chips', { stage: 'insufficient_chips' });
             return;
           }
           if (!(await deductChips(authNow.userId, waitlistBuyIn))) {
-            socket.emit('error', { message: 'Could not deduct chips — try again' });
+            failWaitlist('handler_exception', 'Could not deduct chips — try again', { stage: 'deduct_failed' });
             return;
           }
           auditLog(authNow.username, 'BUY_IN_DEDUCT', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, reason: 'waitlist' });
@@ -8422,7 +9366,7 @@ Give feedback in this JSON format:
               auditLog(authNow.username, 'BUY_IN_REFUND_FAILED', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, error: String(e) });
             }
           }
-          socket.emit('error', { message: 'Could not join table' });
+          failWaitlist('handler_exception', 'Could not join table', { stage: 'sit_down_failed' });
           return;
         }
 
@@ -8453,6 +9397,51 @@ Give feedback in this JSON format:
           table.startNewHand();
         }
 
+        // 2026-08-17 P1 — ANSWER THE LOGIN. Everything above seats the player,
+        // but poker-3d's deep-link screen is a full-screen spinner gated on
+        // `displayedScreen === 'login'`; only a successful `loginResult` (via
+        // gameStore.login) moves it off. Without this emit the user sat behind
+        // the spinner until the 15s watchdog and was shown "Connection timed
+        // out" — while already seated, already dealt in, and already debited
+        // `minBuyIn` a few lines above. Emitted BEFORE the gameState push so
+        // the client is logged in by the time the table state lands.
+        //
+        // Shape mirrors authWithTicket's success frame exactly, so the client's
+        // single onResult path handles both flows identically.
+        try {
+          const seatedAuth = authSessions.get(socket.id);
+          if (seatedAuth) {
+            const { rows: lurows } = await getPool().query('SELECT * FROM users WHERE id = $1 LIMIT 1', [seatedAuth.userId]);
+            const lu = lurows[0];
+            if (lu) {
+              socket.emit('loginResult', {
+                success: true,
+                token: data.token,
+                userData: {
+                  id: lu.id,
+                  username: lu.username,
+                  displayName: lu.display_name,
+                  chips: lu.chips,
+                  level: lu.level,
+                  xp: lu.xp,
+                  stats: parseStatsColumn(lu.stats),
+                  achievements: typeof lu.achievements === 'string'
+                    ? JSON.parse(lu.achievements || '[]')
+                    : (lu.achievements || []),
+                  isAdmin: !!lu.is_admin,
+                },
+                ...(wlRequestId ? { requestId: wlRequestId } : {}),
+              });
+            } else {
+              console.error(`[waitlistContext] seated but local user ${seatedAuth.userId} vanished — no loginResult sent`);
+            }
+          }
+        } catch (e: any) {
+          // Non-fatal: the seat is real and the gameState below still lands.
+          // Loud, because the user will sit on the spinner until the watchdog.
+          console.error('[waitlistContext] loginResult emit failed (client will time out):', e?.message);
+        }
+
         socket.emit('gameState', getGameStateForPlayer(table, targetSeat));
         broadcastGameState(bestTable.tableId);
         sendProgressToPlayer(socket.id);
@@ -8463,7 +9452,8 @@ Give feedback in this JSON format:
         );
       } catch (err: any) {
         console.error('joinWithWaitlistContext error:', err);
-        socket.emit('error', { message: 'Server error joining with context' });
+        if (Sentry) Sentry.captureException(err, { tags: { area: 'auth.joinWithWaitlistContext' } });
+        failWaitlist('handler_exception', 'Server error joining with context');
       }
     }
   );
@@ -12256,6 +13246,18 @@ app.post('/api/tournament/simulate', (req, res) => {
 
 // ========== Initialize Auth Database ==========
 initDB().then(async () => {
+  // 2026-08-17 — resolve users.stats' real column type once, loudly, and put it
+  // on /api/health. Read-only; never throws. See probeStatsColumnType.
+  await probeStatsColumnType();
+  console.log(
+    `[identity-guard] mode=${IDENTITY_GUARD_MODE}` +
+      (IDENTITY_GUARD_MODE === 'warn'
+        ? ' (WARN — conflicts are logged and ALLOWED; no login is refused. ' +
+          'Collect `[identity-guard] WARN` lines, merge the real duplicate accounts, ' +
+          'then set ONLINE_IDENTITY_GUARD_ENFORCE=1.)'
+        : ' (ENFORCE — a login that would bind to another master account\'s row is REFUSED ' +
+          'with identity_conflict. Recovery: adminClearIdentityStamp.)')
+  );
   try { await initClubTables(); } catch (e) { console.error('[Clubs] initClubTables failed', e); }
   try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }
   try { await initPredictionTables(); } catch (e) { console.error('[prediction] initPredictionTables failed', e); }
