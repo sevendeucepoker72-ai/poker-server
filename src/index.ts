@@ -848,18 +848,21 @@ const TURN_TIMEOUT_MS = 30000; // 30 seconds
 const drawTimers = new Map<string, { timeout: ReturnType<typeof setTimeout>; handNumber: number; phase: GamePhase }>();
 const TURN_WARNING_LEAD_MS = 10000; // fire warning 10s before timeout
 
-// Push-notification "prior seat" tracker: tableId -> last seat we already
-// fired a `your_turn` push for. MUST be a SEPARATE map from turnTimers
-// because turnTimers entries get deleted by their own setTimeout callback;
-// using turnTimers as the prior-seat reference caused the 551c785 -> 9128699
-// turn-timer-restart regression. We compare this map's value against the
-// table's current activeSeatIndex to decide whether the seat actually changed
-// since the last broadcast — and only fire the push on real transitions.
-const lastActiveSeatByTable = new Map<string, number>();
+// 2026-08-25 — `lastActiveSeatByTable` removed with the server-side `your_turn`
+// push it existed to de-duplicate. Its lesson is worth keeping regardless:
+// NEVER use a turnTimers entry as a "prior state" reference. turnTimers entries
+// are deleted by their own setTimeout callback, so the next read sees "new
+// state" and resets things — that is exactly what caused the 551c785 -> 9128699
+// turn-timer-restart regression. Any future prior-seat tracking needs its own
+// map with an independent lifetime.
 
 // Push-notification turn-warning timer: tableId -> { timeout, turnId }.
-// Sibling to turnTimers; cleared on the same seatChanged transition so a
-// stale warning never fires for a seat that already acted.
+// NOTE 2026-08-25: now VESTIGIAL. The only code that populated this map was the
+// `turn_warning` push dispatch, removed the same day. The remaining get/delete
+// call sites are harmless no-ops on a permanently empty map and were left in
+// place deliberately — they cost nothing and removing them would touch four
+// more live game-loop paths for no functional gain. Reuse this map if a
+// server-driven warning is ever reintroduced.
 const turnWarningTimers = new Map<string, { timeout: ReturnType<typeof setTimeout>; turnId: number }>();
 
 // Track when each table's current turn started (epoch ms) so clients can render
@@ -2398,50 +2401,27 @@ function armTurnTimer(tableId: string): void {
       }, TURN_TIMEOUT_MS);
       turnTimers.set(tableId, { timeout, seatIndex: activeSeat, turnId });
 
-      try {
-        const priorPushSeat = lastActiveSeatByTable.get(tableId);
-        if (priorPushSeat !== activeSeat) {
-          lastActiveSeatByTable.set(tableId, activeSeat);
-          const seat = table.seats[activeSeat];
-          if (seat && !seat.isAI && !seat.folded && seat.playerName) {
-            const userId = userIdForSeat(tableId, activeSeat);
-            if (userId) {
-              void notifyPlayer(
-                userId,
-                'your_turn',
-                "It's your turn!",
-                'Tap to make your move.',
-                { priority: 'high', metadata: { gameId: tableId, seatNumber: activeSeat } }
-              );
-            }
-          }
-        }
-
-        const warnDelay = TURN_TIMEOUT_MS - TURN_WARNING_LEAD_MS;
-        if (warnDelay > 0) {
-          const warnTimeout = setTimeout(() => {
-            const entry = turnWarningTimers.get(tableId);
-            if (!entry || entry.turnId !== turnId) return;
-            turnWarningTimers.delete(tableId);
-            const t = tableManager.getTable(tableId);
-            if (!t || !t.isHandInProgress() || t.activeSeatIndex !== activeSeat) return;
-            const seatNow = t.seats[activeSeat];
-            if (!seatNow || seatNow.isAI || seatNow.folded || !seatNow.playerName) return;
-            const uid = userIdForSeat(tableId, activeSeat);
-            if (!uid) return;
-            void notifyPlayer(
-              uid,
-              'turn_warning',
-              'Time running out!',
-              'Your action clock is about to expire.',
-              { priority: 'urgent', metadata: { gameId: tableId, seatNumber: activeSeat } }
-            );
-          }, warnDelay);
-          turnWarningTimers.set(tableId, { timeout: warnTimeout, turnId });
-        }
-      } catch (err) {
-        console.warn('[notifyPlayer your_turn/turn_warning] hook failed:', (err as Error)?.message);
-      }
+      // 2026-08-25 — REMOVED the server-side push dispatch for `your_turn` and
+      // `turn_warning`. The .online client already does this locally, and does
+      // it better: GameHUD.jsx plays a turn sound + haptic, and calls
+      // notify.yourTurn() (the browser's own Notification API) ONLY when
+      // document.visibilityState === 'hidden', so a player looking at the table
+      // is never spammed.
+      //
+      // The server path here was a second, worse copy of the same alert: it
+      // fired unconditionally, round-tripped through the master API, and had
+      // NEVER once worked — userIdForSeat() returns poker-server's LOCAL
+      // integer users.id, while the master API keys notification_preferences on
+      // UUID. The correct value (masterUserId) sits on the same authSessions
+      // entry, unused. Live logs showed ~550 failed dispatches/day
+      // (your_turn 358, hand_complete 165, all_in_alert 15, turn_warning 12),
+      // every one dying on `invalid input syntax for type uuid`.
+      //
+      // Deliberately NOT repaired: fixing the id would have turned on one OS
+      // push PER TURN — dozens per session, per player. Deleting is correct.
+      // If a server-driven push is ever wanted here, the only defensible case
+      // is an event the player is NOT on-screen for (tournament start, waitlist
+      // seat) — and it must send masterUserId.
     }
   }
 }
@@ -4028,31 +4008,13 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
         progressionManager.recordRoyalFlush(session.playerId);
       }
 
-      // === Push notification: hand_complete ===
-      // Notify the winner with their pot win amount. Fire-and-forget;
-      // skip 0-amount results (defensive — winnerSeatIndices is built from
-      // results, which can include zero-amount split-pot ties; we only ping
-      // when there's actual chips flowing).
-      if (potSize > 0) {
-        try {
-          const auth = authSessions.get(session.socketId);
-          const uid = auth?.userId;
-          if (uid) {
-            void notifyPlayer(
-              uid,
-              'hand_complete',
-              `You won ${potSize.toLocaleString()} chips!`,
-              'Tap to see the next hand.',
-              {
-                priority: 'normal',
-                metadata: { gameId: tableId, seatNumber: session.seatIndex },
-              }
-            );
-          }
-        } catch (err) {
-          console.warn('[notifyPlayer hand_complete] hook failed:', (err as Error)?.message);
-        }
-      }
+      // 2026-08-25 — REMOVED the server-side push dispatch for `hand_complete`.
+      // A player who just won a pot is, by definition, looking at the table —
+      // the win is already shown on-screen. This fired an OS-level push on every
+      // won hand and had never worked anyway (auth.userId is poker-server's
+      // local integer id; the master API keys notification_preferences on UUID
+      // — masterUserId, on this same authSessions entry). See the fuller note at
+      // the your_turn removal above.
     } else {
       progressionManager.recordHandLost(session.playerId);
       progressionManager.recordPositionResult(session.playerId, posCategory, false);
@@ -9842,34 +9804,14 @@ Give feedback in this JSON format:
         }
         case 'allIn':
           success = table.playerAllIn(session.seatIndex);
-          // === Push notification: all_in_alert ===
-          // Fire to every other live human seat at the table. Fire-and-forget;
-          // never block the action handler. Only fires when the engine
-          // accepted the all-in (success === true) so misfires don't ping
-          // people on a rejected action.
-          if (success) {
-            try {
-              const shoverSeat = session.seatIndex;
-              const shoverName = table.seats[shoverSeat]?.playerName || 'A player';
-              for (let i = 0; i < table.seats.length; i++) {
-                if (i === shoverSeat) continue;
-                const other = table.seats[i];
-                if (!other || other.state !== 'occupied') continue;
-                if (other.isAI || other.folded || !other.playerName) continue;
-                const uid = userIdForSeat(session.tableId, i);
-                if (!uid) continue;
-                void notifyPlayer(
-                  uid,
-                  'all_in_alert',
-                  'All-in!',
-                  `${shoverName} just shoved all-in.`,
-                  { priority: 'urgent', metadata: { gameId: session.tableId, seatNumber: i } }
-                );
-              }
-            } catch (err) {
-              console.warn('[notifyPlayer all_in_alert] hook failed:', (err as Error)?.message);
-            }
-          }
+          // 2026-08-25 — REMOVED the server-side push dispatch for
+          // `all_in_alert`. It fanned out an URGENT-priority OS push to EVERY
+          // other seated human on every all-in — the single spammiest path in
+          // the codebase — and it had never worked (userIdForSeat() returns the
+          // local integer id, not the masterUserId UUID the master API needs).
+          // Everyone at the table already sees the all-in on screen in
+          // real time via the normal socket broadcast. See the fuller note at
+          // the your_turn removal above.
           break;
         default:
           socket.emit('error', { message: 'Unknown action type' });
