@@ -214,3 +214,8 @@ probeStatsColumnType
 # that the rest of this work exists to make trustworthy.
 # ============================================================
 waitlist_auth_failed
+
+# 2026-10-06 P0 — upsertOidcLocalUser bind values must match the statement's
+# placeholders ($6 exists only in ENFORCE mode). A fixed 6-value array broke
+# every WARN-mode OIDC socket login for 7 weeks (user_upsert_failed).
+upsertParams

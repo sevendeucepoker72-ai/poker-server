@@ -643,6 +643,15 @@ async function upsertOidcLocalUser(args: {
     // display_name and is_admin, so `RETURNING *`.stats is the row's
     // pre-existing stats: exactly the value the SQL guard would have tested.
     const guard = enforcing ? `WHERE ${masterIdGuardSql('$6')}` : '';
+    // 2026-10-06 P0 — `$6` (sub) is referenced ONLY by the enforce-mode guard.
+    // Postgres refuses a bind that supplies more values than the statement
+    // uses ("bind message supplies 6 parameters, but prepared statement \"\"
+    // requires 5"), so in WARN mode — the live default — EVERY oauthLogin and
+    // OIDC tokenLogin failed with user_upsert_failed from the 2026-08-18 deploy
+    // on (Railway: 0 `oauthLogin ok` vs 654 upsert failures, 09-07..10-07).
+    // The bind list must track the placeholders actually in the statement.
+    const upsertParams: any[] = [String(key), displayName, placeholderHash, statsJson, isAdmin];
+    if (enforcing) upsertParams.push(String(sub));
     const res = await getPool().query(
       `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
          VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4, $5)
@@ -651,7 +660,7 @@ async function upsertOidcLocalUser(args: {
                is_admin = ($5 OR users.is_admin)
          ${guard}
        RETURNING *`,
-      [String(key), displayName, placeholderHash, statsJson, isAdmin, String(sub)]
+      upsertParams
     );
     rows = res.rows;
   } catch (dbErr: any) {
