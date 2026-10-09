@@ -48,6 +48,8 @@ check on top.
 | 7 | **Admin socket handlers MUST `await isUserAdmin(auth.userId)`** before mutating state. Client-side route hiding is UX, not security. | 2026-04-22 |
 | 8 | **`package.json` + `package-lock.json` commit together.** Mismatched lockfile breaks Railway's `npm ci`. Pre-push: `npm ci --dry-run`. | 2026-04-22 |
 | 9 | **Regression-guard tests in `tests/PokerTable.test.ts`** — every state-machine fix gets a test that reproduces the bad state and asserts the fix. Wired into CI. | Convention |
+| 10 | **Every play-entry handler calls `assertPlayable(socket, '<event>')` FIRST** — before leaving a table, standing up an AI, a buy-in, a seat or a credit consume. No master id → `login_required`; suspended master id (master `GET /users/:id/play-status/internal`, cached 60s, FAIL-OPEN) → `player_suspended` with the owner's exact sentence. Guest `register` is refused (`guest_disabled`). Spectating is never gated; nothing is pushed to a suspended player unprompted. A NEW seat/registration handler must be gated and added to the `GATED` list in `tests/playGate.test.ts`, which scans `src/index.ts` for the ordering. Logic: `src/auth/playGate.ts`. | 2026-10-07 (owner: 86'd player + guest play off) |
+| 11 | **Every login handler registers with `loginTracker`; the seat restore is gated.** `login` / `oauthLogin` / `tokenLogin` / `authWithTicket` are registered via `trackLogin(socket, '<event>', async …)` and the waitlist auth bootstrap via `loginTracker.begin/release`, so a play tap racing a reconnect's login WAITS for it (bounded 6s, under poker-3d's 8s join watchdog) instead of getting `login_required`; disconnect calls `loginTracker.forget`. A NEW login path must do the same. Every reserved/orphan seat restore runs `refuseSeatRestoreIfBarred(...)` first (with `waitForLogin:false` — it runs inside the login), SKIPS its `playerSessions.set` on a non-null refusal, and sends the refusal AFTER `loginResult`. Suspended → seat stood up (`seat_restore_refused`); no account behind the session → seat HELD on its reservation, never destroyed (`seat_restore_held` — a retried oauthLogin can still claim it). Pinned by `tests/playGate.test.ts`. | 2026-10-07 (review: reconnect race + seat restore) |
 
 ## Surface area
 
@@ -78,6 +80,8 @@ See `src/index.ts`. Key events:
 | `MASTER_API_URL` | Optional (default prod Cloud Run URL) | Master API base for user fetches + auth-event reporting |
 | `JWT_SECRET` | Required for legacy HS256 login | If unset in prod, legacy HS256 token auth is DISABLED (forgery guard, `src/auth/authManager.ts:19-28`) — OAuth login unaffected |
 | `SENTRY_DSN` | Optional | Exception capture |
+| `INTERNAL_NOTIFY_TOKEN` | **Required in prod** | `X-Internal-Token` for the master's internalAuth routes: qualifier-credit consume/refund/issue, qualifier schedule/register/results, and (2026-10-07) the play gate's `/users/:id/play-status/internal`. Unset = suspension checks FAIL OPEN (visible as `playGate.internalTokenConfigured:false` on `/api/health`) |
+| `ONLINE_GUEST_PLAY_ENABLED` | **Leave unset** | EMERGENCY ROLLBACK ONLY. `1` re-allows guest `register` and no-account play, against the 2026-10-07 owner rule "nobody plays .online without an American Pub Poker account". Suspended players stay blocked either way. Shown as `playGate.guestPlayEnabled` on `/api/health` |
 
 ## Deploy pre-flight
 

@@ -91,6 +91,15 @@ export interface AuthResult {
   success: boolean;
   error?: string;
   token?: string;
+  /**
+   * 2026-10-07 (play gate, N3) — SERVER-SIDE ONLY. The master-API users.id
+   * that the master's own POST /users/login just authenticated (phone +
+   * password), set only when loginUserAsync succeeded through the master.
+   * index.ts's `login` handler uses it to identify the player to the play
+   * gate and strips it before emitting loginResult. Never set from a local-DB
+   * fallback login (nothing attested it).
+   */
+  attestedMasterUserId?: string;
   userData?: {
     id: number;
     username: string;
@@ -626,7 +635,18 @@ export async function loginUserAsync(username: string, password: string): Promis
     const localUser = await syncMasterUser(masterUser, password);
     clearLoginAttempts(username);
     const token = generateToken(localUser.id, localUser.username, localUser.tokenVersion || 0);
-    return { success: true, token, userData: formatUserData(localUser) };
+    // 2026-10-07 (play gate, N3) — hand the master id the master just
+    // authenticated back to the caller (in memory only; see AuthResult).
+    // syncMasterUser deliberately does NOT write it into users.stats: on prod
+    // the column is TEXT (/api/health identityGuard.statsColumnType), the
+    // existing-row ON CONFLICT branch never rewrites stats, and the
+    // stats.masterUserId stamp is what upsertOidcLocalUser's ownership guard
+    // and authWithTicket step 3a resolve identities by — writing it from this
+    // path would change which local row OTHER login paths land on.
+    const attestedMasterUserId = masterUser.id != null && String(masterUser.id).trim()
+      ? String(masterUser.id).trim()
+      : undefined;
+    return { success: true, token, userData: formatUserData(localUser), attestedMasterUserId };
   }
 
   // Fall back to local DB

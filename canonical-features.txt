@@ -219,3 +219,46 @@ waitlist_auth_failed
 # placeholders ($6 exists only in ENFORCE mode). A fixed 6-value array broke
 # every WARN-mode OIDC socket login for 7 weeks (user_upsert_failed).
 upsertParams
+
+# ============================================================
+# 2026-10-07 — PLAY GATE: game suspensions + guest play OFF (src/auth/playGate.ts).
+#
+# Owner decisions: a suspended ("86'd") player is refused every .online game
+# with the exact sentence below (spectating stays allowed, nothing is pushed
+# to him unprompted), and NOBODY plays .online without an American Pub Poker
+# account — guest `register` is refused. Every play-entry handler calls
+# assertPlayable() before any side effect; the master answers per MASTER id
+# via GET /users/:id/play-status/internal (X-Internal-Token), cached 60s,
+# FAIL-OPEN on any error. The C5 codes are the wire contract poker-3d's
+# playRefusal.js keys on — renaming one silently turns a refusal back into a
+# generic error. tests/playGate.test.ts also pins handler ORDERING (gate
+# before the first side effect) by scanning src/index.ts.
+# ============================================================
+[play-gate]
+/play-status/internal
+player_suspended
+login_required
+guest_disabled
+You are suspended from playing any games with American Pub Poker.
+Sign in with your American Pub Poker account to play.
+guest_register_refused
+ONLINE_GUEST_PLAY_ENABLED
+playGate
+qualifier_registrant_removed_suspended
+
+# 2026-10-07 review fixes — (1) reconnect race: a play tap that lands while
+# the same socket's login (oauthLogin / tokenLogin / authWithTicket / password
+# login / waitlist bootstrap) is still running WAITS for it (bounded 6s, under
+# poker-3d's 8s join watchdog) instead of being refused login_required.
+# Counters: /api/health playGate.loginWaits. (2) seat-restore gate: oauthLogin
+# and both tokenLogin branches no longer put a player who may not play back
+# at his reserved seat, and the C5 refusal follows loginResult. SUSPENDED →
+# the seat is stood up (stack credited, mid-hand chips left in the pot):
+# seat_restore_refused. NO ACCOUNT behind the session (legacy guest row) → the
+# seat is HELD on its reservation, not destroyed, so a retried oauthLogin can
+# still claim it: seat_restore_held. Losing the hold re-opens a race where a
+# legacy tokenLogin running beside oauthLogin cashes out a real player's seat.
+play_waited_for_login
+loginWaits
+seat_restore_refused
+seat_restore_held

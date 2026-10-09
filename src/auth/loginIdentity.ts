@@ -59,7 +59,14 @@ export type LoginFailureCode =
   | 'ticket_invalid'
   | 'ticket_missing_user'
   | 'master_user_unreachable'
-  | 'master_user_shape';
+  | 'master_user_shape'
+  // 2026-10-07 — play gate (auth/playGate.ts). Used by joinWithWaitlistContext,
+  // which answers on loginResult: the deep-link ticket's master account (or
+  // the socket's) is suspended from all American Pub Poker games, or the
+  // socket has no American Pub Poker account behind it. Same strings as the
+  // `code` on the `error` / `joinError` / `qualifierRegistrationResult` frames.
+  | 'player_suspended'
+  | 'login_required';
 
 export interface LoginIdentity {
   /** The value used as the LOCAL poker-server users.username key. */

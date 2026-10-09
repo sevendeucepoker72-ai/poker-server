@@ -58,6 +58,12 @@ import {
   resolveIdentityGuardMode, clearMasterIdentityStamp,
   type LoginFailureCode, type IdentityGuardMode,
 } from './auth/loginIdentity';
+import {
+  createPlayStatusClient, createAssertPlayable, resolveSessionMasterId, masterIdFromStats,
+  resolveGuestPlayEnabled, guestRegisterRefusal, partitionSuspendedRegistrants,
+  createLoginTracker, seatRestoreAction, PLAYER_SUSPENDED_MESSAGE,
+  type PlayRefusal, type AssertPlayableOptions,
+} from './auth/playGate';
 import { notifyPlayer } from './notifyClient';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
 // being migrated to log.debug so they mute under production pino level
@@ -1267,7 +1273,122 @@ setInterval(() => {
 // qualifier credits are keyed on; userId is poker-server's OWN local users.id.
 // Stored at oauthLogin so getQualifications can match the master id, not the
 // local int. phone kept as a display/fallback match key.
-const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string }>();
+// 2026-10-07 — statsMasterUserId: the local row's stats.masterUserId, used ONLY
+// by the play gate (resolveMasterId) for sessions with no attested master id
+// (legacy HS256 tokenLogin, password login). It does NOT stand in for
+// masterUserId anywhere else — see GateSession in auth/playGate.ts.
+const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null }>();
+
+// ────────────────────────────────────────────────────────────────────────
+// 2026-10-07 — PLAY GATE (auth/playGate.ts has the full rationale).
+// Every play-entry handler calls assertPlayable() FIRST, before any side
+// effect (leaving a table, standing up an AI, deducting a buy-in), and refuses
+// on the event that handler's client already listens to:
+//   - no American Pub Poker account (no master id)  → code 'login_required'
+//   - master id suspended (master /play-status)     → code 'player_suspended'
+// Suspension lookups FAIL OPEN (logged `[play-gate]`); the account requirement
+// does not. Spectating is never gated. Nothing is ever pushed to a suspended
+// player unprompted — he only sees the sentence as the answer to his own try.
+// ────────────────────────────────────────────────────────────────────────
+const GUEST_PLAY_ENABLED = resolveGuestPlayEnabled(process.env.ONLINE_GUEST_PLAY_ENABLED);
+if (GUEST_PLAY_ENABLED) {
+  console.warn('[play-gate] ONLINE_GUEST_PLAY_ENABLED is ON — guest/no-account play is ALLOWED (emergency rollback mode; owner rule 2026-10-07 is "no account, no play")');
+}
+const playStatusClient = createPlayStatusClient({
+  baseUrl: () => process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api',
+  token: () => process.env.INTERNAL_NOTIFY_TOKEN || '',
+});
+const playGateRefusals = { player_suspended: 0, login_required: 0, guest_disabled: 0 };
+
+// 2026-10-07 review fix — logins in flight per socket (auth/playGate.ts
+// LoginTracker). A play tap that lands while this socket's oauthLogin /
+// tokenLogin / authWithTicket / waitlist bootstrap is still running waits for
+// it (bounded) instead of being refused login_required. Counters on
+// /api/health → playGate.loginWaits.
+const loginTracker = createLoginTracker();
+const playGateLoginWaits = { settled: 0, timeout: 0, resolvedAfterWait: 0 };
+
+/**
+ * Register an async login handler with loginTracker for the socket it runs
+ * on: begun synchronously when the event is dispatched (so a play event
+ * queued right behind it always sees it), released when the handler settles.
+ * A rejected handler promise is logged here rather than left unhandled — every
+ * wrapped handler has its own handler-wide try/catch, so this is a backstop.
+ */
+function trackLogin<A extends unknown[]>(
+  socket: Socket,
+  via: string,
+  handler: (...args: A) => Promise<void>,
+): (...args: A) => Promise<void> {
+  return (...args: A): Promise<void> => {
+    const release = loginTracker.begin(socket.id);
+    let p: Promise<void>;
+    try {
+      p = handler(...args);
+    } catch (e) {
+      release();
+      throw e;
+    }
+    p.then(release, (e: any) => {
+      release();
+      console.error(`[play-gate] login handler '${via}' rejected (released its in-flight mark):`, e?.message || e);
+    });
+    return p;
+  };
+}
+
+const loadLocalStats = async (userId: number): Promise<unknown> => {
+  const { rows } = await getPool().query('SELECT stats FROM users WHERE id = $1 LIMIT 1', [userId]);
+  return rows[0]?.stats;
+};
+
+/** The MASTER user id behind this socket's session, or null (no account). */
+async function resolveMasterId(socket: Socket): Promise<string | null> {
+  return resolveSessionMasterId(authSessions.get(socket.id), loadLocalStats);
+}
+
+const assertPlayableForSocket = createAssertPlayable({
+  getSession: (socketId) => authSessions.get(socketId),
+  loadStats: loadLocalStats,
+  getPlayStatus: (id) => playStatusClient.getPlayStatus(id),
+  requireAccount: () => !GUEST_PLAY_ENABLED,
+  waitForLogin: (socketId, timeoutMs) => loginTracker.waitFor(socketId, timeoutMs),
+  onLoginWait: (outcome, ctx) => {
+    if (outcome === 'settled') playGateLoginWaits.settled++;
+    if (outcome === 'timeout') playGateLoginWaits.timeout++;
+    if (ctx.resolved) playGateLoginWaits.resolvedAfterWait++;
+    const line = `[play-gate] ${JSON.stringify({
+      event: 'play_waited_for_login', where: ctx.where, outcome, waitedMs: ctx.waitedMs, resolved: ctx.resolved,
+    })}`;
+    if (outcome === 'timeout') console.warn(line); else console.log(line);
+  },
+  onRefusal: (refusal, ctx) => {
+    playGateRefusals[refusal.code]++;
+    console.warn(`[play-gate] ${JSON.stringify({
+      event: 'play_refused', where: ctx.where, code: refusal.code,
+      masterId: refusal.masterId || null, localUserId: ctx.localUserId,
+    })}`);
+  },
+});
+
+/**
+ * null = may play. Otherwise the refusal to send (the caller picks the event).
+ * `extraMasterIds` adds identities proven by the request itself (e.g. the
+ * verified deep-link ticket's user id) — if ANY attached id is suspended, refuse.
+ */
+function assertPlayable(
+  socket: Socket,
+  where: string,
+  extraMasterIds: Array<string | null | undefined> = [],
+  opts: AssertPlayableOptions = {},
+): Promise<PlayRefusal | null> {
+  return assertPlayableForSocket(socket.id, where, extraMasterIds, opts);
+}
+
+/** Refuse on the generic `error` channel (lobby joins, quick modes, tournaments, clubs, rebuy). */
+function emitPlayRefusal(socket: Socket, refusal: PlayRefusal): void {
+  socket.emit('error', { message: refusal.message, code: refusal.code });
+}
 
 // Admin operational state (2026-07-01 Batch 5 — real backends for the admin
 // panel). In-memory by design: an IP ban / maintenance toggle is an
@@ -1517,6 +1638,23 @@ app.get('/api/health', async (_req, res) => {
         statsColumnType: _statsColumnType,
         stampDurable: _statsColumnType === 'jsonb',
         ...identityGuardStats,
+      },
+      // 2026-10-07 — play gate (game suspensions + no-account play). Counters
+      // only, no ids. `guestPlayEnabled:true` = the emergency rollback switch
+      // is on. `internalTokenConfigured:false` or a climbing `failOpen` means
+      // suspension checks are NOT being enforced (fail-open) — see
+      // lastFailOpenReason (http_404 = master route not deployed, http_401 =
+      // INTERNAL_NOTIFY_TOKEN drift, timeout = master slow).
+      playGate: {
+        guestPlayEnabled: GUEST_PLAY_ENABLED,
+        internalTokenConfigured: !!(process.env.INTERNAL_NOTIFY_TOKEN || '').trim(),
+        refusals: { ...playGateRefusals },
+        // Play taps that raced a login on the same socket and waited for it
+        // (reconnect race). `timeout` climbing = logins slower than the 6s bound.
+        loginWaits: { ...playGateLoginWaits },
+        loginsInFlight: loginTracker.size(),
+        ...playStatusClient.counters(),
+        cacheSize: playStatusClient.cacheSize(),
       },
     });
   } catch (e: any) {
@@ -1988,6 +2126,74 @@ setInterval(() => {
     }
   }
 }, 30000);
+
+/**
+ * 2026-10-07 — qualifier PRE-START SUSPENSION SCREEN.
+ *
+ * registerQualifierTournament refuses a suspended player, but a player
+ * suspended AFTER registering (the window opens 3h before start) would still
+ * be seated by the auto-start above. In the last few minutes before start,
+ * re-check every registrant's master id and drop the suspended ones, refunding
+ * the credit their registration consumed and un-persisting the master row —
+ * exactly what unregisterQualifierTournament does.
+ *
+ * SILENT on purpose: owner rule — nothing announcing a suspension is ever
+ * pushed to the player. He just isn't in the field when it starts.
+ * Fail-open like every play-gate check: an unreachable master removes no one.
+ * Runs on its own timer so the auto-start loop above is untouched.
+ */
+const QUALIFIER_SCREEN_LEAD_MS = 5 * 60 * 1000;
+const qualifierScreensInFlight = new Set<string>();
+async function screenQualifierRegistrants(qualId: string, qt: QualifierTournamentReg): Promise<void> {
+  const { suspended } = await partitionSuspendedRegistrants(qt.players.slice(), (id) => playStatusClient.getPlayStatus(id));
+  if (suspended.length === 0) return;
+  if (qt.status !== 'registering') {
+    console.warn(`[play-gate] ${JSON.stringify({ event: 'qualifier_screen_too_late', qualifierId: qualId, status: qt.status, suspendedCount: suspended.length })}`);
+    return;
+  }
+  const drop = new Set(suspended);
+  qt.players = qt.players.filter((p) => !drop.has(p));
+  const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+  const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  for (const p of suspended) {
+    console.warn(`[play-gate] ${JSON.stringify({ event: 'qualifier_registrant_removed_suspended', qualifierId: qualId, masterId: p.masterPlayerId || null })}`);
+    if (p.consumedCreditId) {
+      const cid = p.consumedCreditId;
+      refundQualifierCreditOnMaster(cid)
+        .then((refunded) => auditLog(
+          p.playerId,
+          refunded ? 'QUALIFIER_SUSPENDED_CREDIT_REFUND' : 'QUALIFIER_SUSPENDED_CREDIT_REFUND_FAILED',
+          { qualifierId: qualId, creditId: cid },
+        ))
+        .catch(() => { /* audited above on the false branch */ });
+    }
+    if (qt.masterQualifierId && p.masterPlayerId) {
+      fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+        body: JSON.stringify({ userId: p.masterPlayerId }),
+      }).catch((e) => console.warn('[play-gate] qualifier unregister persist failed:', e?.message));
+    }
+  }
+  io.emit('qualifierTournamentUpdate', {
+    qualifierId: qualId,
+    status: qt.status,
+    registeredCount: qt.players.length,
+    players: qt.players.map((p) => ({ name: p.playerName })),
+  });
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [qualId, qt] of qualifierTournaments) {
+    if (qt.status !== 'registering' || qt.players.length === 0) continue;
+    if (new Date(qt.scheduledAt).getTime() - now > QUALIFIER_SCREEN_LEAD_MS) continue;
+    if (qualifierScreensInFlight.has(qualId)) continue;
+    qualifierScreensInFlight.add(qualId);
+    screenQualifierRegistrants(qualId, qt)
+      .catch((e) => console.error('[play-gate] qualifier screen failed:', e?.message || e))
+      .finally(() => qualifierScreensInFlight.delete(qualId));
+  }
+}, 20000);
 
 // ========== Helper Functions ==========
 
@@ -4332,6 +4538,138 @@ function clearGhostSeatsForUser(userId: number, tableId: string, excludeSocketId
   return cleared;
 }
 
+// ========== Seat-restore play gate (2026-10-07 review fix) ==========
+/**
+ * Stand up a seat that has NO live socket behind it (a reserved / post-restart
+ * orphaned seat) because its player may no longer play. Same teardown
+ * decisions as handlePlayerLeave, which can't be used here (it is keyed on a
+ * socket's playerSession):
+ *   - mid-hand with chips committed to the live pot → fold now, register a
+ *     deferred removal FIRST (audit #7), and let processPendingSeatRemovals
+ *     credit + stand the seat up after the pot is awarded (audit C7);
+ *   - otherwise → credit the at-table stack back to the wallet
+ *     (creditSeatStackToWallet skips tournament stacks) and stand up now.
+ * A seat already registered for deferred removal is left to that path.
+ */
+function standUpRefusedSeat(userId: number, username: string, tableId: string, seatIndex: number, reason: string): void {
+  const table = tableManager.getTable(tableId);
+  if (!table) return;
+  const seat = table.seats[seatIndex];
+  if (!seat || seat.state !== 'occupied' || seat.isAI) return;
+  if (pendingSeatRemovalAfterHand.get(tableId)?.has(seatIndex)) return;
+
+  const deferRemoval =
+    table.isHandInProgress() &&
+    !seat.folded &&
+    (seat.totalInvestedThisHand || 0) > 0;
+  if (deferRemoval) {
+    let m = pendingSeatRemovalAfterHand.get(tableId);
+    if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(tableId, m); }
+    m.set(seatIndex, { userId, username });
+  }
+  if (table.isHandInProgress()) {
+    if (table.activeSeatIndex === seatIndex) table.playerFold(seatIndex);
+    else if (deferRemoval) table.forceFoldSeat(seatIndex);
+  }
+
+  const tracker = sitOutTracker.get(tableId);
+  if (tracker) tracker.delete(seatIndex);
+  if (!deferRemoval) {
+    // Re-read: the fold above may have ended the hand.
+    const s = table.seats[seatIndex];
+    if (s && s.state === 'occupied' && !s.isAI) {
+      s.deadBlindOwedChips = 0;
+      s.missedBlind = 'none';
+      creditSeatStackToWallet(userId, username, tableId, s, reason);
+      table.standUp(seatIndex);
+    }
+  }
+  syncSitOutToTable(tableId);
+  broadcastGameState(tableId);
+}
+
+/**
+ * 2026-10-07 — SEAT-RESTORE GATE. oauthLogin and both tokenLogin branches put
+ * a reconnecting player straight back into his reserved (or post-restart
+ * orphaned) seat. That restore is a way back into play, so it is gated like
+ * every other play entry (decision: seatRestoreAction in auth/playGate.ts):
+ *
+ *   - SUSPENDED (player_suspended) → he is NOT put back. His reserved seat is
+ *     stood up (stack credited back to the wallet, mid-hand chips left in the
+ *     pot until it is awarded), and if this very socket is still seated (a
+ *     re-login on a live socket) that seat is left through handlePlayerLeave.
+ *   - NO ACCOUNT behind this session (login_required — with guest play off, a
+ *     legacy session whose row carries no American Pub Poker id) → the
+ *     reserved seat is HELD, not restored to this session and not destroyed:
+ *     a parallel / retried oauthLogin for the same player (poker-3d re-auths
+ *     silently on login_required) can still claim it, and otherwise the
+ *     reservation's own expiry cashes it out exactly as it always has. A live
+ *     seat on this socket is left alone (nothing is being restored).
+ *
+ * Runs the play-gate lookup ONLY when there is something to restore, so a
+ * plain sign-in costs nothing extra. Calls the gate with waitForLogin:false:
+ * it runs inside a login handler, which is itself the in-flight login.
+ *
+ * Returns the refusal for the caller to send AFTER its loginResult (the
+ * sign-in itself still succeeds — only play is refused), or null. A non-null
+ * return ALSO means "skip the restore": every caller checks it before its
+ * `playerSessions.set(socket.id, …)` (pinned by tests/playGate.test.ts).
+ */
+async function refuseSeatRestoreIfBarred(
+  socket: Socket, userId: number, username: string, via: string,
+): Promise<PlayRefusal | null> {
+  const pending = reservedSeats.get(userId);
+  const hasReservation = !!(pending && pending.expiresAt > Date.now());
+  if (!hasReservation && !playerSessions.has(socket.id)) return null;
+
+  const refusal = await assertPlayable(socket, `${via}:seatRestore`, [], { waitForLogin: false });
+  const action = seatRestoreAction(refusal);
+  if (!refusal || action === 'restore') return null;
+
+  if (action === 'hold') {
+    // Re-read after the await.
+    const held = reservedSeats.get(userId);
+    if (!held || !(held.expiresAt > Date.now())) return null; // nothing is being restored
+    // A SYNTHETIC reservation (the orphan scans above build one with no
+    // cleanupTimer and no hand counter) would otherwise linger past its 60s
+    // window and block the next login's orphan scan (`!reservedSeats.has`).
+    // Drop it: the seat goes back to being the orphan it was before this
+    // login, and the next account login re-finds it. A REAL reservation (from
+    // the disconnect handler) keeps its timer — that expiry is the cash-out.
+    if (!held.cleanupTimer) reservedSeats.delete(userId);
+    console.warn(`[play-gate] ${JSON.stringify({
+      event: 'seat_restore_held', via, code: refusal.code, localUserId: userId,
+      tableId: held.tableId, seatIndex: held.seatIndex, synthetic: !held.cleanupTimer,
+    })}`);
+    return refusal;
+  }
+
+  // action === 'stand_up' (suspended). Re-read everything after the await.
+  const reserved = reservedSeats.get(userId);
+  if (reserved) {
+    if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
+    reservedSeats.delete(userId);
+  }
+  const own = playerSessions.get(socket.id);
+  // Never throws into the login handler: the reservation is already gone and
+  // the caller skips its restore on a non-null return, so even a failed
+  // teardown cannot lead to the seat being restored.
+  try {
+    if (own) handlePlayerLeave(socket);
+    if (reserved && !(own && own.tableId === reserved.tableId && own.seatIndex === reserved.seatIndex)) {
+      standUpRefusedSeat(userId, username, reserved.tableId, reserved.seatIndex, `${via}_seat_restore_refused`);
+    }
+  } catch (e: any) {
+    console.error(`[play-gate] seat-restore teardown failed (${via}, localUserId=${userId}):`, e?.message || e);
+  }
+  console.warn(`[play-gate] ${JSON.stringify({
+    event: 'seat_restore_refused', via, code: refusal.code, action, masterId: refusal.masterId || null,
+    localUserId: userId, tableId: reserved?.tableId || own?.tableId || null,
+    seatIndex: reserved?.seatIndex ?? own?.seatIndex ?? null, liveSeatLeft: !!own,
+  })}`);
+  return refusal;
+}
+
 // ========== Server-wide stats tracking ==========
 let handsPlayedToday = 0;
 let handsPlayedTodayDate = new Date().toDateString();
@@ -4476,6 +4814,10 @@ io.on('connection', (socket: Socket) => {
     // disconnect cleanup happens via the timestamp sweeper above (10-min TTL).
     actionTimings.delete(socket.id);
     tokenLoginAttempts.delete(socket.id);
+    // 2026-10-07 play gate — a login handler still running (or hung) for this
+    // socket must not leave its in-flight mark behind; the socket is gone, so
+    // nothing can usefully wait on it. Touches only the tracker.
+    loginTracker.forget(socket.id);
     lastEmoteTime.delete(socket.id);
     lastReactionTime.delete(socket.id);
     lastChatTime.delete(socket.id);
@@ -4492,28 +4834,71 @@ io.on('connection', (socket: Socket) => {
 
   // ========== Auth Events ==========
 
-  socket.on('login', async (data: { phone?: string; username?: string; password: string }) => {
+  socket.on('login', trackLogin(socket, 'login', async (data: { phone?: string; username?: string; password: string }) => {
     const phone = data.phone || data.username || '';
     // Phone is PII — log only the last 4 digits so the audit trail is useful
     // for support without exposing the full number in shared log aggregators.
     console.log(`[Auth] Login attempt: phone="****${String(phone).slice(-4)}", hasPassword=${!!data?.password}`);
     const result = await loginUserAsync(phone, data.password);
     console.log(`[Auth] Login result: success=${result.success}, error=${result.error || 'none'}`);
+    // 2026-10-07 (play gate, N3) — attestedMasterUserId is the master id the
+    // master's own /users/login just authenticated. It is server-side only:
+    // stripped from the loginResult frame below (same wire shape as before).
+    const { attestedMasterUserId, ...wireResult } = result;
     if (result.success && result.userData) {
-      authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username });
+      authSessions.set(socket.id, {
+        userId: result.userData.id,
+        username: result.userData.username,
+        // Play gate identity for this session. Deliberately the GATE-ONLY
+        // field (statsMasterUserId), not `masterUserId`: it identifies the
+        // player for the suspension / account check, and must not grant the
+        // master-id-keyed privileges (qualifier entry, credit redemption)
+        // that only the OIDC / ticket paths confer (see GateSession in
+        // auth/playGate.ts). Prefer the id the master just authenticated;
+        // fall back to the local row's stats stamp (local-DB fallback login,
+        // master unreachable) — null means login_required at play time.
+        statsMasterUserId: attestedMasterUserId || masterIdFromStats(result.userData.stats),
+      });
     }
-    socket.emit('loginResult', result);
+    socket.emit('loginResult', wireResult);
     // Proactively hydrate + push playerProgress so the client never
     // renders the fresh-init level:1 / xp:0 state after a redeploy.
     if (result.success && result.userData) {
       hydrateAndPushProgress(socket, result.userData.id, result.userData.username).catch(() => {});
     }
-  });
+  }));
 
+  // 2026-10-07 OWNER DECISION — GUEST PLAY IS OFF for everyone: nobody plays
+  // .online without an American Pub Poker account. `register` is the old
+  // "Play as Guest" (a local GuestNNNN row with no master identity), refused
+  // here before any row is created.
+  //
+  // WHO STILL SENDS IT (checked 2026-10-09): poker-3d source from the
+  // 2026-10-07 suspension change on has no guest button and never emits
+  // `register`. Every bundle built BEFORE that change still does — that is
+  // the bundle live on americanpubpoker.online until the poker-3d change
+  // ships, and browser-cached copies after it. Those bundles' LoginScreen
+  // shows `registerResult.error` verbatim (setError(result.error)), so the
+  // guestRegisterRefusal() sentence is what an old-bundle guest tap displays.
+  //
+  // Note the asymmetry with an EXISTING guest row: tokenLogin does not refuse
+  // a legacy guest at sign-in (it logs in as before); the refusal arrives at
+  // play time as `login_required` from assertPlayable, and a reserved seat is
+  // held rather than restored (refuseSeatRestoreIfBarred). Only creating a
+  // NEW guest row is refused here, with `guest_disabled`.
+  //
+  // ONLINE_GUEST_PLAY_ENABLED=1 is the emergency rollback (see playGate.ts) —
+  // it re-enables this handler, not the removed client button.
   socket.on('register', async (data: { username: string; password: string }) => {
+    if (!GUEST_PLAY_ENABLED) {
+      playGateRefusals.guest_disabled++;
+      console.warn(`[play-gate] ${JSON.stringify({ event: 'guest_register_refused', code: 'guest_disabled' })}`);
+      socket.emit('registerResult', guestRegisterRefusal());
+      return;
+    }
     const result = await registerUser(data.username, data.password);
     if (result.success && result.userData) {
-      authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username });
+      authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username, statsMasterUserId: null });
     }
     socket.emit('registerResult', result);
   });
@@ -4582,6 +4967,15 @@ io.on('connection', (socket: Socket) => {
 
   // Register for a qualifier tournament
   socket.on('registerQualifierTournament', async (data: { qualifierId: string; playerName: string; phone: string }) => {
+    // 2026-10-07 play gate — FIRST, before the window / credit / re-entry
+    // steps (the re-entry branch deducts chips and consumes a credit). The
+    // master's credit consume also refuses a suspended player (fail-closed),
+    // but with the wrong words; this answers with the owner's sentence.
+    const qGate = await assertPlayable(socket, 'registerQualifierTournament');
+    if (qGate) {
+      socket.emit('qualifierRegistrationResult', { success: false, error: qGate.message, code: qGate.code, qualifierId: data?.qualifierId });
+      return;
+    }
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Must be logged in' }); return; }
 
@@ -4729,6 +5123,13 @@ io.on('connection', (socket: Socket) => {
                 auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_REFUND_FAILED', { qualifierId: qualId, buyIn, error: String(e) });
               }
             }
+            if (consumeRes.error === 'http_423') {
+              // The master refused because the player is suspended ("86'd").
+              // Our 60s play-status cache can lag a fresh suspension; the
+              // master consume is the fail-closed backstop. Say why (C5).
+              socket.emit('qualifierRegistrationResult', { success: false, error: PLAYER_SUSPENDED_MESSAGE, code: 'player_suspended' });
+              return;
+            }
             if (consumeRes.error) console.error('[QualifierReEntry] credit consume failed:', consumeRes.error);
             socket.emit('qualifierRegistrationResult', {
               success: false,
@@ -4820,6 +5221,11 @@ io.on('connection', (socket: Socket) => {
     if (qt.requiresQualifierCredit) {
       const consumeRes = await consumeQualifierCreditOnMaster(masterId, qt.qualifierType, qualId, 'entry');
       if (!consumeRes.consumed) {
+        if (consumeRes.error === 'http_423') {
+          // Master refused: player suspended ("86'd") — see the re-entry branch.
+          socket.emit('qualifierRegistrationResult', { success: false, error: PLAYER_SUSPENDED_MESSAGE, code: 'player_suspended' });
+          return;
+        }
         if (consumeRes.error) console.error('[QualifierEntry] credit consume failed:', consumeRes.error);
         socket.emit('qualifierRegistrationResult', {
           success: false,
@@ -5302,7 +5708,7 @@ Give feedback in this JSON format:
   // THAT integer id for authSessions and loadProgress. The previous
   // `parseInt(oauthResult.sub, 10)` just parsed the first digit of the UUID
   // and always failed with "User not found".
-  socket.on('oauthLogin', async (data: { accessToken: string; skipSeatRecovery?: boolean; requestId?: string }) => {
+  socket.on('oauthLogin', trackLogin(socket, 'oauthLogin', async (data: { accessToken: string; skipSeatRecovery?: boolean; requestId?: string }) => {
     // 2026-08-17 — `requestId` is opaque to the server and echoed back on every
     // loginResult this handler emits. poker-3d runs SEVERAL auth flows on ONE
     // socket (bridge handoff, boot refresh, legacy tokenLogin, deep-link
@@ -5461,6 +5867,8 @@ Give feedback in this JSON format:
       // slot / name-scan recovery (which would yank a secondary onto the
       // primary's table). The primary login path leaves skipSeatRecovery
       // falsy, so its proven reconnect behavior is unchanged.
+      // 2026-10-07 — set when the seat-restore play gate refuses (see (a2)).
+      let seatRestoreRefusal: PlayRefusal | null = null;
       if (!data?.skipSeatRecovery) try {
         const recoverName = localUser.display_name || localUser.username;
         // (a) Post-restart orphan recovery: a Railway redeploy wipes the
@@ -5494,9 +5902,14 @@ Give feedback in this JSON format:
             if (found) break;
           }
         }
+        // (a2) 2026-10-07 play gate — a player who may not play (suspended)
+        // is not put back at the table; his reserved seat is stood up instead
+        // and the refusal is sent after loginResult. No-op (no lookup) when
+        // there is nothing to restore. A refusal also skips (b).
+        seatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, localUser.username, 'oauthLogin');
         // (b) Restore the reserved seat (the normal reconnect path).
         const reserved = reservedSeats.get(userId);
-        if (reserved && reserved.expiresAt > Date.now()) {
+        if (!seatRestoreRefusal && reserved && reserved.expiresAt > Date.now()) {
           const rTable = tableManager.getTable(reserved.tableId);
           const rSeat = rTable?.seats?.[reserved.seatIndex];
           if (rTable && rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
@@ -5535,6 +5948,9 @@ Give feedback in this JSON format:
         userData,
         ...(requestId ? { requestId } : {}),
       });
+      // 2026-10-07 — the sign-in succeeded; only the seat restore was refused.
+      // Sent after loginResult so the client is signed in when it lands (C5).
+      if (seatRestoreRefusal) emitPlayRefusal(socket, seatRestoreRefusal);
       hydrateAndPushProgress(socket, userId, localUser.username).catch(() => {});
 
       console.log(
@@ -5551,9 +5967,9 @@ Give feedback in this JSON format:
         diag: { error: String(err?.message || 'unknown').slice(0, 160) },
       });
     }
-  });
+  }));
 
-  socket.on('tokenLogin', async (data: { token: string; requestId?: string }) => {
+  socket.on('tokenLogin', trackLogin(socket, 'tokenLogin', async (data: { token: string; requestId?: string }) => {
     // 2026-08-17 — see oauthLogin: echoed back so a client running several auth
     // flows on one socket can attribute this result. Critically, THIS handler's
     // failure is the one that used to be mistaken for the bridge handoff's
@@ -5762,9 +6178,14 @@ Give feedback in this JSON format:
             }
           }
 
+          // 2026-10-07 play gate — same as oauthLogin (a2): a player who may
+          // not play is not put back at the table; the refusal is sent after
+          // loginResult below.
+          const tlSeatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, _tlLocalUser.username, 'tokenLogin');
+
           // Check for reserved seat (same reconnection logic as legacy)
           const reserved = reservedSeats.get(userId);
-          if (reserved && reserved.expiresAt > Date.now()) {
+          if (!tlSeatRestoreRefusal && reserved && reserved.expiresAt > Date.now()) {
             const table = tableManager.getTable(reserved.tableId);
             if (table) {
               const seat = table.seats[reserved.seatIndex];
@@ -5830,6 +6251,7 @@ Give feedback in this JSON format:
             success: true, token: data.token, userData: progress.userData,
             ...(tlRequestId ? { requestId: tlRequestId } : {}),
           });
+          if (tlSeatRestoreRefusal) emitPlayRefusal(socket, tlSeatRestoreRefusal); // 2026-10-07
           hydrateAndPushProgress(socket, progress.userData.id, progress.userData.username).catch(() => {});
           return;
         }
@@ -5837,13 +6259,23 @@ Give feedback in this JSON format:
 
       // Legacy HS256 JWT fallback
       const result = await getUserFromToken(data.token);
+      let legacySeatRestoreRefusal: PlayRefusal | null = null;
       if (result.success && result.userData) {
         const userId = result.userData.id;
-        authSessions.set(socket.id, { userId, username: result.userData.username });
+        // 2026-10-07 play gate: legacy tokens carry no attested master id —
+        // fall back to the local row's stats stamp (null for guest rows).
+        authSessions.set(socket.id, { userId, username: result.userData.username, statsMasterUserId: masterIdFromStats(result.userData.stats) });
+
+        // 2026-10-07 play gate — a legacy session that may not play is not
+        // put back at the table: a suspended account's seat is stood up; a
+        // guest row with no American Pub Poker account (guest play off) has
+        // its seat HELD on its reservation (see refuseSeatRestoreIfBarred).
+        // The refusal is sent after loginResult below.
+        legacySeatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, result.userData.username, 'tokenLogin_legacy');
 
         // Check for a reserved seat and restore it
         const reserved = reservedSeats.get(userId);
-        if (reserved && reserved.expiresAt > Date.now()) {
+        if (!legacySeatRestoreRefusal && reserved && reserved.expiresAt > Date.now()) {
           const table = tableManager.getTable(reserved.tableId);
           if (table) {
             const seat = table.seats[reserved.seatIndex];
@@ -5923,6 +6355,7 @@ Give feedback in this JSON format:
       // fall through and get mislabelled as a dead legacy token).
       if (result?.success) {
         socket.emit('loginResult', { ...result, ...(tlRequestId ? { requestId: tlRequestId } : {}) });
+        if (legacySeatRestoreRefusal) emitPlayRefusal(socket, legacySeatRestoreRefusal); // 2026-10-07
       } else {
         failLogin(socket, {
           code: 'legacy_token_invalid',
@@ -5953,7 +6386,7 @@ Give feedback in this JSON format:
         onlyWhenAttributed: true,
       });
     }
-  });
+  }));
 
   socket.on('logout', async () => {
     authSessions.delete(socket.id);
@@ -6850,6 +7283,9 @@ Give feedback in this JSON format:
   });
 
   socket.on('joinClubTable', async (data: { clubTableId: number; playerName: string; seatIndex: number; buyIn: number; avatar?: string }) => {
+    // 2026-10-07 play gate (joinTable re-checks; the result is cached).
+    const ctGate = await assertPlayable(socket, 'joinClubTable');
+    if (ctGate) { emitPlayRefusal(socket, ctGate); return; }
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
 
@@ -7043,6 +7479,8 @@ Give feedback in this JSON format:
   });
 
   socket.on('registerClubTournament', async (data: { tournamentId: number }) => {
+    const crGate = await assertPlayable(socket, 'registerClubTournament'); // 2026-10-07 play gate
+    if (crGate) { emitPlayRefusal(socket, crGate); return; }
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = await registerForClubTournament(data.tournamentId, auth.userId);
@@ -7067,6 +7505,8 @@ Give feedback in this JSON format:
   // ========== Club Challenges ==========
 
   socket.on('createClubChallenge', async (data: { clubId: number; challengedId: number; stakes: number }) => {
+    const ccGate = await assertPlayable(socket, 'createClubChallenge'); // 2026-10-07 play gate
+    if (ccGate) { emitPlayRefusal(socket, ccGate); return; }
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = await createChallenge(data.clubId, auth.userId, data.challengedId, data.stakes);
@@ -7078,6 +7518,10 @@ Give feedback in this JSON format:
   });
 
   socket.on('acceptClubChallenge', async (data: { challengeId: number }) => {
+    // 2026-10-07 play gate — before acceptChallenge() mutates the challenge
+    // and a table is spawned for both players.
+    const caGate = await assertPlayable(socket, 'acceptClubChallenge');
+    if (caGate) { emitPlayRefusal(socket, caGate); return; }
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     const result = await acceptChallenge(data.challengeId, auth.userId);
@@ -7458,6 +7902,20 @@ Give feedback in this JSON format:
       expectedVariant?: string;
     }) => { (async () => {
       if (blockedByMaintenance(socket)) return;
+      // 2026-10-07 play gate — before ANY side effect below (spectator scrub,
+      // leaving the old table, standing up an AI). Also covers club tables
+      // and club challenges, which re-dispatch into this listener.
+      const joinGate = await assertPlayable(socket, 'joinTable');
+      if (joinGate) { emitPlayRefusal(socket, joinGate); return; }
+      // Local .online ban — moved up here 2026-10-07 for the same reason: it
+      // used to run AFTER the old seat was left and an AI was stood up.
+      {
+        const authForBan = authSessions.get(socket.id);
+        if (authForBan && await isUserBanned(authForBan.userId)) {
+          socket.emit('error', { message: 'Your account has been banned' });
+          return;
+        }
+      }
       let { tableId, playerName, seatIndex, buyIn } = data;
       const table = tableManager.getTable(tableId);
 
@@ -7566,12 +8024,9 @@ Give feedback in this JSON format:
         if (profiles) profiles.delete(seatIndex);
       }
 
-      // Check if the authenticated user is banned before seating
+      // (The banned check that used to sit here now runs at the top of the
+      // handler, before any side effect.)
       const authForJoin = authSessions.get(socket.id);
-      if (authForJoin && await isUserBanned(authForJoin.userId)) {
-        socket.emit('error', { message: 'Your account has been banned' });
-        return;
-      }
 
       // Sanitize playerName
       playerName = playerName.trim().slice(0, 30).replace(/[<>&"']/g, '');
@@ -7694,6 +8149,9 @@ Give feedback in this JSON format:
     'quickPlay',
     (data: { playerName: string; avatar?: string }) => { (async () => {
       if (blockedByMaintenance(socket)) return;
+      // 2026-10-07 play gate — before the scrub / leave / AI stand-up below.
+      const qpGate = await assertPlayable(socket, 'quickPlay');
+      if (qpGate) { emitPlayRefusal(socket, qpGate); return; }
       const { playerName } = data;
 
       // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
@@ -8752,7 +9210,7 @@ Give feedback in this JSON format:
    */
   socket.on(
     'authWithTicket',
-    async (data: { token: string; requestId?: string }) => {
+    trackLogin(socket, 'authWithTicket', async (data: { token: string; requestId?: string }) => {
       // 2026-08-17 P1 — the deep-link ticket flow was one of two loginResult
       // producers left unconverted, and that made it a permanent hole rather
       // than a transitional one: poker-3d's socketAuth.js accepts an
@@ -9059,7 +9517,7 @@ Give feedback in this JSON format:
           error: String(err?.message || 'unknown').slice(0, 160),
         });
       }
-    }
+    })
   );
 
   /**
@@ -9120,7 +9578,7 @@ Give feedback in this JSON format:
       const failWaitlist = (
         code: LoginFailureCode, message: string, detail?: Record<string, any>
       ) => {
-        socket.emit('error', { message });
+        socket.emit('error', { message, code });
         failLogin(socket, { code, message, via: 'joinWithWaitlistContext', requestId: wlRequestId, detail });
       };
       try {
@@ -9195,6 +9653,15 @@ Give feedback in this JSON format:
           return;
         }
 
+        // 2026-10-07 play gate — before the auth bootstrap, AI eviction and
+        // buy-in deduct below. Checks the verified ticket's master id AND the
+        // socket's existing session (if any): either one suspended → refuse.
+        const wlGate = await assertPlayable(socket, 'joinWithWaitlistContext', [String(remoteUserId)]);
+        if (wlGate) {
+          failWaitlist(wlGate.code === 'player_suspended' ? 'player_suspended' : 'login_required', wlGate.message);
+          return;
+        }
+
         // Resolve local user + set auth session BEFORE seating. Previously
         // this handler seated the player purely on the ticket claim, without
         // confirming authSessions[socket.id] — if the parallel oauthLogin from
@@ -9202,29 +9669,42 @@ Give feedback in this JSON format:
         // player would be visually seated but unable to take any later action
         // that requires auth (cash-out, switch tables). Resolving locally here
         // closes that gap: waitlist seat ALWAYS comes with a real auth session.
-        if (!authSessions.has(socket.id)) {
-          try {
-            const meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`, meBypassInit);
-            if (meRes.ok) {
-              const meJson: any = await meRes.json();
-              const masterUser = meJson?.data || meJson;
-              const phone = masterUser.phoneNumber || masterUser.phone_number;
-              if (phone) {
-                const { rows: urows } = await getPool().query(
-                  'SELECT id, username FROM users WHERE username = $1 LIMIT 1',
-                  [phone]
-                );
-                if (urows[0]) {
-                  authSessions.set(socket.id, { userId: urows[0].id, username: urows[0].username });
+        //
+        // 2026-10-07 — the bootstrap is a login like any other: registered
+        // with loginTracker so a play event racing it on this socket waits for
+        // it instead of being refused login_required. Begun AFTER the gate
+        // above (the gate would otherwise wait on this very bootstrap).
+        const releaseWlBootstrap = loginTracker.begin(socket.id);
+        try {
+          if (!authSessions.has(socket.id)) {
+            try {
+              const meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`, meBypassInit);
+              if (meRes.ok) {
+                const meJson: any = await meRes.json();
+                const masterUser = meJson?.data || meJson;
+                const phone = masterUser.phoneNumber || masterUser.phone_number;
+                if (phone) {
+                  const { rows: urows } = await getPool().query(
+                    'SELECT id, username FROM users WHERE username = $1 LIMIT 1',
+                    [phone]
+                  );
+                  if (urows[0]) {
+                    // 2026-10-07 — masterUserId = the VERIFIED ticket's user id
+                    // (the same attestation authWithTicket stamps on its session);
+                    // this row was found via that account's own /me.
+                    authSessions.set(socket.id, { userId: urows[0].id, username: urows[0].username, masterUserId: String(remoteUserId) });
+                  }
                 }
+              } else {
+                reportAuthEvent('waitlist_auth_failed', { reason: `me_fetch_http_${meRes.status}` });
               }
-            } else {
-              reportAuthEvent('waitlist_auth_failed', { reason: `me_fetch_http_${meRes.status}` });
+            } catch (e) {
+              reportAuthEvent('waitlist_auth_failed', { reason: 'me_fetch_error' });
+              console.warn('[joinWithWaitlistContext] auth-bootstrap failed:', (e as Error).message);
             }
-          } catch (e) {
-            reportAuthEvent('waitlist_auth_failed', { reason: 'me_fetch_error' });
-            console.warn('[joinWithWaitlistContext] auth-bootstrap failed:', (e as Error).message);
           }
+        } finally {
+          releaseWlBootstrap();
         }
 
         // If we still don't have an auth session after the bootstrap attempt,
@@ -9465,6 +9945,9 @@ Give feedback in this JSON format:
   });
 
   socket.on('rebuy', async (data: { amount?: number } = {}) => { (async () => {
+    // 2026-10-07 play gate — a rebuy puts fresh chips in play.
+    const rbGate = await assertPlayable(socket, 'rebuy');
+    if (rbGate) { emitPlayRefusal(socket, rbGate); return; }
     const session = playerSessions.get(socket.id);
     if (!session) { socket.emit('error', { message: 'Not at a table' }); return; }
     const table = tableManager.getTable(session.tableId);
@@ -10460,6 +10943,8 @@ Give feedback in this JSON format:
   socket.on('quickHeadsUp', async (data: { playerName: string }) => {
     if (quickPlayRateLimited()) return; // #12
     if (blockedByMaintenance(socket)) return;
+    const huGate = await assertPlayable(socket, 'quickHeadsUp'); // 2026-10-07 play gate
+    if (huGate) { emitPlayRefusal(socket, huGate); return; }
     const { playerName } = data;
 
     // Leave existing table if any
@@ -10581,6 +11066,8 @@ Give feedback in this JSON format:
   socket.on('quickSpinGo', async (data: { playerName: string }) => {
     if (quickPlayRateLimited()) return; // #12
     if (blockedByMaintenance(socket)) return;
+    const sgGate = await assertPlayable(socket, 'quickSpinGo'); // 2026-10-07 play gate
+    if (sgGate) { emitPlayRefusal(socket, sgGate); return; }
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -10741,6 +11228,8 @@ Give feedback in this JSON format:
   socket.on('quickAllInOrFold', async (data: { playerName: string }) => {
     if (quickPlayRateLimited()) return; // #12
     if (blockedByMaintenance(socket)) return;
+    const aofGate = await assertPlayable(socket, 'quickAllInOrFold'); // 2026-10-07 play gate
+    if (aofGate) { emitPlayRefusal(socket, aofGate); return; }
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -10823,6 +11312,8 @@ Give feedback in this JSON format:
   socket.on('startCareerGame', async (data: { venue: number; stage: number }) => {
     if (quickPlayRateLimited()) return; // #12
     if (blockedByMaintenance(socket)) return;
+    const crGate = await assertPlayable(socket, 'startCareerGame'); // 2026-10-07 play gate
+    if (crGate) { emitPlayRefusal(socket, crGate); return; }
     const { venue, stage } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -11313,6 +11804,9 @@ Give feedback in this JSON format:
 
   socket.on('registerTournament', async (data: { tournamentId: string; playerName: string }) => {
     if (blockedByMaintenance(socket)) return;
+    // 2026-10-07 play gate — before the entry-fee deduct.
+    const rtGate = await assertPlayable(socket, 'registerTournament');
+    if (rtGate) { emitPlayRefusal(socket, rtGate); return; }
     const session = playerSessions.get(socket.id);
     const playerId = session?.playerId || `player-${uuidv4()}`;
     const playerName = data.playerName || session?.playerName || 'Player';
@@ -11528,6 +12022,9 @@ Give feedback in this JSON format:
   // ========== Multi-Table Support ==========
 
   socket.on('joinAdditionalTable', async (data: { tableId: string; playerName: string; buyIn: number; avatar?: string }) => {
+    // 2026-10-07 play gate — before the seat search stands up an AI.
+    const atGate = await assertPlayable(socket, 'joinAdditionalTable');
+    if (atGate) { emitPlayRefusal(socket, atGate); return; }
     const { tableId, playerName, buyIn, avatar } = data;
     const table = tableManager.getTable(tableId);
     if (!table) {
@@ -11739,6 +12236,10 @@ Give feedback in this JSON format:
   });
 
   socket.on('joinByInviteCode', async (data: { inviteCode: string; playerName: string; buyIn: number; avatar?: any }) => {
+    // 2026-10-07 play gate. This path answers on 'joinError' (CreateTableModal
+    // waits on it; an 'error' frame would leave it spinning for 10s).
+    const icGate = await assertPlayable(socket, 'joinByInviteCode');
+    if (icGate) { socket.emit('joinError', { message: icGate.message, code: icGate.code }); return; }
     const { inviteCode, playerName, buyIn, avatar } = data;
     // Find table whose ID starts with the invite code (lowercased)
     const target = tableManager.getTableByInviteCode(inviteCode.toLowerCase());
