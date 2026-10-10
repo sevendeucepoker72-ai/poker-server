@@ -6,7 +6,7 @@ import crypto from 'crypto';
 // or as JSON text depending on the live column type (see probeStatsColumnType
 // in index.ts — /api/health reports the answer). Using it instead of a bare
 // JSON.parse is what stops mergeUserStats from silently wiping the column.
-import { parseStatsColumn } from './loginIdentity';
+import { parseStatsColumn, masterIdGuardSql } from './loginIdentity';
 
 // JWT secret. H1 (2026-07-01 audit): the old guard keyed the fatal check on
 // NODE_ENV==='production' ONLY, but Railway uses nixpacks and does NOT set
@@ -601,6 +601,33 @@ async function syncMasterUser(masterData: any, password: string): Promise<UserDa
   const isAdmin = masterData.roles?.includes('siteAdmin') || masterData.roles?.includes('leagueAdmin') || false;
   const hash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
 
+  // 2026-10-10 — ONE PERSON, ONE ROW (auth/accountMerge.ts): the master account
+  // the master API just authenticated signs in to ITS row, exactly like
+  // oauthLogin / tokenLogin / authWithTicket / the waitlist link. Keyed on the
+  // phone alone, this path would create a fresh unlinked 50,000-chip row under
+  // a phone username the one-time merge freed. Lazy require: accountMerge
+  // imports ProgressionManager, which imports this module. A lookup that cannot
+  // be answered THROWS (MasterLookupError) — never "no row" — and the caller
+  // refuses the sign-in.
+  const masterId = masterData?.id != null && String(masterData.id).trim() ? String(masterData.id).trim() : '';
+  if (masterId) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { findLocalUserByMasterId } = require('./accountMerge') as typeof import('./accountMerge');
+    const byMaster = await findLocalUserByMasterId(pool, masterId);
+    if (byMaster) {
+      const { rows: upd } = await pool.query(
+        // Round-7 review — admin is GRANT-ONLY here, as on the OIDC path: a
+        // roles list without admin (the master swallows a failed roles query
+        // into []) must never revoke it from the master's one row.
+        `UPDATE users SET password_hash = $2, is_admin = (is_admin OR $3), display_name = COALESCE(display_name, $4) WHERE id = $1 RETURNING *`,
+        [byMaster.id, hash, isAdmin, displayName],
+      );
+      return rowToUserData(upd[0] || byMaster);
+    }
+  }
+
+  // 2026-10-10 — now master-first above and ownership-GUARDED below (a phone
+  // row another master owns is never signed in to). History:
   // 2026-08-17 P2 — DELIBERATELY LEFT UNGUARDED (assessed, not overlooked).
   // The P0 display-name takeover guard (see index.ts upsertOidcLocalUser and
   // auth/loginIdentity.ts) covers the two OIDC socket-login upserts. This one
@@ -615,14 +642,47 @@ async function syncMasterUser(masterData: any, password: string): Promise<UserDa
   const { rows } = await pool.query(
     `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     ON CONFLICT (LOWER(username)) DO UPDATE SET password_hash = $3, is_admin = $8, display_name = COALESCE(users.display_name, $2)
+     ON CONFLICT (LOWER(username)) DO UPDATE SET password_hash = $3, is_admin = (users.is_admin OR $8), display_name = COALESCE(users.display_name, $2)
+     ${masterId ? `WHERE ${masterIdGuardSql('$9')}` : ''}
      RETURNING *`,
-    [phone, displayName, hash, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, JSON.stringify({ masterPhone: phone, masterUsername: masterData.username }), isAdmin]
+    [phone, displayName, hash, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, JSON.stringify({
+      masterPhone: phone, masterUsername: masterData.username,
+      // 2026-10-10 — a NEW row is this master's (found master-first next time).
+      ...(masterId ? { masterUserId: masterId } : {}),
+    }), isAdmin, ...(masterId ? [masterId] : [])]
   );
+
+  // 2026-10-10 — an EXISTING phone row (ON CONFLICT: the INSERT's stats were not
+  // written) that no master owns yet is stamped as this one's, so every path
+  // finds it by master id from now on (the master-first lookup above found no
+  // row for this master, so this cannot create a second). A row another master
+  // owns is left alone.
+  if (rows.length > 0 && masterId) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { identityStampPatch } = require('./accountMerge') as typeof import('./accountMerge');
+      const owner = parseStatsColumn(rows[0].stats).masterUserId;
+      if (owner == null || owner === '') {
+        const patch = identityStampPatch(rows[0].stats, { masterUserId: masterId, masterUsername: masterData.username });
+        if (patch) await mergeUserStats(rows[0].id, patch);
+      }
+    } catch (e: any) {
+      console.warn('[Auth] syncMasterUser master stamp failed (non-fatal):', e?.message);
+    }
+  }
 
   if (rows.length > 0) return rowToUserData(rows[0]);
   // Fallback: query existing
   const fallback = await pool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [phone]);
+  // Round-7 review — under the ownership guard, no row back means this phone's
+  // row is ANOTHER master account's (a phone number that moved between
+  // accounts): never sign in to it — and its password / admin were not touched.
+  if (masterId && fallback.rows[0]) {
+    const owner = parseStatsColumn(fallback.rows[0].stats).masterUserId;
+    if (owner != null && owner !== '' && String(owner) !== masterId) {
+      throw new Error(`identity_conflict: phone row ${fallback.rows[0].id} belongs to another master account`);
+    }
+  }
   return rowToUserData(fallback.rows[0]);
 }
 
@@ -641,17 +701,23 @@ export async function loginUserAsync(username: string, password: string): Promis
   // Try master API first
   const masterUser = await authenticateWithMasterAPI(username, password);
   if (masterUser) {
-    const localUser = await syncMasterUser(masterUser, password);
+    let localUser: UserData;
+    try {
+      localUser = await syncMasterUser(masterUser, password);
+    } catch (e: any) {
+      // 2026-10-10 — e.g. the master-first lookup could not be answered: refuse
+      // (retryable) rather than guess a row.
+      console.warn('[Auth] syncMasterUser failed (login refused, retryable):', e?.message);
+      return { success: false, error: 'The server is busy right now — please try again.' } as any;
+    }
     clearLoginAttempts(username);
     const token = generateToken(localUser.id, localUser.username, localUser.tokenVersion || 0);
     // 2026-10-07 (play gate, N3) — hand the master id the master just
     // authenticated back to the caller (in memory only; see AuthResult).
-    // syncMasterUser deliberately does NOT write it into users.stats: on prod
-    // the column is TEXT (/api/health identityGuard.statsColumnType), the
-    // existing-row ON CONFLICT branch never rewrites stats, and the
-    // stats.masterUserId stamp is what upsertOidcLocalUser's ownership guard
-    // and authWithTicket step 3a resolve identities by — writing it from this
-    // path would change which local row OTHER login paths land on.
+    // 2026-10-10 — syncMasterUser now resolves the master's ONE row first and
+    // stamps a new / unowned phone row with this master id (every sign-in path
+    // resolves master-first, so the stamp no longer moves anyone to another
+    // row; see auth/accountMerge.ts).
     const attestedMasterUserId = masterUser.id != null && String(masterUser.id).trim()
       ? String(masterUser.id).trim()
       : undefined;

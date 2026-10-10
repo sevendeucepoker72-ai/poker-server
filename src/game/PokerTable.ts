@@ -190,6 +190,15 @@ export class PokerTable extends EventEmitter {
    */
   public stateVersion: number = 0;
 
+  /**
+   * 2026-10-10 (Z3) — the big blind THIS hand was dealt at, captured when the
+   * hand starts. `config.bigBlind` is the table's CURRENT level: a tournament
+   * blind level-up rewrites it mid-hand, so anything that reasons about the
+   * hand in progress (index.ts absentTournamentSeatMayLimp) reads this one.
+   * 0 = no hand dealt yet (an older snapshot, a fresh table).
+   */
+  public handBigBlind: number = 0;
+
   /** TDA Rule 33 (Dead Button): track previous BB position so blinds advance
    * by exactly one occupied seat per hand even when players bust. */
   public previousBigBlindSeat: number = -1;
@@ -658,6 +667,7 @@ export class PokerTable extends EventEmitter {
     this.communityCards = [];
     this.currentBetToMatch = 0;
     this.lastRaiseAmount = this.config.bigBlind;
+    this.handBigBlind = this.config.bigBlind;   // Z3: this hand's level (a mid-hand level-up changes config only)
     this.lastAggressorSeat = -1;
     this.actionLog = [];
     this.wentToShowdown = false; // set true only on a contested showdown (>= 2 tabled)
@@ -2420,6 +2430,7 @@ export class PokerTable extends EventEmitter {
       activeSeatIndex: this.activeSeatIndex,
       currentBetToMatch: this.currentBetToMatch,
       lastRaiseAmount: this.lastRaiseAmount,
+      handBigBlind: this.handBigBlind,
       stateVersion: this.stateVersion,
       lastAggressorSeat: this.lastAggressorSeat,
       previousBigBlindSeat: this.previousBigBlindSeat,
@@ -2464,6 +2475,8 @@ export class PokerTable extends EventEmitter {
     this.activeSeatIndex = snap.activeSeatIndex;
     this.currentBetToMatch = snap.currentBetToMatch;
     this.lastRaiseAmount = snap.lastRaiseAmount;
+    // Z3 — older snapshots lack it: 0 (absentTournamentSeatMayLimp then reads config.bigBlind).
+    this.handBigBlind = typeof snap.handBigBlind === 'number' ? snap.handBigBlind : 0;
     // Restore the decision-point version if the snapshot carries it (older
     // snapshots won't — a rehydrate resetting it lower is safe; see field doc).
     // rehydrate itself will re-emit phaseChanged/turnChanged during resume,
@@ -2505,6 +2518,8 @@ export interface PokerTableSnapshot {
   activeSeatIndex: number;
   currentBetToMatch: number;
   lastRaiseAmount: number;
+  /** Z3 — the big blind the hand was dealt at (optional: older snapshots). */
+  handBigBlind?: number;
   /** Decision-point version — optional for backward-compat with older snapshots. */
   stateVersion?: number;
   lastAggressorSeat: number;

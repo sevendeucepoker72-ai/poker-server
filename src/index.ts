@@ -3493,6 +3493,23 @@ function ensureTurnTimerWired(tableId: string): void {
     table.on('turnChanged', () => armTurnTimer(tableId));
   }
 }
+/**
+ * 2026-10-10 (round-7 review) — does a socket OTHER than `exceptSocketId` hold a
+ * player session (main or extra-table) at (tableId, seatIndex)? A disconnect
+ * never reserves / acts for a seat someone else is playing, and an orphan-seat
+ * scan never binds a second session to it.
+ */
+function otherSessionHoldsSeat(exceptSocketId: string, tableId: string, seatIndex: number): boolean {
+  for (const [sid, s] of playerSessions) {
+    if (sid !== exceptSocketId && s.tableId === tableId && s.seatIndex === seatIndex) return true;
+  }
+  for (const [sid, list] of multiTableSessions) {
+    if (sid === exceptSocketId || !Array.isArray(list)) continue;
+    if (list.some((s) => s && s.tableId === tableId && s.seatIndex === seatIndex)) return true;
+  }
+  return false;
+}
+
 /** A session points at (tableId, seatIndex) — the same test broadcastGameState's auto-act uses. */
 function seatHasLiveSession(tableId: string, seatIndex: number): boolean {
   for (const s of playerSessions.values()) {
@@ -3554,12 +3571,17 @@ function tournamentSeatSitsOut(tableId: string, seatIndex: number): boolean {
 function absentTournamentSeatMayLimp(tableId: string, t: PokerTable, seatIndex: number, callAmt: number): boolean {
   if (!isTournamentTable(tableId) || !t.isHandInProgress()) return false;
   const seat = t.seats[seatIndex];
-  if (!seat || callAmt <= 0 || callAmt > t.config.bigBlind || callAmt >= seat.chipCount) return false;
+  // Z3 (2026-10-10) — the big blind THIS hand was dealt at (PokerTable
+  // .handBigBlind, captured at hand start): blindLevelUp rewrites
+  // config.bigBlind mid-hand, and a doubled level made a min-raise (2 BB of
+  // the hand) look like "one big blind" — the absent seat called a raise.
+  const handBB = t.handBigBlind > 0 ? t.handBigBlind : t.config.bigBlind;
+  if (!seat || callAmt <= 0 || callAmt > handBB || callAmt >= seat.chipCount) return false;
   // Only the BLIND is ever limped: pre-flop, with nothing above the big blind
   // to match — never a raise (the big blind facing a min-raise owes just one
   // big blind more), a post-flop bet or a shove. (Tournament tables are
   // Hold'em; absent seats never bet, so an all-absent hand still checks down.)
-  if (t.currentPhase !== GamePhase.PreFlop || t.currentBetToMatch > t.config.bigBlind) return false;
+  if (t.currentPhase !== GamePhase.PreFlop || t.currentBetToMatch > handBB) return false;
   for (let i = 0; i < MAX_SEATS; i++) {
     const s = t.seats[i];
     if (!s || s.state !== 'occupied' || s.folded || !(s.holeCards && s.holeCards.length > 0)) continue;
@@ -8060,6 +8082,11 @@ Give feedback in this JSON format:
                 if (seat.playerId !== expectedPlayerId) continue;
                 // 2026-10-10 — never a seat RESERVED for another account.
                 if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;
+                // 2026-10-10 (round-7 review, major) — never a seat a live
+                // session still plays (oauthLogin's scan already skipped it):
+                // binding a SECOND session to it let the first socket's later
+                // disconnect reserve and fold the hand this socket was playing.
+                if (otherSessionHoldsSeat(socket.id, t.tableId, i)) continue;
                 // Found an orphaned seat for this user. Reserve it so the
                 // block below treats it as a normal reconnect. No cleanupTimer
                 // needed — this synthetic reservation will be consumed
@@ -8582,18 +8609,34 @@ Give feedback in this JSON format:
     // never sign back in and Return to it (and a Return / sign-in restore of a
     // banned account is refused player_suspended: bannedAccountRefusal). His
     // account is read first (his sessions carry his master id); the ban is
-    // written after the disqualification. A seat a live socket of his still
-    // plays is not touched (banUser never kicked — unchanged).
+    // written after the disqualification. Z5 (2026-10-10) — a tournament seat
+    // a live socket of his PLAYS is disqualified too, exactly as adminIPBan does
+    // (leaveTournamentSeatOnAdminRemoval: audited, never credited); before, it
+    // was skipped and, once it went absent, he could still finish in the
+    // money. A socket of his that plays no LIVE tournament seat is not touched
+    // (a cash seat stays; banUser never kicks — unchanged); one that does
+    // leaves that table the way the IP-ban's does (handlePlayerLeave — its
+    // extra-table cash seats are cashed out to him too).
     const banTargetId = Number(data?.userId);
     const banAccount = Number.isInteger(banTargetId) && banTargetId > 0
       ? await adminRemovalTargetAccount(banTargetId, socketsForUser(banTargetId)) : null;
+    let seatedDisqualified = 0;
     let awayDisqualified = 0;
     if (banAccount) {
+      for (const sid of socketsForUser(banTargetId)) {
+        const s = io.sockets.sockets.get(sid);
+        if (!s) continue;
+        try { if (leaveTournamentSeatOnAdminRemoval(s, 'admin_ban', auth.username, undefined, true)) seatedDisqualified++; } catch (e: any) {
+          console.error('[banUser] seated tournament entry:', e?.message || e);
+        }
+      }
       try { awayDisqualified = disqualifyAwayTournamentEntriesOnAdminRemoval(banAccount, 'admin_ban', auth.username); } catch (e: any) {
         console.error('[banUser] away tournament entries:', e?.message || e);
       }
     }
-    auditLog(auth.username, 'BAN_USER', { targetUserId: data.userId, awayTournamentEntriesDisqualified: awayDisqualified });
+    auditLog(auth.username, 'BAN_USER', {
+      targetUserId: data.userId, seatedTournamentEntriesDisqualified: seatedDisqualified, awayTournamentEntriesDisqualified: awayDisqualified,
+    });
     await banUserDB(data.userId);
     socket.emit('userBanned', { userId: data.userId });
   });
@@ -14913,7 +14956,9 @@ Give feedback in this JSON format:
   // (another tab or device, or his own stale connection) is taken over —
   // restoreAbsentTournamentSeat(..., takeOver): that socket's session ends, it
   // leaves the room and gets 'tournamentSeatTakenOver' {tournamentId, tableId,
-  // seatIndex}; there is no "held elsewhere" refusal. P-k (round 6) — a
+  // seatIndex}; there is no "held elsewhere" refusal. Z4: only when the Return
+  // NAMES its tournament — without a tournamentId only an ABSENT seat of his is
+  // restored (no_tournament_seat when there is none). P-k (round 6) — a
   // locally BANNED account is refused player_suspended (bannedAccountRefusal).
   // A no_tournament_seat answer for a named tournament says WHY when the
   // server knows (returnNoSeatAnswer): `tournamentFinished:true` + `position`
@@ -14924,8 +14969,10 @@ Give feedback in this JSON format:
     const last = args[args.length - 1];
     const ack = typeof last === 'function' ? (last as (r: unknown) => void) : null;
     const first = args[0];
-    const wanted = first && typeof first === 'object' && typeof (first as { tournamentId?: unknown }).tournamentId === 'string'
-      ? String((first as { tournamentId: string }).tournamentId).slice(0, 128) : undefined;
+    const wantedRaw = first && typeof first === 'object' && typeof (first as { tournamentId?: unknown }).tournamentId === 'string'
+      ? String((first as { tournamentId: string }).tournamentId).trim().slice(0, 128) : '';
+    // Round-7 review — an empty tournamentId is NO tournament (never a takeover with no filter).
+    const wanted = wantedRaw ? wantedRaw : undefined;
     const answer = (r: Record<string, unknown>): void => {
       socket.emit('returnToTournamentResult', r);
       if (ack) { try { ack(r); } catch { /* client ack threw — nothing to do */ } }
@@ -14973,7 +15020,12 @@ Give feedback in this JSON format:
       answer({ success: false, code: 'already_seated', error: 'Leave your current table first, then tap Return to tournament.' });
       return;
     }
-    if (!absentTournamentSeatOf(auth, wanted, 'any', true)) {
+    // Z4 (2026-10-10) — P-c'' takeover only for a NAMED tournament. A Return
+    // with no tournamentId is restored to an ABSENT seat of his only (never a
+    // seat another tab plays — it used to take the first played seat it met
+    // while his away seat waited); none → no_tournament_seat, nothing guessed.
+    const takeOver = wanted !== undefined;
+    if (!absentTournamentSeatOf(auth, wanted, 'any', takeOver)) {
       tournamentSeatKeep.returnRefused++;
       answer(returnNoSeatAnswer(auth, wanted));
       return;
@@ -14986,7 +15038,7 @@ Give feedback in this JSON format:
       releaseSeatedSlot(socket.id, own.tableId);
       socket.leave(`table:${own.tableId}`);
     }
-    const restored = restoreAbsentTournamentSeat(socket, auth, 'returnToTournamentSeat', wanted, 'any', true);
+    const restored = restoreAbsentTournamentSeat(socket, auth, 'returnToTournamentSeat', wanted, 'any', takeOver);
     if (!restored) {
       tournamentSeatKeep.returnRefused++;
       answer(returnNoSeatAnswer(auth, wanted));
@@ -15271,6 +15323,50 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
             console.warn(`[disconnect] SKIPPED saveProgress for userId=${authSession.userId} — progress not hydrated yet (would have overwritten real values with fresh-init)`);
           }
 
+          // Z1 (2026-10-10) — the seat changed hands DURING the save await: a
+          // Return to tournament / sign-in restore by account (this socket is
+          // already out of io.sockets, so it counts as gone) moved the seat to
+          // his NEW socket, or a gate stood it up. `session` is stale: reserving
+          // it (and folding it on its turn) would act on the hand the new socket
+          // now plays. Nothing of the main seat is this handler's any more —
+          // only this socket's own state ends (its extra-table seats, auth,
+          // delta baseline). (A DIFFERENT session on this dead socket now gets
+          // the leave the handler's tail gives — kept absent / cashed out.)
+          //
+          // Round-7 review (widened): the seat is only this handler's to
+          // reserve when, AFTER the await, (a) this socket's session is still
+          // `session`, (b) the table is the same live object and did not break
+          // (a rebalance skips dead sockets, so a reservation would land on the
+          // broken table's leftover copy), (c) the seat is still his (same seat
+          // object, occupied, his playerId) and (d) NO other socket's session
+          // plays it (a sign-in on another socket can hold the very same seat).
+          // Otherwise nothing is reserved or acted for — except the OLD seat
+          // when it is still his and unplayed while a different session landed
+          // on this socket (it is reserved exactly as before).
+          const currentSession = playerSessions.get(socket.id);
+          const tableNow = tableManager.getTable(session.tableId);
+          const seatNow = tableNow ? tableNow.seats[session.seatIndex] : undefined;
+          // A broken tournament table (kept in brokenTournamentTables for its
+          // removal window) is never where his seat is any more.
+          const brokeMeanwhile = brokenTournamentTables.has(session.tableId) && !tournamentTables.has(session.tableId);
+          const seatStillHis = tableNow === table && seatNow === seat && seat.state === 'occupied'
+            && seat.playerId === session.playerId && !brokeMeanwhile;
+          const playedElsewhere = otherSessionHoldsSeat(socket.id, session.tableId, session.seatIndex);
+          if (currentSession !== session || !seatStillHis || playedElsewhere) {
+            if (currentSession === session) playerSessions.delete(socket.id);
+            else if (seatStillHis && !playedElsewhere) reserveSeatForDeparture(authSession, session, table, seat);
+            if (currentSession && currentSession !== session) handlePlayerLeave(socket, 'kept');
+            else cashOutAdditionalSeatsOnDeparture(socket, authSession, 'additional_table_disconnect');
+            authSessions.delete(socket.id);
+            lastSentState.delete(socket.id); lastSentJson.delete(socket.id);
+            console.log(`[disconnect] ${JSON.stringify({
+              event: currentSession !== session ? 'disconnect_session_replaced_during_save' : 'disconnect_seat_not_his_after_save',
+              localUserId: authSession.userId, tableId: session.tableId, seatIndex: session.seatIndex,
+              seatStillHis, playedElsewhere, brokeMeanwhile,
+            })}`);
+            return;
+          }
+
           reserveSeatForDeparture(authSession, session, table, seat);
 
           // 2026-06-11 audit E4 — see cashOutAdditionalSeatsOnDeparture.
@@ -15365,11 +15461,17 @@ type SocketAuthSession = { userId: number; username: string; masterUserId?: stri
  * (releaseSocketForAccountSwitch) treats the previous account exactly as if
  * its socket had dropped: the seat is reserved for that account (cash: its
  * stack is credited to THAT account when the reservation ends; tournament:
- * never credited, never stood up — T1), auto-folded if it is on the clock.
+ * never credited, never stood up — T1); on the clock it is checked when a
+ * check is free, else folded (Z6).
  * The caller removes the socket's player session and owns authSessions.
  */
 function reserveSeatForDeparture(
   authSession: SocketAuthSession, session: PlayerSession, table: PokerTable, seat: any,
+  // Round-7 review — set on the reservation BEFORE the seat is acted for, so a
+  // check that hands the action straight back to this seat (heads-up big blind
+  // → flop) arms the SHORT absent clock (isAbsentTournamentSeatPastHandLimit
+  // reads handsRemaining when the turn timer arms).
+  opts: { handsRemaining?: number; voluntary?: boolean } = {},
 ): void {
   // Reserve the seat for 10 minutes so the player can reconnect
   // Cancel any existing reservation for this user first
@@ -15419,7 +15521,8 @@ function reserveSeatForDeparture(
     sittingOut: session.sittingOut,
     expiresAt: Date.now() + SEAT_RESERVE_MS,
     cleanupTimer,
-    handsRemaining: DISCONNECT_HANDS_LIMIT,
+    handsRemaining: typeof opts.handsRemaining === 'number' ? opts.handsRemaining : DISCONNECT_HANDS_LIMIT,
+    ...(opts.voluntary ? { voluntary: true } : {}),
     // T1: snapshot — a later table break drops the id from tournamentTables.
     // F2: and a disconnect IN the break window (session still on the
     // broken table, id already gone from tournamentTables) is still a
@@ -15432,8 +15535,9 @@ function reserveSeatForDeparture(
       : authSession.statsMasterUserId !== undefined ? { masterUserId: authSession.statsMasterUserId || null } : {}),
   });
 
-  // Auto-fold if it's their turn right now. That's the ONLY
-  // behavior we need on disconnect. Previously we ALSO flagged
+  // Act for the seat if it's their turn right now (Z6: check when
+  // free, else fold — below). That's the ONLY behavior we need on
+  // disconnect. Previously we ALSO flagged
   // the seat as sitting-out after a 20s timer so future hands'
   // markSittingOutBlinds would charge dead-blind debt — but
   // PWA backgrounding / WiFi handoff / iOS suspend triggered
@@ -15445,8 +15549,15 @@ function reserveSeatForDeparture(
   // they'll tap the explicit Sit Out button.
   session.sittingOut = false;
 
-  if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
-    table.playerFold(session.seatIndex);
+  // Round-7 review — never in a draw phase (activeSeatIndex / currentBetToMatch
+  // are stale there; every other auto-act path skips draws too).
+  if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex && !DrawPhases.includes(table.currentPhase)) {
+    // Z6 (2026-10-10) — the seat stays in play: CHECK when a check is free,
+    // FOLD only when facing a bet (P-i's absent action, without its limp).
+    // It used to fold whatever was owed — a big blind with the option, or a
+    // free check on a later street, handed the pot away.
+    const owed = table.currentBetToMatch - (table.seats[session.seatIndex]?.currentBet || 0);
+    if (!(owed <= 0 && table.playerCheck(session.seatIndex))) table.playerFold(session.seatIndex);
     broadcastGameState(session.tableId);
     // 2026-10-10 hotfix — like every other fold path, hand the turn to the next
     // bot. Without this a bot next to act sat idle until the 30s clock / the
@@ -15623,14 +15734,17 @@ function releaseSocketForAccountSwitch(socket: Socket, nextUserId: number, via: 
  *       stale connection) is moved like a reconnect restore; that socket's
  *       session ends, it leaves the room and gets 'tournamentSeatTakenOver'
  *       {tournamentId, tableId, seatIndex}. A repeated / duplicated Return is
- *       an idempotent success (a lost answer is simply re-sent).
+ *       an idempotent success (a lost answer is simply re-sent). Z4: the
+ *       takeover needs a NAMED tournamentId; a Return without one is restored
+ *       to an ABSENT seat only (else no_tournament_seat — never a guess).
  *  P-d  every full gameState carries `isTournament` + `tournamentId`.
  *  P-e  a kept-absent seat's elimination: eliminatedToSpectator / spectator
  *       only on the socket that holds the player session AT that table and
  *       none elsewhere (P-e'); every other live socket of his gets ONE plain
  *       notice ('playerEliminated' + tournamentId) — the room's copy skips it.
- *  P-f  an admin kick / IP-ban from a tournament seat DISQUALIFIES the entrant
- *       (leaveTournamentSeatOnAdminRemoval) — the seat is never kept.
+ *  P-f  an admin kick / IP-ban / banUser (Z5) from a tournament seat
+ *       DISQUALIFIES the entrant (leaveTournamentSeatOnAdminRemoval) — the seat
+ *       is never kept.
  *  P-g  one socket, one table view: every seat / spectate path runs
  *       detachSocketFromOtherTables first (a dead tournament seat's session
  *       at another table ends there too).
@@ -15640,12 +15754,15 @@ function releaseSocketForAccountSwitch(socket: Socket, nextUserId: number, via: 
  *       so (finishedTournamentRecords).
  *  P-i  absent auto-action (autoActForSeat): CHECK, or CALL at most ONE big
  *       blind (never all-in) when every seat still in the hand is absent too;
- *       otherwise FOLD.
+ *       otherwise FOLD. Z3: "one big blind" is the hand's own (captured at
+ *       its start — a mid-hand level-up does not widen it). Z6: a leave /
+ *       disconnect ON his turn checks when a check is free, else folds.
  *  P-j  on a tournament table sitting out = absent: dealt in, blinds posted,
  *       acted for per P-i on the short clock (syncSitOutToTable).
  *  P-k  a kick acts only on the table it targets (its socket's main seat, or
  *       a named tableId / tournamentId); IP-ban and banUser disqualify every
- *       AWAY entry; a banned account's Return / sign-in restore is refused
+ *       entry — the seats his live sockets play (P-f; banUser since Z5) and
+ *       every AWAY one; a banned account's Return / sign-in restore is refused
  *       player_suspended (bannedAccountRefusal).
  * A NON-voluntary keep ('kept': a suspended player's own seat at a re-login, a
  * hand-start stand-up whose disqualification failed, an account switch or a
@@ -15762,18 +15879,16 @@ function keepTournamentSeatOnLeave(
         // id snapshot for the U2 gate, fold-on-turn), started PAST its hand
         // limit: the short absent clock from his next turn on. P-b: a voluntary
         // one is flagged — no sign-in restores it.
-        reserveSeatForDeparture(auth, session, table, seat);
+        reserveSeatForDeparture(auth, session, table, seat, { handsRemaining: 0, voluntary });
         const r = reservedSeats.get(auth.userId);
-        if (r) {
-          r.handsRemaining = 0;
-          if (voluntary) r.voluntary = true;
-        }
         reserved = !!r;
       }
     }
     if (voluntary) voluntarilyAbsentTournamentEntrants.set(voluntaryAbsenceKey(tournamentId, tp.playerId), Date.now());
-    if (!reserved && table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
-      table.playerFold(session.seatIndex);
+    if (!reserved && table.isHandInProgress() && table.activeSeatIndex === session.seatIndex && !DrawPhases.includes(table.currentPhase)) {
+      // Z6 — kept in play: check when free, fold only facing a bet (as reserveSeatForDeparture).
+      const owed = table.currentBetToMatch - (seat.currentBet || 0);
+      if (!(owed <= 0 && table.playerCheck(session.seatIndex))) table.playerFold(session.seatIndex);
       broadcastGameState(session.tableId);
     }
   } finally {
@@ -15882,7 +15997,7 @@ function absentTournamentSeatsOf(
   return out;
 }
 
-/** S2 — the first one (sign-ins: never a VOLUNTARY one — P-b, never a played one; Return: any, P-c'' takeOver). */
+/** S2 — the first one (sign-ins: never a VOLUNTARY one — P-b, never a played one; Return: any — P-c'' takeOver only for a named tournament, Z4). */
 function absentTournamentSeatOf(
   auth: SocketAuthSession, onlyTournamentId?: string, voluntary: 'exclude' | 'any' = 'exclude', takeOver = false,
 ): AbsentTournamentSeatOfAccount | null {
@@ -15904,12 +16019,13 @@ function absentTournamentSeatOf(
  * reconnect: `reconnectedToTable {tableId, seatIndex, tournamentId}` + a full
  * gameState. P-b: a sign-in passes voluntary 'exclude' (never a seat he LEFT —
  * it only tells him, tellKeptTournamentSeats); 'returnToTournamentSeat'
- * passes 'any' and `takeOver` (P-c'', round 6 — LATEST CONNECTION WINS): a
- * seat another live socket of the SAME account plays (another tab or device,
- * or his own stale connection the server still counts as connected) moves to
- * this socket like a reconnect restore; the old socket's session there ends,
- * it leaves the room (no further frames) and gets 'tournamentSeatTakenOver'
- * {tournamentId, tableId, seatIndex}. A sign-in never takes a played seat.
+ * passes 'any' and, for a NAMED tournament (Z4), `takeOver` (P-c'', round 6 —
+ * LATEST CONNECTION WINS): a seat another live socket of the SAME account
+ * plays (another tab or device, or his own stale connection the server still
+ * counts as connected) moves to this socket like a reconnect restore; the old
+ * socket's session there ends, it leaves the room (no further frames) and
+ * gets 'tournamentSeatTakenOver' {tournamentId, tableId, seatIndex}. A
+ * sign-in never takes a played seat.
  */
 function restoreAbsentTournamentSeat(
   socket: Socket, auth: SocketAuthSession, via: string, onlyTournamentId?: string,
@@ -16449,10 +16565,15 @@ function standUpAdminDisqualifiedAbsentSeat(
  * `onlyTournamentId` (a kick that NAMES its target): only a seat of that
  * tournament is disqualified; null (a named cash table) disqualifies none — a
  * tournament seat on the socket is then kept absent like any other leave.
+ * Z5 (2026-10-10) — banUser ('admin_ban', never a kick) passes `liveSeatOnly`:
+ * only a LIVE tournament seat is acted on (disqualified, then left as above);
+ * any other seat on the socket (a cash seat, a dead tournament seat) is not
+ * touched. Returns whether the entrant was disqualified.
  */
 function leaveTournamentSeatOnAdminRemoval(
-  socket: Socket, via: 'admin_kick' | 'admin_ip_ban', actor: string, onlyTournamentId?: string | null,
-): void {
+  socket: Socket, via: 'admin_kick' | 'admin_ip_ban' | 'admin_ban', actor: string, onlyTournamentId?: string | null,
+  liveSeatOnly = false,
+): boolean {
   const session = playerSessions.get(socket.id);
   const table = session ? tableManager.getTable(session.tableId) : undefined;
   const tournamentId = session ? tournamentTables.get(session.tableId) : undefined;
@@ -16461,11 +16582,14 @@ function leaveTournamentSeatOnAdminRemoval(
   const tp = t && seat && seat.state === 'occupied' && !seat.isAI ? t.players.find((p) => p.playerId === seat.playerId) : undefined;
   const targeted = onlyTournamentId === undefined || onlyTournamentId === tournamentId;
   const live = !!(targeted && session && table && tournamentId && t && t.status === 'running' && seat && tp && !tp.eliminated);
+  if (!live && liveSeatOnly) return false;
+  let disqualified = false;
   if (live) holdTournamentRebalance(tournamentId!);
   try {
     if (live) {
       const auth = authSessions.get(socket.id);
       const dq = tournamentManager.disqualifyPlayer(tournamentId!, tp!.playerId);
+      disqualified = !!dq;
       if (dq) tournamentHandStartSafety.adminRemovalsDisqualified++;
       auditLog(actor, 'TOURNAMENT_ENTRANT_DISQUALIFIED_BY_ADMIN', {
         via, tournamentId, tableId: session!.tableId, seatIndex: session!.seatIndex, playerId: tp!.playerId,
@@ -16480,6 +16604,7 @@ function leaveTournamentSeatOnAdminRemoval(
   } finally {
     if (live) releaseTournamentRebalance(tournamentId!, table!, session!.tableId);
   }
+  return disqualified;
 }
 
 /**
@@ -18145,6 +18270,13 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
       } finally {
         eliminationDirectNotice = null;
       }
+      // Z2 (2026-10-10) — HIS place: the busted entrant's own finishPosition.
+      // When this bust FINISHES the tournament, eliminatePlayer returns
+      // finishTournament's result, whose `position` is the WINNER's (1) — the
+      // runner-up was told "1st" (the room's copy carried the right place, but
+      // round 6 skips the directly told sockets).
+      const bustPosition = bustTp && bustTp.eliminated && bustTp.finishPosition > 0
+        ? bustTp.finishPosition : (result ? result.position : 0);
       // The elimination may have broken THIS table right now (playerEliminated
       // → handleTableRebalance runs synchronously): read it again.
       const brokenNow = !tournamentTables.has(tableId);
@@ -18193,7 +18325,7 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
           sock.emit('eliminatedToSpectator', {
             tournamentId,
             tableId: specTableId,
-            position: result.position,
+            position: bustPosition,
             totalPlayers: tournamentManager.getTournament(tournamentId)?.players.length || 0,
             status: tournamentManager.getTournamentStatus(tournamentId),
             tableIds: tournamentManager.getTournament(tournamentId)?.tableIds || [],
@@ -18203,7 +18335,7 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
         // tournamentId: a toast, the away seat ends) to every live socket
         // signed in as him except the one switched to spectator above — the
         // room's copy skipped them (one notice each).
-        noticeTournamentEliminationToEntrant(tournamentId, seat.playerId, noticeSids, seat.playerName, result.position);
+        noticeTournamentEliminationToEntrant(tournamentId, seat.playerId, noticeSids, seat.playerName, bustPosition);
       }
     } catch (e) {
       console.error('[Tournament] eliminatePlayer failed:', e);

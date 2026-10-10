@@ -568,7 +568,7 @@ eliminationsToSocketSeatedElsewhere
 noteAbsentTournamentSeatMoved
 absent_tournament_seat_moved_told
 absentSeatsMovedNotified
-# P-f: an admin kick / IP-ban disqualifies a live tournament entrant.
+# P-f: an admin kick / IP-ban (and banUser, Z5) disqualifies a live tournament entrant.
 leaveTournamentSeatOnAdminRemoval
 TOURNAMENT_ENTRANT_DISQUALIFIED_BY_ADMIN
 tournament_entrant_disqualified_by_admin
@@ -588,20 +588,24 @@ eliminationsToAwaySocket
 detachSocketFromOtherTables
 table_view_detached
 tableViewDetaches
-# P-h: tournamentFinished reaches every entrant's live sockets; a Return after
-# the end answers no_tournament_seat + tournamentFinished + position.
+# P-h: the end of a tournament reaches every entrant — the table rooms get
+# tournamentFinished, an entrant's socket outside them its own
+# tournamentFinishedForEntrant (P-h', round 6); a Return after the end answers
+# no_tournament_seat + tournamentFinished + position.
 emitTournamentFinishedToEntrants
 tournament_finished_told_to_entrants
 tournamentFinishedNotices
 finishedTournamentRecords
 returnAfterFinish
-# P-f gap: an admin kick / IP-ban disqualifies the entrant's AWAY entries too.
+# P-f gap / P-k: IP-ban and banUser disqualify every AWAY entry of his; a kick
+# only the AWAY entry of a tournament it NAMES (round 6).
 disqualifyAwayTournamentEntriesOnAdminRemoval
 adminRemovalsAwayDisqualified
 awayTournamentEntriesDisqualified
 # All-absent tournament hand: the absent auto-action may call (bounded by P-i, round 6).
 allAbsentAutoCalls
-# A leave whose fold synchronously breaks the table tells the FINAL seat only.
+# A leave whose own action (fold, or a free check — Z6) synchronously ends the
+# hand and breaks the table tells the FINAL seat only.
 keepingTournamentSeatOnLeave
 tournamentSeatLocationNow
 #
@@ -675,3 +679,25 @@ redirect_merged_account_credit
 merged_account_redirects
 [identity-gate] open
 pg_input_is_valid(users.stats::text, 'jsonb')
+#
+# 2026-10-10 (fourteenth pass, pe6 review, owner "fix all") — Z1..Z7 polish
+# (CONTRACTS.md C5).
+# Z1: a disconnect whose seat was Returned / restored during its save await
+# neither reserves nor acts for that seat.
+disconnect_session_replaced_during_save
+# Z2: a bust notice carries the BUSTED entrant's own place (the final bust
+# tells the runner-up 2nd, never the winner's 1st).
+const bustPosition = bustTp && bustTp.eliminated && bustTp.finishPosition > 0
+# Z3: the absent limp ceiling is the big blind the hand was dealt at.
+this.handBigBlind = this.config.bigBlind;
+const handBB = t.handBigBlind > 0 ? t.handBigBlind : t.config.bigBlind;
+# Z4: a Return takes over a played seat only for a NAMED tournament.
+const takeOver = wanted !== undefined;
+# Z5: banUser disqualifies a tournament seat his live socket plays, too.
+seatedTournamentEntriesDisqualified
+liveSeatOnly
+# Z6: a leave / disconnect on his turn checks when a check is free, else folds.
+if (!(owed <= 0 && table.playerCheck(session.seatIndex)))
+# round-7 review: one seat, one session (a stale disconnect never acts for a seat another socket plays; tokenLogin's orphan scan skips it).
+otherSessionHoldsSeat
+disconnect_seat_not_his_after_save

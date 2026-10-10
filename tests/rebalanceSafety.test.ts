@@ -77,7 +77,7 @@ const P = {
   startHand: handlerSrc('startHand', '\n  });\n'),
   returnToTournament: handlerSrc('returnToTournamentSeat', '\n  });\n'),
   seatKeep: slice('// ===== Tournament seat kept on leave', '// ===== end tournament seat kept on leave =====\n'),
-  departure: fnSrc('function reserveSeatForDeparture(') + fnSrc('function cashOutAdditionalSeatsOnDeparture('),
+  departure: fnSrc('function otherSessionHoldsSeat(') + fnSrc('function reserveSeatForDeparture(') + fnSrc('function cashOutAdditionalSeatsOnDeparture('),
   noteNotCashed: fnSrc('function noteTournamentReservationNotCashed('),
   accountSwitch: slice('const socketAccountSwitches = {', '\n}\n'),
   // Round 5 (2026-10-10): the REAL seat / spectate handlers P-g covers and the admin removals (P-f gap).
@@ -89,6 +89,8 @@ const P = {
   // Round 6 (2026-10-10): spectateNextTable (pe5 X5 — a busted player's dead seat) and banUser (P-k).
   spectateNextTable: handlerSrc('spectateNextTable', '\n  });\n'),
   banUser: handlerSrc('banUser', '\n  });\n'),
+  // Z1 (2026-10-10): the main (last-registered) disconnect handler — its seat reserve runs after the save await.
+  disconnect: slice("  socket.on('disconnect', async () => {\n    console.log(`Player disconnected: ${socket.id}`);", '\n  });\n'),
 };
 
 /** The pre-P1 planning: no capacity check (every table "has room"), no "not enough seats" abort. */
@@ -177,6 +179,7 @@ function wireSocket(socket) {
   ${p.adminIPBan}
   ${p.spectateNextTable}
   ${p.banUser}
+  ${p.disconnect}
 }`;
 }
 
@@ -1520,15 +1523,31 @@ describe('S2 — a voluntary leave from a LIVE tournament seat keeps the seat in
     expect(w.chipsInPlay()).toBe(before - 5000);
   });
 
-  it('mid-hand, on his turn: folded at once, the seat stays in the hand (no deferred stand-up, no pot erased)', () => {
+  it('mid-hand, on his turn FACING a raise: folded at once, the seat stays in the hand (no deferred stand-up, no pot erased)', () => {
     const { w, s, TB } = leaveWorld();
     expect(TB.startNewHand()).toBe(true);
+    expect(TB.playerRaise(TB.activeSeatIndex, 400)).toBe(true);             // the first to act raises
     for (let g = 0; g < 10 && TB.activeSeatIndex !== 2; g++) { const a = TB.activeSeatIndex; if (!TB.playerCall(a)) TB.playerCheck(a); }
     expect(TB.activeSeatIndex).toBe(2);
+    expect(TB.currentBetToMatch - TB.seats[2].currentBet).toBeGreaterThan(0);
     const total = w.chipsInPlay();
     w.m.handlePlayerLeave(s);
     expect(TB.seats[2]).toMatchObject({ state: 'occupied', folded: true });
     expect(TB.activeSeatIndex).not.toBe(2);
+    expect(w.chipsInPlay()).toBe(total);
+    expect(w.credits).toEqual([]);
+  });
+
+  it('Z6 — mid-hand, on his turn with a FREE check (the big blind\'s option): CHECKED, not folded — the seat stays live in the hand; nothing moves', () => {
+    const { w, s, TB } = leaveWorld();
+    expect(TB.startNewHand()).toBe(true);
+    for (let g = 0; g < 10 && TB.activeSeatIndex !== 2; g++) { const a = TB.activeSeatIndex; if (!TB.playerCall(a)) TB.playerCheck(a); }
+    expect(TB.activeSeatIndex).toBe(2);
+    expect(TB.currentBetToMatch - TB.seats[2].currentBet).toBe(0);           // b2 is the big blind, everyone limped
+    const total = w.chipsInPlay();
+    w.m.handlePlayerLeave(s);
+    expect(TB.seats[2]).toMatchObject({ state: 'occupied', folded: false });
+    expect(TB.currentPhase).toBe(GamePhase.Flop);                            // his check closed the pre-flop round
     expect(w.chipsInPlay()).toBe(total);
     expect(w.credits).toEqual([]);
   });
@@ -2058,12 +2077,14 @@ describe('V3 / P-a — a voluntary leave ends the socket\'s session BEFORE any f
   }
   const EARLY = '  socket.leave(`table:${session.tableId}`);\n  if (playerSessions.get(socket.id) === session) playerSessions.delete(socket.id);\n';
 
-  it('leave on his own turn: he is folded and the table is broadcast — none of it reaches the leaving socket (no session, not in the room); only tournamentSeatKept is sent to it', () => {
+  it('leave on his own turn: he is acted for (Z6: his free check — the big blind\'s option — is checked) and the table is broadcast — none of it reaches the leaving socket (no session, not in the room); only tournamentSeatKept is sent to it', () => {
     const { w, sent, TB, s } = recWorld();
+    expect(TB.currentBetToMatch - TB.seats[2].currentBet).toBe(0);
     w.m.handlePlayerLeave(s);
-    expect(TB.seats[2]).toMatchObject({ state: 'occupied', folded: true, chipCount: expect.any(Number) });
+    expect(TB.seats[2]).toMatchObject({ state: 'occupied', folded: false, chipCount: expect.any(Number) });
+    expect(TB.activeSeatIndex === 2 && TB.currentPhase === GamePhase.PreFlop).toBe(false);   // acted for
     const tb = sent.filter((x) => x.tableId === 'TB');
-    expect(tb.length).toBeGreaterThan(0);                                   // the fold was broadcast…
+    expect(tb.length).toBeGreaterThan(0);                                   // the action was broadcast…
     expect(tb.flatMap((x) => x.to).filter((r) => r.endsWith(':S-b2'))).toEqual([]);   // …never to him
     expect(s.emitted.map(([ev]: [string]) => ev)).toEqual(['tournamentSeatKept']);
     expect(w.reservedSeats.get(202)).toMatchObject({ voluntary: true, handsRemaining: 0 });
@@ -2982,12 +3003,13 @@ describe('P-c\'\' (round 6) — LATEST CONNECTION WINS: a Return takes the seat 
   });
 
   it('CONTROL — round 5 (no takeover): the new connection is refused no_tournament_seat while the stale socket holds the seat (the X1 lock-out)', async () => {
-    const R1 = "    if (!absentTournamentSeatOf(auth, wanted, 'any', true)) {\n";
-    const R2 = "    const restored = restoreAbsentTournamentSeat(socket, auth, 'returnToTournamentSeat', wanted, 'any', true);\n";
+    // Z4 (2026-10-10): the takeover flag is `takeOver` (a NAMED tournament) — off here.
+    const R1 = "    const takeOver = wanted !== undefined;\n";
+    const R2 = "    const restored = restoreAbsentTournamentSeat(socket, auth, 'returnToTournamentSeat', wanted, 'any', takeOver);\n";
     expect(P.returnToTournament).toContain(R1);
     expect(P.returnToTournament).toContain(R2);
     const { w, answer } = await staleConnection({
-      returnToTournament: P.returnToTournament.replace(R1, "    if (!absentTournamentSeatOf(auth, wanted, 'any')) {\n").replace(R2, "    const restored = restoreAbsentTournamentSeat(socket, auth, 'returnToTournamentSeat', wanted, 'any');\n"),
+      returnToTournament: P.returnToTournament.replace(R1, '    const takeOver = false;\n'),
     });
     expect(answer).toMatchObject({ success: false, code: 'no_tournament_seat' });
     expect(w.playerSessions.get('S-A')).toMatchObject({ tableId: 'TB', seatIndex: 2 });
@@ -3142,7 +3164,7 @@ describe('P-f gap / P-k — IP-ban and banUser disqualify his AWAY entries (neve
       d: expect.objectContaining({ via: 'admin_ban', away: true, playerId: 'b2', disqualified: true, credited: 0 }),
     }));
     expect(w.audits).toContainEqual(expect.objectContaining({ action: 'TOURNAMENT_STACK_NOT_CASHED', d: expect.objectContaining({ amount: 5000, reason: 'admin_ban_away_disqualified' }) }));
-    expect(w.audits).toContainEqual(expect.objectContaining({ action: 'BAN_USER', d: { targetUserId: 202, awayTournamentEntriesDisqualified: 1 } }));
+    expect(w.audits).toContainEqual(expect.objectContaining({ action: 'BAN_USER', d: { targetUserId: 202, seatedTournamentEntriesDisqualified: 0, awayTournamentEntriesDisqualified: 1 } }));
     expect(admin.emitted).toContainEqual(['userBanned', { userId: 202 }]);
     expect(await returnAgain(w)).toMatchObject({ success: false, code: 'player_suspended' });
   });
@@ -3312,5 +3334,326 @@ describe('P-l (round 6) — the hand-complete DB writes run SERIALLY again (roun
     expect(P.handComplete).not.toContain('persistOne');
     expect(P.handComplete).not.toContain('Promise.all(persisting)');
     expect(P.handComplete).toContain('for (const [socketId, session] of playerSessions) {');
+  });
+});
+
+// ===================== 2026-10-10 fourteenth pass (pe6 review, owner "fix all") — Z1 / Z2 / Z4 / Z5 =====================
+
+describe('Z1 — a disconnect acts on its seat only while the seat is still its own AFTER the save await (pe6 RV6_F5)', () => {
+  const GUARD = '          if (currentSession !== session || !seatStillHis || playedElsewhere) {\n';
+  /**
+   * Heads-up T1: b0 live on S-b0, b1 live on S1. S1 drops when it is NOT his
+   * turn; its saveProgress is HELD. With `returnInWindow` his new socket S2
+   * taps Return meanwhile. Then b0 acts, so it is b1's turn, and the save is
+   * released.
+   */
+  async function dropDuringSave(returnInWindow: boolean, over: Partial<typeof P> = {}) {
+    const hold = deferred();
+    let holdSave = true;
+    const saved: number[] = [];
+    const scope = { ...persistenceScope(null), saveProgress: async (uid: number) => { saved.push(uid); if (holdSave) await hold.p; return true; } };
+    const w = world({ layout: { T1: field('b', 2, 5000, 200) }, scope, over });
+    const T1 = w.tables.get('T1')!;
+    w.seatLive('S-b0', 'T1', 0, 200, 'm-b0');
+    w.seatLive('S1', 'T1', 1, 201, 'm-b1');
+    w.tm.getTournament(w.tid)!.players.find((p) => p.playerId === 'b1')!.socketId = 'S1';
+    const s1 = w.wireSocket('S1');
+    expect(T1.startNewHand()).toBe(true);
+    if (T1.activeSeatIndex === 1) { if (!T1.playerCall(1)) T1.playerCheck(1); }
+    expect(T1.activeSeatIndex).toBe(0);
+    // socket.io 4.x: out of the namespace and connected=false BEFORE 'disconnect' fires.
+    s1.connected = false;
+    w.live.delete('S1');
+    const disc = s1.handlers.disconnect();
+    await flush();
+    expect(saved).toEqual([201]);                                             // inside its save await
+    const acks: any[] = [];
+    if (returnInWindow) {
+      const s2 = w.wireSocket('S2');
+      w.authSessions.set('S2', { userId: 201, username: 'u201', masterUserId: 'm-b1' });
+      await s2.handlers.returnToTournamentSeat({ tournamentId: w.tid }, (r: unknown) => acks.push(r));
+      await flush();
+    }
+    if (!T1.playerCall(0)) T1.playerCheck(0);                                  // b0 acts: b1's turn now
+    expect(T1.activeSeatIndex).toBe(1);
+    const at = { hand: T1.handNumber, phase: T1.currentPhase };
+    const before = w.chipsInPlay();
+    holdSave = false;
+    hold.resolve();
+    await disc;
+    await flush();
+    const r = w.reservedSeats.get(201);
+    const s2s = w.playerSessions.get('S2');
+    return {
+      w, T1, ack: acks[0],
+      s2Session: s2s ? { tableId: s2s.tableId, seatIndex: s2s.seatIndex } : null,
+      stillHisTurn: T1.handNumber === at.hand && T1.currentPhase === at.phase && T1.activeSeatIndex === 1,
+      reservation: r ? { tableId: r.tableId, seatIndex: r.seatIndex, handsRemaining: r.handsRemaining } : null,
+      s1Left: !w.authSessions.has('S1') && !w.playerSessions.has('S1'),
+      chipsKept: w.chipsInPlay() === before,
+    };
+  }
+
+  it('his new socket Returns during the save await: the seat is NOT re-reserved and NOT acted for — still his turn, played by S2; S1\'s auth ends; logged', async () => {
+    const x = await dropDuringSave(true);
+    expect(x.ack).toMatchObject({ success: true, tableId: 'T1', seatIndex: 1 });
+    expect(x.s2Session).toEqual({ tableId: 'T1', seatIndex: 1 });
+    expect(x.stillHisTurn).toBe(true);
+    expect(x.T1.seats[1].folded).toBe(false);
+    expect(x.reservation).toBeNull();
+    expect(x.s1Left).toBe(true);
+    expect(x.chipsKept).toBe(true);
+    expect(x.w.credits).toEqual([]);
+    expect(x.w.logs.some((l) => l.includes('disconnect_session_replaced_during_save'))).toBe(true);
+  });
+
+  it('CONTROL — pre-Z1 (no re-check after the await): the seat S2 now plays is re-reserved and the server acts for it on its turn', async () => {
+    expect(P.disconnect).toContain(GUARD);
+    const x = await dropDuringSave(true, { disconnect: P.disconnect.replace(GUARD, '          if (false) {\n') });
+    expect(x.s2Session).toEqual({ tableId: 'T1', seatIndex: 1 });
+    expect(x.reservation).toEqual({ tableId: 'T1', seatIndex: 1, handsRemaining: 20 });
+    expect(x.stillHisTurn).toBe(false);
+  });
+
+  it('no Return in the window: the plain disconnect reserves the seat exactly as before (S1 session + auth end)', async () => {
+    const x = await dropDuringSave(false);
+    expect(x.reservation).toEqual({ tableId: 'T1', seatIndex: 1, handsRemaining: 20 });
+    expect(x.s1Left).toBe(true);
+    expect(x.stillHisTurn).toBe(false);                                       // acted for on his turn (Z6: a free check)
+    expect(x.T1.seats[1].folded).toBe(false);
+    expect(x.chipsKept).toBe(true);
+    expect(x.w.logs.some((l) => l.includes('disconnect_session_replaced_during_save'))).toBe(false);
+  });
+});
+
+describe('Z2 — the FINAL bust tells the runner-up HIS place (2nd), never the winner\'s 1st (pe6 RV6_F2)', () => {
+  const BUST_POS = 'const bustPosition = bustTp && bustTp.eliminated && bustTp.finishPosition > 0\n        ? bustTp.finishPosition : (result ? result.position : 0);';
+  function recExceptIo(ref: { w?: ReturnType<typeof world> }) {
+    const roomEmits: Array<{ room: string; ev: string; except: string[]; d: any }> = [];
+    const io: any = {
+      to: (room: string) => {
+        const op: any = { ex: [] as string[] };
+        op.except = (ids: string | string[]) => { op.ex = [...op.ex, ...(Array.isArray(ids) ? ids : [ids])]; return op; };
+        op.emit = (ev: string, d: any) => roomEmits.push({ room, ev, except: op.ex, d });
+        return op;
+      },
+      emit() {},
+      sockets: { get sockets() { return ref.w!.live; } },
+    };
+    return { io, roomEmits };
+  }
+  /** Heads-up final: b1's stack busts, b0 wins. 'lobby' / 'watching': b1 tapped Back to Lobby (watching T1 or not); 'played': S-b1 plays the seat. */
+  async function finalBust(mode: 'lobby' | 'watching' | 'played', over: Partial<typeof P> = {}) {
+    const ref: { w?: ReturnType<typeof world> } = {};
+    const x = recExceptIo(ref);
+    const w = world({ layout: { T1: field('b', 2, 5000, 200) }, over, scope: { ...persistenceScope(null), io: x.io }, config: { prizePool: 1000 } });
+    ref.w = w;
+    const T1 = w.tables.get('T1')!;
+    w.seatLive('S-b0', 'T1', 0, 200, 'm-b0');
+    const s1 = w.seatLive('S-b1', 'T1', 1, 201, 'm-b1');
+    w.tm.getTournament(w.tid)!.players.find((p) => p.playerId === 'b1')!.socketId = 'S-b1';
+    if (mode !== 'played') w.m.handlePlayerLeave(s1);
+    if (mode === 'watching') { w.spectators.set('T1', new Set(['S-b1'])); s1.join('table:T1'); }
+    s1.emitted.length = 0;
+    T1.seats[0].chipCount += T1.seats[1].chipCount;
+    T1.seats[1].chipCount = 0;
+    (T1 as any).currentPhase = GamePhase.HandComplete;
+    await w.m.handleHandComplete('T1', [{ seatIndex: 0, amount: 5000 }]);
+    const t = w.tm.getTournament(w.tid)!;
+    return {
+      status: t.status,
+      place: t.players.find((p) => p.playerId === 'b1')!.finishPosition,
+      told: s1.emitted
+        .filter(([ev]: [string]) => ['playerEliminated', 'eliminatedToSpectator', 'tournamentFinishedForEntrant'].includes(ev))
+        .map(([ev, d]: [string, any]) => [ev, d.position]),
+      roomCopies: x.roomEmits.filter((e) => e.ev === 'playerEliminated' && e.d.playerId === 'b1' && s1.rooms.has(e.room) && !e.except.includes('S-b1')).map((e) => e.d.position),
+    };
+  }
+
+  it('away in the lobby: his finished notice AND his elimination notice both say 2nd', async () => {
+    const r = await finalBust('lobby');
+    expect(r).toEqual({ status: 'finished', place: 2, told: [['tournamentFinishedForEntrant', 2], ['playerEliminated', 2]], roomCopies: [] });
+  });
+
+  it('away, watching his own table: ONE notice (the direct one), 2nd', async () => {
+    const r = await finalBust('watching');
+    expect(r).toEqual({ status: 'finished', place: 2, told: [['playerEliminated', 2]], roomCopies: [] });
+  });
+
+  it('the socket that PLAYED the seat: eliminatedToSpectator says 2nd too (the room copy, unchanged, also 2nd)', async () => {
+    const r = await finalBust('played');
+    expect(r).toEqual({ status: 'finished', place: 2, told: [['eliminatedToSpectator', 2]], roomCopies: [2] });
+  });
+
+  it('a bust that does NOT finish the tournament: unchanged (his place)', async () => {
+    const w = world({ layout: { T1: field('b', 3, 5000, 200) }, scope: persistenceScope(null) });
+    const T1 = w.tables.get('T1')!;
+    w.seatLive('S-b0', 'T1', 0, 200, 'm-b0');
+    const s2 = w.seatLive('S-b2', 'T1', 2, 202, 'm-b2');
+    w.tm.getTournament(w.tid)!.players.find((p) => p.playerId === 'b2')!.socketId = 'S-b2';
+    w.m.handlePlayerLeave(s2);
+    s2.emitted.length = 0;
+    T1.seats[0].chipCount += T1.seats[2].chipCount;
+    T1.seats[2].chipCount = 0;
+    (T1 as any).currentPhase = GamePhase.HandComplete;
+    await w.m.handleHandComplete('T1', [{ seatIndex: 0, amount: 5000 }]);
+    expect(w.tm.getTournament(w.tid)!.status).toBe('running');
+    expect(s2.emitted.filter(([ev]: [string]) => ev === 'playerEliminated').map(([, d]: [string, any]) => d.position)).toEqual([3]);
+  });
+
+  it('CONTROL — pre-Z2 (eliminatePlayer\'s result.position): the runner-up is told 1st — the WINNER\'s place', async () => {
+    expect(P.helpers).toContain(BUST_POS);
+    const over = { helpers: P.helpers.replace(BUST_POS, 'const bustPosition = result ? result.position : 0;') };
+    expect((await finalBust('lobby', over)).told).toEqual([['tournamentFinishedForEntrant', 2], ['playerEliminated', 1]]);
+    expect((await finalBust('played', over)).told).toEqual([['eliminatedToSpectator', 1]]);
+  });
+});
+
+describe('Z4 — a Return WITHOUT tournamentId restores an ABSENT seat only; the P-c\'\' takeover needs a NAMED tournament (pe6 RV6_F3)', () => {
+  const TAKE = '    const takeOver = wanted !== undefined;\n';
+  /** Tab 1 PLAYS his tournament-A seat (TA) live; with `awayAtTX` his tournament-B seat (TX) is away. Tab 2 (same account) taps Return with `payload`. */
+  async function twoTournaments(payload: (tidA: string, tidB: string | null) => unknown, awayAtTX: boolean, over: Partial<typeof P> = {}) {
+    const w = world({ layout: { TA: field('a', 2, 5000, 100) }, scope: persistenceScope(null), over });
+    let tid2: string | null = null;
+    if (awayAtTX) {
+      tid2 = w.tm.createTournament({ name: 'Second Cup', buyIn: 0, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: [{ sb: 100, bb: 200, ante: 0, duration: 600 }] } as any);
+      w.tm.registerPlayer(tid2, 'x-me', 'a1', 'reg-x-me', 101);
+      w.tm.registerPlayer(tid2, 'x-other', 'other', 'reg-x-other', 999);
+      expect(w.tm.startTournament(tid2)).toBeTruthy();
+      w.tm.setTableIds(tid2, ['TX']);
+      const tx = new PokerTable({ tableId: 'TX', tableName: 'TX', smallBlind: 100, bigBlind: 200, minBuyIn: 5000, maxBuyIn: 50000, maxPlayers: 9 } as any);
+      expect(tx.sitDown(0, 'a1', 5000, 'x-me', false, true)).toBe(true);
+      expect(tx.sitDown(1, 'other', 5000, 'x-other', false, true)).toBe(true);
+      w.tm.setPlayerTable(tid2, 'x-me', 'TX'); w.tm.setPlayerTable(tid2, 'x-other', 'TX');
+      w.tables.set('TX', tx); w.tournamentTables.set('TX', tid2);
+    }
+    const tab1 = w.seatLive('S-tab1', 'TA', 1, 101, 'm-a1');
+    const tab2 = w.wireSocket('S-tab2');
+    w.authSessions.set('S-tab2', { userId: 101, username: 'u101', masterUserId: 'm-a1' });
+    const acks: any[] = [];
+    await tab2.handlers.returnToTournamentSeat(payload(w.tid, tid2), (r: unknown) => acks.push(r));
+    await flush();
+    return {
+      ack: acks[0],
+      tab1Plays: w.playerSessions.get('S-tab1')?.tableId ?? null,
+      tab1Told: tab1.emitted.map(([ev]: [string]) => ev),
+      tab2Plays: w.playerSessions.get('S-tab2')?.tableId ?? null,
+      takeOvers: w.m.tournamentSeatKeep.returnTakeOvers,
+    };
+  }
+
+  it('no tournamentId, an away seat at TX and a live one at TA (tab 1): he is put back on TX — tab 1 keeps playing TA, untouched', async () => {
+    const r = await twoTournaments(() => ({}), true);
+    expect(r.ack).toMatchObject({ success: true, tableId: 'TX', seatIndex: 0 });
+    expect(r).toMatchObject({ tab1Plays: 'TA', tab1Told: [], tab2Plays: 'TX', takeOvers: 0 });
+  });
+
+  it('no tournamentId and NO away seat (his only seat is played by tab 1): no_tournament_seat — nothing guessed, tab 1 untouched', async () => {
+    const r = await twoTournaments(() => ({}), false);
+    expect(r.ack).toEqual({ success: false, code: 'no_tournament_seat', error: 'You have no seat waiting in a running tournament.' });
+    expect(r).toMatchObject({ tab1Plays: 'TA', tab1Told: [], tab2Plays: null, takeOvers: 0 });
+  });
+
+  it('a NAMED tournament is unchanged (P-c\'\' latest connection wins): naming TA\'s tournament takes the seat from tab 1, which is told', async () => {
+    const r = await twoTournaments((tidA) => ({ tournamentId: tidA }), true);
+    expect(r.ack).toMatchObject({ success: true, tableId: 'TA', seatIndex: 1 });
+    expect(r).toMatchObject({ tab1Plays: null, tab1Told: ['tournamentSeatTakenOver'], tab2Plays: 'TA', takeOvers: 1 });
+  });
+
+  it('CONTROL — round 6 (takeover with no tournamentId): tab 2 takes tab 1\'s LIVE TA seat while his TX seat stays away', async () => {
+    expect(P.returnToTournament).toContain(TAKE);
+    const over = { returnToTournament: P.returnToTournament.replace(TAKE, '    const takeOver = true;\n') };
+    const r = await twoTournaments(() => ({}), true, over);
+    expect(r).toMatchObject({ tab1Plays: null, tab1Told: ['tournamentSeatTakenOver'], tab2Plays: 'TA', takeOvers: 1 });
+  });
+});
+
+describe('Z5 — banUser on an entrant whose live socket PLAYS his tournament seat disqualifies that entry too (as IP-ban does): audited, never credited, never paid', () => {
+  const SEATED = "        try { if (leaveTournamentSeatOnAdminRemoval(s, 'admin_ban', auth.username, undefined, true)) seatedDisqualified++; } catch (e: any) {\n";
+  /** b2 plays TB seat 2 on his live socket S-b2; with `withCashSeat` his second socket S-c sits at a CASH table. The admin socket has the REAL handler. */
+  function seatedBanWorld(over: Partial<typeof P> = {}, withCashSeat = false) {
+    const ref: { w?: ReturnType<typeof world> } = {};
+    const banned = new Set<number>();
+    const w = world({
+      layout: { TA: field('a', 6, 5000, 100), TB: field('b', 5, 5000, 200) }, over,
+      scope: {
+        isUserAdmin: async (uid: number) => uid === 1,
+        socketsForUser: (uid: number) => [...ref.w!.authSessions].filter(([, a]) => a.userId === uid).map(([sid]) => sid),
+        banUserDB: async (uid: number) => { banned.add(uid); return true; },
+        isUserBanned: async (uid: number) => banned.has(uid),
+      },
+    });
+    ref.w = w;
+    const s = w.seatLive('S-b2', 'TB', 2, 202, 'm-b2');
+    let cash: PokerTable | null = null;
+    if (withCashSeat) {
+      cash = new PokerTable({ tableId: 'CASH-1', tableName: 'CASH-1', smallBlind: 10, bigBlind: 20, minBuyIn: 400, maxBuyIn: 4000, maxPlayers: 9 } as any);
+      expect(cash.sitDown(0, 'b2', 3000, 'user_202', false, true)).toBe(true);
+      expect(cash.sitDown(1, 'zed', 3000, 'user_900', false, true)).toBe(true);
+      w.tables.set('CASH-1', cash);
+      w.mkSocket('S-c');
+      w.authSessions.set('S-c', { userId: 202, username: 'u202', masterUserId: 'm-b2' });
+      w.playerSessions.set('S-c', { socketId: 'S-c', tableId: 'CASH-1', seatIndex: 0, playerName: 'b2', playerId: 'user_202', sittingOut: false });
+    }
+    w.mkSocket('S-admin');
+    w.authSessions.set('S-admin', { userId: 1, username: 'the.admin' });
+    const admin = w.wireSocket('S-admin');
+    return { w, s, admin, TB: w.tables.get('TB')!, banned, cash };
+  }
+
+  it('his seat is disqualified (no prize), stood up, its 5000 NEVER credited (audited); BAN_USER counts it; his socket is not kicked; a later Return is refused', async () => {
+    const { w, s, admin, TB, banned } = seatedBanWorld();
+    const before = w.chipsInPlay();
+    await admin.handlers.banUser({ userId: 202 });
+    expect(w.tm.getTournament(w.tid)!.players.find((p) => p.playerId === 'b2')!).toMatchObject({ eliminated: true, disqualified: true });
+    expect(TB.seats[2].state).toBe('empty');
+    expect(w.playerSessions.has('S-b2')).toBe(false);
+    expect(w.credits).toEqual([]);
+    expect(w.chipsInPlay()).toBe(before - 5000);
+    expect(w.audits).toContainEqual(expect.objectContaining({
+      actor: 'the.admin', action: 'TOURNAMENT_ENTRANT_DISQUALIFIED_BY_ADMIN',
+      d: expect.objectContaining({ via: 'admin_ban', playerId: 'b2', targetUserId: 202, disqualified: true, credited: 0 }),
+    }));
+    expect(w.audits.find((a) => a.action === 'TOURNAMENT_ENTRANT_DISQUALIFIED_BY_ADMIN')!.d.away).toBeUndefined();
+    expect(w.audits).toContainEqual(expect.objectContaining({ action: 'TOURNAMENT_STACK_NOT_CASHED', d: expect.objectContaining({ userId: 202, amount: 5000 }) }));
+    expect(w.audits).toContainEqual(expect.objectContaining({ action: 'BAN_USER', d: { targetUserId: 202, seatedTournamentEntriesDisqualified: 1, awayTournamentEntriesDisqualified: 0 } }));
+    expect(w.m.tournamentHandStartSafety).toMatchObject({ adminRemovalsDisqualified: 1, adminRemovalsAwayDisqualified: 0 });
+    expect(banned.has(202)).toBe(true);
+    expect(s.connected).toBe(true);
+    expect(s.emitted.map(([ev]: [string]) => ev)).not.toContain('kickedByAdmin');
+    const acks: any[] = [];
+    await w.wireSocket('S-b2').handlers.returnToTournamentSeat({ tournamentId: w.tid }, (r: unknown) => acks.push(r));
+    expect(acks[0]).toMatchObject({ success: false, code: 'player_suspended' });
+  });
+
+  it('CONTROL — round 6 (away entries only): his played seat is untouched; once he leaves it the seat is kept in play and he is never disqualified — he can still finish in the money', async () => {
+    expect(P.banUser).toContain(SEATED);
+    const { w, s, admin, TB } = seatedBanWorld({ banUser: P.banUser.replace(SEATED, '        try { void s; } catch (e: any) {\n') });
+    await admin.handlers.banUser({ userId: 202 });
+    expect(w.tm.getTournament(w.tid)!.players.find((p) => p.playerId === 'b2')!.eliminated).toBe(false);
+    expect(TB.seats[2]).toMatchObject({ state: 'occupied', chipCount: 5000 });
+    w.m.handlePlayerLeave(s);                                                 // Back to Lobby: kept absent, in play
+    expect(TB.seats[2]).toMatchObject({ state: 'occupied', chipCount: 5000 });
+    expect(w.tm.getTournament(w.tid)!.players.find((p) => p.playerId === 'b2')!.disqualified).toBeUndefined();
+  });
+
+  it('only a LIVE tournament seat: his CASH seat on another socket is left exactly as it was (never stood up, never credited; banUser never kicks)', async () => {
+    const { w, admin, TB, cash } = seatedBanWorld({}, true);
+    await admin.handlers.banUser({ userId: 202 });
+    expect(TB.seats[2].state).toBe('empty');                                  // the tournament seat: disqualified
+    expect(cash!.seats[0]).toMatchObject({ state: 'occupied', chipCount: 3000 });
+    expect(w.playerSessions.get('S-c')).toMatchObject({ tableId: 'CASH-1', seatIndex: 0 });
+    expect(w.credits).toEqual([]);
+    expect(w.audits).toContainEqual(expect.objectContaining({ action: 'BAN_USER', d: expect.objectContaining({ seatedTournamentEntriesDisqualified: 1 }) }));
+  });
+
+  it('wiring: banUser reads the account, then disqualifies the seats his sockets play, then the away entries, THEN writes the ban', () => {
+    const ban = handlerSrc('banUser', '\n  });\n');
+    const acct = ban.indexOf('await adminRemovalTargetAccount(banTargetId, socketsForUser(banTargetId))');
+    const seated = ban.indexOf("leaveTournamentSeatOnAdminRemoval(s, 'admin_ban', auth.username, undefined, true)");
+    const away = ban.indexOf("disqualifyAwayTournamentEntriesOnAdminRemoval(banAccount, 'admin_ban', auth.username)");
+    const write = ban.indexOf('await banUserDB(data.userId);');
+    expect({ order: acct > -1 && acct < seated && seated < away && away < write }).toEqual({ order: true });
+    expect(ban).not.toContain('s.disconnect(');
   });
 });

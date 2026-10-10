@@ -69,7 +69,8 @@ const CREDIT_SEAT = slice('function creditSeatStackToWallet(', '\n}\n');
 // P4 (2026-10-10): its seat reservation + extra-table cash-out are two functions
 // (shared with the account switch, releaseSocketForAccountSwitch); the handler
 // text is prefixed with them so it runs — and is mutated — as before.
-const DISCONNECT_HANDLER = slice('function reserveSeatForDeparture(', '\n}\n')
+const DISCONNECT_HANDLER = slice('function otherSessionHoldsSeat(', '\n}\n') // round-7 review: the disconnect re-validates the seat with it
+    + slice('function reserveSeatForDeparture(', '\n}\n')
     + slice('function cashOutAdditionalSeatsOnDeparture(', '\n}\n')
   + slice("socket.on('disconnect', async () => {", '\n  });', SRC.lastIndexOf("socket.on('disconnect', async () => {"));
 // handleHandComplete's tournament bust check (runs after tickReservedSeatHands). S1 (2026-10-10):

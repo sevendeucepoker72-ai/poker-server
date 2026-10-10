@@ -85,7 +85,8 @@ const P = {
   canStandUp: fnSrc('function suspendedSeatCanStandUp('),
   standUpSuspendedSeat: fnSrc('function standUpSuspendedSeat('),
   standUpAbsent: fnSrc('function standUpAbsentTournamentSeat('),
-  seatHasLiveSession: fnSrc('function seatHasLiveSession('),
+  // round-7 review: tokenLogin's orphan scan + the disconnect re-validation use otherSessionHoldsSeat.
+  seatHasLiveSession: fnSrc('function otherSessionHoldsSeat(') + fnSrc('function seatHasLiveSession('),
   isAbsentPastLimit: fnSrc('function isAbsentTournamentSeatPastHandLimit('),
   // Round 6 (2026-10-10): P-i / P-j — the absent auto-action (autoActForSeat) and "sitting out = absent".
   autoAct: slice('function seatHasPlayingSession(', "  t.playerFold(seatIndex);\n  return 'fold';\n}\n"),
@@ -1497,8 +1498,10 @@ describe('pe3 minor — oauthLogin\'s display-name orphan scan never hands a TOU
  */
 describe('P-i (round 6) — an absent tournament seat checks, limps at most ONE big blind only when every seat in the hand is absent, else folds; never all-in by a call', () => {
   const LIMP = 'if (absentTournamentSeatMayLimp(tableId, t, seatIndex, callAmt) && t.playerCall(seatIndex)) {';
-  const BOUND = 'if (!seat || callAmt <= 0 || callAmt > t.config.bigBlind || callAmt >= seat.chipCount) return false;';
-  const NO_RAISE = '  if (t.currentPhase !== GamePhase.PreFlop || t.currentBetToMatch > t.config.bigBlind) return false;\n';
+  const BOUND = 'if (!seat || callAmt <= 0 || callAmt > handBB || callAmt >= seat.chipCount) return false;';
+  const NO_RAISE = '  if (t.currentPhase !== GamePhase.PreFlop || t.currentBetToMatch > handBB) return false;\n';
+  // Z3 (2026-10-10): the ceiling is the big blind the HAND was dealt at.
+  const HAND_BB = 'const handBB = t.handBigBlind > 0 ? t.handBigBlind : t.config.bigBlind;';
   /** Plays ONE hand on the turn timer alone (nobody acts). Returns the folds and the auto-calls seen. */
   function playOnTimer(w: ReturnType<typeof world>) {
     const folds: number[] = [];
@@ -1602,7 +1605,7 @@ describe('P-i (round 6) — an absent tournament seat checks, limps at most ONE 
   });
 
   it('CONTROL — without the chip guard the same timeout puts him all-in', () => {
-    const { first, actions } = shortStackToAct({ autoAct: P.autoAct.replace(BOUND, 'if (!seat || callAmt <= 0 || callAmt > t.config.bigBlind) return false;') });
+    const { first, actions } = shortStackToAct({ autoAct: P.autoAct.replace(BOUND, 'if (!seat || callAmt <= 0 || callAmt > handBB) return false;') });
     expect(actions[0]).toEqual([first, PlayerAction.AllIn]);
   });
 
@@ -1611,7 +1614,7 @@ describe('P-i (round 6) — an absent tournament seat checks, limps at most ONE 
    * table and then her session ends; Bob, the big blind, owes just ONE big blind
    * more — still a raise.
    */
-  function bigBlindFacingMinRaise(over: Partial<typeof P> = {}) {
+  function bigBlindFacingMinRaise(over: Partial<typeof P> = {}, beforeTimer?: (t: PokerTable) => void) {
     const w = world({ tournament: true, seats: [[0, 'Alice', 7000, 'user_101'], [1, 'Bob', 5000, 'user_102']], over });
     const alice = w.seatLive('SA', ALICE, 0);
     expect(w.table.startNewHand()).toBe(true);
@@ -1623,6 +1626,7 @@ describe('P-i (round 6) — an absent tournament seat checks, limps at most ONE 
     w.m.handlePlayerLeave(alice);
     expect(w.table.activeSeatIndex).toBe(1);
     expect(w.table.currentBetToMatch - w.table.seats[1].currentBet).toBeLessThanOrEqual(50);   // ≤ 1 BB to call
+    if (beforeTimer) beforeTimer(w.table);
     const actions: Array<[number, PlayerAction]> = [];
     w.table.on('playerAction', (d: { seatIndex: number; action: PlayerAction }) => actions.push([d.seatIndex, d.action]));
     w.m.armTurnTimer('t1');
@@ -1640,6 +1644,64 @@ describe('P-i (round 6) — an absent tournament seat checks, limps at most ONE 
     expect(P.autoAct).toContain(NO_RAISE);
     const { actions } = bigBlindFacingMinRaise({ autoAct: P.autoAct.replace(NO_RAISE, '') });
     expect(actions[0]).toEqual([1, PlayerAction.Call]);
+  });
+
+  /** The blindLevelUp handlers' own mutation (index.ts), applied to the live table mid-hand: 25/50 -> 50/100. */
+  const LEVEL_UP_SRC = 't.config.smallBlind = data.sb;\n        t.config.bigBlind = data.bb;';
+  const levelUpMidHand = (t: PokerTable) => { t.config.smallBlind = 50; t.config.bigBlind = 100; };
+
+  it('Z3: a blind level-up DURING the hand (config.bigBlind doubled) never widens the limp — facing a min-raise the absent seat still FOLDS', () => {
+    expect(SRC).toContain(LEVEL_UP_SRC);                                        // the real handlers rewrite the live config mid-hand
+    expect(P.autoAct).toContain(HAND_BB);
+    const { w, actions } = bigBlindFacingMinRaise({}, levelUpMidHand);
+    expect(w.table.config.bigBlind).toBe(100);
+    expect(w.table.handBigBlind).toBe(50);                                      // captured when the hand was dealt
+    expect(actions[0]).toEqual([1, PlayerAction.Fold]);
+    expect(w.m.tournamentHandStartSafety.allAbsentAutoCalls).toBe(0);
+  });
+
+  it('CONTROL — the pre-Z3 ceiling (the LIVE config.bigBlind): after the same level-up the absent seat CALLS the raise (pe6 RV6_F1)', () => {
+    const { actions } = bigBlindFacingMinRaise({ autoAct: P.autoAct.replace(HAND_BB, 'const handBB = t.config.bigBlind;') }, levelUpMidHand);
+    expect(actions[0]).toEqual([1, PlayerAction.Call]);
+  });
+
+  it('Z3: the level-up does not stop the limp of the blind itself — every seat away, the hand still limps / checks down to showdown at the hand\'s own level (<= 50)', () => {
+    const w = world({ tournament: true });
+    const before = total(w);
+    const amounts: number[] = [];
+    w.table.on('playerAction', (d: { action: PlayerAction; amount?: number }) => { if (d.action === PlayerAction.Call) amounts.push(d.amount || 0); });
+    expect(w.table.startNewHand()).toBe(true);
+    levelUpMidHand(w.table);
+    for (let g = 0; g < 40 && w.table.isHandInProgress(); g++) {
+      w.m.armTurnTimer('t1');
+      jest.advanceTimersByTime(TURN_TIMEOUT_MS);
+    }
+    expect(w.table.wentToShowdown).toBe(true);
+    expect(amounts.length).toBeGreaterThan(0);
+    expect(Math.max(...amounts)).toBeLessThanOrEqual(50);
+    expect(total(w)).toBe(before);
+  });
+
+  it('PokerTable: handBigBlind is the level a hand was DEALT at; the next hand takes the new level; a snapshot carries it (an older one reads 0)', () => {
+    const t = new PokerTable({ tableId: 'z3', tableName: 'z3', smallBlind: 25, bigBlind: 50, minBuyIn: 1000, maxBuyIn: 10000, maxPlayers: 9 } as any);
+    expect(t.sitDown(0, 'A', 5000, 'pa', false, true)).toBe(true);
+    expect(t.sitDown(1, 'B', 5000, 'pb', false, true)).toBe(true);
+    expect(t.handBigBlind).toBe(0);
+    expect(t.startNewHand()).toBe(true);
+    levelUpMidHand(t);
+    expect(t.handBigBlind).toBe(50);
+    const snap: any = t.serializeSnapshot();
+    expect(snap.handBigBlind).toBe(50);
+    const t2 = new PokerTable({ tableId: 'z3', tableName: 'z3', smallBlind: 50, bigBlind: 100, minBuyIn: 1000, maxBuyIn: 10000, maxPlayers: 9 } as any);
+    t2.rehydrateFromSnapshot(snap);
+    expect(t2.handBigBlind).toBe(50);
+    delete snap.handBigBlind;
+    t2.rehydrateFromSnapshot(snap);
+    expect(t2.handBigBlind).toBe(0);
+    for (let g = 0; g < 20 && t.isHandInProgress(); g++) t.playerFold(t.activeSeatIndex);
+    expect(t.isHandInProgress()).toBe(false);
+    expect(t.startNewHand()).toBe(true);
+    expect(t.handBigBlind).toBe(100);
   });
 
   it('a PRESENT player in the hand (live session): the absent seats fold facing a bet (no limp)', () => {
@@ -1773,5 +1835,109 @@ describe('W1 / P-c\' (round 5, server side) — a Return lost with its transport
     expect(acks2).toEqual([{ success: true, tournamentId: w.tid, tableId: 't1', seatIndex: 0 }]);
     expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
     expect(w.credits).toEqual([]);
+  });
+});
+
+// ── Z6 (2026-10-10, pe6 nit) — a departure ON his turn checks when a check is free ──
+describe('Z6 — a leave / disconnect on his own turn CHECKS when a check is free and FOLDS only facing a bet (consistent with P-i)', () => {
+  const ACT = '    if (!(owed <= 0 && table.playerCheck(session.seatIndex))) table.playerFold(session.seatIndex);\n';
+  /** Heads-up, both live: the first to act pre-flop (the button / small blind) calls or min-raises; then it is the big blind's turn. */
+  function bigBlindToAct(tournament: boolean, first: 'call' | 'raise', over: Partial<typeof P> = {}) {
+    const w = world({ tournament, seats: [[0, 'Alice', 7000, 'user_101'], [1, 'Bob', 5000, 'user_102']], over });
+    const sa = w.seatLive('SA', ALICE, 0);
+    const sb = w.seatLive('SB', 102, 1);
+    expect(w.table.startNewHand()).toBe(true);
+    const btn = w.table.activeSeatIndex;
+    const bb = 1 - btn;
+    if (first === 'call') expect(w.table.playerCall(btn)).toBe(true);
+    else expect(w.table.playerRaise(btn, 100)).toBe(true);
+    expect(w.table.activeSeatIndex).toBe(bb);
+    const chips = () => w.table.seats.reduce((n, x) => n + x.chipCount + (x.totalInvestedThisHand || 0), 0);
+    return { w, bb, sock: bb === 0 ? sa : sb, uid: bb === 0 ? ALICE : 102, chips, before: chips() };
+  }
+
+  it('cash, his socket drops with the big blind\'s OPTION (nothing to call): CHECKED — the hand goes on to the flop with his seat in it (reserved); no chip moves', async () => {
+    const { w, bb, sock, uid, chips, before } = bigBlindToAct(false, 'call');
+    await w.drop(sock);
+    expect(w.table.seats[bb].folded).toBe(false);
+    expect(w.table.isHandInProgress()).toBe(true);
+    expect(w.table.currentPhase).toBe(GamePhase.Flop);
+    expect(w.reservedSeats.get(uid)).toMatchObject({ tableId: 't1', seatIndex: bb });
+    expect(chips()).toBe(before);
+    expect(w.credits).toEqual([]);
+  });
+
+  it('cash, his socket drops FACING a raise: FOLDED, as before (the hand ends)', async () => {
+    const { w, bb, sock } = bigBlindToAct(false, 'raise');
+    await w.drop(sock);
+    expect(w.table.seats[bb].folded).toBe(true);
+    expect(w.table.isHandInProgress()).toBe(false);
+  });
+
+  it('CONTROL — pre-Z6 (fold whatever is owed): the same free check is FOLDED — the pot handed to the other player', async () => {
+    expect(P.departure).toContain(ACT);
+    const { w, bb, sock } = bigBlindToAct(false, 'call', { departure: P.departure.replace(ACT, '    table.playerFold(session.seatIndex);\n') });
+    await w.drop(sock);
+    expect(w.table.seats[bb].folded).toBe(true);
+    expect(w.table.isHandInProgress()).toBe(false);
+  });
+
+  it('tournament, Back to Lobby with the big blind\'s option (the voluntary keep): CHECKED — the kept seat stays in the hand; nothing credited', () => {
+    const { w, bb, sock, uid, chips, before } = bigBlindToAct(true, 'call');
+    w.m.handlePlayerLeave(sock);
+    expect(w.playerSessions.has(bb === 0 ? 'SA' : 'SB')).toBe(false);
+    expect(w.table.seats[bb]).toMatchObject({ state: 'occupied', folded: false });
+    expect(w.table.currentPhase).toBe(GamePhase.Flop);
+    expect(w.reservedSeats.get(uid)).toMatchObject({ tableId: 't1', seatIndex: bb, voluntary: true });
+    expect(chips()).toBe(before);
+    expect(w.credits).toEqual([]);
+  });
+
+  it('tournament, Back to Lobby FACING a raise: folded (kept, out of this hand only)', () => {
+    const { w, bb, sock } = bigBlindToAct(true, 'raise');
+    w.m.handlePlayerLeave(sock);
+    expect(w.table.seats[bb]).toMatchObject({ state: 'occupied', folded: true });
+  });
+
+  it('wiring: the keep\'s unreserved branch acts the same way; a cash LEAVE (the seat is torn down) still folds', () => {
+    expect(P.seatKeep).toContain('      if (!(owed <= 0 && table.playerCheck(session.seatIndex))) table.playerFold(session.seatIndex);\n');
+    expect(P.handlePlayerLeave).toContain('      if (table.activeSeatIndex === session.seatIndex) {\n        table.playerFold(session.seatIndex);\n');
+  });
+});
+
+// ===================== 2026-10-10 round-7 review — two sessions on one seat =====================
+describe('round-7 review (major) — a seat is never played by two sessions; a stale disconnect never acts for a seat someone plays', () => {
+  const sessionsOnSeat = (w: any, tableId: string, seatIndex: number) =>
+    [...w.playerSessions.entries()].filter(([, s]: any) => s.tableId === tableId && s.seatIndex === seatIndex).map(([sid]: any) => sid);
+
+  it('tokenLogin\'s orphan-seat scan never binds a SECOND session to a seat a live session plays (as oauthLogin\'s)', async () => {
+    const w = world({ seats: [[0, 'Alice', 7000, 'user_101'], [1, 'Bob', 5000, 'user_102']] });
+    w.seatLive('S1', ALICE, 0);
+    w.seatLive('SB', 102, 1);
+    const s2 = w.mkSocket('S2');
+    await s2.handlers.tokenLogin({ token: 'oidc-alice' });
+    await flush();
+    expect(sessionsOnSeat(w, (w.playerSessions.get('S1') as any).tableId, 0)).toEqual(['S1']);
+    expect(w.playerSessions.get('S2')).toBeUndefined();
+  });
+
+  it('a disconnect whose seat ANOTHER socket now plays neither reserves it nor acts for it (her live hand is untouched)', async () => {
+    const w = world({ seats: [[0, 'Alice', 7000, 'user_101'], [1, 'Bob', 5000, 'user_102']] });
+    const s1 = w.seatLive('S1', ALICE, 0);
+    w.seatLive('SB', 102, 1);
+    expect(w.table.startNewHand()).toBe(true);
+    // However it got there, a second live session now plays seat 0.
+    const tableId = (w.playerSessions.get('S1') as any).tableId;
+    const s2 = w.mkSocket('S2');
+    w.playerSessions.set('S2', { ...(w.playerSessions.get('S1') as any), socketId: 'S2' });
+    w.authSessions.set('S2', { ...(w.authSessions.get('S1') as any) });
+    if (w.table.activeSeatIndex === 1) expect(w.table.playerRaise(1, 200)).toBe(true);
+    expect(w.table.activeSeatIndex).toBe(0);
+    await w.drop(s1);
+    await flush();
+    expect(w.table.seats[0].folded).toBe(false);          // not folded for her
+    expect(w.reservedSeats.has(ALICE)).toBe(false);        // no stale reservation on the seat S2 plays
+    expect(sessionsOnSeat(w, tableId, 0)).toEqual(['S2']); // S2 still plays it
+    void s2;
   });
 });

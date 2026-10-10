@@ -39,7 +39,8 @@ const P = {
   autoStart: fnSrc('function autoStartNextHand(tableId: string): void {'),
   // P4 (2026-10-10): its seat reservation + extra-table cash-out are two functions
   // (shared with the account switch); the handler text is prefixed with them.
-  disconnect: slice('function reserveSeatForDeparture(', '\n}\n')
+  disconnect: slice('function otherSessionHoldsSeat(', '\n}\n')
+    + slice('function reserveSeatForDeparture(', '\n}\n')
     + slice('function cashOutAdditionalSeatsOnDeparture(', '\n}\n')
     + slice("socket.on('disconnect', async () => {", '\n  });', SRC.lastIndexOf("socket.on('disconnect', async () => {")),
 };
@@ -134,21 +135,20 @@ beforeEach(() => { jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 
 afterEach(() => { jest.clearAllTimers(); jest.useRealTimers(); });
 
 describe('F2 — a disconnect / leave in the break window never credits a tournament stack', () => {
-  it('disconnect in the window: the reservation is a TOURNAMENT one; at the 6h expiry NOTHING is credited (audited, kept in play on T2)', async () => {
+  it('disconnect in the window: NO reservation on the broken table (round-7 review), NOTHING is ever credited, the seat stays in play on T2', async () => {
     const w = world();
     breakT1(w);
     expect(w.m.isTournamentTable('T1')).toBe(true);
     await w.drop();
-    const r = w.reservedSeats.get(ALICE);
-    expect(r).toMatchObject({ tableId: 'T1', tournament: true });
-    expect(w.m.isTournamentReservation(r)).toBe(true);
+    // Round-7 review (#6): the broken table's leftover copy is not his seat —
+    // a reservation there would let a reconnect inside the 5s removal window
+    // restore onto it. His seat (moved to T2) comes back by account (S2).
+    expect(w.reservedSeats.has(ALICE)).toBe(false);
     jest.advanceTimersByTime(5000);                                       // the broken table is removed
     expect(w.tables.has('T1')).toBe(false);
-    jest.advanceTimersByTime(SEAT_RESERVE_MS);                            // the reservation expires
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);
     await flush();
     expect(w.credits).toEqual([]);
-    expect(w.reservedSeats.has(ALICE)).toBe(false);
-    expect(w.notCashed()).toEqual([expect.objectContaining({ userId: ALICE, reason: 'reserve_expiry', seatKept: true })]);
     expect(w.tables.get('T2')!.seats.find((s) => s.playerId === 'p-alice')!.state).toBe('occupied');
   });
 
@@ -223,7 +223,10 @@ describe('P8 (2026-10-10) — broken-table retention is by TIME, not "until the 
 describe('F2 — CONTROL: deciding by tournamentTables alone (pre-F2) MINTS the stack', () => {
   it('disconnect in the window → reservation tournament:false → the 6h expiry credits 7,000 that are still in play on T2', async () => {
     const w = world({
-      disconnect: P.disconnect.replace('tournament: isTournamentTable(session.tableId),', 'tournament: tournamentTables.has(session.tableId),'),
+      disconnect: P.disconnect
+        .replace('tournament: isTournamentTable(session.tableId),', 'tournament: tournamentTables.has(session.tableId),')
+        // (round-7 review: a disconnect no longer reserves a broken table at all — the control removes that too)
+        .replace('const brokeMeanwhile = brokenTournamentTables.has(session.tableId) && !tournamentTables.has(session.tableId);', 'const brokeMeanwhile = false;'),
       isTournamentReservation: P.isTournamentReservation.replace('isTournamentTable(reserved.tableId)', 'tournamentTables.has(reserved.tableId)'),
     });
     breakT1(w);
