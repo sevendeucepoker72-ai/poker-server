@@ -498,11 +498,17 @@ function failLogin(
      * a socket failure. Old clients keep the old wire shape.
      */
     onlyWhenAttributed?: boolean;
+    /**
+     * 2026-10-10 — ADDITIVE fields on the `loginResult` failure frame (older
+     * clients ignore unknown keys), e.g. the waitlist link's
+     * `cancelCode: 'buy_in_cancelled'`. Never a token, claim value or name.
+     */
+    extra?: Record<string, string | number | boolean>;
   }
 ): void {
   const rid = normalizeRequestId(opts.requestId);
   if (!opts.onlyWhenAttributed || rid) {
-    socket.emit('loginResult', buildLoginFailure(opts.code, opts.message, rid));
+    socket.emit('loginResult', { ...buildLoginFailure(opts.code, opts.message, rid), ...(opts.extra || {}) });
   }
   const detail = {
     stage: 'socket_login', code: opts.code, via: opts.via, ...(opts.detail || {}),
@@ -910,6 +916,12 @@ const turnStartedSeatMap = new Map<string, number>();
 // would skip arming the timer — leaving an unresponsive first actor able to
 // stall the table forever. Comparing handNumber catches that case.
 const turnStartedHandMap = new Map<string, number>();
+// Round 6 (2026-10-10) — the STREET the turn timer was last armed for. The
+// same gap one street later: heads-up the big blind acts LAST pre-flop and
+// FIRST on the flop — same seat, same hand — so the timer was never re-armed:
+// an absent big blind (P-i / P-j) waited for the wedge watchdog (20-35s), and a
+// present one was acted for on the flop with what was left of his pre-flop clock.
+const turnStartedPhaseMap = new Map<string, string>();
 
 // Delta state tracking: socketId -> last full state sent to that client
 const lastSentState = new Map<string, Record<string, any>>();
@@ -1535,6 +1547,20 @@ interface BuyInExpectation {
 }
 const buyInsOnStaleState = { abandoned: 0, refunded: 0, refundFailed: 0 };
 const BUY_IN_CANCELLED_MESSAGE = 'Your table changed before your buy-in went through, so it was cancelled — any chips taken were returned. Please try again.';
+/**
+ * M4 (2026-10-10) — the same cancellation on the WAITLIST deep link. Not
+ * retryable: its ticket was burned on receipt (a retry of the same link is
+ * answered ticket_replayed), so the player is told to tap Play Online in the
+ * app again for a new link — never "try again".
+ */
+const WAITLIST_BUY_IN_CANCELLED_MESSAGE = 'Your table changed before your seat was confirmed, so it was cancelled — any chips taken were returned. Tap Play Online in the American Pub Poker app again for a new link.';
+/**
+ * 2026-10-10 (pe3 minor) — the machine-readable code of that cancellation, an
+ * extra field (`cancelCode`) on the waitlist failure's `error` AND
+ * `loginResult` frames: poker-3d maps on it first (its text match second), so
+ * the player is told his chips were returned whatever the sentence says.
+ */
+const WAITLIST_BUY_IN_CANCEL_CODE = 'buy_in_cancelled';
 function buyInStateChanged(socket: Socket, expect: BuyInExpectation): string | null {
   if (expect.userId !== undefined && authSessions.get(socket.id)?.userId !== expect.userId) return 'user_changed';
   if (expect.mainSession !== undefined) {
@@ -1994,7 +2020,15 @@ function syncSitOutToTable(tableId: string): void {
     }
   }
   sitOutTracker.set(tableId, set);
-  table.setSittingOutSeats(set);
+  // P-j (S2 protocol, round 6) — on a TOURNAMENT table sitting out never takes
+  // a seat out of the deal: the engine sees NO sitting-out seat, so the seat is
+  // dealt in and posts its blinds / antes live (no dead-blind debt) and is
+  // acted for as ABSENT (autoActForSeat, short clock — tournamentSeatSitsOut).
+  // Before, a sitting-out seat was never dealt or blinded: a heads-up with one
+  // never dealt again and the tournament could not finish (pe5 X3; with S2 a
+  // Back to Lobby while sitting out made it permanent). The tracker still
+  // records the seat (the player's own Sit Out state). Cash tables: unchanged.
+  table.setSittingOutSeats(isTournamentTable(tableId) ? [] : set);
 }
 
 // Track AI profiles per table
@@ -2025,6 +2059,14 @@ interface ReservedSeat {
    * by it (no socket, no session left to read it from).
    */
   masterUserId?: string | null;
+  /**
+   * 2026-10-10 (S2 fixed protocol, P-b) — a TOURNAMENT seat the player LEFT on
+   * purpose (keepTournamentSeatOnLeave, kind 'voluntary'). No sign-in ever
+   * auto-restores it (oauthLogin / tokenLogin ×2 / resumeSession skip it and
+   * leave it intact); he comes back only with `returnToTournamentSeat`. A
+   * disconnect's reservation never carries it (today's auto-restore).
+   */
+  voluntary?: boolean;
 }
 const reservedSeats = new Map<number, ReservedSeat>();
 
@@ -2115,6 +2157,17 @@ function noteBrokenTournamentTable(tableId: string, tournamentId: string): void 
   const now = Date.now();
   pruneBrokenTournamentTables(now);
   brokenTournamentTables.set(tableId, { tournamentId, brokenAt: now });
+}
+/**
+ * 2026-10-10 (S2 fixed protocol, P-b / P-d) — the tournament a table belongs
+ * to, for what is TOLD to a client (gameState `tournamentId`, the reservation
+ * path's `reconnectedToTable.tournamentId`): a live tournament table, else one
+ * a rebalance broke (F2). undefined = a cash table.
+ */
+function tournamentIdOfTable(tableId: string): string | undefined {
+  const live = tournamentTables.get(tableId);
+  if (live) return live;
+  return isTournamentTable(tableId) ? brokenTournamentTables.get(tableId)?.tournamentId : undefined;
 }
 /**
  * F2 — THE "is this a tournament table?" test for every decision about
@@ -2365,6 +2418,30 @@ app.get('/api/health', async (_req, res) => {
         // longer the registrant's: rebound = seat bound to his own other
         // socket, unbound = dealt in absent (bindRegistrantSocket).
         registrantSockets: { ...registrantBindings },
+        // 2026-10-10 (S2) — leaves from a live tournament seat that kept it in
+        // play, absent (keptVoluntary = the player's own leave, P-a;
+        // keptUnreserved = his reservation slot held another seat's), seats
+        // given back (returnToTournamentSeat / a sign-in by account — never a
+        // voluntary one, P-b), refused returns, signInNotices = voluntary seats
+        // a sign-in TOLD about instead of restoring (tournamentSeatKept),
+        // returnAlreadyThere = a Return for the seat the socket held again;
+        // returnAfterFinish = a Return answered tournamentFinished (P-h);
+        // returnTakeOvers = a Return that took the seat from another live
+        // socket of the same account (P-c'', round 6 — latest connection wins).
+        seatsKeptOnLeave: { ...tournamentSeatKeep },
+        // Fixed protocol: P-e eliminationsToSocketSeatedElsewhere, V4
+        // absentSeatsMovedNotified and P-f adminRemovalsDisqualified are in
+        // the counters above (round 5: eliminationsToAwaySocket,
+        // adminRemovalsAwayDisqualified, allAbsentAutoCalls too).
+        // Round 5 — P-g: sockets taken off other tables' spectating / rooms
+        // when they took a seat or started watching a table (calls; how many
+        // spectator views ended; how many rooms were left). P-h: finished-
+        // tournament notices (room broadcasts; tournamentFinishedForEntrant
+        // to entrants' sockets outside those rooms — P-h', round 6). Round 6:
+        // deadSeatSessionsEnded = busted tournament seats' sessions a detach
+        // ended (pe5 X5).
+        tableViewDetaches: { ...tableViewDetaches },
+        tournamentFinishedNotices: { ...tournamentFinishedNotices },
       },
       // 2026-10-09 — R1 resumable ticket sessions. enabled:false = JWT_SECRET
       // missing in prod (tokens would be forgeable) — every resume refused.
@@ -3190,6 +3267,18 @@ function getGameStateForPlayer(
     stateObj.ante = table.config.ante;
   }
 
+  // 2026-10-10 (S2 fixed protocol, P-d) — a TOURNAMENT table says so in every
+  // full state: `isTournament: true` + its `tournamentId` (a live tournament
+  // table, or one a rebalance just broke). poker-3d recognises a tournament
+  // seat after a reload from these (PokerTable2D + its tournament-seat store:
+  // the leave dialog, Return to tournament). ALWAYS emitted — `false` / `null`
+  // on a cash table — so the per-socket delta (shallowDiff) clears them when
+  // the same socket moves from a tournament table to a cash one; an absent
+  // key would leave the client's merged `true` in place.
+  const stateTournamentId = tournamentIdOfTable(table.config.tableId) ?? null;
+  stateObj.isTournament = !!stateTournamentId;
+  stateObj.tournamentId = stateTournamentId;
+
   // Add missed-blind info for this player. Now sourced directly from the
   // seat object (seat.deadBlindOwedChips + seat.missedBlind) — single
   // source of truth after the audit refactor.
@@ -3319,6 +3408,75 @@ function isAbsentTournamentSeatPastHandLimit(tableId: string, seatIndex: number)
   return false;
 }
 
+/**
+ * P-j (S2 protocol, round 6) — a session at this seat that PLAYS it: one that
+ * is not sitting out. On a TOURNAMENT table a seat with no such session is
+ * ABSENT — nobody there (Back to Lobby, a disconnect) or its player sits out
+ * (Sit Out, the client's AFK tracker): it stays in the deal (syncSitOutToTable)
+ * and is acted for on the absent clock by autoActForSeat.
+ */
+function seatHasPlayingSession(tableId: string, seatIndex: number): boolean {
+  for (const s of playerSessions.values()) {
+    if (s.tableId === tableId && s.seatIndex === seatIndex && !s.sittingOut) return true;
+  }
+  return false;
+}
+
+/** P-j — a TOURNAMENT seat whose session sits out (absent, short clock). */
+function tournamentSeatSitsOut(tableId: string, seatIndex: number): boolean {
+  return isTournamentTable(tableId) && seatHasLiveSession(tableId, seatIndex) && !seatHasPlayingSession(tableId, seatIndex);
+}
+
+/**
+ * P-i (S2 protocol, round 6 — replaces round 5's unbounded all-absent call) —
+ * may the server CALL for this ABSENT tournament seat? Only to complete the
+ * big blind pre-flop (a limp: at most ONE big blind, nothing raised) leaving
+ * it chips behind (never all-in by a call, never a raise, a bet or a shove),
+ * and only when EVERY seat still in the hand (occupied, dealt in, not folded
+ * — all-ins included, this seat included) is absent too: no AI, no session
+ * playing it. So an all-absent hand limps / checks down to
+ * showdown and the forced blinds bust someone in the end (round 5's stall:
+ * check-or-fold alone folded the small blind to the big blind forever), while
+ * an absent player is never called into a bet (pe5 X2: a shove followed by
+ * Back to Lobby called the other absent stack all-in). Cash tables: never.
+ */
+function absentTournamentSeatMayLimp(tableId: string, t: PokerTable, seatIndex: number, callAmt: number): boolean {
+  if (!isTournamentTable(tableId) || !t.isHandInProgress()) return false;
+  const seat = t.seats[seatIndex];
+  if (!seat || callAmt <= 0 || callAmt > t.config.bigBlind || callAmt >= seat.chipCount) return false;
+  // Only the BLIND is ever limped: pre-flop, with nothing above the big blind
+  // to match — never a raise (the big blind facing a min-raise owes just one
+  // big blind more), a post-flop bet or a shove. (Tournament tables are
+  // Hold'em; absent seats never bet, so an all-absent hand still checks down.)
+  if (t.currentPhase !== GamePhase.PreFlop || t.currentBetToMatch > t.config.bigBlind) return false;
+  for (let i = 0; i < MAX_SEATS; i++) {
+    const s = t.seats[i];
+    if (!s || s.state !== 'occupied' || s.folded || !(s.holeCards && s.holeCards.length > 0)) continue;
+    if (s.isAI || seatHasPlayingSession(tableId, i)) return false;
+  }
+  return true;
+}
+
+/**
+ * P-i — THE action the server takes for a seat it acts for (the turn timeout,
+ * the 500ms orphan auto-act, a tournament Sit Out on the clock): CHECK when
+ * nothing is owed; CALL only what absentTournamentSeatMayLimp allows; else
+ * FOLD. A refused call folds. Cash tables: check-or-fold, as always.
+ */
+function autoActForSeat(tableId: string, t: PokerTable, seatIndex: number): 'check' | 'call' | 'fold' {
+  const callAmt = t.currentBetToMatch - (t.seats[seatIndex]?.currentBet || 0);
+  if (callAmt <= 0) {
+    t.playerCheck(seatIndex);
+    return 'check';
+  }
+  if (absentTournamentSeatMayLimp(tableId, t, seatIndex, callAmt) && t.playerCall(seatIndex)) {
+    tournamentHandStartSafety.allAbsentAutoCalls++;
+    return 'call';
+  }
+  t.playerFold(seatIndex);
+  return 'fold';
+}
+
 function armTurnTimer(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
@@ -3327,7 +3485,8 @@ function armTurnTimer(tableId: string): void {
     const activeSeat = table.activeSeatIndex;
     const priorSeatForStart = turnStartedSeatMap.get(tableId);
     const handChanged = turnStartedHandMap.get(tableId) !== table.handNumber;
-    const seatChanged = priorSeatForStart !== activeSeat || handChanged;
+    const streetChanged = turnStartedPhaseMap.get(tableId) !== String(table.currentPhase);
+    const seatChanged = priorSeatForStart !== activeSeat || handChanged || streetChanged;
     const inDrawPhase = DrawPhases.includes(table.currentPhase);
 
     if (seatChanged || inDrawPhase) {
@@ -3344,15 +3503,17 @@ function armTurnTimer(tableId: string): void {
       turnStartedAtMap.set(tableId, turnStartedAt);
       turnStartedSeatMap.set(tableId, activeSeat);
       turnStartedHandMap.set(tableId, table.handNumber);
+      turnStartedPhaseMap.set(tableId, String(table.currentPhase));
       // U4 — an absent tournament seat past its reservation's hand limit acts
-      // on a short clock. Re-checked when it fires: a player who reconnected
-      // meanwhile (a live session on the seat) gets the REST of the normal
-      // clock instead of being acted for.
-      const shortClock = isAbsentTournamentSeatPastHandLimit(tableId, activeSeat);
+      // on a short clock; P-j (round 6) — so does a tournament seat whose
+      // player sits out. Re-checked when it fires: a player who reconnected or
+      // sat back in meanwhile (a session PLAYING the seat) gets the REST of the
+      // normal clock instead of being acted for.
+      const shortClock = isAbsentTournamentSeatPastHandLimit(tableId, activeSeat) || tournamentSeatSitsOut(tableId, activeSeat);
       const onTurnTimeout = (short: boolean) => (): void => {
         const entry = turnTimers.get(tableId);
         if (!entry || entry.turnId !== turnId) return;
-        if (short && seatHasLiveSession(tableId, activeSeat)) {
+        if (short && seatHasPlayingSession(tableId, activeSeat)) {
           entry.timeout = setTimeout(onTurnTimeout(false), Math.max(0, TURN_TIMEOUT_MS - (Date.now() - turnStartedAt)));
           return;
         }
@@ -3362,13 +3523,10 @@ function armTurnTimer(tableId: string): void {
         if (DrawPhases.includes(t.currentPhase)) return;
         const seat = t.seats[activeSeat];
         if (!seat || !seat.playerName || seat.folded) return;
-        const callAmt = t.currentBetToMatch - (seat.currentBet || 0);
-        log.debug(`[Timer] Seat ${activeSeat} (${seat.playerName}) timed out — ${callAmt > 0 ? 'folding' : 'checking'}`);
-        if (callAmt > 0) {
-          t.playerFold(activeSeat);
-        } else {
-          t.playerCheck(activeSeat);
-        }
+        // P-i — check, an absent seat's ≤1 BB limp in an all-absent hand
+        // (all_absent_hand_auto_call), else fold.
+        const did = autoActForSeat(tableId, t, activeSeat);
+        log.debug(`[Timer] Seat ${activeSeat} (${seat.playerName}) timed out — ${did}${did === 'call' ? ' (all_absent_hand_auto_call)' : ''}`);
         broadcastGameState(tableId);
         scheduleAIAction(tableId);
       };
@@ -3510,12 +3668,8 @@ function broadcastGameState(tableId: string): void {
             (r) => r.tableId === tableId && r.seatIndex === activeIdx && r.expiresAt > Date.now()
           );
           if (nowHasLiveSession || seatReserved) return;
-          const callAmt = t.currentBetToMatch - (t.seats[activeIdx]?.currentBet || 0);
-          if (callAmt <= 0) {
-            t.playerCheck(activeIdx);
-          } else {
-            t.playerFold(activeIdx);
-          }
+          // P-i — check, an absent seat's ≤1 BB limp in an all-absent tournament hand, else fold.
+          autoActForSeat(tableId, t, activeIdx);
           broadcastGameState(tableId);
           // #4: if this auto-act advanced into a draw phase, arm the draw clock
           // / next AI turn (see the turn-timer callback note above).
@@ -3734,7 +3888,13 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         }
       }
     }
-    handleHandComplete(tableId, data.results);
+    // S1 (2026-10-10) — not awaited (as before), but never left unhandled: a
+    // handler that THREW must not leave this hand's tournament bust check —
+    // and so this table's next deal — waiting for the stale backstop.
+    handleHandComplete(tableId, data.results).catch((e: any) => {
+      console.error(`[hand-complete] handler failed on ${tableId} — running its tournament bust check now:`, e?.message || e);
+      runPendingTournamentBustChecks(tableId, 'hand_complete_threw');
+    });
     // Prediction games (3c): settle open market bets + spectator picks for
     // this hand from the AUTHORITATIVE final table state, then push results.
     // Runs before processPendingSeatRemovals so seat.allIn flags are still set.
@@ -4450,6 +4610,19 @@ function autoStartNextHand(tableId: string): void {
     return;
   }
   if (tId) {
+    // S1 (2026-10-10) — never deal before this table's bust check has run
+    // (handleHandComplete runs it only after its per-player DB awaits): the
+    // deal would flag the 0-chip seat eliminated on the table only and the
+    // entrant would stay alive in the tournament forever. Re-scheduled here;
+    // the bust check re-kicks the table when it runs (the stale capture is run
+    // by the guard itself after TOURNAMENT_BUST_CHECK_STALE_MS).
+    if (tournamentDealWaitsForBustCheck(tableId, tId, table)) {
+      holdTournamentDealForBustCheck(tableId, tId);
+      return;
+    }
+    // A bust check the guard ran just now may have broken THIS table (its
+    // players were moved) — it never deals again.
+    if (tournamentTables.get(tableId) !== tId) return;
     // P1 (2026-10-10) — a table break DEFERRED because this table was mid-hand
     // runs here, at its hand boundary, before it deals again.
     if (tournamentBreaksAwaitingHandEnd.get(tableId) === tId) {
@@ -4979,6 +5152,12 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     broadcastGameState(tableId); // reflect the adjusted stack to all clients
   }
 
+  // S1 (2026-10-10) — capture this hand's tournament bust check NOW, before
+  // the first await below: until it runs, this table does not deal again
+  // (tournamentDealWaitsForBustCheck), and what it needs (pot winners, pre-hand
+  // stacks, the 0-chip seats) is read before anything can change the table.
+  const tournamentBustCheck = captureTournamentBustCheck(tableId, table, results);
+
   for (const session of humanSessions) {
     // Everyone who played gets recordHandPlayed + 5 XP. Pass variantId
     // so lifetime "all_variants" + daily/weekly variety achievements
@@ -5074,6 +5253,10 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // below, leaving a 0-chip entrant alive in the tournament forever — and the
   // rebalance now waits for exactly that bust check before breaking his table
   // (pendingTournamentBustSeat), so it must always run.
+  // P-l (round 6) — SERIAL again: one player at a time (the round-5 parallel
+  // writes asked the 10-connection pool for one connection per human at once,
+  // on every table). The tournament deal hold stays: the bust check below
+  // still runs only after every player's writes.
   for (const [socketId, session] of playerSessions) {
     if (session.tableId === tableId) try {
       sendProgressToPlayer(socketId);
@@ -5158,116 +5341,15 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
 
   // Tournament elimination tracking: if this table is part of a tournament,
   // record busted players so finish positions and bounty payouts are correct.
-  // Q1 (2026-10-10) — resolved HERE, after the awaits above. While they ran, a
-  // rebalance triggered ELSEWHERE (another table's bust, the 5s sweep, a
-  // deferred break) could break THIS table: it leaves tournamentTables at
-  // once, so `tournamentTables.get` alone found nothing, this hand's busts were
-  // never eliminated and the 0-chip entrant stayed ALIVE with no seat — the
-  // tournament could never finish. The broken-table registry still names the
-  // tournament. (handleTableRebalance now also refuses to break a table whose
-  // bust check is pending — this is the second lock.) Each bust is eliminated
-  // exactly once: seat.eliminated is set before eliminatePlayer, which itself
-  // ignores an entrant already out.
-  const tournamentId = tournamentTables.get(tableId) ?? brokenTournamentTables.get(tableId)?.tournamentId;
-  const tableBroken = !!tournamentId && !tournamentTables.has(tableId);
-  if (tableBroken) {
-    console.warn(`[Tournament] ${JSON.stringify({ event: 'bust_check_on_broken_table', tableId, tournamentId })}`);
-  }
-  if (tournamentId) {
-    // Identify this hand's pot winners IN POT ORDER (results are emitted main-pot
-    // first, then each side pot). 2026-07-05 audit P2 fix: previously the FIRST
-    // winner was credited as the eliminator for EVERY busted player, so in a
-    // multi-way all-in with side pots one winner collected every bounty while the
-    // real eliminators got none. Each busted player is eliminated by the winner of
-    // the pot their all-in chips were in — mapped positionally below.
-    const orderedWinnerIds: string[] = [];
-    for (const r of results) {
-      if ((r.amount || 0) > 0) {
-        const seat = table.seats[r.seatIndex];
-        if (seat?.playerId) orderedWinnerIds.push(seat.playerId);
-      }
-    }
-    // 2026-06-11 audit R2: when multiple players bust the SAME hand, finish
-    // position — and now the real funded prize payout — must be decided by
-    // PRE-HAND stack (the bigger stack outlasted more, so finishes higher),
-    // not raw seat-index order. eliminatePlayer assigns worsening positions in
-    // call order, so eliminate the SHORTEST pre-hand stack FIRST (worst place).
-    const bustedSeatIdx: number[] = [];
-    for (let i = 0; i < MAX_SEATS; i++) {
-      const s = table.seats[i];
-      if (s?.state === 'occupied' && s.chipCount <= 0 && !s.eliminated) bustedSeatIdx.push(i);
-    }
-    bustedSeatIdx.sort((a, b) => (table.startChips.get(a) || 0) - (table.startChips.get(b) || 0));
-    let bustRank = 0;
-    for (const i of bustedSeatIdx) {
-      const seat = table.seats[i];
-      if (seat?.state === 'occupied' && seat.chipCount <= 0 && !seat.eliminated) {
-        seat.eliminated = true;
-        // Pair the k-th shortest bust with the k-th pot winner (clamped to the
-        // last winner): the shortest all-in was in the main pot, the next in side
-        // pot 1, and so on — so distinct busts credit their true eliminators.
-        const eliminatorId = orderedWinnerIds.length > 0
-          ? orderedWinnerIds[Math.min(bustRank, orderedWinnerIds.length - 1)]
-          : undefined;
-        bustRank++;
-        try {
-          const result = tournamentManager.eliminatePlayer(tournamentId, seat.playerId, eliminatorId);
-          if (result && result.bountyPayout && eliminatorId) {
-            // 2026-06-11 audit R3: actually CREDIT the bounty to the
-            // eliminator's tournament stack — previously it was only emitted as
-            // a UI event + counter, so the bounty mechanic did nothing. These
-            // are tournament chips (wallet-isolated), so it's a play-chip
-            // reward, not a wallet mint. The eliminator won the busting pot on
-            // THIS table, so his seat is here — his LIVE seat (Q2, 2026-10-10:
-            // a re-entered qualifier player's OLD busted seat carries the same
-            // playerId; crediting it lost the bounty) — unless a rebalance
-            // broke this table meanwhile (Q1): his stack was then moved, and
-            // the copy left here is discarded with the table.
-            const bountySeat = tournamentLiveSeatOf(tournamentId, eliminatorId, tableBroken ? undefined : tableId);
-            if (bountySeat) bountySeat.chipCount += result.bountyPayout;
-            // Notify eliminator
-            for (const [sid, s] of playerSessions) {
-              if (s.playerId === eliminatorId) {
-                io.to(sid).emit('bountyAwarded', { amount: result.bountyPayout, eliminated: seat.playerName });
-                break;
-              }
-            }
-          }
-
-          // Auto-switch eliminated human players to spectator mode
-          if (!seat.isAI && result) {
-            const tp = tournamentManager.getTournament(tournamentId)?.players.find(p => p.playerId === seat.playerId);
-            if (tp) {
-              const sock = io.sockets.sockets.get(tp.socketId);
-              if (sock) {
-                // Add as spectator on their current table (Q1: a table a
-                // rebalance broke is removed within 5s — he watches one of
-                // the tournament's live tables instead).
-                const specTableId = tableBroken
-                  ? (tournamentManager.getTournament(tournamentId)?.tableIds[0] ?? tableId)
-                  : tableId;
-                const specSet = spectators.get(specTableId) || new Set();
-                specSet.add(tp.socketId);
-                spectators.set(specTableId, specSet);
-                if (specTableId !== tableId) sock.join(`table:${specTableId}`);
-
-                sock.emit('eliminatedToSpectator', {
-                  tournamentId,
-                  tableId: specTableId,
-                  position: result.position,
-                  totalPlayers: tournamentManager.getTournament(tournamentId)?.players.length || 0,
-                  status: tournamentManager.getTournamentStatus(tournamentId),
-                  tableIds: tournamentManager.getTournament(tournamentId)?.tableIds || [],
-                });
-              }
-            }
-          }
-        } catch (e) {
-          console.error('[Tournament] eliminatePlayer failed:', e);
-        }
-      }
-    }
-  }
+  // S1 (2026-10-10) — the check itself is runTournamentBustCheck, run from the
+  // capture taken before the awaits above. It resolves the tournament when it
+  // runs (Q1: a table broken meanwhile is still found through the broken-table
+  // registry). Each bust is eliminated exactly once: seat.eliminated is set
+  // before eliminatePlayer, which itself ignores an entrant already out; a
+  // capture the deal guard already ran late (stale) finds nothing left here.
+  runTournamentBustCheck(tableId, table, tournamentBustCheck, 'hand_complete');
+  // S1 — a deal that waited for this check goes now.
+  rekickTournamentDealAfterBustCheck(tableId);
 }
 
 // ========== Ghost-seat cleanup ==========
@@ -5483,10 +5565,23 @@ async function refuseSeatRestoreIfBarred(
   mine?: SocketAuthSession,
 ): Promise<PlayRefusal | null> {
   const pending = reservedSeats.get(userId);
-  const hasReservation = !!(pending && pending.expiresAt > Date.now());
-  if (!hasReservation && !playerSessions.has(socket.id)) return null;
+  // P-b (S2 fixed protocol, 2026-10-10) — a VOLUNTARY tournament reservation
+  // (he left the seat on purpose) is never restored by a sign-in, so it is
+  // nothing to gate here; it stays exactly as it is (Return to tournament,
+  // gated by its own assertPlayable, is his way back).
+  const hasReservation = !!(pending && !pending.voluntary && pending.expiresAt > Date.now());
+  // S2 (2026-10-10) — an ABSENT live tournament seat of this account is
+  // restored too (restoreAbsentTournamentSeat, by account), so it is gated too.
+  const account = mine ?? authSessions.get(socket.id);
+  const absentTournamentSeat = !hasReservation && !playerSessions.has(socket.id) && !!account
+    && !!absentTournamentSeatOf(account);
+  if (!hasReservation && !playerSessions.has(socket.id) && !absentTournamentSeat) return null;
 
-  const refusal = await assertPlayable(socket, `${via}:seatRestore`, [], { waitForLogin: false });
+  // P-k (S2 protocol, round 6) — a locally BANNED account (banUser / adminIPBan)
+  // is refused like a suspended one (player_suspended → 'stand_up': a cash seat
+  // is stood up and credited, a tournament seat is kept absent, never restored).
+  const refusal = (await assertPlayable(socket, `${via}:seatRestore`, [], { waitForLogin: false }))
+    ?? (await bannedAccountRefusal(userId, `${via}:seatRestore`));
   // U1 — the socket dropped during the lookup: act on NOTHING here (no
   // reservation consumed, no seat stood up, no live seat left — the disconnect
   // handler owns this socket's seat). The caller's own loginSocketGone check,
@@ -5502,9 +5597,12 @@ async function refuseSeatRestoreIfBarred(
   if (!refusal || action === 'restore') return null;
 
   if (action === 'hold') {
-    // Re-read after the await.
-    const held = reservedSeats.get(userId);
-    if (!held || !(held.expiresAt > Date.now())) return null; // nothing is being restored
+    // Re-read after the await (P-b: a voluntary reservation is not this restore's).
+    const heldNow = reservedSeats.get(userId);
+    const held = heldNow && !heldNow.voluntary ? heldNow : undefined;
+    // nothing is being restored — S2: unless an absent tournament seat would
+    // be (by account): HELD the same way (refused, left in play).
+    if (!held || !(held.expiresAt > Date.now())) return absentTournamentSeat ? refusal : null;
     // A SYNTHETIC reservation (the orphan scans above build one with no
     // cleanupTimer and no hand counter) would otherwise linger past its 60s
     // window and block the next login's orphan scan (`!reservedSeats.has`).
@@ -5520,7 +5618,10 @@ async function refuseSeatRestoreIfBarred(
   }
 
   // action === 'stand_up' (suspended). Re-read everything after the await.
-  const reserved = reservedSeats.get(userId);
+  // P-b: a VOLUNTARY tournament reservation is left alone (nothing restores
+  // it; the hand-start gate screens that absent seat by its master id).
+  const reservedNow = reservedSeats.get(userId);
+  const reserved = reservedNow && !reservedNow.voluntary ? reservedNow : undefined;
   if (reserved) {
     if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
     reservedSeats.delete(userId);
@@ -5534,14 +5635,16 @@ async function refuseSeatRestoreIfBarred(
   // seat stays in play, ABSENT, and the hand-start gate disqualifies it at the
   // next boundary (standUpSuspendedSeatsBeforeDeal screens absent tournament
   // seats; his master id is noted for it here, his status is now cached).
-  const tournamentSeatKept = !!reserved && isTournamentReservation(reserved);
+  // S2: an absent tournament seat found by account (no reservation) is kept the
+  // same way — never restored, left to the hand-start gate.
+  const tournamentSeatKept = (!!reserved && isTournamentReservation(reserved)) || absentTournamentSeat;
   if (tournamentSeatKept && refusal.masterId) noteAbsentSeatMasterId(userId, refusal.masterId);
   const own = playerSessions.get(socket.id);
   // Never throws into the login handler: the reservation is already gone and
   // the caller skips its restore on a non-null return, so even a failed
   // teardown cannot lead to the seat being restored.
   try {
-    if (own) handlePlayerLeave(socket);
+    if (own) handlePlayerLeave(socket, 'kept');
     if (reserved && !tournamentSeatKept && !(own && own.tableId === reserved.tableId && own.seatIndex === reserved.seatIndex)) {
       standUpRefusedSeat(userId, username, reserved.tableId, reserved.seatIndex, `${via}_seat_restore_refused`);
     }
@@ -5615,10 +5718,34 @@ const tournamentRebalanceHolds = new Map<string, { depth: number; pending: boole
 // Q1 (2026-10-10): breaksDeferredPendingBust (a break waited for that table's
 // bust check). Minor (2026-10-10): reentrySessionsCreated (a qualifier
 // re-entry whose socket had no session — e.g. its busted seat was vacated).
+// S1 (2026-10-10): dealsHeldForBustCheck (a tournament table waited for its
+// bust check before dealing), bustChecksRunLate (a capture run by the deal
+// guard: its handler hung (stale) or a 0-chip entrant had no capture —
+// should stay ~0), bustLeftoversEliminated (a seat PokerTable had flagged
+// before its bust check — should stay 0 now), clientHandStartsRouted (socket
+// 'startHand' on a live tournament table, dealt only through the tournament's
+// guards). M1: moversWithoutLiveSeat (a mover with no live seat on the break
+// table: re-mapped to his live seat, or eliminated — never seated with a
+// stack nobody paid for; should stay 0). M3: entrantSocketsDetached (an
+// account switch took an entrant's tournament socket).
 const tournamentHandStartSafety = {
   rebalancesHeld: 0, handStartsVetoed: 0, heldRebalanceErrors: 0,
   breaksDeferredMidHand: 0, breaksAbortedNoSeats: 0, bustedSeatsVacated: 0, reconnectedSessionsMoved: 0, reservationsMoved: 0,
   breaksDeferredPendingBust: 0, reentrySessionsCreated: 0,
+  dealsHeldForBustCheck: 0, bustChecksRunLate: 0, bustLeftoversEliminated: 0, clientHandStartsRouted: 0,
+  moversWithoutLiveSeat: 0, entrantSocketsDetached: 0,
+  // 2026-10-10 (S2 fixed protocol) — P-e: busts told by the plain notice
+  // because his socket sat at another table; V4: absent seats a rebalance
+  // moved (tournamentSeatKept re-sent to his sockets); P-f: entrants an admin
+  // kick / IP-ban disqualified.
+  eliminationsToSocketSeatedElsewhere: 0, absentSeatsMovedNotified: 0, adminRemovalsDisqualified: 0,
+  // Round 5 (2026-10-10) — P-e': busts of an AWAY seat told by the plain
+  // notice only (his socket held no session at that table — never made a
+  // spectator / joined to its room); P-f gap / P-k: admin-removal
+  // disqualifications of an ABSENT entry (included in adminRemovalsDisqualified
+  // too); P-i (round 6): absent auto-actions that CALLED — at most one big
+  // blind, never all-in — because every seat still in the hand was absent.
+  eliminationsToAwaySocket: 0, adminRemovalsAwayDisqualified: 0, allAbsentAutoCalls: 0,
 };
 function holdTournamentRebalance(tournamentId: string): void {
   const h = tournamentRebalanceHolds.get(tournamentId);
@@ -5905,7 +6032,7 @@ function standUpSuspendedSeat(
     const multi = multiTableSessions.get(owner.socketId);
     if (multi) multiTableSessions.delete(owner.socketId);
     try {
-      handlePlayerLeave(sock!);
+      handlePlayerLeave(sock!, 'kept');
     } finally {
       if (multi) multiTableSessions.set(owner.socketId, multi);
     }
@@ -5918,6 +6045,7 @@ function standUpSuspendedSeat(
     // quick table).
     const stillThere = tableManager.getTable(tableId);
     if (stillThere && sock) {
+      detachSocketFromOtherTables(sock, tableId, 'spectate', 'suspended_stand_up');   // P-g (round 5)
       if (!spectators.has(tableId)) spectators.set(tableId, new Set());
       spectators.get(tableId)!.add(sock.id);
       sock.join(`table:${tableId}`);
@@ -6675,6 +6803,8 @@ io.on('connection', (socket: Socket) => {
             }
             // He plays again — no longer a spectator of this tournament's tables.
             for (const ttid of tournament.tableIds) spectators.get(ttid)?.delete(socket.id);
+            // P-g (round 5) — nor of any other table, nor in any other table's room.
+            detachSocketFromOtherTables(socket, tid, 'seat', 'qualifierReentry');
             socket.join(`table:${tid}`);
             seated = true;
             console.log(`[Tournament] Re-entry: ${existingEntry.playerName} seated at table ${tid} seat ${s}`);
@@ -6896,6 +7026,18 @@ io.on('connection', (socket: Socket) => {
       return;
     }
 
+    // P-g (round 5) — one table view per socket, as the `spectate` handler: a
+    // LIVE seat this socket still holds is left first (handlePlayerLeave — a
+    // tournament seat kept absent, 'voluntary'), then every other table's
+    // spectating and room end. A DEAD (busted) tournament seat's session at
+    // another table ends in the detach too (round 6 — pe5 X5); the seat itself
+    // is not touched.
+    {
+      const own = playerSessions.get(socket.id);
+      const ownSeat = own ? tableManager.getTable(own.tableId)?.seats[own.seatIndex] : undefined;
+      if (own && ownSeat && ownSeat.state === 'occupied' && !ownSeat.eliminated) handlePlayerLeave(socket);
+    }
+    detachSocketFromOtherTables(socket, bestTable, 'spectate', 'spectateTournament');
     // Use existing spectator system
     socket.emit('spectateTable', { tableId: bestTable });
     // Manually trigger spectate logic
@@ -6937,6 +7079,11 @@ io.on('connection', (socket: Socket) => {
     const oldSet = spectators.get(data.currentTableId);
     if (oldSet) { oldSet.delete(socket.id); }
     socket.leave(`table:${data.currentTableId}`);
+    // P-g (round 5) — and every other spectated table / room (a table this
+    // socket holds a LIVE session at keeps its room). Round 6 (pe5 X5): a
+    // busted player's DEAD-seat session at his old table ends here, so that
+    // table's player-view frames never interleave with the one he now watches.
+    detachSocketFromOtherTables(socket, nextTableId, 'spectate', 'spectateNextTable');
 
     // Join new table
     const newSet = spectators.get(nextTableId) || new Set();
@@ -7427,6 +7574,14 @@ Give feedback in this JSON format:
         if (!reservedSeats.has(userId) && recoverName) {
           let found = false;
           for (const t of tableManager.getTableList()) {
+            // 2026-10-10 (pe3 minor) — never a TOURNAMENT table: a display
+            // name is not an account (ticket names 'First L.' collide), and an
+            // ABSENT tournament seat (Back to Lobby, a disconnect past its
+            // reservation) is its entrant's — handed to a same-named account
+            // it was his stack to play and his entry to bust. A tournament
+            // seat comes back only BY ACCOUNT (restoreAbsentTournamentSeat,
+            // (c) below) or by its own reservation.
+            if (isTournamentTable(t.tableId)) continue;
             const table = tableManager.getTable(t.tableId);
             if (!table) continue;
             for (let i = 0; i < table.seats.length; i++) {
@@ -7465,9 +7620,12 @@ Give feedback in this JSON format:
         // Q3 — another account's login took this socket during the gate: no
         // restore under it (same reservation rules as U1).
         if (loginSessionReplaced(socket, oauthSession, 'oauthLogin', 'after_seat_restore_gate', { dropSyntheticReservationOf: userId })) return;
-        // (b) Restore the reserved seat (the normal reconnect path).
+        // (b) Restore the reserved seat (the normal reconnect path). P-b (S2
+        // fixed protocol): never a VOLUNTARY tournament reservation — he left
+        // that seat on purpose; it is left intact and he is TOLD instead
+        // (tellKeptTournamentSeats after loginResult).
         const reserved = reservedSeats.get(userId);
-        if (!seatRestoreRefusal && reserved && reserved.expiresAt > Date.now()) {
+        if (!seatRestoreRefusal && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {
           const rTable = tableManager.getTable(reserved.tableId);
           const rSeat = rTable?.seats?.[reserved.seatIndex];
           if (rTable && rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
@@ -7478,6 +7636,7 @@ Give feedback in this JSON format:
             // restored one. Kills the "two of me" duplicate; stacks are credited
             // back to the wallet inside clearGhostSeatsForUser.
             clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex);
+            detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'oauthLogin');   // P-g (round 5)
             playerSessions.set(socket.id, {
               socketId: socket.id, tableId: reserved.tableId, seatIndex: reserved.seatIndex,
               playerName: reserved.playerName, playerId: `user_${userId}`,
@@ -7488,7 +7647,8 @@ Give feedback in this JSON format:
             if (tracker) tracker.delete(reserved.seatIndex);
             syncSitOutToTable(reserved.tableId);
             if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
-            socket.emit('reconnectedToTable', { tableId: reserved.tableId, seatIndex: reserved.seatIndex });
+            // P-b — a tournament reservation says which tournament (+tournamentId).
+            socket.emit('reconnectedToTable', { tableId: reserved.tableId, seatIndex: reserved.seatIndex, ...reconnectTournamentFields(reserved) });
             emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
             broadcastGameState(reserved.tableId);
             console.log(`[OAuth Reserve] user ${userId} reconnected to seat ${reserved.seatIndex}`);
@@ -7496,6 +7656,9 @@ Give feedback in this JSON format:
             reservedSeats.delete(userId);
           }
         }
+        // (c) S2 / M5 (2026-10-10) — no seat restored above: his ABSENT live
+        // tournament seat, found by ACCOUNT (gated by (a2) above; synchronous).
+        if (!seatRestoreRefusal) restoreAbsentTournamentSeat(socket, oauthSession, 'oauthLogin');
       } catch (e: any) {
         console.warn(`[OAuth seat-recovery] user ${userId}:`, e?.message);
       }
@@ -7512,6 +7675,9 @@ Give feedback in this JSON format:
       // 2026-10-07 — the sign-in succeeded; only the seat restore was refused.
       // Sent after loginResult so the client is signed in when it lands (C5).
       if (seatRestoreRefusal) emitPlayRefusal(socket, seatRestoreRefusal);
+      // P-b (S2 fixed protocol) — his VOLUNTARILY left tournament seats were
+      // not restored: tell this socket (not a secondary multi-table socket).
+      if (!data?.skipSeatRecovery) tellKeptTournamentSeats(socket, oauthSession, 'voluntary', 'oauthLogin');
       hydrateAndPushProgress(socket, userId, localUser.username).catch(() => {});
 
       console.log(
@@ -7715,6 +7881,11 @@ Give feedback in this JSON format:
           if (!reservedSeats.has(userId)) {
             const expectedPlayerId = `user_${userId}`;
             for (const t of tableManager.getTableList()) {
+              // 2026-10-10 (S2 fixed protocol) — never a TOURNAMENT table: a
+              // tournament seat comes back only BY ACCOUNT
+              // (restoreAbsentTournamentSeat below — never a seat he LEFT, P-b)
+              // or by its own reservation.
+              if (isTournamentTable(t.tableId)) continue;
               const table = tableManager.getTable(t.tableId);
               if (!table) continue;
               for (let i = 0; i < table.seats.length; i++) {
@@ -7757,9 +7928,10 @@ Give feedback in this JSON format:
           // Q3 — another account's login took this socket during the gate.
           if (loginSessionReplaced(socket, tlSession, 'tokenLogin', 'after_seat_restore_gate', { dropSyntheticReservationOf: userId })) return;
 
-          // Check for reserved seat (same reconnection logic as legacy)
+          // Check for reserved seat (same reconnection logic as legacy). P-b:
+          // never a VOLUNTARY tournament reservation (left intact; told below).
           const reserved = reservedSeats.get(userId);
-          if (!tlSeatRestoreRefusal && reserved && reserved.expiresAt > Date.now()) {
+          if (!tlSeatRestoreRefusal && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {
             const table = tableManager.getTable(reserved.tableId);
             if (table) {
               const seat = table.seats[reserved.seatIndex];
@@ -7776,6 +7948,7 @@ Give feedback in this JSON format:
                   sittingOut: false,
                   avatar: reserved.avatar,
                 };
+                detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'tokenLogin');   // P-g (round 5)
                 playerSessions.set(socket.id, restoredSession);
                 socket.join(`table:${reserved.tableId}`);
                 // MISSED-BLINDS FIX: on reconnect, remove seat from
@@ -7801,6 +7974,7 @@ Give feedback in this JSON format:
                 socket.emit('reconnectedToTable', {
                   tableId: reserved.tableId,
                   seatIndex: reserved.seatIndex,
+                  ...reconnectTournamentFields(reserved),   // P-b: + tournamentId for a tournament seat
                 });
                 // Send a FORCED full state to the reconnecting socket so they
                 // get hole cards + current phase + turn info immediately, not
@@ -7820,6 +7994,13 @@ Give feedback in this JSON format:
               reservedSeats.delete(userId);
             }
           }
+          // S2 / M5 (2026-10-10) — no seat restored above: his ABSENT live
+          // tournament seat, found by ACCOUNT (gated above; synchronous).
+          if (!tlSeatRestoreRefusal) {
+            try { restoreAbsentTournamentSeat(socket, tlSession, 'tokenLogin'); } catch (e: any) {
+              console.warn(`[tokenLogin tournament-seat recovery] user ${userId}:`, e?.message);
+            }
+          }
 
           socket.emit('loginResult', {
             success: true, token: data.token, userData: progress.userData,
@@ -7827,6 +8008,7 @@ Give feedback in this JSON format:
             ...(tlRequestId ? { requestId: tlRequestId } : {}),
           });
           if (tlSeatRestoreRefusal) emitPlayRefusal(socket, tlSeatRestoreRefusal); // 2026-10-07
+          tellKeptTournamentSeats(socket, tlSession, 'voluntary', 'tokenLogin'); // P-b (S2 fixed protocol)
           hydrateAndPushProgress(socket, progress.userData.id, progress.userData.username).catch(() => {});
           return;
         }
@@ -7860,9 +8042,10 @@ Give feedback in this JSON format:
         // reservation + its timer are NOT consumed, nothing is restored.
         if (loginSessionReplaced(socket, legacySession, 'tokenLogin_legacy', 'after_seat_restore_gate')) return;
 
-        // Check for a reserved seat and restore it
+        // Check for a reserved seat and restore it. P-b: never a VOLUNTARY
+        // tournament reservation (left intact; told after loginResult).
         const reserved = reservedSeats.get(userId);
-        if (!legacySeatRestoreRefusal && reserved && reserved.expiresAt > Date.now()) {
+        if (!legacySeatRestoreRefusal && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {
           const table = tableManager.getTable(reserved.tableId);
           if (table) {
             const seat = table.seats[reserved.seatIndex];
@@ -7882,6 +8065,7 @@ Give feedback in this JSON format:
                 sittingOut: reserved.sittingOut,
                 avatar: reserved.avatar,
               };
+              detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'tokenLogin_legacy');   // P-g (round 5)
               playerSessions.set(socket.id, restoredSession);
               socket.join(`table:${reserved.tableId}`);
 
@@ -7906,6 +8090,7 @@ Give feedback in this JSON format:
               socket.emit('reconnectedToTable', {
                 tableId: reserved.tableId,
                 seatIndex: reserved.seatIndex,
+                ...reconnectTournamentFields(reserved),   // P-b: + tournamentId for a tournament seat
               });
 
               // Forced full state to the reconnecting socket — see the OAuth
@@ -7921,6 +8106,13 @@ Give feedback in this JSON format:
             }
           } else {
             reservedSeats.delete(userId);
+          }
+        }
+        // S2 / M5 (2026-10-10) — no seat restored above: his ABSENT live
+        // tournament seat, found by ACCOUNT (gated above; synchronous).
+        if (!legacySeatRestoreRefusal) {
+          try { restoreAbsentTournamentSeat(socket, legacySession, 'tokenLogin_legacy'); } catch (e: any) {
+            console.warn(`[tokenLogin_legacy tournament-seat recovery] user ${userId}:`, e?.message);
           }
         }
       }
@@ -7943,6 +8135,11 @@ Give feedback in this JSON format:
       if (result?.success) {
         socket.emit('loginResult', { ...result, ...(tlRequestId ? { requestId: tlRequestId } : {}) });
         if (legacySeatRestoreRefusal) emitPlayRefusal(socket, legacySeatRestoreRefusal); // 2026-10-07
+        // P-b (S2 fixed protocol) — his voluntarily left tournament seats: told, not restored.
+        const legacyAuthNow = authSessions.get(socket.id);
+        if (legacyAuthNow && result.userData && legacyAuthNow.userId === result.userData.id) {
+          tellKeptTournamentSeats(socket, legacyAuthNow, 'voluntary', 'tokenLogin_legacy');
+        }
       } else {
         failLogin(socket, {
           code: 'legacy_token_invalid',
@@ -8214,8 +8411,24 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'Access denied' });
       return;
     }
-    auditLog(auth.username, 'BAN_USER', { targetUserId: data.userId });
-    banUserDB(data.userId);
+    // P-k (S2 protocol, round 6) — the account ban disqualifies EVERY tournament
+    // entry he is AWAY from (no socket plays it), audited, never paid — he can
+    // never sign back in and Return to it (and a Return / sign-in restore of a
+    // banned account is refused player_suspended: bannedAccountRefusal). His
+    // account is read first (his sessions carry his master id); the ban is
+    // written after the disqualification. A seat a live socket of his still
+    // plays is not touched (banUser never kicked — unchanged).
+    const banTargetId = Number(data?.userId);
+    const banAccount = Number.isInteger(banTargetId) && banTargetId > 0
+      ? await adminRemovalTargetAccount(banTargetId, socketsForUser(banTargetId)) : null;
+    let awayDisqualified = 0;
+    if (banAccount) {
+      try { awayDisqualified = disqualifyAwayTournamentEntriesOnAdminRemoval(banAccount, 'admin_ban', auth.username); } catch (e: any) {
+        console.error('[banUser] away tournament entries:', e?.message || e);
+      }
+    }
+    auditLog(auth.username, 'BAN_USER', { targetUserId: data.userId, awayTournamentEntriesDisqualified: awayDisqualified });
+    await banUserDB(data.userId);
     socket.emit('userBanned', { userId: data.userId });
   });
 
@@ -8292,18 +8505,40 @@ Give feedback in this JSON format:
       ? await revokeTokensOnSignOut(targetUserId, 'admin_kick')
       : 'invalid_user';
     auditLog(auth.username, 'ADMIN_KICK', { targetUserId, tokenRevocation: revocation });
+    // P-k (S2 protocol, round 6) — a KICK acts only on the table it targets:
+    // the request's optional `tournamentId` / `tableId` (a cash table → no
+    // tournament), else (the admin dashboard sends only {userId}) each kicked
+    // socket's MAIN session's table. A kick that targets no tournament seat
+    // disqualifies nothing (pe5 X4: a kick from a cash table disqualified every
+    // away tournament entry he held). `target`: undefined = his main sessions'
+    // tables; a tournament id; null = a named cash table.
+    const ctx = (data || {}) as { tableId?: unknown; tournamentId?: unknown };
+    const target: string | null | undefined = typeof ctx.tournamentId === 'string' ? ctx.tournamentId
+      : typeof ctx.tableId === 'string' ? (tournamentIdOfTable(ctx.tableId) ?? null) : undefined;
+    // His AWAY entry in a NAMED tournament: read his account before his sockets
+    // are dropped (their sessions carry his master id).
+    const kickAccount = typeof target === 'string' && Number.isInteger(targetUserId) && targetUserId > 0
+      ? await adminRemovalTargetAccount(targetUserId, socketsForUser(targetUserId)) : null;
     let kicked = 0;
     for (const sid of socketsForUser(targetUserId)) {
       const s = io.sockets.sockets.get(sid);
       if (!s) continue;
       // Cash the player out of any seats (handlePlayerLeave credits + tears
-      // down) BEFORE disconnecting, so their stack isn't stranded.
-      try { handlePlayerLeave(s); } catch { /* best effort */ }
+      // down) BEFORE disconnecting, so their stack isn't stranded. P-f
+      // (2026-10-10): a LIVE tournament seat the kick targets is not kept —
+      // the entrant is disqualified first (leaveTournamentSeatOnAdminRemoval).
+      try { leaveTournamentSeatOnAdminRemoval(s, 'admin_kick', auth.username, target); } catch { /* best effort */ }
       s.emit('kickedByAdmin', { reason: 'Removed by an administrator' });
       s.disconnect(true);
       kicked++;
     }
-    socket.emit('adminKickResult', { success: true, userId: targetUserId, kicked, tokensRevoked: revocation === 'revoked' });
+    let awayDisqualified = 0;
+    if (kickAccount && typeof target === 'string') {
+      try { awayDisqualified = disqualifyAwayTournamentEntriesOnAdminRemoval(kickAccount, 'admin_kick', auth.username, target); } catch (e: any) {
+        console.error('[adminKickPlayer] away tournament entry:', e?.message || e);
+      }
+    }
+    socket.emit('adminKickResult', { success: true, userId: targetUserId, kicked, tokensRevoked: revocation === 'revoked', awayTournamentEntriesDisqualified: awayDisqualified });
   });
 
   socket.on('adminIPBan', async (data: { userId: number }) => {
@@ -8314,17 +8549,29 @@ Give feedback in this JSON format:
     // lifetime, then kick every live socket. A durable IP ban belongs in the
     // master admin; this is the in-game incident-response tool.
     const ips: string[] = [];
+    // P-f gap (round 5) — read before his sockets are dropped (their sessions carry his master id).
+    const banAccount = Number.isInteger(targetUserId) && targetUserId > 0
+      ? await adminRemovalTargetAccount(targetUserId, socketsForUser(targetUserId)) : null;
     for (const sid of socketsForUser(targetUserId)) {
       const s = io.sockets.sockets.get(sid);
       const ip = s ? realClientIp(s) : '';
       if (ip) { bannedIPs.add(ip); ips.push(ip); }
-      if (s) { try { handlePlayerLeave(s); } catch {} s.emit('kickedByAdmin', { reason: 'Banned by an administrator' }); s.disconnect(true); }
+      // P-f (2026-10-10): a live tournament seat → the entrant is disqualified, never kept.
+      if (s) { try { leaveTournamentSeatOnAdminRemoval(s, 'admin_ip_ban', auth.username); } catch {} s.emit('kickedByAdmin', { reason: 'Banned by an administrator' }); s.disconnect(true); }
+    }
+    // P-f gap (round 5) — EVERY away tournament entry of his is disqualified
+    // too (no socket plays it; he could otherwise sign in and Return to it).
+    let awayDisqualified = 0;
+    if (banAccount) {
+      try { awayDisqualified = disqualifyAwayTournamentEntriesOnAdminRemoval(banAccount, 'admin_ip_ban', auth.username); } catch (e: any) {
+        console.error('[adminIPBan] away tournament entries:', e?.message || e);
+      }
     }
     // Account ban is the reliable effect; the IP block is best-effort (shared
     // NAT / proxy IPs can over-match — noted for the admin).
     try { await banUserDB(targetUserId); } catch {}
-    auditLog(auth.username, 'ADMIN_IP_BAN', { targetUserId, ips });
-    socket.emit('adminIPBanResult', { success: true, userId: targetUserId, ipsBanned: ips.length });
+    auditLog(auth.username, 'ADMIN_IP_BAN', { targetUserId, ips, awayTournamentEntriesDisqualified: awayDisqualified });
+    socket.emit('adminIPBanResult', { success: true, userId: targetUserId, ipsBanned: ips.length, awayTournamentEntriesDisqualified: awayDisqualified });
   });
 
   socket.on('adminToggleAdmin', async (data: { userId: number }) => {
@@ -9622,9 +9869,10 @@ Give feedback in this JSON format:
       // there's no playerSessions entry — so a spectator-only socket
       // calling joinTable skipped that cleanup entirely. Scrub here BEFORE
       // any other state changes so every joinTable entrant exits cleanly.
-      for (const [tid, s] of spectators) {
-        if (s.delete(socket.id) && s.size === 0) spectators.delete(tid);
-      }
+      // P-g (round 5): through detachSocketFromOtherTables — the spectated
+      // tables' ROOMS are left too (the old scrub left the socket in them:
+      // their chat / emotes / tournament events reached the new seat).
+      detachSocketFromOtherTables(socket, tableId, 'seat', 'joinTable');
 
       // If player already has a session, leave old table first
       const existingSession = playerSessions.get(socket.id);
@@ -9777,6 +10025,8 @@ Give feedback in this JSON format:
         sittingOut: false,
         avatar: data.avatar || undefined,
       };
+      // P-g — again at the commit: a spectate during the buy-in awaits ends here.
+      detachSocketFromOtherTables(socket, tableId, 'seat', 'joinTable');
       playerSessions.set(socket.id, session);
 
       // Initialize progression (userId → hydrate xp/level/achievements from DB)
@@ -9823,10 +10073,8 @@ Give feedback in this JSON format:
       // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
       // See joinTable handler above for the full rationale — same bug
       // applies to quickPlay because handlePlayerLeave early-returns
-      // for spectator-only sockets.
-      for (const [tid, s] of spectators) {
-        if (s.delete(socket.id) && s.size === 0) spectators.delete(tid);
-      }
+      // for spectator-only sockets. P-g (round 5): rooms left too.
+      detachSocketFromOtherTables(socket, null, 'seat', 'quickPlay');
 
       // If the player already has a session on a table, leave it first
       const existingSession = playerSessions.get(socket.id);
@@ -9975,6 +10223,7 @@ Give feedback in this JSON format:
         sittingOut: false,
         avatar: data.avatar || undefined,
       };
+      detachSocketFromOtherTables(socket, chosenTableId, 'seat', 'quickPlay');   // P-g — at the commit too
       playerSessions.set(socket.id, session);
       socket.join(`table:${chosenTableId}`);
 
@@ -11197,6 +11446,12 @@ Give feedback in this JSON format:
           }),
           ...(tkRequestId ? { requestId: tkRequestId } : {}),
         });
+        // P-b (S2 fixed protocol) — a ticket sign-in restores NO seat: tell
+        // this (fresh Play Online) tab about EVERY absent tournament seat of
+        // the account — left on purpose or not (a disconnect's) — so it can
+        // offer Return to tournament (returnToTournamentSeat).
+        const tkSession = authSessions.get(socket.id);
+        if (tkSession && tkSession.userId === localUser.id) tellKeptTournamentSeats(socket, tkSession, 'all', 'authWithTicket');
         hydrateAndPushProgress(socket, localUser.id, localUser.username).catch(() => {});
 
         console.log(
@@ -11345,9 +11600,10 @@ Give feedback in this JSON format:
           // Q3 — another account's login took this socket during the gate: the
           // reservation + its timer are NOT consumed, nothing is restored.
           if (loginSessionReplaced(socket, rsSession, 'resumeSession', 'after_seat_restore_gate')) return;
-          // (b) Restore the reserved seat.
+          // (b) Restore the reserved seat. P-b (S2 fixed protocol): never a
+          // VOLUNTARY tournament reservation (left intact; told below).
           const reserved = reservedSeats.get(userId);
-          if (!rsSeatRestoreRefusal && reserved && reserved.expiresAt > Date.now()) {
+          if (!rsSeatRestoreRefusal && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {
             const rTable = tableManager.getTable(reserved.tableId);
             const rSeat = rTable?.seats?.[reserved.seatIndex];
             if (rTable && rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
@@ -11355,6 +11611,7 @@ Give feedback in this JSON format:
               reservedSeats.delete(userId);
               // userId-only ghost clearing (no display-name match — D1).
               clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex, { nameScan: false });
+              detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'resumeSession');   // P-g (round 5)
               playerSessions.set(socket.id, {
                 socketId: socket.id, tableId: reserved.tableId, seatIndex: reserved.seatIndex,
                 playerName: reserved.playerName, playerId: `user_${userId}`,
@@ -11365,7 +11622,8 @@ Give feedback in this JSON format:
               if (tracker) tracker.delete(reserved.seatIndex);
               syncSitOutToTable(reserved.tableId);
               if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
-              socket.emit('reconnectedToTable', { tableId: reserved.tableId, seatIndex: reserved.seatIndex });
+              // P-b — + tournamentId for a tournament reservation.
+              socket.emit('reconnectedToTable', { tableId: reserved.tableId, seatIndex: reserved.seatIndex, ...reconnectTournamentFields(reserved) });
               emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
               broadcastGameState(reserved.tableId);
               console.log(`[resumeSession] user ${userId} reconnected to seat ${reserved.seatIndex}`);
@@ -11373,6 +11631,10 @@ Give feedback in this JSON format:
               reservedSeats.delete(userId);
             }
           }
+          // (c) S2 / M5 (2026-10-10) — no seat restored above: his ABSENT live
+          // tournament seat, found by ACCOUNT (the LOCAL userId / master id —
+          // never a display name, D1; gated by (a2) above; synchronous).
+          if (!rsSeatRestoreRefusal) restoreAbsentTournamentSeat(socket, rsSession, 'resumeSession');
         } catch (e: any) {
           console.warn(`[resumeSession seat-recovery] user ${userId}:`, e?.message);
         }
@@ -11392,6 +11654,8 @@ Give feedback in this JSON format:
         });
         // The sign-in succeeded; only the seat restore was refused (C5, after loginResult).
         if (rsSeatRestoreRefusal) emitPlayRefusal(socket, rsSeatRestoreRefusal);
+        // P-b (S2 fixed protocol) — voluntarily left tournament seats: told, not restored.
+        if (!data?.skipSeatRecovery) tellKeptTournamentSeats(socket, rsSession, 'voluntary', 'resumeSession');
         hydrateAndPushProgress(socket, userId, row.username).catch(() => {});
         console.log(`[resumeSession] resumed localId=${userId} masterId=${claims.masterUserId}`);
       } catch (err: any) {
@@ -11585,10 +11849,14 @@ Give feedback in this JSON format:
        * asked for a waitlist deep-link, and for them silence is the bug.
        */
       const failWaitlist = (
-        code: LoginFailureCode, message: string, detail?: Record<string, any>
+        code: LoginFailureCode, message: string, detail?: Record<string, any>,
+        // 2026-10-10 (pe3 minor) — additive fields on BOTH frames, e.g. the
+        // buy-in cancellation's `cancelCode: 'buy_in_cancelled'` (poker-3d maps
+        // on it first, its text second; older bundles ignore it).
+        extra?: Record<string, string>,
       ) => {
-        socket.emit('error', { message, code });
-        failLogin(socket, { code, message, via: 'joinWithWaitlistContext', requestId: wlRequestId, detail });
+        socket.emit('error', { message, code, ...(extra || {}) });
+        failLogin(socket, { code, message, via: 'joinWithWaitlistContext', requestId: wlRequestId, detail, extra });
       };
       try {
         if (!data || !data.token) {
@@ -11770,10 +12038,8 @@ Give feedback in this JSON format:
 
         // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
         // See joinTable handler for the full rationale — same bug
-        // applies on this seat-after-auth path.
-        for (const [tid, s] of spectators) {
-          if (s.delete(socket.id) && s.size === 0) spectators.delete(tid);
-        }
+        // applies on this seat-after-auth path. P-g (round 5): rooms left too.
+        detachSocketFromOtherTables(socket, null, 'seat', 'joinWithWaitlistContext');
 
         // 2) Pick lowest-stakes Texas Hold'em table (Beginner's Table)
         const existingSession = playerSessions.get(socket.id);
@@ -11846,7 +12112,7 @@ Give feedback in this JSON format:
           // live table; a live socket is answered on the deep link's channel.
           const wlState: BuyInExpectation = {
             userId: authNow.userId, mainSession: null, table: { tableId: bestTable.tableId, table },
-            answer: (reason) => failWaitlist('handler_exception', BUY_IN_CANCELLED_MESSAGE, { stage: 'state_changed', reason }),
+            answer: (reason) => failWaitlist('handler_exception', WAITLIST_BUY_IN_CANCELLED_MESSAGE, { stage: 'state_changed', reason }, { cancelCode: WAITLIST_BUY_IN_CANCEL_CODE }),
           };
           const dbChips = await ensureChipsForBuyIn(authNow.userId, authNow.username, waitlistBuyIn);
           if (await buyInSocketGone(socket, 'joinWithWaitlistContext', 'balance_read', undefined, wlState)) return; // F3 — nothing deducted yet
@@ -11903,6 +12169,7 @@ Give feedback in this JSON format:
             startTime: data.context?.startTime ?? claims.startTime ?? null,
           },
         };
+        detachSocketFromOtherTables(socket, bestTable.tableId, 'seat', 'joinWithWaitlistContext');   // P-g — at the commit too
         playerSessions.set(socket.id, session);
         socket.join(`table:${bestTable.tableId}`);
 
@@ -11971,6 +12238,10 @@ Give feedback in this JSON format:
         broadcastGameState(bestTable.tableId);
         sendProgressToPlayer(socket.id);
         scheduleAIAction(bestTable.tableId);
+        // P-b (S2 fixed protocol) — the bootstrap is a sign-in: his
+        // voluntarily left tournament seats (never restored) are told.
+        const wlAuthNow = authSessions.get(socket.id);
+        if (wlAuthNow) tellKeptTournamentSeats(socket, wlAuthNow, 'voluntary', 'joinWithWaitlistContext');
 
         console.log(
           `[waitlistContext] seated user=${remoteUserId} at table=${bestTable.tableId} seat=${targetSeat} gameId=${claims.gameId}`
@@ -12235,6 +12506,30 @@ Give feedback in this JSON format:
     if (table.isHandInProgress()) {
       socket.emit('error', { message: 'Hand already in progress' });
       return;
+    }
+
+    // S1 (2026-10-10) — a LIVE tournament table deals only through the
+    // tournament's own guards: the director pause, a deferred break, the
+    // under-5 rebalance wait and — S1 — never before this table's bust check
+    // has run. poker-3d's auto-deal sends 'startHand' ~2s after every
+    // HandComplete (and the Deal button any time); dealing here directly
+    // skipped every one of them, and a deal before the bust check flagged the
+    // 0-chip seat eliminated on the table only — the entrant stayed alive in
+    // the tournament forever. At a hand end it is autoStartNextHand itself
+    // (same as the server's own timer, only sooner); a table whose first deal
+    // never happened deals only when none of those holds applies.
+    const liveTournamentId = tournamentTables.get(session.tableId);
+    if (liveTournamentId) {
+      tournamentHandStartSafety.clientHandStartsRouted++;
+      if (table.currentPhase === GamePhase.HandComplete) {
+        autoStartNextHand(session.tableId);
+        return;
+      }
+      const hold = tournamentDealHoldReason(session.tableId, liveTournamentId, table);
+      if (hold) {
+        socket.emit('error', { message: 'The tournament deals the next hand itself.', code: 'tournament_hand_held', reason: hold });
+        return;
+      }
     }
 
     const occupiedCount = table.getOccupiedSeatCount();
@@ -12847,11 +13142,14 @@ Give feedback in this JSON format:
       }
     }
 
-    // If sitting out and it's currently their turn, auto-fold
+    // If sitting out and it's currently their turn, auto-fold (P-j: a
+    // tournament seat is acted for as ABSENT — check, or fold — never taken
+    // out of the hand).
     if (session.sittingOut) {
       const table = tableManager.getTable(session.tableId);
       if (table && table.activeSeatIndex === session.seatIndex) {
-        table.playerFold(session.seatIndex);
+        if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);
+        else table.playerFold(session.seatIndex);
         broadcastGameState(session.tableId);
       }
     }
@@ -12869,10 +13167,12 @@ Give feedback in this JSON format:
 
     socket.emit('sitOutToggled', { sittingOut: true, reason: 'afk' });
 
-    // Auto-fold if it's currently their turn
+    // Auto-fold if it's currently their turn (P-j: a tournament seat is acted
+    // for as ABSENT — check, or fold).
     const table = tableManager.getTable(session.tableId);
     if (table && table.activeSeatIndex === session.seatIndex) {
-      table.playerFold(session.seatIndex);
+      if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);
+      else table.playerFold(session.seatIndex);
       broadcastGameState(session.tableId);
     }
   });
@@ -13107,6 +13407,7 @@ Give feedback in this JSON format:
       trainingEnabled: false,
       sittingOut: false,
     };
+    detachSocketFromOtherTables(socket, tableId, 'seat', 'quickHeadsUp');   // P-g (round 5) — one table view per socket
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
 
@@ -13254,6 +13555,7 @@ Give feedback in this JSON format:
       trainingEnabled: false,
       sittingOut: false,
     };
+    detachSocketFromOtherTables(socket, tableId, 'seat', 'quickSpinGo');   // P-g (round 5) — one table view per socket
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
 
@@ -13414,6 +13716,7 @@ Give feedback in this JSON format:
       trainingEnabled: false,
       sittingOut: false,
     };
+    detachSocketFromOtherTables(socket, tableId, 'seat', 'quickAllInOrFold');   // P-g (round 5) — one table view per socket
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
 
@@ -13534,6 +13837,7 @@ Give feedback in this JSON format:
       trainingEnabled: false,
       sittingOut: false,
     };
+    detachSocketFromOtherTables(socket, tableId, 'seat', 'startCareerGame');   // P-g (round 5) — one table view per socket
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
 
@@ -13690,6 +13994,8 @@ Give feedback in this JSON format:
     if (existingSession) {
       handlePlayerLeave(socket);
     }
+    // P-g (round 5) — one table view: every OTHER table's spectating and room end.
+    detachSocketFromOtherTables(socket, tableId, 'spectate', 'spectate');
 
     // Add to spectators
     if (!spectators.has(tableId)) {
@@ -14281,6 +14587,9 @@ Give feedback in this JSON format:
       avatar: avatar || undefined,
     };
 
+    // P-g (round 5) — an extra seat ends any spectating (its main seat and
+    // other extra seats keep their rooms).
+    detachSocketFromOtherTables(socket, tableId, 'seat', 'joinAdditionalTable');
     if (!multiTableSessions.has(socket.id)) {
       multiTableSessions.set(socket.id, []);
     }
@@ -14376,6 +14685,112 @@ Give feedback in this JSON format:
     handlePlayerLeave(socket);
   });
 
+  // S2 (2026-10-10) — the lobby's "Return to tournament": put this signed-in
+  // socket back on its account's ABSENT live tournament seat (a Back to Lobby,
+  // a cash join that left it, a sign-in that did not restore it, a start that
+  // dealt him in absent). A way back into play, so it is gated like every seat
+  // restore (assertPlayable FIRST: a suspended player is not put back — his
+  // absent seat is disqualified at the next hand start). Payload `{tournamentId?}`
+  // (optional; narrows the search), optional ack.
+  // THE FIXED PROTOCOL (P-c, CONTRACTS.md C5): the ONLY way back to a seat he
+  // LEFT (no sign-in auto-restores it — P-b). The answer goes on the ack AND on
+  // 'returnToTournamentResult': success `{success:true, tournamentId, tableId,
+  // seatIndex}`, emitted AFTER `reconnectedToTable {tableId, seatIndex,
+  // tournamentId}` and a full gameState; or `{success:false, code, error}` with
+  // code player_suspended | login_required (assertPlayable) | not_signed_in |
+  // already_seated | session_changed | no_tournament_seat. `already_seated` =
+  // this socket holds a LIVE seat at ANOTHER table (main or extra-table) —
+  // authoritative; the client never pre-refuses from its own table state. A
+  // tap for the seat the socket already holds again (a lost ack, a double tap)
+  // is answered success (+ reconnectedToTable and a full gameState) — never
+  // already_seated: a lost answer is simply re-sent. A session left pointing at
+  // a dead seat (busted / stood up) is cleared first. P-c'' (round 6) — LATEST
+  // CONNECTION WINS: a seat another live socket of the SAME account plays
+  // (another tab or device, or his own stale connection) is taken over —
+  // restoreAbsentTournamentSeat(..., takeOver): that socket's session ends, it
+  // leaves the room and gets 'tournamentSeatTakenOver' {tournamentId, tableId,
+  // seatIndex}; there is no "held elsewhere" refusal. P-k (round 6) — a
+  // locally BANNED account is refused player_suspended (bannedAccountRefusal).
+  // A no_tournament_seat answer for a named tournament says WHY when the
+  // server knows (returnNoSeatAnswer): `tournamentFinished:true` + `position`
+  // (P-h — the tournament ended) or `eliminated:true` + `position` (he is out
+  // of a running one). A socket that dropped during the gate is not answered
+  // (nothing to send to).
+  socket.on('returnToTournamentSeat', async (...args: unknown[]) => {
+    const last = args[args.length - 1];
+    const ack = typeof last === 'function' ? (last as (r: unknown) => void) : null;
+    const first = args[0];
+    const wanted = first && typeof first === 'object' && typeof (first as { tournamentId?: unknown }).tournamentId === 'string'
+      ? String((first as { tournamentId: string }).tournamentId).slice(0, 128) : undefined;
+    const answer = (r: Record<string, unknown>): void => {
+      socket.emit('returnToTournamentResult', r);
+      if (ack) { try { ack(r); } catch { /* client ack threw — nothing to do */ } }
+    };
+    const before = authSessions.get(socket.id);
+    let rtsGate = await assertPlayable(socket, 'returnToTournamentSeat');
+    // P-k (round 6) — a locally BANNED account gets no seat back (player_suspended).
+    const banChecked = authSessions.get(socket.id);
+    if (!rtsGate && banChecked) rtsGate = await bannedAccountRefusal(banChecked.userId, 'returnToTournamentSeat');
+    if (rtsGate) {
+      tournamentSeatKeep.returnRefused++;
+      answer({ success: false, error: rtsGate.message, code: rtsGate.code });
+      return;
+    }
+    if (!socket.connected) return;  // U1 — its disconnect already ran; nothing is bound to a dead socket
+    const auth = authSessions.get(socket.id);
+    if (!auth) { answer({ success: false, code: 'not_signed_in', error: 'Sign in with your American Pub Poker account to play.' }); return; }
+    // Q3 — the gate (and the ban check) answered for the account signed in when it started.
+    if ((before && before.userId !== auth.userId) || (banChecked && banChecked.userId !== auth.userId)) { answer({ success: false, code: 'session_changed', error: 'Your sign-in changed — tap Return to tournament again.' }); return; }
+    const own = playerSessions.get(socket.id);
+    if (own) {
+      const ownTable = tableManager.getTable(own.tableId);
+      const ownSeat = ownTable?.seats[own.seatIndex];
+      const ownTournamentId = tournamentTables.get(own.tableId);
+      const ownTp = ownTournamentId && ownSeat ? tournamentManager.getTournament(ownTournamentId)?.players.find((p) => p.playerId === ownSeat.playerId) : undefined;
+      const liveOwnSeat = !!ownSeat && ownSeat.state === 'occupied' && !ownSeat.eliminated;
+      if (liveOwnSeat && ownTournamentId && ownTp && !ownTp.eliminated && (!wanted || wanted === ownTournamentId)
+          && tournamentEntrantIsAccount(ownTournamentId, ownTp, auth)) {
+        // Already back on this tournament's seat: answered like the return.
+        tournamentSeatKeep.returnAlreadyThere++;
+        detachSocketFromOtherTables(socket, own.tableId, 'seat', 'returnToTournamentSeat');   // P-g
+        socket.join(`table:${own.tableId}`);
+        socket.emit('reconnectedToTable', { tableId: own.tableId, seatIndex: own.seatIndex, tournamentId: ownTournamentId });
+        emitGameState(socket, getGameStateForPlayer(ownTable!, own.seatIndex, own.trainingEnabled), true);
+        answer({ success: true, tournamentId: ownTournamentId, tableId: own.tableId, seatIndex: own.seatIndex });
+        return;
+      }
+      if (liveOwnSeat || (multiTableSessions.get(socket.id) || []).length > 0) {
+        tournamentSeatKeep.returnRefused++;
+        answer({ success: false, code: 'already_seated', error: 'Leave your current table first, then tap Return to tournament.' });
+        return;
+      }
+    } else if ((multiTableSessions.get(socket.id) || []).length > 0) {
+      tournamentSeatKeep.returnRefused++;
+      answer({ success: false, code: 'already_seated', error: 'Leave your current table first, then tap Return to tournament.' });
+      return;
+    }
+    if (!absentTournamentSeatOf(auth, wanted, 'any', true)) {
+      tournamentSeatKeep.returnRefused++;
+      answer(returnNoSeatAnswer(auth, wanted));
+      return;
+    }
+    // Going back to a seat: a session on a DEAD seat (his busted seat, a seat
+    // stood up under it — nothing of his in play there) ends first; any
+    // spectating ends in the restore (P-g, detachSocketFromOtherTables).
+    if (own) {
+      playerSessions.delete(socket.id);
+      releaseSeatedSlot(socket.id, own.tableId);
+      socket.leave(`table:${own.tableId}`);
+    }
+    const restored = restoreAbsentTournamentSeat(socket, auth, 'returnToTournamentSeat', wanted, 'any', true);
+    if (!restored) {
+      tournamentSeatKeep.returnRefused++;
+      answer(returnNoSeatAnswer(auth, wanted));
+      return;
+    }
+    answer({ success: true, ...restored });
+  });
+
   // ── Private Home Games ─────────────────────────────────────────────────────
   socket.on('createPrivateTable', async (data: {
     tableName: string;
@@ -14450,6 +14865,15 @@ Give feedback in this JSON format:
       return;
     }
 
+    // P-g / P-a (round 5) — a socket that holds a seat leaves it FIRST, through
+    // handlePlayerLeave like every other join (a cash seat credited, a live
+    // tournament seat KEPT absent — 'voluntary', told tournamentSeatKept). The
+    // invite join used to overwrite the session: the tournament seat was left
+    // absent with no reservation, no voluntary mark and no Return offered, and
+    // the socket stayed in the old table's room.
+    if (playerSessions.get(socket.id)) handlePlayerLeave(socket);
+    detachSocketFromOtherTables(socket, tableId, 'seat', 'joinByInviteCode');
+
     // 2026-06-19 Phase 4: clamp the client buy-in to [minBuyIn, minBuyIn*10],
     // matching joinTable's audit-C6 cap (this invite path only enforced the
     // minimum). Own-wallet + balance-checked below, so not a mint — this is the
@@ -14504,6 +14928,7 @@ Give feedback in this JSON format:
       socketId: socket.id, tableId, seatIndex: openSeat, playerName, playerId,
       trainingEnabled: false, sittingOut: false, avatar: avatar || undefined,
     };
+    detachSocketFromOtherTables(socket, tableId, 'seat', 'joinByInviteCode');   // P-g — at the commit too
     playerSessions.set(socket.id, session);
     socket.join(`table:${tableId}`);
     progressionManager.getOrCreateProgress(playerId, playerName, authSessions.get(socket.id)?.userId);
@@ -14662,7 +15087,9 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
     // deleting auth beforehand made those credits silently no-op. (The
     // common seated-disconnect case already returns early via the reserve
     // branch above; this guards the multi-table / fallthrough cases.)
-    handlePlayerLeave(socket);
+    // S2: a tournament seat reached here (no account behind it) is kept
+    // absent like any disconnect — not a voluntary leave.
+    handlePlayerLeave(socket, 'kept');
     if (authSession) authSessions.delete(socket.id);
     // Clear delta tracking so a reconnect gets a fresh full state
     lastSentState.delete(socket.id); lastSentJson.delete(socket.id);
@@ -14902,8 +15329,10 @@ function releaseSocketForAccountSwitch(socket: Socket, nextUserId: number, via: 
     socketAccountSwitches.seatsReserved++;
   } else if (session) {
     // handlePlayerLeave credits authSessions.get(socket.id) — still the
-    // previous account here (or nobody, for an anonymous seat).
-    handlePlayerLeave(socket);
+    // previous account here (or nobody, for an anonymous seat). S2: an
+    // account switch is not the player leaving — a tournament seat is kept
+    // absent, unflagged (P-b: his next sign-in restores it).
+    handlePlayerLeave(socket, 'kept');
     mainSeat = 'left';
     if (prev) socketAccountSwitches.seatsLeft++;
     else socketAccountSwitches.unownedSeatsCleared++;
@@ -14918,6 +15347,8 @@ function releaseSocketForAccountSwitch(socket: Socket, nextUserId: number, via: 
       if (specs.size === 0) spectators.delete(tid);
     }
   }
+  // M3 (2026-10-10) — and so do its tournament records' pointers at this socket.
+  if (prev) detachTournamentEntrantSockets(socket.id, prev);
   authSessions.delete(socket.id);
   console.warn(`[login] ${JSON.stringify({
     event: 'socket_account_switch', via, fromUserId: prev?.userId ?? null, toUserId: nextUserId, mainSeat,
@@ -14925,12 +15356,966 @@ function releaseSocketForAccountSwitch(socket: Socket, nextUserId: number, via: 
   })}`);
 }
 
-function handlePlayerLeave(socket: Socket): void {
+// ===== Tournament seat kept on leave (S2, 2026-10-10) =====
+/**
+ * S2 (2026-10-10) — a leave from a LIVE tournament seat keeps the seat in
+ * play. It used to stand the seat up (handlePlayerLeave: a
+ * TOURNAMENT_STACK_NOT_CASHED audit, then standUp) WITHOUT eliminating him:
+ * his stack was gone, TournamentManager still counted him alive with no seat —
+ * a single-table tournament could never finish, and a later break re-seated
+ * him with a stack nobody paid for. Standard online-poker behaviour now: the
+ * seat stays IN PLAY, ABSENT — what the disconnect reservation does with a
+ * tournament seat (T1): never cashed out, never stood up, folded if it is his
+ * turn now and from then on acted for on the SHORT absent clock (his
+ * reservation starts past its hand limit — U4: the table does not wait 30s for
+ * him), and the hand-complete bust check eliminates it when the stack is gone.
+ * Left to the normal leave: a seat whose entrant is OUT (eliminated /
+ * disqualified — the hand-start suspension stand-up and an admin kick / ban
+ * (P-f) disqualify first), a broken table's seat (his stack already sits at
+ * the target table), a tournament not running. A reservation another seat of
+ * his already holds (a cash seat) is never overwritten — that would strand its
+ * stack; this seat then stays absent unreserved (the orphan auto-act blinds
+ * it) and is still found by account.
+ *
+ * THE S2 PROTOCOL (pe3 review, amended rounds 5 and 6 — 2026-10-10;
+ * CONTRACTS.md C5; poker-3d implements the same names):
+ *  P-a  VOLUNTARY leave (`leaveTable`, or handlePlayerLeave run first by
+ *       joinTable / quickPlay / joinWithWaitlistContext / joinByInviteCode /
+ *       spectate / spectateTournament (a LIVE seat) / the quick games on that
+ *       socket): the socket's session at the table ends FIRST — out of the
+ *       room, session deleted, delta baseline dropped — BEFORE any fold /
+ *       broadcast the keep triggers, so the leaving socket receives NO further
+ *       gameState for that table. The kept reservation is flagged `voluntary`
+ *       (and the entrant, voluntarilyAbsentTournamentEntrants), and the socket
+ *       is told where the seat is AFTER the keep (the final seat only):
+ *       'tournamentSeatKept' {tournamentId, tableId, seatIndex, tournamentName,
+ *       chips}.
+ *  P-b  No sign-in (oauthLogin, tokenLogin ×2, resumeSession, authWithTicket,
+ *       the waitlist bootstrap) auto-restores a VOLUNTARY kept seat: after its
+ *       normal answer it sends 'tournamentSeatKept' for each one the account
+ *       holds (tellKeptTournamentSeats — current table/seat after any
+ *       rebalance). A DISCONNECT's (non-voluntary) reservation keeps today's
+ *       auto-restore, and its 'reconnectedToTable' carries `tournamentId`
+ *       (reconnectTournamentFields). authWithTicket (restores no seat) also
+ *       tells a NON-voluntary absent tournament seat, so a fresh Play Online tab
+ *       can offer Return. A sign-in never takes a seat another socket plays.
+ *  P-c  'returnToTournamentSeat' {tournamentId} + ack → the ack AND
+ *       'returnToTournamentResult': {success:true, tournamentId, tableId,
+ *       seatIndex} + 'reconnectedToTable' {tableId, seatIndex, tournamentId} +
+ *       a full gameState; or {success:false, code, error}, code ∈
+ *       player_suspended | login_required | not_signed_in | already_seated |
+ *       session_changed | no_tournament_seat. already_seated = this socket
+ *       holds a live seat at ANOTHER table — the server's answer is
+ *       authoritative. no_tournament_seat for a named tournament may add
+ *       `tournamentFinished:true` / `eliminated:true` + `position`.
+ *  P-c'' LATEST CONNECTION WINS (round 6): a Return for an alive entrant
+ *       always binds the seat to the asking socket — a seat another live
+ *       socket of the SAME account plays (another tab / device, or his own
+ *       stale connection) is moved like a reconnect restore; that socket's
+ *       session ends, it leaves the room and gets 'tournamentSeatTakenOver'
+ *       {tournamentId, tableId, seatIndex}. A repeated / duplicated Return is
+ *       an idempotent success (a lost answer is simply re-sent).
+ *  P-d  every full gameState carries `isTournament` + `tournamentId`.
+ *  P-e  a kept-absent seat's elimination: eliminatedToSpectator / spectator
+ *       only on the socket that holds the player session AT that table and
+ *       none elsewhere (P-e'); every other live socket of his gets ONE plain
+ *       notice ('playerEliminated' + tournamentId) — the room's copy skips it.
+ *  P-f  an admin kick / IP-ban from a tournament seat DISQUALIFIES the entrant
+ *       (leaveTournamentSeatOnAdminRemoval) — the seat is never kept.
+ *  P-g  one socket, one table view: every seat / spectate path runs
+ *       detachSocketFromOtherTables first (a dead tournament seat's session
+ *       at another table ends there too).
+ *  P-h  the table rooms get 'tournamentFinished' unchanged; an entrant's
+ *       socket outside them gets 'tournamentFinishedForEntrant' {tournamentId,
+ *       position, prize?, tournamentName} (P-h'); a Return after the end says
+ *       so (finishedTournamentRecords).
+ *  P-i  absent auto-action (autoActForSeat): CHECK, or CALL at most ONE big
+ *       blind (never all-in) when every seat still in the hand is absent too;
+ *       otherwise FOLD.
+ *  P-j  on a tournament table sitting out = absent: dealt in, blinds posted,
+ *       acted for per P-i on the short clock (syncSitOutToTable).
+ *  P-k  a kick acts only on the table it targets (its socket's main seat, or
+ *       a named tableId / tournamentId); IP-ban and banUser disqualify every
+ *       AWAY entry; a banned account's Return / sign-in restore is refused
+ *       player_suspended (bannedAccountRefusal).
+ * A NON-voluntary keep ('kept': a suspended player's own seat at a re-login, a
+ * hand-start stand-up whose disqualification failed, an account switch or a
+ * disconnect fall-through) keeps the seat the same way, unflagged and untold.
+ */
+const tournamentSeatKeep = {
+  kept: 0, keptUnreserved: 0, returned: 0, returnRefused: 0,
+  // Fixed protocol (2026-10-10): voluntary keeps; sign-ins that left a
+  // voluntary seat alone and sent tournamentSeatKept instead; Return taps
+  // answered for a seat the socket already held again.
+  keptVoluntary: 0, signInNotices: 0, returnAlreadyThere: 0,
+  // Round 5 — Return answered no_tournament_seat because the tournament had
+  // FINISHED (P-h: tournamentFinished + position). Round 6 (P-c'') — Returns
+  // that took the seat from another live socket of the same account.
+  returnAfterFinish: 0, returnTakeOvers: 0,
+};
+
+/** What a leave does to a LIVE tournament seat (handlePlayerLeave's second argument) — see the protocol above. */
+type TournamentSeatLeaveKind = 'voluntary' | 'kept';
+
+/**
+ * P-b — entrants whose tournament seat is kept absent after a VOLUNTARY leave
+ * (key: tournamentId + NUL + playerId → when). Keyed by ENTRANT, so it
+ * survives a rebalance move and the end of the reservation itself (its
+ * SEAT_RESERVE_MS expiry, a cash reservation taking the user's single slot).
+ * Cleared by a return (restoreAbsentTournamentSeat); an entry whose entrant
+ * is out or whose tournament is over is dropped when read and by the 5s sweep.
+ */
+const voluntarilyAbsentTournamentEntrants = new Map<string, number>();
+function voluntaryAbsenceKey(tournamentId: string, playerId: string): string {
+  return `${tournamentId}\u0000${playerId}`;
+}
+/** P-b — did this LIVE entrant leave his seat on purpose (and not come back since)? */
+function tournamentSeatLeftVoluntarily(tournamentId: string, playerId: string): boolean {
+  const key = voluntaryAbsenceKey(tournamentId, playerId);
+  if (!voluntarilyAbsentTournamentEntrants.has(key)) return false;
+  const t = tournamentManager.getTournament(tournamentId);
+  const tp = t?.players.find((p) => p.playerId === playerId);
+  if (!t || t.status !== 'running' || !tp || tp.eliminated) {
+    voluntarilyAbsentTournamentEntrants.delete(key);
+    return false;
+  }
+  return true;
+}
+/** P-b — bounded memory (the 5s sweep): entries of entrants who are out / tournaments that ended. */
+function pruneVoluntarilyAbsentTournamentEntrants(): void {
+  for (const key of [...voluntarilyAbsentTournamentEntrants.keys()]) {
+    const at = key.indexOf('\u0000');
+    tournamentSeatLeftVoluntarily(key.slice(0, at), key.slice(at + 1));
+  }
+}
+
+/** The 'tournamentSeatKept' payload (P-a / P-b / V4). */
+function tournamentSeatKeptPayload(
+  tournamentId: string, tableId: string, seatIndex: number, seat: Seat,
+): { tournamentId: string; tableId: string; seatIndex: number; tournamentName: string; chips: number } {
+  return {
+    tournamentId, tableId, seatIndex,
+    tournamentName: tournamentManager.getTournament(tournamentId)?.config.name || 'Tournament',
+    chips: seat.chipCount,
+  };
+}
+
+/**
+ * P-b — the reservation path's 'reconnectedToTable' extra field: the
+ * tournament of a TOURNAMENT reservation (`{tournamentId}`), else nothing.
+ */
+function reconnectTournamentFields(reserved: { tableId: string; tournament?: boolean }): { tournamentId?: string } {
+  if (!isTournamentReservation(reserved)) return {};
+  const tournamentId = tournamentIdOfTable(reserved.tableId);
+  return tournamentId ? { tournamentId } : {};
+}
+
+function keepTournamentSeatOnLeave(
+  socket: Socket, session: PlayerSession, table: PokerTable, kind: TournamentSeatLeaveKind = 'voluntary',
+): boolean {
+  const tournamentId = tournamentTables.get(session.tableId);
+  if (!tournamentId) return false;
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t || t.status !== 'running') return false;
+  const seat = table.seats[session.seatIndex];
+  if (!seat || seat.state !== 'occupied' || seat.isAI) return false;
+  const tp = t.players.find((p) => p.playerId === seat.playerId);
+  if (!tp || tp.eliminated) return false;
+  const voluntary = kind === 'voluntary';
+
+  // P-a — this socket's session at the table ends FIRST, before the fold /
+  // broadcast below: out of the room, no session, no delta baseline. The
+  // leaving socket then receives NO further gameState for this table (pe3:
+  // the fold's broadcast reached it after poker-3d had cleared its table
+  // state; merged into the cached state it put a stale seat back in the lobby
+  // and Return to tournament was refused). Its next gameState is a full one.
+  socket.leave(`table:${session.tableId}`);
+  if (playerSessions.get(socket.id) === session) playerSessions.delete(socket.id);
+  releaseSeatedSlot(socket.id, session.tableId);
+  lastSentState.delete(socket.id);
+  lastSentJson.delete(socket.id);
+
+  const auth = authSessions.get(socket.id);
+  let reserved = false;
+  // Round 5 (pe4 nit) — the fold below can END the hand, and with no human
+  // session left at the table handleHandComplete reaches its bust check with
+  // no await: an elimination there can break THIS table at once, the
+  // rebalance moves this absent seat and V4 (noteAbsentTournamentSeatMoved)
+  // tells his sockets the NEW seat — this socket then got the OLD (broken)
+  // seat after it. While the keep runs, V4 skips this socket; it is told ONCE,
+  // at the end, where the seat is NOW (the final seat only).
+  keepingTournamentSeatOnLeave.add(socket.id);
+  try {
+    if (auth) {
+      const existing = reservedSeats.get(auth.userId);
+      if (!existing || (existing.tableId === session.tableId && existing.seatIndex === session.seatIndex)) {
+        // The disconnect handler's own reservation (tournament snapshot, master
+        // id snapshot for the U2 gate, fold-on-turn), started PAST its hand
+        // limit: the short absent clock from his next turn on. P-b: a voluntary
+        // one is flagged — no sign-in restores it.
+        reserveSeatForDeparture(auth, session, table, seat);
+        const r = reservedSeats.get(auth.userId);
+        if (r) {
+          r.handsRemaining = 0;
+          if (voluntary) r.voluntary = true;
+        }
+        reserved = !!r;
+      }
+    }
+    if (voluntary) voluntarilyAbsentTournamentEntrants.set(voluntaryAbsenceKey(tournamentId, tp.playerId), Date.now());
+    if (!reserved && table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
+      table.playerFold(session.seatIndex);
+      broadcastGameState(session.tableId);
+    }
+  } finally {
+    keepingTournamentSeatOnLeave.delete(socket.id);
+  }
+  if (seat.chipCount > 0) {
+    auditLog(auth?.username || seat.playerName || seat.playerId, 'TOURNAMENT_STACK_NOT_CASHED', {
+      userId: auth?.userId ?? null, tableId: session.tableId, amount: seat.chipCount,
+      reason: voluntary ? 'voluntary_leave_seat_kept' : 'leave_seat_kept_absent', seatKept: true,
+    });
+  }
+  tournamentSeatKeep.kept++;
+  if (voluntary) tournamentSeatKeep.keptVoluntary++;
+  if (!reserved) tournamentSeatKeep.keptUnreserved++;
+  // P-a — told only to a signed-in socket, and only for a VOLUNTARY leave: an
+  // account-less seat (guest-play rollback only) is kept too, but its socket
+  // may be becoming ANOTHER account (P4); a non-voluntary keep (suspended,
+  // account switch, disconnect) is not his to return to from this socket.
+  // Round 5 — where the seat is NOW (a synchronous break above may have moved
+  // it); nothing when it is no longer in play.
+  const now = tournamentSeatLocationNow(tournamentId, tp.playerId, session.tableId);
+  if (auth && voluntary && now) {
+    socket.emit('tournamentSeatKept', tournamentSeatKeptPayload(tournamentId, now.tableId, now.seatIndex, now.seat));
+  }
+  console.log(`[Tournament] ${JSON.stringify({
+    event: 'tournament_seat_kept_on_leave', tournamentId, tableId: session.tableId, seatIndex: session.seatIndex,
+    localUserId: auth?.userId ?? null, reserved, voluntary,
+    ...(now && (now.tableId !== session.tableId || now.seatIndex !== session.seatIndex) ? { movedTo: { tableId: now.tableId, seatIndex: now.seatIndex } } : {}),
+  })}`);
+  return true;
+}
+
+/**
+ * Round 5 — the sockets inside keepTournamentSeatOnLeave right now: V4's
+ * moved-seat notice skips them (the keep tells them the final seat itself).
+ */
+const keepingTournamentSeatOnLeave = new Set<string>();
+
+/** Round 5 — a LIVE entrant's live seat right now (after any rebalance), or null (out / not running / no seat). */
+function tournamentSeatLocationNow(
+  tournamentId: string, playerId: string, alsoTableId?: string,
+): { tableId: string; seatIndex: number; seat: Seat } | null {
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t || t.status !== 'running') return null;
+  const tp = t.players.find((p) => p.playerId === playerId);
+  if (!tp || tp.eliminated) return null;
+  for (const tableId of [t.playerTableMap.get(playerId), t.tableId, alsoTableId]) {
+    if (!tableId || tournamentTables.get(tableId) !== tournamentId) continue;
+    const table = tableManager.getTable(tableId);
+    const seatIndex = tournamentLiveSeatIndex(table, playerId);
+    if (seatIndex >= 0) return { tableId, seatIndex, seat: table!.seats[seatIndex] };
+  }
+  return null;
+}
+
+/** One absent live tournament seat of an account (absentTournamentSeatsOf). */
+interface AbsentTournamentSeatOfAccount {
+  tournamentId: string; tableId: string; seatIndex: number; seat: Seat; tp: TournamentPlayer; voluntary: boolean;
+  /** P-c'' — `takeOver` only: the live sockets of the SAME account playing the seat now (Return takes it from them). */
+  heldBy: string[];
+}
+
+/**
+ * S2 — this account's ABSENT live tournament seats: an entrant of a RUNNING
+ * tournament (tournamentEntrantIsAccount — local userId, a qualifier entrant
+ * by his master id), his LIVE seat (Q2) on a live tournament table, with no
+ * LIVE socket's session on it. `voluntary`: 'exclude' (what a sign-in may
+ * auto-restore — P-b), 'only' (what a sign-in tells about), 'any' (Return).
+ * P-c'' (round 6) — `takeOver` (Return only): a seat played by live sockets
+ * signed in as this SAME account counts too (`heldBy` = those sockets) — the
+ * latest connection wins; a seat a live socket of anyone else plays never.
+ */
+function absentTournamentSeatsOf(
+  auth: SocketAuthSession, opts: { onlyTournamentId?: string; voluntary: 'exclude' | 'only' | 'any'; takeOver?: boolean },
+): AbsentTournamentSeatOfAccount[] {
+  const out: AbsentTournamentSeatOfAccount[] = [];
+  for (const tournamentId of new Set(tournamentTables.values())) {
+    if (opts.onlyTournamentId && tournamentId !== opts.onlyTournamentId) continue;
+    const t = tournamentManager.getTournament(tournamentId);
+    if (!t || t.status !== 'running') continue;
+    for (const tp of t.players) {
+      if (tp.eliminated || !tournamentEntrantIsAccount(tournamentId, tp, auth)) continue;
+      const voluntary = tournamentSeatLeftVoluntarily(tournamentId, tp.playerId);
+      if (opts.voluntary === 'exclude' && voluntary) continue;
+      if (opts.voluntary === 'only' && !voluntary) continue;
+      const tableId = t.playerTableMap.get(tp.playerId) ?? t.tableId ?? undefined;
+      if (!tableId || tournamentTables.get(tableId) !== tournamentId) continue;
+      const table = tableManager.getTable(tableId);
+      const idx = tournamentLiveSeatIndex(table, tp.playerId);
+      if (idx < 0) continue;
+      const seat = table!.seats[idx];
+      if (seat.isAI) continue;
+      const heldBy: string[] = [];
+      let heldByOther = false;
+      for (const [sid, s] of playerSessions) {
+        if (s.tableId !== tableId || s.seatIndex !== idx) continue;
+        if (!io.sockets.sockets.get(sid)?.connected) continue;          // a gone socket's — the restore drops it
+        const holder = authSessions.get(sid);
+        if (opts.takeOver && holder && tournamentEntrantIsAccount(tournamentId, tp, holder)) heldBy.push(sid);
+        else { heldByOther = true; break; }
+      }
+      if (heldByOther) continue;
+      out.push({ tournamentId, tableId, seatIndex: idx, seat, tp, voluntary, heldBy });
+    }
+  }
+  return out;
+}
+
+/** S2 — the first one (sign-ins: never a VOLUNTARY one — P-b, never a played one; Return: any, P-c'' takeOver). */
+function absentTournamentSeatOf(
+  auth: SocketAuthSession, onlyTournamentId?: string, voluntary: 'exclude' | 'any' = 'exclude', takeOver = false,
+): AbsentTournamentSeatOfAccount | null {
+  return absentTournamentSeatsOf(auth, { onlyTournamentId, voluntary, takeOver })[0] ?? null;
+}
+
+/**
+ * S2 / M5 (2026-10-10) — put `socket` (signed in as `auth`) back on its
+ * account's ABSENT live tournament seat, found by ACCOUNT — not by a
+ * reservation (a voluntary leave whose reservation slot was taken, a
+ * reservation past its 6h, a registrant the start dealt in absent — his seat's
+ * playerId is the registration's `player-<uuid>`, never `user_<id>`, so no
+ * reservation or orphan scan ever found it). Synchronous (callers run it right
+ * after their seat-restore gate + overtake checks, or after their own gate).
+ * Never while the socket holds a main seat. The session's playerId is the
+ * SEAT's (the tournament's entrant id); his reservation for that seat (if any)
+ * is consumed; a session a gone socket left on the seat is dropped; his
+ * tournament record's socket follows; a voluntary absence ends. Answers like a
+ * reconnect: `reconnectedToTable {tableId, seatIndex, tournamentId}` + a full
+ * gameState. P-b: a sign-in passes voluntary 'exclude' (never a seat he LEFT —
+ * it only tells him, tellKeptTournamentSeats); 'returnToTournamentSeat'
+ * passes 'any' and `takeOver` (P-c'', round 6 — LATEST CONNECTION WINS): a
+ * seat another live socket of the SAME account plays (another tab or device,
+ * or his own stale connection the server still counts as connected) moves to
+ * this socket like a reconnect restore; the old socket's session there ends,
+ * it leaves the room (no further frames) and gets 'tournamentSeatTakenOver'
+ * {tournamentId, tableId, seatIndex}. A sign-in never takes a played seat.
+ */
+function restoreAbsentTournamentSeat(
+  socket: Socket, auth: SocketAuthSession, via: string, onlyTournamentId?: string,
+  voluntary: 'exclude' | 'any' = 'exclude', takeOver = false,
+): { tournamentId: string; tableId: string; seatIndex: number } | null {
+  if (playerSessions.has(socket.id)) return null;
+  const found = absentTournamentSeatOf(auth, onlyTournamentId, voluntary, takeOver);
+  if (!found) return null;
+  const { tournamentId, tableId, seatIndex, seat, tp } = found;
+  const table = tableManager.getTable(tableId);
+  if (!table) return null;
+  const r = reservedSeats.get(auth.userId);
+  if (r && r.tableId === tableId && r.seatIndex === seatIndex) {
+    if (r.cleanupTimer) clearTimeout(r.cleanupTimer);
+    reservedSeats.delete(auth.userId);
+  }
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId !== tableId || s.seatIndex !== seatIndex) continue;
+    playerSessions.delete(sid);   // a gone socket's, or (P-c'') one of found.heldBy — told below
+    if (!found.heldBy.includes(sid)) continue;
+    const old = io.sockets.sockets.get(sid);
+    releaseSeatedSlot(sid, tableId);
+    lastSentState.delete(sid);
+    lastSentJson.delete(sid);
+    if (old) {
+      old.leave(`table:${tableId}`);
+      old.emit('tournamentSeatTakenOver', { tournamentId, tableId, seatIndex });
+    }
+    tournamentSeatKeep.returnTakeOvers++;
+    console.log(`[Tournament] ${JSON.stringify({
+      event: 'tournament_seat_taken_over', via, tournamentId, tableId, seatIndex, localUserId: auth.userId,
+    })}`);
+  }
+  // P-g (round 5) — one table view: every OTHER table's spectating and room
+  // end first (pe4: a sign-in restore by account left the socket spectating
+  // another table on the same delta channel), and its spectating of THIS one.
+  detachSocketFromOtherTables(socket, tableId, 'seat', via);
+  playerSessions.set(socket.id, {
+    socketId: socket.id, tableId, seatIndex, playerName: seat.playerName, playerId: seat.playerId,
+    trainingEnabled: false, sittingOut: false,
+  } as PlayerSession);
+  socket.join(`table:${tableId}`);
+  sitOutTracker.get(tableId)?.delete(seatIndex);
+  syncSitOutToTable(tableId);
+  seat.deadBlindOwedChips = 0;
+  seat.missedBlind = 'none';
+  tp.socketId = socket.id;
+  voluntarilyAbsentTournamentEntrants.delete(voluntaryAbsenceKey(tournamentId, tp.playerId));
+  tournamentSeatKeep.returned++;
+  socket.emit('reconnectedToTable', { tableId, seatIndex, tournamentId });
+  emitGameState(socket, getGameStateForPlayer(table, seatIndex), true);
+  broadcastGameState(tableId);
+  console.log(`[Tournament] ${JSON.stringify({
+    event: 'tournament_seat_returned', via, tournamentId, tableId, seatIndex, localUserId: auth.userId,
+  })}`);
+  return { tournamentId, tableId, seatIndex };
+}
+
+/**
+ * P-b (S2 fixed protocol) — after a sign-in's normal answer: tell `socket`
+ * about the account's kept-absent tournament seats it did NOT restore —
+ * 'tournamentSeatKept' {tournamentId, tableId, seatIndex, tournamentName,
+ * chips} per seat, its CURRENT table/seat (after any rebalance). `which`:
+ * 'voluntary' (oauthLogin, tokenLogin ×2, resumeSession, the waitlist
+ * bootstrap — a non-voluntary one they restore themselves) or 'all'
+ * (authWithTicket, which restores no seat: a fresh Play Online tab can offer
+ * Return for a disconnect's seat too). Only while the socket is still signed
+ * in as `auth`. Returns how many it told.
+ */
+function tellKeptTournamentSeats(socket: Socket, auth: SocketAuthSession, which: 'voluntary' | 'all', via: string): number {
+  // Runs AFTER a successful loginResult: it must never throw into the login
+  // handler (whose catch would answer a second, failed loginResult).
+  try {
+    if (!socket.connected || authSessions.get(socket.id) !== auth) return 0;
+    const seats = absentTournamentSeatsOf(auth, { voluntary: which === 'voluntary' ? 'only' : 'any' });
+    for (const s of seats) socket.emit('tournamentSeatKept', tournamentSeatKeptPayload(s.tournamentId, s.tableId, s.seatIndex, s.seat));
+    if (seats.length > 0) {
+      tournamentSeatKeep.signInNotices += seats.length;
+      console.log(`[Tournament] ${JSON.stringify({
+        event: 'tournament_seat_kept_told_on_sign_in', via, which, localUserId: auth.userId,
+        seats: seats.map((s) => ({ tournamentId: s.tournamentId, tableId: s.tableId, seatIndex: s.seatIndex, voluntary: s.voluntary })),
+      })}`);
+    }
+    return seats.length;
+  } catch (e: any) {
+    console.warn(`[Tournament] tellKeptTournamentSeats failed (${via}):`, e?.message || e);
+    return 0;
+  }
+}
+
+/** P-e / V4 — is this entrant identified by an account (local userId or master id)? An account-less one cannot be told apart from anyone. */
+function tournamentEntrantHasAccount(tournamentId: string, tp: { playerId: string; userId?: number; masterUserId?: string }): boolean {
+  return tp.userId !== undefined || !!(tp.masterUserId || qualifierEntrantMasterId(tournamentId, tp.playerId));
+}
+
+/**
+ * V4 (S2 fixed protocol) — a rebalance moved this entrant's ABSENT seat to
+ * (tableId, seatIndex): every live socket signed in as HIM that does not play
+ * that seat gets an updated 'tournamentSeatKept' (the new table/seat), so the
+ * lobby's Return to tournament follows the seat. (A socket that played the
+ * seat was moved with it and got 'playerMoved'.)
+ */
+function noteAbsentTournamentSeatMoved(
+  tournamentId: string, tp: { playerId: string; userId?: number; masterUserId?: string }, tableId: string, seatIndex: number,
+): void {
+  if (!tournamentEntrantHasAccount(tournamentId, tp)) return;
+  const seat = tableManager.getTable(tableId)?.seats[seatIndex];
+  if (!seat || seat.state !== 'occupied') return;
+  let told = 0;
+  for (const [sid, a] of authSessions) {
+    if (!tournamentEntrantIsAccount(tournamentId, tp, a)) continue;
+    const s = playerSessions.get(sid);
+    if (s && s.tableId === tableId && s.seatIndex === seatIndex) continue;
+    // Round 5 — a socket inside its own keep is told the FINAL seat by the keep itself.
+    if (keepingTournamentSeatOnLeave.has(sid)) continue;
+    const sock = io.sockets.sockets.get(sid);
+    if (!sock || !sock.connected) continue;
+    sock.emit('tournamentSeatKept', tournamentSeatKeptPayload(tournamentId, tableId, seatIndex, seat));
+    told++;
+  }
+  if (told > 0) {
+    tournamentHandStartSafety.absentSeatsMovedNotified++;
+    console.log(`[Tournament] ${JSON.stringify({
+      event: 'absent_tournament_seat_moved_told', tournamentId, playerId: tp.playerId, tableId, seatIndex, sockets: told,
+    })}`);
+  }
+}
+
+/** P-e — does this socket hold a player session (main or extra-table) at a table OTHER than `tableId`? */
+function socketHoldsPlayerSessionElsewhere(socketId: string, tableId: string): boolean {
+  const main = playerSessions.get(socketId);
+  if (main && main.tableId !== tableId) return true;
+  return (multiTableSessions.get(socketId) || []).some((ms) => ms.tableId !== tableId);
+}
+
+/**
+ * P-e / P-e' — who gets the PLAIN elimination notice: every live socket signed
+ * in as this entrant except `toldSid` (the one that PLAYED the seat, told
+ * eliminatedToSpectator). Round 5 (P-e'): a socket that is in this table's
+ * room without playing the seat (an away entrant spectating his own table) is
+ * told too — the room's own 'playerEliminated' carries no tournamentId, so it
+ * could never end his away seat; round 6: the room's copy skips these sockets
+ * (eliminationDirectNotice) — one notice each. An account-less entrant cannot
+ * be told apart from anyone: nobody.
+ */
+function tournamentEliminationNoticeSockets(
+  tournamentId: string, tp: { playerId: string; userId?: number; masterUserId?: string }, toldSid: string | null,
+): string[] {
+  if (!tournamentEntrantHasAccount(tournamentId, tp)) return [];
+  const out: string[] = [];
+  for (const [sid, a] of authSessions) {
+    if (sid === toldSid || !tournamentEntrantIsAccount(tournamentId, tp, a)) continue;
+    if (io.sockets.sockets.get(sid)?.connected) out.push(sid);
+  }
+  return out;
+}
+
+/**
+ * P-e / P-e' — the PLAIN elimination notice (a toast + the end of the away
+ * seat on the client, never a screen switch): 'playerEliminated'
+ * {tournamentId, playerId, playerName, position} to `sids`
+ * (tournamentEliminationNoticeSockets). Returns how many sockets were told.
+ */
+function noticeTournamentEliminationToEntrant(
+  tournamentId: string, playerId: string, sids: string[], playerName: string, position: number,
+): number {
+  const payload = { tournamentId, playerId, playerName, position };
+  let told = 0;
+  for (const sid of sids) {
+    const sock = io.sockets.sockets.get(sid);
+    if (!sock || !sock.connected) continue;
+    sock.emit('playerEliminated', payload);
+    told++;
+  }
+  return told;
+}
+
+/**
+ * P-g (S2 fixed protocol amendment, round 5, 2026-10-10) — ONE socket, ONE
+ * table view. The per-socket delta channel (emitGameState / lastSentState)
+ * carries ONE table's state: a socket that kept spectating table Y (or stayed
+ * in Y's room — chat, emotes, deck commitments, blind-ups, tournament events)
+ * after it took a seat or started watching table X got Y's frames mixed into
+ * X's. Every path that seats a socket or makes it a spectator at X calls this
+ * FIRST: the socket stops spectating every other table (`kind` 'seat': X too —
+ * a player is never also X's spectator) and leaves every other `table:*`
+ * room, except a table where it holds a player session (its main seat — a
+ * caller still about to leave it does that itself — or an extra-table seat).
+ * When anything was detached the per-socket delta baseline is dropped (it was
+ * another table's): its next frame is a full one. `tableId` null = not known
+ * yet (quickPlay, the waitlist bootstrap before the table is picked).
+ * Round 6 (pe5 X5) — a main session on a DEAD tournament seat (busted /
+ * eliminated, stood up, or its table gone) at ANOTHER table is not a seat: it
+ * ends here (session, seated slot, room). broadcastGameState sends player-view
+ * frames to every session at a table whatever rooms the socket is in, so a
+ * busted player who moved on with spectateNextTable / spectate / Watch Live
+ * got his OLD table's frames interleaved with the new one's. The seat itself
+ * is not touched (the bust check / rebalance own it).
+ */
+const tableViewDetaches = { calls: 0, spectatorViewsEnded: 0, roomsLeft: 0, deadSeatSessionsEnded: 0 };
+function detachSocketFromOtherTables(
+  socket: Socket, tableId: string | null, kind: 'seat' | 'spectate', via: string,
+): void {
+  const ended: string[] = [];
+  for (const [tid, specs] of spectators) {
+    if (kind === 'spectate' && tid === tableId) continue;
+    if (!specs.delete(socket.id)) continue;
+    if (specs.size === 0) spectators.delete(tid);
+    ended.push(tid);
+  }
+  const keep = new Set<string>();
+  if (tableId) keep.add(tableId);
+  let main = playerSessions.get(socket.id);
+  let deadSeatEnded: string | null = null;
+  if (main && main.tableId !== tableId) {
+    const t = tableManager.getTable(main.tableId);
+    const s = t?.seats[main.seatIndex];
+    if (!t || (isTournamentTable(main.tableId) && (!s || s.state !== 'occupied' || s.eliminated))) {
+      playerSessions.delete(socket.id);
+      releaseSeatedSlot(socket.id, main.tableId);
+      tableViewDetaches.deadSeatSessionsEnded++;
+      deadSeatEnded = main.tableId;
+      main = undefined;
+    }
+  }
+  if (main) keep.add(main.tableId);
+  for (const ms of multiTableSessions.get(socket.id) || []) keep.add(ms.tableId);
+  const left: string[] = [];
+  const rooms: unknown[] = socket.rooms ? [...socket.rooms] : [];
+  for (const room of rooms) {
+    if (typeof room !== 'string' || !room.startsWith('table:')) continue;
+    const tid = room.slice('table:'.length);
+    if (keep.has(tid)) continue;
+    socket.leave(room);
+    left.push(tid);
+  }
+  if (ended.length === 0 && left.length === 0 && !deadSeatEnded) return;
+  lastSentState.delete(socket.id);
+  lastSentJson.delete(socket.id);
+  tableViewDetaches.calls++;
+  tableViewDetaches.spectatorViewsEnded += ended.length;
+  tableViewDetaches.roomsLeft += left.length;
+  console.log(`[Tables] ${JSON.stringify({
+    event: 'table_view_detached', via, kind, tableId, spectating: ended, rooms: left,
+    ...(deadSeatEnded ? { deadSeatSessionEnded: deadSeatEnded } : {}),
+  })}`);
+}
+
+/**
+ * P-h (round 5, 2026-10-10) — finished tournaments by ENTRANT, so a Return
+ * tapped after the end can say so (`tournamentFinished:true` + his
+ * `position`) instead of "no seat". TournamentManager drops a template
+ * tournament 10s after it finishes; this keeps {playerId, local userId,
+ * master id, finish position} per entrant for FINISHED_TOURNAMENT_KEEP_MS.
+ * Bounded (oldest dropped past FINISHED_TOURNAMENTS_MAX); pruned by the 5s
+ * sweep. Memory only.
+ */
+const FINISHED_TOURNAMENT_KEEP_MS = 6 * 60 * 60_000;
+const FINISHED_TOURNAMENTS_MAX = 500;
+interface FinishedTournamentEntrant { playerId: string; userId?: number; masterUserId?: string; position: number; prize?: number }
+const finishedTournamentRecords = new Map<string, { finishedAt: number; entrants: FinishedTournamentEntrant[] }>();
+const tournamentFinishedNotices = { roomBroadcasts: 0, entrantSockets: 0 };
+function pruneFinishedTournamentRecords(now: number = Date.now()): void {
+  for (const [id, rec] of finishedTournamentRecords) {
+    if (now - rec.finishedAt > FINISHED_TOURNAMENT_KEEP_MS) finishedTournamentRecords.delete(id);
+  }
+  while (finishedTournamentRecords.size > FINISHED_TOURNAMENTS_MAX) {
+    const oldest = finishedTournamentRecords.keys().next().value;
+    if (oldest === undefined) break;
+    finishedTournamentRecords.delete(oldest);
+  }
+}
+function noteFinishedTournament(
+  tournamentId: string, data: { results?: Array<{ playerId: string; position: number; userId?: number; payout?: number }> },
+): { finishedAt: number; entrants: FinishedTournamentEntrant[] } {
+  const t = tournamentManager.getTournament(tournamentId);
+  const entrants: FinishedTournamentEntrant[] = [];
+  const seen = new Set<string>();
+  for (const r of data?.results || []) {
+    if (!r?.playerId || seen.has(r.playerId)) continue;
+    seen.add(r.playerId);
+    const tp = t?.players.find((p) => p.playerId === r.playerId);
+    const userId = r.userId ?? tp?.userId;
+    const master = tp?.masterUserId || qualifierEntrantMasterId(tournamentId, r.playerId) || undefined;
+    if (userId === undefined && !master) continue;          // account-less (AI fill): nobody to tell
+    const prize = Math.max(0, Math.floor(Number(r.payout) || 0));
+    entrants.push({
+      playerId: r.playerId, ...(userId !== undefined ? { userId } : {}), ...(master ? { masterUserId: String(master) } : {}),
+      position: Number(r.position) || 0, ...(prize > 0 ? { prize } : {}),
+    });
+  }
+  const rec = { finishedAt: Date.now(), entrants };
+  finishedTournamentRecords.delete(tournamentId);
+  finishedTournamentRecords.set(tournamentId, rec);
+  pruneFinishedTournamentRecords();
+  return rec;
+}
+/** P-h — is `auth` this finished-tournament entrant (same rule as tournamentEntrantIsAccount)? */
+function finishedEntrantIsAccount(e: FinishedTournamentEntrant, auth: SocketAuthSession | undefined): boolean {
+  if (!auth) return false;
+  if (e.userId !== undefined) return auth.userId === e.userId;
+  const sessionMaster = auth.masterUserId || auth.statsMasterUserId || null;
+  return !!e.masterUserId && !!sessionMaster && String(sessionMaster) === e.masterUserId;
+}
+
+/**
+ * P-h (round 5) / P-h' (round 6) — the end of a tournament reaches EVERY
+ * entrant: the table rooms get 'tournamentFinished' exactly as before (`data`
+ * unchanged), then every live socket signed in as an entrant that is in none
+ * of those rooms (an away entrant in the lobby, at a cash table, on another
+ * tab) gets its OWN event 'tournamentFinishedForEntrant' {tournamentId,
+ * position, prize?, tournamentName} — a toast / banner on the client, never the
+ * table's Game Over screen (round 5 sent it as a second 'tournamentFinished',
+ * which a client draws as a full-screen modal over whatever table it shows;
+ * an older client ignores the new name). Also records the result for a Return
+ * tapped after the end.
+ */
+function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: string[], data: any): void {
+  const rooms = [...new Set(roomTableIds.filter(Boolean).map((tid) => `table:${tid}`))];
+  for (const room of rooms) io.to(room).emit('tournamentFinished', data);
+  tournamentFinishedNotices.roomBroadcasts += rooms.length;
+  const id = data?.tournamentId || tournamentId;
+  const rec = noteFinishedTournament(id, data);
+  const tournamentName = tournamentManager.getTournament(id)?.config.name || 'Tournament';
+  let told = 0;
+  for (const [sid, a] of authSessions) {
+    const e = rec.entrants.find((x) => finishedEntrantIsAccount(x, a));
+    if (!e) continue;
+    const sock = io.sockets.sockets.get(sid);
+    if (!sock || !sock.connected) continue;
+    if (rooms.some((r) => sock.rooms?.has(r))) continue;   // the room's frame reached it
+    sock.emit('tournamentFinishedForEntrant', {
+      tournamentId: id, position: e.position, ...(e.prize ? { prize: e.prize } : {}), tournamentName,
+    });
+    told++;
+  }
+  tournamentFinishedNotices.entrantSockets += told;
+  if (told > 0) {
+    console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_finished_told_to_entrants', tournamentId, sockets: told })}`);
+  }
+}
+
+/**
+ * P-c / P-h (round 5) — why a Return for `tournamentId` found no seat of
+ * `auth`'s: 'finished' (the tournament ended — his place), 'eliminated' (he is
+ * out of a running one — his place), or null (nothing known). (Round 6, P-c'':
+ * a seat another socket of his plays is no longer a refusal — the Return takes
+ * it over — so there is no "held elsewhere" answer.)
+ */
+function tournamentEntryOutcomeOfAccount(
+  auth: SocketAuthSession, tournamentId: string,
+): { kind: 'finished' | 'eliminated'; position: number } | null {
+  const t = tournamentManager.getTournament(tournamentId);
+  const tp = t?.players.find((p) => tournamentEntrantHasAccount(tournamentId, p) && tournamentEntrantIsAccount(tournamentId, p, auth));
+  if (t && tp && t.status === 'running') {
+    return tp.eliminated ? { kind: 'eliminated', position: tp.finishPosition || 0 } : null;
+  }
+  if (t && tp && t.status === 'finished') return { kind: 'finished', position: tp.finishPosition || 0 };
+  const rec = finishedTournamentRecords.get(tournamentId);
+  const e = rec?.entrants.find((x) => finishedEntrantIsAccount(x, auth));
+  return e ? { kind: 'finished', position: e.position } : null;
+}
+
+/**
+ * P-k (S2 protocol, round 6) — a locally BANNED account (banUser, adminIPBan:
+ * users.banned) gets no seat back: returnToTournamentSeat and every sign-in
+ * restore (refuseSeatRestoreIfBarred) refuse it with code 'player_suspended',
+ * like a master suspension. Fails OPEN on a DB error (logged), like the play
+ * gate's suspension lookup — the ban's own disqualification already ran.
+ */
+async function bannedAccountRefusal(userId: number, where: string): Promise<PlayRefusal | null> {
+  try {
+    if (!(await isUserBanned(userId))) return null;
+  } catch (e: any) {
+    console.warn(`[play-gate] ${JSON.stringify({ event: 'ban_check_failed_open', where, localUserId: userId, error: String(e?.message || e) })}`);
+    return null;
+  }
+  console.warn(`[play-gate] ${JSON.stringify({ event: 'banned_account_refused', where, localUserId: userId })}`);
+  return { code: 'player_suspended', message: PLAYER_SUSPENDED_MESSAGE };
+}
+
+const RETURN_NO_SEAT_MESSAGE = 'You have no seat waiting in a running tournament.';
+function ordinalPlace(n: number): string {
+  const v = n % 100;
+  const s = ['th', 'st', 'nd', 'rd'];
+  return `${n}${s[(v - 20) % 10] || s[v] || s[0]}`;
+}
+/**
+ * P-c / P-h (round 5) — the no_tournament_seat answer of a Return. The code is
+ * always no_tournament_seat; for a NAMED tournament the server adds what it
+ * knows (tournamentEntryOutcomeOfAccount): `tournamentFinished:true` (+
+ * `position` when known) — P-h; or `eliminated:true` (+ `position`). Without a
+ * tournamentId nothing is guessed (several tournaments could be meant).
+ */
+function returnNoSeatAnswer(auth: SocketAuthSession, wanted: string | undefined): Record<string, unknown> {
+  const base = { success: false, code: 'no_tournament_seat', ...(wanted ? { tournamentId: wanted } : {}) };
+  const why = wanted ? tournamentEntryOutcomeOfAccount(auth, wanted) : null;
+  if (why?.kind === 'finished') {
+    tournamentSeatKeep.returnAfterFinish++;
+    return {
+      ...base, tournamentFinished: true, ...(why.position > 0 ? { position: why.position } : {}),
+      error: why.position > 0 ? `This tournament has finished — you placed ${ordinalPlace(why.position)}.` : 'This tournament has finished.',
+    };
+  }
+  if (why?.kind === 'eliminated') {
+    return {
+      ...base, eliminated: true, ...(why.position > 0 ? { position: why.position } : {}),
+      error: why.position > 0 ? `You are out of this tournament — you finished ${ordinalPlace(why.position)}.` : 'You are out of this tournament.',
+    };
+  }
+  return { ...base, error: RETURN_NO_SEAT_MESSAGE };
+}
+
+/**
+ * P-f gap (round 5) / P-k (round 6) — an admin removal of an entrant who is
+ * AWAY (no socket plays his tournament seat: Back to Lobby, a disconnect)
+ * disqualifies those entries too — before, only a seat a kicked SOCKET sat at
+ * was, and he signed back in and Returned to the absent one. IP-ban and the
+ * account ban (banUser): every away entry; a kick: only the tournament it
+ * NAMES (`onlyTournamentId`). Each absent live tournament seat of the account:
+ * the entrant is disqualified through TournamentManager (no eliminator, no prize —
+ * finishTournament pays a disqualified entrant nothing), audited
+ * TOURNAMENT_ENTRANT_DISQUALIFIED_BY_ADMIN {away:true, credited:0}, then the
+ * seat is stood up (folded first, at the hand's end if his chips are in a live
+ * pot) — its tournament chips NEVER credited (TOURNAMENT_STACK_NOT_CASHED). A
+ * seat whose disqualification did not happen is left in play (a live entrant
+ * is never stood up without being eliminated). Rebalance held meanwhile, like
+ * the seated P-f path. Returns how many entries were disqualified.
+ */
+function disqualifyAwayTournamentEntriesOnAdminRemoval(
+  account: SocketAuthSession, via: 'admin_kick' | 'admin_ip_ban' | 'admin_ban', actor: string, onlyTournamentId?: string,
+): number {
+  let n = 0;
+  for (const away of absentTournamentSeatsOf(account, { onlyTournamentId, voluntary: 'any' })) {
+    const { tournamentId, tableId, seatIndex, seat, tp } = away;
+    const table = tableManager.getTable(tableId);
+    if (!table) continue;
+    holdTournamentRebalance(tournamentId);
+    try {
+      const chips = seat.chipCount;
+      const dq = tournamentManager.disqualifyPlayer(tournamentId, tp.playerId);
+      auditLog(actor, 'TOURNAMENT_ENTRANT_DISQUALIFIED_BY_ADMIN', {
+        via, away: true, tournamentId, tableId, seatIndex, playerId: tp.playerId,
+        targetUserId: account.userId, chips, disqualified: !!dq, position: dq?.position ?? null, credited: 0,
+      });
+      console.warn(`[Tournament] ${JSON.stringify({
+        event: 'tournament_entrant_disqualified_by_admin', via, away: true, tournamentId, tableId, playerId: tp.playerId, disqualified: !!dq,
+      })}`);
+      if (!dq) continue;
+      tournamentHandStartSafety.adminRemovalsDisqualified++;
+      tournamentHandStartSafety.adminRemovalsAwayDisqualified++;
+      voluntarilyAbsentTournamentEntrants.delete(voluntaryAbsenceKey(tournamentId, tp.playerId));
+      standUpAdminDisqualifiedAbsentSeat(table, tableId, seatIndex, account, via);
+      n++;
+    } finally {
+      releaseTournamentRebalance(tournamentId, table, tableId);
+    }
+  }
+  return n;
+}
+
+/**
+ * P-f gap — the account an admin kick / IP-ban targets, for its AWAY entries:
+ * his local userId, and his master id (a qualifier entrant is known by it
+ * alone) from one of his live sockets' sessions, else his row's stats stamp.
+ */
+async function adminRemovalTargetAccount(userId: number, sids: string[]): Promise<SocketAuthSession> {
+  let username = '';
+  let master: string | null = null;
+  for (const sid of sids) {
+    const a = authSessions.get(sid);
+    if (!a || a.userId !== userId) continue;
+    username = username || a.username;
+    master = master || (a.masterUserId ? String(a.masterUserId) : (a.statsMasterUserId ? String(a.statsMasterUserId) : null));
+  }
+  if (!master) {
+    try { master = masterIdFromStats(await loadLocalStats(userId)); } catch { master = null; }
+  }
+  return { userId, username: username || String(userId), ...(master ? { masterUserId: master } : {}) };
+}
+
+/** P-f gap — stand an admin-disqualified ABSENT seat up; the same teardown handlePlayerLeave gives a seated one. */
+function standUpAdminDisqualifiedAbsentSeat(
+  table: PokerTable, tableId: string, seatIndex: number, account: SocketAuthSession, via: string,
+): void {
+  const seat = table.seats[seatIndex];
+  if (!seat || seat.state !== 'occupied' || seat.isAI) return;
+  for (const [uid, r] of reservedSeats) {
+    if (r.tableId !== tableId || r.seatIndex !== seatIndex) continue;
+    if (r.cleanupTimer) clearTimeout(r.cleanupTimer);
+    reservedSeats.delete(uid);
+  }
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId === tableId && s.seatIndex === seatIndex) playerSessions.delete(sid);   // a gone socket's (the seat was absent)
+  }
+  sitOutTracker.get(tableId)?.delete(seatIndex);
+  seat.deadBlindOwedChips = 0;
+  seat.missedBlind = 'none';
+  // His chips in a LIVE pot stay there until the hand ends (C7): folded now,
+  // stood up by processPendingSeatRemovals — whose creditSeatStackToWallet
+  // never credits a tournament table. Registered BEFORE the fold (#7).
+  const inPot = table.isHandInProgress() && !seat.folded && (seat.totalInvestedThisHand || 0) > 0;
+  if (inPot) {
+    let m = pendingSeatRemovalAfterHand.get(tableId);
+    if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(tableId, m); }
+    m.set(seatIndex, { userId: account.userId, username: account.username || String(account.userId) });
+  }
+  if (table.isHandInProgress()) {
+    if (table.activeSeatIndex === seatIndex) table.playerFold(seatIndex);
+    else if (inPot) table.forceFoldSeat(seatIndex);
+  }
+  if (!inPot && seat.state === 'occupied') {
+    if (seat.chipCount > 0) {
+      auditLog(account.username || String(account.userId), 'TOURNAMENT_STACK_NOT_CASHED', {
+        userId: account.userId, tableId, amount: seat.chipCount, reason: `${via}_away_disqualified`,
+      });
+    }
+    table.standUp(seatIndex);
+  }
+  syncSitOutToTable(tableId);
+  broadcastGameState(tableId);
+}
+
+/**
+ * P-f (S2 fixed protocol, 2026-10-10) — an admin KICK / IP-BAN of a socket
+ * seated at a LIVE tournament seat: the seat is NOT kept (a kicked / banned
+ * player must not sign back into it). The entrant is DISQUALIFIED through
+ * TournamentManager first — no eliminator, no bounty, no prize (the same path
+ * as the hand-start suspension disqualification), audited
+ * `TOURNAMENT_ENTRANT_DISQUALIFIED_BY_ADMIN` — then the seat goes through the
+ * normal leave: stood up (at the hand's end if his chips are in a live pot),
+ * its tournament chips NEVER cashed into a wallet (TOURNAMENT_STACK_NOT_CASHED).
+ * A live entrant's seat is never stood up without eliminating him: if the
+ * disqualification does not happen, the seat is kept absent (unflagged). The
+ * rebalance the elimination asks for is held until the seat is gone. A cash
+ * seat: the normal leave, unchanged (credited to his wallet). P-k (round 6) —
+ * `onlyTournamentId` (a kick that NAMES its target): only a seat of that
+ * tournament is disqualified; null (a named cash table) disqualifies none — a
+ * tournament seat on the socket is then kept absent like any other leave.
+ */
+function leaveTournamentSeatOnAdminRemoval(
+  socket: Socket, via: 'admin_kick' | 'admin_ip_ban', actor: string, onlyTournamentId?: string | null,
+): void {
+  const session = playerSessions.get(socket.id);
+  const table = session ? tableManager.getTable(session.tableId) : undefined;
+  const tournamentId = session ? tournamentTables.get(session.tableId) : undefined;
+  const t = tournamentId ? tournamentManager.getTournament(tournamentId) : undefined;
+  const seat = session && table ? table.seats[session.seatIndex] : undefined;
+  const tp = t && seat && seat.state === 'occupied' && !seat.isAI ? t.players.find((p) => p.playerId === seat.playerId) : undefined;
+  const targeted = onlyTournamentId === undefined || onlyTournamentId === tournamentId;
+  const live = !!(targeted && session && table && tournamentId && t && t.status === 'running' && seat && tp && !tp.eliminated);
+  if (live) holdTournamentRebalance(tournamentId!);
+  try {
+    if (live) {
+      const auth = authSessions.get(socket.id);
+      const dq = tournamentManager.disqualifyPlayer(tournamentId!, tp!.playerId);
+      if (dq) tournamentHandStartSafety.adminRemovalsDisqualified++;
+      auditLog(actor, 'TOURNAMENT_ENTRANT_DISQUALIFIED_BY_ADMIN', {
+        via, tournamentId, tableId: session!.tableId, seatIndex: session!.seatIndex, playerId: tp!.playerId,
+        targetUserId: auth?.userId ?? null, chips: seat!.chipCount, disqualified: !!dq, position: dq?.position ?? null, credited: 0,
+      });
+      console.warn(`[Tournament] ${JSON.stringify({
+        event: 'tournament_entrant_disqualified_by_admin', via, tournamentId, tableId: session!.tableId,
+        playerId: tp!.playerId, disqualified: !!dq,
+      })}`);
+    }
+    handlePlayerLeave(socket, 'kept');
+  } finally {
+    if (live) releaseTournamentRebalance(tournamentId!, table!, session!.tableId);
+  }
+}
+
+/**
+ * M3 (2026-10-10) — P4: a login is moving `socketId` from `prev` to another
+ * account. A running tournament's record that still names this socket for one
+ * of prev's entries (TournamentPlayer.socketId: his elimination notice and
+ * spectator switch go there) follows prev's own other live socket, else none
+ * (''). Without it the bust check sent prev's `eliminatedToSpectator` to the
+ * socket now signed in as the other account and made it spectate prev's table.
+ */
+function detachTournamentEntrantSockets(socketId: string, prev: SocketAuthSession): void {
+  for (const tournamentId of new Set(tournamentTables.values())) {
+    const t = tournamentManager.getTournament(tournamentId);
+    if (!t) continue;
+    for (const tp of t.players) {
+      if (tp.socketId !== socketId || tp.eliminated || !tournamentEntrantIsAccount(tournamentId, tp, prev)) continue;
+      let next = '';
+      for (const [sid, a] of authSessions) {
+        if (sid === socketId || !tournamentEntrantIsAccount(tournamentId, tp, a)) continue;
+        if (io.sockets.sockets.get(sid)?.connected) { next = sid; break; }
+      }
+      tp.socketId = next;
+      tournamentHandStartSafety.entrantSocketsDetached++;
+      console.warn(`[Tournament] ${JSON.stringify({
+        event: 'tournament_entrant_socket_detached', tournamentId, playerId: tp.playerId, rebound: !!next,
+      })}`);
+    }
+  }
+}
+// ===== end tournament seat kept on leave =====
+
+function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKind = 'voluntary'): void {
   const session = playerSessions.get(socket.id);
   if (!session) return;
 
   const table = tableManager.getTable(session.tableId);
-  if (table) {
+  // S2 (2026-10-10) — a LIVE tournament seat is never stood up by a leave: it
+  // stays in play, absent (keepTournamentSeatOnLeave); only this socket's
+  // session at that table ends (below). `tournamentSeat` (S2 fixed protocol):
+  // 'voluntary' (the default — leaveTable and every join / quick-play /
+  // spectate / waitlist path that leaves first: flagged, told
+  // tournamentSeatKept, never auto-restored by a sign-in) or 'kept' (not his
+  // choice: suspended, account switch, disconnect fall-through, after an
+  // admin removal's disqualification — kept unflagged and untold).
+  if (table && !keepTournamentSeatOnLeave(socket, session, table, tournamentSeat)) {
     // 2026-06-11 audit C7: decide whether this seat's teardown must be
     // DEFERRED to hand-end. If the player is leaving mid-hand while still
     // holding chips in the live pot (totalInvestedThisHand > 0, not folded),
@@ -15149,7 +16534,8 @@ function handlePlayerLeave(socket: Socket): void {
  * his attested master id); otherwise to another LIVE socket signed in as him
  * that holds no seat (he reconnected since); otherwise to NONE: the seat is
  * dealt in ABSENT, like any absent tournament seat (blinded out; the hand-start
- * gate screens it; his next sign-in finds it through the orphan scan). A
+ * gate screens it; M5: every seat-restoring sign-in and the lobby's
+ * returnToTournamentSeat find it BY ACCOUNT — restoreAbsentTournamentSeat). A
  * registration with no account at all (guest-play rollback only) is bound only
  * to a socket that is still signed out. Returns the socket id, or null.
  */
@@ -15223,9 +16609,10 @@ function startTournamentGame(tournamentId: string): void {
       trainingEnabled: false,
       sittingOut: false,
     };
+    const sock = io.sockets.sockets.get(boundSid);
+    if (sock) detachSocketFromOtherTables(sock, tableId, 'seat', 'startTournamentGame');   // P-g (round 5)
     playerSessions.set(boundSid, session);
 
-    const sock = io.sockets.sockets.get(boundSid);
     if (sock) {
       sock.join(`table:${tableId}`);
       sock.emit('tournamentStarted', {
@@ -15326,10 +16713,15 @@ function startTournamentGame(tournamentId: string): void {
     if (event === 'tournamentFinished') {
       void payTournamentPrizes(data).catch(() => {}); // funded prize payouts + staking settlement (mint-free, idempotent)
       postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
-      io.to(`table:${tableId}`).emit('tournamentFinished', data);
+      // P-h (round 5) — the table room as before, AND every entrant's other
+      // live sockets (an away entrant in the lobby / at cash / on another tab).
+      emitTournamentFinishedToEntrants(tournamentId, [tableId], data);
     }
     if (event === 'playerEliminated') {
-      io.to(`table:${tableId}`).emit('playerEliminated', data);
+      // Round 6 — the sockets told directly by the bust check are skipped (one notice each).
+      const except = roomEliminationNoticeExcept(data?.playerId);
+      const room = io.to(`table:${tableId}`);
+      (except.length > 0 ? room.except(except) : room).emit('playerEliminated', data);
     }
   });
 }
@@ -15490,8 +16882,9 @@ function startQualifierTournament(
       trainingEnabled: false,
       sittingOut: false,
     };
-    playerSessions.set(boundSid, sess);
     const sock = io.sockets.sockets.get(boundSid);
+    if (sock) detachSocketFromOtherTables(sock, tid, 'seat', 'startQualifierTournament');   // P-g (round 5)
+    playerSessions.set(boundSid, sess);
     if (sock) sock.join(`table:${tid}`);
   }
 
@@ -15565,8 +16958,11 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): vo
       }
     }
     if (event === 'playerEliminated') {
+      // Round 6 — the sockets told directly by the bust check are skipped (one notice each).
+      const except = roomEliminationNoticeExcept(data?.playerId);
       for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
-        io.to(`table:${tid}`).emit('playerEliminated', data);
+        const room = io.to(`table:${tid}`);
+        (except.length > 0 ? room.except(except) : room).emit('playerEliminated', data);
       }
       // Check table rebalancing after elimination
       handleTableRebalance(tournamentId);
@@ -15574,9 +16970,9 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): vo
     if (event === 'tournamentFinished') {
       void payTournamentPrizes(data).catch(() => {}); // funded prize payouts + staking settlement (mint-free, idempotent)
       postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
-      for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
-        io.to(`table:${tid}`).emit('tournamentFinished', data);
-      }
+      // P-h (round 5) — every table room as before, AND every entrant's other
+      // live sockets (an away entrant in the lobby / at cash / on another tab).
+      emitTournamentFinishedToEntrants(tournamentId, tournamentManager.getTournament(tournamentId)?.tableIds || [], data);
     }
   });
 }
@@ -15685,8 +17081,9 @@ function startMultiTableTournament(
         trainingEnabled: false,
         sittingOut: false,
       };
-      playerSessions.set(humanSocketId, session);
       const sock = io.sockets.sockets.get(humanSocketId);
+      if (sock) detachSocketFromOtherTables(sock, tid, 'seat', 'startMultiTableTournament');   // P-g (round 5)
+      playerSessions.set(humanSocketId, session);
       if (sock) {
         sock.join(`table:${tid}`);
         sock.emit('tournamentStarted', {
@@ -16024,9 +17421,20 @@ function vacateBustedTournamentSeat(table: PokerTable, tableId: string, seatInde
   for (const [sid, s] of playerSessions) {
     if (s.tableId !== tableId || s.seatIndex !== seatIndex) continue;
     playerSessions.delete(sid);
-    if (io.sockets.sockets.get(sid)) {
-      if (!spectators.has(tableId)) spectators.set(tableId, new Set());
-      spectators.get(tableId)!.add(sid);
+    const vacatedSock = io.sockets.sockets.get(sid);
+    if (vacatedSock) {
+      // P-g (round 5) — one table view per socket. A socket already WATCHING
+      // another table (he busted here, then cycled to another tournament table
+      // with spectateNextTable) keeps that view: it is not pulled back here,
+      // only taken out of this table's room. Otherwise it watches this table.
+      const watchingElsewhere = [...spectators].some(([tid, set]) => tid !== tableId && set.has(sid));
+      if (watchingElsewhere) {
+        vacatedSock.leave(`table:${tableId}`);
+      } else {
+        detachSocketFromOtherTables(vacatedSock, tableId, 'spectate', 'busted_seat_vacated');
+        if (!spectators.has(tableId)) spectators.set(tableId, new Set());
+        spectators.get(tableId)!.add(sid);
+      }
     }
   }
   for (const [, list] of multiTableSessions) {
@@ -16064,10 +17472,16 @@ function vacateBustedTournamentSeat(table: PokerTable, tableId: string, seatInde
  * reservation provably of ANOTHER account (local user id / master id) is
  * never moved. The tournament record's socketId follows the first live
  * session, so later tournament frames reach the socket he plays on.
+ * V4 (S2 fixed protocol, 2026-10-10) — an ABSENT seat (no live session moved:
+ * Back to Lobby, a disconnect) is moved too, and the entrant's own live
+ * sockets are TOLD — an updated `tournamentSeatKept` with the NEW
+ * table/seat (noteAbsentTournamentSeatMoved) — so his Return to tournament
+ * follows the seat instead of reporting it gone.
  */
 function moveTournamentSeatPointers(
   tp: { playerId: string; socketId: string; userId?: number; masterUserId?: string } | undefined,
   fromTableId: string, fromSeat: number, toTableId: string, toSeat: number,
+  tournamentId?: string,
 ): void {
   const notTheirs = (auth: { userId: number; masterUserId?: string } | undefined): boolean => {
     if (!tp || !auth) return false;
@@ -16118,6 +17532,8 @@ function moveTournamentSeatPointers(
     tournamentHandStartSafety.reservationsMoved++;
   }
   if (tp && firstLive) tp.socketId = firstLive;
+  // V4 — nobody plays this seat right now: tell his own sockets where it went.
+  if (tp && !firstLive && tournamentId) noteAbsentTournamentSeatMoved(tournamentId, tp, toTableId, toSeat);
 }
 
 /**
@@ -16151,6 +17567,517 @@ function restartWaitingTournamentTables(tournamentId: string, opts: { startWaiti
       scheduleAIAction(tid);
     }
   }
+}
+
+/**
+ * M1 (2026-10-10) — a break mover TournamentManager maps to the broken table
+ * who has NO live seat there (run after the break). Never seated with a stack
+ * that does not exist — a tournament stack lives only on its seat:
+ *   - he holds a live seat on ANOTHER table of the tournament (a stale map):
+ *     the map follows that seat; nothing moves;
+ *   - otherwise he has no stack anywhere — his 0-chip seat on the broken table
+ *     (PokerTable flagged it before the bust check ran — S1's leftover) or no
+ *     seat at all: he is ELIMINATED through TournamentManager (no eliminator),
+ *     audited `TOURNAMENT_ENTRANT_ELIMINATED_NO_LIVE_SEAT` — the tournament can
+ *     finish, nothing is minted.
+ * `tournamentSafety.moversWithoutLiveSeat` (should stay 0).
+ */
+function settleTournamentEntrantWithoutLiveSeat(
+  tournamentId: string, player: { playerId: string; playerName: string }, brokenTableId: string, brokenTable: PokerTable | undefined,
+): void {
+  const t = tournamentManager.getTournament(tournamentId);
+  const tp = t?.players.find((p) => p.playerId === player.playerId);
+  if (!t || t.status !== 'running' || !tp || tp.eliminated) return;
+  tournamentHandStartSafety.moversWithoutLiveSeat++;
+  for (const tid of t.tableIds) {
+    if (tournamentLiveSeatIndex(tableManager.getTable(tid), tp.playerId) >= 0) {
+      tournamentManager.setPlayerTable(tournamentId, tp.playerId, tid);
+      console.warn(`[Tournament] ${JSON.stringify({
+        event: 'rebalance_mover_without_live_seat', outcome: 'remapped', tournamentId, brokenTableId, playerId: tp.playerId, tableId: tid,
+      })}`);
+      return;
+    }
+  }
+  const deadIdx = brokenTable
+    ? brokenTable.seats.findIndex((s) => s.state === 'occupied' && s.playerId === tp.playerId && s.chipCount <= 0)
+    : -1;
+  if (deadIdx >= 0) brokenTable!.seats[deadIdx].eliminated = true;
+  const reason = deadIdx >= 0 ? 'busted_seat' : 'no_seat';
+  auditLog(tp.userId !== undefined ? String(tp.userId) : tp.playerId, 'TOURNAMENT_ENTRANT_ELIMINATED_NO_LIVE_SEAT', {
+    tournamentId, tableId: brokenTableId, playerId: tp.playerId, reason, credited: 0,
+  });
+  console.warn(`[Tournament] ${JSON.stringify({
+    event: 'rebalance_mover_without_live_seat', outcome: 'eliminated', reason, tournamentId, brokenTableId, playerId: tp.playerId,
+  })}`);
+  try {
+    tournamentManager.eliminatePlayer(tournamentId, tp.playerId);
+  } catch (e) {
+    console.error('[Tournament] eliminatePlayer (mover without a live seat) failed:', e);
+  }
+}
+
+/**
+ * S1 (2026-10-10) — the tournament BUST CHECK, and the rule that a tournament
+ * table never deals before it has run.
+ *
+ * handleHandComplete (the 'handResult' listener does not await it) ran the bust
+ * check only AFTER its per-human DB awaits (mergeUserStats is a transaction
+ * with SELECT FOR UPDATE, then saveProgress and tickScratchProgress, one human
+ * after another). Meanwhile the next hand could be dealt: the server's own
+ * autoStart (1.5s after an AI action, 3s after a human's) — even on a table a
+ * break was waiting on when it still had 5+ alive —, the client's default
+ * auto-deal `startHand` (~2s after HandComplete), or the socket 'startHand',
+ * which had no tournament guard at all. PokerTable.startNewHand then flagged
+ * the 0-chip seat `eliminated` on the TABLE only, the bust check skipped it
+ * (`!s.eliminated`) and TournamentManager still counted the entrant alive: a
+ * single-table tournament could never finish, and a later break re-seated him
+ * (as an AI) with a stack nobody paid for. Now:
+ *  (a) the finished hand's bust check is CAPTURED synchronously when the hand
+ *      ends (captureTournamentBustCheck — this hand's pot winners in pot order,
+ *      the pre-hand stacks, the seats that ended at 0), and a tournament table
+ *      does NOT deal while a capture is pending or a 0-chip entrant who is
+ *      still alive sits on it (tournamentDealWaitsForBustCheck):
+ *      autoStartNextHand re-schedules and returns, and the bust check re-kicks
+ *      the table (rekickTournamentDealAfterBustCheck). A capture whose handler
+ *      died or hangs is run from the capture after
+ *      TOURNAMENT_BUST_CHECK_STALE_MS; an uncovered 0-chip entrant (no
+ *      capture) is checked at once, with no eliminator;
+ *  (b) the socket 'startHand' on a LIVE tournament table goes through the same
+ *      guards (autoStartNextHand / tournamentDealHoldReason);
+ *  (c) second lock: the bust check also eliminates — through TournamentManager,
+ *      once — a 0-chip seat PokerTable already flagged while TournamentManager
+ *      still counts the entrant alive and he has NO other live seat (a
+ *      re-entered qualifier player's old busted seat is not one). Attributed to
+ *      this hand's pot winner only when THIS hand busted him (its capture),
+ *      else to nobody (log `bust_check_leftover_eliminated`).
+ */
+interface TournamentBustCheck {
+  handNumber: number;
+  capturedAt: number;
+  /** This hand's pot winners IN POT ORDER (main pot first) — read when the hand ended. */
+  orderedWinnerIds: string[];
+  /** The finished hand's PRE-hand stacks (PokerTable.startChips at its end). */
+  startChips: Map<number, number>;
+  /** The seats THIS hand left at 0 chips (seat index → playerId). */
+  bustedThisHand: Map<number, string>;
+  /** Set when it has run — a second run (the deal guard ran it late) does nothing. */
+  ran: boolean;
+}
+/** S1 — tournament table → its captured, not yet run, bust checks (by hand number). */
+const tournamentBustChecksPending = new Map<string, Map<number, TournamentBustCheck>>();
+/** S1 — tables whose deal waited for a bust check; re-kicked when it runs. */
+const tournamentDealsHeldForBustCheck = new Set<string>();
+/** S1 — a captured bust check older than this is run by the deal guard itself (its handler threw or hangs). */
+const TOURNAMENT_BUST_CHECK_STALE_MS = 20_000;
+
+/**
+ * M3 (2026-10-10) — is `auth` (a socket's signed-in account) THIS tournament
+ * entrant? A buy-in entrant by his LOCAL userId; a qualifier entrant (no local
+ * userId) by the master id his registration holds; an entrant with no account
+ * on record (AI fill, guest-play rollback) only a signed-out socket.
+ */
+function tournamentEntrantIsAccount(
+  tournamentId: string,
+  tp: { playerId: string; userId?: number; masterUserId?: string },
+  auth: SocketAuthSession | undefined,
+): boolean {
+  if (tp.userId !== undefined) return !!auth && auth.userId === tp.userId;
+  const master = tp.masterUserId || qualifierEntrantMasterId(tournamentId, tp.playerId);
+  if (master) {
+    const sessionMaster = auth?.masterUserId || auth?.statsMasterUserId || null;
+    return !!sessionMaster && String(sessionMaster) === String(master);
+  }
+  return !auth;
+}
+
+/**
+ * M3 — the live socket to tell about THIS entrant (his elimination): the one
+ * whose main session is at his seat, else his tournament record's socket —
+ * only while it is still signed in as HIM (after a P4 account switch the
+ * record's socket can belong to another account). null = none.
+ */
+function tournamentEntrantSocket(
+  tournamentId: string, tp: { playerId: string; socketId: string; userId?: number; masterUserId?: string },
+  tableId: string, seatIndex: number,
+): string | null {
+  // An entrant with NO account on record (AI fill, an admin simulation's human)
+  // cannot be told apart from anyone: he is told as before (his record's socket).
+  const identified = tp.userId !== undefined || !!(tp.masterUserId || qualifierEntrantMasterId(tournamentId, tp.playerId));
+  const candidates: string[] = [];
+  for (const [sid, s] of playerSessions) if (s.tableId === tableId && s.seatIndex === seatIndex) candidates.push(sid);
+  if (tp.socketId) candidates.push(tp.socketId);
+  for (const sid of candidates) {
+    const sock = io.sockets.sockets.get(sid);
+    if (!sock || !sock.connected) continue;
+    if (!identified || tournamentEntrantIsAccount(tournamentId, tp, authSessions.get(sid))) return sid;
+  }
+  return null;
+}
+
+/** S1 (c) — does this entrant hold a LIVE seat (occupied, not eliminated) on any table of the tournament? */
+function tournamentEntrantHasLiveSeat(tournamentId: string, playerId: string): boolean {
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t) return false;
+  const ids = new Set<string>(t.tableIds);
+  if (t.tableId) ids.add(t.tableId);
+  const mapped = t.playerTableMap.get(playerId);
+  if (mapped) ids.add(mapped);
+  for (const tid of ids) if (tournamentLiveSeatIndex(tableManager.getTable(tid), playerId) >= 0) return true;
+  return false;
+}
+
+/**
+ * S1 — the first seat on `table` the bust check still has to settle: a 0-chip
+ * seat of an entrant TournamentManager counts alive that is either not
+ * eliminated yet (pendingTournamentBustSeat) or flagged eliminated by
+ * PokerTable while he has no other live seat (c). -1 = none.
+ */
+function tournamentUnsettledBustSeat(tournamentId: string, table: PokerTable | undefined): number {
+  if (!table) return -1;
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t || t.status !== 'running') return -1;
+  for (let i = 0; i < MAX_SEATS; i++) {
+    const s = table.seats[i];
+    if (!s || s.state !== 'occupied' || s.chipCount > 0) continue;
+    const tp = t.players.find((p) => p.playerId === s.playerId);
+    if (!tp || tp.eliminated) continue;
+    if (!s.eliminated || !tournamentEntrantHasLiveSeat(tournamentId, s.playerId)) return i;
+  }
+  return -1;
+}
+
+/**
+ * S1 (a) — called by handleHandComplete SYNCHRONOUSLY, before its first await,
+ * on the hand that just ended: what its bust check needs, read before anything
+ * else can change the table (a deal resets startChips and flags 0-chip seats).
+ * V1 (2026-10-10, pe3 review) — registered as PENDING for EVERY completed
+ * tournament hand, a hand with no bust too: the next deal (autoStartNextHand,
+ * the routed socket 'startHand') waits until THIS hand's check has run. Before
+ * V1 only a hand that left a 0-chip seat was pending, so a no-bust hand's
+ * check — still in its per-human DB awaits — ran DURING the next, already
+ * dealt hand and took a player who was all-in there (0 chips behind, his
+ * chips in the pot) for a bust: a heads-up final was decided mid-hand. The
+ * 20s stale backstop (TOURNAMENT_BUST_CHECK_STALE_MS) still bounds the wait.
+ * null = not a tournament table.
+ */
+function captureTournamentBustCheck(tableId: string, table: PokerTable, results: any[]): TournamentBustCheck | null {
+  if (!isTournamentTable(tableId)) return null;
+  // Pot winners IN POT ORDER (results are emitted main pot first, then each
+  // side pot). 2026-07-05 audit P2: each busted player is eliminated by the
+  // winner of the pot his all-in chips were in — mapped positionally later.
+  const orderedWinnerIds: string[] = [];
+  for (const r of results || []) {
+    if ((r?.amount || 0) > 0) {
+      const seat = table.seats[r.seatIndex];
+      if (seat?.playerId) orderedWinnerIds.push(seat.playerId);
+    }
+  }
+  const bustedThisHand = new Map<number, string>();
+  for (let i = 0; i < MAX_SEATS; i++) {
+    const s = table.seats[i];
+    if (s?.state === 'occupied' && s.chipCount <= 0 && !s.eliminated) bustedThisHand.set(i, s.playerId);
+  }
+  const check: TournamentBustCheck = {
+    handNumber: table.handNumber, capturedAt: Date.now(), orderedWinnerIds,
+    startChips: new Map(table.startChips), bustedThisHand, ran: false,
+  };
+  // V1 (a) — pending whatever the hand left (see above).
+  let pend = tournamentBustChecksPending.get(tableId);
+  if (!pend) { pend = new Map(); tournamentBustChecksPending.set(tableId, pend); }
+  pend.set(check.handNumber, check);
+  return check;
+}
+
+/**
+ * Round 6 — while runTournamentBustCheck (below) eliminates `playerId`: the sockets
+ * that get his DIRECT notice. The table-room 'playerEliminated' broadcast
+ * (bootstrap / multi-table event handlers) skips them — `.except(...)`.
+ */
+let eliminationDirectNotice: { playerId: string; sids: string[] } | null = null;
+function roomEliminationNoticeExcept(playerId: unknown): string[] {
+  return eliminationDirectNotice && eliminationDirectNotice.playerId === playerId ? eliminationDirectNotice.sids : [];
+}
+
+/**
+ * S1 — the tournament bust check (moved out of handleHandComplete; same rules):
+ * every 0-chip seat on `tableId` is eliminated through TournamentManager —
+ * exactly once (seat.eliminated is set first; eliminatePlayer ignores an
+ * entrant already out) — shortest PRE-hand stack first (it finishes worst),
+ * the k-th bust paired with the k-th pot winner. `check` = the capture of the
+ * hand that busted them (null: an uncovered bust — no eliminator). Resolves the
+ * tournament NOW (Q1: a table broken meanwhile is still found through the
+ * broken-table registry).
+ * V1 (b) (2026-10-10) — it settles only `check`'s own busts (bustedThisHand,
+ * credited to this hand's pot winners) plus leftovers (an uncovered 0-chip
+ * seat, a PokerTable-flagged one — no eliminator), and NEVER a seat with
+ * chips invested in a hand IN PROGRESS: 0 chips behind there is an all-in of
+ * the NEXT hand, whose own capture settles it when that hand ends.
+ * P-e (S2 fixed protocol) — a busted human's socket becomes a spectator of the
+ * tournament table (eliminatedToSpectator) only when it holds NO player
+ * session at another table; otherwise it gets the plain notice (P-e' / round 6:
+ * only the socket that played the seat here; every other socket of his gets ONE
+ * plain notice — the room copy skips it).
+ */
+function runTournamentBustCheck(tableId: string, table: PokerTable, check: TournamentBustCheck | null, via: string): void {
+  if (check) {
+    if (check.ran) return;
+    check.ran = true;
+    const pend = tournamentBustChecksPending.get(tableId);
+    if (pend) {
+      pend.delete(check.handNumber);
+      if (pend.size === 0) tournamentBustChecksPending.delete(tableId);
+    }
+  }
+  // Q1 (2026-10-10) — resolved HERE, when the check runs (after
+  // handleHandComplete's awaits). While they ran, a rebalance triggered
+  // ELSEWHERE (another table's bust, the 5s sweep, a deferred break) could
+  // break THIS table: it leaves tournamentTables at once, so
+  // `tournamentTables.get` alone found nothing, this hand's busts were never
+  // eliminated and the 0-chip entrant stayed ALIVE with no seat. The
+  // broken-table registry still names the tournament.
+  const tournamentId = tournamentTables.get(tableId) ?? brokenTournamentTables.get(tableId)?.tournamentId;
+  if (!tournamentId) return;
+  const tableBroken = !tournamentTables.has(tableId);
+  if (tableBroken) {
+    console.warn(`[Tournament] ${JSON.stringify({ event: 'bust_check_on_broken_table', tableId, tournamentId, via })}`);
+  }
+  const tour = tournamentManager.getTournament(tournamentId);
+  const aliveEntrant = (pid: string): boolean => !!tour?.players.some((p) => p.playerId === pid && !p.eliminated);
+  // (c) a seat PokerTable flagged before this check ran still counts as a bust
+  // while its entrant is alive with no other live seat.
+  const unsettledLeftover = (s: Seat): boolean =>
+    s.eliminated && aliveEntrant(s.playerId) && !tournamentEntrantHasLiveSeat(tournamentId, s.playerId);
+  // A 0-chip seat ANOTHER pending capture covers (a later hand busted him
+  // while this check was still in its awaits) is left to that capture — it
+  // knows his eliminator.
+  const otherPending = tournamentBustChecksPending.get(tableId);
+  const coveredElsewhere = (i: number, pid: string): boolean =>
+    !!otherPending && [...otherPending.values()].some((c) => c.bustedThisHand.get(i) === pid);
+  const orderedWinnerIds = check?.orderedWinnerIds ?? [];
+  const startChips = check?.startChips ?? table.startChips;
+  // V1 (b) (2026-10-10) — a seat with chips in a hand IN PROGRESS is in that
+  // hand (all-in: 0 behind, his chips in the pot) — never a bust of THIS check.
+  // A late check (its handler's per-human awaits outlived the next deal: the
+  // 20s stale backstop, a deal path outside autoStartNextHand) used to
+  // eliminate him mid-hand. The hand's own capture settles him when it ends.
+  const inHandInProgress = (s: Seat): boolean => table.isHandInProgress() && (s.totalInvestedThisHand || 0) > 0;
+  // 2026-06-11 audit R2: when multiple players bust the SAME hand, finish
+  // position — and now the real funded prize payout — must be decided by
+  // PRE-HAND stack (the bigger stack outlasted more, so finishes higher),
+  // not raw seat-index order. eliminatePlayer assigns worsening positions in
+  // call order, so eliminate the SHORTEST pre-hand stack FIRST (worst place).
+  // A leftover from an earlier hand is not in this hand's startChips (0) — he
+  // busted first, he finishes worst.
+  const bustedSeatIdx: number[] = [];
+  for (let i = 0; i < MAX_SEATS; i++) {
+    const s = table.seats[i];
+    if (s?.state !== 'occupied' || s.chipCount > 0 || coveredElsewhere(i, s.playerId)) continue;
+    if (inHandInProgress(s)) continue;
+    if (!s.eliminated || unsettledLeftover(s)) bustedSeatIdx.push(i);
+  }
+  bustedSeatIdx.sort((a, b) => (startChips.get(a) || 0) - (startChips.get(b) || 0));
+  let bustRank = 0;
+  for (const i of bustedSeatIdx) {
+    const seat = table.seats[i];
+    if (seat?.state !== 'occupied' || seat.chipCount > 0 || inHandInProgress(seat)) continue;
+    const leftover = seat.eliminated;
+    if (leftover && !unsettledLeftover(seat)) continue;
+    // Only a seat THIS hand busted is paired with this hand's pot winners: the
+    // k-th shortest bust with the k-th pot winner (clamped to the last winner)
+    // — the shortest all-in was in the main pot, the next in side pot 1, and
+    // so on — so distinct busts credit their true eliminators.
+    const thisHand = !!check && check.bustedThisHand.get(i) === seat.playerId;
+    seat.eliminated = true;
+    const eliminatorId = thisHand && orderedWinnerIds.length > 0
+      ? orderedWinnerIds[Math.min(bustRank, orderedWinnerIds.length - 1)]
+      : undefined;
+    if (thisHand) bustRank++;
+    if (leftover) {
+      tournamentHandStartSafety.bustLeftoversEliminated++;
+      console.warn(`[Tournament] ${JSON.stringify({
+        event: 'bust_check_leftover_eliminated', tournamentId, tableId, seatIndex: i, playerId: seat.playerId,
+        attributed: !!eliminatorId, via,
+      })}`);
+    }
+    // P-e' (round 5) — WHO plays this seat, read BEFORE the elimination: the
+    // rebalance it can trigger may vacate this busted seat for a mover and drop
+    // that session (vacateBustedTournamentSeat) — he still played it.
+    const bustTp = seat.isAI ? undefined : tournamentManager.getTournament(tournamentId)?.players.find(p => p.playerId === seat.playerId);
+    const bustSid = bustTp ? tournamentEntrantSocket(tournamentId, bustTp, tableId, i) : null;
+    const bustSidPlaysHere = !!bustSid && playerSessions.get(bustSid)?.tableId === tableId;
+    // P-e (S2 fixed protocol, 2026-10-10) — a socket that holds a player
+    // session (main or extra-table) at ANOTHER table is never made a
+    // spectator here: he left this (kept-absent) seat and sat at a cash table
+    // on the same socket, and the spectator loop would push this table's state
+    // over the SAME per-socket delta channel as his cash seat. He gets the
+    // plain notice instead.
+    // P-e' (round 5) — and a socket is made a spectator / joined to this
+    // table's room ONLY when it holds the player session AT THIS TABLE (it
+    // played the seat). An AWAY entrant's socket (Back to Lobby: in the lobby,
+    // watching another table, about to start a quick game) gets the plain
+    // notice only — no spectator switch, no room join (pe4: a lobby socket
+    // made a spectator here carried this table's frames into his next quick
+    // game / invite seat).
+    // Round 6 — decided here, BEFORE the elimination, together with WHO gets
+    // the plain notice (every live socket of his but the switched one): the
+    // table-room 'playerEliminated' the elimination broadcasts skips those
+    // sockets (eliminationDirectNotice), so an away entrant watching his own
+    // tournament's table is told ONCE — pe5: the room's generic copy AND the
+    // direct one gave him two toasts.
+    const bustSock = bustSid ? io.sockets.sockets.get(bustSid) : undefined;
+    const seatedElsewhere = !!bustSid && !!bustSock && socketHoldsPlayerSessionElsewhere(bustSid, tableId);
+    const toSpectator = !!bustSid && !!bustSock && bustSidPlaysHere && !seatedElsewhere;
+    const noticeSids = bustTp ? tournamentEliminationNoticeSockets(tournamentId, bustTp, toSpectator ? bustSid : null) : [];
+    try {
+      let result: ReturnType<typeof tournamentManager.eliminatePlayer>;
+      eliminationDirectNotice = noticeSids.length > 0 ? { playerId: seat.playerId, sids: noticeSids } : null;
+      try {
+        result = tournamentManager.eliminatePlayer(tournamentId, seat.playerId, eliminatorId);
+      } finally {
+        eliminationDirectNotice = null;
+      }
+      // The elimination may have broken THIS table right now (playerEliminated
+      // → handleTableRebalance runs synchronously): read it again.
+      const brokenNow = !tournamentTables.has(tableId);
+      if (result && result.bountyPayout && eliminatorId) {
+        // 2026-06-11 audit R3: actually CREDIT the bounty to the eliminator's
+        // tournament stack — tournament chips (wallet-isolated), a play-chip
+        // reward, not a wallet mint. His LIVE seat (Q2: a re-entered qualifier
+        // player's OLD busted seat carries the same playerId): on this table —
+        // unless it is broken by now (a rebalance meanwhile, or M2: THIS very
+        // elimination broke it) — then wherever his stack was moved (the copy
+        // left here is discarded with the table).
+        const bountySeat = tournamentLiveSeatOf(tournamentId, eliminatorId, brokenNow ? undefined : tableId);
+        if (bountySeat) bountySeat.chipCount += result.bountyPayout;
+        // Notify eliminator
+        for (const [sid, s] of playerSessions) {
+          if (s.playerId === eliminatorId) {
+            io.to(sid).emit('bountyAwarded', { amount: result.bountyPayout, eliminated: seat.playerName });
+            break;
+          }
+        }
+      }
+
+      // Auto-switch eliminated human players to spectator mode — on HIS socket
+      // only (M3: never a socket that is now another account's); P-e / P-e'
+      // above decided which.
+      if (!seat.isAI && result) {
+        const sid = bustSid;
+        const sock = bustSock;
+        if (seatedElsewhere) tournamentHandStartSafety.eliminationsToSocketSeatedElsewhere++;
+        if (sid && sock && !bustSidPlaysHere && !seatedElsewhere) tournamentHandStartSafety.eliminationsToAwaySocket++;
+        if (toSpectator && sid && sock) {
+          // Add as spectator on their current table (Q1: a table a rebalance
+          // broke is removed within 5s — he watches one of the tournament's
+          // live tables instead).
+          const specTableId = brokenNow
+            ? (tournamentManager.getTournament(tournamentId)?.tableIds[0] ?? tableId)
+            : tableId;
+          // P-g — one socket, one table view (it held this seat, so it is in
+          // this table's room; any other spectating / room ends).
+          detachSocketFromOtherTables(sock, specTableId, 'spectate', 'eliminated_to_spectator');
+          const specSet = spectators.get(specTableId) || new Set();
+          specSet.add(sid);
+          spectators.set(specTableId, specSet);
+          sock.join(`table:${specTableId}`);   // a no-op unless a break moved him to another live table's view
+
+          sock.emit('eliminatedToSpectator', {
+            tournamentId,
+            tableId: specTableId,
+            position: result.position,
+            totalPlayers: tournamentManager.getTournament(tournamentId)?.players.length || 0,
+            status: tournamentManager.getTournamentStatus(tournamentId),
+            tableIds: tournamentManager.getTournament(tournamentId)?.tableIds || [],
+          });
+        }
+        // P-e / P-e' — the plain elimination notice (`playerEliminated` +
+        // tournamentId: a toast, the away seat ends) to every live socket
+        // signed in as him except the one switched to spectator above — the
+        // room's copy skipped them (one notice each).
+        noticeTournamentEliminationToEntrant(tournamentId, seat.playerId, noticeSids, seat.playerName, result.position);
+      }
+    } catch (e) {
+      console.error('[Tournament] eliminatePlayer failed:', e);
+    }
+  }
+}
+
+/** S1 — run every capture still pending on this table now (its handleHandComplete threw), then re-kick its deal. */
+function runPendingTournamentBustChecks(tableId: string, via: string): void {
+  const table = tableManager.getTable(tableId);
+  const pend = tournamentBustChecksPending.get(tableId);
+  if (table && pend) {
+    for (const c of [...pend.values()].sort((a, b) => a.handNumber - b.handNumber)) runTournamentBustCheck(tableId, table, c, via);
+  }
+  rekickTournamentDealAfterBustCheck(tableId);
+}
+
+/** S1 — a deal that waited for this table's bust check is re-kicked now that it ran. */
+function rekickTournamentDealAfterBustCheck(tableId: string): void {
+  if (tournamentDealsHeldForBustCheck.delete(tableId)) scheduleAutoStart(tableId);
+}
+
+/**
+ * S1 (a) — must this tournament table WAIT before dealing? true while a
+ * captured bust check has not run (its handleHandComplete is still in its DB
+ * awaits). A capture older than TOURNAMENT_BUST_CHECK_STALE_MS (its handler
+ * threw or hangs) is run here from the capture, and a 0-chip entrant still
+ * alive with NO capture covering him (a handler that died before capturing, a
+ * rehydrated table, a PokerTable-flagged leftover) is checked here at once,
+ * with no eliminator. A check run here can eliminate, rebalance (break THIS
+ * table) or finish the tournament: the caller re-reads the table after a false.
+ */
+function tournamentDealWaitsForBustCheck(tableId: string, tournamentId: string, table: PokerTable): boolean {
+  const pend = tournamentBustChecksPending.get(tableId);
+  if (pend && pend.size > 0) {
+    const checks = [...pend.values()].sort((a, b) => a.handNumber - b.handNumber);
+    if (Date.now() - checks[0].capturedAt < TOURNAMENT_BUST_CHECK_STALE_MS) return true;
+    for (const c of checks) {
+      tournamentHandStartSafety.bustChecksRunLate++;
+      console.warn(`[Tournament] ${JSON.stringify({
+        event: 'bust_check_run_late', reason: 'stale', tournamentId, tableId, handNumber: c.handNumber,
+        ageMs: Date.now() - c.capturedAt,
+      })}`);
+      runTournamentBustCheck(tableId, table, c, 'deal_guard_stale');
+    }
+  }
+  if (tournamentUnsettledBustSeat(tournamentId, table) >= 0) {
+    tournamentHandStartSafety.bustChecksRunLate++;
+    console.warn(`[Tournament] ${JSON.stringify({ event: 'bust_check_run_late', reason: 'uncovered', tournamentId, tableId })}`);
+    runTournamentBustCheck(tableId, table, null, 'deal_guard_uncovered');
+  }
+  // Whatever an elimination that threw left behind is retried by the next
+  // bust check — the table is never held forever.
+  return false;
+}
+
+/** S1 — hold this table's deal until its bust check runs (re-scheduled meanwhile: the stale path is the backstop). */
+function holdTournamentDealForBustCheck(tableId: string, tournamentId: string): void {
+  if (!tournamentDealsHeldForBustCheck.has(tableId)) {
+    tournamentHandStartSafety.dealsHeldForBustCheck++;
+    console.log(`[Tournament] ${JSON.stringify({ event: 'deal_held_for_bust_check', tournamentId, tableId })}`);
+  }
+  tournamentDealsHeldForBustCheck.add(tableId);
+  scheduleAutoStart(tableId);
+}
+
+/**
+ * S1 (b) — why a LIVE tournament table that is NOT at a hand end (its first
+ * deal never happened) must not be dealt by a client 'startHand' right now —
+ * the same holds autoStartNextHand applies at a hand end. null = it may deal.
+ */
+function tournamentDealHoldReason(tableId: string, tournamentId: string, table: PokerTable): string | null {
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t || t.status !== 'running') return 'not_running';
+  if (t.paused) return 'paused';
+  if (tournamentDealWaitsForBustCheck(tableId, tournamentId, table)) return 'bust_check_pending';
+  if (tournamentTables.get(tableId) !== tournamentId) return 'table_closed';
+  if (tournamentBreaksAwaitingHandEnd.get(tableId) === tournamentId) return 'break_pending';
+  if (t.tableIds.length > 1) {
+    const aliveOnTable = t.players.filter((p) => !p.eliminated && t.playerTableMap.get(p.playerId) === tableId).length;
+    if (aliveOnTable < 5 && planTournamentRebalance(tournamentId)) return 'rebalance_pending';
+  }
+  return null;
 }
 // ===== end tournament rebalance helpers =====
 
@@ -16220,9 +18147,17 @@ function handleTableRebalance(tournamentId: string): void {
   // live stack went with the broken table. (No mover's live seat holds 0
   // chips here: a pending bust defers the whole break — Q1 above.)
   const movers: Array<{ player: { playerId: string; playerName: string }; breakSeatIdx: number; breakSeat: any }> = [];
+  // M1 (2026-10-10) — an entrant TournamentManager maps to the break table
+  // with NO live seat there is never seated anywhere: there is no stack of his
+  // to move (a tournament stack exists only on its seat). Before M1 he was
+  // placed with `breakSeat?.chipCount || tp.chips || 5000` as an AI seat
+  // (`isAI ?? true`) — an unpaid stack a bot played on his entry. Settled
+  // after the break instead (settleTournamentEntrantWithoutLiveSeat).
+  const withoutLiveSeat: Array<{ playerId: string; playerName: string }> = [];
   for (const player of playersToMove) {
     const breakSeatIdx = tournamentLiveSeatIndex(breakTable, player.playerId);
     const breakSeat = breakSeatIdx >= 0 ? breakTable!.seats[breakSeatIdx] : undefined;
+    if (!breakSeat) { withoutLiveSeat.push(player); continue; }
     movers.push({ player, breakSeatIdx, breakSeat });
   }
   // Empty seats first (in table order, as before), then busted seats.
@@ -16254,9 +18189,11 @@ function handleTableRebalance(tournamentId: string): void {
 
   let next = 0;
   for (const { player, breakSeatIdx, breakSeat } of movers) {
-    // Get player's current chips from the breaking table
-    const chips = breakSeat?.chipCount || tournament.players.find(p => p.playerId === player.playerId)?.chips || 5000;
-    const isAI = breakSeat?.isAI ?? true;
+    // Get player's current chips from the breaking table — his LIVE seat's
+    // stack, the only place it exists (M1: a mover always has one now; no
+    // record's starting stack, no 5000 default, no AI default).
+    const chips = breakSeat.chipCount;
+    const isAI = !!breakSeat.isAI;
     let placed = false;
 
     while (!placed && next < targets.length) {
@@ -16292,7 +18229,7 @@ function handleTableRebalance(tournamentId: string): void {
         // stack. A session on a socket that is gone is skipped (its
         // disconnect handler owns it; reconnect recovery picks it up).
         const tp = tournament.players.find(p => p.playerId === player.playerId);
-        moveTournamentSeatPointers(tp, breakTableId, breakSeatIdx, targetTid, emptySeat);
+        moveTournamentSeatPointers(tp, breakTableId, breakSeatIdx, targetTid, emptySeat, tournamentId);
       }
 
       placed = true;
@@ -16348,6 +18285,11 @@ function handleTableRebalance(tournamentId: string): void {
     // goes through scheduleAutoStart, never a synchronous startNewHand here.
     restartWaitingTournamentTables(tournamentId, { startWaiting: true });
   }
+
+  // M1 — the movers with no live seat, now that the break is complete (an
+  // elimination here re-enters the rebalance through playerEliminated, which
+  // must never happen in the middle of this one).
+  for (const player of withoutLiveSeat) settleTournamentEntrantWithoutLiveSeat(tournamentId, player, breakTableId, breakTable);
 }
 
 // Periodic rebalance check — prevents stalls when tables have < 5 players
@@ -16360,6 +18302,24 @@ function handleTableRebalance(tournamentId: string): void {
 // it. Each tournament's rebalance is independent of the others'.
 function sweepTournamentRebalances(): void {
   pruneBrokenTournamentTables(); // P8 — time-based retention
+  // S1 (2026-10-10) — bounded memory: a removed table's bust-check captures
+  // whose handler never came back, and its held-deal mark (a live table's
+  // stale capture is run by its own deal guard instead).
+  for (const [tableId, pend] of tournamentBustChecksPending) {
+    if (tableManager.getTable(tableId)) continue;
+    for (const c of [...pend.values()]) {
+      if (Date.now() - c.capturedAt > TOURNAMENT_BUST_CHECK_STALE_MS) pend.delete(c.handNumber);
+    }
+    if (pend.size === 0) tournamentBustChecksPending.delete(tableId);
+  }
+  for (const tableId of tournamentDealsHeldForBustCheck) {
+    if (!tableManager.getTable(tableId)) tournamentDealsHeldForBustCheck.delete(tableId);
+  }
+  // S2 fixed protocol (P-b) — voluntary-absence marks of entrants who are out
+  // or whose tournament ended.
+  pruneVoluntarilyAbsentTournamentEntrants();
+  // P-h (round 5) — finished-tournament results kept for a late Return.
+  pruneFinishedTournamentRecords();
   for (const [tableId, tid] of tournamentBreaksAwaitingHandEnd) {
     if (!tournamentTables.has(tableId)) tournamentBreaksAwaitingHandEnd.delete(tableId);
     else if (tournamentManager.getTournament(tid)?.status !== 'running') tournamentBreaksAwaitingHandEnd.delete(tableId);

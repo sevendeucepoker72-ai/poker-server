@@ -490,3 +490,150 @@ reentry_session_created
 reentrySessionsCreated
 sweepTournamentRebalances
 emitHandCompletion
+#
+# 2026-10-10 (tenth pass, owner "fix all") — S1 / S2 + minors (CONTRACTS.md C5).
+# S1: a tournament table never deals before its bust check has run — the check
+# is captured when the hand ends, the deal is held (timer AND socket startHand),
+# a stale / uncovered / thrown check is run late, and the bust check also
+# eliminates a seat PokerTable flagged first (tests/rebalanceSafety.test.ts).
+captureTournamentBustCheck
+runTournamentBustCheck
+tournamentDealWaitsForBustCheck
+deal_held_for_bust_check
+dealsHeldForBustCheck
+bust_check_run_late
+bustChecksRunLate
+bust_check_leftover_eliminated
+bustLeftoversEliminated
+tournament_hand_held
+clientHandStartsRouted
+# S2: a voluntary leave keeps a live tournament seat in play (absent); he comes
+# back with returnToTournamentSeat (P-b: a sign-in restores only a NON-voluntary
+# absent seat by account — a voluntary one is told, never restored).
+keepTournamentSeatOnLeave
+voluntary_leave_seat_kept
+tournamentSeatKept
+tournament_seat_kept_on_leave
+returnToTournamentSeat
+returnToTournamentResult
+restoreAbsentTournamentSeat
+tournament_seat_returned
+no_tournament_seat
+seatsKeptOnLeave
+# M1: a break mover with no live seat is never seated with an unpaid stack.
+rebalance_mover_without_live_seat
+TOURNAMENT_ENTRANT_ELIMINATED_NO_LIVE_SEAT
+moversWithoutLiveSeat
+# M3: an elimination notice goes only to the entrant's own socket; an account
+# switch detaches his tournament records from the socket.
+tournamentEntrantSocket
+tournament_entrant_socket_detached
+entrantSocketsDetached
+# M4: the waitlist cancellation is not retryable — never "try again".
+Tap Play Online in the American Pub Poker app again for a new link
+#
+# 2026-10-10 (eleventh pass, pe3 review, owner "fix all") — V1 + the FIXED S2
+# protocol P-a..P-f (CONTRACTS.md C5; poker-3d implements the same names).
+# V1: every completed tournament hand's bust check is pending (the next deal
+# waits for it), and a bust check never takes a seat with chips in a hand in
+# progress (tests/rebalanceSafety.test.ts E1 / E1c + controls).
+inHandInProgress
+# P-a: a voluntary leave ends the socket's session before the keep's fold /
+# broadcast; the kept reservation / entrant is flagged voluntary; a
+# non-voluntary keep is unflagged and untold.
+voluntarilyAbsentTournamentEntrants
+tournamentSeatLeftVoluntarily
+leave_seat_kept_absent
+keptVoluntary
+# P-b: no sign-in auto-restores a voluntary seat — it tells (tournamentSeatKept);
+# a reservation-path reconnectedToTable carries tournamentId.
+tellKeptTournamentSeats
+tournament_seat_kept_told_on_sign_in
+signInNotices
+reconnectTournamentFields
+pruneVoluntarilyAbsentTournamentEntrants
+# P-c: Return is authoritative; a repeated tap for the held seat is success.
+returnAlreadyThere
+already_seated
+session_changed
+# P-d: every full gameState says whether its table is a tournament table.
+tournamentIdOfTable
+stateObj.isTournament = !!stateTournamentId
+# P-e: a busted entrant's socket seated elsewhere gets the plain notice, never
+# the spectator switch.
+socketHoldsPlayerSessionElsewhere
+noticeTournamentEliminationToEntrant
+eliminationsToSocketSeatedElsewhere
+# V4: a rebalance moving an absent seat tells his sockets.
+noteAbsentTournamentSeatMoved
+absent_tournament_seat_moved_told
+absentSeatsMovedNotified
+# P-f: an admin kick / IP-ban disqualifies a live tournament entrant.
+leaveTournamentSeatOnAdminRemoval
+TOURNAMENT_ENTRANT_DISQUALIFIED_BY_ADMIN
+tournament_entrant_disqualified_by_admin
+adminRemovalsDisqualified
+# Waitlist buy-in cancellation: machine-readable cancelCode on both frames.
+WAITLIST_BUY_IN_CANCEL_CODE
+cancelCode: WAITLIST_BUY_IN_CANCEL_CODE
+#
+# 2026-10-10 (twelfth pass, pe4 review, owner "fix all") — protocol amendments
+# P-e' / P-g / P-h / P-c' + the server minors (CONTRACTS.md C5).
+# P-e': an AWAY seat's bust never makes a socket a spectator or joins it to the
+# table's room unless it holds the player session AT that table; away sockets
+# get the plain playerEliminated notice only.
+eliminationsToAwaySocket
+# P-g: one socket, one table view — every seat / spectate path first ends the
+# socket's other spectating and leaves the other table rooms.
+detachSocketFromOtherTables
+table_view_detached
+tableViewDetaches
+# P-h: tournamentFinished reaches every entrant's live sockets; a Return after
+# the end answers no_tournament_seat + tournamentFinished + position.
+emitTournamentFinishedToEntrants
+tournament_finished_told_to_entrants
+tournamentFinishedNotices
+finishedTournamentRecords
+returnAfterFinish
+# P-f gap: an admin kick / IP-ban disqualifies the entrant's AWAY entries too.
+disqualifyAwayTournamentEntriesOnAdminRemoval
+adminRemovalsAwayDisqualified
+awayTournamentEntriesDisqualified
+# All-absent tournament hand: the absent auto-action may call (bounded by P-i, round 6).
+allAbsentAutoCalls
+# A leave whose fold synchronously breaks the table tells the FINAL seat only.
+keepingTournamentSeatOnLeave
+tournamentSeatLocationNow
+#
+# 2026-10-10 (thirteenth pass, pe5 review, owner "fix all" — SIMPLIFY) — S2
+# protocol P-c'' / P-h' / P-i / P-j / P-k / P-l (CONTRACTS.md C5). Removed in the
+# same change, deliberately: seatHeldElsewhere + returnHeldElsewhere (P-c'' —
+# a Return takes the seat over instead of refusing), tournamentHandAllAbsent
+# (P-i replaces the unbounded all-absent call), persistOne (P-l — the
+# hand-complete writes are SERIAL again).
+# P-c'': latest connection wins — a Return takes a seat another socket of the
+# same account plays; that socket is told tournamentSeatTakenOver.
+tournamentSeatTakenOver
+tournament_seat_taken_over
+returnTakeOvers
+# P-i: an absent seat checks, limps at most one big blind (never all-in) only
+# when every seat still in the hand is absent, else folds.
+autoActForSeat
+absentTournamentSeatMayLimp
+all_absent_hand_auto_call
+# P-j: sitting out on a tournament table = absent (dealt in, short clock).
+seatHasPlayingSession
+tournamentSeatSitsOut
+# P-h': the per-entrant finished notice has its own event name.
+tournamentFinishedForEntrant
+# P-k: a banned account gets no seat back; a kick acts only on its target.
+bannedAccountRefusal
+banned_account_refused
+# One elimination notice per socket (the room copy skips the directly told).
+tournamentEliminationNoticeSockets
+roomEliminationNoticeExcept
+# A busted tournament seat's session at another table ends in the detach.
+deadSeatSessionsEnded
+# The turn timer re-arms on a new street (heads-up big blind: pre-flop -> flop),
+# so the absent clock (P-i / P-j) runs on every street.
+turnStartedPhaseMap

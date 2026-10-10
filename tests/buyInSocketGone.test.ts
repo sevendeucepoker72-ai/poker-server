@@ -143,7 +143,7 @@ function world(opts: { handlers?: Partial<typeof H>; tournament?: 'buyin' | 'qua
     log: { debug() {}, warn() {}, info() {} },
     // waitlist
     normalizeRequestId: (x: unknown) => (typeof x === 'string' ? x : undefined),
-    failLogin: (s: any, f: any) => s.emit('loginResult', { success: false, code: f.code }),
+    failLogin: (s: any, f: any) => s.emit('loginResult', { success: false, code: f.code, ...(f.extra || {}) }),
     markTicketUsed: () => true,
     reportAuthEvent() {},
     loginTracker: { begin: () => () => {}, forget() {} },
@@ -804,5 +804,54 @@ describe('P4 — a waitlist link never seats or charges the OTHER account signed
     await run(w, link, s);
     expect(w.deductions).toEqual([{ uid: BOB, amount: 1000 }]);
     expect(w.playerSessions.get('S1')).toMatchObject({ tableId: 'cash1' });
+  });
+});
+
+// ── pe3 minor (2026-10-10) — the waitlist buy-in cancellation carries a machine-readable cancelCode ──
+describe('pe3 minor — the waitlist link\'s buy-in cancellation says so on BOTH frames: cancelCode buy_in_cancelled', () => {
+  it('the account changed during the deduct on a LIVE socket: refunded once; error AND loginResult carry cancelCode \'buy_in_cancelled\' and the "chips were returned … tap Play Online again" sentence', async () => {
+    const p = PATHS.find((x) => (x.event as string) === 'waitlist')!;
+    const w = world();
+    const s = w.mkSocket('S1');
+    const gate = deferred();
+    w.gates.deduct = gate.p;
+    await run(w, p, s);
+    w.authSessions.set('S1', { userId: BOB, username: 'bob.player', masterUserId: 'm-bob' });
+    gate.resolve();
+    await flush();
+    const err = w.emitted.find(([ev, d]) => ev === 'error' && d?.cancelCode);
+    expect(err![1]).toEqual({ code: 'handler_exception', cancelCode: 'buy_in_cancelled', message: expect.stringContaining('any chips taken were returned') });
+    expect(err![1].message).toContain('Tap Play Online in the American Pub Poker app again for a new link');
+    expect(w.emitted.find(([ev, d]) => ev === 'loginResult' && d?.success === false)![1]).toMatchObject({ code: 'handler_exception', cancelCode: 'buy_in_cancelled' });
+    expect(w.credits).toEqual([{ uid: ALICE, amount: p.amount }]);
+  });
+
+  it('other waitlist failures carry no cancelCode (e.g. no tables)', async () => {
+    const p = PATHS.find((x) => (x.event as string) === 'waitlist')!;
+    const w = world();
+    w.tables.delete('cash1');
+    const s = w.mkSocket('S1');
+    await run(w, p, s);
+    await flush();
+    const errs = w.emitted.filter(([ev]) => ev === 'error');
+    expect(errs.length).toBeGreaterThan(0);
+    for (const [, d] of errs) expect(d.cancelCode).toBeUndefined();
+  });
+
+  it('the REAL failLogin merges `extra` into the loginResult failure frame (additive; older clients ignore it)', () => {
+    const sent: any[] = [];
+    const { exports } = load(slice('function failLogin(', '\n}\n'), {
+      normalizeRequestId: (x: unknown) => (typeof x === 'string' ? x : undefined),
+      buildLoginFailure: (code: string, message: string, rid?: string) => ({ success: false, error: message, code, ...(rid ? { requestId: rid } : {}) }),
+      authTelemetry: { suppressedNoType: 0 }, LOGIN_FAILURE_EVENT_TYPE: '', reportAuthEvent() {}, _warnedLoginFailureTypeUnset: true,
+      console: { warn() {}, log() {}, error() {} },
+    }, '{ failLogin }');
+    const sock = { emit: (ev: string, d: any) => sent.push([ev, d]) };
+    exports.failLogin(sock, { code: 'handler_exception', message: 'M', via: 'joinWithWaitlistContext', requestId: 'r1', extra: { cancelCode: 'buy_in_cancelled' } });
+    exports.failLogin(sock, { code: 'ticket_missing', message: 'N', via: 'joinWithWaitlistContext' });
+    expect(sent).toEqual([
+      ['loginResult', { success: false, error: 'M', code: 'handler_exception', requestId: 'r1', cancelCode: 'buy_in_cancelled' }],
+      ['loginResult', { success: false, error: 'N', code: 'ticket_missing' }],
+    ]);
   });
 });

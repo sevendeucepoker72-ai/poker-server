@@ -47,7 +47,7 @@ const P = {
   canStandUp: fnSrc('function suspendedSeatCanStandUp('),
   standUpAbsent: fnSrc('function standUpAbsentTournamentSeat('),
   standUpSuspended: fnSrc('function standUpSuspendedSeat('),
-  handlePlayerLeave: fnSrc('function handlePlayerLeave(socket: Socket): void {'),
+  handlePlayerLeave: fnSrc('function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKind'),
   creditSeat: fnSrc('function creditSeatStackToWallet('),
   // P1/P2/P6 (2026-10-10): capacity plan, busted-seat vacating, seat-pointer moves, the idle-table restart.
   helpers: slice('// ===== Tournament rebalance helpers', '// ===== end tournament rebalance helpers =====\n'),

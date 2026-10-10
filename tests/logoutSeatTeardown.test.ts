@@ -63,7 +63,7 @@ const IS_TOURNAMENT_RESERVATION = slice('function isTournamentReservation(', '\n
 const BROKEN_TABLES = slice('const brokenTournamentTables = new Map', 'brokenTournamentTables.has(tableId);\n}\n');
 const NOTE_NOT_CASHED = slice('function noteTournamentReservationNotCashed(', '\n}\n');
 const TICK_RESERVED = slice('function tickReservedSeatHands(tableId: string): void {', '\n}\n');
-const HANDLE_PLAYER_LEAVE = slice('function handlePlayerLeave(socket: Socket): void {', '\n}\n');
+const HANDLE_PLAYER_LEAVE = slice('function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKind', '\n}\n');
 const CREDIT_SEAT = slice('function creditSeatStackToWallet(', '\n}\n');
 // The main (last-registered) disconnect handler — the one with the seat reserve.
 // P4 (2026-10-10): its seat reservation + extra-table cash-out are two functions
@@ -72,12 +72,24 @@ const CREDIT_SEAT = slice('function creditSeatStackToWallet(', '\n}\n');
 const DISCONNECT_HANDLER = slice('function reserveSeatForDeparture(', '\n}\n')
     + slice('function cashOutAdditionalSeatsOnDeparture(', '\n}\n')
   + slice("socket.on('disconnect', async () => {", '\n  });', SRC.lastIndexOf("socket.on('disconnect', async () => {"));
-// handleHandComplete's tournament bust check (runs after tickReservedSeatHands).
-const BUST_CHECK = slice(
-  // Q1 (2026-10-10): the id resolves through the broken-table registry too (a bust on a just-broken table).
-  '  const tournamentId = tournamentTables.get(tableId) ?? brokenTournamentTables.get(tableId)?.tournamentId;',
-  "console.error('[Tournament] eliminatePlayer failed:', e);\n        }\n      }\n    }\n  }",
-);
+// handleHandComplete's tournament bust check (runs after tickReservedSeatHands). S1 (2026-10-10):
+// extracted — captured when the hand ends (captureTournamentBustCheck) and run after the awaits
+// (runTournamentBustCheck); the helpers it reads come along. Q1: the id resolves through the
+// broken-table registry too (a bust on a just-broken table).
+const fnSrc = (signature: string): string => slice(signature, '\n}\n');
+const BUST_CHECK = [
+  slice('const tournamentBustChecksPending = new Map', ';\n'),
+  fnSrc('function captureTournamentBustCheck('),
+  fnSrc('function runTournamentBustCheck('),
+  fnSrc('function tournamentEntrantHasLiveSeat('),
+  fnSrc('function tournamentLiveSeatIndex('),
+  fnSrc('function tournamentLiveSeatOf('),
+  fnSrc('function tournamentEntrantSocket('),
+  fnSrc('function tournamentEntrantIsAccount('),
+  fnSrc('function qualifierEntrantMasterId('),
+].join('\n');
+// S2 (2026-10-10): handlePlayerLeave keeps a LIVE tournament seat in play (absent) instead of standing it up.
+const SEAT_KEEP = slice('// ===== Tournament seat kept on leave', '// ===== end tournament seat kept on leave =====\n');
 /** The live HEAD (5ea0f80) `logout` handler, verbatim (`git show HEAD:src/index.ts`, lines 6391-6393). */
 const HEAD_LOGOUT_HANDLER = "socket.on('logout', async () => {\n    authSessions.delete(socket.id);\n  });";
 
@@ -94,9 +106,11 @@ ${IS_TOURNAMENT_RESERVATION}
 ${NOTE_NOT_CASHED}
 ${parts.tick ?? TICK_RESERVED}
 ${CREDIT_SEAT}
+${SEAT_KEEP}
 ${HANDLE_PLAYER_LEAVE}
-function bustCheck(tableId, table, results) {
 ${BUST_CHECK}
+function bustCheck(tableId, table, results) {
+  runTournamentBustCheck(tableId, table, captureTournamentBustCheck(tableId, table, results), 'test');
 }
 function wire(socket) {
   ${parts.logout === undefined ? LOGOUT_HANDLER : (parts.logout ?? '')}
@@ -163,6 +177,10 @@ function harness(opts: HarnessOpts = {}) {
     tableManager: { getTable: (id: string) => tables.get(id) },
     authSessions, playerSessions, reservedSeats, tournamentTables,
     tournamentManager: opts.tournament?.tm ?? null,
+    // S1/S2 (2026-10-10): the extracted bust check's + the seat-keep region's module state.
+    qualifierTournaments: new Map(),
+    tournamentHandStartSafety: { bustLeftoversEliminated: 0, entrantSocketsDetached: 0 },
+    emitGameState() {}, getGameStateForPlayer: () => ({}),
     io: { to: () => ({ emit() {} }), sockets: { sockets: new Map() } },
     pendingSeatRemovalAfterHand: new Map(), sitOutTracker: new Map(), multiTableSessions: new Map(),
     spectators: new Map(), aiProfiles: new Map(), aiTimeouts: new Map(), pendingAutoStartTimers: new Map(),
@@ -624,7 +642,12 @@ describe('T1 — a reserved TOURNAMENT seat is never cashed out to the wallet an
     const hhc = slice('async function handleHandComplete(', '\n}\n');
     const tickAt = hhc.indexOf('tickReservedSeatHands(tableId);');
     expect(tickAt).toBeGreaterThan(0);
-    expect(hhc.indexOf('const tournamentId = tournamentTables.get(tableId) ?? brokenTournamentTables.get(tableId)?.tournamentId;')).toBeGreaterThan(tickAt);
+    // S1 (2026-10-10): captured after the tick (before any await), run at the end.
+    const captureAt = hhc.indexOf('const tournamentBustCheck = captureTournamentBustCheck(tableId, table, results);');
+    expect(captureAt).toBeGreaterThan(tickAt);
+    expect(captureAt).toBeLessThan(hhc.indexOf('await mergeUserStats('));   // the first await
+    expect(hhc.indexOf("runTournamentBustCheck(tableId, table, tournamentBustCheck, 'hand_complete');")).toBeGreaterThan(captureAt);
+    expect(fnSrc('function runTournamentBustCheck(')).toContain('const tournamentId = tournamentTables.get(tableId) ?? brokenTournamentTables.get(tableId)?.tournamentId;');
     // F2 (2026-10-10): the snapshot uses isTournamentTable — a table a rebalance just broke still counts.
     expect(DISCONNECT_HANDLER).toContain('tournament: isTournamentTable(session.tableId),');
     expect(DISCONNECT_HANDLER).not.toContain('tournament: tournamentTables.has(session.tableId),');

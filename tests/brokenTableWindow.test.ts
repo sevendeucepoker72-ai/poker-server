@@ -32,7 +32,7 @@ const P = {
   gateState: slice('const playGateHandStart = {', '\n}\n'),
   rebalanceIsHeld: fnSrc('function tournamentRebalanceIsHeld('),
   creditSeat: fnSrc('function creditSeatStackToWallet('),
-  handlePlayerLeave: fnSrc('function handlePlayerLeave(socket: Socket): void {'),
+  handlePlayerLeave: fnSrc('function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKind'),
   // P1/P2/P6 (2026-10-10): capacity plan, busted-seat vacating, seat-pointer moves, the idle-table restart.
   helpers: slice('// ===== Tournament rebalance helpers', '// ===== end tournament rebalance helpers =====\n'),
   rebalance: fnSrc('function handleTableRebalance(tournamentId: string): void {'),

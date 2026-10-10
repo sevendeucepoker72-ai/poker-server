@@ -708,6 +708,8 @@ describe('index.ts — every play-entry handler is gated before its first side e
     // 2026-10-09 — side features a suspended player could still use.
     'createStake', 'buyStake', 'placePredictionBet', 'placeSocialSideBet', 'redeemEntryCode',
     'createPrivateTable',
+    // 2026-10-10 (S2) — the lobby's Return to tournament puts a player back on his absent seat.
+    'returnToTournamentSeat',
   ];
 
   it.each(GATED)('%s calls assertPlayable before any side effect', (event) => {
@@ -794,7 +796,8 @@ describe('index.ts — every play-entry handler is gated before its first side e
    */
   function expectRestoreSkippedOnRefusal(body: string, refusalVar: string, gateCall: string) {
     const gateAt = body.indexOf(` ${refusalVar} = await refuseSeatRestoreIfBarred(socket, userId, ${gateCall}`);
-    const guard = `if (!${refusalVar} && reserved && reserved.expiresAt > Date.now()) {`;
+    // S2 fixed protocol (P-b, 2026-10-10): a VOLUNTARY tournament reservation is never restored by a sign-in.
+    const guard = `if (!${refusalVar} && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {`;
     const guardAt = body.indexOf(guard);
     expect({ refusalVar, gate: gateAt > -1 }).toEqual({ refusalVar, gate: true });
     expect({ refusalVar, guard: guardAt > gateAt }).toEqual({ refusalVar, guard: true });
@@ -840,7 +843,8 @@ describe('index.ts — every play-entry handler is gated before its first side e
     // …and only a SYNTHETIC reservation (no cleanupTimer) is dropped from the map.
     expect(hold).toContain('if (!held.cleanupTimer) reservedSeats.delete(userId);');
     // The stand-up teardown is AFTER the hold branch.
-    const teardownAt = fn.indexOf('if (own) handlePlayerLeave(socket);');
+    // S2 fixed protocol: a suspended player's own tournament seat is kept absent NON-voluntarily ('kept').
+    const teardownAt = fn.indexOf("if (own) handlePlayerLeave(socket, 'kept');");
     expect(teardownAt).toBeGreaterThan(holdEnd);
     expect(fn.indexOf('standUpRefusedSeat(userId, username, reserved.tableId, reserved.seatIndex')).toBeGreaterThan(holdEnd);
   });
@@ -933,7 +937,7 @@ describe('index.ts — every play-entry handler is gated before its first side e
     expect(dqAt).toBeGreaterThan(-1);
     expect(standUpLoopAt).toBeGreaterThan(dqAt);
     expect(su).not.toContain('disqualifyPlayer');
-    const leaveAt = su.indexOf('handlePlayerLeave(sock!)');
+    const leaveAt = su.indexOf("handlePlayerLeave(sock!, 'kept')");   // S2 fixed protocol: never a voluntary keep
     expect(leaveAt).toBeGreaterThan(-1);
     // Extra-table seats are detached for the main-seat leave, then put back.
     expect(su).toContain('if (multi) multiTableSessions.delete(owner.socketId);');
