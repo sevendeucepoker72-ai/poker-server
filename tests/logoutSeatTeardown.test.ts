@@ -59,6 +59,8 @@ const SIGN_OUT_STATE = slice('const SIGN_IN_REVOCATION_MIN_INTERVAL_MS', 'notSig
 const REVOKE_FOR_SOCKET = slice('async function revokeSignInTokensForSocket(', '\n}\n');
 const ANSWER_REVOCATION = slice('async function answerSignInTokenRevocation(', '\n}\n');
 const IS_TOURNAMENT_RESERVATION = slice('function isTournamentReservation(', '\n}\n');
+// F2 (2026-10-10): the broken-tournament-table registry + isTournamentTable (used by the above, the leave and the credit helper).
+const BROKEN_TABLES = slice('const brokenTournamentTables = new Map', 'brokenTournamentTables.has(tableId);\n}\n');
 const NOTE_NOT_CASHED = slice('function noteTournamentReservationNotCashed(', '\n}\n');
 const TICK_RESERVED = slice('function tickReservedSeatHands(tableId: string): void {', '\n}\n');
 const HANDLE_PLAYER_LEAVE = slice('function handlePlayerLeave(socket: Socket): void {', '\n}\n');
@@ -81,6 +83,7 @@ ${SIGN_OUT_STATE}
 ${REVOKE_FN}
 ${REVOKE_FOR_SOCKET}
 ${ANSWER_REVOCATION}
+${BROKEN_TABLES}
 ${IS_TOURNAMENT_RESERVATION}
 ${NOTE_NOT_CASHED}
 ${parts.tick ?? TICK_RESERVED}
@@ -616,7 +619,9 @@ describe('T1 — a reserved TOURNAMENT seat is never cashed out to the wallet an
     const tickAt = hhc.indexOf('tickReservedSeatHands(tableId);');
     expect(tickAt).toBeGreaterThan(0);
     expect(hhc.indexOf('const tournamentId = tournamentTables.get(tableId);')).toBeGreaterThan(tickAt);
-    expect(DISCONNECT_HANDLER).toContain('tournament: tournamentTables.has(session.tableId),');
+    // F2 (2026-10-10): the snapshot uses isTournamentTable — a table a rebalance just broke still counts.
+    expect(DISCONNECT_HANDLER).toContain('tournament: isTournamentTable(session.tableId),');
+    expect(DISCONNECT_HANDLER).not.toContain('tournament: tournamentTables.has(session.tableId),');
     const shutdown = slice('// 2. Cash out every reserved seat (disconnected but not yet expired).', '// 3. Flush every pending debounced hand-snapshot');
     expect(shutdown).toContain('!isTournamentReservation(reserved)');
     expect(shutdown).not.toContain('!tournamentTables.has(reserved.tableId)');

@@ -467,6 +467,8 @@ export class SevenStudTable extends PokerTable {
    * Override startNewHand to set phase to ThirdStreet instead of PreFlop.
    */
   startNewHand(): boolean {
+    // F1 (2026-10-10): a nested call is refused by the base class — never reset this hand's stud state for it.
+    if (this.isStartingHand()) return super.startNewHand();
     this.cardVisibility.clear();
     this.currentStudPhase = 'ThirdStreet';
     this.studStreetIndex = 0;

@@ -33,6 +33,12 @@ export interface TournamentPlayer {
   // (undefined for AI fill / unauthenticated). Prize credits on finish go to
   // this id; only entrants with a userId paid the entry fee and fund the pool.
   userId?: number;
+  // 2026-10-10 (F4) — the MASTER account id the entrant registered with. A
+  // QUALIFIER entrant has no local userId (startQualifierTournament registers
+  // him by the qualifier registration's playerId); his identity is the master
+  // id that registration holds (qualifierTournaments[].players[].masterPlayerId).
+  // The hand-start play gate screens an ABSENT entrant by it. Never a payout key.
+  masterUserId?: string;
   // 2026-10-09 — set by disqualifyPlayer (play gate: suspended mid-tournament).
   // A disqualified entrant is eliminated and is paid NO prize (his share stays
   // unpaid — never redistributed, never minted).
@@ -265,7 +271,11 @@ export class TournamentManager {
     return list;
   }
 
-  registerPlayer(tournamentId: string, playerId: string, playerName: string, socketId: string, userId?: number): { success: boolean; error?: string } {
+  registerPlayer(
+    tournamentId: string, playerId: string, playerName: string, socketId: string, userId?: number,
+    /** F4 (2026-10-10) — the entrant's attested MASTER id (qualifier registrations); identity only, never paid by it. */
+    masterUserId?: string,
+  ): { success: boolean; error?: string } {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament) return { success: false, error: 'Tournament not found' };
     if (tournament.status !== 'registering') return { success: false, error: 'Tournament not open for registration' };
@@ -282,6 +292,7 @@ export class TournamentManager {
       bounties: 0,
       bountyEarnings: 0,
       userId,
+      ...(masterUserId ? { masterUserId } : {}),
     });
 
     // 2026-06-11 tournament economy: a PAYING human entrant (has a userId and

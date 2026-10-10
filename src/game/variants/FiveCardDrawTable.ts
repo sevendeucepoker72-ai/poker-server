@@ -247,6 +247,8 @@ export class FiveCardDrawTable extends PokerTable {
    * Override startNewHand to reset draw state.
    */
   startNewHand(): boolean {
+    // F1 (2026-10-10): a nested call is refused by the base class — never reset this hand's draw state for it.
+    if (this.isStartingHand()) return super.startNewHand();
     this.drawsCompleted.clear();
     this.currentDrawPhase = null;
     this.drawRound = 0;

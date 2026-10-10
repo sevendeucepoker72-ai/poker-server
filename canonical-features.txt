@@ -393,3 +393,27 @@ tournamentSeatKept
 # absent-seat turn clock, ABSENT_TOURNAMENT_SEAT_TURN_MS) are pinned by
 # tests/absentSeat.test.ts. U7: the socket `logout` is kept for compatibility
 # only — no poker-3d bundle emits it (locked there: `blocked a socket logout emit`).
+#
+# 2026-10-10 (seventh pass) — F1-F4 (CONTRACTS.md C5).
+# F1: a hand is never started twice — PokerTable refuses a nested startNewHand
+# and honours a beforeHandStart veto; the hand-start gate HOLDS the rebalance
+# its disqualifications cause until the suspended seats are stood up (then
+# runs it before the deal; a deal on a table it broke is vetoed); the
+# rebalance relocates stacks with allowBelowMin. /api/health tournamentSafety.
+start_new_hand_reentrant_refused
+hand_start_vetoed
+tournament_table_broken
+tournamentSafety
+reentrantStartsRefused
+rebalancesHeld
+handStartsVetoed
+# F2: broken tournament tables stay tournament tables to every chip decision
+# (isTournamentTable) — a disconnect/leave in the ≤5s break window never
+# credits the stack (tests/brokenTableWindow.test.ts).
+brokenTablesRetained
+# F3: a buy-in whose socket dropped while it awaited seats nothing; a deducted
+# buy-in is refunded exactly once (tests/buyInSocketGone.test.ts).
+buy_in_abandoned_socket_gone
+buyInsAbandonedSocketGone
+# F4: an absent suspended QUALIFIER entrant is identified by his registration's
+# master id and disqualified — pinned by tests/handStartRebalance.test.ts.

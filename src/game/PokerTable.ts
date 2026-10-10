@@ -490,7 +490,58 @@ export class PokerTable extends EventEmitter {
 
   // ========== Hand Flow ==========
 
+  /**
+   * 2026-10-10 (F1) — true while startNewHand runs, its 'beforeHandStart'
+   * listeners included. Those listeners run synchronously and can reach code
+   * that starts hands (index.ts: a tournament disqualification → elimination →
+   * table rebalance → "restart hands on tables that were waiting"), which
+   * called startNewHand on THIS table while it was still inside its own: the
+   * hand was started twice, and the outer start then reset the inner hand's
+   * posted blinds (seat.currentBet / totalInvestedThisHand = 0 — chips gone).
+   * A hand can never be started twice now: a nested call is refused (false).
+   */
+  private _startingHand = false;
+  /** F1 — set by a 'beforeHandStart' listener (vetoHandStart): do not deal this hand. */
+  private _handStartVeto: string | null = null;
+  /** F1 — startNewHand calls refused because the same table was already inside one. Should stay 0 (/api/health). */
+  static reentrantStartsRefused = 0;
+
+  /** F1 — is this table inside startNewHand right now (e.g. in its 'beforeHandStart' listeners)? */
+  isStartingHand(): boolean {
+    return this._startingHand;
+  }
+
+  /**
+   * F1 — called by a 'beforeHandStart' listener: the hand being started must
+   * NOT be dealt (index.ts: the tournament rebalance that listener ran broke
+   * this very table — its players now sit at other tables). startNewHand then
+   * returns false before anything is reset or posted. A no-op outside
+   * startNewHand.
+   */
+  vetoHandStart(reason: string): void {
+    if (this._startingHand && this._handStartVeto === null) this._handStartVeto = reason;
+  }
+
   startNewHand(): boolean {
+    if (this._startingHand) {
+      PokerTable.reentrantStartsRefused++;
+      console.warn(`[PokerTable] ${JSON.stringify({
+        event: 'start_new_hand_reentrant_refused', tableId: this.config.tableId,
+        handNumber: this.handNumber, phase: this.currentPhase,
+      })}`);
+      return false;
+    }
+    this._startingHand = true;
+    this._handStartVeto = null;
+    try {
+      return this.startNewHandOnce();
+    } finally {
+      this._startingHand = false;
+      this._handStartVeto = null;
+    }
+  }
+
+  private startNewHandOnce(): boolean {
     // 2026-10-09 — PRE-DEAL HOOK (play gate: index.ts stands up a player found
     // suspended). This is the last moment a seat can leave with NOTHING in a
     // pot — the previous hand's pots are awarded, this hand's blinds are not
@@ -502,6 +553,14 @@ export class PokerTable extends EventEmitter {
       this.emit('beforeHandStart', { handNumber: this.handNumber + 1 });
     } catch (e: any) {
       console.error('[PokerTable] beforeHandStart listener threw (ignored, hand continues):', e?.message || e);
+    }
+
+    // F1 — a listener vetoed this deal (nothing has been reset or posted yet).
+    if (this._handStartVeto !== null) {
+      console.warn(`[PokerTable] ${JSON.stringify({
+        event: 'hand_start_vetoed', tableId: this.config.tableId, reason: this._handStartVeto,
+      })}`);
+      return false;
     }
 
     const occupiedSeats = this.seats.filter(

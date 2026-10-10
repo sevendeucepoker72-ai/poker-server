@@ -1405,6 +1405,52 @@ function loginSocketGone(
   return true;
 }
 
+/**
+ * 2026-10-10 (F3) — a BUY-IN can outlive its socket, exactly like a login
+ * (U1). Every seat-buying handler awaits (the play gate, the ban check, the
+ * balance read, the deduct). If the socket drops meanwhile, the 'disconnect'
+ * handler has ALREADY run — there was no seat yet to reserve — and never runs
+ * again: a seat taken now is bound to a dead socket with no reservation and no
+ * cash-out timer, and the stack (wallet chips the deduct just took) is never
+ * cashed out. So each buy-in path calls this after EACH await, before it
+ * seats (or registers, or tops up): true = the socket is gone, the caller
+ * returns at once and seats nothing. `refund` (pass it once the deduct has
+ * succeeded) gives the buy-in back through the one additive path
+ * (addChipsToUser) with an audit row — exactly once, since this is the
+ * handler's only exit after its deduct. socket.io sets `connected = false`
+ * before it emits 'disconnect'. /api/health playGate.buyInsAbandonedSocketGone.
+ */
+const buyInsOnDeadSocket = { abandoned: 0, refunded: 0, refundFailed: 0 };
+async function buyInSocketGone(
+  socket: Socket, via: string, stage: string,
+  refund?: { userId: number; username: string; amount: number; tableId?: string | null; action?: string },
+): Promise<boolean> {
+  if (socket.connected) return false;
+  buyInsOnDeadSocket.abandoned++;
+  let refundResult: 'none' | 'refunded' | 'failed' = 'none';
+  if (refund && refund.amount > 0) {
+    const action = refund.action || 'BUY_IN_REFUND';
+    const detail = { userId: refund.userId, tableId: refund.tableId ?? null, amount: refund.amount, reason: 'socket_gone', via, stage };
+    try {
+      const ok = await addChipsToUser(refund.userId, refund.amount);
+      refundResult = ok ? 'refunded' : 'failed';
+      auditLog(refund.username, ok ? action : `${action}_FAILED`, detail);
+    } catch (e: any) {
+      refundResult = 'failed';
+      console.error(`[buy-in] socket-gone refund failed for userId=${refund.userId} amount=${refund.amount} (${via}):`, e?.message || e);
+      if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.buyInSocketGoneRefund' }, extra: { userId: refund.userId, amount: refund.amount, via } });
+      auditLog(refund.username, `${action}_FAILED`, { ...detail, error: String(e?.message || e) });
+    }
+    if (refundResult === 'refunded') buyInsOnDeadSocket.refunded++;
+    else buyInsOnDeadSocket.refundFailed++;
+  }
+  console.warn(`[buy-in] ${JSON.stringify({
+    event: 'buy_in_abandoned_socket_gone', via, stage, localUserId: refund?.userId ?? null,
+    tableId: refund?.tableId ?? null, amount: refund?.amount ?? 0, refundResult,
+  })}`);
+  return true;
+}
+
 const loadLocalStats = async (userId: number): Promise<unknown> => {
   const { rows } = await getPool().query('SELECT stats FROM users WHERE id = $1 LIMIT 1', [userId]);
   return rows[0]?.stats;
@@ -1874,7 +1920,42 @@ function absentSeatMasterId(localUserId: number, reserved: ReservedSeat | undefi
  * recovery will pick it up"). Checked against the snapshot AND the live map.
  */
 function isTournamentReservation(reserved: { tableId: string; tournament?: boolean }): boolean {
-  return reserved.tournament === true || tournamentTables.has(reserved.tableId);
+  return reserved.tournament === true || isTournamentTable(reserved.tableId);
+}
+
+/**
+ * 2026-10-10 (F2) — tournament tables a rebalance has BROKEN (table id →
+ * tournament id + when). handleTableRebalance drops the id from
+ * tournamentTables at once, but the table itself lives on for 5s ("let the
+ * current hand finish"), a session can still point at it (the rebalance moves
+ * a human's session only through his REGISTRATION socket — a player who
+ * reconnected since is left on the broken table), and his stack is ALREADY on
+ * the target table. Anything that decided "tournament seat?" by
+ * tournamentTables alone treated the broken table as a CASH table in that
+ * window: a disconnect reserved the seat with `tournament:false` and the 6h
+ * expiry credited the stack to the wallet; a leave / the SIGTERM flush / the
+ * guest carry-over pre-step credited it at once — a mint, the stack being in
+ * play on the target table. Kept for longer than any reservation can live
+ * (SEAT_RESERVE_MS), then pruned. Table ids are UUIDs, never reused.
+ */
+const brokenTournamentTables = new Map<string, { tournamentId: string; brokenAt: number }>();
+function noteBrokenTournamentTable(tableId: string, tournamentId: string): void {
+  const now = Date.now();
+  const retainMs = SEAT_RESERVE_MS + 60 * 60_000;
+  for (const [id, b] of brokenTournamentTables) {
+    if (now - b.brokenAt > retainMs) brokenTournamentTables.delete(id);
+  }
+  brokenTournamentTables.set(tableId, { tournamentId, brokenAt: now });
+}
+/**
+ * F2 — THE "is this a tournament table?" test for every decision about
+ * whose chips a seat holds (credit to the wallet or not, cash-table actions):
+ * a live tournament table OR one a rebalance broke. Never tournamentTables
+ * alone. (tournamentTables.get(tableId) is still what to use for the RUNNING
+ * tournament's id — a broken table plays no further part in it.)
+ */
+function isTournamentTable(tableId: string): boolean {
+  return tournamentTables.has(tableId) || brokenTournamentTables.has(tableId);
 }
 
 /**
@@ -2030,12 +2111,29 @@ app.get('/api/health', async (_req, res) => {
         // stopped before setting a session / restoring a seat (a reservation
         // is left for the next reconnect). See loginSocketGone.
         loginsAbandonedSocketGone: loginsOnDeadSocket.abandoned,
+        // 2026-10-10 (F3) — seat buy-ins whose socket dropped while they
+        // awaited: nothing seated; a buy-in already deducted refunded once
+        // (refundFailed > 0 = an audited BUY_IN_REFUND_FAILED-class row to
+        // reconcile). See buyInSocketGone.
+        buyInsAbandonedSocketGone: { ...buyInsOnDeadSocket },
         ...playStatusClient.counters(),
         cacheSize: playStatusClient.cacheSize(),
         // 2026-10-09 — players found suspended mid-session and stood up before
         // a deal (disqualified = tournament seats); refreshes = background
         // status lookups the hand loop fired instead of waiting.
         handStart: { ...playGateHandStart },
+      },
+      // 2026-10-10 (F1/F2) — tournament hand-start safety. rebalancesHeld =
+      // rebalances a hand-start disqualification caused, run only after that
+      // boundary's suspended seats were stood up (before the deal);
+      // handStartsVetoed = deals skipped because that rebalance broke the
+      // table itself; reentrantStartsRefused = startNewHand called on a table
+      // already inside one (should stay 0); brokenTablesRetained = broken
+      // tournament tables still treated as tournament tables (F2).
+      tournamentSafety: {
+        ...tournamentHandStartSafety,
+        reentrantStartsRefused: PokerTable.reentrantStartsRefused,
+        brokenTablesRetained: brokenTournamentTables.size,
       },
       // 2026-10-09 — R1 resumable ticket sessions. enabled:false = JWT_SECRET
       // missing in prod (tokens would be forgeable) — every resume refused.
@@ -2473,6 +2571,9 @@ setInterval(() => {
       id: p.playerId,
       name: p.playerName,
       socketId: p.socketId,
+      // F4 (2026-10-10) — the registration's attested master id: the entrant's
+      // identity for the hand-start play gate (qualifier entrants have no local userId).
+      masterId: p.masterPlayerId || null,
     }));
 
     // Real players only — no AI fill
@@ -4013,6 +4114,13 @@ function autoStartNextHand(tableId: string): void {
 
   if (table.currentPhase !== GamePhase.HandComplete) return;
 
+  // F2 (2026-10-10) — a tournament table a rebalance BROKE never deals again:
+  // its players (and stacks) already sit at the target tables, and it is
+  // removed 5s after the break. Without this, the hand left running at the
+  // break ended, the table was no longer in tournamentTables, and the cash
+  // branches below (AI reload / fill) plus a new hand ran on it.
+  if (brokenTournamentTables.has(tableId)) return;
+
   // Reload BUSTED-OUT seats. Two HARD rules earned 2026-07-01 (.online audit
   // #3) — the old loop reloaded every busted seat (human + AI, cash + tourney)
   // to minBuyIn with no wallet deduction and un-eliminated it:
@@ -4266,7 +4374,7 @@ function ensureCashTableRunning(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
   // Skip tournament tables — those run on a different schedule.
-  if (tournamentTables.has(tableId)) return;
+  if (isTournamentTable(tableId)) return;
   // Skip quick-play / heads-up tables (#5) — they have a fixed roster; the ring
   // heartbeat would backfill AI and break their 2-seat winner logic.
   if (quickTables.has(tableId)) return;
@@ -5203,6 +5311,106 @@ async function refuseSeatRestoreIfBarred(
  */
 const playGateHandStart = { standUps: 0, disqualified: 0, absentDisqualified: 0, refreshes: 0, errors: 0 };
 
+/**
+ * 2026-10-10 (F1) — the gate runs INSIDE PokerTable.startNewHand
+ * ('beforeHandStart'). Disqualifying a suspended entrant eliminates him, and
+ * TournamentManager emits 'playerEliminated' synchronously; the multi-table
+ * handler (bootstrapTournamentTables) ran handleTableRebalance right there:
+ *   - BEFORE this boundary's suspended seats were stood up, so the seats they
+ *     were about to free still looked taken — a player moved off a broken
+ *     table found no seat ("Could not place") and was left seatless;
+ *   - and its "restart hands on tables that were waiting" branch called
+ *     startNewHand on THIS table, still inside its own startNewHand: the hand
+ *     was started twice and the outer start reset the inner one's posted
+ *     blinds.
+ * Now, while the gate works on a tournament, a rebalance it causes is HELD
+ * (handleTableRebalance only records it); once every suspended seat of this
+ * boundary is stood up, the held rebalance runs — still BEFORE this table's
+ * deal, so players moved here are dealt into this hand — and if it broke THIS
+ * table, the deal is vetoed (its players now sit at the target tables).
+ * PokerTable also refuses a nested startNewHand on the same table outright.
+ */
+const tournamentRebalanceHolds = new Map<string, { depth: number; pending: boolean }>();
+const tournamentHandStartSafety = { rebalancesHeld: 0, handStartsVetoed: 0, heldRebalanceErrors: 0 };
+function holdTournamentRebalance(tournamentId: string): void {
+  const h = tournamentRebalanceHolds.get(tournamentId);
+  if (h) h.depth++;
+  else tournamentRebalanceHolds.set(tournamentId, { depth: 1, pending: false });
+}
+/** true = a hand-start gate holds this tournament's rebalance: recorded, the caller must not rebalance now. */
+function tournamentRebalanceIsHeld(tournamentId: string): boolean {
+  const h = tournamentRebalanceHolds.get(tournamentId);
+  if (!h) return false;
+  h.pending = true;
+  return true;
+}
+function releaseTournamentRebalance(tournamentId: string, table: PokerTable, tableId: string): void {
+  const h = tournamentRebalanceHolds.get(tournamentId);
+  if (!h) return;
+  h.depth--;
+  if (h.depth > 0) return;
+  tournamentRebalanceHolds.delete(tournamentId);
+  if (!h.pending) return;
+  tournamentHandStartSafety.rebalancesHeld++;
+  // The batch may have FINISHED the tournament: nothing left to rebalance.
+  if (tournamentManager.getTournament(tournamentId)?.status !== 'running') return;
+  try {
+    handleTableRebalance(tournamentId);
+  } catch (e: any) {
+    tournamentHandStartSafety.heldRebalanceErrors++;
+    console.error(`[play-gate] held tournament rebalance failed (tournament ${tournamentId}, table ${tableId}):`, e?.message || e);
+  }
+  if (!tournamentTables.has(tableId) && table.isStartingHand()) {
+    // The rebalance broke THIS table: its players were moved, so its hand must
+    // not be dealt (blinds would be posted on a table that is being removed).
+    table.vetoHandStart('tournament_table_broken');
+    tournamentHandStartSafety.handStartsVetoed++;
+  }
+}
+
+/**
+ * 2026-10-10 (F4) — who is behind an ABSENT tournament seat. A buy-in entrant
+ * (registerTournament) carries his LOCAL userId. A QUALIFIER entrant carries
+ * none — startQualifierTournament registers him by the qualifier
+ * registration's playerId — only the MASTER id that registration holds
+ * (TournamentPlayer.masterUserId, else qualifierTournaments[].players[]
+ * .masterPlayerId). Before F4 the gate skipped him: a suspended qualifier
+ * entrant who was away kept his seat to the end and got a qualifier result.
+ * null = nothing to screen (no identity: AI fill / anonymous);
+ * masterId: string = screen by it; null = no account; undefined = being
+ * resolved in the background (a later boundary acts on it).
+ * localUserId: the reservation key / audit actor, when known.
+ */
+function absentEntrantIdentity(
+  tournamentId: string, tableId: string, seatIndex: number,
+  tp: { playerId: string; userId?: number; masterUserId?: string },
+): { localUserId: number | null; masterId: string | null | undefined } | null {
+  if (tp.userId !== undefined) {
+    return { localUserId: tp.userId, masterId: absentSeatMasterId(tp.userId, reservedSeats.get(tp.userId)) };
+  }
+  const masterId = tp.masterUserId || qualifierEntrantMasterId(tournamentId, tp.playerId);
+  if (!masterId) return null;
+  return { localUserId: reservationHolderAt(tableId, seatIndex), masterId };
+}
+
+/** F4 — the master id a qualifier registration holds for this tournament entrant, or null. */
+function qualifierEntrantMasterId(tournamentId: string, playerId: string): string | null {
+  for (const qt of qualifierTournaments.values()) {
+    if (qt.tournamentId !== tournamentId) continue;
+    const reg = qt.players.find((p) => p.playerId === playerId);
+    if (reg?.masterPlayerId) return String(reg.masterPlayerId);
+  }
+  return null;
+}
+
+/** F4 — the LOCAL user id whose seat reservation points at (tableId, seatIndex), or null. */
+function reservationHolderAt(tableId: string, seatIndex: number): number | null {
+  for (const [uid, r] of reservedSeats) {
+    if (r.tableId === tableId && r.seatIndex === seatIndex) return uid;
+  }
+  return null;
+}
+
 /** The live socket seated at (tableId, seatIndex): its main seat or one of its additional-table seats. */
 function seatOwnerSocket(tableId: string, seatIndex: number): { socketId: string; kind: 'main' | 'additional' } | null {
   for (const [sid, s] of playerSessions) {
@@ -5229,13 +5437,15 @@ function standUpSuspendedSeatsBeforeDeal(table: PokerTable, tableId: string): vo
     if (tournamentIdForGate && (!owner || !io.sockets.sockets.get(owner.socketId))) {
       // U2 — no live socket behind this tournament seat. Screen it by the
       // entrant's own record (TournamentManager: the local userId that paid
-      // the entry and would be paid the prize).
+      // the entry and would be paid the prize — or, F4, a QUALIFIER entrant's
+      // registered master id: he has no local userId).
       const tp = tournamentManager.getTournament(tournamentIdForGate)?.players.find((p) => p.playerId === seat.playerId);
-      if (!tp || tp.eliminated || tp.userId === undefined) continue;
-      const masterId = absentSeatMasterId(tp.userId, reservedSeats.get(tp.userId));
-      if (masterId === undefined) continue; // being resolved — a later boundary acts on it
-      absent.set(i, { localUserId: tp.userId, staleOwner: owner });
-      seats.push({ seatIndex: i, masterId });
+      if (!tp || tp.eliminated) continue;
+      const who = absentEntrantIdentity(tournamentIdForGate, tableId, i, tp);
+      if (!who) continue;                        // no identity behind it (AI fill / anonymous)
+      if (who.masterId === undefined) continue;  // being resolved — a later boundary acts on it
+      absent.set(i, { localUserId: who.localUserId, staleOwner: owner });
+      seats.push({ seatIndex: i, masterId: who.masterId });
       continue;
     }
     if (!owner) continue;
@@ -5270,30 +5480,38 @@ function standUpSuspendedSeatsBeforeDeal(table: PokerTable, tableId: string): vo
   // entrant was still unflagged — and finishTournament paid him 1st place
   // (heads-up, both suspended). Only seats this pass will really stand up
   // are included — U2: the ABSENT ones too, in the same batch.
-  const disqualifiedSeats = new Map<number, boolean>();
-  if (tournamentIdForGate) {
-    try {
-      const targets = plan.standUp.filter(({ seatIndex }) =>
-        absent.has(seatIndex) || suspendedSeatCanStandUp(table, seatIndex, owners.get(seatIndex)!));
-      const dq = tournamentManager.disqualifyPlayers(tournamentIdForGate, targets.map(({ seatIndex }) => table.seats[seatIndex].playerId));
-      for (const { seatIndex } of targets) disqualifiedSeats.set(seatIndex, !!dq.get(table.seats[seatIndex].playerId));
-    } catch (e: any) {
-      playGateHandStart.errors++;
-      console.error(`[play-gate] hand-start disqualification failed (table ${tableId}):`, e?.message || e);
-    }
-  }
-  for (const { seatIndex, masterId } of plan.standUp) {
-    try {
-      const away = absent.get(seatIndex);
-      if (away) {
-        standUpAbsentTournamentSeat(table, tableId, seatIndex, away, masterId, disqualifiedSeats.get(seatIndex) === true);
-        continue;
+  // F1 — a rebalance these eliminations cause is HELD until every seat below
+  // is stood up, then run before this table's deal (releaseTournamentRebalance).
+  if (plan.standUp.length === 0) return;
+  if (tournamentIdForGate) holdTournamentRebalance(tournamentIdForGate);
+  try {
+    const disqualifiedSeats = new Map<number, boolean>();
+    if (tournamentIdForGate) {
+      try {
+        const targets = plan.standUp.filter(({ seatIndex }) =>
+          absent.has(seatIndex) || suspendedSeatCanStandUp(table, seatIndex, owners.get(seatIndex)!));
+        const dq = tournamentManager.disqualifyPlayers(tournamentIdForGate, targets.map(({ seatIndex }) => table.seats[seatIndex].playerId));
+        for (const { seatIndex } of targets) disqualifiedSeats.set(seatIndex, !!dq.get(table.seats[seatIndex].playerId));
+      } catch (e: any) {
+        playGateHandStart.errors++;
+        console.error(`[play-gate] hand-start disqualification failed (table ${tableId}):`, e?.message || e);
       }
-      standUpSuspendedSeat(table, tableId, seatIndex, owners.get(seatIndex)!, masterId, disqualifiedSeats.get(seatIndex) === true);
-    } catch (e: any) {
-      playGateHandStart.errors++;
-      console.error(`[play-gate] hand-start stand-up failed (table ${tableId} seat ${seatIndex}):`, e?.message || e);
     }
+    for (const { seatIndex, masterId } of plan.standUp) {
+      try {
+        const away = absent.get(seatIndex);
+        if (away) {
+          standUpAbsentTournamentSeat(table, tableId, seatIndex, away, masterId, disqualifiedSeats.get(seatIndex) === true);
+          continue;
+        }
+        standUpSuspendedSeat(table, tableId, seatIndex, owners.get(seatIndex)!, masterId, disqualifiedSeats.get(seatIndex) === true);
+      } catch (e: any) {
+        playGateHandStart.errors++;
+        console.error(`[play-gate] hand-start stand-up failed (table ${tableId} seat ${seatIndex}):`, e?.message || e);
+      }
+    }
+  } finally {
+    if (tournamentIdForGate) releaseTournamentRebalance(tournamentIdForGate, table, tableId);
   }
 }
 
@@ -5309,8 +5527,12 @@ function suspendedSeatCanStandUp(
 
 /** U2 — a tournament seat with no live socket behind it (see standUpSuspendedSeatsBeforeDeal). */
 interface AbsentTournamentSeat {
-  /** The entrant's LOCAL users.id (TournamentManager's record — entry fee payer, prize recipient). */
-  localUserId: number;
+  /**
+   * The entrant's LOCAL users.id (TournamentManager's record — entry fee payer,
+   * prize recipient). F4: a QUALIFIER entrant has none on record — then the
+   * holder of a reservation pointing at this seat, else null.
+   */
+  localUserId: number | null;
   /** A session still pointing at this seat from a socket that is gone, if any. */
   staleOwner: { socketId: string; kind: 'main' | 'additional' } | null;
 }
@@ -5340,8 +5562,8 @@ function standUpAbsentTournamentSeat(
   }
   playGateHandStart.disqualified++;
   playGateHandStart.absentDisqualified++;
-  const reserved = reservedSeats.get(away.localUserId);
-  if (reserved && reserved.tableId === tableId && reserved.seatIndex === seatIndex) {
+  const reserved = away.localUserId !== null ? reservedSeats.get(away.localUserId) : undefined;
+  if (away.localUserId !== null && reserved && reserved.tableId === tableId && reserved.seatIndex === seatIndex) {
     if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
     reservedSeats.delete(away.localUserId);
   }
@@ -5356,8 +5578,9 @@ function standUpAbsentTournamentSeat(
   }
   const chips = seat.chipCount || 0;
   if (chips > 0) {
-    auditLog(String(away.localUserId), 'TOURNAMENT_STACK_NOT_CASHED', {
-      userId: away.localUserId, tableId, reason: 'suspended_absent_disqualified', chips,
+    auditLog(away.localUserId !== null ? String(away.localUserId) : (seat.playerId || seat.playerName || 'unknown'), 'TOURNAMENT_STACK_NOT_CASHED', {
+      userId: away.localUserId, ...(away.localUserId === null ? { masterId } : {}),
+      tableId, reason: 'suspended_absent_disqualified', chips,
     });
   }
   sitOutTracker.get(tableId)?.delete(seatIndex);
@@ -5568,7 +5791,7 @@ async function cashOutSeatsBeforeGuestClaim(guestUserId: number): Promise<void> 
     const table = tableManager.getTable(tableId);
     const seat = table?.seats?.[seatIndex];
     if (!table || !seat || seat.state !== 'occupied' || seat.isAI) return true; // nothing seated there
-    if (tournamentSeat || tournamentTables.has(tableId)) return false;
+    if (tournamentSeat || isTournamentTable(tableId)) return false;
     if (pendingSeatRemovalAfterHand.get(tableId)?.has(seatIndex)) return true;
     if (table.isHandInProgress() && !seat.folded && (seat.totalInvestedThisHand || 0) > 0) {
       standUpRefusedSeat(guestUserId, label, tableId, seatIndex, reason);
@@ -5603,7 +5826,7 @@ async function cashOutSeatsBeforeGuestClaim(guestUserId: number): Promise<void> 
       const gs = io.sockets.sockets.get(sid);
       const ps = playerSessions.get(sid);
       if (ps) {
-        cashOut(ps.tableId, ps.seatIndex, 'guest_claim_live_seat', tournamentTables.has(ps.tableId));
+        cashOut(ps.tableId, ps.seatIndex, 'guest_claim_live_seat', isTournamentTable(ps.tableId));
         playerSessions.delete(sid);
         releaseSeatedSlot(sid, ps.tableId);
         gs?.leave(`table:${ps.tableId}`);
@@ -5611,7 +5834,7 @@ async function cashOutSeatsBeforeGuestClaim(guestUserId: number): Promise<void> 
       const multi = multiTableSessions.get(sid);
       if (multi) {
         for (const ms of multi) {
-          cashOut(ms.tableId, ms.seatIndex, 'guest_claim_additional_seat', tournamentTables.has(ms.tableId));
+          cashOut(ms.tableId, ms.seatIndex, 'guest_claim_additional_seat', isTournamentTable(ms.tableId));
           gs?.leave(`table:${ms.tableId}`);
         }
         multiTableSessions.delete(sid);
@@ -5660,7 +5883,7 @@ function cleanupQuickTable(tableId: string): void {
     // adminForceCloseTable). Chip-conserving: crediting winner + loser stacks
     // sums to the total bought in.
     const inHand = table.isHandInProgress();
-    const isTournament = tournamentTables.has(tableId);
+    const isTournament = isTournamentTable(tableId);
     for (let i = 0; i < MAX_SEATS; i++) {
       const seat = table.seats[i];
       if (!seat || seat.state !== 'occupied') continue;
@@ -6041,8 +6264,11 @@ io.on('connection', (socket: Socket) => {
         // index.ts:4471 and rebuy at index.ts:5878). Only runs when the
         // qualifier carries a chip buy-in.
         const buyIn = Math.floor(qt.buyIn || 0);
+        // F3 (2026-10-10) — the socket may have dropped during the qualification check.
+        if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'qualified_check')) return;
         if (buyIn > 0) {
           const dbChips = await ensureChipsForBuyIn(auth.userId, auth.username, buyIn);
+          if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'balance_read')) return; // nothing deducted yet
           if (buyIn > dbChips) {
             socket.emit('qualifierRegistrationResult', { success: false, error: 'Insufficient chips for re-entry' });
             return;
@@ -6052,6 +6278,10 @@ io.on('connection', (socket: Socket) => {
             return;
           }
           auditLog(auth.username, 'QUALIFIER_REENTRY_BUYIN_DEDUCT', { qualifierId: qualId, buyIn, priorReEntries });
+          // F3 — dropped during the deduct: refund it before a credit is consumed.
+          if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'deduct', {
+            userId: auth.userId, username: auth.username, amount: buyIn, action: 'QUALIFIER_REENTRY_BUYIN_REFUND',
+          })) return;
         }
 
         // (c) Qualifier-credit consumption — atomic conditional update
@@ -6092,6 +6322,23 @@ io.on('connection', (socket: Socket) => {
           }
           consumedCreditId = consumeRes.creditId || null;
           auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_CONSUME', { qualifierId: qualId, creditId: consumedCreditId });
+          // F3 (2026-10-10) — dropped during the credit consume: give BOTH back
+          // (the chip buy-in once, through the additive path; the credit through
+          // the master) and seat nothing — a re-entry seat on a dead socket has
+          // no session and would only be blinded out.
+          if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'credit_consume', buyIn > 0 ? {
+            userId: auth.userId, username: auth.username, amount: buyIn, action: 'QUALIFIER_REENTRY_BUYIN_REFUND',
+          } : undefined)) {
+            if (consumedCreditId) {
+              const refunded = await refundQualifierCreditOnMaster(consumedCreditId);
+              auditLog(
+                auth.username,
+                refunded ? 'QUALIFIER_REENTRY_CREDIT_REFUND' : 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED',
+                { qualifierId: qualId, creditId: consumedCreditId, reason: 'socket_gone' },
+              );
+            }
+            return;
+          }
         }
 
         // (d) NOW re-seat. Find a table with empty seats.
@@ -7551,7 +7798,7 @@ Give feedback in this JSON format:
         players: t.playerCount,
         blinds: `${t.smallBlind}/${t.bigBlind}`,
         variant: t.variantName,
-        isTournament: tournamentTables.has(t.tableId),
+        isTournament: isTournamentTable(t.tableId),
       })),
       handsPlayedToday,
       uptime: `${hours}h ${mins}m`,
@@ -7872,7 +8119,7 @@ Give feedback in this JSON format:
     // (same class as the shutdown #1 fix). Tournament stacks are wallet-unbacked
     // — skip them (crediting would mint), exactly like creditSeatStackToWallet.
     const inHand = table.isHandInProgress();
-    const isTournament = tournamentTables.has(data.tableId);
+    const isTournament = isTournamentTable(data.tableId);
     for (let i = 0; i < MAX_SEATS; i++) {
       const seat = table.seats[i];
       if (!seat || seat.state !== 'occupied') continue;
@@ -8974,6 +9221,9 @@ Give feedback in this JSON format:
           return;
         }
       }
+      // F3 (2026-10-10) — the socket may have dropped during the awaits above:
+      // stop before leaving a table, standing an AI up or touching the wallet.
+      if (await buyInSocketGone(socket, 'joinTable', 'gate')) return;
       let { tableId, playerName, seatIndex, buyIn } = data;
       const table = tableManager.getTable(tableId);
 
@@ -9121,6 +9371,7 @@ Give feedback in this JSON format:
       // so no one ever hits "Insufficient chips" while we're iterating.
       if (authForJoin) {
         const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, buyIn);
+        if (await buyInSocketGone(socket, 'joinTable', 'balance_read')) return; // F3 — nothing deducted yet
         if (buyIn > dbChips) {
           socket.emit('error', { message: 'Insufficient chips' });
           return;
@@ -9130,6 +9381,10 @@ Give feedback in this JSON format:
           return;
         }
         auditLog(authForJoin.username, 'BUY_IN_DEDUCT', { tableId, buyIn });
+        // F3 — the socket dropped during the deduct: refund it, seat nothing.
+        if (await buyInSocketGone(socket, 'joinTable', 'deduct', {
+          userId: authForJoin.userId, username: authForJoin.username, amount: buyIn, tableId,
+        })) return;
       }
 
       mySlots.add(`${socket.id}:${tableSlotKey}`);
@@ -9210,6 +9465,8 @@ Give feedback in this JSON format:
       // 2026-10-07 play gate — before the scrub / leave / AI stand-up below.
       const qpGate = await assertPlayable(socket, 'quickPlay');
       if (qpGate) { emitPlayRefusal(socket, qpGate); return; }
+      // F3 (2026-10-10) — before the leave / AI stand-up below, on a socket that already dropped.
+      if (await buyInSocketGone(socket, 'quickPlay', 'gate')) return;
       const { playerName } = data;
 
       // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
@@ -9297,6 +9554,7 @@ Give feedback in this JSON format:
       let chipsDeducted = false;
       if (authForJoin) {
         const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, buyIn);
+        if (await buyInSocketGone(socket, 'quickPlay', 'balance_read')) return; // F3 — nothing deducted yet
         if (buyIn > dbChips) {
           socket.emit('error', { message: 'Insufficient chips' });
           return;
@@ -9307,6 +9565,10 @@ Give feedback in this JSON format:
         }
         chipsDeducted = true;
         auditLog(authForJoin.username, 'QUICKPLAY_BUY_IN_DEDUCT', { tableId: chosenTableId, buyIn });
+        // F3 — the socket dropped during the deduct: refund it, seat nothing.
+        if (await buyInSocketGone(socket, 'quickPlay', 'deduct', {
+          userId: authForJoin.userId, username: authForJoin.username, amount: buyIn, tableId: chosenTableId, action: 'QUICKPLAY_REFUND',
+        })) return;
       }
 
       const playerId = `player-${uuidv4()}`;
@@ -11092,6 +11354,11 @@ Give feedback in this JSON format:
           releaseWlBootstrap();
         }
 
+        // F3 (2026-10-10) — the socket dropped during the ticket verify / the
+        // bootstrap: a login like any other (U1) — drop a session the bootstrap
+        // set on the dead socket and stop before the AI eviction and buy-in.
+        if (loginSocketGone(socket, 'joinWithWaitlistContext', 'auth_bootstrap', { localUserId: wlBootstrapSession?.userId })) return;
+
         // If we still don't have an auth session after the bootstrap attempt,
         // abort rather than seating an unauthenticated player who will then
         // silently fail on every subsequent action.
@@ -11174,6 +11441,7 @@ Give feedback in this JSON format:
         const waitlistBuyIn = table.config.minBuyIn;
         if (authNow) {
           const dbChips = await ensureChipsForBuyIn(authNow.userId, authNow.username, waitlistBuyIn);
+          if (await buyInSocketGone(socket, 'joinWithWaitlistContext', 'balance_read')) return; // F3 — nothing deducted yet
           if (waitlistBuyIn > dbChips) {
             failWaitlist('handler_exception', 'Insufficient chips', { stage: 'insufficient_chips' });
             return;
@@ -11183,6 +11451,10 @@ Give feedback in this JSON format:
             return;
           }
           auditLog(authNow.username, 'BUY_IN_DEDUCT', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, reason: 'waitlist' });
+          // F3 — the socket dropped during the deduct: refund it, seat nothing.
+          if (await buyInSocketGone(socket, 'joinWithWaitlistContext', 'deduct', {
+            userId: authNow.userId, username: authNow.username, amount: waitlistBuyIn, tableId: bestTable.tableId,
+          })) return;
         }
 
         const success = table.sitDown(
@@ -11341,6 +11613,7 @@ Give feedback in this JSON format:
     // 2026-10-07 play gate — a rebuy puts fresh chips in play.
     const rbGate = await assertPlayable(socket, 'rebuy');
     if (rbGate) { emitPlayRefusal(socket, rbGate); return; }
+    if (await buyInSocketGone(socket, 'rebuy', 'gate')) return; // F3 (2026-10-10)
     const session = playerSessions.get(socket.id);
     if (!session) { socket.emit('error', { message: 'Not at a table' }); return; }
     const table = tableManager.getTable(session.tableId);
@@ -11355,7 +11628,7 @@ Give feedback in this JSON format:
     // owned by TournamentManager; a self-serve rebuy would let them
     // un-eliminate with a client-chosen stack and corrupt standings +
     // payouts. Mirror the moveSeat tournament gate.
-    if (tournamentTables.has(session.tableId)) {
+    if (isTournamentTable(session.tableId)) {
       socket.emit('error', { message: 'Rebuys are disabled in tournaments' });
       return;
     }
@@ -11382,6 +11655,7 @@ Give feedback in this JSON format:
     const authForRebuy = authSessions.get(socket.id);
     if (authForRebuy) {
       const dbChips = await ensureChipsForBuyIn(authForRebuy.userId, authForRebuy.username, topUpAmount);
+      if (await buyInSocketGone(socket, 'rebuy', 'balance_read')) return; // F3 — nothing deducted yet
       if (topUpAmount > dbChips) {
         socket.emit('error', { message: 'Insufficient chips for rebuy' });
         return;
@@ -11391,6 +11665,12 @@ Give feedback in this JSON format:
         return;
       }
       auditLog(authForRebuy.username, 'REBUY_DEDUCT', { tableId: session.tableId, topUpAmount, newStack: requested });
+      // F3 — the socket dropped during the deduct: its seat is now the
+      // disconnect handler's reservation (an absent seat that keeps posting
+      // blinds). Refund the top-up instead of adding it to that seat.
+      if (await buyInSocketGone(socket, 'rebuy', 'deduct', {
+        userId: authForRebuy.userId, username: authForRebuy.username, amount: topUpAmount, tableId: session.tableId, action: 'REBUY_REFUND',
+      })) return;
     }
     // 2026-06-11 audit C5: a hand can auto-start during the awaits above
     // (ensureChipsForBuyIn / deductChips are DB round-trips). If it did,
@@ -11454,7 +11734,7 @@ Give feedback in this JSON format:
       // Gate: cash tables only. Tournament table seat assignment is owned
       // by TournamentManager (rebalance logic); allowing self-serve seat
       // change there would race with table-balance decisions.
-      if (tournamentTables.has(session.tableId)) {
+      if (isTournamentTable(session.tableId)) {
         socket.emit('error', { message: 'Seat moves are disabled in tournaments' });
         return;
       }
@@ -12348,6 +12628,7 @@ Give feedback in this JSON format:
     if (blockedByMaintenance(socket)) return;
     const huGate = await assertPlayable(socket, 'quickHeadsUp'); // 2026-10-07 play gate
     if (huGate) { emitPlayRefusal(socket, huGate); return; }
+    if (await buyInSocketGone(socket, 'quickHeadsUp', 'gate')) return; // F3 (2026-10-10)
     const { playerName } = data;
 
     // Leave existing table if any
@@ -12365,9 +12646,14 @@ Give feedback in this JSON format:
     const authHU = authSessions.get(socket.id);
     if (authHU) {
       const dbChips = await ensureChipsForBuyIn(authHU.userId, authHU.username, HEADS_UP_BUYIN);
+      if (await buyInSocketGone(socket, 'quickHeadsUp', 'balance_read')) return; // F3 — nothing deducted yet
       if (HEADS_UP_BUYIN > dbChips) { socket.emit('error', { message: 'Not enough chips for the 1,000 buy-in' }); return; }
       if (!(await deductChips(authHU.userId, HEADS_UP_BUYIN))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authHU.username, 'QUICK_BUYIN_DEDUCT', { mode: 'headsUp', buyIn: HEADS_UP_BUYIN });
+      // F3 — the socket dropped during the deduct: refund it, create/seat nothing.
+      if (await buyInSocketGone(socket, 'quickHeadsUp', 'deduct', {
+        userId: authHU.userId, username: authHU.username, amount: HEADS_UP_BUYIN, action: 'QUICK_BUYIN_REFUND',
+      })) return;
     }
 
     const tableId = tableManager.createHeadsUpTable(`Heads-Up Snap: ${playerName}`);
@@ -12471,6 +12757,7 @@ Give feedback in this JSON format:
     if (blockedByMaintenance(socket)) return;
     const sgGate = await assertPlayable(socket, 'quickSpinGo'); // 2026-10-07 play gate
     if (sgGate) { emitPlayRefusal(socket, sgGate); return; }
+    if (await buyInSocketGone(socket, 'quickSpinGo', 'gate')) return; // F3 (2026-10-10)
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -12487,9 +12774,14 @@ Give feedback in this JSON format:
     const authSG = authSessions.get(socket.id);
     if (authSG) {
       const dbChips = await ensureChipsForBuyIn(authSG.userId, authSG.username, SPINGO_BUYIN);
+      if (await buyInSocketGone(socket, 'quickSpinGo', 'balance_read')) return; // F3 — nothing deducted yet
       if (SPINGO_BUYIN > dbChips) { socket.emit('error', { message: 'Not enough chips for the 500 Spin & Go buy-in' }); return; }
       if (!(await deductChips(authSG.userId, SPINGO_BUYIN))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authSG.username, 'QUICK_BUYIN_DEDUCT', { mode: 'spinGo', buyIn: SPINGO_BUYIN });
+      // F3 — the socket dropped during the deduct: refund it, create/seat nothing.
+      if (await buyInSocketGone(socket, 'quickSpinGo', 'deduct', {
+        userId: authSG.userId, username: authSG.username, amount: SPINGO_BUYIN, action: 'QUICK_BUYIN_REFUND',
+      })) return;
     }
 
     // Random multiplier: 2x (60%), 3x (25%), 5x (10%), 10x (4%), 25x (1%)
@@ -12633,6 +12925,7 @@ Give feedback in this JSON format:
     if (blockedByMaintenance(socket)) return;
     const aofGate = await assertPlayable(socket, 'quickAllInOrFold'); // 2026-10-07 play gate
     if (aofGate) { emitPlayRefusal(socket, aofGate); return; }
+    if (await buyInSocketGone(socket, 'quickAllInOrFold', 'gate')) return; // F3 (2026-10-10)
     const { playerName } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -12646,9 +12939,14 @@ Give feedback in this JSON format:
     const authAOF = authSessions.get(socket.id);
     if (authAOF) {
       const dbChips = await ensureChipsForBuyIn(authAOF.userId, authAOF.username, AOF_BUYIN);
+      if (await buyInSocketGone(socket, 'quickAllInOrFold', 'balance_read')) return; // F3 — nothing deducted yet
       if (AOF_BUYIN > dbChips) { socket.emit('error', { message: 'Not enough chips for the 1,000 buy-in' }); return; }
       if (!(await deductChips(authAOF.userId, AOF_BUYIN))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authAOF.username, 'QUICK_BUYIN_DEDUCT', { mode: 'allInOrFold', buyIn: AOF_BUYIN });
+      // F3 — the socket dropped during the deduct: refund it, create/seat nothing.
+      if (await buyInSocketGone(socket, 'quickAllInOrFold', 'deduct', {
+        userId: authAOF.userId, username: authAOF.username, amount: AOF_BUYIN, action: 'QUICK_BUYIN_REFUND',
+      })) return;
     }
 
     const tableId = tableManager.createQuickTable(
@@ -12717,6 +13015,7 @@ Give feedback in this JSON format:
     if (blockedByMaintenance(socket)) return;
     const crGate = await assertPlayable(socket, 'startCareerGame'); // 2026-10-07 play gate
     if (crGate) { emitPlayRefusal(socket, crGate); return; }
+    if (await buyInSocketGone(socket, 'startCareerGame', 'gate')) return; // F3 (2026-10-10)
     const { venue, stage } = data;
 
     const existingSession = playerSessions.get(socket.id);
@@ -12750,9 +13049,14 @@ Give feedback in this JSON format:
     const authCareer = authSessions.get(socket.id);
     if (authCareer) {
       const dbChips = await ensureChipsForBuyIn(authCareer.userId, authCareer.username, config.buyIn);
+      if (await buyInSocketGone(socket, 'startCareerGame', 'balance_read')) return; // F3 — nothing deducted yet
       if (config.buyIn > dbChips) { socket.emit('error', { message: `Not enough chips for the ${config.name} buy-in (${config.buyIn.toLocaleString()})` }); return; }
       if (!(await deductChips(authCareer.userId, config.buyIn))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authCareer.username, 'QUICK_BUYIN_DEDUCT', { mode: 'career', venue: config.name, buyIn: config.buyIn });
+      // F3 — the socket dropped during the deduct: refund it, create/seat nothing.
+      if (await buyInSocketGone(socket, 'startCareerGame', 'deduct', {
+        userId: authCareer.userId, username: authCareer.username, amount: config.buyIn, action: 'QUICK_BUYIN_REFUND',
+      })) return;
     }
 
     // Stage 3 is the boss stage - harder AI
@@ -13210,6 +13514,7 @@ Give feedback in this JSON format:
     // 2026-10-07 play gate — before the entry-fee deduct.
     const rtGate = await assertPlayable(socket, 'registerTournament');
     if (rtGate) { emitPlayRefusal(socket, rtGate); return; }
+    if (await buyInSocketGone(socket, 'registerTournament', 'gate')) return; // F3 (2026-10-10)
     const session = playerSessions.get(socket.id);
     const playerId = session?.playerId || `player-${uuidv4()}`;
     const playerName = data.playerName || session?.playerName || 'Player';
@@ -13227,9 +13532,17 @@ Give feedback in this JSON format:
     if (entryFee > 0) {
       if (!authT) { socket.emit('error', { message: 'Log in to enter a buy-in tournament' }); return; }
       const dbChips = await ensureChipsForBuyIn(authT.userId, authT.username, entryFee);
+      if (await buyInSocketGone(socket, 'registerTournament', 'balance_read')) return; // F3 — nothing deducted yet
       if (entryFee > dbChips) { socket.emit('error', { message: `Not enough chips for the ${entryFee.toLocaleString()} entry fee` }); return; }
       if (!(await deductChips(authT.userId, entryFee))) { socket.emit('error', { message: 'Could not deduct entry fee — try again' }); return; }
       auditLog(authT.username, 'TOURNAMENT_ENTRY_DEDUCT', { tournamentId: data.tournamentId, entryFee });
+      // F3 — the socket dropped during the deduct: refund the fee and register
+      // nothing (registerPlayer is what adds it to the prize pool, so the pool
+      // stays in lockstep). Registered on a dead socket, he would be seated at
+      // the start with no session — an absent seat blinded out.
+      if (await buyInSocketGone(socket, 'registerTournament', 'deduct', {
+        userId: authT.userId, username: authT.username, amount: entryFee, action: 'TOURNAMENT_ENTRY_REFUND',
+      })) return;
     }
 
     const result = tournamentManager.registerPlayer(data.tournamentId, playerId, playerName, socket.id, authT?.userId);
@@ -13429,6 +13742,7 @@ Give feedback in this JSON format:
     // 2026-10-07 play gate — before the seat search stands up an AI.
     const atGate = await assertPlayable(socket, 'joinAdditionalTable');
     if (atGate) { emitPlayRefusal(socket, atGate); return; }
+    if (await buyInSocketGone(socket, 'joinAdditionalTable', 'gate')) return; // F3 (2026-10-10) — before the AI stand-up
     const { tableId, playerName, buyIn, avatar } = data;
     const table = tableManager.getTable(tableId);
     if (!table) {
@@ -13470,9 +13784,15 @@ Give feedback in this JSON format:
     const authAdd = authSessions.get(socket.id);
     if (authAdd) {
       const dbChips = await ensureChipsForBuyIn(authAdd.userId, authAdd.username, effectiveBuyIn);
+      if (await buyInSocketGone(socket, 'joinAdditionalTable', 'balance_read')) return; // F3 — nothing deducted yet
       if (effectiveBuyIn > dbChips) { socket.emit('error', { message: 'Insufficient chips for the additional-table buy-in' }); return; }
       if (!(await deductChips(authAdd.userId, effectiveBuyIn))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN', { tableId, buyIn: effectiveBuyIn });
+      // F3 — the socket dropped during the deduct (its multi-table sessions
+      // were already torn down by the disconnect): refund, seat nothing.
+      if (await buyInSocketGone(socket, 'joinAdditionalTable', 'deduct', {
+        userId: authAdd.userId, username: authAdd.username, amount: effectiveBuyIn, tableId, action: 'ADDITIONAL_TABLE_BUYIN_REFUND',
+      })) return;
     }
 
     const playerId = `player-${uuidv4()}`;
@@ -13650,6 +13970,7 @@ Give feedback in this JSON format:
     // waits on it; an 'error' frame would leave it spinning for 10s).
     const icGate = await assertPlayable(socket, 'joinByInviteCode');
     if (icGate) { socket.emit('joinError', { message: icGate.message, code: icGate.code }); return; }
+    if (await buyInSocketGone(socket, 'joinByInviteCode', 'gate')) return; // F3 (2026-10-10)
     const { inviteCode, playerName, buyIn, avatar } = data;
     // Find table whose ID starts with the invite code (lowercased)
     const target = tableManager.getTableByInviteCode(inviteCode.toLowerCase());
@@ -13679,6 +14000,7 @@ Give feedback in this JSON format:
     let chipsDeducted = false;
     if (authForJoin) {
       const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, actualBuyIn);
+      if (await buyInSocketGone(socket, 'joinByInviteCode', 'balance_read')) return; // F3 — nothing deducted yet
       if (actualBuyIn > dbChips) {
         socket.emit('joinError', { message: 'Insufficient chips for this table.' });
         return;
@@ -13689,6 +14011,10 @@ Give feedback in this JSON format:
       }
       chipsDeducted = true;
       auditLog(authForJoin.username, 'INVITE_BUY_IN_DEDUCT', { tableId, buyIn: actualBuyIn });
+      // F3 — the socket dropped during the deduct: refund it, seat nothing.
+      if (await buyInSocketGone(socket, 'joinByInviteCode', 'deduct', {
+        userId: authForJoin.userId, username: authForJoin.username, amount: actualBuyIn, tableId, action: 'INVITE_REFUND',
+      })) return;
     }
 
     const playerId = `player-${uuidv4()}`;
@@ -13897,7 +14223,10 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
             cleanupTimer,
             handsRemaining: DISCONNECT_HANDS_LIMIT,
             // T1: snapshot — a later table break drops the id from tournamentTables.
-            tournament: tournamentTables.has(session.tableId),
+            // F2: and a disconnect IN the break window (session still on the
+            // broken table, id already gone from tournamentTables) is still a
+            // tournament seat — isTournamentTable keeps broken tables.
+            tournament: isTournamentTable(session.tableId),
             // U2: snapshot — the hand-start gate screens an absent tournament
             // seat by it (the session is deleted below).
             ...(authSession.masterUserId
@@ -13995,8 +14324,9 @@ function creditSeatStackToWallet(
   // multi-table tournaments that rebalance, lets a player EXTRACT chips still
   // in play by leaving mid-tournament with a doubled-up stack. The prize
   // payout path (handleTournamentFinished) is the only sanctioned tournament
-  // wallet credit.
-  if (tournamentTables.has(tableId)) {
+  // wallet credit. F2 (2026-10-10): a table a rebalance just BROKE is still a
+  // tournament table (its stacks are already on the target tables).
+  if (isTournamentTable(tableId)) {
     auditLog(username, 'TOURNAMENT_STACK_NOT_CASHED', { userId, tableId, reason, chips });
     return;
   }
@@ -14120,7 +14450,8 @@ function handlePlayerLeave(socket: Socket): void {
       // table stack — it's tournament chips, not wallet-funded. Crediting it
       // mints chips / lets a player extract chips still in play. See the same
       // guard in creditSeatStackToWallet. Prizes are paid by finish position.
-      const isTournamentSeat = tournamentTables.has(session.tableId);
+      // F2: incl. a table a rebalance just broke (session not moved — the stack is already on the target table).
+      const isTournamentSeat = isTournamentTable(session.tableId);
       if (isTournamentSeat && auth && chipsToReturn > 0) {
         auditLog(auth.username, 'TOURNAMENT_STACK_NOT_CASHED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, reason: 'handlePlayerLeave' });
       }
@@ -14456,7 +14787,7 @@ const AI_NAMES_POOL = [
  * notification loop is unchanged.
  */
 function startQualifierTournament(
-  players: { id: string; name: string; socketId: string }[],
+  players: { id: string; name: string; socketId: string; masterId?: string | null }[],
   startingStack: number = 50000,
   turbo: boolean = false,
 ): { tournamentId: string; tableIds: string[]; tableCount: number } | null {
@@ -14477,7 +14808,10 @@ function startQualifierTournament(
   if (!tournament) return null;
 
   for (const p of players) {
-    tournamentManager.registerPlayer(tournamentId, p.id, p.name, p.socketId);
+    // F4 (2026-10-10) — no local userId (a qualifier pays no wallet prize), but
+    // the registration's MASTER id goes on the entrant: the hand-start play
+    // gate screens an ABSENT suspended entrant by it (disqualified, no result).
+    tournamentManager.registerPlayer(tournamentId, p.id, p.name, p.socketId, undefined, p.masterId || undefined);
   }
 
   const startResult = tournamentManager.startTournament(tournamentId);
@@ -14955,6 +15289,11 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
 }
 
 function handleTableRebalance(tournamentId: string): void {
+  // F1 (2026-10-10) — asked for by an elimination the hand-start gate made
+  // INSIDE a startNewHand: held until that gate has stood its suspended seats
+  // up, then run (still before that table's deal) — see
+  // releaseTournamentRebalance.
+  if (tournamentRebalanceIsHeld(tournamentId)) return;
   const rebalance = tournamentManager.checkRebalance(tournamentId);
   if (!rebalance) return;
 
@@ -14990,8 +15329,13 @@ function handleTableRebalance(tournamentId: string): void {
       for (let seatIdx = 0; seatIdx < 9; seatIdx++) {
         if (targetTable.seats[seatIdx].state !== 'empty') continue;
 
-        // Sit down at new table — sitDown returns false if seat is taken
-        const seated = targetTable.sitDown(seatIdx, player.playerName, chips, player.playerId, isAI);
+        // Sit down at new table — sitDown returns false if seat is taken.
+        // F1 (2026-10-10): allowBelowMin — this RELOCATES a tournament stack
+        // (PokerTable.sitDown's documented rule for moves). Tournament tables
+        // are created with minBuyIn = the STARTING stack, so without it every
+        // player below the starting stack was refused by every seat and left
+        // seatless ("Could not place") while still alive in the tournament.
+        const seated = targetTable.sitDown(seatIdx, player.playerName, chips, player.playerId, isAI, true);
         if (!seated) continue;
 
         tournamentManager.setPlayerTable(tournamentId, player.playerId, targetTid);
@@ -15051,6 +15395,10 @@ function handleTableRebalance(tournamentId: string): void {
 
   // Remove the broken table
   tournamentManager.removeTable(tournamentId, breakTableId);
+  // F2 (2026-10-10) — remembered BEFORE it leaves tournamentTables: for the
+  // ≤5s the table still exists (and for sessions still pointing at it) it
+  // must stay a tournament table to every cash-out decision (isTournamentTable).
+  noteBrokenTournamentTable(breakTableId, tournamentId);
   tournamentTables.delete(breakTableId);
   aiProfiles.delete(breakTableId);
   // Don't remove the table from tableManager yet — let current hand finish
@@ -15089,7 +15437,10 @@ function handleTableRebalance(tournamentId: string): void {
     if (t) {
       for (const tid of t.tableIds) {
         const table = tableManager.getTable(tid);
-        if (table && !table.isHandInProgress()) {
+        // F1 (2026-10-10): a table that is INSIDE startNewHand right now (this
+        // rebalance was held by its hand-start gate) is dealt by that start —
+        // never start it again from here.
+        if (table && !table.isHandInProgress() && !table.isStartingHand()) {
           const alivePlayers = tournamentManager.getAlivePlayersOnTable(tournamentId, tid);
           const isFinalTable = t.tableIds.length === 1;
           if (alivePlayers.length >= 2 && (isFinalTable || alivePlayers.length >= 5)) {
@@ -15394,7 +15745,8 @@ async function gracefulShutdown(signal: string) {
         // Tournament stacks are NOT wallet-funded — never cash them out (would
         // mint). They persist with the tournament (or are lost if the
         // tournament can't rehydrate), but they must not hit the wallet.
-        if (seat && seat.state === 'occupied' && !creditedSeats.has(seatKey) && !tournamentTables.has(session.tableId)) {
+        // F2: a table a rebalance just broke counts (isTournamentTable).
+        if (seat && seat.state === 'occupied' && !creditedSeats.has(seatKey) && !isTournamentTable(session.tableId)) {
           // 2026-07-01 audit #1: refund the FULL table stake. Mid-hand the pot
           // has NOT been awarded yet (determineWinners sets phase=HandComplete),
           // so chips already committed this hand (totalInvestedThisHand) would be

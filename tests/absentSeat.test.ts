@@ -56,6 +56,16 @@ const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
   absentSeatMasterId: fnSrc('function absentSeatMasterId('),
   isTournamentReservation: fnSrc('function isTournamentReservation('),
+  // F2 (2026-10-10): broken-tournament-table registry + isTournamentTable.
+  brokenTables: slice('const brokenTournamentTables = new Map', 'brokenTournamentTables.has(tableId);\n}\n'),
+  // F1 (2026-10-10): the hand-start gate holds the rebalance its disqualifications cause.
+  rebalanceHold: slice('const tournamentRebalanceHolds = new Map', '\n}\n'),
+  rebalanceIsHeld: fnSrc('function tournamentRebalanceIsHeld('),
+  releaseRebalance: fnSrc('function releaseTournamentRebalance('),
+  // F4 (2026-10-10): a qualifier entrant's identity (registered master id).
+  absentEntrantIdentity: fnSrc('function absentEntrantIdentity('),
+  qualifierEntrantMasterId: fnSrc('function qualifierEntrantMasterId('),
+  reservationHolderAt: fnSrc('function reservationHolderAt('),
   noteNotCashed: fnSrc('function noteTournamentReservationNotCashed('),
   creditSeat: fnSrc('function creditSeatStackToWallet('),
   handlePlayerLeave: fnSrc('function handlePlayerLeave(socket: Socket): void {'),
@@ -94,7 +104,14 @@ ${p.trackLogin}
 ${p.loginSocketGone}
 ${p.absentIds}
 ${p.absentSeatMasterId}
+${p.brokenTables}
 ${p.isTournamentReservation}
+${p.rebalanceHold}
+${p.rebalanceIsHeld}
+${p.releaseRebalance}
+${p.absentEntrantIdentity}
+${p.qualifierEntrantMasterId}
+${p.reservationHolderAt}
 ${p.noteNotCashed}
 ${p.creditSeat}
 ${p.handlePlayerLeave}
@@ -208,6 +225,7 @@ function world(opts: WorldOpts = {}) {
     },
     authSessions, playerSessions, reservedSeats, multiTableSessions, tournamentTables, io,
     tournamentManager: tm,
+    qualifierTournaments: new Map(),
     pendingSeatRemovalAfterHand: new Map(), sitOutTracker: new Map(), spectators: new Map(), aiProfiles: new Map(),
     aiTimeouts: new Map(), pendingAutoStartTimers: new Map(), quickTables: new Set(), lastSentState: new Map(),
     lastSentJson: new Map(), MAX_SEATS: 9, SEAT_RESERVE_MS, DISCONNECT_HANDS_LIMIT: HANDS_LIMIT,

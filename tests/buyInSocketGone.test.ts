@@ -1,0 +1,480 @@
+/**
+ * 2026-10-10 (F3) — a BUY-IN that outlives its socket.
+ *
+ * Every seat-buying handler awaits (the play gate, the ban check, the balance
+ * read, the deduct). If the socket drops meanwhile, the `disconnect` handler
+ * has ALREADY run — there was no seat yet to reserve — and never runs again.
+ * Before F3 the handler went on: it seated the player on the dead socket (no
+ * reservation, no cash-out timer) and the wallet chips the deduct had just
+ * taken were never cashed out. Now every buy-in path checks the socket after
+ * each await (buyInSocketGone) and, once the deduct has succeeded, refunds the
+ * buy-in through the additive path exactly once and seats nothing.
+ *
+ * Every handler below is the REAL source text of src/index.ts (sliced and
+ * transpiled; index.ts boots a server on import) against the REAL PokerTable
+ * and TournamentManager, with an in-memory wallet.
+ */
+import { PokerTable } from '../src/game/PokerTable';
+import { TournamentManager } from '../src/game/TournamentManager';
+import { SRC, slice, handlerSrc, load, flush, deferred } from './helpers/indexSource';
+
+const ALICE = 101;
+const START_WALLET = 100_000;
+
+const H = {
+  joinTable: handlerSrc('joinTable', '\n    })(); }\n  );'),
+  quickPlay: handlerSrc('quickPlay', '\n    })(); }\n  );'),
+  waitlist: handlerSrc('joinWithWaitlistContext', '\n    }\n  );'),
+  rebuy: handlerSrc('rebuy', '\n  })(); });'),
+  quickHeadsUp: handlerSrc('quickHeadsUp', '\n  });\n'),
+  quickSpinGo: handlerSrc('quickSpinGo', '\n  });\n'),
+  quickAllInOrFold: handlerSrc('quickAllInOrFold', '\n  });\n'),
+  startCareerGame: handlerSrc('startCareerGame', '\n  });\n'),
+  registerTournament: handlerSrc('registerTournament', '\n  });\n'),
+  joinAdditionalTable: handlerSrc('joinAdditionalTable', '\n  });\n'),
+  joinByInviteCode: handlerSrc('joinByInviteCode', '\n  });\n'),
+  joinClubTable: handlerSrc('joinClubTable', '\n  });\n'),
+  registerQualifierTournament: handlerSrc('registerQualifierTournament', '\n  });\n'),
+};
+const BUY_IN_GONE = slice('const buyInsOnDeadSocket = {', '\n}\n');
+const LOGIN_GONE = slice('const loginsOnDeadSocket = { abandoned: 0 };', '\n}\n');
+const BROKEN_TABLES = slice('const brokenTournamentTables = new Map', 'brokenTournamentTables.has(tableId);\n}\n');
+
+/** Neutralise every F3 check (the pre-F3 behaviour) — for the CONTROL tests. */
+const withoutF3 = (s: string) => s.split('await buyInSocketGone(').join('await (async (..._a: any[]) => false)(');
+
+type Gate = 'balance' | 'deduct' | 'consume' | 'me' | null;
+
+function world(opts: { handlers?: Partial<typeof H>; tournament?: 'buyin' | 'qualifier' } = {}) {
+  const wallet = new Map<number, number>([[ALICE, START_WALLET]]);
+  const deductions: Array<{ uid: number; amount: number }> = [];
+  const credits: Array<{ uid: number; amount: number }> = [];
+  const audits: Array<{ actor: string; action: string; d: any }> = [];
+  const creditRefunds: string[] = [];
+  const calls = { consume: 0 };
+  const gates: Record<string, Promise<void> | null> = { balance: null, deduct: null, consume: null, me: null };
+  const tables = new Map<string, PokerTable>();
+  const mkTable = (id: string, minBuyIn = 1000, maxPlayers = 9) => {
+    const t = new PokerTable({ tableId: id, tableName: id, smallBlind: 10, bigBlind: 20, minBuyIn, maxBuyIn: minBuyIn * 10, maxPlayers } as any);
+    (t as any).variantId = 'texas-holdem';
+    tables.set(id, t);
+    return t;
+  };
+  let created = 0;
+  const cash = mkTable('cash1');
+  cash.sitDown(0, 'Bob', 5000, 'p-bob', false);
+  const authSessions = new Map<string, any>();
+  const playerSessions = new Map<string, any>();
+  const multiTableSessions = new Map<string, any[]>();
+  const reservedSeats = new Map<number, any>();
+  const sockets = new Map<string, any>();
+  const tournamentTables = new Map<string, string>();
+  const tm = new TournamentManager();
+  const qualifierTournaments = new Map<string, any>();
+  let tournamentId = '';
+  if (opts.tournament === 'buyin') {
+    tournamentId = tm.createTournament({ name: 'F3 Cup', buyIn: 500, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: [{ sb: 10, bb: 20, ante: 0, duration: 600 }] } as any);
+  }
+  if (opts.tournament === 'qualifier') {
+    tournamentId = tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: [{ sb: 10, bb: 20, ante: 0, duration: 600 }] } as any);
+    for (const [pid, name] of [['alice.player', 'Alice'], ['bob.player', 'Bob'], ['carl.player', 'Carl']]) tm.registerPlayer(tournamentId, pid, name, `reg-${pid}`);
+    tm.startTournament(tournamentId);
+    const qt1 = mkTable('q1', 50000);
+    qt1.sitDown(1, 'Bob', 50000, 'bob.player', false, true);
+    qt1.sitDown(2, 'Carl', 50000, 'carl.player', false, true);
+    tournamentTables.set('q1', tournamentId);
+    tm.setTableIds(tournamentId, ['q1']);
+    tm.eliminatePlayer(tournamentId, 'alice.player');               // Alice busted: re-entry
+    qualifierTournaments.set('weekly-qualifier', {
+      qualifierId: 'weekly-qualifier', qualifierType: 'weekly', qualifierName: 'Weekly', startingStack: 50000, maxPlayers: 999,
+      scheduledAt: new Date(Date.now() - 10 * 60_000).toISOString(), status: 'running', tournamentId,
+      buyIn: 1000, requiresQualifierCredit: true, blindStructure: [],
+      players: [{ playerId: 'alice.player', masterPlayerId: 'm-alice', playerName: 'Alice', phone: '', socketId: 'old', reEntries: 0 }],
+    });
+  }
+
+  const scope: Record<string, unknown> = {
+    tableManager: {
+      getTable: (id: string) => tables.get(id),
+      getTableList: () => [...tables.entries()].map(([tableId, t]) => ({
+        tableId, variant: 'texas-holdem', playerCount: t.getOccupiedSeatCount(), smallBlind: t.config.smallBlind,
+      })),
+      createHeadsUpTable: (name: string) => { const id = `hu${++created}`; mkTable(id, 1000, 2).config.tableName = name; return id; },
+      createQuickTable: (name: string, maxPlayers: number, _sb: number, _bb: number, minBuyIn: number) => {
+        const id = `qt${++created}`; mkTable(id, minBuyIn, maxPlayers).config.tableName = name; return id;
+      },
+      getTableByInviteCode: (code: string) => (code === 'cash1' ? { tableId: 'cash1', table: tables.get('cash1') } : null),
+    },
+    authSessions, playerSessions, multiTableSessions, reservedSeats, tournamentTables, qualifierTournaments,
+    tournamentManager: tm,
+    spectators: new Map(), aiProfiles: new Map(), ipSeatedSlots: new Map(), quickTables: new Set(), quickGameTimers: new Map(),
+    spinGoMultipliers: new Map(), allInOrFoldTables: new Set(), careerTables: new Map(), challengeTables: new Map(),
+    MAX_SEATS: 9, clientIp: '10.0.0.1', SEAT_RESERVE_MS: 6 * 3600_000,
+    io: { emit() {}, to: () => ({ emit() {} }), sockets: { sockets } },
+    uuidv4: () => `u${Math.random().toString(36).slice(2, 10)}`,
+    generateRandomProfile: () => ({ botName: `Bot${Math.random().toString(36).slice(2, 7)}` }),
+    blockedByMaintenance: () => false, quickPlayRateLimited: () => false,
+    assertPlayable: async () => null, emitPlayRefusal: (s: any, r: any) => s.emit('error', { message: r.message, code: r.code }),
+    isUserBanned: async () => false,
+    ensureChipsForBuyIn: async (uid: number) => { if (gates.balance) await gates.balance; return wallet.get(uid) ?? 0; },
+    deductChips: async (uid: number, amount: number) => {
+      if (gates.deduct) await gates.deduct;
+      const have = wallet.get(uid) ?? 0;
+      if (have < amount) return false;
+      wallet.set(uid, have - amount);
+      deductions.push({ uid, amount });
+      return true;
+    },
+    addChipsToUser: async (uid: number, amount: number) => {
+      wallet.set(uid, (wallet.get(uid) ?? 0) + amount);
+      credits.push({ uid, amount });
+      return true;
+    },
+    auditLog: (actor: string, action: string, d: any) => { audits.push({ actor, action, d }); },
+    Sentry: null,
+    console: { log() {}, warn() {}, error() {} },
+    log: { debug() {}, warn() {}, info() {} },
+    // waitlist
+    normalizeRequestId: (x: unknown) => (typeof x === 'string' ? x : undefined),
+    failLogin: (s: any, f: any) => s.emit('loginResult', { success: false, code: f.code }),
+    markTicketUsed: () => true,
+    reportAuthEvent() {},
+    loginTracker: { begin: () => () => {}, forget() {} },
+    fetch: async (url: string) => {
+      if (url.endsWith('/online-link-token/verify')) {
+        return { ok: true, json: async () => ({ valid: true, payload: { userId: 'm-alice', gameId: 'g1' } }) };
+      }
+      if (gates.me) await gates.me;
+      return { ok: true, json: async () => ({ phoneNumber: '5550101' }) };
+    },
+    getPool: () => ({ query: async () => ({ rows: [{ id: ALICE, username: '5550101' }] }) }),
+    resumeFieldsFor: () => ({}),
+    // clubs
+    getClubTableById: async () => ({ clubId: 7, tableId: 'cash1' }),
+    isClubMember: async () => true,
+    // tournaments / qualifiers
+    screenAndStartTournament: async () => {},
+    isPlayerQualified: async () => true,
+    consumeQualifierCreditOnMaster: async () => { calls.consume++; if (gates.consume) await gates.consume; return { consumed: true, creditId: 'credit-1' }; },
+    refundQualifierCreditOnMaster: async (id: string) => { creditRefunds.push(id); return true; },
+    PLAYER_SUSPENDED_MESSAGE: 'SUSPENDED',
+  };
+
+  const h = { ...H, ...(opts.handlers || {}) };
+  const code = `
+${BUY_IN_GONE}
+${LOGIN_GONE}
+${BROKEN_TABLES}
+function wire(socket) {
+  ${Object.values(h).join('\n  ')}
+}`;
+  const { exports: m, stubbed } = load(code, scope, '{ wire, buyInsOnDeadSocket, loginsOnDeadSocket }');
+
+  const emitted: Array<[string, any]> = [];
+  const mkSocket = (id: string, signedIn = true) => {
+    const handlers: Record<string, (...a: any[]) => any> = {};
+    const s: any = {
+      id, connected: true, handlers, handshake: { address: '10.0.0.1' },
+      on: (ev: string, fn: any) => { handlers[ev] = fn; },
+      listeners: (ev: string) => (handlers[ev] ? [handlers[ev]] : []),
+      emit: (ev: string, p: any) => { emitted.push([ev, p]); },
+      join() {}, leave() {},
+    };
+    sockets.set(id, s);
+    if (signedIn) authSessions.set(id, { userId: ALICE, username: 'alice.player', masterUserId: 'm-alice' });
+    m.wire(s);
+    return s;
+  };
+  /**
+   * socket.io order: `connected=false` first, then 'disconnect' — whose
+   * handler (no seat yet) tears the socket's auth session down. A socket that
+   * already had a seat (rebuy) is reserved by it instead.
+   */
+  const drop = (s: any) => {
+    s.connected = false;
+    sockets.delete(s.id);
+    const ps = playerSessions.get(s.id);
+    if (ps) {
+      reservedSeats.set(ALICE, { tableId: ps.tableId, seatIndex: ps.seatIndex, chips: tables.get(ps.tableId)!.seats[ps.seatIndex].chipCount });
+      playerSessions.delete(s.id);
+    }
+    multiTableSessions.delete(s.id);
+    authSessions.delete(s.id);
+  };
+  /** Every seat anywhere that holds Alice's buy-in (by name; the quick modes name the seat after the request). */
+  const aliceSeats = () => {
+    const out: Array<{ tableId: string; seatIndex: number; chips: number }> = [];
+    for (const [tableId, t] of tables) {
+      t.seats.forEach((s, i) => {
+        if (s.state === 'occupied' && !s.isAI && /alice|Player-m-alic/i.test(s.playerName || '') && tableId !== 'q1') {
+          out.push({ tableId, seatIndex: i, chips: s.chipCount });
+        }
+      });
+    }
+    return out;
+  };
+  return {
+    m, stubbed, wallet, deductions, credits, audits, creditRefunds, calls, gates, tables, cash, tm, tournamentId,
+    qualifierTournaments, playerSessions, multiTableSessions, authSessions, reservedSeats, emitted, mkSocket, drop, aliceSeats,
+  };
+}
+
+interface PathSpec {
+  event: keyof typeof H;
+  payload: any;
+  amount: number;
+  refundAction: string;
+  /** Extra set-up on the world before the request (e.g. a seated session for rebuy). */
+  setup?: (w: ReturnType<typeof world>, s: any) => void;
+  tournament?: 'buyin' | 'qualifier';
+  /** What "not seated / not registered" means for this path. */
+  notSeated: (w: ReturnType<typeof world>, sid: string) => void;
+}
+
+const notSeatedAnywhere = (w: ReturnType<typeof world>, sid: string) => {
+  expect(w.playerSessions.has(sid)).toBe(false);
+  expect(w.multiTableSessions.has(sid)).toBe(false);
+  expect(w.aliceSeats()).toEqual([]);
+};
+
+const PATHS: PathSpec[] = [
+  { event: 'joinTable', payload: { tableId: 'cash1', playerName: 'Alice', seatIndex: 3, buyIn: 2000 }, amount: 2000, refundAction: 'BUY_IN_REFUND', notSeated: notSeatedAnywhere },
+  { event: 'joinClubTable', payload: { clubTableId: 1, playerName: 'Alice', seatIndex: 3, buyIn: 2000 }, amount: 2000, refundAction: 'BUY_IN_REFUND', notSeated: notSeatedAnywhere },
+  { event: 'quickPlay', payload: { playerName: 'Alice' }, amount: 1000, refundAction: 'QUICKPLAY_REFUND', notSeated: notSeatedAnywhere },
+  { event: 'joinByInviteCode', payload: { inviteCode: 'cash1', playerName: 'Alice', buyIn: 3000 }, amount: 3000, refundAction: 'INVITE_REFUND', notSeated: notSeatedAnywhere },
+  { event: 'joinAdditionalTable', payload: { tableId: 'cash1', playerName: 'Alice', buyIn: 1500 }, amount: 1500, refundAction: 'ADDITIONAL_TABLE_BUYIN_REFUND', notSeated: notSeatedAnywhere },
+  { event: 'quickHeadsUp', payload: { playerName: 'Alice' }, amount: 1000, refundAction: 'QUICK_BUYIN_REFUND', notSeated: notSeatedAnywhere },
+  { event: 'quickSpinGo', payload: { playerName: 'Alice' }, amount: 500, refundAction: 'QUICK_BUYIN_REFUND', notSeated: notSeatedAnywhere },
+  { event: 'quickAllInOrFold', payload: { playerName: 'Alice' }, amount: 1000, refundAction: 'QUICK_BUYIN_REFUND', notSeated: notSeatedAnywhere },
+  {
+    event: 'startCareerGame', payload: { venue: 1, stage: 0 }, amount: 5000, refundAction: 'QUICK_BUYIN_REFUND',
+    // Career names the seat after the existing session (none here: 'Player').
+    notSeated: (w, sid) => {
+      expect(w.playerSessions.has(sid)).toBe(false);
+      for (const [id, t] of w.tables) if (id.startsWith('qt')) expect(t.seats.some((s) => s.state === 'occupied' && !s.isAI)).toBe(false);
+    },
+  },
+  {
+    event: 'waitlist' as any, payload: { token: 'tkt', context: {} }, amount: 1000, refundAction: 'BUY_IN_REFUND',
+    notSeated: (w, sid) => {
+      expect(w.playerSessions.has(sid)).toBe(false);
+      expect(w.cash.seats.filter((s) => s.state === 'occupied' && !s.isAI).map((s) => s.playerName)).toEqual(['Bob']);
+    },
+  },
+  {
+    event: 'rebuy', payload: { amount: 8000 }, amount: 6000, refundAction: 'REBUY_REFUND',
+    setup: (w, s) => {
+      expect(w.cash.sitDown(4, 'Alice', 2000, 'p-alice', false)).toBe(true);
+      w.playerSessions.set(s.id, { socketId: s.id, tableId: 'cash1', seatIndex: 4, playerName: 'Alice', playerId: 'p-alice', sittingOut: false });
+    },
+    // The seat is the disconnect's reservation now: its stack is NOT topped up.
+    notSeated: (w) => { expect(w.cash.seats[4]).toMatchObject({ state: 'occupied', chipCount: 2000 }); },
+  },
+  {
+    event: 'registerTournament', tournament: 'buyin', payload: { tournamentId: '', playerName: 'Alice' }, amount: 500, refundAction: 'TOURNAMENT_ENTRY_REFUND',
+    notSeated: (w) => {
+      const t = w.tm.getTournament(w.tournamentId)!;
+      expect(t.players).toEqual([]);                    // not registered
+      expect(t.collectedEntryFees).toBe(0);             // the pool stays in lockstep with real chips
+    },
+  },
+];
+
+/** The socket's handler name (the waitlist deep link is registered as joinWithWaitlistContext). */
+const evName = (p: PathSpec) => ((p.event as string) === 'waitlist' ? 'joinWithWaitlistContext' : p.event);
+
+async function run(w: ReturnType<typeof world>, p: PathSpec, s: any) {
+  const payload = p.event === 'registerTournament' ? { ...p.payload, tournamentId: w.tournamentId } : p.payload;
+  // Not awaited: the handler may be parked on a gate the test resolves after this returns.
+  void s.handlers[evName(p)](payload);
+  await flush();
+}
+
+beforeEach(() => { jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] }); });
+afterEach(() => { jest.clearAllTimers(); jest.useRealTimers(); });
+
+describe('F3 — a buy-in whose socket drops during the deduct is refunded EXACTLY ONCE and seats nothing', () => {
+  it.each(PATHS.map((p) => [evName(p), p] as const))('%s', async (_name, p) => {
+    const w = world({ tournament: p.tournament });
+    const s = w.mkSocket('S1');
+    p.setup?.(w, s);
+    const gate = deferred();
+    w.gates.deduct = gate.p;
+    await run(w, p, s);
+    w.drop(s);                                         // dropped while the deduct awaits
+    gate.resolve();
+    await flush();
+    jest.advanceTimersByTime(10_000);                  // e.g. Spin & Go's delayed deal: nothing to deal
+    await flush();
+
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: p.amount }]);
+    expect(w.credits).toEqual([{ uid: ALICE, amount: p.amount }]);   // refunded exactly once
+    expect(w.wallet.get(ALICE)).toBe(START_WALLET);
+    p.notSeated(w, 'S1');
+    expect(w.m.buyInsOnDeadSocket).toEqual({ abandoned: 1, refunded: 1, refundFailed: 0 });
+    const refund = w.audits.filter((a) => a.action === p.refundAction);
+    expect(refund).toEqual([expect.objectContaining({ d: expect.objectContaining({ reason: 'socket_gone', amount: p.amount, via: expect.any(String) }) })]);
+    // The safety net must not have been the inert stub.
+    expect([...w.stubbed].filter((n) => /buyInSocketGone|addChipsToUser|deductChips|ensureChipsForBuyIn/.test(n))).toEqual([]);
+  });
+});
+
+describe('F3 — a socket that drops during the BALANCE READ is stopped before anything is deducted', () => {
+  it.each(PATHS.map((p) => [evName(p), p] as const))('%s', async (_name, p) => {
+    const w = world({ tournament: p.tournament });
+    const s = w.mkSocket('S1');
+    p.setup?.(w, s);
+    const gate = deferred();
+    w.gates.balance = gate.p;
+    await run(w, p, s);
+    w.drop(s);
+    gate.resolve();
+    await flush();
+    expect(w.deductions).toEqual([]);
+    expect(w.credits).toEqual([]);
+    expect(w.wallet.get(ALICE)).toBe(START_WALLET);
+    p.notSeated(w, 'S1');
+    expect(w.m.buyInsOnDeadSocket).toEqual({ abandoned: 1, refunded: 0, refundFailed: 0 });
+  });
+});
+
+describe('F3 — a LIVE socket is unaffected: one deduct, no refund, seated/registered as before', () => {
+  it.each(PATHS.filter((p) => p.event !== 'rebuy').map((p) => [evName(p), p] as const))('%s', async (_name, p) => {
+    const w = world({ tournament: p.tournament });
+    const s = w.mkSocket('S1');
+    p.setup?.(w, s);
+    await run(w, p, s);
+    jest.advanceTimersByTime(4000);
+    await flush();
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: p.amount }]);
+    expect(w.credits).toEqual([]);
+    expect(w.m.buyInsOnDeadSocket).toEqual({ abandoned: 0, refunded: 0, refundFailed: 0 });
+    if (p.event === 'registerTournament') {
+      expect(w.tm.getTournament(w.tournamentId)!.players.map((x) => x.userId)).toEqual([ALICE]);
+    } else if (p.event === 'joinAdditionalTable') {
+      expect(w.multiTableSessions.get('S1')).toEqual([expect.objectContaining({ tableId: 'cash1' })]);
+    } else {
+      expect(w.playerSessions.get('S1')).toBeTruthy();
+    }
+  });
+
+  it('rebuy: the top-up lands on the live seat once', async () => {
+    const p = PATHS.find((x) => x.event === 'rebuy')!;
+    const w = world();
+    const s = w.mkSocket('S1');
+    p.setup!(w, s);
+    await run(w, p, s);
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 6000 }]);
+    expect(w.credits).toEqual([]);
+    expect(w.cash.seats[4].chipCount).toBe(8000);
+  });
+});
+
+describe('F3 — qualifier RE-ENTRY (chip buy-in + a qualifier credit)', () => {
+  const p = (): any => ({ qualifierId: 'weekly-qualifier', playerName: 'Alice', phone: '' });
+
+  it('dropped during the credit consume: chips refunded ONCE, the credit refunded, NOT re-seated, still eliminated', async () => {
+    const w = world({ tournament: 'qualifier' });
+    const s = w.mkSocket('S1');
+    const gate = deferred();
+    w.gates.consume = gate.p;
+    s.handlers.registerQualifierTournament(p());
+    await flush();
+    w.drop(s);
+    gate.resolve();
+    await flush();
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);
+    expect(w.credits).toEqual([{ uid: ALICE, amount: 1000 }]);
+    expect(w.creditRefunds).toEqual(['credit-1']);
+    expect(w.audits.map((a) => a.action)).toEqual(expect.arrayContaining(['QUALIFIER_REENTRY_BUYIN_REFUND', 'QUALIFIER_REENTRY_CREDIT_REFUND']));
+    expect(w.tables.get('q1')!.seats.filter((x) => x.state === 'occupied').map((x) => x.playerId)).toEqual(['bob.player', 'carl.player']);
+    expect(w.tm.getTournament(w.tournamentId)!.players.find((x) => x.playerId === 'alice.player')!.eliminated).toBe(true);
+    expect(w.emitted.filter(([ev, r]) => ev === 'qualifierRegistrationResult' && r.success)).toEqual([]);
+  });
+
+  it('dropped during the deduct: chips refunded once, NO credit consumed, not re-seated', async () => {
+    const w = world({ tournament: 'qualifier' });
+    const s = w.mkSocket('S1');
+    const gate = deferred();
+    w.gates.deduct = gate.p;
+    s.handlers.registerQualifierTournament(p());
+    await flush();
+    w.drop(s);
+    gate.resolve();
+    await flush();
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);
+    expect(w.credits).toEqual([{ uid: ALICE, amount: 1000 }]);
+    expect(w.audits.filter((a) => a.action === 'QUALIFIER_REENTRY_CREDIT_CONSUME')).toEqual([]);
+    expect(w.calls.consume).toBe(0);
+    expect(w.tables.get('q1')!.seats.filter((x) => x.state === 'occupied')).toHaveLength(2);
+  });
+
+  it('live socket: re-seated with one deduct + one credit, nothing refunded', async () => {
+    const w = world({ tournament: 'qualifier' });
+    const s = w.mkSocket('S1');
+    s.handlers.registerQualifierTournament(p());
+    await flush();
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);
+    expect(w.credits).toEqual([]);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.tables.get('q1')!.seats.filter((x) => x.state === 'occupied').map((x) => x.playerId).sort())
+      .toEqual(['alice.player', 'bob.player', 'carl.player']);
+  });
+});
+
+describe('F3 — waitlist deep link: a socket that drops during the auth bootstrap leaves no session on the dead socket and deducts nothing', () => {
+  it('bootstrap /me in flight → dropped → no session, no deduct, no seat', async () => {
+    const w = world();
+    const s = w.mkSocket('S1', false);                 // the deep link arrives on a not-signed-in socket
+    const gate = deferred();
+    w.gates.me = gate.p;
+    s.handlers.joinWithWaitlistContext({ token: 'tkt', context: {} });
+    await flush();
+    w.drop(s);
+    gate.resolve();
+    await flush();
+    expect(w.authSessions.has('S1')).toBe(false);      // the bootstrap's session was not left behind
+    expect(w.m.loginsOnDeadSocket.abandoned).toBe(1);
+    expect(w.deductions).toEqual([]);
+    expect(w.playerSessions.has('S1')).toBe(false);
+  });
+});
+
+describe('F3 — CONTROL: without the checks the dead socket is SEATED and the buy-in is never refunded (the pre-F3 bug)', () => {
+  it.each(['joinTable', 'quickPlay', 'joinAdditionalTable'] as const)('%s', async (event) => {
+    const p = PATHS.find((x) => x.event === event)!;
+    const w = world({ handlers: { [event]: withoutF3(H[event]) } as any });
+    const s = w.mkSocket('S1');
+    const gate = deferred();
+    w.gates.deduct = gate.p;
+    await run(w, p, s);
+    w.drop(s);
+    gate.resolve();
+    await flush();
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: p.amount }]);
+    expect(w.credits).toEqual([]);                     // never refunded…
+    expect(w.aliceSeats()).toHaveLength(1);            // …and seated on a socket that no longer exists
+  });
+});
+
+describe('F3 — wiring', () => {
+  it('every buy-in path checks the socket after its deduct, before it seats / registers / tops up', () => {
+    const after = (body: string, needle: string, check: string) => {
+      const at = body.indexOf(needle);
+      expect({ needle, found: at > -1 }).toEqual({ needle, found: true });
+      const next = body.indexOf('await ', at + needle.length);
+      const checkAt = body.indexOf(check, at);
+      expect({ needle, checkedBeforeNextAwait: checkAt > at && (next < 0 || checkAt <= next) }).toEqual({ needle, checkedBeforeNextAwait: true });
+    };
+    for (const [event, body] of Object.entries(H)) {
+      if (event === 'joinClubTable') continue;           // re-dispatches into joinTable
+      if (!body.includes('deductChips(')) continue;
+      after(body, 'deductChips(', 'await buyInSocketGone(socket,');
+      after(body, 'ensureChipsForBuyIn(', 'await buyInSocketGone(socket,');
+    }
+    expect(H.registerQualifierTournament).toContain("await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'credit_consume'");
+    expect(H.waitlist).toContain("loginSocketGone(socket, 'joinWithWaitlistContext', 'auth_bootstrap'");
+    // The health counter is exposed.
+    expect(SRC).toContain('buyInsAbandonedSocketGone: { ...buyInsOnDeadSocket },');
+  });
+});
