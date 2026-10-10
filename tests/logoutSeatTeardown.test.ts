@@ -66,10 +66,16 @@ const TICK_RESERVED = slice('function tickReservedSeatHands(tableId: string): vo
 const HANDLE_PLAYER_LEAVE = slice('function handlePlayerLeave(socket: Socket): void {', '\n}\n');
 const CREDIT_SEAT = slice('function creditSeatStackToWallet(', '\n}\n');
 // The main (last-registered) disconnect handler — the one with the seat reserve.
-const DISCONNECT_HANDLER = slice("socket.on('disconnect', async () => {", '\n  });', SRC.lastIndexOf("socket.on('disconnect', async () => {"));
+// P4 (2026-10-10): its seat reservation + extra-table cash-out are two functions
+// (shared with the account switch, releaseSocketForAccountSwitch); the handler
+// text is prefixed with them so it runs — and is mutated — as before.
+const DISCONNECT_HANDLER = slice('function reserveSeatForDeparture(', '\n}\n')
+    + slice('function cashOutAdditionalSeatsOnDeparture(', '\n}\n')
+  + slice("socket.on('disconnect', async () => {", '\n  });', SRC.lastIndexOf("socket.on('disconnect', async () => {"));
 // handleHandComplete's tournament bust check (runs after tickReservedSeatHands).
 const BUST_CHECK = slice(
-  '  const tournamentId = tournamentTables.get(tableId);\n  if (tournamentId) {',
+  // Q1 (2026-10-10): the id resolves through the broken-table registry too (a bust on a just-broken table).
+  '  const tournamentId = tournamentTables.get(tableId) ?? brokenTournamentTables.get(tableId)?.tournamentId;',
   "console.error('[Tournament] eliminatePlayer failed:', e);\n        }\n      }\n    }\n  }",
 );
 /** The live HEAD (5ea0f80) `logout` handler, verbatim (`git show HEAD:src/index.ts`, lines 6391-6393). */
@@ -618,7 +624,7 @@ describe('T1 — a reserved TOURNAMENT seat is never cashed out to the wallet an
     const hhc = slice('async function handleHandComplete(', '\n}\n');
     const tickAt = hhc.indexOf('tickReservedSeatHands(tableId);');
     expect(tickAt).toBeGreaterThan(0);
-    expect(hhc.indexOf('const tournamentId = tournamentTables.get(tableId);')).toBeGreaterThan(tickAt);
+    expect(hhc.indexOf('const tournamentId = tournamentTables.get(tableId) ?? brokenTournamentTables.get(tableId)?.tournamentId;')).toBeGreaterThan(tickAt);
     // F2 (2026-10-10): the snapshot uses isTournamentTable — a table a rebalance just broke still counts.
     expect(DISCONNECT_HANDLER).toContain('tournament: isTournamentTable(session.tableId),');
     expect(DISCONNECT_HANDLER).not.toContain('tournament: tournamentTables.has(session.tableId),');

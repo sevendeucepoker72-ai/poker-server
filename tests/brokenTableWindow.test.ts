@@ -33,9 +33,15 @@ const P = {
   rebalanceIsHeld: fnSrc('function tournamentRebalanceIsHeld('),
   creditSeat: fnSrc('function creditSeatStackToWallet('),
   handlePlayerLeave: fnSrc('function handlePlayerLeave(socket: Socket): void {'),
+  // P1/P2/P6 (2026-10-10): capacity plan, busted-seat vacating, seat-pointer moves, the idle-table restart.
+  helpers: slice('// ===== Tournament rebalance helpers', '// ===== end tournament rebalance helpers =====\n'),
   rebalance: fnSrc('function handleTableRebalance(tournamentId: string): void {'),
   autoStart: fnSrc('function autoStartNextHand(tableId: string): void {'),
-  disconnect: slice("socket.on('disconnect', async () => {", '\n  });', SRC.lastIndexOf("socket.on('disconnect', async () => {")),
+  // P4 (2026-10-10): its seat reservation + extra-table cash-out are two functions
+  // (shared with the account switch); the handler text is prefixed with them.
+  disconnect: slice('function reserveSeatForDeparture(', '\n}\n')
+    + slice('function cashOutAdditionalSeatsOnDeparture(', '\n}\n')
+    + slice("socket.on('disconnect', async () => {", '\n  });', SRC.lastIndexOf("socket.on('disconnect', async () => {")),
 };
 
 function world(over: Partial<typeof P> = {}) {
@@ -68,6 +74,7 @@ function world(over: Partial<typeof P> = {}) {
     authSessions, playerSessions, reservedSeats, multiTableSessions: new Map(), spectators: new Map(), aiProfiles: new Map(),
     tableProgressListeners: new Set(), sitOutTracker: new Map(), pendingSeatRemovalAfterHand: new Map(), quickTables: new Set(),
     pendingAutoStartTimers: new Map(), aiTimeouts: new Map(), lastSentState: new Map(), lastSentJson: new Map(),
+    scheduleAutoStart() {}, broadcastGameState() {}, scheduleAIAction() {}, syncSitOutToTable() {},
     io: { to: () => ({ emit() {} }), emit() {}, sockets: { sockets: live } },
     SEAT_RESERVE_MS, DISCONNECT_HANDS_LIMIT: 20, MAX_SEATS: 9, GamePhase,
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
@@ -84,6 +91,7 @@ ${p.gateState}
 ${p.rebalanceIsHeld}
 ${p.creditSeat}
 ${p.handlePlayerLeave}
+${p.helpers}
 ${p.rebalance}
 ${p.autoStart}
 function wire(socket) {
@@ -100,12 +108,21 @@ function wire(socket) {
   playerSessions.set('S2', { socketId: 'S2', tableId: 'T1', seatIndex: 0, playerName: 'alice', playerId: 'p-alice', sittingOut: false });
   const drop = async () => { s2.connected = false; live.delete('S2'); await handlers.disconnect(); await flush(); };
   const notCashed = () => audits.filter((a) => a.action === 'TOURNAMENT_STACK_NOT_CASHED').map((a) => a.d);
-  return { m, tm, tid, tables, tournamentTables, credits, audits, reservedSeats, playerSessions, s2, drop, notCashed };
+  return { m, tm, tid, tables, tournamentTables, credits, audits, reservedSeats, playerSessions, s2, drop, notCashed, live };
 }
 
-/** The break: T1's players copied to T2, T1 out of tournamentTables (alive 5 more seconds), Alice's session left on T1. */
+/**
+ * The break: T1's players copied to T2, T1 out of tournamentTables (alive 5
+ * more seconds), Alice's session left on T1. P6 (2026-10-10): the rebalance now
+ * moves every LIVE session of a moved player, whatever socket it is on; the
+ * window still exists for a session whose socket is going away (gone from the
+ * live registry, its 'disconnect' not yet run) — modelled by taking S2 off the
+ * registry for the break.
+ */
 function breakT1(w: ReturnType<typeof world>) {
+  w.live.delete('S2');
   w.m.handleTableRebalance(w.tid);
+  w.live.set('S2', w.s2);
   expect(w.tournamentTables.has('T1')).toBe(false);
   expect(w.tables.has('T1')).toBe(true);                                  // the ≤5s window
   expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 'T1' });    // not moved (registration socket S1 is dead)
@@ -187,6 +204,22 @@ describe('F2 — a disconnect / leave in the break window never credits a tourna
   });
 });
 
+describe('P8 (2026-10-10) — broken-table retention is by TIME, not "until the next break"', () => {
+  it('an entry past SEAT_RESERVE_MS + 1h is dropped on its next READ — no later break needed — and /api/health prunes before counting', () => {
+    const w = world();
+    breakT1(w);
+    jest.setSystemTime(Date.now() + SEAT_RESERVE_MS + 30 * 60_000);
+    expect(w.m.isTournamentTable('T1')).toBe(true);                        // still within retention
+    jest.setSystemTime(Date.now() + 31 * 60_000);
+    expect(w.m.brokenTournamentTables.has('T1')).toBe(true);               // nothing has pruned it yet…
+    expect(w.m.isTournamentTable('T1')).toBe(false);                       // …the read does
+    expect(w.m.brokenTournamentTables.has('T1')).toBe(false);
+    expect(SRC).toContain('pruneBrokenTournamentTables(); // P8 — brokenTablesRetained counts only entries still retained');
+    expect(slice('function sweepTournamentRebalances(', '\n}\n')).toContain('pruneBrokenTournamentTables(); // P8');
+    expect(SRC).toContain('setInterval(sweepTournamentRebalances, 5000);');
+  });
+});
+
 describe('F2 — CONTROL: deciding by tournamentTables alone (pre-F2) MINTS the stack', () => {
   it('disconnect in the window → reservation tournament:false → the 6h expiry credits 7,000 that are still in play on T2', async () => {
     const w = world({
@@ -227,8 +260,12 @@ describe('F2 — wiring: every "tournament seat?" chip decision uses isTournamen
     const uses = SRC.split('\n').map((l, i) => [i + 1, l] as const).filter(([, l]) => l.includes('tournamentTables.has('));
     // The ONLY remaining direct reads: isTournamentTable itself, and autoStartNextHand's cash branches,
     // which a broken table never reaches (it returns before them).
+    // P8 / P5 (2026-10-10): isTournamentTable's live-table read, and "is this table still LIVE in
+    // the tournament" checks (the broken-table startHand refusal) — no chip decision among them.
     const allowed = uses.filter(([, l]) => /return tournamentTables\.has\(tableId\) \|\| brokenTournamentTables\.has\(tableId\);/.test(l)
-      || /!tournamentTables\.has\(tableId\)/.test(l));
+      || /if \(tournamentTables\.has\(tableId\)\) return true;/.test(l)
+      || /!tournamentTables\.has\(tableId\)/.test(l)
+      || /brokenTournamentTables\.has\(session\.tableId\) && !tournamentTables\.has\(session\.tableId\)/.test(l));
     expect(uses.length - allowed.length).toBe(0);
     const auto = P.autoStart;
     expect(auto.indexOf('if (brokenTournamentTables.has(tableId)) return;')).toBeGreaterThan(-1);

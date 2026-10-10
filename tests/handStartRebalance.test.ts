@@ -25,7 +25,7 @@
  * Everything runs the REAL source of src/index.ts (sliced + transpiled) with
  * the REAL PokerTable, TournamentManager and play-gate helpers.
  */
-import { PokerTable } from '../src/game/PokerTable';
+import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { FiveCardDrawTable } from '../src/game/variants/FiveCardDrawTable';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
 import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE_MAX_STATUS_AGE_MS } from '../src/auth/playGate';
@@ -49,6 +49,8 @@ const P = {
   standUpSuspended: fnSrc('function standUpSuspendedSeat('),
   handlePlayerLeave: fnSrc('function handlePlayerLeave(socket: Socket): void {'),
   creditSeat: fnSrc('function creditSeatStackToWallet('),
+  // P1/P2/P6 (2026-10-10): capacity plan, busted-seat vacating, seat-pointer moves, the idle-table restart.
+  helpers: slice('// ===== Tournament rebalance helpers', '// ===== end tournament rebalance helpers =====\n'),
   rebalance: fnSrc('function handleTableRebalance(tournamentId: string): void {'),
   events: slice('  tournamentManager.onEvent(tournamentId, (event, data) => {', '\n  });\n', SRC.indexOf('function bootstrapTournamentTables(')),
   postQualifierResults: slice('const postedQualifierResults = new Set<string>();', '\n}\n'),
@@ -56,6 +58,18 @@ const P = {
 };
 
 const HOLD_CHECK = '  if (tournamentRebalanceIsHeld(tournamentId)) return;\n';
+/**
+ * P1 (2026-10-10) — the pre-P1 planning, for CONTROL runs: checkRebalance with
+ * no capacity check at all (every table "has room") and no "not enough seats →
+ * do not break" abort.
+ */
+const PLAN = 'planTournamentRebalance(tournamentId)';
+const ABORT = 'if (targets.length < movers.length) {';
+function withoutCapacityPlan(rebalance: string): string {
+  expect(rebalance).toContain(PLAN);
+  expect(rebalance).toContain(ABORT);
+  return rebalance.split(PLAN).join('tournamentManager.checkRebalance(tournamentId, () => 99)').replace(ABORT, 'if (false) {');
+}
 
 function compile(over: Partial<typeof P> = {}): string {
   const p = { ...P, ...over };
@@ -77,6 +91,7 @@ ${p.standUpAbsent}
 ${p.standUpSuspended}
 ${p.handlePlayerLeave}
 ${p.creditSeat}
+${p.helpers}
 ${p.rebalance}
 ${p.postQualifierResults}
 ${p.startQualifier}
@@ -134,6 +149,7 @@ function world(opts: {
   const posted: any[] = [];
   const results: any[] = [];
   const qualifierTournaments = new Map<string, any>();
+  const scheduled: string[] = [];
   const scope: Record<string, unknown> = {
     tournamentTables, tournamentManager: tm, qualifierTournaments,
     tableManager: {
@@ -144,7 +160,8 @@ function world(opts: {
         return id;
       },
     },
-    DEFAULT_BLIND_LEVELS,
+    DEFAULT_BLIND_LEVELS, GamePhase,
+    pendingAutoStartTimers: new Map(), scheduleAutoStart: (id: string) => { scheduled.push(id); },
     reservedSeats, playerSessions, authSessions, multiTableSessions: new Map(), spectators: new Map(), aiProfiles: new Map(),
     tableProgressListeners: new Set(), sitOutTracker: new Map(), pendingSeatRemovalAfterHand: new Map(),
     io: { to: () => ({ emit() {} }), emit() {}, sockets: { sockets: live } },
@@ -309,11 +326,11 @@ describe('F1 — disqualification at hand start never starts the hand twice, los
     for (const [pid, at] of w.seatsOf()) expect({ pid, seats: at.length }).toEqual({ pid, seats: 1 });
   });
 
-  it('CONTROL — without the hold, the rebalance runs before the suspended seat is freed: a moved player is left seatless (and the restart re-enters TB, refused only by PokerTable)', () => {
+  it('CONTROL — without the hold (and without P1 capacity planning, which now refuses that break on its own), the rebalance runs before the suspended seat is freed: a moved player is left seatless (and the restart re-enters TB, refused only by PokerTable)', () => {
     expect(P.rebalance).toContain(HOLD_CHECK);
-    const RESTART_SKIP = ' && !table.isStartingHand()';
-    expect(P.rebalance).toContain(RESTART_SKIP);
-    const w = threeTables({ rebalance: P.rebalance.replace(HOLD_CHECK, '').replace(RESTART_SKIP, '') });
+    const RESTART_SKIP = ' || table.isStartingHand()';
+    expect(P.helpers).toContain(RESTART_SKIP);
+    const w = threeTables({ rebalance: withoutCapacityPlan(P.rebalance.replace(HOLD_CHECK, '')), helpers: P.helpers.replace(RESTART_SKIP, '') });
     absentSuspended(w);
     const refusedBefore = PokerTable.reentrantStartsRefused;
     const TB = w.tables.get('TB')!;
@@ -478,8 +495,10 @@ describe('F1/F4 — wiring', () => {
     expect(loopAt).toBeGreaterThan(dqAt);
     expect(releaseAt).toBeGreaterThan(loopAt);
     expect(P.gate.slice(loopAt, releaseAt)).toContain('} finally {');
-    expect(P.rebalance.indexOf(HOLD_CHECK)).toBeLessThan(P.rebalance.indexOf('tournamentManager.checkRebalance(tournamentId)'));
-    expect(P.rebalance).toContain('if (table && !table.isHandInProgress() && !table.isStartingHand()) {');
+    expect(P.rebalance.indexOf(HOLD_CHECK)).toBeGreaterThan(-1);
+    expect(P.rebalance.indexOf(HOLD_CHECK)).toBeLessThan(P.rebalance.indexOf(PLAN));
+    // F1 + P2: the idle-table restart skips a table that is mid-start or still completing its hand.
+    expect(P.helpers).toContain('if (!table || table.isHandInProgress() || table.isStartingHand() || table.isCompletingHand()) continue;');
     expect(SRC).toContain("masterId: p.masterPlayerId || null,");
     expect(P.startQualifier).toContain('tournamentManager.registerPlayer(tournamentId, p.id, p.name, p.socketId, undefined, p.masterId || undefined);');
   });

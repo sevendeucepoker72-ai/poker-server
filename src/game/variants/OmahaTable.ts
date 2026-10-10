@@ -409,8 +409,10 @@ export class OmahaTable extends PokerTable {
     this.currentPhase = GamePhase.HandComplete;
     this.activeSeatIndex = -1;
 
-    this.emit('handResult', { results, handNumber: this.handNumber });
-    this.emit('handHistory', handHistory);
+    // 2026-10-10 — through the base completion: emits handResult + handHistory
+    // AND reveals this hand's deck seed (it never did — hi-lo hands could not
+    // be verified on /api/fairness), with startNewHand refused meanwhile (P2).
+    this.emitHandCompletion(results, handHistory);
     this.emit('phaseChanged', { phase: this.currentPhase });
   }
 }

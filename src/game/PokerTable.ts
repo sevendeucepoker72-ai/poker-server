@@ -268,6 +268,14 @@ export class PokerTable extends EventEmitter {
     if (event === 'turnChanged' || event === 'phaseChanged' || event === 'handStarted') {
       this.stateVersion++;
     }
+    // P2 (2026-10-10) — a hand-completion emit from ANY determineWinners (the
+    // Omaha / Stud hi-lo overrides emit their own) runs with startNewHand
+    // refused, so its listeners can never start the next hand underneath it.
+    if ((event === 'handResult' || event === 'handHistory') && !this._completingHand) {
+      let out = false;
+      this.whileCompletingHand(() => { out = super.emit(event, ...args); });
+      return out;
+    }
     return super.emit(event, ...args);
   }
 
@@ -506,9 +514,42 @@ export class PokerTable extends EventEmitter {
   /** F1 — startNewHand calls refused because the same table was already inside one. Should stay 0 (/api/health). */
   static reentrantStartsRefused = 0;
 
+  /**
+   * 2026-10-10 (P2) — true while the hand that just ended is being COMPLETED:
+   * determineWinners (or a variant's override) is emitting 'handResult' /
+   * 'handHistory' and, in the base class, revealing the finished hand's deck
+   * seed. Those listeners run synchronously and reach code that starts hands
+   * (index.ts: a bust → TournamentManager 'playerEliminated' → table rebalance
+   * → "restart hands on tables that were waiting"). A hand started there
+   * replaced the deck commitment BEFORE determineWinners revealed it, so the
+   * NEW hand's seed was published (the unauthenticated /api/fairness
+   * endpoints) while the finished hand's was never revealed. startNewHand is
+   * refused while this is set (counted below); the next hand comes from the
+   * normal hand-boundary scheduler.
+   */
+  private _completingHand = false;
+  /** P2 — startNewHand calls refused because the table was still completing its previous hand. Should stay 0 (/api/health). */
+  static completingHandStartsRefused = 0;
+
   /** F1 — is this table inside startNewHand right now (e.g. in its 'beforeHandStart' listeners)? */
   isStartingHand(): boolean {
     return this._startingHand;
+  }
+
+  /** P2 — is this table still completing its previous hand (inside its own 'handResult' / 'handHistory' emits)? */
+  isCompletingHand(): boolean {
+    return this._completingHand;
+  }
+
+  /** P2 — run `fn` (the hand-completion emits) with startNewHand refused on this table. Re-entrant. */
+  protected whileCompletingHand(fn: () => void): void {
+    const outer = this._completingHand;
+    this._completingHand = true;
+    try {
+      fn();
+    } finally {
+      this._completingHand = outer;
+    }
   }
 
   /**
@@ -527,6 +568,16 @@ export class PokerTable extends EventEmitter {
       PokerTable.reentrantStartsRefused++;
       console.warn(`[PokerTable] ${JSON.stringify({
         event: 'start_new_hand_reentrant_refused', tableId: this.config.tableId,
+        handNumber: this.handNumber, phase: this.currentPhase,
+      })}`);
+      return false;
+    }
+    // P2 — never start the next hand from inside the previous hand's
+    // completion (its 'handResult' listeners): its seed is not revealed yet.
+    if (this._completingHand) {
+      PokerTable.completingHandStartsRefused++;
+      console.warn(`[PokerTable] ${JSON.stringify({
+        event: 'start_new_hand_while_completing_refused', tableId: this.config.tableId,
         handNumber: this.handNumber, phase: this.currentPhase,
       })}`);
       return false;
@@ -2121,14 +2172,33 @@ export class PokerTable extends EventEmitter {
     this.currentPhase = GamePhase.HandComplete;
     this.activeSeatIndex = -1;
 
-    this.emit('handResult', { results, handNumber: this.handNumber });
-    this.emit('handHistory', handHistory);
-    // Reveal seed so players can verify the shuffle was fair
-    const commitment = this.deck.revealSeed();
-    if (commitment) {
-      this.emit('deckSeedRevealed', { seed: commitment.seed, hash: commitment.hash, handNumber: commitment.handNumber });
-    }
+    this.emitHandCompletion(results, handHistory);
     this.emit('phaseChanged', { phase: this.currentPhase });
+  }
+
+  /**
+   * The ONE way a finished hand is announced — the base determineWinners AND
+   * the Omaha / Stud hi-lo overrides (2026-10-10). Before this the hi-lo
+   * overrides emitted 'handResult' themselves and never revealed the deck
+   * seed: their hand's commitment was broadcast at hand start but its seed was
+   * never published, so /api/fairness could not verify a single hi-lo hand
+   * (`hiLoSeedRevealed` — the fairness rule: every committed hand is revealed).
+   * P2 (2026-10-10): the commitment of the hand that JUST ENDED is read before
+   * any listener runs — it is the one revealed, whatever a listener does — and
+   * no listener may start the next hand while this one is completing
+   * (startNewHand is refused until the seed below has been revealed).
+   * `handHistory` null = a variant that records none (Stud hi-lo).
+   */
+  protected emitHandCompletion(results: HandWinResult[], handHistory: HandHistoryRecord | null): void {
+    const commitment = this.deck.revealSeed();
+    this.whileCompletingHand(() => {
+      this.emit('handResult', { results, handNumber: this.handNumber });
+      if (handHistory) this.emit('handHistory', handHistory);
+      // Reveal seed so players can verify the shuffle was fair
+      if (commitment) {
+        this.emit('deckSeedRevealed', { seed: commitment.seed, hash: commitment.hash, handNumber: commitment.handNumber });
+      }
+    });
   }
 
   // ========== Utility Methods ==========

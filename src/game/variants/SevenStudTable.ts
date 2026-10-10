@@ -390,7 +390,11 @@ export class SevenStudTable extends PokerTable {
     }
     this.currentPhase = GamePhase.HandComplete;
     this.activeSeatIndex = -1;
-    this.emit('handResult', { results, handNumber: this.handNumber });
+    // 2026-10-10 — through the base completion: emits handResult AND reveals
+    // this hand's deck seed (it never did — Stud hi-lo hands could not be
+    // verified on /api/fairness), with startNewHand refused meanwhile (P2).
+    // No handHistory record here (unchanged).
+    this.emitHandCompletion(results, null);
   }
 
   /**
@@ -468,7 +472,8 @@ export class SevenStudTable extends PokerTable {
    */
   startNewHand(): boolean {
     // F1 (2026-10-10): a nested call is refused by the base class — never reset this hand's stud state for it.
-    if (this.isStartingHand()) return super.startNewHand();
+    // P2: likewise a call made while the previous hand is still completing (its handResult listeners).
+    if (this.isStartingHand() || this.isCompletingHand()) return super.startNewHand();
     this.cardVisibility.clear();
     this.currentStudPhase = 'ThirdStreet';
     this.studStreetIndex = 0;

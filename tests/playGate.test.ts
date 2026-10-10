@@ -804,7 +804,7 @@ describe('index.ts — every play-entry handler is gated before its first side e
 
   it('oauthLogin: the seat-restore gate runs before the restore; the refusal is sent after loginResult', () => {
     const body = expectRestoresGated('oauthLogin', 1);
-    expectRestoreSkippedOnRefusal(body, 'seatRestoreRefusal', "localUser.username, 'oauthLogin')");
+    expectRestoreSkippedOnRefusal(body, 'seatRestoreRefusal', "localUser.username, 'oauthLogin', oauthSession)");   // Q3: + the login's own session
     const loginResultAt = body.indexOf("socket.emit('loginResult', {\n        success: true,");
     const refusalAt = body.indexOf('if (seatRestoreRefusal) emitPlayRefusal(socket, seatRestoreRefusal);');
     expect(loginResultAt).toBeGreaterThan(-1);
@@ -813,8 +813,8 @@ describe('index.ts — every play-entry handler is gated before its first side e
 
   it('tokenLogin (OIDC branch + legacy HS256 branch): each restore is gated; refusals follow loginResult', () => {
     const body = expectRestoresGated('tokenLogin', 2);
-    expectRestoreSkippedOnRefusal(body, 'tlSeatRestoreRefusal', "_tlLocalUser.username, 'tokenLogin')");
-    expectRestoreSkippedOnRefusal(body, 'legacySeatRestoreRefusal', "result.userData.username, 'tokenLogin_legacy')");
+    expectRestoreSkippedOnRefusal(body, 'tlSeatRestoreRefusal', "_tlLocalUser.username, 'tokenLogin', tlSession)");
+    expectRestoreSkippedOnRefusal(body, 'legacySeatRestoreRefusal', "result.userData.username, 'tokenLogin_legacy', legacySession)");
     const oidcResultAt = body.indexOf("success: true, token: data.token, userData: progress.userData,");
     const oidcRefusalAt = body.indexOf('if (tlSeatRestoreRefusal) emitPlayRefusal(socket, tlSeatRestoreRefusal);');
     expect(oidcRefusalAt).toBeGreaterThan(oidcResultAt);
@@ -1049,7 +1049,7 @@ describe('index.ts — every play-entry handler is gated before its first side e
 
   it('(B) resumeSession: the seat restore is gated and skipped on refusal; the refusal follows loginResult', () => {
     const body = expectRestoresGated('resumeSession', 1);
-    expectRestoreSkippedOnRefusal(body, 'rsSeatRestoreRefusal', "row.username, 'resumeSession')");
+    expectRestoreSkippedOnRefusal(body, 'rsSeatRestoreRefusal', "row.username, 'resumeSession', rsSession)");
     const loginResultAt = body.indexOf("socket.emit('loginResult', {\n          success: true,");
     const refusalAt = body.indexOf('if (rsSeatRestoreRefusal) emitPlayRefusal(socket, rsSeatRestoreRefusal);');
     expect(loginResultAt).toBeGreaterThan(-1);

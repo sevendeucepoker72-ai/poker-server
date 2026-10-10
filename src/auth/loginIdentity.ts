@@ -67,6 +67,13 @@ export type LoginFailureCode =
   // `code` on the `error` / `joinError` / `qualifierRegistrationResult` frames.
   | 'player_suspended'
   | 'login_required'
+  // 2026-10-10 (P4) — `joinWithWaitlistContext`: the socket is ALREADY signed
+  // in to a DIFFERENT (or unprovable) American Pub Poker account than the
+  // waitlist ticket's. Refused before any seat or deduct — the link's buy-in is
+  // never charged to, nor seated under, the other account. Definitive for this
+  // ticket (it is single-use and already burned); the user signs out of the
+  // other account and opens a fresh link.
+  | 'account_mismatch'
   // 2026-10-09 — R1 `resumeSession`: the resume token is DEFINITIVELY unusable
   // (expired, bad signature, wrong kind, users.token_version bumped, account
   // banned, master link changed, row retired). The client drops it and falls

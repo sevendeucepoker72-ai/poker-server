@@ -53,6 +53,8 @@ const fnSrc = (signature: string) => slice(signature, '\n}\n');
 const P = {
   trackLogin: fnSrc('function trackLogin<A extends unknown[]>('),
   loginSocketGone: slice('const loginsOnDeadSocket = { abandoned: 0 };', '\n}\n'),
+  // Q3 (2026-10-10): the overtake guard every seat-restoring login runs after its gate await.
+  loginOvertake: slice('// ===== Login overtake guard', '// ===== end login overtake guard =====\n'),
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
   absentSeatMasterId: fnSrc('function absentSeatMasterId('),
   isTournamentReservation: fnSrc('function isTournamentReservation('),
@@ -87,6 +89,11 @@ const P = {
   tokenLogin: slice("socket.on('tokenLogin', trackLogin(socket, 'tokenLogin', async", '\n  }));\n'),
   // The main (last-registered) disconnect handler — the one with the seat reserve.
   disconnect: slice("socket.on('disconnect', async () => {", '\n  });', SRC.lastIndexOf("socket.on('disconnect', async () => {")),
+  // P4 (2026-10-10): the disconnect's seat reservation + extra-table cash-out are two
+  // functions, shared with the account switch every login now runs first.
+  departure: slice('function reserveSeatForDeparture(', '\n}\n')
+    + slice('function cashOutAdditionalSeatsOnDeparture(', '\n}\n'),
+  accountSwitch: slice('const socketAccountSwitches = {', '\n}\n'),
 };
 
 const constOf = (name: string): number => {
@@ -102,6 +109,7 @@ function compile(over: Partial<typeof P> = {}): string {
   const code = `
 ${p.trackLogin}
 ${p.loginSocketGone}
+${p.loginOvertake}
 ${p.absentIds}
 ${p.absentSeatMasterId}
 ${p.brokenTables}
@@ -115,6 +123,8 @@ ${p.reservationHolderAt}
 ${p.noteNotCashed}
 ${p.creditSeat}
 ${p.handlePlayerLeave}
+${p.departure}
+${p.accountSwitch}
 ${p.clearGhost}
 ${p.standUpRefusedSeat}
 ${p.refuseSeatRestore}
@@ -137,6 +147,7 @@ ${p.resume}
 module.exports = {
   wire, standUpSuspendedSeatsBeforeDeal, armTurnTimer, tickReservedSeatHands, cashOutSeatsBeforeGuestClaim,
   refuseSeatRestoreIfBarred, clearGhostSeatsForUser, loginsOnDeadSocket, absentSeatMasterIds,
+  handlePlayerLeave, socketAccountSwitches, loginsOvertaken, releaseSocketForAccountSwitch,
 };
 `;
   return ts.transpileModule(code, {
@@ -229,6 +240,8 @@ function world(opts: WorldOpts = {}) {
     pendingSeatRemovalAfterHand: new Map(), sitOutTracker: new Map(), spectators: new Map(), aiProfiles: new Map(),
     aiTimeouts: new Map(), pendingAutoStartTimers: new Map(), quickTables: new Set(), lastSentState: new Map(),
     lastSentJson: new Map(), MAX_SEATS: 9, SEAT_RESERVE_MS, DISCONNECT_HANDS_LIMIT: HANDS_LIMIT,
+    // handlePlayerLeave's tail (P4 tests run a full leave).
+    lastEmoteTime: new Map(), lastReactionTime: new Map(), lastChatTime: new Map(),
     syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {}, emitGameState() {},
     getGameStateForPlayer: () => ({}), scheduleAIAction() {}, log: { debug() {} },
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
@@ -282,10 +295,12 @@ function world(opts: WorldOpts = {}) {
     emitPlayRefusal: (s: any, r: any) => s.emit('error', { message: r.message, code: r.code }),
     hydrateAndPushProgress: async () => {},
     validateOAuthToken: async (tok: string) => (tok === 'oidc-alice'
-      ? { valid: true, sub: 'm-alice', username: 'Alice', isAdmin: false } : { valid: false }),
+      ? { valid: true, sub: 'm-alice', username: 'Alice', isAdmin: false }
+      // Q3 (2026-10-10): a second account's OIDC sign-in on a shared browser.
+      : tok === 'oidc-bob' ? { valid: true, sub: 'm-bob', username: 'Bob', isAdmin: false } : { valid: false }),
     reportAuthEvent() {},
     resolveLoginIdentity: () => ({ ok: true, identity: { key: 'alice.player', displayName: 'Alice', source: 'username' } }),
-    upsertOidcLocalUser: async () => ({ ok: true, user: { ...users.get(ALICE) } }),
+    upsertOidcLocalUser: async (a: { sub: string }) => ({ ok: true, user: { ...users.get(a.sub === 'm-bob' ? 102 : ALICE) } }),
     loadProgress: async (uid: number) => {
       if (ctl.loadProgressGate) await ctl.loadProgressGate;
       const r = users.get(uid);
@@ -537,10 +552,12 @@ describe('U1 — a login that outlives its socket never consumes the reservation
   });
 
   it('CONTROL — without the U1 checks the resume consumes the reservation and its timer, binds the seat to the dead socket, and the stack is never cashed out', async () => {
-    const off = (s: string) => s.split('loginSocketGone(').join('(() => false)(');
+    // Q3 (2026-10-10): the overtake check would ALSO stop this login (the disconnect removed its
+    // session) — off too, so the control shows the pre-U1 behaviour.
+    const off = (s: string) => s.split('loginSocketGone(').join('(() => false)(').split('loginSessionReplaced(').join('(() => false)(');
     const over = {
       resume: off(P.resume),
-      refuseSeatRestore: P.refuseSeatRestore.replace('if (!socket.connected) return refusal;', ''),
+      refuseSeatRestore: P.refuseSeatRestore.replace('if (!socket.connected) return refusal;', '').replace('if (mine && socketSessionOvertaken(socket, mine)) return refusal;', ''),
     };
     expect(over.resume).not.toBe(P.resume);
     expect(over.refuseSeatRestore).not.toBe(P.refuseSeatRestore);
@@ -835,7 +852,8 @@ describe('U3 — a table break never credits a tournament reservation (isTournam
     const ghost = fnSrc('function clearGhostSeatsForUser(');
     expect(ghost).toContain('if (isTournamentReservation(reserved)) {');
     expect(fnSrc('function tickReservedSeatHands(')).toContain('if (isTournamentReservation(reserved)) {');
-    expect(P.disconnect).toContain('if (isTournamentReservation(reserved)) {');
+    expect(P.departure).toContain('if (isTournamentReservation(reserved)) {');   // P4: the disconnect's reservation function
+    expect(P.disconnect).toContain('reserveSeatForDeparture(authSession, session, table, seat);');
     expect(slice('// 2. Cash out every reserved seat (disconnected but not yet expired).', '// 3. Flush every pending debounced hand-snapshot'))
       .toContain('!isTournamentReservation(reserved)');
   });
@@ -925,5 +943,288 @@ describe('U4 — an absent tournament seat past its hand limit acts on a short c
     expect(w.table.currentPhase === phase0 && w.table.activeSeatIndex === 0 && w.table.isHandInProgress()).toBe(true);
     jest.advanceTimersByTime(1);
     expect(w.table.currentPhase !== phase0 || w.table.activeSeatIndex !== 0 || !w.table.isHandInProgress()).toBe(true);
+  });
+});
+
+// ── P4 (2026-10-10) ────────────────────────────────────────────────────────
+/**
+ * A login that binds a socket to a DIFFERENT account (shared browser: a Play
+ * Online / waitlist deep link for one account and the stored refresh-token
+ * sign-in of another race on ONE socket) used to rebind authSessions while
+ * playerSessions still held the previous account's seat — and every cash-out
+ * reads authSessions. Every login now releases the socket first
+ * (releaseSocketForAccountSwitch): the previous account's seat is reserved
+ * for IT, exactly as if its socket had dropped.
+ */
+describe('P4 — a login that switches a socket to ANOTHER account never inherits the previous account\'s seat', () => {
+  /**
+   * Bob (102) is signed in on S1 and seated at t1 seat 1 (5,000). Alice has no
+   * seat of her own here (her seat 0 is vacated), so nothing of hers can be restored.
+   */
+  const bobSeated = (w: ReturnType<typeof world>) => { w.table.standUp(0); return w.seatLive('S1', 102, 1); };
+
+  it.each([
+    ['resumeSession', (s: any) => s.handlers.resumeSession({ resumeToken: 'tok' })],
+    ['oauthLogin', (s: any) => s.handlers.oauthLogin({ accessToken: 'oidc-alice' })],
+  ] as const)('%s for Alice on Bob\'s seated socket: Bob\'s seat is RESERVED for Bob; a leave credits Alice nothing; Bob\'s reservation cashes out to BOB', async (_via, login) => {
+    const w = world();
+    const s1 = bobSeated(w);
+    await login(s1);
+    await flush();
+    expect(w.authSessions.get('S1')).toMatchObject({ userId: ALICE });
+    expect(w.playerSessions.has('S1')).toBe(false);                            // Alice did not inherit Bob's seat
+    expect(w.reservedSeats.get(102)).toMatchObject({ tableId: 't1', seatIndex: 1, tournament: false });
+    expect(w.table.seats[1]).toMatchObject({ state: 'occupied', chipCount: 5000 });
+    expect(w.m.socketAccountSwitches).toMatchObject({ switches: 1, seatsReserved: 1 });
+    w.m.handlePlayerLeave(s1);                                                 // Alice leaves "her" table
+    await flush();
+    expect(w.credits).toEqual([]);
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);                                 // Bob never came back
+    await flush();
+    expect(w.credits).toEqual([{ uid: 102, amount: 5000 }]);                    // his own stack, to HIS wallet, once
+  });
+
+  it('CONTROL — without the release (pre-P4) the resume rebinds the socket under Bob\'s seat and Alice\'s leave credits BOB\'s 5,000 to ALICE', async () => {
+    const CALL = "        releaseSocketForAccountSwitch(socket, userId, 'resumeSession');\n";
+    expect(P.resume).toContain(CALL);
+    const w = world({ over: { resume: P.resume.replace(CALL, '') } });
+    const s1 = bobSeated(w);
+    await s1.handlers.resumeSession({ resumeToken: 'tok' });
+    await flush();
+    expect(w.authSessions.get('S1')).toMatchObject({ userId: ALICE });
+    expect(w.playerSessions.get('S1')).toMatchObject({ tableId: 't1', seatIndex: 1 });   // Bob's seat, now under Alice
+    w.m.handlePlayerLeave(s1);
+    await flush();
+    expect(w.credits).toEqual([{ uid: ALICE, amount: 5000 }]);                  // the theft
+  });
+
+  it('a TOURNAMENT seat is reserved as a tournament seat (kept in play, never cashed out — T1)', async () => {
+    const w = world({ tournament: true });
+    const s1 = bobSeated(w);
+    await s1.handlers.resumeSession({ resumeToken: 'tok' });
+    await flush();
+    expect(w.reservedSeats.get(102)).toMatchObject({ tournament: true });
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);
+    await flush();
+    expect(w.credits).toEqual([]);
+    expect(w.table.seats[1]).toMatchObject({ state: 'occupied', chipCount: 5000 });
+  });
+
+  it('the SAME account signing in again on its socket (a token refresh) changes nothing: seat, session and no reservation', async () => {
+    const w = world();
+    const s1 = w.seatLive('S1', ALICE, 0);
+    await s1.handlers.oauthLogin({ accessToken: 'oidc-alice' });
+    await flush();
+    expect(w.playerSessions.get('S1')).toMatchObject({ tableId: 't1', seatIndex: 0 });
+    expect(w.reservedSeats.has(ALICE)).toBe(false);
+    expect(w.m.socketAccountSwitches.switches).toBe(0);
+  });
+
+  it('a seat on the socket with NO account behind it is stood up without any credit — a login never adopts a stack it did not buy', async () => {
+    const w = world();
+    w.table.standUp(0);                                                         // (Alice has no orphan seat to recover)
+    const s1 = w.mkSocket('S1');
+    w.playerSessions.set('S1', { socketId: 'S1', tableId: 't1', seatIndex: 2, playerName: 'Carl', playerId: 'user_103', sittingOut: false });
+    await s1.handlers.oauthLogin({ accessToken: 'oidc-alice' });
+    await flush();
+    expect(w.table.seats[2].state).toBe('empty');
+    expect(w.playerSessions.has('S1')).toBe(false);
+    expect(w.credits).toEqual([]);
+    expect(w.m.socketAccountSwitches.unownedSeatsCleared).toBe(1);
+  });
+
+  it('wiring: every login releases the socket right before it binds the new account', () => {
+    const sites = [
+      ["socket.on('login'", "releaseSocketForAccountSwitch(socket, result.userData.id, 'login');"],
+      ["socket.on('register'", "releaseSocketForAccountSwitch(socket, result.userData.id, 'register');"],
+      ["socket.on('oauthLogin'", "releaseSocketForAccountSwitch(socket, userId, 'oauthLogin');"],
+      ["socket.on('tokenLogin'", "releaseSocketForAccountSwitch(socket, userId, 'tokenLogin');"],
+      ["socket.on('tokenLogin'", "releaseSocketForAccountSwitch(socket, userId, 'tokenLogin_legacy');"],
+      ["'authWithTicket',", "releaseSocketForAccountSwitch(socket, localUser.id, 'authWithTicket');"],
+      ["'resumeSession',", "releaseSocketForAccountSwitch(socket, userId, 'resumeSession');"],
+      ["'joinWithWaitlistContext',", "releaseSocketForAccountSwitch(socket, urows[0].id, 'joinWithWaitlistContext');"],
+    ];
+    for (const [handler, call] of sites) {
+      const at = SRC.indexOf(handler);
+      const callAt = SRC.indexOf(call, at);
+      expect({ call, found: at > -1 && callAt > at }).toEqual({ call, found: true });
+      // The very next statement binds the session (nothing awaited in between).
+      const next = SRC.slice(callAt + call.length).trimStart();
+      expect({ call, next: next.slice(0, 26) }).toEqual({ call, next: 'authSessions.set(socket.id' });
+    }
+    // No other authSessions.set on a socket outside these (and the gate tests' fakes).
+    expect(SRC.split('authSessions.set(socket.id').length - 1).toBe(sites.length);
+  });
+});
+
+// ── Q3 (2026-10-10) ────────────────────────────────────────────────────────
+/**
+ * The rest of P4's server half. A login sets its auth session, then awaits the
+ * seat-restore play gate before it binds the seat. On a shared browser (an old
+ * bundle starts a Play Online ticket for one account and the stored sign-in of
+ * another at once) a DIFFERENT account's login can take the socket during that
+ * await (releaseSocketForAccountSwitch + its own authSessions.set). The
+ * overtaken login used to restore its seat under the other account — and every
+ * cash-out reads authSessions. Now it restores nothing (loginSessionReplaced).
+ */
+describe('Q3 — a login OVERTAKEN by another account on its socket never restores its seat under that account', () => {
+  /** Bob's ticket sign-in reaching its set point on S2 — exactly what authWithTicket does (release + set, synchronous). */
+  const bobTakesSocket = (w: ReturnType<typeof world>, s: any) => {
+    w.m.releaseSocketForAccountSwitch(s, 102, 'authWithTicket');
+    w.authSessions.set(s.id, { userId: 102, username: 'bob.player', masterUserId: 'm-bob', phone: 'x' });
+  };
+
+  async function overtaken(login: (s: any) => Promise<unknown>, over: Partial<typeof P> = {}) {
+    const w = world({ over });
+    const r = await aliceReserved(w);                                          // Alice: 7,000 reserved (her old socket dropped)
+    const s2 = w.mkSocket('S2');                                               // the shared browser's socket
+    const gate = deferred();
+    w.ctl.gateGate = gate.p;
+    const pending = login(s2);
+    await flush();
+    expect(w.authSessions.get('S2')).toMatchObject({ userId: ALICE });        // set — now held in the seat-restore gate
+    bobTakesSocket(w, s2);
+    gate.resolve();
+    w.ctl.gateGate = null;
+    await pending;
+    await flush();
+    return { w, r, s2 };
+  }
+
+  it.each([
+    ['oauthLogin', (s: any) => s.handlers.oauthLogin({ accessToken: 'oidc-alice' })],
+    ['tokenLogin (OIDC branch)', (s: any) => s.handlers.tokenLogin({ token: 'oidc-alice' })],
+    ['tokenLogin (legacy branch)', (s: any) => s.handlers.tokenLogin({ token: 'legacy-alice' })],
+    ['resumeSession', (s: any) => s.handlers.resumeSession({ resumeToken: 'tok' })],
+  ] as const)('%s for Alice, overtaken by Bob during its gate: nothing restored under Bob, her reservation + timer intact, credited ONCE to her at expiry', async (_via, login) => {
+    const { w, r, s2 } = await overtaken(login);
+    expect(w.authSessions.get('S2')).toMatchObject({ userId: 102 });          // Bob's session untouched
+    expect(w.playerSessions.has('S2')).toBe(false);                            // Alice's seat NOT bound under Bob
+    expect(w.reservedSeats.get(ALICE)).toBe(r);                                // her REAL reservation, untouched…
+    expect(w.reservedSeats.get(ALICE).cleanupTimer).toBe(r.cleanupTimer);      // …with its cash-out timer
+    expect(w.emitted('S2').map(([ev]) => ev)).not.toContain('reconnectedToTable');
+    expect(w.emitted('S2').filter(([ev, d]) => ev === 'loginResult' && d.success)).toEqual([]);
+    expect(w.m.loginsOvertaken.abandoned).toBe(1);
+    expect(w.table.seats[0]).toMatchObject({ state: 'occupied', chipCount: 7000 });
+    w.m.handlePlayerLeave(s2);                                                 // Bob leaves: nothing of Alice's to credit
+    await flush();
+    expect(w.credits).toEqual([]);
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);                                 // Alice never came back
+    await flush();
+    expect(w.credits).toEqual([{ uid: ALICE, amount: 7000 }]);                  // her stack, to HER wallet, exactly once
+    // …and a later sign-in of Alice's would have restored it instead (the reservation was hers to the end).
+  });
+
+  it('…and Alice\'s NEXT sign-in restores the seat from that intact reservation', async () => {
+    const { w } = await overtaken((s) => s.handlers.resumeSession({ resumeToken: 'tok' }));
+    const s3 = w.mkSocket('S3');
+    await s3.handlers.resumeSession({ resumeToken: 'tok' });
+    await flush();
+    expect(w.playerSessions.get('S3')).toMatchObject({ tableId: 't1', seatIndex: 0 });
+    expect(w.reservedSeats.has(ALICE)).toBe(false);
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);
+    await flush();
+    expect(w.credits).toEqual([]);                                             // seated again: nothing cashed out
+  });
+
+  it('CONTROL — without the overtake checks (pre-Q3) Alice\'s seat is restored under BOB, and Bob\'s leave credits Alice\'s 7,000 to BOB', async () => {
+    const OFF = 'if (mine && socketSessionOvertaken(socket, mine)) return refusal;';
+    expect(P.refuseSeatRestore).toContain(OFF);
+    expect(P.oauth).toContain('loginSessionReplaced(');
+    const { w, s2 } = await overtaken((s) => s.handlers.oauthLogin({ accessToken: 'oidc-alice' }), {
+      oauth: P.oauth.split('loginSessionReplaced(').join('(() => false)('),
+      refuseSeatRestore: P.refuseSeatRestore.replace(OFF, ''),
+    });
+    expect(w.authSessions.get('S2')).toMatchObject({ userId: 102 });
+    expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });   // Alice's seat, under Bob
+    w.m.handlePlayerLeave(s2);
+    await flush();
+    expect(w.credits).toEqual([{ uid: 102, amount: 7000 }]);                    // the theft
+  });
+
+  it('a parallel sign-in of the SAME account is not an overtake: the seat is restored once, no reservation left, nothing credited', async () => {
+    const w = world();
+    await aliceReserved(w);
+    const s2 = w.mkSocket('S2');
+    const gate = deferred();
+    w.ctl.gateGate = gate.p;
+    const a = s2.handlers.oauthLogin({ accessToken: 'oidc-alice' });
+    await flush();
+    const b = s2.handlers.tokenLogin({ token: 'oidc-alice' });                 // the same player's second boot sign-in
+    await flush();
+    gate.resolve();
+    w.ctl.gateGate = null;
+    await a;
+    await b;
+    await flush();
+    expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
+    expect(w.reservedSeats.has(ALICE)).toBe(false);
+    expect(w.m.loginsOvertaken.abandoned).toBe(0);
+    expect(w.emitted('S2').filter(([ev]) => ev === 'reconnectedToTable')).toHaveLength(1);
+    expect(w.emitted('S2').filter(([ev, d]) => ev === 'loginResult' && d.success)).toHaveLength(2);
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);
+    await flush();
+    expect(w.credits).toEqual([]);
+  });
+
+  it('wiring: every seat-restoring login passes its OWN session to the gate and checks the overtake right after it, before any restore', () => {
+    const all = (body: string, needle: string) => {
+      const out: number[] = [];
+      for (let i = body.indexOf(needle); i >= 0; i = body.indexOf(needle, i + 1)) out.push(i);
+      return out;
+    };
+    for (const [name, body, n] of [['oauthLogin', P.oauth, 1], ['tokenLogin', P.tokenLogin, 2], ['resumeSession', P.resume, 1]] as const) {
+      const gates = all(body, 'await refuseSeatRestoreIfBarred(socket, userId,');
+      const restores = all(body, 'playerSessions.set(socket.id');
+      expect({ name, gates: gates.length, restores: restores.length }).toEqual({ name, gates: n, restores: n });
+      gates.forEach((g, i) => {
+        const call = body.slice(g, body.indexOf(');', g) + 2);
+        expect({ name, passesSession: /, (oauthSession|tlSession|legacySession|rsSession)\);$/.test(call) }).toEqual({ name, passesSession: true });
+        const check = body.indexOf('loginSessionReplaced(socket,', g);
+        expect({ name, i, checkedBeforeRestore: check > g && check < restores[i] }).toEqual({ name, i, checkedBeforeRestore: true });
+      });
+    }
+    const gate = P.refuseSeatRestore;
+    const overtakeAt = gate.indexOf('if (mine && socketSessionOvertaken(socket, mine)) return refusal;');
+    expect(overtakeAt).toBeGreaterThan(gate.indexOf('const refusal = await assertPlayable('));
+    expect(overtakeAt).toBeLessThan(gate.indexOf('reservedSeats.delete(userId)'));
+    expect(overtakeAt).toBeLessThan(gate.indexOf('handlePlayerLeave(socket)'));
+    // The bail-out never touches the other account's session, and drops only a SYNTHETIC reservation.
+    expect(P.loginOvertake).not.toContain('authSessions.delete(');
+    expect(P.loginOvertake).toContain('if (r && !r.cleanupTimer) { reservedSeats.delete(opts.dropSyntheticReservationOf); syntheticDropped = true; }');
+  });
+});
+
+describe('minor (2026-10-10) — the post-restart orphan-seat scans never claim a seat RESERVED for another account', () => {
+  it('Bob\'s oauthLogin, his display name equal to Alice\'s seat name (ticket names collide), does not take Alice\'s reserved seat', async () => {
+    const w = world();
+    const r = await aliceReserved(w);                                          // seat 0 'Alice', reserved for ALICE
+    w.users.get(102).display_name = 'Alice';
+    const s2 = w.mkSocket('S2');
+    await s2.handlers.oauthLogin({ accessToken: 'oidc-bob' });
+    await flush();
+    expect(w.authSessions.get('S2')).toMatchObject({ userId: 102 });
+    expect(w.reservedSeats.has(102)).toBe(false);                              // no synthetic reservation onto her seat
+    expect(w.playerSessions.has('S2')).toBe(false);
+    expect(w.reservedSeats.get(ALICE)).toBe(r);
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);
+    await flush();
+    expect(w.credits).toEqual([{ uid: ALICE, amount: 7000 }]);
+  });
+
+  it('CONTROL — without the check (pre-fix) Bob\'s name scan synthesizes a reservation onto Alice\'s seat and restores it under him: his leave credits her 7,000 to BOB', async () => {
+    const CHECK = 'if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;';
+    expect(P.oauth).toContain(CHECK);
+    expect(P.tokenLogin).toContain(CHECK);
+    const w = world({ over: { oauth: P.oauth.replace(CHECK, '') } });
+    await aliceReserved(w);
+    w.users.get(102).display_name = 'Alice';
+    const s2 = w.mkSocket('S2');
+    await s2.handlers.oauthLogin({ accessToken: 'oidc-bob' });
+    await flush();
+    expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
+    w.m.handlePlayerLeave(s2);
+    await flush();
+    expect(w.credits).toEqual([{ uid: 102, amount: 7000 }]);
   });
 });

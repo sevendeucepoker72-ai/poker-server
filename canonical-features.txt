@@ -417,3 +417,76 @@ buy_in_abandoned_socket_gone
 buyInsAbandonedSocketGone
 # F4: an absent suspended QUALIFIER entrant is identified by his registration's
 # master id and disqualified — pinned by tests/handStartRebalance.test.ts.
+# F4 lock (2026-10-10, P8): the qualifier-entrant identity helpers (function
+# names survive tsc). A refactor that drops them fails this manifest, not just
+# the tests.
+absentEntrantIdentity
+qualifierEntrantMasterId
+#
+# 2026-10-10 (eighth pass, owner "fix all") — P1-P6 (CONTRACTS.md C5).
+# P1: a rebalance never strands an alive entrant — capacity-checked breaks
+# (TournamentManager.checkRebalance freeSeatsOf), busted seats stood up before
+# they are reused, no break in the middle of a hand, a pending bust never
+# moved; the short table plays on (tests/rebalanceSafety.test.ts).
+table_break_aborted_no_seats
+breaksAbortedNoSeats
+breaksDeferredMidHand
+busted_seat_vacated
+bustedSeatsVacated
+rebalance_pending_bust_not_moved
+# P2: no hand starts inside the previous hand's completion; the finished
+# hand's seed is the one revealed (restart → scheduleAutoStart).
+start_new_hand_while_completing_refused
+completingHandStartsRefused
+# P3: a buy-in on a LIVE socket whose session / seat / account / table changed
+# is refunded once and seats nothing (tests/buyInSocketGone.test.ts).
+buy_in_abandoned_state_changed
+buyInsAbandonedStateChanged
+buy_in_cancelled
+# P4: a login never inherits another account's seat (the previous account's
+# seat is reserved for it); a waitlist link refuses another signed-in account.
+socket_account_switch
+accountSwitches
+waitlist_account_mismatch
+waitlistAccountMismatches
+account_mismatch
+# P5: a cash buy-in never lands on a tournament table; a broken table never deals.
+cash_join_refused_tournament_table
+cashJoinsRefusedAtTournamentTable
+table_closed
+# P6: the rebalance moves a player by his seat — every live session + his reservation.
+reconnectedSessionsMoved
+reservationsMoved
+rebalance_session_not_moved_other_account
+#
+# 2026-10-10 (ninth pass, owner "fix all") — Q1-Q3 + minors (CONTRACTS.md C5).
+# Q1: a break never strands a bust whose check is pending — the break is
+# DEFERRED until that table's bust check has run (the P1 event name above now
+# carries outcome break_deferred), and the bust check resolves a just-broken
+# table's tournament through the broken-table registry (tests/rebalanceSafety.test.ts).
+pendingTournamentBustSeat
+breaksDeferredPendingBust
+break_deferred
+bust_check_on_broken_table
+# Q2: a mover / bounty / placeability seat is the entrant's LIVE seat (a
+# re-entered qualifier player's old busted seat has the same playerId).
+tournamentLiveSeatIndex
+tournamentLiveSeatOf
+# Q3: a login overtaken by another account on its socket restores nothing
+# (tests/absentSeat.test.ts).
+loginSessionReplaced
+socketSessionOvertaken
+login_abandoned_session_replaced
+loginsAbandonedSessionReplaced
+# Minors: the orphan-seat scans never claim a seat reserved for another
+# account; a tournament start binds a seat only to the registrant's own socket;
+# a qualifier re-entry gets a session; the 5s sweep services every tournament;
+# Omaha / Stud hi-lo hands reveal their deck seed (emitHandCompletion).
+seatReservedByOtherAccount
+bindRegistrantSocket
+registrant_socket_not_registrants
+registrantSockets
+reentry_session_created
+reentrySessionsCreated
+sweepTournamentRebalances
+emitHandCompletion

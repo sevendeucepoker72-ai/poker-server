@@ -799,8 +799,18 @@ export class TournamentManager {
    * 2. Any table with fewer than MIN_TABLE_PLAYERS (5) must be broken
    *    when multiple tables are still in play.
    * 3. The final table (only 1 table left) plays with any number of players.
+   *
+   * 2026-10-10 (P1) — CAPACITY. A table is broken ONLY when the other tables'
+   * free seats can hold every player it would move: before this, Rule 2 broke
+   * any table under 5 without looking (TA 6 / TB 4 alive: TB's 4 players met 3
+   * free seats on TA — one was left seatless while still alive, and the
+   * tournament could never finish). `freeSeatsOf(tableId)` = the seats a moved
+   * player could take there RIGHT NOW (index.ts counts empty seats plus busted
+   * seats it stands up before placing); without it, 9 minus the alive players
+   * mapped to that table. When no table can be broken this returns null: the
+   * short table plays on short-handed until a bust elsewhere frees seats.
    */
-  checkRebalance(tournamentId: string): {
+  checkRebalance(tournamentId: string, freeSeatsOf?: (tableId: string) => number): {
     breakTableId: string;
     playersToMove: { playerId: string; playerName: string }[];
   } | null {
@@ -818,27 +828,34 @@ export class TournamentManager {
     }
     tablePops.sort((a, b) => a.count - b.count);
 
+    const free = new Map<string, number>();
+    for (const tp of tablePops) {
+      const n = freeSeatsOf ? freeSeatsOf(tp.tid) : 9 - tp.count;
+      free.set(tp.tid, Math.max(0, Number.isFinite(n) ? Math.floor(n) : 0));
+    }
+    /** P1 — can the OTHER tables seat every player `tp` would move? */
+    const fits = (tp: { tid: string; count: number }): boolean => {
+      let room = 0;
+      for (const [tid, n] of free) if (tid !== tp.tid) room += n;
+      return room >= tp.count;
+    };
+    const breakOf = (tp: { tid: string }) => ({
+      breakTableId: tp.tid,
+      playersToMove: this.getAlivePlayersOnTable(tournamentId, tp.tid)
+        .map(p => ({ playerId: p.playerId, playerName: p.playerName })),
+    });
+
     // Rule 1: can we fit everyone in fewer tables?
     if (alive <= threshold) {
       const smallest = tablePops[0];
-      if (smallest) {
-        return {
-          breakTableId: smallest.tid,
-          playersToMove: this.getAlivePlayersOnTable(tournamentId, smallest.tid)
-            .map(p => ({ playerId: p.playerId, playerName: p.playerName })),
-        };
-      }
+      if (smallest && fits(smallest)) return breakOf(smallest);
     }
 
-    // Rule 2: any table with < 5 players must be broken (unless it's the final table)
+    // Rule 2: any table with < 5 players must be broken (unless it's the final
+    // table) — the smallest one whose players the other tables can seat.
     if (tableCount > 1) {
-      const underMin = tablePops.find(tp => tp.count > 0 && tp.count < TournamentManager.MIN_TABLE_PLAYERS);
-      if (underMin) {
-        return {
-          breakTableId: underMin.tid,
-          playersToMove: this.getAlivePlayersOnTable(tournamentId, underMin.tid)
-            .map(p => ({ playerId: p.playerId, playerName: p.playerName })),
-        };
+      for (const tp of tablePops) {
+        if (tp.count > 0 && tp.count < TournamentManager.MIN_TABLE_PLAYERS && fits(tp)) return breakOf(tp);
       }
     }
 

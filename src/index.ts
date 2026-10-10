@@ -45,7 +45,7 @@ import { sanitizeClientProgressSave, PAYOUT_KEYS_FROM_CLIENT } from './progressi
 import { HandRank } from './game/HandEvaluator';
 import { getFullTrainingData, calculateEquity } from './training/TrainingEngine';
 import { insuranceCashoutAmount, insuranceSettlementDelta } from './game/insurance';
-import { TournamentManager, DEFAULT_BLIND_LEVELS } from './game/TournamentManager';
+import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
@@ -1405,6 +1405,87 @@ function loginSocketGone(
   return true;
 }
 
+// ===== Login overtake guard (Q3, 2026-10-10) =====
+/**
+ * 2026-10-10 (Q3, the rest of P4's server half) — a login can be OVERTAKEN on
+ * a LIVE socket. Every login that restores a seat sets its auth session and
+ * then awaits (the seat-restore play gate) before it binds the seat. Meanwhile
+ * ANOTHER login on the same socket can move it to a different account (P4's
+ * releaseSocketForAccountSwitch + its own authSessions.set — on a shared
+ * browser an old bundle starts a Play Online ticket for A and B's stored
+ * sign-in at once). The overtaken login used to go on and bind ITS account's
+ * reserved seat to a socket now signed in as the OTHER account: every later
+ * leave / disconnect / reservation expiry reads authSessions, so B's stack was
+ * credited to A.
+ *
+ * `socketSessionOvertaken(socket, mine)` — the socket's session is no longer
+ * the very object this login set (`mine`) AND not even the same account. A
+ * newer session of the SAME account (a parallel sign-in of the same player,
+ * e.g. oauthLogin + tokenLogin on one boot) is not an overtake: binding his
+ * own seat under his own account mixes nothing, and the restore goes on
+ * exactly as before.
+ *
+ * `loginSessionReplaced(...)` — the check every such login runs after EACH
+ * await between its authSessions.set and its seat restore (right after its
+ * loginSocketGone check). true = overtaken: the caller stops at once — no seat
+ * restored, no reconnectedToTable, no loginResult (the socket is not this
+ * account's any more; as on a dead socket, the client hears nothing further
+ * for this request). A REAL reservation (the disconnect handler's: timer +
+ * hand count) is left exactly as it was — the account's next login restores
+ * it, or its own expiry / hand limit ends it (cash: credited to THAT account
+ * once; tournament: T1); a SYNTHETIC one this login's orphan scan built is
+ * dropped, as loginSocketGone does. The other account's session is never
+ * touched. The seat-restore gate (refuseSeatRestoreIfBarred) makes the same
+ * check after its own await and then acts on nothing.
+ * /api/health playGate.loginsAbandonedSessionReplaced.
+ */
+const loginsOvertaken = { abandoned: 0 };
+function socketSessionOvertaken(socket: Socket, mine: SocketAuthSession): boolean {
+  const now = authSessions.get(socket.id);
+  if (now === mine) return false;
+  return !(now && now.userId === mine.userId);
+}
+function loginSessionReplaced(
+  socket: Socket, mine: SocketAuthSession, via: string, stage: string,
+  opts: { dropSyntheticReservationOf?: number } = {},
+): boolean {
+  if (!socketSessionOvertaken(socket, mine)) return false;
+  loginsOvertaken.abandoned++;
+  let syntheticDropped = false;
+  if (opts.dropSyntheticReservationOf !== undefined) {
+    const r = reservedSeats.get(opts.dropSyntheticReservationOf);
+    if (r && !r.cleanupTimer) { reservedSeats.delete(opts.dropSyntheticReservationOf); syntheticDropped = true; }
+  }
+  console.warn(`[login] ${JSON.stringify({
+    event: 'login_abandoned_session_replaced', via, stage, localUserId: mine.userId,
+    socketNowUserId: authSessions.get(socket.id)?.userId ?? null,
+    reservationKept: reservedSeats.has(mine.userId), syntheticDropped,
+  })}`);
+  return true;
+}
+
+/**
+ * 2026-10-10 — is (tableId, seatIndex) held by ANOTHER account's live
+ * reservation? The post-restart orphan-seat scans in oauthLogin (by display
+ * NAME) and tokenLogin (by playerId) claimed any matching occupied seat with no
+ * live session — including one reserved for a DIFFERENT account (its socket
+ * dropped, or P4 reserved it on an account switch). On a shared browser B's
+ * sign-in, with B's display name equal to A's seat's (ticket names 'First L.'
+ * collide), synthesized a reservation onto A's seat and restored it under B:
+ * A's stack was then credited to B. A reserved seat belongs to its
+ * reservation's account. A real reservation (cleanupTimer) counts until its
+ * timer ends it; a synthetic one only within its 60s window.
+ */
+function seatReservedByOtherAccount(userId: number, tableId: string, seatIndex: number): boolean {
+  const now = Date.now();
+  for (const [uid, r] of reservedSeats) {
+    if (uid === userId || r.tableId !== tableId || r.seatIndex !== seatIndex) continue;
+    if (r.cleanupTimer || r.expiresAt > now) return true;
+  }
+  return false;
+}
+// ===== end login overtake guard =====
+
 /**
  * 2026-10-10 (F3) — a BUY-IN can outlive its socket, exactly like a login
  * (U1). Every seat-buying handler awaits (the play gate, the ban check, the
@@ -1421,33 +1502,109 @@ function loginSocketGone(
  * before it emits 'disconnect'. /api/health playGate.buyInsAbandonedSocketGone.
  */
 const buyInsOnDeadSocket = { abandoned: 0, refunded: 0, refundFailed: 0 };
+
+/**
+ * 2026-10-10 (P3) — the state a buy-in was PRICED AGAINST, re-checked after its
+ * awaits on a socket that is still LIVE (F3 above only covers a dead socket).
+ * The awaits (balance read, deduct) are DB round-trips; meanwhile the same
+ * live socket can leave the table (`leaveTable` → handlePlayerLeave credits
+ * the stack and stands the seat up — PokerTable.standUp REPLACES the seat
+ * object), be stood up by another device's join (ghost-seat clear), by the
+ * hand-start suspension gate or the guest carry-over, sit down elsewhere
+ * through a second buy-in, switch ACCOUNT (P4), or see the table removed.
+ * Rebuy then added the top-up to a detached seat object and the chips were
+ * gone (repro: leave during the deduct → wallet 96,000 of 102,000); a join
+ * seated on a removed table, or under another account's session.
+ *   userId      — the socket must still be signed in as the account charged;
+ *   mainSession — playerSessions.get(socket.id) must still be exactly this
+ *                 object (null = must still have none: the join left it before
+ *                 its awaits), and for a top-up still point at the seat;
+ *   table       — the table must still be the live object under that id;
+ *   seat        — table.seats[seatIndex] must still be that occupied object;
+ *   answer      — how a LIVE socket is told (default: `error` with
+ *                 code 'buy_in_cancelled').
+ * Returns the reason ('user_changed' | 'session_changed' | 'table_gone' |
+ * 'seat_gone'), or null when nothing changed.
+ */
+interface BuyInExpectation {
+  userId?: number;
+  mainSession?: PlayerSession | null;
+  table?: { tableId: string; table: PokerTable };
+  seat?: { tableId: string; table: PokerTable; seatIndex: number; seat: unknown };
+  answer?: (reason: string) => void;
+}
+const buyInsOnStaleState = { abandoned: 0, refunded: 0, refundFailed: 0 };
+const BUY_IN_CANCELLED_MESSAGE = 'Your table changed before your buy-in went through, so it was cancelled — any chips taken were returned. Please try again.';
+function buyInStateChanged(socket: Socket, expect: BuyInExpectation): string | null {
+  if (expect.userId !== undefined && authSessions.get(socket.id)?.userId !== expect.userId) return 'user_changed';
+  if (expect.mainSession !== undefined) {
+    const now = playerSessions.get(socket.id);
+    const same = expect.mainSession === null ? now === undefined : now === expect.mainSession;
+    if (!same) return expect.seat ? 'seat_gone' : 'session_changed';
+  }
+  if (expect.table && tableManager.getTable(expect.table.tableId) !== expect.table.table) {
+    return expect.seat ? 'seat_gone' : 'table_gone';
+  }
+  if (expect.seat) {
+    const { tableId, table, seatIndex, seat } = expect.seat;
+    if (tableManager.getTable(tableId) !== table) return 'seat_gone';
+    const live = table.seats[seatIndex];
+    if (live !== seat || live.state !== 'occupied') return 'seat_gone';
+    const s = expect.mainSession;
+    if (s && (s.tableId !== tableId || s.seatIndex !== seatIndex)) return 'seat_gone';
+  }
+  return null;
+}
+
+/**
+ * F3 + P3 — true = stop this buy-in now: the socket is gone (F3), or — when
+ * `expect` is passed — it is live but the state the buy-in was priced against
+ * changed (P3). Either way nothing is seated / registered / topped up, and a
+ * deducted buy-in (`refund`) is returned EXACTLY ONCE through addChipsToUser
+ * with an audit row whose reason says why ('socket_gone' or the P3 reason).
+ * A live socket is answered (expect.answer, else `error {code:'buy_in_cancelled'}`).
+ */
 async function buyInSocketGone(
   socket: Socket, via: string, stage: string,
   refund?: { userId: number; username: string; amount: number; tableId?: string | null; action?: string },
+  expect?: BuyInExpectation,
 ): Promise<boolean> {
-  if (socket.connected) return false;
-  buyInsOnDeadSocket.abandoned++;
+  let reason = 'socket_gone';
+  if (socket.connected) {
+    const changed = expect ? buyInStateChanged(socket, expect) : null;
+    if (!changed) return false;
+    reason = changed;
+  }
+  const counters = reason === 'socket_gone' ? buyInsOnDeadSocket : buyInsOnStaleState;
+  counters.abandoned++;
   let refundResult: 'none' | 'refunded' | 'failed' = 'none';
   if (refund && refund.amount > 0) {
     const action = refund.action || 'BUY_IN_REFUND';
-    const detail = { userId: refund.userId, tableId: refund.tableId ?? null, amount: refund.amount, reason: 'socket_gone', via, stage };
+    const detail = { userId: refund.userId, tableId: refund.tableId ?? null, amount: refund.amount, reason, via, stage };
     try {
       const ok = await addChipsToUser(refund.userId, refund.amount);
       refundResult = ok ? 'refunded' : 'failed';
       auditLog(refund.username, ok ? action : `${action}_FAILED`, detail);
     } catch (e: any) {
       refundResult = 'failed';
-      console.error(`[buy-in] socket-gone refund failed for userId=${refund.userId} amount=${refund.amount} (${via}):`, e?.message || e);
-      if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.buyInSocketGoneRefund' }, extra: { userId: refund.userId, amount: refund.amount, via } });
+      console.error(`[buy-in] ${reason} refund failed for userId=${refund.userId} amount=${refund.amount} (${via}):`, e?.message || e);
+      if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.buyInSocketGoneRefund' }, extra: { userId: refund.userId, amount: refund.amount, via, reason } });
       auditLog(refund.username, `${action}_FAILED`, { ...detail, error: String(e?.message || e) });
     }
-    if (refundResult === 'refunded') buyInsOnDeadSocket.refunded++;
-    else buyInsOnDeadSocket.refundFailed++;
+    if (refundResult === 'refunded') counters.refunded++;
+    else counters.refundFailed++;
   }
   console.warn(`[buy-in] ${JSON.stringify({
-    event: 'buy_in_abandoned_socket_gone', via, stage, localUserId: refund?.userId ?? null,
+    event: reason === 'socket_gone' ? 'buy_in_abandoned_socket_gone' : 'buy_in_abandoned_state_changed',
+    via, stage, reason, localUserId: refund?.userId ?? null,
     tableId: refund?.tableId ?? null, amount: refund?.amount ?? 0, refundResult,
   })}`);
+  if (reason !== 'socket_gone') {
+    try {
+      if (expect?.answer) expect.answer(reason);
+      else socket.emit('error', { message: BUY_IN_CANCELLED_MESSAGE, code: 'buy_in_cancelled' });
+    } catch { /* answering is best-effort; the refund already happened */ }
+  }
   return true;
 }
 
@@ -1939,12 +2096,24 @@ function isTournamentReservation(reserved: { tableId: string; tournament?: boole
  * (SEAT_RESERVE_MS), then pruned. Table ids are UUIDs, never reused.
  */
 const brokenTournamentTables = new Map<string, { tournamentId: string; brokenAt: number }>();
+/**
+ * P8 (2026-10-10) — retention is by TIME, not "until the next break": an entry
+ * older than SEAT_RESERVE_MS + 1h is dropped on every write, on every read of
+ * that table (isTournamentTable), on the 5s rebalance sweep and before
+ * /api/health counts `brokenTablesRetained` (before P8 the entries of the
+ * day's last break stayed until the next one).
+ */
+function brokenTournamentTableExpired(b: { brokenAt: number }, now: number): boolean {
+  return now - b.brokenAt > SEAT_RESERVE_MS + 60 * 60_000;
+}
+function pruneBrokenTournamentTables(now: number = Date.now()): void {
+  for (const [id, b] of brokenTournamentTables) {
+    if (brokenTournamentTableExpired(b, now)) brokenTournamentTables.delete(id);
+  }
+}
 function noteBrokenTournamentTable(tableId: string, tournamentId: string): void {
   const now = Date.now();
-  const retainMs = SEAT_RESERVE_MS + 60 * 60_000;
-  for (const [id, b] of brokenTournamentTables) {
-    if (now - b.brokenAt > retainMs) brokenTournamentTables.delete(id);
-  }
+  pruneBrokenTournamentTables(now);
   brokenTournamentTables.set(tableId, { tournamentId, brokenAt: now });
 }
 /**
@@ -1955,8 +2124,42 @@ function noteBrokenTournamentTable(tableId: string, tournamentId: string): void 
  * tournament's id — a broken table plays no further part in it.)
  */
 function isTournamentTable(tableId: string): boolean {
-  return tournamentTables.has(tableId) || brokenTournamentTables.has(tableId);
+  if (tournamentTables.has(tableId)) return true;
+  const broken = brokenTournamentTables.get(tableId);
+  if (broken && brokenTournamentTableExpired(broken, Date.now())) brokenTournamentTables.delete(tableId); // P8
+  return brokenTournamentTables.has(tableId);
 }
+
+/**
+ * 2026-10-10 (P5) — a CASH buy-in is never taken at a tournament table (live,
+ * or one a rebalance just broke — isTournamentTable). Every cash-out path
+ * treats a seat there as a TOURNAMENT seat and never credits it (F2 / the
+ * tournament-economy rule), so before P5 a player who joined one through the
+ * lobby list (getTableList lists tournament tables too), Quick Play (which
+ * prefers the emptiest tables — often tournament tables), an invite code, an
+ * additional-table join or a waitlist link had the table minimum deducted
+ * (for a qualifier, the 50,000 starting stack) and never got it back.
+ * Refused BEFORE any side effect, on the channel the caller listens to, with
+ * code 'tournament_table'. Counted on /api/health playGate.cashJoinsRefusedAtTournamentTable.
+ */
+const TOURNAMENT_TABLE_JOIN_MESSAGE = 'That is a tournament table — register for the tournament to play there.';
+const cashJoinsAtTournamentTable = { refused: 0 };
+function refuseCashJoinAtTournamentTable(socket: Socket, via: string, tableId: string, channel: 'error' | 'joinError' = 'error'): void {
+  cashJoinsAtTournamentTable.refused++;
+  console.warn(`[buy-in] ${JSON.stringify({
+    event: 'cash_join_refused_tournament_table', via, tableId, broken: !tournamentTables.has(tableId),
+  })}`);
+  socket.emit(channel, { message: TOURNAMENT_TABLE_JOIN_MESSAGE, code: 'tournament_table' });
+}
+
+/**
+ * 2026-10-10 (P4) — joinWithWaitlistContext refuses a socket already signed in
+ * to another (or an unprovable) account than the waitlist ticket's
+ * (`account_mismatch`): the link's seat and buy-in are the ticket account's.
+ */
+const WAITLIST_ACCOUNT_MISMATCH_MESSAGE =
+  'This waitlist link is for a different account than the one signed in here. Sign out, then open the link again.';
+const waitlistAccountMismatches = { refused: 0 };
 
 /**
  * 2026-10-09 (T1) — record that a tournament seat's reservation reached a
@@ -2081,6 +2284,7 @@ app.get('/api/health', async (_req, res) => {
     // the answer to the TEXT-vs-JSONB question the guard's durability rests on
     // (see probeStatsColumnType) — anything other than `jsonb` means the
     // adoption stamp is not trustworthy and enforce must stay off.
+    pruneBrokenTournamentTables(); // P8 — brokenTablesRetained counts only entries still retained
     res.json({
       status: 'ok',
       tables: tableManager.getTableList().length,
@@ -2111,11 +2315,28 @@ app.get('/api/health', async (_req, res) => {
         // stopped before setting a session / restoring a seat (a reservation
         // is left for the next reconnect). See loginSocketGone.
         loginsAbandonedSocketGone: loginsOnDeadSocket.abandoned,
+        // 2026-10-10 (Q3) — logins OVERTAKEN on a live socket: another
+        // account signed the socket in during their seat-restore gate, so they
+        // restored nothing (a real reservation is left for that account). See
+        // loginSessionReplaced.
+        loginsAbandonedSessionReplaced: loginsOvertaken.abandoned,
         // 2026-10-10 (F3) — seat buy-ins whose socket dropped while they
         // awaited: nothing seated; a buy-in already deducted refunded once
         // (refundFailed > 0 = an audited BUY_IN_REFUND_FAILED-class row to
         // reconcile). See buyInSocketGone.
         buyInsAbandonedSocketGone: { ...buyInsOnDeadSocket },
+        // 2026-10-10 (P3) — buy-ins on a LIVE socket whose session / seat /
+        // account / table changed while they awaited: nothing seated or topped
+        // up, the deducted buy-in refunded once (audit reason user_changed /
+        // session_changed / table_gone / seat_gone).
+        buyInsAbandonedStateChanged: { ...buyInsOnStaleState },
+        // 2026-10-10 (P5) — cash joins refused at a tournament table.
+        cashJoinsRefusedAtTournamentTable: cashJoinsAtTournamentTable.refused,
+        // 2026-10-10 (P4) — logins that moved a socket to ANOTHER account
+        // (the previous account's seat reserved / left first), and waitlist
+        // links refused because the socket was signed in to another account.
+        accountSwitches: { ...socketAccountSwitches },
+        waitlistAccountMismatches: waitlistAccountMismatches.refused,
         ...playStatusClient.counters(),
         cacheSize: playStatusClient.cacheSize(),
         // 2026-10-09 — players found suspended mid-session and stood up before
@@ -2130,10 +2351,20 @@ app.get('/api/health', async (_req, res) => {
       // table itself; reentrantStartsRefused = startNewHand called on a table
       // already inside one (should stay 0); brokenTablesRetained = broken
       // tournament tables still treated as tournament tables (F2).
+      // 2026-10-10 (P1/P2/P6): completingHandStartsRefused = startNewHand
+      // called inside the previous hand's completion (should stay 0);
+      // breaksDeferredMidHand / breaksAbortedNoSeats (should stay 0) /
+      // bustedSeatsVacated / reconnectedSessionsMoved / reservationsMoved;
+      // (Q1) breaksDeferredPendingBust, reentrySessionsCreated.
       tournamentSafety: {
         ...tournamentHandStartSafety,
         reentrantStartsRefused: PokerTable.reentrantStartsRefused,
+        completingHandStartsRefused: PokerTable.completingHandStartsRefused,
         brokenTablesRetained: brokenTournamentTables.size,
+        // 2026-10-10 — tournament starts whose registration socket was no
+        // longer the registrant's: rebound = seat bound to his own other
+        // socket, unbound = dealt in absent (bindRegistrantSocket).
+        registrantSockets: { ...registrantBindings },
       },
       // 2026-10-09 — R1 resumable ticket sessions. enabled:false = JWT_SECRET
       // missing in prod (tokens would be forgeable) — every resume refused.
@@ -2584,9 +2815,13 @@ setInterval(() => {
       qt.status = 'running';
       qt.tournamentId = result.tournamentId;
 
-      // Notify all registered players
+      // Notify all registered players — 2026-10-10: on the socket his seat was
+      // bound to (bindRegistrantSocket — his own; '' = none), never on a
+      // registration socket that is now another account's.
+      const startedT = tournamentManager.getTournament(result.tournamentId);
       for (const p of qt.players) {
-        const sock = io.sockets.sockets.get(p.socketId);
+        const boundSid = startedT?.players.find((x) => x.playerId === p.playerId)?.socketId ?? '';
+        const sock = boundSid ? io.sockets.sockets.get(boundSid) : undefined;
         if (sock) {
           const playerTable = tournamentManager.getPlayerTable(result.tournamentId, p.playerId);
           sock.emit('qualifierTournamentStarted', {
@@ -4215,12 +4450,22 @@ function autoStartNextHand(tableId: string): void {
     return;
   }
   if (tId) {
+    // P1 (2026-10-10) — a table break DEFERRED because this table was mid-hand
+    // runs here, at its hand boundary, before it deals again.
+    if (tournamentBreaksAwaitingHandEnd.get(tableId) === tId) {
+      tournamentBreaksAwaitingHandEnd.delete(tableId);
+      handleTableRebalance(tId);
+      if (!tournamentTables.has(tableId)) return;   // broken: its players were moved
+    }
     const tourn = tournamentManager.getTournament(tId);
     if (tourn && tourn.tableIds.length > 1) {
       const aliveOnTable = tourn.players.filter(
         p => !p.eliminated && tourn.playerTableMap.get(p.playerId) === tableId
       ).length;
-      if (aliveOnTable < 5) {
+      // P1 — wait for a rebalance only when one CAN happen: when no table can
+      // be broken (not enough free seats elsewhere), this table plays on
+      // short-handed instead of waiting forever.
+      if (aliveOnTable < 5 && planTournamentRebalance(tId)) {
         // Trigger rebalance and don't start hand
         handleTableRebalance(tId);
         return;
@@ -4824,8 +5069,13 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
 
   // Send updated progress to all human players at the table
   // and persist key stats (incl. lastHandAt) to DB for leaderboard accuracy
+  // Q1 (2026-10-10) — each player's persistence is isolated (try/catch): a
+  // throw here used to skip every later player AND the tournament bust check
+  // below, leaving a 0-chip entrant alive in the tournament forever — and the
+  // rebalance now waits for exactly that bust check before breaking his table
+  // (pendingTournamentBustSeat), so it must always run.
   for (const [socketId, session] of playerSessions) {
-    if (session.tableId === tableId) {
+    if (session.tableId === tableId) try {
       sendProgressToPlayer(socketId);
       const authSession = authSessions.get(socketId);
       if (authSession) {
@@ -4901,12 +5151,28 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
           }
         }
       }
+    } catch (e: any) {
+      console.warn(`[hand-complete] progress persistence failed for socket ${socketId} (table ${tableId}) — continuing:`, e?.message || e);
     }
   }
 
   // Tournament elimination tracking: if this table is part of a tournament,
   // record busted players so finish positions and bounty payouts are correct.
-  const tournamentId = tournamentTables.get(tableId);
+  // Q1 (2026-10-10) — resolved HERE, after the awaits above. While they ran, a
+  // rebalance triggered ELSEWHERE (another table's bust, the 5s sweep, a
+  // deferred break) could break THIS table: it leaves tournamentTables at
+  // once, so `tournamentTables.get` alone found nothing, this hand's busts were
+  // never eliminated and the 0-chip entrant stayed ALIVE with no seat — the
+  // tournament could never finish. The broken-table registry still names the
+  // tournament. (handleTableRebalance now also refuses to break a table whose
+  // bust check is pending — this is the second lock.) Each bust is eliminated
+  // exactly once: seat.eliminated is set before eliminatePlayer, which itself
+  // ignores an entrant already out.
+  const tournamentId = tournamentTables.get(tableId) ?? brokenTournamentTables.get(tableId)?.tournamentId;
+  const tableBroken = !!tournamentId && !tournamentTables.has(tableId);
+  if (tableBroken) {
+    console.warn(`[Tournament] ${JSON.stringify({ event: 'bust_check_on_broken_table', tableId, tournamentId })}`);
+  }
   if (tournamentId) {
     // Identify this hand's pot winners IN POT ORDER (results are emitted main-pot
     // first, then each side pot). 2026-07-05 audit P2 fix: previously the FIRST
@@ -4952,14 +5218,13 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
             // a UI event + counter, so the bounty mechanic did nothing. These
             // are tournament chips (wallet-isolated), so it's a play-chip
             // reward, not a wallet mint. The eliminator won the busting pot on
-            // THIS table, so their seat is here.
-            for (let j = 0; j < MAX_SEATS; j++) {
-              const es = table.seats[j];
-              if (es?.playerId === eliminatorId && es.state === 'occupied') {
-                es.chipCount += result.bountyPayout;
-                break;
-              }
-            }
+            // THIS table, so his seat is here — his LIVE seat (Q2, 2026-10-10:
+            // a re-entered qualifier player's OLD busted seat carries the same
+            // playerId; crediting it lost the bounty) — unless a rebalance
+            // broke this table meanwhile (Q1): his stack was then moved, and
+            // the copy left here is discarded with the table.
+            const bountySeat = tournamentLiveSeatOf(tournamentId, eliminatorId, tableBroken ? undefined : tableId);
+            if (bountySeat) bountySeat.chipCount += result.bountyPayout;
             // Notify eliminator
             for (const [sid, s] of playerSessions) {
               if (s.playerId === eliminatorId) {
@@ -4975,14 +5240,20 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
             if (tp) {
               const sock = io.sockets.sockets.get(tp.socketId);
               if (sock) {
-                // Add as spectator on their current table
-                const specSet = spectators.get(tableId) || new Set();
+                // Add as spectator on their current table (Q1: a table a
+                // rebalance broke is removed within 5s — he watches one of
+                // the tournament's live tables instead).
+                const specTableId = tableBroken
+                  ? (tournamentManager.getTournament(tournamentId)?.tableIds[0] ?? tableId)
+                  : tableId;
+                const specSet = spectators.get(specTableId) || new Set();
                 specSet.add(tp.socketId);
-                spectators.set(tableId, specSet);
+                spectators.set(specTableId, specSet);
+                if (specTableId !== tableId) sock.join(`table:${specTableId}`);
 
                 sock.emit('eliminatedToSpectator', {
                   tournamentId,
-                  tableId,
+                  tableId: specTableId,
                   position: result.position,
                   totalPlayers: tournamentManager.getTournament(tournamentId)?.players.length || 0,
                   status: tournamentManager.getTournamentStatus(tournamentId),
@@ -5209,6 +5480,7 @@ function standUpRefusedSeat(userId: number, username: string, tableId: string, s
  */
 async function refuseSeatRestoreIfBarred(
   socket: Socket, userId: number, username: string, via: string,
+  mine?: SocketAuthSession,
 ): Promise<PlayRefusal | null> {
   const pending = reservedSeats.get(userId);
   const hasReservation = !!(pending && pending.expiresAt > Date.now());
@@ -5220,6 +5492,12 @@ async function refuseSeatRestoreIfBarred(
   // handler owns this socket's seat). The caller's own loginSocketGone check,
   // right after this await, stops the login.
   if (!socket.connected) return refusal;
+  // Q3 (2026-10-10) — another ACCOUNT's login took this socket during the
+  // lookup: act on NOTHING (the socket's seat, if any, is that account's now —
+  // the 'stand_up' branch below would have left it), and the answer was about
+  // whatever session the socket held by then. The caller's loginSessionReplaced
+  // check, right after this await, stops the login.
+  if (mine && socketSessionOvertaken(socket, mine)) return refusal;
   const action = seatRestoreAction(refusal);
   if (!refusal || action === 'restore') return null;
 
@@ -5331,7 +5609,17 @@ const playGateHandStart = { standUps: 0, disqualified: 0, absentDisqualified: 0,
  * PokerTable also refuses a nested startNewHand on the same table outright.
  */
 const tournamentRebalanceHolds = new Map<string, { depth: number; pending: boolean }>();
-const tournamentHandStartSafety = { rebalancesHeld: 0, handStartsVetoed: 0, heldRebalanceErrors: 0 };
+// P1/P6 (2026-10-10) counters ride along: breaksDeferredMidHand (a break waited
+// for that table's hand boundary), breaksAbortedNoSeats (should stay 0),
+// bustedSeatsVacated, reconnectedSessionsMoved + reservationsMoved (P6).
+// Q1 (2026-10-10): breaksDeferredPendingBust (a break waited for that table's
+// bust check). Minor (2026-10-10): reentrySessionsCreated (a qualifier
+// re-entry whose socket had no session — e.g. its busted seat was vacated).
+const tournamentHandStartSafety = {
+  rebalancesHeld: 0, handStartsVetoed: 0, heldRebalanceErrors: 0,
+  breaksDeferredMidHand: 0, breaksAbortedNoSeats: 0, bustedSeatsVacated: 0, reconnectedSessionsMoved: 0, reservationsMoved: 0,
+  breaksDeferredPendingBust: 0, reentrySessionsCreated: 0,
+};
 function holdTournamentRebalance(tournamentId: string): void {
   const h = tournamentRebalanceHolds.get(tournamentId);
   if (h) h.depth++;
@@ -6022,6 +6310,8 @@ io.on('connection', (socket: Socket) => {
     // stripped from the loginResult frame below (same wire shape as before).
     const { attestedMasterUserId, ...wireResult } = result;
     if (result.success && result.userData) {
+      // P4 (2026-10-10) — never rebind this socket under another account's seat.
+      releaseSocketForAccountSwitch(socket, result.userData.id, 'login');
       authSessions.set(socket.id, {
         userId: result.userData.id,
         username: result.userData.username,
@@ -6074,6 +6364,8 @@ io.on('connection', (socket: Socket) => {
     }
     const result = await registerUser(data.username, data.password);
     if (result.success && result.userData) {
+      // P4 (2026-10-10) — never rebind this socket under another account's seat.
+      releaseSocketForAccountSwitch(socket, result.userData.id, 'register');
       authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username, statsMasterUserId: null });
     }
     socket.emit('registerResult', result);
@@ -6265,10 +6557,15 @@ io.on('connection', (socket: Socket) => {
         // qualifier carries a chip buy-in.
         const buyIn = Math.floor(qt.buyIn || 0);
         // F3 (2026-10-10) — the socket may have dropped during the qualification check.
-        if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'qualified_check')) return;
+        // P3 — and a LIVE socket must still be signed in as the account that is re-entering.
+        const reentryState: BuyInExpectation = {
+          userId: auth.userId,
+          answer: () => socket.emit('qualifierRegistrationResult', { success: false, error: BUY_IN_CANCELLED_MESSAGE, code: 'buy_in_cancelled', qualifierId: qualId }),
+        };
+        if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'qualified_check', undefined, reentryState)) return;
         if (buyIn > 0) {
           const dbChips = await ensureChipsForBuyIn(auth.userId, auth.username, buyIn);
-          if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'balance_read')) return; // nothing deducted yet
+          if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'balance_read', undefined, reentryState)) return; // nothing deducted yet
           if (buyIn > dbChips) {
             socket.emit('qualifierRegistrationResult', { success: false, error: 'Insufficient chips for re-entry' });
             return;
@@ -6281,7 +6578,7 @@ io.on('connection', (socket: Socket) => {
           // F3 — dropped during the deduct: refund it before a credit is consumed.
           if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'deduct', {
             userId: auth.userId, username: auth.username, amount: buyIn, action: 'QUALIFIER_REENTRY_BUYIN_REFUND',
-          })) return;
+          }, reentryState)) return;
         }
 
         // (c) Qualifier-credit consumption — atomic conditional update
@@ -6328,13 +6625,14 @@ io.on('connection', (socket: Socket) => {
           // no session and would only be blinded out.
           if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'credit_consume', buyIn > 0 ? {
             userId: auth.userId, username: auth.username, amount: buyIn, action: 'QUALIFIER_REENTRY_BUYIN_REFUND',
-          } : undefined)) {
+          } : undefined, reentryState)) {
             if (consumedCreditId) {
               const refunded = await refundQualifierCreditOnMaster(consumedCreditId);
               auditLog(
                 auth.username,
                 refunded ? 'QUALIFIER_REENTRY_CREDIT_REFUND' : 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED',
-                { qualifierId: qualId, creditId: consumedCreditId, reason: 'socket_gone' },
+                // P3: a live socket here means its account changed (user_changed).
+                { qualifierId: qualId, creditId: consumedCreditId, reason: socket.connected ? 'user_changed' : 'socket_gone' },
               );
             }
             return;
@@ -6359,9 +6657,24 @@ io.on('connection', (socket: Socket) => {
             // Un-eliminate the player in tournament manager
             const tp = tournament.players.find(p => p.playerId === existingEntry.playerId);
             if (tp) { tp.eliminated = false; tp.chips = startingStack; }
-            // Update socket session
+            // Update socket session — or CREATE one (2026-10-10). A rebalance
+            // that stood his busted seat up for a moved player
+            // (vacateBustedTournamentSeat) dropped his session and left him
+            // spectating: re-seated with no session he could never act — the
+            // turn timer blinded his new stack out.
             const sess = playerSessions.get(socket.id);
             if (sess) { sess.tableId = tid; sess.seatIndex = s; }
+            else {
+              playerSessions.set(socket.id, {
+                socketId: socket.id, tableId: tid, seatIndex: s,
+                playerName: existingEntry.playerName, playerId: existingEntry.playerId,
+                trainingEnabled: false, sittingOut: false,
+              });
+              tournamentHandStartSafety.reentrySessionsCreated++;
+              console.log(`[Tournament] ${JSON.stringify({ event: 'reentry_session_created', tableId: tid, seatIndex: s, playerId: existingEntry.playerId })}`);
+            }
+            // He plays again — no longer a spectator of this tournament's tables.
+            for (const ttid of tournament.tableIds) spectators.get(ttid)?.delete(socket.id);
             socket.join(`table:${tid}`);
             seated = true;
             console.log(`[Tournament] Re-entry: ${existingEntry.playerName} seated at table ${tid} seat ${s}`);
@@ -7079,12 +7392,17 @@ Give feedback in this JSON format:
       // U1 — the socket dropped during the awaits above: set no session on it
       // and restore nothing (a reservation stays for the next reconnect).
       if (loginSocketGone(socket, 'oauthLogin', 'before_session', { localUserId: userId })) return;
+      // P4 (2026-10-10) — never rebind this socket under another account's seat.
+      releaseSocketForAccountSwitch(socket, userId, 'oauthLogin');
       authSessions.set(socket.id, {
         userId,
         username: localUser.username,
         masterUserId: String(oauthResult.sub),  // master-API users.id = qualifier player_id
         phone: String(phone),
       });
+      // Q3 (2026-10-10) — kept: after every await below, the seat is restored
+      // only while the socket is still signed in as THIS session's account.
+      const oauthSession = authSessions.get(socket.id)!;
 
       // 2026-06-12 — SEAT RECOVERY on the .online PRIMARY login/reconnect path.
       // oauthLogin previously had NONE (only tokenLogin did), so every reconnect
@@ -7115,6 +7433,9 @@ Give feedback in this JSON format:
               const seat = table.seats[i];
               if (seat.state !== 'occupied' || seat.isAI) continue;
               if (seat.playerName !== recoverName) continue;
+              // 2026-10-10 — a seat RESERVED for another account is that
+              // account's, whatever its name (ticket names collide).
+              if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;
               let liveSession = false;
               for (const [sid, sess] of playerSessions) {
                 if (sid === socket.id) continue;
@@ -7137,10 +7458,13 @@ Give feedback in this JSON format:
         // is not put back at the table; his reserved seat is stood up instead
         // and the refusal is sent after loginResult. No-op (no lookup) when
         // there is nothing to restore. A refusal also skips (b).
-        seatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, localUser.username, 'oauthLogin');
+        seatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, localUser.username, 'oauthLogin', oauthSession);
         // U1 — the socket dropped during the gate: no restore onto it. A real
         // reservation stays intact; the synthetic one (a) built is dropped.
         if (loginSocketGone(socket, 'oauthLogin', 'after_seat_restore_gate', { dropSyntheticReservationOf: userId })) return;
+        // Q3 — another account's login took this socket during the gate: no
+        // restore under it (same reservation rules as U1).
+        if (loginSessionReplaced(socket, oauthSession, 'oauthLogin', 'after_seat_restore_gate', { dropSyntheticReservationOf: userId })) return;
         // (b) Restore the reserved seat (the normal reconnect path).
         const reserved = reservedSeats.get(userId);
         if (!seatRestoreRefusal && reserved && reserved.expiresAt > Date.now()) {
@@ -7372,12 +7696,16 @@ Give feedback in this JSON format:
         if (progress.success && progress.userData) {
           // U1 — the socket dropped during the awaits above: no session, no restore.
           if (loginSocketGone(socket, 'tokenLogin', 'before_session', { localUserId: userId })) return;
+          // P4 (2026-10-10) — never rebind this socket under another account's seat.
+          releaseSocketForAccountSwitch(socket, userId, 'tokenLogin');
           authSessions.set(socket.id, {
             userId,
             username: _tlLocalUser.username,
             masterUserId: String(oauthResult.sub),
             phone: String(_tlPhone),
           });
+          // Q3 (2026-10-10) — kept for the overtake check after the gate below.
+          const tlSession = authSessions.get(socket.id)!;
 
           // Post-restart seat recovery: Railway redeploy wipes in-memory
           // state (including reservedSeats Map). But table state was
@@ -7393,6 +7721,8 @@ Give feedback in this JSON format:
                 const seat = table.seats[i];
                 if (seat.state !== 'occupied' || seat.isAI) continue;
                 if (seat.playerId !== expectedPlayerId) continue;
+                // 2026-10-10 — never a seat RESERVED for another account.
+                if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;
                 // Found an orphaned seat for this user. Reserve it so the
                 // block below treats it as a normal reconnect. No cleanupTimer
                 // needed — this synthetic reservation will be consumed
@@ -7420,10 +7750,12 @@ Give feedback in this JSON format:
           // 2026-10-07 play gate — same as oauthLogin (a2): a player who may
           // not play is not put back at the table; the refusal is sent after
           // loginResult below.
-          const tlSeatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, _tlLocalUser.username, 'tokenLogin');
+          const tlSeatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, _tlLocalUser.username, 'tokenLogin', tlSession);
           // U1 — the socket dropped during the gate: no restore onto it (a real
           // reservation stays; the synthetic one from the orphan scan is dropped).
           if (loginSocketGone(socket, 'tokenLogin', 'after_seat_restore_gate', { dropSyntheticReservationOf: userId })) return;
+          // Q3 — another account's login took this socket during the gate.
+          if (loginSessionReplaced(socket, tlSession, 'tokenLogin', 'after_seat_restore_gate', { dropSyntheticReservationOf: userId })) return;
 
           // Check for reserved seat (same reconnection logic as legacy)
           const reserved = reservedSeats.get(userId);
@@ -7509,17 +7841,24 @@ Give feedback in this JSON format:
         if (loginSocketGone(socket, 'tokenLogin_legacy', 'before_session', { localUserId: userId })) return;
         // 2026-10-07 play gate: legacy tokens carry no attested master id —
         // fall back to the local row's stats stamp (null for guest rows).
+        // P4 (2026-10-10) — never rebind this socket under another account's seat.
+        releaseSocketForAccountSwitch(socket, userId, 'tokenLogin_legacy');
         authSessions.set(socket.id, { userId, username: result.userData.username, statsMasterUserId: masterIdFromStats(result.userData.stats) });
+        // Q3 (2026-10-10) — kept for the overtake check after the gate below.
+        const legacySession = authSessions.get(socket.id)!;
 
         // 2026-10-07 play gate — a legacy session that may not play is not
         // put back at the table: a suspended account's seat is stood up; a
         // guest row with no American Pub Poker account (guest play off) has
         // its seat HELD on its reservation (see refuseSeatRestoreIfBarred).
         // The refusal is sent after loginResult below.
-        legacySeatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, result.userData.username, 'tokenLogin_legacy');
+        legacySeatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, result.userData.username, 'tokenLogin_legacy', legacySession);
         // U1 — the socket dropped during the gate: the session is removed and
         // the reservation + its timer are NOT consumed.
         if (loginSocketGone(socket, 'tokenLogin_legacy', 'after_seat_restore_gate', { localUserId: userId })) return;
+        // Q3 — another account's login took this socket during the gate: the
+        // reservation + its timer are NOT consumed, nothing is restored.
+        if (loginSessionReplaced(socket, legacySession, 'tokenLogin_legacy', 'after_seat_restore_gate')) return;
 
         // Check for a reserved seat and restore it
         const reserved = reservedSeats.get(userId);
@@ -9231,6 +9570,14 @@ Give feedback in this JSON format:
         socket.emit('error', { message: 'Table not found' });
         return;
       }
+      // P5 (2026-10-10) — never a CASH buy-in at a TOURNAMENT table (live, or one
+      // a rebalance just broke): every cash-out path treats that seat as a
+      // tournament seat and never credits it, so the buy-in was lost on leave.
+      // Before any side effect below (spectator scrub, leaving the old table).
+      if (isTournamentTable(tableId)) {
+        refuseCashJoinAtTournamentTable(socket, 'joinTable', tableId);
+        return;
+      }
 
       // Variant sanity check — if the client told us which variant they
       // thought they were joining, refuse to seat them at a different one.
@@ -9370,8 +9717,11 @@ Give feedback in this JSON format:
       // testing mode, ensureChipsForBuyIn auto-tops-up below-buyin balances
       // so no one ever hits "Insufficient chips" while we're iterating.
       if (authForJoin) {
+        // P3 — what this buy-in is priced against: still this account, still no
+        // seat on this socket (left above), still this live table.
+        const joinState: BuyInExpectation = { userId: authForJoin.userId, mainSession: null, table: { tableId, table } };
         const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, buyIn);
-        if (await buyInSocketGone(socket, 'joinTable', 'balance_read')) return; // F3 — nothing deducted yet
+        if (await buyInSocketGone(socket, 'joinTable', 'balance_read', undefined, joinState)) return; // F3 — nothing deducted yet
         if (buyIn > dbChips) {
           socket.emit('error', { message: 'Insufficient chips' });
           return;
@@ -9382,9 +9732,10 @@ Give feedback in this JSON format:
         }
         auditLog(authForJoin.username, 'BUY_IN_DEDUCT', { tableId, buyIn });
         // F3 — the socket dropped during the deduct: refund it, seat nothing.
+        // P3 — likewise on a live socket whose session / account / table changed.
         if (await buyInSocketGone(socket, 'joinTable', 'deduct', {
           userId: authForJoin.userId, username: authForJoin.username, amount: buyIn, tableId,
-        })) return;
+        }, joinState)) return;
       }
 
       mySlots.add(`${socket.id}:${tableSlotKey}`);
@@ -9483,7 +9834,11 @@ Give feedback in this JSON format:
         handlePlayerLeave(socket);
       }
 
-      const tables = tableManager.getTableList();
+      // P5 (2026-10-10) — never a tournament table (live or just broken): a
+      // cash buy-in there is treated as a tournament stack and never cashed out
+      // — and Quick Play prefers the emptiest tables, which often ARE
+      // tournament tables.
+      const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId));
 
       // Quick Play prefers Texas Hold'em tables. Sort: holdem first,
       // then by player count, then by smallest blinds.
@@ -9553,8 +9908,10 @@ Give feedback in this JSON format:
       const buyIn = table.config.minBuyIn;
       let chipsDeducted = false;
       if (authForJoin) {
+        // P3 — still this account, still no seat on this socket, still this live table.
+        const qpState: BuyInExpectation = { userId: authForJoin.userId, mainSession: null, table: { tableId: chosenTableId, table } };
         const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, buyIn);
-        if (await buyInSocketGone(socket, 'quickPlay', 'balance_read')) return; // F3 — nothing deducted yet
+        if (await buyInSocketGone(socket, 'quickPlay', 'balance_read', undefined, qpState)) return; // F3 — nothing deducted yet
         if (buyIn > dbChips) {
           socket.emit('error', { message: 'Insufficient chips' });
           return;
@@ -9566,9 +9923,10 @@ Give feedback in this JSON format:
         chipsDeducted = true;
         auditLog(authForJoin.username, 'QUICKPLAY_BUY_IN_DEDUCT', { tableId: chosenTableId, buyIn });
         // F3 — the socket dropped during the deduct: refund it, seat nothing.
+        // P3 — likewise on a live socket whose session / account / table changed.
         if (await buyInSocketGone(socket, 'quickPlay', 'deduct', {
           userId: authForJoin.userId, username: authForJoin.username, amount: buyIn, tableId: chosenTableId, action: 'QUICKPLAY_REFUND',
-        })) return;
+        }, qpState)) return;
       }
 
       const playerId = `player-${uuidv4()}`;
@@ -10813,6 +11171,8 @@ Give feedback in this JSON format:
         // dead socket (the disconnect handler has already run and never will
         // again). authWithTicket restores no seat; nothing else to leave intact.
         if (loginSocketGone(socket, 'authWithTicket', 'before_session', { localUserId: localUser.id })) return;
+        // P4 (2026-10-10) — never rebind this socket under another account's seat.
+        releaseSocketForAccountSwitch(socket, localUser.id, 'authWithTicket');
         authSessions.set(socket.id, { userId: localUser.id, username: localUser.username, masterUserId: String(remoteUserId), phone: String(phone) });
         const userData = {
           id: localUser.id,
@@ -10959,10 +11319,14 @@ Give feedback in this JSON format:
         // master phone-or-slug — NOT always the row's username: a row matched
         // by master id can be phone-keyed), the waitlist bootstrap's carries
         // none. The token carries whatever the original session had.
+        // P4 (2026-10-10) — never rebind this socket under another account's seat.
+        releaseSocketForAccountSwitch(socket, userId, 'resumeSession');
         authSessions.set(socket.id, {
           userId, username: row.username, masterUserId: claims.masterUserId,
           ...(claims.phone ? { phone: claims.phone } : {}),
         });
+        // Q3 (2026-10-10) — kept for the overtake check after the gate below.
+        const rsSession = authSessions.get(socket.id)!;
 
         // SEAT RECOVERY — the point of a silent resume is that the player is
         // still at his table: the seat-restore play gate, then the restore of
@@ -10974,10 +11338,13 @@ Give feedback in this JSON format:
           // (a2) The seat-restore play gate: a suspended player is not put
           // back (his seat is stood up, stack credited); no lookup at all when
           // there is nothing to restore. A refusal also skips (b).
-          rsSeatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, row.username, 'resumeSession');
+          rsSeatRestoreRefusal = await refuseSeatRestoreIfBarred(socket, userId, row.username, 'resumeSession', rsSession);
           // U1 — the socket dropped during the gate: the session set above is
           // removed and the reservation + its timer are NOT consumed.
           if (loginSocketGone(socket, 'resumeSession', 'after_seat_restore_gate', { localUserId: userId })) return;
+          // Q3 — another account's login took this socket during the gate: the
+          // reservation + its timer are NOT consumed, nothing is restored.
+          if (loginSessionReplaced(socket, rsSession, 'resumeSession', 'after_seat_restore_gate')) return;
           // (b) Restore the reserved seat.
           const reserved = reservedSeats.get(userId);
           if (!rsSeatRestoreRefusal && reserved && reserved.expiresAt > Date.now()) {
@@ -11334,11 +11701,16 @@ Give feedback in this JSON format:
                     'SELECT id, username FROM users WHERE username = $1 LIMIT 1',
                     [phone]
                   );
-                  if (urows[0]) {
+                  if (urows[0] && !authSessions.has(socket.id)) {
                     // 2026-10-07 — masterUserId = the VERIFIED ticket's user id
                     // (the same attestation authWithTicket stamps on its session);
                     // this row was found via that account's own /me.
+                    // P4 (2026-10-10) — only if no sign-in landed on this socket
+                    // during the awaits above (that session is then judged by the
+                    // account check below, never overwritten), and never under a
+                    // seat this account did not buy (releaseSocketForAccountSwitch).
                     wlBootstrapSession = { userId: urows[0].id, username: urows[0].username, masterUserId: String(remoteUserId) };
+                    releaseSocketForAccountSwitch(socket, urows[0].id, 'joinWithWaitlistContext');
                     authSessions.set(socket.id, wlBootstrapSession);
                   }
                 }
@@ -11368,6 +11740,34 @@ Give feedback in this JSON format:
           return;
         }
 
+        // P4 (2026-10-10) — the seat this link buys is the TICKET's account's. A
+        // session the socket ALREADY had (the bootstrap above is skipped then)
+        // must be that same master account. On a shared browser the stored
+        // sign-in of ANOTHER account (B) can sign this socket in while A's
+        // link is in flight; this handler then seated B and charged B's wallet
+        // for A's link. Refused (no seat, nothing deducted) unless the
+        // socket's session is provably the ticket's account: its attested
+        // master id, or the gate-only stats stamp the play gate above already
+        // resolved. An unprovable session counts as different.
+        {
+          const sessNow = authSessions.get(socket.id)!;
+          if (sessNow !== wlBootstrapSession) {
+            const sessMaster = sessNow.masterUserId
+              ? String(sessNow.masterUserId)
+              : (sessNow.statsMasterUserId ? String(sessNow.statsMasterUserId) : null);
+            if (sessMaster !== String(remoteUserId)) {
+              waitlistAccountMismatches.refused++;
+              console.warn(`[waitlistContext] ${JSON.stringify({
+                event: 'waitlist_account_mismatch', localUserId: sessNow.userId,
+                sessionMaster: sessMaster ? 'other' : 'unknown',
+              })}`);
+              reportAuthEvent('waitlist_auth_failed', { reason: 'account_mismatch' });
+              failWaitlist('account_mismatch', WAITLIST_ACCOUNT_MISMATCH_MESSAGE);
+              return;
+            }
+          }
+        }
+
         // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
         // See joinTable handler for the full rationale — same bug
         // applies on this seat-after-auth path.
@@ -11378,7 +11778,9 @@ Give feedback in this JSON format:
         // 2) Pick lowest-stakes Texas Hold'em table (Beginner's Table)
         const existingSession = playerSessions.get(socket.id);
         if (existingSession) handlePlayerLeave(socket);
-        const tables = tableManager.getTableList();
+        // P5 (2026-10-10) — a waitlist seat is a CASH buy-in: never a tournament
+        // table (live or just broken) — its stack would never be cashed out.
+        const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId));
         const isHoldem = (t: any) => {
           const tbl = tableManager.getTable(t.tableId);
           const id = (tbl as any)?.variantId || '';
@@ -11440,8 +11842,14 @@ Give feedback in this JSON format:
         // at-venue waitlist seating. Deducting here makes the seat wallet-neutral.
         const waitlistBuyIn = table.config.minBuyIn;
         if (authNow) {
+          // P3 — still this account, still no seat on this socket, still this
+          // live table; a live socket is answered on the deep link's channel.
+          const wlState: BuyInExpectation = {
+            userId: authNow.userId, mainSession: null, table: { tableId: bestTable.tableId, table },
+            answer: (reason) => failWaitlist('handler_exception', BUY_IN_CANCELLED_MESSAGE, { stage: 'state_changed', reason }),
+          };
           const dbChips = await ensureChipsForBuyIn(authNow.userId, authNow.username, waitlistBuyIn);
-          if (await buyInSocketGone(socket, 'joinWithWaitlistContext', 'balance_read')) return; // F3 — nothing deducted yet
+          if (await buyInSocketGone(socket, 'joinWithWaitlistContext', 'balance_read', undefined, wlState)) return; // F3 — nothing deducted yet
           if (waitlistBuyIn > dbChips) {
             failWaitlist('handler_exception', 'Insufficient chips', { stage: 'insufficient_chips' });
             return;
@@ -11452,9 +11860,10 @@ Give feedback in this JSON format:
           }
           auditLog(authNow.username, 'BUY_IN_DEDUCT', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, reason: 'waitlist' });
           // F3 — the socket dropped during the deduct: refund it, seat nothing.
+          // P3 — likewise on a live socket whose session / account / table changed.
           if (await buyInSocketGone(socket, 'joinWithWaitlistContext', 'deduct', {
             userId: authNow.userId, username: authNow.username, amount: waitlistBuyIn, tableId: bestTable.tableId,
-          })) return;
+          }, wlState)) return;
         }
 
         const success = table.sitDown(
@@ -11654,8 +12063,18 @@ Give feedback in this JSON format:
     }
     const authForRebuy = authSessions.get(socket.id);
     if (authForRebuy) {
+      // P3 (2026-10-10) — the top-up is for THIS seat: the same session, still
+      // pointing at it, the same live table, the same occupied seat object
+      // (standUp REPLACES it), the same account. Any of those changed during
+      // the awaits (leaveTable, another device's join, the hand-start stand-up,
+      // a guest-claim cash-out, an account switch) → the top-up is refunded.
+      const tableIdForRebuy = session.tableId;
+      const rebuyState: BuyInExpectation = {
+        userId: authForRebuy.userId, mainSession: session, table: { tableId: tableIdForRebuy, table },
+        seat: { tableId: tableIdForRebuy, table, seatIndex: session.seatIndex, seat },
+      };
       const dbChips = await ensureChipsForBuyIn(authForRebuy.userId, authForRebuy.username, topUpAmount);
-      if (await buyInSocketGone(socket, 'rebuy', 'balance_read')) return; // F3 — nothing deducted yet
+      if (await buyInSocketGone(socket, 'rebuy', 'balance_read', undefined, rebuyState)) return; // F3 — nothing deducted yet
       if (topUpAmount > dbChips) {
         socket.emit('error', { message: 'Insufficient chips for rebuy' });
         return;
@@ -11664,13 +12083,15 @@ Give feedback in this JSON format:
         socket.emit('error', { message: 'Could not deduct chips — try again' });
         return;
       }
-      auditLog(authForRebuy.username, 'REBUY_DEDUCT', { tableId: session.tableId, topUpAmount, newStack: requested });
+      auditLog(authForRebuy.username, 'REBUY_DEDUCT', { tableId: tableIdForRebuy, topUpAmount, newStack: requested });
       // F3 — the socket dropped during the deduct: its seat is now the
       // disconnect handler's reservation (an absent seat that keeps posting
       // blinds). Refund the top-up instead of adding it to that seat.
+      // P3 — likewise on a LIVE socket whose seat is gone (REBUY_REFUND, reason
+      // seat_gone; user_changed after an account switch).
       if (await buyInSocketGone(socket, 'rebuy', 'deduct', {
-        userId: authForRebuy.userId, username: authForRebuy.username, amount: topUpAmount, tableId: session.tableId, action: 'REBUY_REFUND',
-      })) return;
+        userId: authForRebuy.userId, username: authForRebuy.username, amount: topUpAmount, tableId: tableIdForRebuy, action: 'REBUY_REFUND',
+      }, rebuyState)) return;
     }
     // 2026-06-11 audit C5: a hand can auto-start during the awaits above
     // (ensureChipsForBuyIn / deductChips are DB round-trips). If it did,
@@ -11798,6 +12219,16 @@ Give feedback in this JSON format:
     const table = tableManager.getTable(session.tableId);
     if (!table) {
       socket.emit('error', { message: 'Table not found' });
+      return;
+    }
+
+    // P5 (2026-10-10) — a tournament table a rebalance BROKE never deals again
+    // (its players and stacks already sit at the target tables; it is removed
+    // 5s after the break). autoStartNextHand already returns for it; a player
+    // whose session was still on it could deal a new hand there with this
+    // event. (P6 now moves every live session off the broken table too.)
+    if (brokenTournamentTables.has(session.tableId) && !tournamentTables.has(session.tableId)) {
+      socket.emit('error', { message: 'This tournament table has closed — you have been moved to another table.', code: 'table_closed' });
       return;
     }
 
@@ -12645,15 +13076,19 @@ Give feedback in this JSON format:
     const HEADS_UP_BUYIN = 1000;
     const authHU = authSessions.get(socket.id);
     if (authHU) {
+      // P3 (2026-10-10) — still this account, and still no seat on this socket
+      // (left above): a second buy-in or an account switch during the awaits
+      // must not leave a seat behind a session this one overwrites.
+      const authHUState: BuyInExpectation = { userId: authHU.userId, mainSession: null };
       const dbChips = await ensureChipsForBuyIn(authHU.userId, authHU.username, HEADS_UP_BUYIN);
-      if (await buyInSocketGone(socket, 'quickHeadsUp', 'balance_read')) return; // F3 — nothing deducted yet
+      if (await buyInSocketGone(socket, 'quickHeadsUp', 'balance_read', undefined, authHUState)) return; // F3 — nothing deducted yet
       if (HEADS_UP_BUYIN > dbChips) { socket.emit('error', { message: 'Not enough chips for the 1,000 buy-in' }); return; }
       if (!(await deductChips(authHU.userId, HEADS_UP_BUYIN))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authHU.username, 'QUICK_BUYIN_DEDUCT', { mode: 'headsUp', buyIn: HEADS_UP_BUYIN });
       // F3 — the socket dropped during the deduct: refund it, create/seat nothing.
       if (await buyInSocketGone(socket, 'quickHeadsUp', 'deduct', {
         userId: authHU.userId, username: authHU.username, amount: HEADS_UP_BUYIN, action: 'QUICK_BUYIN_REFUND',
-      })) return;
+      }, authHUState)) return;
     }
 
     const tableId = tableManager.createHeadsUpTable(`Heads-Up Snap: ${playerName}`);
@@ -12773,15 +13208,19 @@ Give feedback in this JSON format:
     const SPINGO_BUYIN = 500;
     const authSG = authSessions.get(socket.id);
     if (authSG) {
+      // P3 (2026-10-10) — still this account, and still no seat on this socket
+      // (left above): a second buy-in or an account switch during the awaits
+      // must not leave a seat behind a session this one overwrites.
+      const authSGState: BuyInExpectation = { userId: authSG.userId, mainSession: null };
       const dbChips = await ensureChipsForBuyIn(authSG.userId, authSG.username, SPINGO_BUYIN);
-      if (await buyInSocketGone(socket, 'quickSpinGo', 'balance_read')) return; // F3 — nothing deducted yet
+      if (await buyInSocketGone(socket, 'quickSpinGo', 'balance_read', undefined, authSGState)) return; // F3 — nothing deducted yet
       if (SPINGO_BUYIN > dbChips) { socket.emit('error', { message: 'Not enough chips for the 500 Spin & Go buy-in' }); return; }
       if (!(await deductChips(authSG.userId, SPINGO_BUYIN))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authSG.username, 'QUICK_BUYIN_DEDUCT', { mode: 'spinGo', buyIn: SPINGO_BUYIN });
       // F3 — the socket dropped during the deduct: refund it, create/seat nothing.
       if (await buyInSocketGone(socket, 'quickSpinGo', 'deduct', {
         userId: authSG.userId, username: authSG.username, amount: SPINGO_BUYIN, action: 'QUICK_BUYIN_REFUND',
-      })) return;
+      }, authSGState)) return;
     }
 
     // Random multiplier: 2x (60%), 3x (25%), 5x (10%), 10x (4%), 25x (1%)
@@ -12938,15 +13377,19 @@ Give feedback in this JSON format:
     const AOF_BUYIN = 1000;
     const authAOF = authSessions.get(socket.id);
     if (authAOF) {
+      // P3 (2026-10-10) — still this account, and still no seat on this socket
+      // (left above): a second buy-in or an account switch during the awaits
+      // must not leave a seat behind a session this one overwrites.
+      const authAOFState: BuyInExpectation = { userId: authAOF.userId, mainSession: null };
       const dbChips = await ensureChipsForBuyIn(authAOF.userId, authAOF.username, AOF_BUYIN);
-      if (await buyInSocketGone(socket, 'quickAllInOrFold', 'balance_read')) return; // F3 — nothing deducted yet
+      if (await buyInSocketGone(socket, 'quickAllInOrFold', 'balance_read', undefined, authAOFState)) return; // F3 — nothing deducted yet
       if (AOF_BUYIN > dbChips) { socket.emit('error', { message: 'Not enough chips for the 1,000 buy-in' }); return; }
       if (!(await deductChips(authAOF.userId, AOF_BUYIN))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authAOF.username, 'QUICK_BUYIN_DEDUCT', { mode: 'allInOrFold', buyIn: AOF_BUYIN });
       // F3 — the socket dropped during the deduct: refund it, create/seat nothing.
       if (await buyInSocketGone(socket, 'quickAllInOrFold', 'deduct', {
         userId: authAOF.userId, username: authAOF.username, amount: AOF_BUYIN, action: 'QUICK_BUYIN_REFUND',
-      })) return;
+      }, authAOFState)) return;
     }
 
     const tableId = tableManager.createQuickTable(
@@ -13048,15 +13491,19 @@ Give feedback in this JSON format:
     // stack was minted on cash-out). Guests stay wallet-isolated.
     const authCareer = authSessions.get(socket.id);
     if (authCareer) {
+      // P3 (2026-10-10) — still this account, and still no seat on this socket
+      // (left above): a second buy-in or an account switch during the awaits
+      // must not leave a seat behind a session this one overwrites.
+      const authCareerState: BuyInExpectation = { userId: authCareer.userId, mainSession: null };
       const dbChips = await ensureChipsForBuyIn(authCareer.userId, authCareer.username, config.buyIn);
-      if (await buyInSocketGone(socket, 'startCareerGame', 'balance_read')) return; // F3 — nothing deducted yet
+      if (await buyInSocketGone(socket, 'startCareerGame', 'balance_read', undefined, authCareerState)) return; // F3 — nothing deducted yet
       if (config.buyIn > dbChips) { socket.emit('error', { message: `Not enough chips for the ${config.name} buy-in (${config.buyIn.toLocaleString()})` }); return; }
       if (!(await deductChips(authCareer.userId, config.buyIn))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authCareer.username, 'QUICK_BUYIN_DEDUCT', { mode: 'career', venue: config.name, buyIn: config.buyIn });
       // F3 — the socket dropped during the deduct: refund it, create/seat nothing.
       if (await buyInSocketGone(socket, 'startCareerGame', 'deduct', {
         userId: authCareer.userId, username: authCareer.username, amount: config.buyIn, action: 'QUICK_BUYIN_REFUND',
-      })) return;
+      }, authCareerState)) return;
     }
 
     // Stage 3 is the boss stage - harder AI
@@ -13531,8 +13978,11 @@ Give feedback in this JSON format:
     const authT = authSessions.get(socket.id);
     if (entryFee > 0) {
       if (!authT) { socket.emit('error', { message: 'Log in to enter a buy-in tournament' }); return; }
+      // P3 (2026-10-10) — the entry is registered to socket + userId: the socket
+      // must still be signed in as the account that paid.
+      const regState: BuyInExpectation = { userId: authT.userId };
       const dbChips = await ensureChipsForBuyIn(authT.userId, authT.username, entryFee);
-      if (await buyInSocketGone(socket, 'registerTournament', 'balance_read')) return; // F3 — nothing deducted yet
+      if (await buyInSocketGone(socket, 'registerTournament', 'balance_read', undefined, regState)) return; // F3 — nothing deducted yet
       if (entryFee > dbChips) { socket.emit('error', { message: `Not enough chips for the ${entryFee.toLocaleString()} entry fee` }); return; }
       if (!(await deductChips(authT.userId, entryFee))) { socket.emit('error', { message: 'Could not deduct entry fee — try again' }); return; }
       auditLog(authT.username, 'TOURNAMENT_ENTRY_DEDUCT', { tournamentId: data.tournamentId, entryFee });
@@ -13542,7 +13992,7 @@ Give feedback in this JSON format:
       // the start with no session — an absent seat blinded out.
       if (await buyInSocketGone(socket, 'registerTournament', 'deduct', {
         userId: authT.userId, username: authT.username, amount: entryFee, action: 'TOURNAMENT_ENTRY_REFUND',
-      })) return;
+      }, regState)) return;
     }
 
     const result = tournamentManager.registerPlayer(data.tournamentId, playerId, playerName, socket.id, authT?.userId);
@@ -13749,6 +14199,12 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'Table not found' });
       return;
     }
+    // P5 (2026-10-10) — an additional-table seat is a cash buy-in: never at a
+    // tournament table (its stack would never be cashed out). Before the AI stand-up.
+    if (isTournamentTable(tableId)) {
+      refuseCashJoinAtTournamentTable(socket, 'joinAdditionalTable', tableId);
+      return;
+    }
 
     // Find empty seat
     let targetSeat = -1;
@@ -13783,8 +14239,10 @@ Give feedback in this JSON format:
     );
     const authAdd = authSessions.get(socket.id);
     if (authAdd) {
+      // P3 (2026-10-10) — still this account and still this live table.
+      const addState: BuyInExpectation = { userId: authAdd.userId, table: { tableId, table } };
       const dbChips = await ensureChipsForBuyIn(authAdd.userId, authAdd.username, effectiveBuyIn);
-      if (await buyInSocketGone(socket, 'joinAdditionalTable', 'balance_read')) return; // F3 — nothing deducted yet
+      if (await buyInSocketGone(socket, 'joinAdditionalTable', 'balance_read', undefined, addState)) return; // F3 — nothing deducted yet
       if (effectiveBuyIn > dbChips) { socket.emit('error', { message: 'Insufficient chips for the additional-table buy-in' }); return; }
       if (!(await deductChips(authAdd.userId, effectiveBuyIn))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN', { tableId, buyIn: effectiveBuyIn });
@@ -13792,7 +14250,7 @@ Give feedback in this JSON format:
       // were already torn down by the disconnect): refund, seat nothing.
       if (await buyInSocketGone(socket, 'joinAdditionalTable', 'deduct', {
         userId: authAdd.userId, username: authAdd.username, amount: effectiveBuyIn, tableId, action: 'ADDITIONAL_TABLE_BUYIN_REFUND',
-      })) return;
+      }, addState)) return;
     }
 
     const playerId = `player-${uuidv4()}`;
@@ -13979,6 +14437,11 @@ Give feedback in this JSON format:
       return;
     }
     const { tableId, table } = target;
+    // P5 (2026-10-10) — a cash buy-in, never at a tournament table.
+    if (isTournamentTable(tableId)) {
+      refuseCashJoinAtTournamentTable(socket, 'joinByInviteCode', tableId, 'joinError');
+      return;
+    }
 
     // Find an open seat
     const openSeat = table.seats.findIndex((s) => s.state === 'empty');
@@ -13999,8 +14462,14 @@ Give feedback in this JSON format:
     const authForJoin = authSessions.get(socket.id);
     let chipsDeducted = false;
     if (authForJoin) {
+      // P3 (2026-10-10) — still this account, the socket's seat unchanged since
+      // this request began, still this live table; answered on joinError.
+      const inviteState: BuyInExpectation = {
+        userId: authForJoin.userId, mainSession: playerSessions.get(socket.id) ?? null, table: { tableId, table },
+        answer: (reason) => socket.emit('joinError', { message: BUY_IN_CANCELLED_MESSAGE, code: 'buy_in_cancelled', reason }),
+      };
       const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, actualBuyIn);
-      if (await buyInSocketGone(socket, 'joinByInviteCode', 'balance_read')) return; // F3 — nothing deducted yet
+      if (await buyInSocketGone(socket, 'joinByInviteCode', 'balance_read', undefined, inviteState)) return; // F3 — nothing deducted yet
       if (actualBuyIn > dbChips) {
         socket.emit('joinError', { message: 'Insufficient chips for this table.' });
         return;
@@ -14014,7 +14483,7 @@ Give feedback in this JSON format:
       // F3 — the socket dropped during the deduct: refund it, seat nothing.
       if (await buyInSocketGone(socket, 'joinByInviteCode', 'deduct', {
         userId: authForJoin.userId, username: authForJoin.username, amount: actualBuyIn, tableId, action: 'INVITE_REFUND',
-      })) return;
+      }, inviteState)) return;
     }
 
     const playerId = `player-${uuidv4()}`;
@@ -14173,112 +14642,10 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
             console.warn(`[disconnect] SKIPPED saveProgress for userId=${authSession.userId} — progress not hydrated yet (would have overwritten real values with fresh-init)`);
           }
 
-          // Reserve the seat for 10 minutes so the player can reconnect
-          // Cancel any existing reservation for this user first
-          const existing = reservedSeats.get(authSession.userId);
-          if (existing) clearTimeout(existing.cleanupTimer);
+          reserveSeatForDeparture(authSession, session, table, seat);
 
-          const cleanupTimer = setTimeout(() => {
-            const reserved = reservedSeats.get(authSession.userId);
-            if (reserved) {
-              // 2026-10-09 (T1) — a TOURNAMENT seat is never cashed out to the
-              // wallet (a mint) and never bare-stood-up (the tournament could
-              // not finish): audited, the seat stays in play and is blinded out
-              // by the tournament; only the reservation itself ends here.
-              if (isTournamentReservation(reserved)) {
-                noteTournamentReservationNotCashed(authSession.userId, authSession.username, reserved, 'reserve_expiry');
-                reservedSeats.delete(authSession.userId);
-                return;
-              }
-              const t = tableManager.getTable(reserved.tableId);
-              const seatNow = t?.seats?.[reserved.seatIndex];
-              const chipsToReturn = seatNow?.chipCount ?? reserved.chips ?? 0;
-              // Credit the at-table stack back to the wallet before
-              // the seat is torn down. Otherwise the chips vanish.
-              if (chipsToReturn > 0) {
-                addChipsToUser(authSession.userId, chipsToReturn).catch((e: any) =>
-                  console.warn(`[Reserve expiry cash-out ${authSession.userId}]`, e?.message)
-                );
-              }
-              // Clean the sit-out tracker so the NEXT occupant of this
-              // seat doesn't inherit a stale sitting-out flag (root cause
-              // of recurring "missed blinds" popup on a fresh sit-down).
-              const tr = sitOutTracker.get(reserved.tableId);
-              if (tr) tr.delete(reserved.seatIndex);
-              if (t) t.standUp(reserved.seatIndex);
-              syncSitOutToTable(reserved.tableId);
-              reservedSeats.delete(authSession.userId);
-              console.log(`[Reserve] Seat reservation expired for user ${authSession.userId} (returned ${chipsToReturn} chips)`);
-            }
-          }, SEAT_RESERVE_MS);
-
-          reservedSeats.set(authSession.userId, {
-            tableId: session.tableId,
-            seatIndex: session.seatIndex,
-            playerName: session.playerName,
-            chips: seat.chipCount,
-            avatar: session.avatar,
-            sittingOut: session.sittingOut,
-            expiresAt: Date.now() + SEAT_RESERVE_MS,
-            cleanupTimer,
-            handsRemaining: DISCONNECT_HANDS_LIMIT,
-            // T1: snapshot — a later table break drops the id from tournamentTables.
-            // F2: and a disconnect IN the break window (session still on the
-            // broken table, id already gone from tournamentTables) is still a
-            // tournament seat — isTournamentTable keeps broken tables.
-            tournament: isTournamentTable(session.tableId),
-            // U2: snapshot — the hand-start gate screens an absent tournament
-            // seat by it (the session is deleted below).
-            ...(authSession.masterUserId
-              ? { masterUserId: String(authSession.masterUserId) }
-              : authSession.statsMasterUserId !== undefined ? { masterUserId: authSession.statsMasterUserId || null } : {}),
-          });
-
-          // Auto-fold if it's their turn right now. That's the ONLY
-          // behavior we need on disconnect. Previously we ALSO flagged
-          // the seat as sitting-out after a 20s timer so future hands'
-          // markSittingOutBlinds would charge dead-blind debt — but
-          // PWA backgrounding / WiFi handoff / iOS suspend triggered
-          // that timer on users who never actually sat out, leading to
-          // a recurring "missed blinds" popup. The `reservedSeats`
-          // mechanism + turn-auto-fold already handle the disconnect
-          // case cleanly; there's no reason to double-flag with the
-          // sit-out tracker. If the user really wants to sit out,
-          // they'll tap the explicit Sit Out button.
-          session.sittingOut = false;
-
-          if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
-            table.playerFold(session.seatIndex);
-            broadcastGameState(session.tableId);
-          }
-
-          console.log(`[Reserve] Seat ${session.seatIndex} on table ${session.tableId} reserved for user ${authSession.userId} (${session.playerName})`);
-
-          // 2026-06-11 audit E4: only the MAIN seat is reserved here. Any
-          // ADDITIONAL-table seats are NOT reserved, and this branch returns
-          // before handlePlayerLeave's multi-table cleanup ever runs — so they
-          // lingered occupied (auto-folding, unreconnectable). Cash them out +
-          // stand up before the early return. (Tournament stacks are skipped
-          // by creditSeatStackToWallet's guard, so this only affects cash.)
-          const multiD = multiTableSessions.get(socket.id);
-          if (multiD) {
-            for (const ms of multiD) {
-              const mt = tableManager.getTable(ms.tableId);
-              if (mt) {
-                if (mt.isHandInProgress() && mt.activeSeatIndex === ms.seatIndex) {
-                  try { mt.playerFold(ms.seatIndex); } catch {}
-                }
-                const mSeat = mt.seats[ms.seatIndex];
-                if (mSeat && mSeat.state === 'occupied' && !mSeat.isAI) {
-                  creditSeatStackToWallet(authSession.userId, authSession.username, ms.tableId, mSeat, 'additional_table_disconnect');
-                }
-                mt.standUp(ms.seatIndex);
-              }
-              socket.leave(`table:${ms.tableId}`);
-              broadcastGameState(ms.tableId);
-            }
-            multiTableSessions.delete(socket.id);
-          }
+          // 2026-06-11 audit E4 — see cashOutAdditionalSeatsOnDeparture.
+          cashOutAdditionalSeatsOnDeparture(socket, authSession, 'additional_table_disconnect');
 
           // Don't call handlePlayerLeave — main seat stays reserved
           playerSessions.delete(socket.id);
@@ -14356,6 +14723,206 @@ function releaseSeatedSlot(socketId: string, tableId: string): void {
   for (const [ip, slots] of ipSeatedSlots) {
     if (slots.delete(slot) && slots.size === 0) ipSeatedSlots.delete(ip);
   }
+}
+
+/** One socket's signed-in account (the values of `authSessions`). */
+type SocketAuthSession = { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null };
+
+/**
+ * The 'disconnect' handler's MAIN-seat reservation, extracted unchanged
+ * (2026-10-10, P4) so an ACCOUNT SWITCH on a live socket
+ * (releaseSocketForAccountSwitch) treats the previous account exactly as if
+ * its socket had dropped: the seat is reserved for that account (cash: its
+ * stack is credited to THAT account when the reservation ends; tournament:
+ * never credited, never stood up — T1), auto-folded if it is on the clock.
+ * The caller removes the socket's player session and owns authSessions.
+ */
+function reserveSeatForDeparture(
+  authSession: SocketAuthSession, session: PlayerSession, table: PokerTable, seat: any,
+): void {
+  // Reserve the seat for 10 minutes so the player can reconnect
+  // Cancel any existing reservation for this user first
+  const existing = reservedSeats.get(authSession.userId);
+  if (existing) clearTimeout(existing.cleanupTimer);
+
+  const cleanupTimer = setTimeout(() => {
+    const reserved = reservedSeats.get(authSession.userId);
+    if (reserved) {
+      // 2026-10-09 (T1) — a TOURNAMENT seat is never cashed out to the
+      // wallet (a mint) and never bare-stood-up (the tournament could
+      // not finish): audited, the seat stays in play and is blinded out
+      // by the tournament; only the reservation itself ends here.
+      if (isTournamentReservation(reserved)) {
+        noteTournamentReservationNotCashed(authSession.userId, authSession.username, reserved, 'reserve_expiry');
+        reservedSeats.delete(authSession.userId);
+        return;
+      }
+      const t = tableManager.getTable(reserved.tableId);
+      const seatNow = t?.seats?.[reserved.seatIndex];
+      const chipsToReturn = seatNow?.chipCount ?? reserved.chips ?? 0;
+      // Credit the at-table stack back to the wallet before
+      // the seat is torn down. Otherwise the chips vanish.
+      if (chipsToReturn > 0) {
+        addChipsToUser(authSession.userId, chipsToReturn).catch((e: any) =>
+          console.warn(`[Reserve expiry cash-out ${authSession.userId}]`, e?.message)
+        );
+      }
+      // Clean the sit-out tracker so the NEXT occupant of this
+      // seat doesn't inherit a stale sitting-out flag (root cause
+      // of recurring "missed blinds" popup on a fresh sit-down).
+      const tr = sitOutTracker.get(reserved.tableId);
+      if (tr) tr.delete(reserved.seatIndex);
+      if (t) t.standUp(reserved.seatIndex);
+      syncSitOutToTable(reserved.tableId);
+      reservedSeats.delete(authSession.userId);
+      console.log(`[Reserve] Seat reservation expired for user ${authSession.userId} (returned ${chipsToReturn} chips)`);
+    }
+  }, SEAT_RESERVE_MS);
+
+  reservedSeats.set(authSession.userId, {
+    tableId: session.tableId,
+    seatIndex: session.seatIndex,
+    playerName: session.playerName,
+    chips: seat.chipCount,
+    avatar: session.avatar,
+    sittingOut: session.sittingOut,
+    expiresAt: Date.now() + SEAT_RESERVE_MS,
+    cleanupTimer,
+    handsRemaining: DISCONNECT_HANDS_LIMIT,
+    // T1: snapshot — a later table break drops the id from tournamentTables.
+    // F2: and a disconnect IN the break window (session still on the
+    // broken table, id already gone from tournamentTables) is still a
+    // tournament seat — isTournamentTable keeps broken tables.
+    tournament: isTournamentTable(session.tableId),
+    // U2: snapshot — the hand-start gate screens an absent tournament
+    // seat by it (the session is deleted below).
+    ...(authSession.masterUserId
+      ? { masterUserId: String(authSession.masterUserId) }
+      : authSession.statsMasterUserId !== undefined ? { masterUserId: authSession.statsMasterUserId || null } : {}),
+  });
+
+  // Auto-fold if it's their turn right now. That's the ONLY
+  // behavior we need on disconnect. Previously we ALSO flagged
+  // the seat as sitting-out after a 20s timer so future hands'
+  // markSittingOutBlinds would charge dead-blind debt — but
+  // PWA backgrounding / WiFi handoff / iOS suspend triggered
+  // that timer on users who never actually sat out, leading to
+  // a recurring "missed blinds" popup. The `reservedSeats`
+  // mechanism + turn-auto-fold already handle the disconnect
+  // case cleanly; there's no reason to double-flag with the
+  // sit-out tracker. If the user really wants to sit out,
+  // they'll tap the explicit Sit Out button.
+  session.sittingOut = false;
+
+  if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
+    table.playerFold(session.seatIndex);
+    broadcastGameState(session.tableId);
+  }
+
+  console.log(`[Reserve] Seat ${session.seatIndex} on table ${session.tableId} reserved for user ${authSession.userId} (${session.playerName})`);
+}
+
+/**
+ * 2026-06-11 audit E4 (extracted from the 'disconnect' handler, 2026-10-10):
+ * a departing socket's ADDITIONAL-table seats are not reserved — each is
+ * folded if on the clock, its stack credited to `authSession`
+ * (creditSeatStackToWallet skips tournament stacks; no account → nothing is
+ * credited) and stood up.
+ */
+function cashOutAdditionalSeatsOnDeparture(socket: Socket, authSession: SocketAuthSession | undefined, reason: string): void {
+  // 2026-06-11 audit E4: only the MAIN seat is reserved here. Any
+  // ADDITIONAL-table seats are NOT reserved, and this branch returns
+  // before handlePlayerLeave's multi-table cleanup ever runs — so they
+  // lingered occupied (auto-folding, unreconnectable). Cash them out +
+  // stand up before the early return. (Tournament stacks are skipped
+  // by creditSeatStackToWallet's guard, so this only affects cash.)
+  const multiD = multiTableSessions.get(socket.id);
+  if (multiD) {
+    for (const ms of multiD) {
+      const mt = tableManager.getTable(ms.tableId);
+      if (mt) {
+        if (mt.isHandInProgress() && mt.activeSeatIndex === ms.seatIndex) {
+          try { mt.playerFold(ms.seatIndex); } catch {}
+        }
+        const mSeat = mt.seats[ms.seatIndex];
+        if (mSeat && mSeat.state === 'occupied' && !mSeat.isAI) {
+          if (authSession) creditSeatStackToWallet(authSession.userId, authSession.username, ms.tableId, mSeat, reason);
+        }
+        mt.standUp(ms.seatIndex);
+      }
+      socket.leave(`table:${ms.tableId}`);
+      broadcastGameState(ms.tableId);
+    }
+    multiTableSessions.delete(socket.id);
+  }
+}
+
+/**
+ * 2026-10-10 (P4) — a login that binds a socket to a DIFFERENT account.
+ * Every login handler (`login`, `register`, `oauthLogin`, `tokenLogin` both
+ * branches, `authWithTicket`, `resumeSession`, the waitlist bootstrap) calls
+ * this right before its `authSessions.set`, with nothing awaited in between.
+ * On a shared browser two sign-ins race on ONE socket (a Play Online /
+ * waitlist deep link for A and the stored refresh-token sign-in of B); the
+ * later one used to REBIND authSessions while playerSessions still held the
+ * earlier account's seat — every later cash-out (leave, disconnect, reserve
+ * expiry) reads authSessions, so A's stack was credited to B's wallet.
+ * Now, before the socket changes hands:
+ *   - the previous account's MAIN seat is RESERVED for it exactly as if its
+ *     socket had dropped (reserveSeatForDeparture: cash → credited to THAT
+ *     account when the reservation ends; tournament → kept in play, T1), and
+ *     its ADDITIONAL-table seats are cashed out to it;
+ *   - a session with no seat to reserve goes through the normal leave
+ *     (handlePlayerLeave — credits the previous account, defers mid-hand);
+ *   - a seat on the socket with NO account behind it (anonymous — only under
+ *     the guest-play rollback) is left without any credit: a login never
+ *     adopts a stack it did not buy;
+ *   - the previous auth session is removed; the caller then sets the new one.
+ * Same account (a token refresh, a resume of the same user) → nothing changes.
+ */
+const socketAccountSwitches = { switches: 0, seatsReserved: 0, seatsLeft: 0, unownedSeatsCleared: 0 };
+function releaseSocketForAccountSwitch(socket: Socket, nextUserId: number, via: string): void {
+  const prev = authSessions.get(socket.id);
+  if (prev && prev.userId === nextUserId) return;
+  const session = playerSessions.get(socket.id);
+  const extra = multiTableSessions.get(socket.id);
+  const hasExtra = !!extra && extra.length > 0;
+  if (!prev && !session && !hasExtra) return;               // a fresh socket — the normal case
+  if (prev) socketAccountSwitches.switches++;
+  let mainSeat: 'none' | 'reserved' | 'left' = 'none';
+  const table = session ? tableManager.getTable(session.tableId) : undefined;
+  const seat = session && table ? table.seats[session.seatIndex] : undefined;
+  if (prev && session && table && seat && seat.state === 'occupied' && !seat.isAI) {
+    reserveSeatForDeparture(prev, session, table, seat);
+    cashOutAdditionalSeatsOnDeparture(socket, prev, 'additional_table_account_switch');
+    playerSessions.delete(socket.id);
+    releaseSeatedSlot(socket.id, session.tableId);
+    socket.leave(`table:${session.tableId}`);
+    mainSeat = 'reserved';
+    socketAccountSwitches.seatsReserved++;
+  } else if (session) {
+    // handlePlayerLeave credits authSessions.get(socket.id) — still the
+    // previous account here (or nobody, for an anonymous seat).
+    handlePlayerLeave(socket);
+    mainSeat = 'left';
+    if (prev) socketAccountSwitches.seatsLeft++;
+    else socketAccountSwitches.unownedSeatsCleared++;
+  } else if (hasExtra) {
+    cashOutAdditionalSeatsOnDeparture(socket, prev, 'additional_table_account_switch');
+    if (!prev) socketAccountSwitches.unownedSeatsCleared++;
+  }
+  // The previous account's spectating ends with it.
+  for (const [tid, specs] of spectators) {
+    if (specs.delete(socket.id)) {
+      socket.leave(`table:${tid}`);
+      if (specs.size === 0) spectators.delete(tid);
+    }
+  }
+  authSessions.delete(socket.id);
+  console.warn(`[login] ${JSON.stringify({
+    event: 'socket_account_switch', via, fromUserId: prev?.userId ?? null, toUserId: nextUserId, mainSeat,
+    extraSeats: hasExtra ? extra!.length : 0,
+  })}`);
 }
 
 function handlePlayerLeave(socket: Socket): void {
@@ -14567,6 +15134,57 @@ function handlePlayerLeave(socket: Socket): void {
 
 // ========== Tournament Helpers ==========
 
+/**
+ * 2026-10-10 — the socket a tournament REGISTRANT's seat is bound to when the
+ * tournament starts. A registration records the socket it came from
+ * (TournamentPlayer.socketId; a qualifier registration's socketId). By the
+ * start that socket may be signed in to ANOTHER account — on a shared browser
+ * B's stored sign-in lands on A's socket; P4's releaseSocketForAccountSwitch
+ * moves A's SEATS but not his registrations — or to none. startTournamentGame
+ * / startQualifierTournament bound the seat to it blindly: B's socket got a
+ * session on A's tournament seat (B played A's stack, A's prize still went to
+ * A's id — two accounts mixed) and overwrote B's own session there. Now the
+ * seat is bound to the registration socket only while it is still signed in as
+ * the REGISTRANT (his local userId; a qualifier entrant — no local userId — by
+ * his attested master id); otherwise to another LIVE socket signed in as him
+ * that holds no seat (he reconnected since); otherwise to NONE: the seat is
+ * dealt in ABSENT, like any absent tournament seat (blinded out; the hand-start
+ * gate screens it; his next sign-in finds it through the orphan scan). A
+ * registration with no account at all (guest-play rollback only) is bound only
+ * to a socket that is still signed out. Returns the socket id, or null.
+ */
+const registrantBindings = { rebound: 0, unbound: 0 };
+function registrantSessionSocket(reg: { socketId: string; userId?: number; masterUserId?: string | null }): string | null {
+  const ownedBy = (a: SocketAuthSession | undefined): boolean => {
+    if (!a) return false;
+    if (reg.userId !== undefined) return a.userId === reg.userId;
+    const sessionMaster = a.masterUserId || a.statsMasterUserId || null;
+    return !!reg.masterUserId && !!sessionMaster && String(sessionMaster) === String(reg.masterUserId);
+  };
+  if (reg.userId === undefined && !reg.masterUserId) return authSessions.has(reg.socketId) ? null : reg.socketId;
+  if (ownedBy(authSessions.get(reg.socketId))) return reg.socketId;
+  for (const [sid, a] of authSessions) {
+    if (sid === reg.socketId || !ownedBy(a) || playerSessions.has(sid)) continue;
+    const sock = io.sockets.sockets.get(sid);
+    if (sock && sock.connected) return sid;
+  }
+  return null;
+}
+/** The registrant's seat binding at start: updates TournamentPlayer.socketId (''= none) and logs a change. */
+function bindRegistrantSocket(tournamentId: string, tp: TournamentPlayer): string | null {
+  const bound = registrantSessionSocket(tp);
+  if (bound !== tp.socketId) {
+    if (bound) registrantBindings.rebound++;
+    else registrantBindings.unbound++;
+    console.warn(`[Tournament] ${JSON.stringify({
+      event: 'registrant_socket_not_registrants', tournamentId, playerId: tp.playerId,
+      bound: bound ? 'own_other_socket' : 'none_seat_absent',
+    })}`);
+    tp.socketId = bound ?? '';
+  }
+  return bound;
+}
+
 function startTournamentGame(tournamentId: string): void {
   const result = tournamentManager.startTournament(tournamentId);
   if (!result) return;
@@ -14592,9 +15210,12 @@ function startTournamentGame(tournamentId: string): void {
     const tp = tournament.players[i];
     table.sitDown(i, tp.playerName, result.startingChips, tp.playerId, false);
 
-    // Create session for each player
+    // Create session for each player — 2026-10-10: only on a socket still
+    // signed in as THIS registrant (bindRegistrantSocket); none → seat absent.
+    const boundSid = bindRegistrantSocket(tournamentId, tp);
+    if (!boundSid) continue;
     const session: PlayerSession = {
-      socketId: tp.socketId,
+      socketId: boundSid,
       tableId,
       seatIndex: i,
       playerName: tp.playerName,
@@ -14602,9 +15223,9 @@ function startTournamentGame(tournamentId: string): void {
       trainingEnabled: false,
       sittingOut: false,
     };
-    playerSessions.set(tp.socketId, session);
+    playerSessions.set(boundSid, session);
 
-    const sock = io.sockets.sockets.get(tp.socketId);
+    const sock = io.sockets.sockets.get(boundSid);
     if (sock) {
       sock.join(`table:${tableId}`);
       sock.emit('tournamentStarted', {
@@ -14626,6 +15247,8 @@ function startTournamentGame(tournamentId: string): void {
     const notifyTargets: Promise<void>[] = [];
     for (let i = 0; i < tournament.players.length && i < 9; i++) {
       const tp = tournament.players[i];
+      // 2026-10-10 — tp.socketId is now the registrant's OWN bound socket or ''
+      // (bindRegistrantSocket), so this is never whoever took his old socket.
       const auth = authSessions.get(tp.socketId);
       const uid = auth?.userId;
       if (!uid) continue; // skip unauthenticated / bots
@@ -14852,9 +15475,14 @@ function startQualifierTournament(
     table.sitDown(seatIdx, p.name, startingStack, p.id, false);
     tournamentManager.setPlayerTable(tournamentId, p.id, tid);
 
-    // Wire socket session so the player receives table state broadcasts
+    // Wire socket session so the player receives table state broadcasts —
+    // 2026-10-10: only on a socket still signed in as THIS registrant (his
+    // attested master id — bindRegistrantSocket); none → the seat is absent.
+    const tp = tournament.players.find((x) => x.playerId === p.id);
+    const boundSid = tp ? bindRegistrantSocket(tournamentId, tp) : null;
+    if (!boundSid) continue;
     const sess: PlayerSession = {
-      socketId: p.socketId,
+      socketId: boundSid,
       tableId: tid,
       seatIndex: seatIdx,
       playerName: p.name,
@@ -14862,8 +15490,8 @@ function startQualifierTournament(
       trainingEnabled: false,
       sittingOut: false,
     };
-    playerSessions.set(p.socketId, sess);
-    const sock = io.sockets.sockets.get(p.socketId);
+    playerSessions.set(boundSid, sess);
+    const sock = io.sockets.sockets.get(boundSid);
     if (sock) sock.join(`table:${tid}`);
   }
 
@@ -15288,14 +15916,259 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
   }
 }
 
+// ===== Tournament rebalance helpers (P1 / P2 / P6, 2026-10-10) =====
+/**
+ * P1 — tables whose break was DEFERRED because a hand was in progress there
+ * (table id → tournament id). A table is never broken in the middle of a
+ * hand: its live pot would be left behind on a table that is about to be
+ * removed (a winner's chips gone, an all-in player moved with no stack) and
+ * its busts would never be processed (the table is no longer a tournament
+ * table by then — the player stays "alive" with no seat). The break runs at
+ * that table's own hand boundary instead (autoStartNextHand), re-planned then.
+ */
+const tournamentBreaksAwaitingHandEnd = new Map<string, string>();
+
+/**
+ * Q2 (2026-10-10) — an entrant's LIVE seat on `table`: occupied, NOT
+ * eliminated, his playerId. Never a bare playerId match: a qualifier
+ * RE-ENTRY seats him again under the SAME playerId and leaves his old busted
+ * seat occupied (eliminated, 0 chips) on the same or another table — a
+ * playerId-only lookup found that dead seat first (the rebalance then took
+ * him for a pending bust, left him without a seat and threw his live stack
+ * away with the broken table).
+ */
+function tournamentLiveSeatIndex(table: PokerTable | undefined, playerId: string): number {
+  if (!table) return -1;
+  return table.seats.findIndex((s) => s.state === 'occupied' && !s.eliminated && s.playerId === playerId);
+}
+/** Q2 — the entrant's live seat on `onTableId`, else on the table TournamentManager maps him to. */
+function tournamentLiveSeatOf(tournamentId: string, playerId: string, onTableId?: string): Seat | undefined {
+  const tid = onTableId ?? tournamentManager.getTournament(tournamentId)?.playerTableMap.get(playerId);
+  const table = tid ? tableManager.getTable(tid) : undefined;
+  const idx = tournamentLiveSeatIndex(table, playerId);
+  return idx >= 0 ? table!.seats[idx] : undefined;
+}
+
+/**
+ * Q1 (2026-10-10) — a seat on `table` whose bust check has NOT run yet: an
+ * occupied, NOT eliminated seat at 0 chips whose entrant TournamentManager
+ * still counts alive. That is the state between a hand's end and its
+ * handleHandComplete bust check, which runs only after per-player DB awaits.
+ * A table holding one is NOT at its hand boundary yet: breaking it then
+ * (another table's bust, the 5s sweep) used to strand that entrant — he was
+ * not moved (0 chips) and, the table having left tournamentTables, never
+ * eliminated either, so the tournament could never finish. Returns the seat
+ * index, or -1.
+ */
+function pendingTournamentBustSeat(tournamentId: string, table: PokerTable | undefined): number {
+  if (!table) return -1;
+  const t = tournamentManager.getTournament(tournamentId);
+  for (let i = 0; i < MAX_SEATS; i++) {
+    const s = table.seats[i];
+    if (!s || s.state !== 'occupied' || s.eliminated || s.chipCount > 0) continue;
+    const tp = t?.players.find((p) => p.playerId === s.playerId);
+    if (tp && !tp.eliminated) return i;
+  }
+  return -1;
+}
+
+/**
+ * P1 — can a rebalance hand seat `seatIndex` of `table` to a moved player?
+ * An EMPTY seat, or a BUSTED one: handleHandComplete leaves a bust's seat
+ * occupied (eliminated, 0 chips) for good, so before P1 the placement skipped
+ * every such seat and a moved player found "no empty seats" while the table
+ * had room. A busted seat qualifies only when it is not an alive entrant's
+ * seat: its entrant is out of the tournament — or (Q2) he RE-ENTERED and plays
+ * on from another, live seat (the busted one is then dead weight with his
+ * playerId on it). It is stood up right before the move
+ * (vacateBustedTournamentSeat). Never beyond the table's deck-safety seat cap
+ * (PokerTable.sitDown refuses those).
+ */
+function tournamentSeatIsPlaceable(tournamentId: string, table: PokerTable, seatIndex: number): boolean {
+  if (seatIndex < 0 || seatIndex >= MAX_SEATS || seatIndex >= table.maxOccupiableSeats) return false;
+  const seat = table.seats[seatIndex];
+  if (!seat) return false;
+  if (seat.state === 'empty') return true;
+  if (seat.state !== 'occupied' || !seat.eliminated || seat.chipCount > 0) return false;
+  const tp = tournamentManager.getTournament(tournamentId)?.players.find((p) => p.playerId === seat.playerId);
+  if (!tp || tp.eliminated) return true;
+  // Q2 — alive again (re-entry): placeable only if his LIVE seat is elsewhere.
+  return !!tournamentLiveSeatOf(tournamentId, tp.playerId);
+}
+
+/** P1 — the seats a moved player could take at `tableId` right now (checkRebalance's capacity). */
+function tournamentFreeSeats(tournamentId: string, tableId: string): number {
+  const table = tableManager.getTable(tableId);
+  if (!table) return 0;
+  let free = 0;
+  for (let i = 0; i < MAX_SEATS; i++) if (tournamentSeatIsPlaceable(tournamentId, table, i)) free++;
+  return free;
+}
+
+/** P1 — the rebalance this tournament needs AND the other tables have room for (null = none). */
+function planTournamentRebalance(tournamentId: string): ReturnType<TournamentManager['checkRebalance']> {
+  return tournamentManager.checkRebalance(tournamentId, (tid) => tournamentFreeSeats(tournamentId, tid));
+}
+
+/**
+ * P1 — stand a BUSTED seat up so a moved player can take it (0 chips: nothing
+ * to credit). The eliminated entrant keeps watching that table as a
+ * spectator, and every pointer at the seat goes with it, so none can act on —
+ * or be restored onto — the player who sits there next: his main or
+ * extra-table session (handlePlayerLeave acts on a session's seat index
+ * without checking who sits there), a reservation, a pending after-hand
+ * removal, the sit-out entry, an AI profile.
+ */
+function vacateBustedTournamentSeat(table: PokerTable, tableId: string, seatIndex: number): void {
+  const seat = table.seats[seatIndex];
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId !== tableId || s.seatIndex !== seatIndex) continue;
+    playerSessions.delete(sid);
+    if (io.sockets.sockets.get(sid)) {
+      if (!spectators.has(tableId)) spectators.set(tableId, new Set());
+      spectators.get(tableId)!.add(sid);
+    }
+  }
+  for (const [, list] of multiTableSessions) {
+    const idx = list.findIndex((ms) => ms.tableId === tableId && ms.seatIndex === seatIndex);
+    if (idx >= 0) list.splice(idx, 1);
+  }
+  for (const [uid, r] of reservedSeats) {
+    if (r.tableId === tableId && r.seatIndex === seatIndex) {
+      if (r.cleanupTimer) clearTimeout(r.cleanupTimer);
+      reservedSeats.delete(uid);
+    }
+  }
+  pendingSeatRemovalAfterHand.get(tableId)?.delete(seatIndex);
+  sitOutTracker.get(tableId)?.delete(seatIndex);
+  aiProfiles.get(tableId)?.delete(seatIndex);
+  seat.deadBlindOwedChips = 0;
+  seat.missedBlind = 'none';
+  table.standUp(seatIndex);
+  syncSitOutToTable(tableId);
+  tournamentHandStartSafety.bustedSeatsVacated++;
+  console.log(`[Tournament] ${JSON.stringify({ event: 'busted_seat_vacated', tableId, seatIndex, playerId: seat.playerId })}`);
+}
+
+/**
+ * P6 — a rebalance moved a HUMAN's stack from (fromTableId, fromSeat) to
+ * (toTableId, toSeat). Every pointer at the old seat follows it. Before P6
+ * only the session of the socket he REGISTERED with moved
+ * (TournamentPlayer.socketId — never updated on reconnect): a player who had
+ * reconnected since stayed on the broken table, unable to act, while his stack
+ * played on — folded for him — at the new one. Now: every LIVE main or
+ * extra-table session pointing at that seat, whatever socket it is on (a
+ * reconnect restores the seat under a new socket id), and the reservation of
+ * a disconnected player (so his reconnect restores the NEW seat). A session
+ * on a socket that is gone is left to its disconnect handler. A session or
+ * reservation provably of ANOTHER account (local user id / master id) is
+ * never moved. The tournament record's socketId follows the first live
+ * session, so later tournament frames reach the socket he plays on.
+ */
+function moveTournamentSeatPointers(
+  tp: { playerId: string; socketId: string; userId?: number; masterUserId?: string } | undefined,
+  fromTableId: string, fromSeat: number, toTableId: string, toSeat: number,
+): void {
+  const notTheirs = (auth: { userId: number; masterUserId?: string } | undefined): boolean => {
+    if (!tp || !auth) return false;
+    if (tp.userId !== undefined) return auth.userId !== tp.userId;
+    if (tp.masterUserId && auth.masterUserId) return String(auth.masterUserId) !== String(tp.masterUserId);
+    return false;
+  };
+  const atOldSeat = (sid: string, s: { tableId: string; seatIndex: number }): boolean =>
+    s.tableId === fromTableId && (fromSeat >= 0 ? s.seatIndex === fromSeat : sid === tp?.socketId);
+  let firstLive: string | null = null;
+  for (const [sid, s] of playerSessions) {
+    if (!atOldSeat(sid, s)) continue;
+    const sock = io.sockets.sockets.get(sid);
+    if (!sock || !sock.connected) {
+      console.warn(`[Tournament] Rebalance: ${s.playerName} socket ${sid} not live — skipping session mutation; reconnect recovery will pick it up`);
+      continue;
+    }
+    if (notTheirs(authSessions.get(sid))) {
+      console.warn(`[Tournament] ${JSON.stringify({ event: 'rebalance_session_not_moved_other_account', tableId: fromTableId, seatIndex: fromSeat, socketId: sid })}`);
+      continue;
+    }
+    s.tableId = toTableId;
+    s.seatIndex = toSeat;
+    sock.leave(`table:${fromTableId}`);
+    sock.join(`table:${toTableId}`);
+    sock.emit('playerMoved', { fromTable: fromTableId, toTable: toTableId, toSeat, tableId: toTableId });
+    if (sid !== tp?.socketId) tournamentHandStartSafety.reconnectedSessionsMoved++;
+    if (!firstLive) firstLive = sid;
+  }
+  if (fromSeat < 0) return;
+  for (const [sid, list] of multiTableSessions) {
+    const sock = io.sockets.sockets.get(sid);
+    if (!sock || !sock.connected || notTheirs(authSessions.get(sid))) continue;
+    for (const ms of list) {
+      if (ms.tableId !== fromTableId || ms.seatIndex !== fromSeat) continue;
+      ms.tableId = toTableId;
+      ms.seatIndex = toSeat;
+      sock.leave(`table:${fromTableId}`);
+      sock.join(`table:${toTableId}`);
+    }
+  }
+  for (const [uid, r] of reservedSeats) {
+    if (r.tableId !== fromTableId || r.seatIndex !== fromSeat) continue;
+    if (tp?.userId !== undefined && uid !== tp.userId) continue;
+    if (tp?.userId === undefined && tp?.masterUserId && r.masterUserId && String(r.masterUserId) !== String(tp.masterUserId)) continue;
+    r.tableId = toTableId;
+    r.seatIndex = toSeat;
+    tournamentHandStartSafety.reservationsMoved++;
+  }
+  if (tp && firstLive) tp.socketId = firstLive;
+}
+
+/**
+ * P1/P2 — after a rebalance (or when none is possible): deal the tournament's
+ * idle tables again. A table whose hand has ENDED (HandComplete) is handed to
+ * the hand-boundary scheduler (scheduleAutoStart → autoStartNextHand, which
+ * honours the director pause and the rebalance rules) — NEVER started from
+ * here: this runs inside a bust's elimination, i.e. inside some table's own
+ * 'handResult' emit, and a hand started there replaced that table's deck
+ * commitment before its seed was revealed (P2). A table already holding a
+ * scheduled start is left alone. Only a WaitingForPlayers table is started
+ * directly — and only after a break (`startWaiting`), as before P1. With no
+ * rebalance possible, a short table plays on (>= 2 alive).
+ */
+function restartWaitingTournamentTables(tournamentId: string, opts: { startWaiting: boolean }): void {
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t || t.status !== 'running') return;
+  for (const tid of t.tableIds) {
+    const table = tableManager.getTable(tid);
+    // F1: a table INSIDE startNewHand is dealt by that start; P2: one still
+    // completing its previous hand is restarted by its own scheduler.
+    if (!table || table.isHandInProgress() || table.isStartingHand() || table.isCompletingHand()) continue;
+    if (tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length < 2) continue;
+    if (table.currentPhase === GamePhase.HandComplete) {
+      if (!pendingAutoStartTimers.has(tid)) scheduleAutoStart(tid);
+      continue;
+    }
+    if (!opts.startWaiting || t.paused) continue;
+    if (table.startNewHand()) {
+      broadcastGameState(tid);
+      scheduleAIAction(tid);
+    }
+  }
+}
+// ===== end tournament rebalance helpers =====
+
 function handleTableRebalance(tournamentId: string): void {
   // F1 (2026-10-10) — asked for by an elimination the hand-start gate made
   // INSIDE a startNewHand: held until that gate has stood its suspended seats
   // up, then run (still before that table's deal) — see
   // releaseTournamentRebalance.
   if (tournamentRebalanceIsHeld(tournamentId)) return;
-  const rebalance = tournamentManager.checkRebalance(tournamentId);
-  if (!rebalance) return;
+  // P1 — only a break the other tables have ROOM for (checkRebalance capacity).
+  const rebalance = planTournamentRebalance(tournamentId);
+  if (!rebalance) {
+    // Nothing to break (or no room to): make sure no table whose hand ended
+    // sits idle waiting for a rebalance that is not coming (scheduled through
+    // the hand-boundary scheduler only — nothing is dealt from here).
+    restartWaitingTournamentTables(tournamentId, { startWaiting: false });
+    return;
+  }
 
   const tournament = tournamentManager.getTournament(tournamentId);
   if (!tournament) return;
@@ -15303,89 +16176,127 @@ function handleTableRebalance(tournamentId: string): void {
   const { breakTableId, playersToMove } = rebalance;
   const breakTable = tableManager.getTable(breakTableId);
 
-  console.log(`[Tournament] Breaking table ${breakTableId} — moving ${playersToMove.length} players`);
-
-  // Emit table breaking event
-  io.to(`table:${breakTableId}`).emit('tableBroken', { tableId: breakTableId, reason: 'Table combining' });
+  // P1 — never break a table in the MIDDLE of a hand (see
+  // tournamentBreaksAwaitingHandEnd): deferred to its hand boundary.
+  if (breakTable && breakTable.isHandInProgress()) {
+    if (tournamentBreaksAwaitingHandEnd.get(breakTableId) !== tournamentId) tournamentHandStartSafety.breaksDeferredMidHand++;
+    tournamentBreaksAwaitingHandEnd.set(breakTableId, tournamentId);
+    return;
+  }
+  // Q1 (2026-10-10) — …nor before its hand boundary is REACHED: a table whose
+  // last hand left a 0-chip entrant the bust check has not eliminated yet
+  // (handleHandComplete is still in its per-player DB awaits) is deferred the
+  // same way. Its own bust check then eliminates him and re-runs this
+  // rebalance (playerEliminated); its autoStartNextHand and the 5s sweep retry
+  // it too. Before Q1 the pending bust was skipped here ("not moved") — right
+  // only when this rebalance ran from INSIDE that table's own bust loop; when
+  // ANOTHER table's bust (or the sweep) broke it, the table left
+  // tournamentTables, its bust check found no tournament, and the entrant
+  // stayed alive with no seat: the tournament could never finish.
+  const pendingBustIdx = pendingTournamentBustSeat(tournamentId, breakTable);
+  if (pendingBustIdx >= 0) {
+    if (tournamentBreaksAwaitingHandEnd.get(breakTableId) !== tournamentId) {
+      tournamentHandStartSafety.breaksDeferredPendingBust++;
+      console.log(`[Tournament] ${JSON.stringify({
+        // The P1 event name is kept (log searches + the manifest lock): the pending
+        // bust is still never moved — now because the whole break waits for him.
+        event: 'rebalance_pending_bust_not_moved', outcome: 'break_deferred', tournamentId, tableId: breakTableId,
+        seatIndex: pendingBustIdx, playerId: breakTable!.seats[pendingBustIdx].playerId,
+      })}`);
+    }
+    tournamentBreaksAwaitingHandEnd.set(breakTableId, tournamentId);
+    return;
+  }
+  tournamentBreaksAwaitingHandEnd.delete(breakTableId);
 
   // Find seats on remaining tables
   const remainingTables = tournament.tableIds.filter(tid => tid !== breakTableId);
 
+  // P1 — who moves and where is decided BEFORE anything changes. Q2
+  // (2026-10-10): each mover's LIVE seat — occupied, not eliminated, his
+  // playerId (tournamentLiveSeatIndex). A re-entered qualifier player's OLD
+  // busted seat carries the same playerId; the playerId-only lookup found it
+  // (0 chips), took him for a pending bust and left him seatless while his
+  // live stack went with the broken table. (No mover's live seat holds 0
+  // chips here: a pending bust defers the whole break — Q1 above.)
+  const movers: Array<{ player: { playerId: string; playerName: string }; breakSeatIdx: number; breakSeat: any }> = [];
   for (const player of playersToMove) {
-    // Find a table with an empty seat
-    let placed = false;
+    const breakSeatIdx = tournamentLiveSeatIndex(breakTable, player.playerId);
+    const breakSeat = breakSeatIdx >= 0 ? breakTable!.seats[breakSeatIdx] : undefined;
+    movers.push({ player, breakSeatIdx, breakSeat });
+  }
+  // Empty seats first (in table order, as before), then busted seats.
+  const emptyTargets: Array<{ tid: string; table: PokerTable; seatIdx: number }> = [];
+  const bustedTargets: Array<{ tid: string; table: PokerTable; seatIdx: number }> = [];
+  for (const tid of remainingTables) {
+    const t = tableManager.getTable(tid);
+    if (!t) continue;
+    for (let i = 0; i < MAX_SEATS; i++) {
+      if (!tournamentSeatIsPlaceable(tournamentId, t, i)) continue;
+      (t.seats[i].state === 'empty' ? emptyTargets : bustedTargets).push({ tid, table: t, seatIdx: i });
+    }
+  }
+  const targets = [...emptyTargets, ...bustedTargets];
+  if (targets.length < movers.length) {
+    // checkRebalance counted the same seats, so this should not happen; if it
+    // does, the table is NOT broken — nobody is left without a seat.
+    tournamentHandStartSafety.breaksAbortedNoSeats++;
+    console.error(`[Tournament] ${JSON.stringify({
+      event: 'table_break_aborted_no_seats', tournamentId, tableId: breakTableId, movers: movers.length, seats: targets.length,
+    })}`);
+    return;
+  }
 
+  console.log(`[Tournament] Breaking table ${breakTableId} — moving ${movers.length} players`);
+
+  // Emit table breaking event
+  io.to(`table:${breakTableId}`).emit('tableBroken', { tableId: breakTableId, reason: 'Table combining' });
+
+  let next = 0;
+  for (const { player, breakSeatIdx, breakSeat } of movers) {
     // Get player's current chips from the breaking table
-    const breakSeat = breakTable?.seats.find(s => s.playerId === player.playerId);
     const chips = breakSeat?.chipCount || tournament.players.find(p => p.playerId === player.playerId)?.chips || 5000;
     const isAI = breakSeat?.isAI ?? true;
+    let placed = false;
 
-    for (const targetTid of remainingTables) {
-      if (placed) break;
-      const targetTable = tableManager.getTable(targetTid);
-      if (!targetTable) continue;
-
-      // Find ALL empty seats on this table, try each one
-      for (let seatIdx = 0; seatIdx < 9; seatIdx++) {
-        if (targetTable.seats[seatIdx].state !== 'empty') continue;
-
-        // Sit down at new table — sitDown returns false if seat is taken.
-        // F1 (2026-10-10): allowBelowMin — this RELOCATES a tournament stack
-        // (PokerTable.sitDown's documented rule for moves). Tournament tables
-        // are created with minBuyIn = the STARTING stack, so without it every
-        // player below the starting stack was refused by every seat and left
-        // seatless ("Could not place") while still alive in the tournament.
-        const seated = targetTable.sitDown(seatIdx, player.playerName, chips, player.playerId, isAI, true);
-        if (!seated) continue;
-
-        tournamentManager.setPlayerTable(tournamentId, player.playerId, targetTid);
-        const emptySeat = seatIdx;
-
-        // Move AI profile if it's a bot
-        if (isAI && breakSeat) {
-          const oldSeatIdx = breakTable?.seats.findIndex(s => s.playerId === player.playerId) ?? -1;
-          const oldProfile = aiProfiles.get(breakTableId)?.get(oldSeatIdx);
-          if (oldProfile) {
-            if (!aiProfiles.has(targetTid)) aiProfiles.set(targetTid, new Map());
-            aiProfiles.get(targetTid)!.set(emptySeat, oldProfile);
-          }
-        } else {
-          // Human player — update their session IF they're still connected.
-          // If the socket disconnected during rebalance, playerSessions may
-          // still hold a stale entry (cleanup race). Mutating it blindly
-          // would leave a ghost session pointing at the wrong table. Check
-          // the live socket registry first: no live socket → log + skip the
-          // session mutation. The player's tournament seat is already
-          // reassigned (setPlayerTable above); on reconnect, the orphan-seat
-          // recovery flow (oauthLogin) will pick it up correctly.
-          const tp = tournament.players.find(p => p.playerId === player.playerId);
-          if (tp) {
-            const sock = io.sockets.sockets.get(tp.socketId);
-            const sockLive = sock && sock.connected;
-            if (sockLive) {
-              const session = playerSessions.get(tp.socketId);
-              if (session) {
-                session.tableId = targetTid;
-                session.seatIndex = emptySeat;
-              }
-              sock.leave(`table:${breakTableId}`);
-              sock.join(`table:${targetTid}`);
-              sock.emit('playerMoved', {
-                fromTable: breakTableId,
-                toTable: targetTid,
-                toSeat: emptySeat,
-                tableId: targetTid,
-              });
-            } else {
-              console.warn(`[Tournament] Rebalance: ${player.playerName} socket ${tp.socketId} not live — skipping session mutation; reconnect recovery will pick it up`);
-            }
-          }
-        }
-
-        placed = true;
-        console.log(`[Tournament] Moved ${player.playerName} to table ${targetTid} seat ${emptySeat}`);
-        break; // break out of seat loop
+    while (!placed && next < targets.length) {
+      const { tid: targetTid, table: targetTable, seatIdx } = targets[next++];
+      if (targetTable.seats[seatIdx].state !== 'empty') {
+        // P1 — a busted seat: stood up for this player (re-checked: still busted).
+        if (!tournamentSeatIsPlaceable(tournamentId, targetTable, seatIdx)) continue;
+        vacateBustedTournamentSeat(targetTable, targetTid, seatIdx);
       }
+
+      // Sit down at new table — sitDown returns false if seat is taken.
+      // F1 (2026-10-10): allowBelowMin — this RELOCATES a tournament stack
+      // (PokerTable.sitDown's documented rule for moves). Tournament tables
+      // are created with minBuyIn = the STARTING stack, so without it every
+      // player below the starting stack was refused by every seat and left
+      // seatless ("Could not place") while still alive in the tournament.
+      const seated = targetTable.sitDown(seatIdx, player.playerName, chips, player.playerId, isAI, true);
+      if (!seated) continue;
+
+      tournamentManager.setPlayerTable(tournamentId, player.playerId, targetTid);
+      const emptySeat = seatIdx;
+
+      // Move AI profile if it's a bot
+      if (isAI && breakSeat) {
+        const oldProfile = aiProfiles.get(breakTableId)?.get(breakSeatIdx);
+        if (oldProfile) {
+          if (!aiProfiles.has(targetTid)) aiProfiles.set(targetTid, new Map());
+          aiProfiles.get(targetTid)!.set(emptySeat, oldProfile);
+        }
+      } else {
+        // Human player — P6: every live session (on ANY of his sockets, not
+        // just the one he registered with) and his reservation follow the
+        // stack. A session on a socket that is gone is skipped (its
+        // disconnect handler owns it; reconnect recovery picks it up).
+        const tp = tournament.players.find(p => p.playerId === player.playerId);
+        moveTournamentSeatPointers(tp, breakTableId, breakSeatIdx, targetTid, emptySeat);
+      }
+
+      placed = true;
+      console.log(`[Tournament] Moved ${player.playerName} to table ${targetTid} seat ${emptySeat}`);
     }
 
     if (!placed) {
@@ -15427,49 +16338,48 @@ function handleTableRebalance(tournamentId: string): void {
   }
 
   // Cascade: keep rebalancing until all tables have >= 5 players or only 1 table left
-  const nextRebalance = tournamentManager.checkRebalance(tournamentId);
+  const nextRebalance = planTournamentRebalance(tournamentId);
   if (nextRebalance) {
     // Delay slightly to let table state settle
     setTimeout(() => handleTableRebalance(tournamentId), 500);
   } else {
-    // All tables are balanced — restart hands on tables that were waiting
-    const t = tournamentManager.getTournament(tournamentId);
-    if (t) {
-      for (const tid of t.tableIds) {
-        const table = tableManager.getTable(tid);
-        // F1 (2026-10-10): a table that is INSIDE startNewHand right now (this
-        // rebalance was held by its hand-start gate) is dealt by that start —
-        // never start it again from here.
-        if (table && !table.isHandInProgress() && !table.isStartingHand()) {
-          const alivePlayers = tournamentManager.getAlivePlayersOnTable(tournamentId, tid);
-          const isFinalTable = t.tableIds.length === 1;
-          if (alivePlayers.length >= 2 && (isFinalTable || alivePlayers.length >= 5)) {
-            table.startNewHand();
-            broadcastGameState(tid);
-            scheduleAIAction(tid);
-          }
-        }
-      }
-    }
+    // All tables are balanced — restart hands on tables that were waiting.
+    // F1: never a table that is mid-start; P2: a table whose hand just ended
+    // goes through scheduleAutoStart, never a synchronous startNewHand here.
+    restartWaitingTournamentTables(tournamentId, { startWaiting: true });
   }
 }
 
 // Periodic rebalance check — prevents stalls when tables have < 5 players
 // and no eliminations are happening to trigger event-driven rebalance.
-setInterval(() => {
-  for (const [tableId, tournamentId] of tournamentTables) {
+// 2026-10-10 — EVERY tournament is serviced on every tick, once each. It used
+// to `break` after the first tournament that needed a rebalance ("one at a
+// time per tick"); since a break can be DEFERRED (mid-hand, or a pending bust
+// — P1/Q1), that tournament needed one on every tick while its table finished
+// its hand, and every other tournament's sweep-driven rebalance waited behind
+// it. Each tournament's rebalance is independent of the others'.
+function sweepTournamentRebalances(): void {
+  pruneBrokenTournamentTables(); // P8 — time-based retention
+  for (const [tableId, tid] of tournamentBreaksAwaitingHandEnd) {
+    if (!tournamentTables.has(tableId)) tournamentBreaksAwaitingHandEnd.delete(tableId);
+    else if (tournamentManager.getTournament(tid)?.status !== 'running') tournamentBreaksAwaitingHandEnd.delete(tableId);
+  }
+  // A snapshot of the distinct tournaments: a break removes its table from
+  // tournamentTables while we iterate.
+  for (const tournamentId of new Set(tournamentTables.values())) {
     const tournament = tournamentManager.getTournament(tournamentId);
     if (!tournament || tournament.status !== 'running') continue;
     if (tournament.tableIds.length <= 1) continue;
 
-    // Check if any table has < 5 players
-    const rebalance = tournamentManager.checkRebalance(tournamentId);
+    // Check if any table has < 5 players (and the others have room for them)
+    const rebalance = planTournamentRebalance(tournamentId);
     if (rebalance) {
       handleTableRebalance(tournamentId);
-      break; // handle one tournament at a time per tick
+      continue; // never stop servicing the other tournaments (a deferred break re-asks every tick)
     }
   }
-}, 5000);
+}
+setInterval(sweepTournamentRebalances, 5000);
 
 // REST endpoint to start a simulated tournament
 app.post('/api/tournament/simulate', (req, res) => {

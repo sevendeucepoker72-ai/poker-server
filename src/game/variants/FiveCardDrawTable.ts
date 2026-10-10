@@ -248,7 +248,8 @@ export class FiveCardDrawTable extends PokerTable {
    */
   startNewHand(): boolean {
     // F1 (2026-10-10): a nested call is refused by the base class — never reset this hand's draw state for it.
-    if (this.isStartingHand()) return super.startNewHand();
+    // P2: likewise a call made while the previous hand is still completing (its handResult listeners).
+    if (this.isStartingHand() || this.isCompletingHand()) return super.startNewHand();
     this.drawsCompleted.clear();
     this.currentDrawPhase = null;
     this.drawRound = 0;
