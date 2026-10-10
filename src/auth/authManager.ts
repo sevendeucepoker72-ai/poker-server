@@ -1,6 +1,7 @@
 import { Pool } from 'pg';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 // Shared reader for the users.stats column, which may arrive as a jsonb object
 // or as JSON text depending on the live column type (see probeStatsColumnType
 // in index.ts — /api/health reports the answer). Using it instead of a bare
@@ -688,7 +689,81 @@ export async function getUserFromToken(token: string): Promise<AuthResult> {
   }
 }
 
-export async function saveProgress(userId: number, data: { level?: number; xp?: number; stats?: Record<string, any>; achievements?: string[] }): Promise<boolean> {
+/**
+ * 2026-10-09 — a signing key DERIVED from JWT_SECRET for exactly one purpose
+ * (`scope`), e.g. the .online resume token (auth/resumeToken.ts). Deriving
+ * (HMAC-SHA256(JWT_SECRET, scope)) instead of reusing JWT_SECRET directly is
+ * domain separation: a token minted for one purpose can never verify as a
+ * legacy HS256 login token (getUserFromToken) or vice versa.
+ *
+ * Returns null when legacy HS256 is DISABLED (JWT_SECRET unset in a
+ * production-like env): a key derived from the public fallback secret would
+ * be just as forgeable as the fallback itself, so the feature turns off.
+ */
+export function getScopedSigningKey(scope: string): string | null {
+  if (JWT_LEGACY_DISABLED) return null;
+  return crypto.createHmac('sha256', JWT_SECRET).update(String(scope)).digest('hex');
+}
+
+export type LegacyTokenCheck =
+  /** `username` = the token's username claim (generateToken always sets it); null when absent. */
+  | { ok: true; userId: number; tokenVersion: number; expired: boolean; username: string | null }
+  | { ok: false; reason: 'disabled' | 'invalid' | 'expired' };
+
+/**
+ * 2026-10-09 — the legacy HS256 verifier's checks (JWT_SECRET signature +
+ * the JWT_LEGACY_DISABLED forgery guard, exactly as getUserFromToken), but
+ * returning the CLAIMS instead of logging the token in, so a caller can run
+ * its own row checks (token_version, banned) under a row lock. Used by the
+ * guest carry-over (auth/guestClaim.ts) to prove the caller holds a guest
+ * account's credential.
+ *
+ * `allowExpired`: accept a correctly SIGNED token whose `exp` has passed, no
+ * matter how long ago (contract R2). Legacy tokens live 7 days and are
+ * refreshed on every visit; both former guests named by the owner have been
+ * away for weeks, so the token on their device is expired — and it still
+ * proves the same thing: this device was signed in as that guest. What keeps
+ * an old token from being reused is the row's token_version, which the claim
+ * bumps (one claim per row). NEVER used for a LOGIN — getUserFromToken keeps
+ * enforcing `exp`.
+ */
+export function verifyLegacyTokenClaims(
+  token: unknown,
+  opts: { allowExpired?: boolean; nowMs?: number } = {},
+): LegacyTokenCheck {
+  if (JWT_LEGACY_DISABLED) return { ok: false, reason: 'disabled' };
+  if (typeof token !== 'string' || !token || token.length > 4096) return { ok: false, reason: 'invalid' };
+  const tok: string = token;
+  const nowSec = Math.floor((opts.nowMs ?? Date.now()) / 1000);
+  const verify = (ignoreExpiration: boolean) =>
+    jwt.verify(tok, JWT_SECRET, { algorithms: ['HS256'], ignoreExpiration, clockTimestamp: nowSec }) as any;
+  let decoded: any;
+  let expired = false;
+  try {
+    decoded = verify(false);
+  } catch (e: any) {
+    if (e?.name !== 'TokenExpiredError') return { ok: false, reason: 'invalid' };
+    if (!opts.allowExpired) return { ok: false, reason: 'expired' };
+    // Signature (and alg) are checked again here; only `exp` is waived.
+    try { decoded = verify(true); } catch { return { ok: false, reason: 'invalid' }; }
+    expired = true;
+  }
+  const userId = Number(decoded?.userId);
+  if (!Number.isInteger(userId) || userId <= 0) return { ok: false, reason: 'invalid' };
+  const tokenVersion = decoded?.tokenVersion == null ? 0 : Number(decoded.tokenVersion);
+  if (!Number.isInteger(tokenVersion) || tokenVersion < 0) return { ok: false, reason: 'invalid' };
+  const username = typeof decoded?.username === 'string' && decoded.username ? decoded.username : null;
+  return { ok: true, userId, tokenVersion, expired, username };
+}
+
+/**
+ * SERVER-SIDE progress write (hand-complete, disconnect, graceful shutdown,
+ * shop boosters). 2026-10-09 (D4): the socket `saveProgress` handler no
+ * longer forwards level / xp / achievements from the CLIENT — it passes only
+ * `stats.clientData` (see progression/clientProgressSave.ts). `db` is optional
+ * (default: the shared pool), for tests.
+ */
+export async function saveProgress(userId: number, data: { level?: number; xp?: number; stats?: Record<string, any>; achievements?: string[] }, db?: ChipQueryable): Promise<boolean> {
   try {
     const sets: string[] = [];
     const vals: any[] = [];
@@ -755,7 +830,7 @@ export async function saveProgress(userId: number, data: { level?: number; xp?: 
     }
     if (sets.length === 0) return true;
     vals.push(userId);
-    await pool.query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${idx}`, vals);
+    await (db || pool).query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${idx}`, vals);
     return true;
   } catch (err) {
     console.error('[Auth] Failed to save progress:', err);
@@ -836,15 +911,26 @@ export async function getUserChips(userId: number): Promise<number> {
   return rows[0]?.chips ?? 0;
 }
 
-export async function deductChips(userId: number, amount: number): Promise<boolean> {
+/**
+ * The query surface the chip paths need. 2026-10-09: `deductChips` /
+ * `addChipsToUser` accept an optional `db` so a caller that must move chips
+ * INSIDE its own transaction (the guest carry-over, auth/guestClaim.ts) runs
+ * the SAME atomic statement on its transaction client instead of hand-writing
+ * a second chip-write path. Omitted = the shared pool, exactly as before.
+ */
+export interface ChipQueryable {
+  query(text: string, params?: unknown[]): Promise<{ rowCount?: number | null }>;
+}
+
+export async function deductChips(userId: number, amount: number, db?: ChipQueryable): Promise<boolean> {
   try {
-    const { rowCount } = await pool.query('UPDATE users SET chips = chips - $1 WHERE id = $2 AND chips >= $1', [amount, userId]);
+    const { rowCount } = await (db || pool).query('UPDATE users SET chips = chips - $1 WHERE id = $2 AND chips >= $1', [amount, userId]);
     return (rowCount ?? 0) > 0;
   } catch { return false; }
 }
 
-export async function addChipsToUser(userId: number, chips: number): Promise<boolean> {
-  try { await pool.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [chips, userId]); return true; } catch { return false; }
+export async function addChipsToUser(userId: number, chips: number, db?: ChipQueryable): Promise<boolean> {
+  try { await (db || pool).query('UPDATE users SET chips = chips + $1 WHERE id = $2', [chips, userId]); return true; } catch { return false; }
 }
 
 /**

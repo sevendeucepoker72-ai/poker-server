@@ -66,7 +66,14 @@ export type LoginFailureCode =
   // socket has no American Pub Poker account behind it. Same strings as the
   // `code` on the `error` / `joinError` / `qualifierRegistrationResult` frames.
   | 'player_suspended'
-  | 'login_required';
+  | 'login_required'
+  // 2026-10-09 — R1 `resumeSession`: the resume token is DEFINITIVELY unusable
+  // (expired, bad signature, wrong kind, users.token_version bumped, account
+  // banned, master link changed, row retired). The client drops it and falls
+  // back to signing in. Transient refusals keep their own codes
+  // (`maintenance`, `rate_limited`, `handler_exception`) so a client never
+  // discards a still-valid resume token over a DB blip.
+  | 'resume_invalid';
 
 export interface LoginIdentity {
   /** The value used as the LOCAL poker-server users.username key. */

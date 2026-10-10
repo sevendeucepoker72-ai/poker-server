@@ -201,6 +201,46 @@ const ACHIEVEMENTS: AchievementDef[] = [
     check: (p) => p.level >= 1000,              reward: { xp: 0, chips: 10000000, stars: 20000 } },
 ];
 
+/**
+ * 2026-10-09 (D2, guest carry-over) — the LIFETIME achievement ids that
+ * reaching `toLevel` unlocks which `fromLevel` did not, by level ALONE (every
+ * other counter held at zero). The carry-over raises the caller's level by
+ * ratchet; the achievements this returns are written as ALREADY EARNED so
+ * checkAchievements never re-pays a level reward the guest already received
+ * (its chips are in the wallet that moved). Derived from ACHIEVEMENTS'
+ * own check functions, so a new level-gated achievement is covered without
+ * touching this. Never throws.
+ */
+export function lifetimeAchievementsUnlockedByLevel(fromLevel: number, toLevel: number): string[] {
+  const clampLevel = (v: number) => Math.min(MAX_LEVEL, Math.max(0, Math.floor(Number(v) || 0)));
+  // Every field other than `level` reads as 0, so only level can satisfy a check.
+  const probe = (level: number) => new Proxy({ level } as Record<string | symbol, unknown>, {
+    get: (target, key) => (key in target ? target[key] : 0),
+  }) as unknown as PlayerProgress;
+  const lo = probe(clampLevel(fromLevel));
+  const hi = probe(clampLevel(toLevel));
+  const out: string[] = [];
+  for (const def of ACHIEVEMENTS) {
+    let atHi = false;
+    let atLo = false;
+    try { atHi = !!def.check(hi); atLo = !!def.check(lo); } catch { continue; }
+    if (atHi && !atLo) out.push(def.id);
+  }
+  return out;
+}
+
+/**
+ * 2026-10-09 (D2) — the most xp a player can legitimately hold AT `level`
+ * (one short of the next level-up; 0 at MAX_LEVEL). The carry-over clamps the
+ * guest's xp to it: an inflated xp would otherwise walk the next addXP through
+ * the level-up loop, paying level * 500 chips per level.
+ */
+export function maxXpAtLevel(level: number): number {
+  const l = Math.floor(Number(level) || 0);
+  if (l >= MAX_LEVEL) return 0;
+  return Math.max(0, xpRequiredForLevel(Math.max(1, l)) - 1);
+}
+
 // ──────────────────────────────────────────────────────────────────────
 //   DAILY ACHIEVEMENTS — reset every UTC 00:00. (user, ach, date) PK
 //   in DB prevents double-claim. Check functions read `p.dailyStats`.
@@ -473,6 +513,79 @@ export class ProgressionManager {
 
   getProgress(playerId: string): PlayerProgress | undefined {
     return this.progressMap.get(playerId);
+  }
+
+  /**
+   * 2026-10-09 (D2) — merge a guest carry-over into the CALLER's live
+   * in-memory progress, WITHOUT reloading it from Postgres. A full reload
+   * would throw away progress that is ahead of the DB (on prod the
+   * end-of-hand save fails on the TEXT stats column, so in-memory xp / hand
+   * counters / achievements routinely lead the row) and, while `hydrated` is
+   * false, persistChipReward / persistStarReward skip — a reward earned in
+   * that window would be lost for good. So only the carried fields move:
+   *   chips / stars    += what the claim added (the DB got the same, additively);
+   *   level / xp       ratchet — never lowers what memory holds;
+   *   achievements     union (incl. the level achievements marked earned).
+   * Nothing is written to the DB here (the claim transaction already did).
+   * An entry still hydrating gets a fresh hydrate instead (its read may
+   * predate the claim's commit). Returns the playerIds merged / re-hydrated.
+   */
+  applyCarriedProgress(
+    userId: number,
+    carried: { chipsAdded: number; starsAdded: number; levelAfter: number; xpAfter: number; achievementIds: string[] },
+  ): { merged: string[]; reloading: string[] } {
+    const merged: string[] = [];
+    const reloading: string[] = [];
+    const nonNeg = (v: unknown) => { const n = Math.floor(Number(v)); return Number.isFinite(n) && n > 0 ? n : 0; };
+    const chipsAdded = nonNeg(carried.chipsAdded);
+    const starsAdded = nonNeg(carried.starsAdded);
+    const levelAfter = Math.min(MAX_LEVEL, Math.max(1, nonNeg(carried.levelAfter)));
+    const xpAfter = Math.min(nonNeg(carried.xpAfter), maxXpAtLevel(levelAfter));
+    const ids = (carried.achievementIds || []).filter((a) => typeof a === 'string' && a.length > 0);
+    for (const [playerId, progress] of this.progressMap) {
+      if (progress.userId !== userId) continue;
+      if (!progress.hydrated) { reloading.push(playerId); continue; }
+      progress.chips += chipsAdded;
+      progress.stars += starsAdded;
+      if (levelAfter > progress.level) {
+        progress.level = levelAfter;
+        progress.xp = xpAfter;
+        progress.xpToNextLevel = xpRequiredForLevel(progress.level);
+        if (progress.level >= MAX_LEVEL) { progress.xp = 0; progress.xpToNextLevel = Infinity; }
+      } else if (levelAfter === progress.level && progress.level < MAX_LEVEL) {
+        progress.xp = Math.max(progress.xp, xpAfter);
+      }
+      progress.achievements = Array.from(new Set([...(progress.achievements || []), ...ids]));
+      merged.push(playerId);
+    }
+    for (const playerId of reloading) {
+      this.hydrateFromDB(playerId, userId).catch((e: any) =>
+        console.warn(`[ProgressionManager.applyCarriedProgress hydrate ${userId}]`, e?.message));
+    }
+    return { merged, reloading };
+  }
+
+  /**
+   * 2026-10-09 — force every in-memory entry belonging to `userId` to re-read
+   * Postgres, after an out-of-band DB change to that user's progress. Used for
+   * the RETIRED guest row after a carry-over (its stars/chips just left it:
+   * persistStars is a GREATEST write, so a stale in-memory entry would re-mint
+   * the moved stars). NOT for the caller — see applyCarriedProgress. Clearing
+   * `hydrated` first engages the existing write gate for the duration of the
+   * reload, so nothing is written from the stale values meanwhile. Returns the
+   * ids reloaded.
+   */
+  async rehydrateUser(userId: number): Promise<string[]> {
+    const ids: string[] = [];
+    for (const [playerId, progress] of this.progressMap) {
+      if (progress.userId === userId) {
+        progress.hydrated = false;
+        ids.push(playerId);
+      }
+    }
+    await Promise.all(ids.map((playerId) => this.hydrateFromDB(playerId, userId).catch((e: any) =>
+      console.warn(`[ProgressionManager.rehydrateUser ${userId}]`, e?.message))));
+    return ids;
   }
 
   /**

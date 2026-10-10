@@ -27,10 +27,18 @@ import {
   createLoginTracker,
   DEFAULT_LOGIN_WAIT_MS,
   seatRestoreAction,
+  findSuspendedRegistrants,
+  removeSuspendedRegistrants,
+  cancelIfTooFewEligibleAfterScreen,
+  MIN_ELIGIBLE_TO_START,
+  planHandStartGate,
+  HAND_GATE_MAX_STATUS_AGE_MS,
+  type PlayStatusPeek,
   type GateSession,
   type PlayStatus,
   type LoginWaitOutcome,
 } from '../src/auth/playGate';
+import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
 
 const ROGER = 'df83fafd-e6ac-403d-8d26-9b01c2a1ee96';
 const OTHER = '16899b30-fcc1-4be1-94f9-47f54cacf240';
@@ -673,6 +681,9 @@ describe('index.ts — every play-entry handler is gated before its first side e
     'registerPlayer(', 'consumeQualifierCreditOnMaster(', 'acceptChallenge(', 'createChallenge(',
     'registerForClubTournament(', 'createQuickTable(', 'tableManager.createTable(', 'spectators.delete(',
     'getClubTableById(', 'qt.players.push(',
+    // 2026-10-09 side features (staking, wagers, entry codes, home games).
+    'createVariantTable(', 'placeMarketBet(', 'addBracketSideBet(', 'UPDATE online_entry_codes',
+    'INSERT INTO staking_offers', 'getPool().connect()',
   ];
 
   /** Body of the handler registered for `event`, up to the next registration. */
@@ -694,6 +705,9 @@ describe('index.ts — every play-entry handler is gated before its first side e
     'joinAdditionalTable', 'joinByInviteCode', 'registerTournament', 'rebuy', 'joinClubTable',
     'registerClubTournament', 'createClubChallenge', 'acceptClubChallenge', 'registerQualifierTournament',
     'joinWithWaitlistContext',
+    // 2026-10-09 — side features a suspended player could still use.
+    'createStake', 'buyStake', 'placePredictionBet', 'placeSocialSideBet', 'redeemEntryCode',
+    'createPrivateTable',
   ];
 
   it.each(GATED)('%s calls assertPlayable before any side effect', (event) => {
@@ -732,7 +746,7 @@ describe('index.ts — every play-entry handler is gated before its first side e
   });
 
   // ── 2026-10-07 review fixes ────────────────────────────────────────────
-  it.each(['login', 'oauthLogin', 'tokenLogin', 'authWithTicket'])(
+  it.each(['login', 'oauthLogin', 'tokenLogin', 'authWithTicket', 'resumeSession'])(
     '%s is registered through trackLogin (the gate can wait for it)',
     (event) => {
       const re = new RegExp(`socket\\.on\\(\\s*'${event}',\\s*trackLogin\\(socket, '${event}', async \\(`);
@@ -850,6 +864,216 @@ describe('index.ts — every play-entry handler is gated before its first side e
     expect(body).toContain("socket.emit('loginResult', wireResult);");
     expect(body).not.toContain("socket.emit('loginResult', result)");
   });
+
+  // ── 2026-10-09 "Fix all of it" ─────────────────────────────────────────
+  /** A top-level function's body (up to the first line that is just `}`). */
+  function fnBody(signature: string): string {
+    const at = src.indexOf(signature);
+    if (at < 0) throw new Error(`${signature} not found in src/index.ts`);
+    return src.slice(at, src.indexOf('\n}\n', at));
+  }
+
+  it.each([
+    ['createStake', 'if (csGate) { emitPlayRefusal(socket, csGate); return; }'],
+    ['buyStake', 'if (bsGate) { replyBuyStake({ success: false, error: bsGate.message, code: bsGate.code }); return; }'],
+    ['placePredictionBet', "if (pbGate) { socket.emit('predictionError', { message: pbGate.message, code: pbGate.code }); return; }"],
+    ['placeSocialSideBet', "if (sbGate) { socket.emit('socialBracketError', { message: sbGate.message, code: sbGate.code }); return; }"],
+    ['redeemEntryCode', "if (rcGate) { socket.emit('redeemEntryCodeResult', { success: false, error: rcGate.message, code: rcGate.code }); return; }"],
+    ['createPrivateTable', 'if (ptGate) { emitPlayRefusal(socket, ptGate); return; }'],
+  ])('(C) %s refuses on the channel its client already listens to', (event, line) => {
+    expect(handlerBody(event)).toContain(line);
+  });
+
+  it('(C) buyStake never pays a SUSPENDED seller — checked before any chip moves, answered as unavailable', () => {
+    const body = handlerBody('buyStake');
+    const sellerAt = body.indexOf('if (await stakingSellerSuspended(Number(offer.sellerId))) {');
+    const txAt = body.indexOf('getPool().connect()');
+    expect(sellerAt).toBeGreaterThan(-1);
+    expect(txAt).toBeGreaterThan(sellerAt);
+    expect(body.slice(sellerAt, txAt)).toContain("error: 'Offer unavailable'");
+  });
+
+  it('(C) the free spectator pick (placePrediction) stays ungated — spectating is never gated', () => {
+    expect(handlerBody('placePrediction')).not.toContain('assertPlayable(');
+  });
+
+  it('(C) every free-chip tournament start goes through the suspension screen', () => {
+    const reg = handlerBody('registerTournament');
+    expect(reg).toContain("void screenAndStartTournament(data.tournamentId, 'register');");
+    expect(reg).not.toMatch(/\bstartTournamentGame\(/);
+    expect(src).toContain("void screenAndStartTournament(id, 'timed');");
+    // The only direct callers left are inside the screen (the normal start
+    // and its fail-open fallback) — plus the definition itself.
+    const screen = fnBody('async function screenAndStartTournament(');
+    expect(screen.split('startTournamentGame(').length - 1).toBe(2);
+    expect(src.split('startTournamentGame(').length - 1).toBe(3);
+    expect(screen).toContain('findSuspendedRegistrants(');
+    expect(screen).toContain("reason: 'suspended_at_start'");
+    // Silent (owner rule): nothing is pushed to the removed registrant.
+    expect(screen).not.toContain(PLAYER_SUSPENDED_MESSAGE);
+    expect(screen).not.toContain('PLAYER_SUSPENDED_MESSAGE');
+  });
+
+  it('(C) the hand loop: beforeHandStart → cached-status stand-up, never awaiting the master', () => {
+    const listener = src.slice(src.indexOf('function ensureTableProgressListener('), src.indexOf('function ensureTableProgressListener(') + 1200);
+    expect(listener).toContain("table.on('beforeHandStart', () => {");
+    expect(listener).toContain('standUpSuspendedSeatsBeforeDeal(table, tableId);');
+    const gate = fnBody('function standUpSuspendedSeatsBeforeDeal(');
+    expect(gate).toContain('if (table.isHandInProgress()) return;');
+    expect(gate).toContain('playStatusClient.peek(id, HAND_GATE_MAX_STATUS_AGE_MS)');
+    expect(gate).not.toMatch(/\bawait\b/);
+    const su = fnBody('function standUpSuspendedSeat(');
+    // Tournament seats: disqualified (eliminated, no prize) BEFORE any leave —
+    // a stood-up-but-alive entrant would stop the tournament from finishing.
+    // S4: ALL of this boundary's suspended entrants in ONE batch
+    // (disqualifyPlayers flags every one before eliminating any), before the
+    // first stand-up — so a finish mid-batch can never pay one of them.
+    const dqAt = gate.indexOf('tournamentManager.disqualifyPlayers(tournamentIdForGate, targets.map(');
+    const standUpLoopAt = gate.indexOf('standUpSuspendedSeat(table, tableId, seatIndex, owners.get(seatIndex)!, masterId, disqualifiedSeats.get(seatIndex) === true);');
+    expect(dqAt).toBeGreaterThan(-1);
+    expect(standUpLoopAt).toBeGreaterThan(dqAt);
+    expect(su).not.toContain('disqualifyPlayer');
+    const leaveAt = su.indexOf('handlePlayerLeave(sock!)');
+    expect(leaveAt).toBeGreaterThan(-1);
+    // Extra-table seats are detached for the main-seat leave, then put back.
+    expect(su).toContain('if (multi) multiTableSessions.delete(owner.socketId);');
+    expect(su).toContain('if (multi) multiTableSessions.set(owner.socketId, multi);');
+    expect(su).toContain("sock?.emit('error', { message: PLAYER_SUSPENDED_MESSAGE, code: 'player_suspended', tableId });");
+    // Spectating stays allowed: after the main-seat leave he is put back in
+    // the room as a SPECTATOR (same steps as the `spectate` handler), so his
+    // client flips to spectator chrome instead of freezing on a seated view.
+    const specAt = su.indexOf('spectators.get(tableId)!.add(sock.id);');
+    expect(specAt).toBeGreaterThan(leaveAt);
+    expect(su).toContain('(spectatorState as any).isSpectator = true;');
+    expect(su).toContain("sock.emit('spectating', { tableId, tableName: stillThere.config.tableName });");
+  });
+
+  it('(B/D1) ONLY authWithTicket and the waitlist bootstrap issue a resume token — never oauthLogin / tokenLogin / login, never an is_admin row', () => {
+    expect(handlerBody('authWithTicket')).toContain(
+      '...resumeFieldsFor(localUser.id, String(remoteUserId), localUser.token_version, {\n            isAdmin: !!localUser.is_admin, phone: String(phone),\n          }),',
+    );
+    // Waitlist: only for the session the bootstrap itself created (a
+    // pre-existing OIDC session on the socket has its own refresh flow).
+    const wl = handlerBody('joinWithWaitlistContext');
+    expect(wl).toContain('...(wlBootstrapSession && seatedAuth === wlBootstrapSession');
+    expect(wl).toContain('? resumeFieldsFor(lu.id, wlBootstrapSession.masterUserId, lu.token_version, { isAdmin: !!lu.is_admin })');
+    expect(wl).toContain('wlBootstrapSession = { userId: urows[0].id, username: urows[0].username, masterUserId: String(remoteUserId) };');
+    // OIDC logins and the password login issue NONE.
+    for (const ev of ['oauthLogin', 'tokenLogin', 'login']) expect(handlerBody(ev)).not.toContain('resumeFieldsFor(');
+    // The only call sites in the file: the two issuers + the resume refresh
+    // (+ the definition) — and every call states isAdmin.
+    expect(src.split('resumeFieldsFor(').length - 1).toBe(4);
+    const fn = fnBody('function resumeFieldsFor(');
+    expect(fn).toContain('opts: { isAdmin: boolean; origIat?: number; phone?: string | null },');
+    expect(fn).toContain('if (opts.isAdmin) { resumeStats.adminRowsSkipped++; return {}; }');
+  });
+
+  it('(D3) EVERY buyStakeResult frame echoes the request offerId (one emit site: the helper)', () => {
+    const body = handlerBody('buyStake');
+    expect(body.split("socket.emit('buyStakeResult'").length - 1).toBe(1);
+    expect(body).toContain("socket.emit('buyStakeResult', { ...frame, ...(bsOfferId ? { offerId: bsOfferId } : {}) });");
+    // The helper is defined BEFORE the gate, so the play-gate refusal carries it too.
+    expect(body.indexOf('const replyBuyStake = ')).toBeLessThan(body.indexOf("await assertPlayable(socket, 'buyStake')"));
+    // success + every failure go through it.
+    expect(body).toContain('replyBuyStake({ success: true });');
+    expect(body.split('replyBuyStake({ success: false').length - 1).toBeGreaterThanOrEqual(9);
+  });
+
+  it('(D4) saveProgress: the client may write ONLY stats.clientData — level / xp / achievements / chips never reach the DB', () => {
+    const body = handlerBody('saveProgress');
+    expect(body).toContain('const { data: progressData, dropped } = sanitizeClientProgressSave(data);');
+    expect(body).toContain('const success = await saveProgress(auth.userId, progressData);');
+    expect(body).not.toMatch(/\.\.\.progressData\s*}\s*=\s*data/);
+    expect(body.split('saveProgress(auth.userId').length - 1).toBe(1);
+  });
+
+  it('(D5) the tournament start screen removes + refunds through removeSuspendedRegistrants (live re-read, single refund)', () => {
+    const screen = fnBody('async function screenAndStartTournament(');
+    expect(screen).toContain('await removeSuspendedRegistrants(');
+    expect(screen).not.toContain('tournamentManager.unregisterPlayer(');
+    expect(screen).not.toContain('tournamentManager.refundEntryFee(');
+  });
+
+  it('(S4) the start screen cancels + refunds (existing cancel path) when its removals leave < 2 eligible — before any start, with no await in between', () => {
+    const screen = fnBody('async function screenAndStartTournament(');
+    const removeAt = screen.indexOf('await removeSuspendedRegistrants(');
+    const cancelAt = screen.indexOf('const cancelled = cancelIfTooFewEligibleAfterScreen(tournamentManager, tournamentId, removed.length);');
+    const refundAt = screen.indexOf("refundCancelledTournamentEntrants(tournamentId, cancelled, 'cancelled_too_few_eligible_at_start');");
+    const startAt = screen.indexOf('if (tournamentManager.canStart(tournamentId)) startTournamentGame(tournamentId);');
+    expect(removeAt).toBeGreaterThan(-1);
+    expect(cancelAt).toBeGreaterThan(removeAt);
+    expect(refundAt).toBeGreaterThan(cancelAt);
+    expect(startAt).toBeGreaterThan(refundAt);
+    // No await between the removal and the cancel decision.
+    expect(screen.slice(screen.indexOf(';', removeAt) + 1, cancelAt)).not.toMatch(/\bawait\b/);
+    // ONE refund path for a cancelled tournament: the stall sweep uses it too,
+    // and it credits additively + audits every entrant.
+    const sweepAt = src.indexOf('for (const id of tournamentManager.checkStalledTournaments()) {');
+    expect(sweepAt).toBeGreaterThan(-1);
+    expect(src.slice(sweepAt, sweepAt + 400)).toContain("refundCancelledTournamentEntrants(id, registrants, 'tournament_cancelled_stalled');");
+    const refundFn = fnBody('function refundCancelledTournamentEntrants(');
+    expect(refundFn).toContain('addChipsToUser(userId, r.refund)');
+    expect(refundFn).toContain("'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED'");
+  });
+
+  it('(B/D1) resumeSession: seat restored by LOCAL userId only (no display-name scan); session phone + orig_iat carried from the token', () => {
+    const body = handlerBody('resumeSession');
+    expect(body).not.toContain('recoverName');
+    expect(body).not.toContain('seat.playerName');
+    expect(body).toContain('const reserved = reservedSeats.get(userId);');
+    expect(body).toContain('...(claims.phone ? { phone: claims.phone } : {}),');
+    expect(body).toContain('isAdmin: !!row.is_admin, origIat: claims.orig_iat, phone: claims.phone,');
+    // The ghost clearing around the restore is userId-only too (its display-name
+    // step would stand up a same-named player and credit HIS stack to this user).
+    expect(body).toContain('clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex, { nameScan: false });');
+    expect(fnBody('function clearGhostSeatsForUser(')).toContain('if (namesToMatch.size > 0 && opts.nameScan !== false) {');
+  });
+
+  it('(B) resumeSession builds userData BEFORE setting the session (no half-signed-in socket on a parse error)', () => {
+    const body = handlerBody('resumeSession');
+    expect(body).toContain('achievements: parseAchievements(row.achievements),');
+    expect(body.indexOf('const userData = {')).toBeLessThan(body.indexOf('authSessions.set(socket.id, {'));
+  });
+
+  it('(B) resumeSession: verified + row-checked before the session is set, exactly like authWithTicket\'s', () => {
+    const body = handlerBody('resumeSession');
+    const verifyAt = body.indexOf('verifyResumeToken(RESUME_SIGNING_KEY, data?.resumeToken)');
+    const rowAt = body.indexOf('checkResumeRow(claims, row)');
+    const setAt = body.indexOf('authSessions.set(socket.id, {');
+    expect(verifyAt).toBeGreaterThan(-1);
+    expect(rowAt).toBeGreaterThan(verifyAt);
+    expect(setAt).toBeGreaterThan(rowAt);
+    expect(body).toContain('userId, username: row.username, masterUserId: claims.masterUserId,\n          ...(claims.phone ? { phone: claims.phone } : {}),');
+    expect(body).toContain("code: 'resume_invalid', message: RESUME_INVALID_MESSAGE");
+  });
+
+  it('(B) resumeSession: the seat restore is gated and skipped on refusal; the refusal follows loginResult', () => {
+    const body = expectRestoresGated('resumeSession', 1);
+    expectRestoreSkippedOnRefusal(body, 'rsSeatRestoreRefusal', "row.username, 'resumeSession')");
+    const loginResultAt = body.indexOf("socket.emit('loginResult', {\n          success: true,");
+    const refusalAt = body.indexOf('if (rsSeatRestoreRefusal) emitPlayRefusal(socket, rsSeatRestoreRefusal);');
+    expect(loginResultAt).toBeGreaterThan(-1);
+    expect(refusalAt).toBeGreaterThan(loginResultAt);
+    expect(body).toContain('if (!data?.skipSeatRecovery) try {');
+  });
+
+  it('(A) claimGuestProgress: read-only checks first, then the guest seat cash-out, then the transaction; audited', () => {
+    const body = handlerBody('claimGuestProgress');
+    const peekAt = body.indexOf('await peekGuestProgress(deps, input)');
+    const cashAt = body.indexOf('await cashOutSeatsBeforeGuestClaim(pre.guestUserId)');
+    const claimAt = body.indexOf('await claimGuestProgress(deps, input)');
+    expect(peekAt).toBeGreaterThan(-1);
+    expect(cashAt).toBeGreaterThan(peekAt);
+    expect(claimAt).toBeGreaterThan(cashAt);
+    expect(body).toContain("'GUEST_PROGRESS_CLAIMED'");
+    // D2: the caller is MERGED (never reloaded: a reload drops unsaved progress).
+    expect(body).toContain('progressionManager.applyCarriedProgress(auth.userId, {');
+    expect(body).not.toContain('rehydrateUser(auth.userId)');
+    // Only an ATTESTED master id may claim — never the gate-only stats id.
+    expect(body).toContain('callerMasterId: auth?.masterUserId');
+    expect(body).not.toContain('statsMasterUserId');
+    expect(src).toContain("'GUEST_PROGRESS_CLAIMED',\n]);"); // durable audit row
+  });
 });
 
 describe('circuit breaker (review R2: a slow master must not stall every join)', () => {
@@ -885,5 +1109,235 @@ describe('circuit breaker (review R2: a slow master must not stall every join)',
     const { c } = client(fetchImpl, { failOpenTtlMs: 0 });
     for (const id of ['a', 'b', 'c', 'd']) await c.getPlayStatus(id);
     expect(calls).toBe(4);
+  });
+});
+
+// ── 2026-10-09 — hand-start stand-up + tournament start screen ─────────────
+describe('play-status cache peek — the hand loop never waits on the master', () => {
+  it('returns the last answer with its age; null when there is none or it is too old; never fetches or counts', async () => {
+    let t = 1_000_000;
+    const m = fakeMaster(new Set([ROGER]));
+    const { c } = client(m.fetchImpl, { now: () => t });
+    expect(c.peek(ROGER, 60_000)).toBeNull();
+    await c.getPlayStatus(ROGER);
+    const before = c.counters();
+    t += 30_000;
+    expect(c.peek(ROGER, HAND_GATE_MAX_STATUS_AGE_MS)).toEqual({ status: { suspended: true, failedOpen: false }, ageMs: 30_000, expired: false });
+    t += 40_000; // 70s — past the 60s TTL: still readable for the hand gate, flagged expired
+    expect(c.peek(ROGER, HAND_GATE_MAX_STATUS_AGE_MS)).toMatchObject({ ageMs: 70_000, expired: true, status: { suspended: true } });
+    expect(c.peek(ROGER, 60_000)).toBeNull();
+    t += HAND_GATE_MAX_STATUS_AGE_MS;
+    expect(c.peek(ROGER, HAND_GATE_MAX_STATUS_AGE_MS)).toBeNull();
+    expect(m.calls).toHaveLength(1);
+    expect(c.counters()).toEqual(before);
+    expect(c.peek('', HAND_GATE_MAX_STATUS_AGE_MS)).toBeNull();
+  });
+
+  it('HAND_GATE_MAX_STATUS_AGE_MS is 5 minutes', () => {
+    expect(HAND_GATE_MAX_STATUS_AGE_MS).toBe(5 * 60_000);
+  });
+});
+
+describe('planHandStartGate — who is stood up before the deal', () => {
+  const peekFrom = (entries: Record<string, PlayStatusPeek>) => (id: string) => entries[id] ?? null;
+  const fresh = (suspended: boolean, failedOpen = false): PlayStatusPeek => ({ status: { suspended, failedOpen }, ageMs: 1_000, expired: false });
+  const stale = (suspended: boolean): PlayStatusPeek => ({ status: { suspended, failedOpen: false }, ageMs: 90_000, expired: true });
+
+  it('a cached SUSPENDED answer stands the seat up; nothing to refresh', () => {
+    expect(planHandStartGate([{ seatIndex: 3, masterId: ROGER }, { seatIndex: 5, masterId: OTHER }], peekFrom({ [ROGER]: fresh(true), [OTHER]: fresh(false) })))
+      .toEqual({ standUp: [{ seatIndex: 3, masterId: ROGER }], refresh: [] });
+  });
+
+  it('no cached answer → nobody stood up THIS hand, the id is refreshed for the next one', () => {
+    expect(planHandStartGate([{ seatIndex: 3, masterId: ROGER }], peekFrom({})))
+      .toEqual({ standUp: [], refresh: [ROGER] });
+  });
+
+  it('an expired (but within max age) suspended answer still stands him up, and is refreshed', () => {
+    expect(planHandStartGate([{ seatIndex: 1, masterId: ROGER }], peekFrom({ [ROGER]: stale(true) })))
+      .toEqual({ standUp: [{ seatIndex: 1, masterId: ROGER }], refresh: [ROGER] });
+  });
+
+  it('fail-open answers and seats with no master id never stand anyone up', () => {
+    expect(planHandStartGate(
+      [{ seatIndex: 0, masterId: ROGER }, { seatIndex: 2, masterId: null }, { seatIndex: 4, masterId: '  ' }],
+      peekFrom({ [ROGER]: fresh(false, true) }),
+    )).toEqual({ standUp: [], refresh: [] });
+  });
+
+  it('one refresh per id even when the same player holds two seats', () => {
+    const plan = planHandStartGate([{ seatIndex: 0, masterId: OTHER }, { seatIndex: 6, masterId: OTHER }], peekFrom({}));
+    expect(plan.refresh).toEqual([OTHER]);
+  });
+});
+
+describe('findSuspendedRegistrants — free-chip tournament start screen', () => {
+  const regs = [
+    { playerId: 'a', socketId: 's-a', userId: 1 },
+    { playerId: 'roger', socketId: 's-r', userId: 2 },
+    { playerId: 'nolink', socketId: 's-n', userId: 3 },
+    { playerId: 'boom', socketId: 's-b', userId: 4 },
+  ];
+  const ids: Record<string, string | null> = { a: OTHER, roger: ROGER, nolink: null };
+  const masterIdOf = async (p: { playerId: string }) => {
+    if (p.playerId === 'boom') throw new Error('stats lookup failed');
+    return ids[p.playerId];
+  };
+
+  it('removes only the suspended; no master id or a failed lookup keeps the player', async () => {
+    const { keep, suspended } = await findSuspendedRegistrants(regs, masterIdOf, async (id) => ({ suspended: id === ROGER, failedOpen: false }));
+    expect(keep.map((p) => p.playerId)).toEqual(['a', 'nolink', 'boom']);
+    expect(suspended).toEqual([{ player: regs[1], masterId: ROGER }]);
+  });
+
+  it('master down (fail-open) → nobody is removed', async () => {
+    const { keep, suspended } = await findSuspendedRegistrants(regs, masterIdOf, async () => ({ suspended: false, failedOpen: true, reason: 'timeout' }));
+    expect(keep).toHaveLength(4);
+    expect(suspended).toHaveLength(0);
+  });
+});
+
+// ── 2026-10-09 decision D5 — the tournament start screen never refunds twice ──
+describe('D5 — removeSuspendedRegistrants against the REAL TournamentManager', () => {
+  const FEE = 500;
+  function paidSng() {
+    const tm = new TournamentManager();
+    const id = tm.createTournament({
+      name: 'D5-SNG', buyIn: FEE, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: DEFAULT_BLIND_LEVELS,
+    } as any);
+    tm.registerPlayer(id, 'p-roger', 'Roger A.', 's-roger', 7); // the suspended registrant (paid)
+    tm.registerPlayer(id, 'p-amy', 'Amy B.', 's-amy', 8);
+    tm.registerPlayer(id, 'p-cal', 'Cal C.', 's-cal', 9);
+    return { tm, id };
+  }
+
+  it('TournamentManager.unregisterPlayer returns true ONLY for a real removal', () => {
+    const { tm, id } = paidSng();
+    expect(tm.unregisterPlayer(id, 'p-roger')).toBe(true);
+    expect(tm.unregisterPlayer(id, 'p-roger')).toBe(false); // already gone
+    expect(tm.unregisterPlayer(id, 'nobody')).toBe(false);
+  });
+
+  it('a suspended registrant still registered is removed and refunded EXACTLY once', async () => {
+    const { tm, id } = paidSng();
+    const credits: Array<[number, number]> = [];
+    const credit = async (u: number, a: number) => { credits.push([u, a]); return true; };
+    const snapshot = tm.getTournament(id)!.players.slice();
+    const suspended = [{ player: snapshot[0], masterId: 'roger-master' }];
+    const out = await removeSuspendedRegistrants(tm, id, suspended, credit);
+    expect(out).toEqual([{ playerId: 'p-roger', masterId: 'roger-master', userId: 7, refunded: FEE, refundFailed: false }]);
+    expect(credits).toEqual([[7, FEE]]);
+    expect(tm.getTournament(id)!.players.map((p) => p.playerId)).toEqual(['p-amy', 'p-cal']);
+    expect(tm.getTournament(id)!.collectedEntryFees).toBe(2 * FEE);
+    // A second screen pass (or a duplicate list entry) changes nothing.
+    expect(await removeSuspendedRegistrants(tm, id, suspended, credit)).toEqual([]);
+    expect(credits).toHaveLength(1);
+  });
+
+  it('THE RACE: he leaves (unregister + refund) while the screen awaits its lookups → the screen does NOT refund again', async () => {
+    const { tm, id } = paidSng();
+    const credits: Array<[number, number]> = [];
+    const credit = async (u: number, a: number) => { credits.push([u, a]); return true; };
+    // 1. The screen snapshots the field and starts its (async) status lookups.
+    const snapshot = tm.getTournament(id)!.players.slice();
+    // 2. Meanwhile his own leaveTournament runs (index.ts handler: unregister,
+    //    then refund on true).
+    if (tm.unregisterPlayer(id, 'p-roger')) { tm.refundEntryFee(id, 7); await credit(7, FEE); }
+    // 3. The lookups resolve: Roger is suspended — from the STALE snapshot.
+    const out = await removeSuspendedRegistrants(tm, id, [{ player: snapshot[0], masterId: 'roger-master' }], credit);
+    expect(out).toEqual([]);
+    expect(credits).toEqual([[7, FEE]]); // ONE refund, not two
+    expect(tm.getTournament(id)!.collectedEntryFees).toBe(2 * FEE); // pool backed out once
+  });
+
+  it('a failed wallet credit is reported (audited as TOURNAMENT_ENTRY_REFUND_FAILED), never retried into a double', async () => {
+    const { tm, id } = paidSng();
+    const snapshot = tm.getTournament(id)!.players.slice();
+    const out = await removeSuspendedRegistrants(tm, id, [{ player: snapshot[0], masterId: 'm' }], async () => false);
+    expect(out).toEqual([{ playerId: 'p-roger', masterId: 'm', userId: 7, refunded: 0, refundFailed: true }]);
+  });
+
+  it('a free tournament / an AI entrant: removed, nothing to refund', async () => {
+    const tm = new TournamentManager();
+    const id = tm.createTournament({ name: 'FREE', buyIn: 0, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: DEFAULT_BLIND_LEVELS } as any);
+    tm.registerPlayer(id, 'p1', 'One', 's1', 1);
+    const credit = jest.fn(async () => true);
+    const out = await removeSuspendedRegistrants(tm, id, [{ player: { playerId: 'p1' }, masterId: 'm' }], credit);
+    expect(out).toEqual([{ playerId: 'p1', masterId: 'm', userId: 1, refunded: 0, refundFailed: false }]);
+    expect(credit).not.toHaveBeenCalled();
+  });
+});
+
+// ── 2026-10-09 S4 — fewer than two eligible after the start screen → cancel + refund ──
+describe('S4 — cancelIfTooFewEligibleAfterScreen against the REAL TournamentManager', () => {
+  const FEE = 1000;
+  beforeEach(() => { jest.useFakeTimers(); });
+  afterEach(() => { jest.clearAllTimers(); jest.useRealTimers(); });
+
+  function sng(names: Array<[string, number]>, maxPlayers = 2) {
+    const tm = new TournamentManager();
+    const id = tm.createTournament({
+      name: 'S4-HU', buyIn: FEE, prizePool: 0, maxPlayers, startInterval: 0, blindLevels: DEFAULT_BLIND_LEVELS,
+    } as any);
+    for (const [pid, uid] of names) tm.registerPlayer(id, pid, pid.toUpperCase(), 's-' + pid, uid);
+    const wallet: Array<[number, number]> = [];
+    const credit = async (u: number, a: number) => { wallet.push([u, a]); return true; };
+    /** What index.ts refundCancelledTournamentEntrants credits. */
+    const refundCancelled = (regs: Array<{ userId?: number; refund: number }>) => {
+      for (const r of regs) if (r.userId !== undefined && r.refund > 0) wallet.push([r.userId, r.refund]);
+    };
+    return { tm, id, wallet, credit, refundCancelled };
+  }
+
+  it('heads-up, one suspended: he is removed + refunded once, the tournament is CANCELLED and the other refunded once — no walkover, no prize', async () => {
+    const { tm, id, wallet, credit, refundCancelled } = sng([['roger', 7], ['amy', 8]]);
+    expect(tm.getTournament(id)!.collectedEntryFees).toBe(2 * FEE);
+    const snapshot = tm.getTournament(id)!.players.slice();
+    const removed = await removeSuspendedRegistrants(tm, id, [{ player: snapshot[0], masterId: 'roger-master' }], credit);
+    expect(removed).toHaveLength(1);
+    const cancelled = cancelIfTooFewEligibleAfterScreen(tm, id, removed.length);
+    expect(cancelled).toEqual([{ playerId: 'amy', userId: 8, refund: FEE }]);
+    refundCancelled(cancelled!);
+    expect(wallet).toEqual([[7, FEE], [8, FEE]]);                       // each exactly once
+    expect(wallet.reduce((s, [, a]) => s + a, 0)).toBe(2 * FEE);          // = what was collected (no mint)
+    const t = tm.getTournament(id)!;
+    expect(t.status).toBe('cancelled');
+    expect(t.players).toEqual([]);
+    expect(t.collectedEntryFees).toBe(0);
+    expect(tm.canStart(id)).toBe(false);
+    // Nothing can refund either of them again:
+    expect(tm.unregisterPlayer(id, 'amy')).toBe(false);                   // leaveTournament refunds only on true
+    expect(cancelIfTooFewEligibleAfterScreen(tm, id, 1)).toBeNull();      // a second screen pass
+    expect(tm.cancelTournament(id)).toEqual([]);                          // the stall sweep's path
+    expect(tm.checkStalledTournaments()).not.toContain(id);
+  });
+
+  it('heads-up, BOTH suspended: both removed + refunded once; the empty tournament is cancelled with nobody else to refund', async () => {
+    const { tm, id, wallet, credit, refundCancelled } = sng([['roger', 7], ['rex', 9]]);
+    const snapshot = tm.getTournament(id)!.players.slice();
+    const removed = await removeSuspendedRegistrants(tm, id, snapshot.map((p) => ({ player: p, masterId: 'm-' + p.playerId })), credit);
+    const cancelled = cancelIfTooFewEligibleAfterScreen(tm, id, removed.length);
+    expect(cancelled).toEqual([]);
+    refundCancelled(cancelled!);
+    expect(wallet).toEqual([[7, FEE], [9, FEE]]);
+    expect(tm.getTournament(id)!.status).toBe('cancelled');
+  });
+
+  it('no-op (null) when nothing was removed, when >= 2 eligible remain, or when the tournament is no longer registering', async () => {
+    const a = sng([['amy', 8]]);                                            // 1 registrant, nobody suspended
+    expect(cancelIfTooFewEligibleAfterScreen(a.tm, a.id, 0)).toBeNull();   // not this rule's business
+    expect(a.tm.getTournament(a.id)!.status).toBe('registering');
+
+    const b = sng([['roger', 7], ['amy', 8], ['cal', 9]], 9);
+    const snap = b.tm.getTournament(b.id)!.players.slice();
+    const removed = await removeSuspendedRegistrants(b.tm, b.id, [{ player: snap[0], masterId: 'm' }], b.credit);
+    expect(cancelIfTooFewEligibleAfterScreen(b.tm, b.id, removed.length)).toBeNull(); // 2 remain
+    expect(b.tm.getTournament(b.id)!.status).toBe('registering');
+    expect(MIN_ELIGIBLE_TO_START).toBe(2);
+
+    const c = sng([['amy', 8], ['cal', 9]]);
+    c.tm.startTournament(c.id);
+    expect(cancelIfTooFewEligibleAfterScreen(c.tm, c.id, 1)).toBeNull();   // running: never cancelled here
+    expect(c.tm.getTournament(c.id)!.status).toBe('running');
   });
 });

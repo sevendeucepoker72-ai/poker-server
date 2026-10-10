@@ -33,6 +33,10 @@ export interface TournamentPlayer {
   // (undefined for AI fill / unauthenticated). Prize credits on finish go to
   // this id; only entrants with a userId paid the entry fee and fund the pool.
   userId?: number;
+  // 2026-10-09 — set by disqualifyPlayer (play gate: suspended mid-tournament).
+  // A disqualified entrant is eliminated and is paid NO prize (his share stays
+  // unpaid — never redistributed, never minted).
+  disqualified?: boolean;
 }
 
 export type TournamentStatus = 'registering' | 'running' | 'finished' | 'cancelled';
@@ -304,11 +308,20 @@ export class TournamentManager {
     tournament.collectedEntryFees = Math.max(0, tournament.collectedEntryFees - tournament.config.buyIn);
   }
 
+  /**
+   * Remove a registrant. Returns true ONLY when a registration was actually
+   * removed. 2026-10-09 (D5): it used to return true for a player who was not
+   * (or no longer) registered, and both callers refund the entry fee on true —
+   * so the tournament start screen, working from a snapshot taken before an
+   * await, refunded a suspended registrant a SECOND time when he had already
+   * left (and been refunded by leaveTournament) during that await.
+   */
   unregisterPlayer(tournamentId: string, playerId: string): boolean {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament || tournament.status !== 'registering') return false;
+    const before = tournament.players.length;
     tournament.players = tournament.players.filter((p) => p.playerId !== playerId);
-    return true;
+    return tournament.players.length < before;
   }
 
   /**
@@ -547,6 +560,66 @@ export class TournamentManager {
     return { finished: false, position: player.finishPosition, payout: 0, bountyPayout };
   }
 
+  /**
+   * 2026-10-09 — DISQUALIFY a running entrant (play gate: found suspended at a
+   * hand boundary mid-tournament). Standing his seat up WITHOUT eliminating
+   * him would leave him "alive" in `players` forever, so the tournament could
+   * never reach one survivor and finish. So: mark disqualified, zero his
+   * tournament stack, and eliminate him through the normal path (no
+   * eliminator → no bounty), which records a finish position and finishes the
+   * tournament if only one entrant is left. finishTournament pays a
+   * disqualified entrant nothing. Returns null if he is not a live entrant.
+   */
+  disqualifyPlayer(tournamentId: string, playerId: string): { finished: boolean; position: number } | null {
+    return this.disqualifyPlayers(tournamentId, [playerId]).get(playerId) ?? null;
+  }
+
+  /**
+   * 2026-10-09 (S4) — disqualify SEVERAL running entrants found suspended at
+   * the SAME hand boundary. ALL of them are flagged `disqualified` (stack
+   * zeroed) BEFORE any is eliminated: eliminating one can finish the
+   * tournament synchronously, and finishTournament pays the last entrant
+   * alive — if that survivor is himself being disqualified he must already
+   * carry the flag, or he is paid 1st place (heads-up with both players
+   * suspended: the second one used to win the pool). A survivor who is
+   * flagged gets position 1 and payout 0; his share stays unpaid (no
+   * redistribution, no mint). Per player: `{finished, position}`, or null if
+   * he was not a live entrant of a running tournament.
+   */
+  disqualifyPlayers(tournamentId: string, playerIds: string[]): Map<string, { finished: boolean; position: number } | null> {
+    const out = new Map<string, { finished: boolean; position: number } | null>();
+    const ids = Array.from(new Set(playerIds));
+    const tournament = this.tournaments.get(tournamentId);
+    if (!tournament || tournament.status !== 'running') {
+      for (const id of ids) out.set(id, null);
+      return out;
+    }
+    const live = new Map<string, TournamentPlayer>();
+    for (const id of ids) {
+      const p = tournament.players.find((x) => x.playerId === id);
+      if (p && !p.eliminated) live.set(id, p);
+    }
+    // 1. Flag every one of them first (nothing is eliminated yet).
+    for (const p of live.values()) {
+      p.disqualified = true;
+      p.chips = 0;
+    }
+    // 2. Then eliminate them one by one through the normal path.
+    for (const id of ids) {
+      const p = live.get(id);
+      if (!p) { out.set(id, null); continue; }
+      if (tournament.status !== 'running') {
+        // An earlier elimination in this batch finished the tournament and he
+        // was its survivor: already flagged, so he was paid nothing.
+        out.set(id, { finished: true, position: p.finishPosition });
+        continue;
+      }
+      const r = this.eliminatePlayer(tournamentId, id);
+      out.set(id, r ? { finished: r.finished, position: p.finishPosition } : null);
+    }
+    return out;
+  }
+
   private finishTournament(tournamentId: string): { finished: boolean; position: number; payout: number } | null {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament) return null;
@@ -585,8 +658,11 @@ export class TournamentManager {
       playerId: p.playerId,
       playerName: p.playerName,
       position: p.finishPosition,
-      payout: payouts[p.finishPosition] || 0,
+      // 2026-10-09 — a disqualified entrant (suspended mid-tournament) is paid
+      // nothing; his position's share stays unpaid (no redistribution, no mint).
+      payout: p.disqualified ? 0 : (payouts[p.finishPosition] || 0),
       userId: p.userId,
+      ...(p.disqualified ? { disqualified: true } : {}),
     }));
 
     this.emitEvent(tournamentId, 'tournamentFinished', {

@@ -102,8 +102,23 @@ export interface PlayStatusClientOptions {
   logError?: (line: string) => void;
 }
 
+/** A cached answer read without a lookup (see PlayStatusClient.peek). */
+export interface PlayStatusPeek {
+  status: PlayStatus;
+  /** How old the answer is. */
+  ageMs: number;
+  /** Past its normal cache TTL — still usable up to the caller's maxAgeMs, but worth refreshing. */
+  expired: boolean;
+}
+
 export interface PlayStatusClient {
   getPlayStatus(masterId: string): Promise<PlayStatus>;
+  /**
+   * 2026-10-09 — read the LAST answer for this id without any lookup, or null
+   * if there is none younger than `maxAgeMs`. Synchronous and free, for the
+   * hand loop (which must never wait on the master). Does not touch counters.
+   */
+  peek(masterId: string, maxAgeMs: number): PlayStatusPeek | null;
   /** Drop one id (or everything) from the cache. */
   invalidate(masterId?: string): void;
   counters(): PlayGateCounters;
@@ -139,7 +154,7 @@ export function createPlayStatusClient(opts: PlayStatusClientOptions): PlayStatu
     }
   };
 
-  const cache = new Map<string, { status: PlayStatus; expiresAt: number }>();
+  const cache = new Map<string, { status: PlayStatus; expiresAt: number; fetchedAt: number }>();
   const inflight = new Map<string, Promise<PlayStatus>>();
   const c: PlayGateCounters = {
     lookups: 0, cacheHits: 0, suspendedAnswers: 0, failOpen: 0,
@@ -196,7 +211,8 @@ export function createPlayStatusClient(opts: PlayStatusClientOptions): PlayStatu
       for (const [k, v] of cache) if (v.expiresAt <= t) cache.delete(k);
       if (cache.size >= MAX_CACHE_ENTRIES) cache.clear();
     }
-    cache.set(masterId, { status, expiresAt: now() + (status.failedOpen ? failOpenTtlMs : ttlMs) });
+    const t = now();
+    cache.set(masterId, { status, expiresAt: t + (status.failedOpen ? failOpenTtlMs : ttlMs), fetchedAt: t });
   }
 
   async function getPlayStatus(masterIdRaw: string): Promise<PlayStatus> {
@@ -217,6 +233,16 @@ export function createPlayStatusClient(opts: PlayStatusClientOptions): PlayStatu
 
   return {
     getPlayStatus,
+    peek(masterIdRaw: string, maxAgeMs: number): PlayStatusPeek | null {
+      const masterId = String(masterIdRaw || '').trim();
+      if (!masterId) return null;
+      const hit = cache.get(masterId);
+      if (!hit) return null;
+      const t = now();
+      const ageMs = t - hit.fetchedAt;
+      if (ageMs > maxAgeMs) return null;
+      return { status: hit.status, ageMs, expired: hit.expiresAt <= t };
+    },
     invalidate(masterId?: string) {
       if (masterId === undefined) cache.clear();
       else cache.delete(String(masterId).trim());
@@ -557,4 +583,170 @@ export async function partitionSuspendedRegistrants<T extends { masterPlayerId?:
   const suspended: T[] = [];
   players.forEach((p, i) => (statuses[i].suspended ? suspended : keep).push(p));
   return { keep, suspended };
+}
+
+/**
+ * 2026-10-09 — TOURNAMENT START SCREEN (free-chip / wallet tournaments).
+ * registerTournament refuses a suspended player, but one suspended AFTER he
+ * registered would still be seated at start. Resolve every registrant's
+ * master id (`masterIdOf` never needs to succeed: an error or null keeps the
+ * player, like qualifiers) and return who is suspended now. Fail-open: an
+ * unreachable master removes no one.
+ */
+export async function findSuspendedRegistrants<T>(
+  players: T[],
+  masterIdOf: (player: T) => Promise<string | null>,
+  getPlayStatus: (masterId: string) => Promise<PlayStatus>,
+): Promise<{ keep: T[]; suspended: Array<{ player: T; masterId: string }> }> {
+  const ids = await Promise.all(players.map((p) => masterIdOf(p).catch(() => null)));
+  const wrapped = players.map((player, i) => ({ player, masterPlayerId: ids[i] ? String(ids[i]).trim() || undefined : undefined }));
+  const { keep, suspended } = await partitionSuspendedRegistrants(wrapped, getPlayStatus);
+  return {
+    keep: keep.map((w) => w.player),
+    suspended: suspended.map((w) => ({ player: w.player, masterId: w.masterPlayerId as string })),
+  };
+}
+
+/** The TournamentManager surface removeSuspendedRegistrants needs (structural, for tests). */
+export interface RegistrantRemovalTm {
+  getTournament(tournamentId: string): { players: Array<{ playerId: string; userId?: number }>; config: { buyIn?: number } } | undefined;
+  /** MUST return true only when a registration was actually removed (TournamentManager does since 2026-10-09). */
+  unregisterPlayer(tournamentId: string, playerId: string): boolean;
+  refundEntryFee(tournamentId: string, userId?: number): void;
+}
+
+export interface RemovedRegistrant {
+  playerId: string;
+  masterId: string;
+  userId: number | null;
+  /** Entry fee credited back (0 = free tournament, no paying userId, or the credit failed). */
+  refunded: number;
+  /** A refund was due and the wallet credit FAILED (audit it as such). */
+  refundFailed: boolean;
+}
+
+/**
+ * 2026-10-09 (D5) — remove the suspended registrants found by
+ * findSuspendedRegistrants and refund each paid entry fee EXACTLY ONCE.
+ * `suspended` was computed from a snapshot taken BEFORE awaiting the
+ * play-status lookups; during that await a registrant may have left on his
+ * own (leaveTournament unregisters AND refunds him). So each one is re-read
+ * from the LIVE tournament, synchronously, right before the removal, and is
+ * refunded only when unregisterPlayer reports a real removal — never twice.
+ */
+export async function removeSuspendedRegistrants(
+  tm: RegistrantRemovalTm,
+  tournamentId: string,
+  suspended: Array<{ player: { playerId: string }; masterId: string }>,
+  creditRefund: (userId: number, amount: number) => Promise<boolean>,
+): Promise<RemovedRegistrant[]> {
+  const removed: RemovedRegistrant[] = [];
+  for (const { player, masterId } of suspended) {
+    // No await between this read and the removal.
+    const t = tm.getTournament(tournamentId);
+    const live = t?.players.find((p) => p.playerId === player.playerId);
+    if (!t || !live) continue; // already gone (left + refunded meanwhile)
+    if (!tm.unregisterPlayer(tournamentId, player.playerId)) continue;
+    const entryFee = t.config.buyIn || 0;
+    let refunded = 0;
+    let refundFailed = false;
+    if (entryFee > 0 && live.userId !== undefined) {
+      tm.refundEntryFee(tournamentId, live.userId);
+      const ok = await creditRefund(live.userId, entryFee);
+      refunded = ok ? entryFee : 0;
+      refundFailed = !ok;
+    }
+    removed.push({ playerId: player.playerId, masterId, userId: live.userId ?? null, refunded, refundFailed });
+  }
+  return removed;
+}
+
+/** The TournamentManager surface cancelIfTooFewEligibleAfterScreen needs (structural, for tests). */
+export interface StartScreenCancelTm {
+  getTournament(tournamentId: string): { status: string; players: unknown[] } | undefined;
+  /** Status → 'cancelled', field + collected pool emptied; returns who to refund (TournamentManager). */
+  cancelTournament(tournamentId: string): Array<{ playerId: string; userId?: number; refund: number }>;
+}
+
+/** Fewer eligible registrants than this after the start screen = the tournament is cancelled. */
+export const MIN_ELIGIBLE_TO_START = 2;
+
+/**
+ * 2026-10-09 (S4) — called right after removeSuspendedRegistrants, with no
+ * await in between. When the screen REMOVED someone and fewer than two
+ * eligible registrants remain, the tournament cannot start with this field:
+ * it is cancelled NOW through the existing cancel path
+ * (TournamentManager.cancelTournament — the stall sweep's path) and the
+ * remaining registrants are returned for their refund. Never a walkover,
+ * and nobody is paid a prize.
+ * SINGLE REFUND: the suspended were already refunded by
+ * removeSuspendedRegistrants and are no longer in the field; cancelTournament
+ * leaves the tournament 'cancelled' with an empty field and pool, so neither
+ * leaveTournament (unregisterPlayer needs 'registering') nor the stall sweep
+ * can refund anyone again.
+ * Returns null — and changes nothing — when nothing was removed, the
+ * tournament is gone or no longer registering, or ≥2 registrants remain.
+ */
+export function cancelIfTooFewEligibleAfterScreen(
+  tm: StartScreenCancelTm,
+  tournamentId: string,
+  removedCount: number,
+): Array<{ playerId: string; userId?: number; refund: number }> | null {
+  if (!(removedCount > 0)) return null;
+  const t = tm.getTournament(tournamentId);
+  if (!t || t.status !== 'registering') return null;
+  if (t.players.length >= MIN_ELIGIBLE_TO_START) return null;
+  return tm.cancelTournament(tournamentId);
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// 2026-10-09 — HAND-START STAND-UP (a player suspended mid-session no longer
+// keeps his seat).
+//
+// PokerTable emits 'beforeHandStart' at the top of startNewHand — the last
+// moment a seat can be stood up with nothing committed to a pot (the previous
+// pot is awarded, the next hand's blinds are not posted). index.ts plans the
+// stand-ups from the play-status CACHE only, so the hand loop never waits on
+// the master: an id with no answer (or one older than the normal TTL) is
+// looked up in the background and acted on at the NEXT hand boundary.
+// HAND_GATE_MAX_STATUS_AGE_MS bounds how stale an answer may be and still
+// stand a player up — long enough to span a slow hand (the refresh is fired
+// at the previous boundary), short enough that a lifted suspension stops
+// mattering within minutes.
+// ────────────────────────────────────────────────────────────────────────
+export const HAND_GATE_MAX_STATUS_AGE_MS = 5 * 60_000;
+
+export interface HandGateSeat {
+  seatIndex: number;
+  /** The seat player's master id; null when his session has none (or it is not resolved yet). */
+  masterId: string | null;
+}
+
+export interface HandGatePlan {
+  /** Seats whose player is suspended per the cached answer — stand them up before the deal. */
+  standUp: Array<{ seatIndex: number; masterId: string }>;
+  /** Master ids with no cached answer, or an expired one — refresh in the background. */
+  refresh: string[];
+}
+
+/**
+ * Decide, from cached answers only, which seats to stand up before this deal
+ * and which ids to refresh. `peek` is the play-status client's cache read
+ * (bound to HAND_GATE_MAX_STATUS_AGE_MS by the caller). A fail-open answer is
+ * "not suspended", like everywhere else in the gate.
+ */
+export function planHandStartGate(
+  seats: HandGateSeat[],
+  peek: (masterId: string) => PlayStatusPeek | null,
+): HandGatePlan {
+  const standUp: Array<{ seatIndex: number; masterId: string }> = [];
+  const refresh = new Set<string>();
+  for (const seat of seats) {
+    const id = seat.masterId == null ? '' : String(seat.masterId).trim();
+    if (!id) continue;
+    const cached = peek(id);
+    if (!cached || cached.expired) refresh.add(id);
+    if (cached && cached.status.suspended) standUp.push({ seatIndex: seat.seatIndex, masterId: id });
+  }
+  return { standUp, refresh: Array.from(refresh) };
 }

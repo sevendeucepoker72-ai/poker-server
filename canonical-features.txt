@@ -262,3 +262,134 @@ play_waited_for_login
 loginWaits
 seat_restore_refused
 seat_restore_held
+
+# ============================================================
+# 2026-10-09 — "Fix all of it" (owner), CONTRACTS.md C5.
+#
+# (B) R1 RESUMABLE TICKET SESSIONS (src/auth/resumeToken.ts). authWithTicket
+# and the waitlist deep link's bootstrap (ONLY those — D1, see the 2026-10-09
+# third-pass block below) put a 12h `resumeToken` on their success
+# loginResult; after a reconnect the client signs back in with
+# `resumeSession` instead of being told to sign in (the ticket is one-shot).
+# Signed with a key DERIVED from JWT_SECRET (scope below); `resume_invalid`
+# is the definitive refusal the client drops the token on. Losing any of
+# these = every "Play Online" player is signed out by the next reconnect.
+resumeSession
+online_resume
+poker-server/online_resume/v1
+resume_invalid
+#
+# (A) R2 GUEST CARRY-OVER (src/auth/guestClaim.ts). A former guest who signs
+# in with an account carries the guest row's chips + progress over ONCE
+# (additive chips, GREATEST level/xp, achievements union); the guest row is
+# retired with stats.claimedBy + token_version+1, never deleted.
+claimGuestProgress
+claimGuestProgressResult
+peekGuestProgress
+GUEST_PROGRESS_CLAIMED
+claimedBy
+#
+# (C) side features + mid-session suspensions. Staking / prediction wagers /
+# social side bets / redeemEntryCode / createPrivateTable are gated (pinned by
+# tests/playGate.test.ts GATED); free-chip tournament starts re-check every
+# registrant; a player found suspended is stood up at the PokerTable
+# `beforeHandStart` hook (whole stack returned; tournament seats disqualified).
+beforeHandStart
+seat_stood_up_suspended
+tournament_registrant_removed_suspended
+suspended_at_start
+#
+# 2026-10-09 (second pass). R2 hardening: only GuestNNNN rows (the old guest
+# flow's username) with no master stamp are claimable — an unstamped ACCOUNT
+# row left on a shared device can never be "carried over"; an expired but
+# correctly SIGNED guest token is accepted for peek/claim only (counted on
+# /api/health guestClaims.expiredTokensAccepted); a large claim raises the
+# same anti-cheat alert line as adminGrantChips.
+/^Guest\d+$/i
+expiredTokensAccepted
+guest carry-over moved
+#
+# 2026-10-09 (third pass) — decisions D1-D5 (CONTRACTS.md C5).
+# D1 resume tokens: ONLY authWithTicket + the waitlist bootstrap issue one
+# (never oauthLogin / tokenLogin, never an is_admin row → `admin_row`); every
+# token carries `orig_iat` (the ORIGINAL ticket login, unchanged across
+# resumes) and a resume is refused `session_too_old` once now - orig_iat >
+# 24h; the socket `logout` bumps users.token_version (revokes resume + legacy
+# tokens; a claimable guest row keeps its carry-over token).
+orig_iat
+session_too_old
+admin_row
+logout_tokens_revoked
+logout_guest_token_kept
+# D2 guest carry-over: only GuestNNNN rows created BEFORE the cutoff below are
+# claimable (no laundering of rollback-flag starting bankrolls); the token's
+# username claim must equal the row's; level achievements a carried level
+# unlocks are written as already earned (never re-paid); the caller's live
+# progress is merged, never reloaded.
+peekGuestProgressResult
+2026-10-09T16:00:00Z
+levelAchievementsMarkedEarned
+achievementIdsAdded
+# D4: the socket saveProgress accepts ONLY stats.clientData from the client
+# (a client level/xp minted ~14M chips through level rewards).
+client_payout_fields_dropped
+#
+# 2026-10-09 (fourth pass) — S1 / S4 (CONTRACTS.md C5).
+# S1: the socket `logout` ONLY bumps users.token_version (awaited) and acks
+# {success:true, revoked} | {success:false, code:'not_signed_in'|'revoke_failed'};
+# it never deletes the auth session or stands anyone up — the disconnect
+# handler owns the seat teardown (pinned by tests/logoutSeatTeardown.test.ts).
+revoke_failed
+# S4: adminKickPlayer revokes the kicked row's resume + legacy tokens before
+# dropping his sockets (/api/health resumeSessions.kickRevocations).
+admin_kick_tokens_revoked
+kickRevocations
+# S4: ONE guest carry-over per caller account (local id or master id).
+already_claimed_by_account
+SELECT id, stats FROM users WHERE stats::text LIKE '%claimedBy%'
+# S4: a tournament start screen that leaves < 2 eligible registrants cancels +
+# refunds (one cancel-refund path); suspended entrants at one hand boundary are
+# disqualified as one batch, so a suspended survivor is never paid.
+tournament_cancelled_too_few_eligible
+cancelled_too_few_eligible_at_start
+#
+# 2026-10-09 (fifth pass) — T1-T4 (CONTRACTS.md C5).
+# T2: the explicit Sign Out is the DEDICATED socket event `revokeSignInTokens`
+# (the live HEAD server deletes the session on `logout`; an old server ignores
+# the new event, so no deploy/rollback order can lose a seated stack). Same
+# body as the kept `logout`: token_version bump + ack, one per socket per 5s
+# (/api/health resumeSessions.signOut), T3 waits for a sign-in in flight.
+revokeSignInTokens
+legacyLogoutEvents
+# T1: a reserved TOURNAMENT seat's reservation ending (hand limit / 6h expiry)
+# never credits the wallet and never stands the seat up — audited only; the
+# seat is blinded out and eliminated by the tournament (logoutSeatTeardown test).
+reserve_hand_limit
+reserve_expiry
+# T4: createStake failure frames carry stable codes; poker-3d
+# StakingMarketplace settles a pending sell on these codes, never on the text.
+stake_sign_in_required
+stake_invalid_offer
+stake_invalid_price
+stake_create_failed
+#
+# 2026-10-09 (sixth pass) — U1-U4, U7 (CONTRACTS.md C5).
+# U1: a login whose socket dropped while it awaited (resumeSession / oauthLogin
+# / tokenLogin / authWithTicket) stops before setting a session or consuming a
+# seat reservation — the reservation and its cash-out timer stay for the next
+# reconnect (before U1 the seat was bound to the dead socket and its stack was
+# never cashed out). /api/health playGate.loginsAbandonedSocketGone.
+login_abandoned_socket_gone
+loginsAbandonedSocketGone
+# U2: a suspended player's ABSENT tournament seat (no live socket) is
+# disqualified at the hand-start gate in the same batch as live seats and
+# never paid; the seat-restore gate never bare-stands a tournament reservation
+# (it is kept for that gate). /api/health playGate.handStart.absentDisqualified.
+suspended_absent_disqualified
+absentDisqualified
+absent_tournament_seat_not_disqualified
+tournamentSeatKept
+# U3 (isTournamentReservation in every reservation consumer) and U4 (the short
+# absent-seat turn clock, ABSENT_TOURNAMENT_SEAT_TURN_MS) are pinned by
+# tests/absentSeat.test.ts. U7: the socket `logout` is kept for compatibility
+# only — no poker-3d bundle emits it (locked there: `blocked a socket logout emit`).

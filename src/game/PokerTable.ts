@@ -491,6 +491,19 @@ export class PokerTable extends EventEmitter {
   // ========== Hand Flow ==========
 
   startNewHand(): boolean {
+    // 2026-10-09 — PRE-DEAL HOOK (play gate: index.ts stands up a player found
+    // suspended). This is the last moment a seat can leave with NOTHING in a
+    // pot — the previous hand's pots are awarded, this hand's blinds are not
+    // posted yet — so a stand-up here returns the whole stack. Listeners run
+    // synchronously and may stand seats up; everything below reads the seats
+    // AFTER them (the start gate may then find < 2 players and return false).
+    // A throwing listener must never stop the hand loop, so the emit is guarded.
+    try {
+      this.emit('beforeHandStart', { handNumber: this.handNumber + 1 });
+    } catch (e: any) {
+      console.error('[PokerTable] beforeHandStart listener threw (ignored, hand continues):', e?.message || e);
+    }
+
     const occupiedSeats = this.seats.filter(
       s => s.state === 'occupied' && !s.eliminated && s.chipCount > 0
     );
