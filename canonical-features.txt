@@ -655,3 +655,23 @@ WEDGE_TURN_GRACE_MS
 # The old `COALESCE(stats, '{}'::jsonb)` failed the WHOLE UPDATE (42804 —
 # level / xp / achievements included) on every save since 89ac65e (2026-06-19).
 COALESCE(NULLIF(stats::text, '')::jsonb, '{}'::jsonb)
+
+# ============================================================
+# 2026-10-10 — ONE PERSON, ONE LOCAL ROW (src/auth/accountMerge.ts).
+# Master-first resolver on every sign-in path, the one-time boot merge of
+# split master accounts (114 masters / 240 rows), the credit-redirect trigger
+# for merged tombstones, the identity gate sign-ins wait on, and the one-time
+# 50,000-chip goodwill grant (saveProgress was broken 2026-06-19..10-10).
+# ============================================================
+merge_split_master_accounts_2026_10_10
+goodwill_50k_progress_save_bug_2026_10_10
+# review 2026-10-10: already-satisfied achievements are marked earned (no re-pay
+# of rewards the 06-19..10-10 save bug left unrecorded, or that a merge alone
+# reached); a master lookup that cannot be answered never inserts a row.
+achievement_backfill_2026_10_10
+lifetimeAchievementsSatisfiedBy
+MasterLookupError
+redirect_merged_account_credit
+merged_account_redirects
+[identity-gate] open
+pg_input_is_valid(users.stats::text, 'jsonb')

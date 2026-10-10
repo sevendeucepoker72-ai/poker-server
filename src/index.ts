@@ -60,6 +60,11 @@ import {
   type LoginFailureCode, type IdentityGuardMode,
 } from './auth/loginIdentity';
 import {
+  findLocalUserByMasterId, awaitIdentityGate, releaseIdentityGate, scheduleBootAccountOps, isMergedTombstone,
+  withMasterLock, identityStampPatch, MasterLookupError,
+  identityGateState, identityGateStats, identityResolverStats, bootAccountOps,
+} from './auth/accountMerge';
+import {
   createPlayStatusClient, createAssertPlayable, resolveSessionMasterId, masterIdFromStats,
   resolveGuestPlayEnabled, guestRegisterRefusal, partitionSuspendedRegistrants,
   createLoginTracker, seatRestoreAction, PLAYER_SUSPENDED_MESSAGE, DEFAULT_LOGIN_WAIT_MS,
@@ -619,7 +624,7 @@ interface LocalUserUpsertErr {
   diag?: Record<string, any>;
 }
 
-async function upsertOidcLocalUser(args: {
+type OidcUpsertArgs = {
   key: string;            // local users.username key (phone claim, else username claim)
   displayName: string;
   sub: string;            // cryptographically-attested master user id
@@ -629,10 +634,19 @@ async function upsertOidcLocalUser(args: {
   masterPhone?: string;
   isAdmin: boolean;
   via: string;            // 'oauthLogin' | 'tokenLogin' — for logs
-}): Promise<LocalUserUpsertOk | LocalUserUpsertErr> {
+};
+
+/**
+ * 2026-10-10 — serialized per master account (accountMerge.withMasterLock): a
+ * Play Online tap sends `oauthLogin` (bridge) and `authWithTicket` together, and
+ * for a brand-new player both used to find no row and both INSERT one.
+ */
+async function upsertOidcLocalUser(args: OidcUpsertArgs): Promise<LocalUserUpsertOk | LocalUserUpsertErr> {
+  return withMasterLock(String(args.sub), () => upsertOidcLocalUserLocked(args));
+}
+
+async function upsertOidcLocalUserLocked(args: OidcUpsertArgs): Promise<LocalUserUpsertOk | LocalUserUpsertErr> {
   const { key, displayName, sub, masterDisplayName, masterPhone, isAdmin, via } = args;
-  const bcrypt = require('bcryptjs');
-  const placeholderHash = bcrypt.hashSync(`oauth-placeholder-${sub}-${Date.now()}`, 10);
   // 2026-08-17 P3 — field semantics. `masterUsername` is the master API's unique
   // SLUG and this path never receives it (auth-server's `username` claim is a
   // display name), so it is NOT written here; writing the display name into it
@@ -645,6 +659,60 @@ async function upsertOidcLocalUser(args: {
     ...(masterPhone ? { masterPhone } : {}),
   });
   const enforcing = IDENTITY_GUARD_MODE === 'enforce';
+
+  // 2026-10-10 — ONE PERSON, ONE ROW (auth/accountMerge.ts). A master account
+  // that already has a local row signs in to THAT row. The key below is the
+  // `username` claim — a display name that changes with the master's name and
+  // differs from the ticket path's slug — so keying on it alone gave one
+  // person two or three rows (114 masters / 240 rows on 2026-10-10). Same
+  // grant-only is_admin and COALESCE display_name as the upsert below.
+  let byMaster: any = null;
+  try {
+    byMaster = await findLocalUserByMasterId(getPool(), String(sub));
+  } catch (e: any) {
+    // A lookup that could not be ANSWERED is never "no row": falling through to
+    // the key INSERT below created a second row for an existing person (review
+    // 2026-10-10). Refuse — the client retries.
+    return {
+      ok: false,
+      code: 'user_upsert_failed',
+      detail: {},
+      diag: { db_error: `master_lookup: ${String(e?.message || e).slice(0, 140)}` },
+    };
+  }
+  if (byMaster) {
+    try {
+      if (isAdmin && !byMaster.is_admin) {
+        await getPool().query('UPDATE users SET is_admin = TRUE WHERE id = $1', [byMaster.id]);
+        byMaster.is_admin = true;
+      }
+      if (!byMaster.display_name && displayName) {
+        await getPool().query('UPDATE users SET display_name = $2 WHERE id = $1 AND display_name IS NULL', [byMaster.id, displayName]);
+        byMaster.display_name = displayName;
+      }
+      // Atomic merge of ONLY the changed identity keys (mergeUserStats locks the
+      // row) — never a whole-stats rewrite from this earlier read.
+      const patch = identityStampPatch(byMaster.stats, {
+        masterUserId: String(sub),
+        ...(masterDisplayName ? { masterDisplayName } : {}),
+        ...(masterPhone ? { masterPhone } : {}),
+      });
+      if (patch) {
+        await mergeUserStats(byMaster.id, patch);
+        byMaster.stats = { ...parseStatsColumn(byMaster.stats), ...patch };
+      }
+    } catch (e: any) {
+      // Non-fatal: the row is this master's; only the descriptive refresh failed.
+      console.warn(`[OAuth] ${via} master-row refresh failed (login continues):`, e?.message);
+    }
+    return { ok: true, user: byMaster, adopted: true };
+  }
+
+  // Only a master with no row yet reaches the INSERT, so only it pays for the
+  // ~90ms synchronous bcrypt (it ran on EVERY sign-in before 2026-10-10 — the
+  // CPU burst behind the pool timeouts when the identity gate opened).
+  const bcrypt = require('bcryptjs');
+  const placeholderHash = bcrypt.hashSync(`oauth-placeholder-${sub}-${Date.now()}`, 10);
 
   let rows: any[];
   try {
@@ -728,14 +796,16 @@ async function upsertOidcLocalUser(args: {
     // Merge, never replace: users.stats carries unrelated keys from other
     // subsystems.
     try {
-      const merged = mergeMasterIdentityStats(user.stats, {
+      // 2026-10-10 — atomic patch of the changed identity keys only
+      // (mergeUserStats locks the row), not a whole-stats rewrite.
+      const patch = identityStampPatch(user.stats, {
         masterUserId: String(sub),
         ...(masterDisplayName ? { masterDisplayName } : {}),
         ...(masterPhone ? { masterPhone } : {}),
       });
-      if (merged) {
-        await getPool().query('UPDATE users SET stats = $1 WHERE id = $2', [JSON.stringify(merged), user.id]);
-        user.stats = merged;
+      if (patch) {
+        await mergeUserStats(user.id, patch);
+        user.stats = { ...parseStatsColumn(user.stats), ...patch };
       }
     } catch (stampErr: any) {
       // Non-fatal: the login itself already succeeded and the guard still
@@ -825,10 +895,12 @@ async function probeStatsColumnType(): Promise<void> {
       `[schema] users.stats data_type = ${_statsColumnType}` +
         (expected
           ? ' (jsonb — saveProgress / authWithTicket / the masterUserId index are all valid)'
-          : ' — ⚠️ NOT jsonb. saveProgress\'s `COALESCE(stats,\'{}\'::jsonb)`, authWithTicket 3a\'s ' +
-            '`stats->>\'masterUserId\'` and idx_users_stats_master_user_id are ALL failing silently ' +
-            'against this column. Do not enable ONLINE_IDENTITY_GUARD_ENFORCE until this is resolved: ' +
-            'the guard depends on that stamp being readable and durable.')
+          // 2026-10-10 — saveProgress (29fe063) and every master-id lookup
+          // (accountMerge.findLocalUserByMasterId) are TEXT-safe now; only the
+          // functional index idx_users_stats_master_user_id cannot be built on
+          // TEXT (the lookup does not need it at this table size).
+          : ' (TEXT — saveProgress and the master-id lookups are TEXT-safe since 2026-10-10; ' +
+            'idx_users_stats_master_user_id cannot be built on TEXT and is not needed at this size)')
     );
   } catch (e: any) {
     _statsColumnType = `probe_failed:${String(e?.message || 'unknown').slice(0, 60)}`;
@@ -1136,6 +1208,10 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // retirement, once per guest, so it gets the durable trail (the row also
   // keeps its own reversal record in stats.claimed*).
   'GUEST_PROGRESS_CLAIMED',
+  // 2026-10-10 — the one-time account merge (auth/accountMerge.ts) folds a
+  // master account's split local rows into one, and the goodwill grant pays
+  // 50,000 chips per person: both are chip + identity mutations.
+  'ACCOUNT_MERGE', 'GOODWILL_CHIP_GRANT', 'ACHIEVEMENT_BACKFILL',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -1357,7 +1433,17 @@ function trackLogin<A extends unknown[]>(
     const release = loginTracker.begin(socket.id);
     let p: Promise<void>;
     try {
-      p = handler(...args);
+      // 2026-10-10 — every sign-in waits (bounded) for the boot account
+      // operations (auth/accountMerge.ts): no session may bind to a row the
+      // one-time merge is about to retire. Open at once on boots where the
+      // operations are already done.
+      p = awaitIdentityGate().then(() => {
+        // A socket that dropped while it waited never runs its sign-in: the
+        // handler would burn a single-use ticket and add to the post-gate burst
+        // for a client that is already gone (review 2026-10-10).
+        if (!socket.connected) return;
+        return handler(...args);
+      });
     } catch (e) {
       release();
       throw e;
@@ -2349,6 +2435,31 @@ app.get('/api/health', async (_req, res) => {
         statsColumnType: _statsColumnType,
         stampDurable: _statsColumnType === 'jsonb',
         ...identityGuardStats,
+      },
+      // 2026-10-10 — one person, one local row (auth/accountMerge.ts). Counts
+      // only, no ids: the identity gate, the master-first resolver (splitSeen
+      // > 0 = a master still has two rows), and the one-time merge + goodwill.
+      accountMerge: {
+        gate: { ...identityGateState(), ...identityGateStats },
+        resolver: { ...identityResolverStats },
+        ops: {
+          startedAt: bootAccountOps.startedAt,
+          finishedAt: bootAccountOps.finishedAt,
+          previousInstance: bootAccountOps.previousInstance,
+          merge: bootAccountOps.merge && {
+            status: bootAccountOps.merge.status, groups: bootAccountOps.merge.groups, merged: bootAccountOps.merge.merged,
+            rowsRetired: bootAccountOps.merge.rowsRetired, archivedRows: bootAccountOps.merge.archivedRows,
+            skipped: bootAccountOps.merge.skipped.length, error: bootAccountOps.merge.error || null,
+          },
+          backfill: bootAccountOps.backfill && {
+            status: bootAccountOps.backfill.status, rows: bootAccountOps.backfill.rows,
+            added: bootAccountOps.backfill.added, error: bootAccountOps.backfill.error || null,
+          },
+          goodwill: bootAccountOps.goodwill && {
+            status: bootAccountOps.goodwill.status, recipients: bootAccountOps.goodwill.recipients,
+            amount: bootAccountOps.goodwill.amount, error: bootAccountOps.goodwill.error || null,
+          },
+        },
       },
       // 2026-10-07 — play gate (game suspensions + no-account play). Counters
       // only, no ids. `guestPlayEnabled:true` = the emergency rollback switch
@@ -3526,7 +3637,10 @@ function armTurnTimer(tableId: string): void {
         // P-i — check, an absent seat's ≤1 BB limp in an all-absent hand
         // (all_absent_hand_auto_call), else fold.
         const did = autoActForSeat(tableId, t, activeSeat);
-        log.debug(`[Timer] Seat ${activeSeat} (${seat.playerName}) timed out — ${did}${did === 'call' ? ' (all_absent_hand_auto_call)' : ''}`);
+        // 2026-10-10 — info, not debug: since the watchdog defers to a live
+        // turn clock, this is THE record of every turn the server takes for a
+        // player (the post-hotfix check needs to see them).
+        log.info(`[Timer] Seat ${activeSeat} (${seat.playerName}) timed out — ${did}${did === 'call' ? ' (all_absent_hand_auto_call)' : ''}`);
         broadcastGameState(tableId);
         scheduleAIAction(tableId);
       };
@@ -11355,104 +11469,120 @@ Give feedback in this JSON format:
         // by username='josh.hall2' wouldn't match the existing
         // username='7202780636') and create a duplicate. Look up by
         // masterUserId first — that's stable across both code paths.
-        const bcrypt = require('bcryptjs');
-        const placeholderHash = bcrypt.hashSync(
-          `ticket-placeholder-${remoteUserId}-${Date.now()}`,
-          10
-        );
-
-        let localUser: any = null;
-        // 3a. Prefer matching by masterUserId in stats JSONB — works regardless
-        // of whether the row was originally keyed by phone or by username.
         //
-        // 2026-05-19 — relies on the partial functional index
-        // `idx_users_stats_master_user_id` (created in authManager.ts:initDB).
-        // Without that index this is a sequential scan that adds visible
-        // latency on Railway cold-start.
-        try {
-          const byMasterId = await getPool().query(
-            `SELECT * FROM users WHERE stats->>'masterUserId' = $1 LIMIT 1`,
-            [String(remoteUserId)]
-          );
-          if (byMasterId.rows.length > 0) {
-            localUser = byMasterId.rows[0];
-            // 2026-05-19 — only run the JSONB UPDATE if something actually
-            // changed (masterUsername drifted, missing masterPhone, missing
-            // display_name). Previously this UPDATE fired on EVERY
-            // authWithTicket, which is once per Play Online click — pure
-            // overhead on the hot path of a deep-link sign-in. Now the
-            // common case (returning user, no drift) skips the write and
-            // the deep-link consumer's 15s timeout has more headroom on
-            // top of Railway cold-start.
-            const existingStats: any = typeof localUser.stats === 'object' && localUser.stats
-              ? localUser.stats
-              : {};
-            const wantMasterPhone = phone && phone !== masterUser.username ? phone : undefined;
-            const driftedUsername = existingStats.masterUsername !== masterUser.username;
-            const driftedPhone = wantMasterPhone != null && existingStats.masterPhone !== wantMasterPhone;
-            const missingDisplay = !localUser.display_name && displayName;
-            if (driftedUsername || driftedPhone || missingDisplay) {
-              try {
-                const merged = {
-                  ...existingStats,
-                  masterUserId: String(remoteUserId),
-                  masterUsername: masterUser.username,
-                  ...(wantMasterPhone ? { masterPhone: wantMasterPhone } : {}),
-                };
-                await getPool().query(
-                  `UPDATE users SET stats = $1, display_name = COALESCE(display_name, $2) WHERE id = $3`,
-                  [JSON.stringify(merged), displayName, localUser.id]
-                );
-                localUser.stats = merged;
-                localUser.display_name = localUser.display_name || displayName;
-              } catch { /* non-fatal */ }
+        // 2026-10-10 — ONE PERSON, ONE ROW (auth/accountMerge.ts). The whole
+        // lookup-or-insert runs under the per-master lock it shares with
+        // oauthLogin / tokenLogin (withMasterLock): one Play Online tap fires
+        // this AND the bridge's oauthLogin together, and for a brand-new player
+        // both used to find no row and both insert. A lookup that cannot be
+        // ANSWERED refuses the sign-in — it never falls through to the INSERT
+        // (after the merge freed the retired rows' usernames, that fall-through
+        // created a fresh 50,000-chip row for an existing person).
+        let localUser: any = null;
+        let masterLookupFailed = false as boolean;
+        await withMasterLock(String(remoteUserId), async () => {
+          // 3a. Prefer matching by masterUserId — works regardless of whether
+          // the row was originally keyed by phone, by username or by display
+          // name. The old `stats->>'masterUserId'` ERRORED on the TEXT stats
+          // column ("operator does not exist: text ->> unknown"), so it never
+          // matched and every ticket sign-in fell through to the slug upsert:
+          // one person, two rows. findLocalUserByMasterId is TEXT-safe, skips
+          // merged tombstones, and is the resolver the OIDC path uses too.
+          try {
+            const byMaster = await findLocalUserByMasterId(getPool(), String(remoteUserId));
+            if (byMaster) {
+              localUser = byMaster;
+              // 2026-05-19 — write only if something actually changed (the
+              // common returning-player case skips it). An ATOMIC patch of the
+              // changed identity keys (mergeUserStats locks the row) — never a
+              // whole-stats rewrite: the old `typeof stats === 'object'` read a
+              // TEXT row as {} and would have wiped handsPlayed / handsWon /
+              // biggestPot / recovery flags on the next drift write.
+              const wantMasterPhone = phone && phone !== masterUser.username ? phone : undefined;
+              const patch = identityStampPatch(localUser.stats, {
+                masterUserId: String(remoteUserId),
+                masterUsername: masterUser.username,
+                ...(wantMasterPhone ? { masterPhone: wantMasterPhone } : {}),
+              });
+              if (patch) {
+                try {
+                  await mergeUserStats(localUser.id, patch);
+                  localUser.stats = { ...parseStatsColumn(localUser.stats), ...patch };
+                } catch { /* non-fatal */ }
+              }
+              if (!localUser.display_name && displayName) {
+                try {
+                  await getPool().query('UPDATE users SET display_name = COALESCE(display_name, $2) WHERE id = $1', [localUser.id, displayName]);
+                  localUser.display_name = displayName;
+                } catch { /* non-fatal */ }
+              }
+            }
+          } catch (e: any) {
+            masterLookupFailed = true;
+            console.warn('[authWithTicket] masterUserId lookup failed — refusing the sign-in (never inserts):', e?.message || e);
+            return;
+          }
+
+          // 3b. Fall back to UPSERT by username if no masterUserId match.
+          //
+          // 2026-08-17 P2 — DELIBERATELY LEFT UNGUARDED. Assessed, decided, not
+          // an oversight. The P0 ownership guard covers 2 of the 4 upsert sites
+          // (`oauthLogin` + `tokenLogin`, via upsertOidcLocalUser); this one and
+          // `authManager.syncMasterUser` are the other two, and both stay as-is:
+          //
+          //   • They key on `phone` = `phoneNumber || phone_number || username`
+          //     where `username` is the master API's UNIQUE SLUG (`josh.hall2`),
+          //     not the freely-settable display name. A user cannot rename
+          //     themselves onto another account's slug, so the escalation path
+          //     that motivated the guard does not exist here.
+          //   • The value comes from the master API's /me response for a
+          //     server-verified ticket, not from a client-supplied claim.
+          //   • Adding a fail-closed guard here during a live sign-in outage
+          //     would put a NEW refusal on the deep-link path, which is the
+          //     path a first-time visitor from an SMS lands on. That is a worse
+          //     trade than the (currently unexploitable) hole it would close.
+          //
+          // 2026-10-10 — the "my chips changed when I used the Play Online link"
+          // effect this comment used to accept is fixed: 3a now resolves the
+          // master's ONE row, and the boot merge folded the old split rows
+          // together (auth/accountMerge.ts). Only a master with no row reaches
+          // this INSERT — and only it pays the ~90ms synchronous bcrypt.
+          if (!localUser) {
+            const bcrypt = require('bcryptjs');
+            const placeholderHash = bcrypt.hashSync(
+              `ticket-placeholder-${remoteUserId}-${Date.now()}`,
+              10
+            );
+            const { rows } = await getPool().query(
+              `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
+                 VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4)
+                 ON CONFLICT (LOWER(username)) DO UPDATE
+                   SET display_name = COALESCE(users.display_name, $2)
+               RETURNING *`,
+              [phone, displayName, placeholderHash, JSON.stringify({ masterPhone: phone, masterUsername: masterUser.username, masterUserId: remoteUserId })]
+            );
+            localUser = rows[0];
+            // An EXISTING slug row (ON CONFLICT: the INSERT's stats were not
+            // written) that nobody owns yet is stamped as this master's, so the
+            // next sign-in on either path finds it by master id instead of
+            // creating a second row. A row another master owns is left alone.
+            if (localUser && !isRowOwnedByOtherMaster(localUser.stats, String(remoteUserId))) {
+              const patch = identityStampPatch(localUser.stats, {
+                masterUserId: String(remoteUserId),
+                masterUsername: masterUser.username,
+              });
+              if (patch) {
+                try {
+                  await mergeUserStats(localUser.id, patch);
+                  localUser.stats = { ...parseStatsColumn(localUser.stats), ...patch };
+                } catch { /* non-fatal: the next sign-in retries the stamp */ }
+              }
             }
           }
-        } catch (e: any) {
-          console.warn('[authWithTicket] masterUserId lookup failed (non-fatal):', e?.message || e);
-        }
-
-        // 3b. Fall back to UPSERT by username if no masterUserId match.
-        //
-        // 2026-08-17 P2 — DELIBERATELY LEFT UNGUARDED. Assessed, decided, not
-        // an oversight. The P0 ownership guard covers 2 of the 4 upsert sites
-        // (`oauthLogin` + `tokenLogin`, via upsertOidcLocalUser); this one and
-        // `authManager.syncMasterUser` are the other two, and both stay as-is:
-        //
-        //   • They key on `phone` = `phoneNumber || phone_number || username`
-        //     where `username` is the master API's UNIQUE SLUG (`josh.hall2`),
-        //     not the freely-settable display name. A user cannot rename
-        //     themselves onto another account's slug, so the escalation path
-        //     that motivated the guard does not exist here.
-        //   • The value comes from the master API's /me response for a
-        //     server-verified ticket, not from a client-supplied claim.
-        //   • Adding a fail-closed guard here during a live sign-in outage
-        //     would put a NEW refusal on the deep-link path, which is the
-        //     path a first-time visitor from an SMS lands on. That is a worse
-        //     trade than the (currently unexploitable) hole it would close.
-        //
-        // KNOWN SECOND-ORDER EFFECT of the adoption stamp, accepted knowingly:
-        // step 3a above looks a row up by `stats->>'masterUserId'`. Before the
-        // stamp existed, a row ADOPTED by the OIDC path carried no masterUserId
-        // (the old ON CONFLICT DO UPDATE never wrote stats), so 3a missed it and
-        // this 3b upsert bound the user to their slug-keyed row instead. Now
-        // that adoption stamps the display-name-keyed row, 3a can start
-        // resolving to it — so a user who has BOTH rows may see their deep-link
-        // session land on the other one, with visibly different chips/level.
-        // That is the correct long-run behaviour (one human, one row) and it
-        // converges, but it is a visible change: if a player reports "my chips
-        // changed when I used the Play Online link", this is the cause, and the
-        // fix is to merge the two local rows, not to revert the stamp.
-        if (!localUser) {
-          const { rows } = await getPool().query(
-            `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
-               VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4)
-               ON CONFLICT (LOWER(username)) DO UPDATE
-                 SET display_name = COALESCE(users.display_name, $2)
-             RETURNING *`,
-            [phone, displayName, placeholderHash, JSON.stringify({ masterPhone: phone, masterUsername: masterUser.username, masterUserId: remoteUserId })]
-          );
-          localUser = rows[0];
+        });
+        if (masterLookupFailed) {
+          failTicket('handler_exception', 'The server is busy right now — please tap Play Online again.');
+          return;
         }
 
         // 2026-07-07 gap-fill — enforce maintenance mode on ticket login too
@@ -11892,6 +12022,10 @@ Give feedback in this JSON format:
       };
     }) => {
       const wlRequestId = normalizeRequestId(data?.requestId);
+      // 2026-10-10 — a waitlist link signs in too: wait (bounded) for the boot
+      // account operations like every trackLogin handler (auth/accountMerge.ts).
+      await awaitIdentityGate();
+      if (!socket.connected) return; // dropped while waiting: never burn the link
       /**
        * Answer BOTH channels. `error` keeps the legacy behaviour for any
        * non-deep-link caller; `loginResult` is what the deep-link flow waits
@@ -12011,16 +12145,30 @@ Give feedback in this JSON format:
         try {
           if (!authSessions.has(socket.id)) {
             try {
-              const meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`, meBypassInit);
-              if (meRes.ok) {
+              // 2026-10-10 — master-first (auth/accountMerge.ts): the verified
+              // ticket's master account resolves to ITS one local row, exactly as
+              // oauthLogin / authWithTicket do. The phone lookup below is the old
+              // fallback (the public /me no longer returns a phone, so it rarely
+              // matches) for a master that has no stamped row yet.
+              const byMaster = await findLocalUserByMasterId(getPool(), String(remoteUserId));
+              if (byMaster && !authSessions.has(socket.id)) {
+                wlBootstrapSession = { userId: byMaster.id, username: byMaster.username, masterUserId: String(remoteUserId) };
+                releaseSocketForAccountSwitch(socket, byMaster.id, 'joinWithWaitlistContext');
+                authSessions.set(socket.id, wlBootstrapSession);
+              }
+              const meRes = byMaster ? null : await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`, meBypassInit);
+              if (!meRes) {
+                // resolved by master id above
+              } else if (meRes.ok) {
                 const meJson: any = await meRes.json();
                 const masterUser = meJson?.data || meJson;
                 const phone = masterUser.phoneNumber || masterUser.phone_number;
                 if (phone) {
                   const { rows: urows } = await getPool().query(
-                    'SELECT id, username FROM users WHERE username = $1 LIMIT 1',
+                    'SELECT id, username, stats FROM users WHERE username = $1 LIMIT 1',
                     [phone]
                   );
+                  if (urows[0] && isMergedTombstone(urows[0].stats)) urows.length = 0;
                   if (urows[0] && !authSessions.has(socket.id)) {
                     // 2026-10-07 — masterUserId = the VERIFIED ticket's user id
                     // (the same attestation authWithTicket stamps on its session);
@@ -13203,6 +13351,9 @@ Give feedback in this JSON format:
         if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);
         else table.playerFold(session.seatIndex);
         broadcastGameState(session.tableId);
+        // 2026-10-10 — hand the turn on: the next bot acts now, not after its 30s
+        // turn timer (the watchdog no longer cuts a live clock short).
+        scheduleAIAction(session.tableId);
       }
     }
   });
@@ -13226,6 +13377,7 @@ Give feedback in this JSON format:
       if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);
       else table.playerFold(session.seatIndex);
       broadcastGameState(session.tableId);
+      scheduleAIAction(session.tableId); // 2026-10-10 — the next bot acts now
     }
   });
 
@@ -15335,6 +15487,7 @@ function cashOutAdditionalSeatsOnDeparture(socket: Socket, authSession: SocketAu
       }
       socket.leave(`table:${ms.tableId}`);
       broadcastGameState(ms.tableId);
+      scheduleAIAction(ms.tableId); // 2026-10-10 — the next bot acts now, not after 30s
     }
     multiTableSessions.delete(socket.id);
   }
@@ -18446,6 +18599,19 @@ initDB().then(async () => {
   try { await initPredictionTables(); } catch (e) { console.error('[prediction] initPredictionTables failed', e); }
   try { await initBracketTables(); } catch (e) { console.error('[bracket] initBracketTables failed', e); }
 
+  // 2026-10-10 — one-time account merge (one person, one local row) and the
+  // 50,000-chip goodwill grant (auth/accountMerge.ts). They start
+  // MERGE_START_DELAY_MS after boot, once the previous Railway container is gone
+  // (it is SIGTERMed only AFTER this one is listening); every sign-in waits for
+  // them via the identity gate. On later boots both are done and the gate opens
+  // at once.
+  try {
+    await scheduleBootAccountOps(getPool(), auditLog);
+  } catch (e: any) {
+    console.error('[account-ops] schedule failed (sign-ins proceed):', e?.message || e);
+    releaseIdentityGate('schedule_failed');
+  }
+
   // One-time chip recovery grant for admin — compensates for the
   // "disconnect wiped my wallet" bug (fixed in commit 03b5170). Guarded
   // by a JSONB flag in users.stats so this only runs once per admin even
@@ -18513,6 +18679,11 @@ initDB().then(async () => {
   } catch (err: any) {
     console.warn('[Recovery] grant failed:', err?.message);
   }
+}).catch((e: any) => {
+  // 2026-10-10 — never leave sign-ins waiting on the identity gate because the
+  // boot chain threw before it scheduled the account operations.
+  console.error('[boot] initDB chain failed:', e?.message || e);
+  releaseIdentityGate('initdb_failed');
 });
 
 // ========== Start Server ==========

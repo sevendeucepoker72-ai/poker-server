@@ -117,6 +117,9 @@ export interface AuthResult {
 
 let pool: Pool;
 
+/** pg application_name of this process's sessions (<= 63 chars, Postgres NAMEDATALEN). */
+export const DB_APPLICATION_NAME = ('poker-server:' + String(process.env.RAILWAY_DEPLOYMENT_ID || process.env.HOSTNAME || 'local')).slice(0, 63);
+
 /** Access the lazy-initialized PG pool (call after initDB). */
 export function getPool(): Pool {
   if (!pool) throw new Error('DB not initialized');
@@ -162,6 +165,11 @@ export async function initDB(): Promise<void> {
   // visible diff rather than a config addition.
   pool = new Pool({
     connectionString: dbUrl,
+    // 2026-10-10 — every session of THIS process is labelled, so the one-time
+    // account merge (auth/accountMerge.ts waitForPreviousInstanceGone) can see
+    // the previous Railway container's sessions (unlabelled or another label)
+    // during the deploy overlap.
+    application_name: DB_APPLICATION_NAME,
     max: 10,                          // explicit pg default; visible to review
     connectionTimeoutMillis: 5_000,   // give up acquiring a conn after 5s
     idleTimeoutMillis: 30_000,        // recycle idle conns after 30s
@@ -1099,7 +1107,10 @@ export async function persistStars(userId: number, stars: number): Promise<void>
     // used for `level` and session `xp` in saveProgress. Belt + suspenders
     // on top of the `progress.hydrated` gate at the call site.
     // Earned: CLAUDE.md cites this as a class of historical regression.
-    await pool.query('UPDATE users SET stars = GREATEST(stars, $1) WHERE id = $2', [Math.max(0, Math.floor(stars)), userId]);
+    // 2026-10-10 — never on a row the account merge retired: an ABSOLUTE write
+    // there would be redirected to the survivor as a fresh credit by the
+    // redirect_merged_account_credit trigger (a mint). No caller today.
+    await pool.query(`UPDATE users SET stars = GREATEST(stars, $1) WHERE id = $2 AND position('"mergedInto"' in COALESCE(stats::text, '')) = 0`, [Math.max(0, Math.floor(stars)), userId]);
   } catch (e: any) {
     console.warn(`[persistStars ${userId}]`, e.message);
   }

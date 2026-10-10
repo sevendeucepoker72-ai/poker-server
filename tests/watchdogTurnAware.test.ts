@@ -57,7 +57,9 @@ function run(opts: Opts, simMs: number) {
     turnTimers: new Map(), turnWarningTimers: new Map(), turnStartedAtMap: new Map(), turnStartedSeatMap: new Map(),
     turnStartedHandMap: new Map(), turnStartedPhaseMap: new Map(), globalTurnId: 0,
     TURN_TIMEOUT_MS: 30000, ABSENT_TOURNAMENT_SEAT_TURN_MS: 3000,
-    log: { debug: (_m: string) => { out.timerActs++; } },
+    // 2026-10-10 — the turn-timer act logs at info now (it is the record of
+    // every turn the server takes); count exactly those lines.
+    log: { debug: () => {}, info: (m: string) => { if (String(m).startsWith('[Timer]')) out.timerActs++; } },
     console: {
       log: () => {},
       warn: (m: string) => { if (String(m).startsWith('[WedgeWatchdog] Table')) { lastReason = String(m).replace(/^.*? (stuck|pot)/, '$1'); out.watchdogFires++; lastWatchdogAt = Date.now(); if (out.firstFireAt < 0) out.firstFireAt = Date.now() - t0; } },

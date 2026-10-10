@@ -222,6 +222,9 @@ export function checkResumeRow(claims: ResumeClaims, row: ResumeRow | null | und
   if (rowVersion !== claims.token_version) return 'token_version_mismatch';
   const stats = parseStatsColumn(row.stats);
   if (stats.claimedBy != null) return 'row_retired';
+  // 2026-10-10 — a row the one-time account merge retired (auth/accountMerge.ts):
+  // its person now signs in to the survivor; never resume onto the tombstone.
+  if (stats.mergedInto != null) return 'row_retired';
   const stamped = stats.masterUserId == null ? '' : String(stats.masterUserId).trim();
   if (stamped && stamped !== claims.masterUserId) return 'master_link_changed';
   return null;

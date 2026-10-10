@@ -62,7 +62,7 @@ function world(opts: { tournament: boolean; over?: Partial<typeof P> }) {
     MAX_SEATS: 9, TURN_TIMEOUT_MS, ABSENT_TOURNAMENT_SEAT_TURN_MS, DrawPhases: [], GamePhase,
     turnTimers: new Map(), turnWarningTimers: new Map(), turnStartedAtMap: new Map(), turnStartedSeatMap: new Map(),
     turnStartedHandMap: new Map(), turnStartedPhaseMap: new Map(), globalTurnId: 0,
-    broadcastGameState() {}, scheduleAIAction() {}, log: { debug() {} },
+    broadcastGameState() {}, scheduleAIAction() {}, log: { debug() {}, info() {} },
   };
   const code = `${p.broken}\n${p.isTournamentReservation}\n${p.sync}\n${p.liveSession}\n${p.pastLimit}\n${p.autoAct}\n${p.armTurnTimer}\nfunction wire(socket) {\n${p.sitOut}\n}`;
   const { exports: m, stubbed } = load(code, scope, '{ syncSitOutToTable, armTurnTimer, autoActForSeat, tournamentSeatSitsOut, wire }');

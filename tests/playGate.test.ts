@@ -1076,7 +1076,12 @@ describe('index.ts — every play-entry handler is gated before its first side e
     // Only an ATTESTED master id may claim — never the gate-only stats id.
     expect(body).toContain('callerMasterId: auth?.masterUserId');
     expect(body).not.toContain('statsMasterUserId');
-    expect(src).toContain("'GUEST_PROGRESS_CLAIMED',\n]);"); // durable audit row
+    // Durable audit row: listed in DURABLE_AUDIT_ACTIONS (2026-10-10:
+    // ACCOUNT_MERGE / GOODWILL_CHIP_GRANT were appended after it).
+    const durableStart = src.indexOf('const DURABLE_AUDIT_ACTIONS = new Set([');
+    expect(durableStart).toBeGreaterThan(-1);
+    const durable = src.slice(durableStart, src.indexOf(']);', durableStart));
+    expect(durable).toContain("'GUEST_PROGRESS_CLAIMED',");
   });
 });
 

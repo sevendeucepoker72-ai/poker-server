@@ -258,7 +258,7 @@ function world(opts: WorldOpts = {}) {
     // handlePlayerLeave's tail (P4 tests run a full leave).
     lastEmoteTime: new Map(), lastReactionTime: new Map(), lastChatTime: new Map(),
     syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {}, emitGameState() {},
-    getGameStateForPlayer: () => ({}), scheduleAIAction() {}, log: { debug() {} },
+    getGameStateForPlayer: () => ({}), scheduleAIAction() {}, log: { debug() {}, info() {} },
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
     auditLog: (actor: string, action: string, d: any) => { audits.push({ actor, action, d }); },
     saveProgress: async () => true,
@@ -310,6 +310,8 @@ function world(opts: WorldOpts = {}) {
     }),
     emitPlayRefusal: (s: any, r: any) => s.emit('error', { message: r.message, code: r.code }),
     hydrateAndPushProgress: async () => {},
+    // 2026-10-10 — trackLogin awaits the account-merge identity gate (open here).
+    awaitIdentityGate: async () => {},
     validateOAuthToken: async (tok: string) => (tok === 'oidc-alice'
       ? { valid: true, sub: 'm-alice', username: 'Alice', isAdmin: false }
       // Q3 (2026-10-10): a second account's OIDC sign-in on a shared browser.
@@ -1064,6 +1066,9 @@ describe('P4 — a login that switches a socket to ANOTHER account never inherit
       ["socket.on('tokenLogin'", "releaseSocketForAccountSwitch(socket, userId, 'tokenLogin_legacy');"],
       ["'authWithTicket',", "releaseSocketForAccountSwitch(socket, localUser.id, 'authWithTicket');"],
       ["'resumeSession',", "releaseSocketForAccountSwitch(socket, userId, 'resumeSession');"],
+      // 2026-10-10 — the waitlist bootstrap resolves master-first (one person,
+      // one row: auth/accountMerge.ts), then falls back to the phone lookup.
+      ["'joinWithWaitlistContext',", "releaseSocketForAccountSwitch(socket, byMaster.id, 'joinWithWaitlistContext');"],
       ["'joinWithWaitlistContext',", "releaseSocketForAccountSwitch(socket, urows[0].id, 'joinWithWaitlistContext');"],
     ];
     for (const [handler, call] of sites) {

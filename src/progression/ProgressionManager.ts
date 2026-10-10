@@ -230,6 +230,31 @@ export function lifetimeAchievementsUnlockedByLevel(fromLevel: number, toLevel: 
 }
 
 /**
+ * 2026-10-10 (account merge) — every LIFETIME achievement a stored state
+ * already satisfies. `state` is shaped like PlayerProgress (level,
+ * totalHandsPlayed, handsWon, biggestPot, …); missing fields read as 0.
+ *
+ * Used by the one-time account merge (auth/accountMerge.ts) and its
+ * achievement backfill: a saveProgress bug (2026-06-19..10-10) paid achievement
+ * rewards but never stored the achievement id, and a merge SUMS counters /
+ * takes the other row's level — either way checkAchievements would pay a
+ * reward again on the next hand. Marking every satisfied achievement as earned
+ * closes that, the same rule the guest carry-over applies (D2). Derived from
+ * ACHIEVEMENTS' own checks, so a new achievement is covered automatically.
+ * Never throws.
+ */
+export function lifetimeAchievementsSatisfiedBy(state: Record<string, unknown>): string[] {
+  const probe = new Proxy({ ...state } as Record<string | symbol, unknown>, {
+    get: (target, key) => (key in target ? target[key] : 0),
+  }) as unknown as PlayerProgress;
+  const out: string[] = [];
+  for (const def of ACHIEVEMENTS) {
+    try { if (def.check(probe)) out.push(def.id); } catch { /* a check that cannot run is not satisfied */ }
+  }
+  return out;
+}
+
+/**
  * 2026-10-09 (D2) — the most xp a player can legitimately hold AT `level`
  * (one short of the next level-up; 0 at MAX_LEVEL). The carry-over clamps the
  * guest's xp to it: an inflated xp would otherwise walk the next addXP through
