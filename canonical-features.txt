@@ -637,3 +637,21 @@ deadSeatSessionsEnded
 # The turn timer re-arms on a new street (heads-up big blind: pre-flop -> flop),
 # so the absent clock (P-i / P-j) runs on every street.
 turnStartedPhaseMap
+
+# ============================================================
+# 2026-10-10 HOTFIX — "it is auto folding me without me hitting anything".
+#
+# The 15s wedge watchdog knew only the sampled active seat INDEX, so the one
+# human at a table of near-instant bots was folded / checked 0.1-12s into a
+# fresh turn whenever three samples in a row landed on his turns (live: hands
+# 223 / 233 / 244 on 090a0e6e; ~235 fires/hour on 15 tables, ~90% with the pot
+# or street moved inside the last sample). It now tracks the TURN (hand +
+# street + seat + turnStartedAt) and never acts on a turn whose own clock is
+# live (TURN_TIMEOUT_MS + WEDGE_TURN_GRACE_MS) except a real oscillation.
+# Pinned by tests/watchdogTurnAware.test.ts.
+# ============================================================
+WEDGE_TURN_GRACE_MS
+# users.stats is TEXT on prod: saveProgress's stats merge must stay TEXT-safe.
+# The old `COALESCE(stats, '{}'::jsonb)` failed the WHOLE UPDATE (42804 —
+# level / xp / achievements included) on every save since 89ac65e (2026-06-19).
+COALESCE(NULLIF(stats::text, '')::jsonb, '{}'::jsonb)

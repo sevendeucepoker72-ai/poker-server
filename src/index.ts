@@ -4866,12 +4866,36 @@ setInterval(() => {
 // observed 2026-04-22 during a playtest: the active-seat ring kept
 // bouncing between Max (SB) and Knox (BB) for 60+ seconds without pot
 // or phase changing. The original stuck-seat check missed it.
+//
+// 2026-10-10 HOTFIX ("it is auto folding me without me hitting anything") —
+// the tracker used to know only the sampled seat INDEX. It samples every 15s
+// and reset seatSince only when a sample saw a DIFFERENT seat, so a seat that
+// was active at three samples in a row — three different turns, across
+// different streets or hands, the normal case for the one human at a table of
+// near-instant bots — read as "stuck 30000ms" and was folded / checked a few
+// seconds into a fresh turn with 20s+ left on its real clock (live: hands
+// 223 / 233 / 244 on 090a0e6e; ~200 false fires/hour fleet-wide). Now:
+//   • a turn is identified the way armTurnTimer records it (hand + street +
+//     seat + turnStartedAt), and seatSince resets on every new turn;
+//   • the pot/phase fingerprint includes the hand number;
+//   • while armTurnTimer's clock for THIS turn is armed and not overdue
+//     (TURN_TIMEOUT_MS + WEDGE_TURN_GRACE_MS) the watchdog never acts on that
+//     turn — the turn timer owns it. The watchdog only recovers a turn whose
+//     clock is missing or dead, or a real oscillation: the SAME seat starting
+//     a second turn while no chips / street / hand moved (impossible in a
+//     legal betting round — everyone checks or folds at most once — and
+//     exactly what the 2026-04-22 seat ring did).
+const WEDGE_TURN_GRACE_MS = 15000;
 const wedgeWatchdog = new Map<string, {
   lastSeat: number;
+  lastTurnKey: string;
   seatSince: number;
   lastPot: number;
   lastPhase: string;
+  lastHand: number;
   potPhaseSince: number;
+  /** seat -> the first turn it was seen on since pot/phase/hand last moved */
+  potPhaseTurns: Map<number, string>;
 }>();
 setInterval(() => {
   try {
@@ -4901,27 +4925,48 @@ setInterval(() => {
         0,
       );
       const phase = String(table.currentPhase);
+      const hand: number = (table as any).handNumber ?? -1;
+      // 2026-10-10 hotfix — the turn this sample sees, identified exactly as
+      // armTurnTimer recorded it. A turnStartedAt that belongs to a different
+      // seat / hand / street is not this turn's.
+      const turnStartedAt = turnStartedAtMap.get(t.tableId);
+      const turnArmedHere = turnStartedAt !== undefined
+        && turnStartedSeatMap.get(t.tableId) === activeSeat
+        && turnStartedHandMap.get(t.tableId) === hand
+        && turnStartedPhaseMap.get(t.tableId) === phase;
+      const turnKey = `${hand}|${phase}|${activeSeat}|${turnArmedHere ? turnStartedAt : '-'}`;
+      const turnTimer = turnTimers.get(t.tableId);
+      const turnClockLive = turnArmedHere && !!turnTimer && turnTimer.seatIndex === activeSeat
+        && now - (turnStartedAt as number) < TURN_TIMEOUT_MS + WEDGE_TURN_GRACE_MS;
       const prior = wedgeWatchdog.get(t.tableId);
 
       if (!prior) {
         wedgeWatchdog.set(t.tableId, {
-          lastSeat: activeSeat, seatSince: now,
-          lastPot: pot, lastPhase: phase, potPhaseSince: now,
+          lastSeat: activeSeat, lastTurnKey: turnKey, seatSince: now,
+          lastPot: pot, lastPhase: phase, lastHand: hand, potPhaseSince: now,
+          potPhaseTurns: new Map([[activeSeat, turnKey]]),
         });
         continue;
       }
 
-      // Seat tracking — reset timer if seat changed
-      if (prior.lastSeat !== activeSeat) {
+      // Seat tracking — reset timer on a NEW TURN (seat, street, hand or turn
+      // start changed), not only when the sampled seat index differs.
+      if (prior.lastTurnKey !== turnKey) {
         prior.lastSeat = activeSeat;
+        prior.lastTurnKey = turnKey;
         prior.seatSince = now;
       }
-      // Pot/phase tracking — reset timer if either moved (normal progress)
-      if (prior.lastPot !== pot || prior.lastPhase !== phase) {
+      // Pot/phase tracking — reset timer if pot, street or hand moved (normal progress)
+      if (prior.lastPot !== pot || prior.lastPhase !== phase || prior.lastHand !== hand) {
         prior.lastPot = pot;
         prior.lastPhase = phase;
+        prior.lastHand = hand;
         prior.potPhaseSince = now;
+        prior.potPhaseTurns.clear();
       }
+      const seenTurnOfSeat = prior.potPhaseTurns.get(activeSeat);
+      if (seenTurnOfSeat === undefined) prior.potPhaseTurns.set(activeSeat, turnKey);
+      const sameSeatNewTurn = seenTurnOfSeat !== undefined && seenTurnOfSeat !== turnKey;
 
       const seatStuck = now - prior.seatSince;
       const potPhaseStuck = now - prior.potPhaseSince;
@@ -4930,10 +4975,17 @@ setInterval(() => {
       // ~25s instead of 60s. If the root bug keeps re-wedging after recovery
       // we want to recover faster between wedges so play still feels
       // continuous.
-      const isWedged = seatStuck >= 20000 || potPhaseStuck >= 25000;
+      // 2026-10-10 hotfix — a live turn clock owns its turn: no seat-stuck
+      // action while it runs, and no pot/phase action on it unless the window
+      // already showed this seat on an EARLIER turn (an oscillation). Folds and
+      // checks never move the pot, so "pot unchanged 25s" alone also fired on a
+      // player still inside his own 30s.
+      const seatWedged = seatStuck >= 20000 && !turnClockLive;
+      const potPhaseWedged = potPhaseStuck >= 25000 && (!turnClockLive || sameSeatNewTurn);
+      const isWedged = seatWedged || potPhaseWedged;
 
       if (isWedged) {
-        const reason = seatStuck >= 20000
+        const reason = seatWedged
           ? `stuck on seat ${activeSeat} for ${seatStuck}ms`
           : `pot+phase unchanged ${potPhaseStuck}ms (oscillating seat ${activeSeat})`;
         console.warn(`[WedgeWatchdog] Table ${t.tableId} ${reason} — forcing advance`);
@@ -15244,6 +15296,10 @@ function reserveSeatForDeparture(
   if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex) {
     table.playerFold(session.seatIndex);
     broadcastGameState(session.tableId);
+    // 2026-10-10 hotfix — like every other fold path, hand the turn to the next
+    // bot. Without this a bot next to act sat idle until the 30s clock / the
+    // watchdog (live: hand 226 on 090a0e6e, seat 0 idle ~30s).
+    scheduleAIAction(session.tableId);
   }
 
   console.log(`[Reserve] Seat ${session.seatIndex} on table ${session.tableId} reserved for user ${authSession.userId} (${session.playerName})`);

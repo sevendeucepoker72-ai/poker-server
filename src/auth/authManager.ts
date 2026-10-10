@@ -810,7 +810,13 @@ export async function saveProgress(userId: number, data: { level?: number; xp?: 
     // CLAUDE.md describes for stats-shaped fields. The `||` operator
     // concatenates JSONB objects with right-hand precedence.
     if (data.stats !== undefined) {
-      sets.push(`stats = COALESCE(stats, '{}'::jsonb) || $${idx++}::jsonb`);
+      // 2026-10-10 hotfix — prod users.stats is TEXT (index.ts
+      // probeStatsColumnType); COALESCE(text, jsonb) failed the WHOLE UPDATE
+      // (42804) — level / xp / achievements included — on every hand-complete
+      // save since 89ac65e. Correct under BOTH column types (the loginIdentity.ts
+      // masterIdGuardSql pattern): no trailing ::text — the assignment casts
+      // jsonb->text for a TEXT column and is a no-op for a jsonb one.
+      sets.push(`stats = COALESCE(NULLIF(stats::text, '')::jsonb, '{}'::jsonb) || $${idx++}::jsonb`);
       vals.push(JSON.stringify(data.stats));
     }
     // Achievements list should only grow — use a JSONB union via SQL so a
@@ -833,7 +839,7 @@ export async function saveProgress(userId: number, data: { level?: number; xp?: 
     await (db || pool).query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${idx}`, vals);
     return true;
   } catch (err) {
-    console.error('[Auth] Failed to save progress:', err);
+    console.error(`[Auth] Failed to save progress userId=${userId} keys=${Object.keys(data).join(',')}:`, err);
     return false;
   }
 }
