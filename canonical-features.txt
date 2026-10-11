@@ -844,3 +844,6 @@ const onTable = chipsOnTablesOfUser(ctx.userId);
 ...(myRole ? { clubCode: club.clubCode } : {}),
 # R1 (H2) — insurance counters on /api/health.
 insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
+
+# 2026-10-11 R1 review (R1REV-2 / GAME-13): the waitlist deep link finds Hold'em tables by the table LIST variant
+waitlistHoldemByListVariant

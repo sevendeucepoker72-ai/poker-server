@@ -6403,7 +6403,7 @@ const careerTables = new Map<string, { venue: number; stage: number }>();
 // All-in insurance cashouts locked in for the CURRENT hand, per table. Settled
 // at hand-complete (before bust removal) and cleared. Server-computed amount —
 // the client's suggested figure is never trusted.
-const insuranceCashouts = new Map<string, Array<{ seatIndex: number; playerId: string; userId?: number; cashout: number; handNumber: number; equityPct: number; pot: number }>>();
+const insuranceCashouts = new Map<string, Array<{ seatIndex: number; playerId: string; userId?: number; cashout: number; handNumber: number; equityPct: number; pot: number; exclusive?: number }>>();
 
 // Club-challenge heads-up tables: tableId -> the challenge being played on it.
 // The stakes are the buy-in, so chips flow through the normal join/cleanup paths.
@@ -6525,6 +6525,22 @@ function insuranceCandidates(tableId: string, table: PokerTable): Array<{ seatIn
     out.push({ seatIndex: s.seatIndex, opponent: inHand.find((o) => o.seatIndex !== s.seatIndex)!.seatIndex });
   }
   return out;
+}
+
+/**
+ * 2026-10-11 (R1 review R1REV-MONEY-1) — the pots ONLY the insured seat can
+ * win (e.g. a folded raiser's dead money above the short opponent's all-in).
+ * With exactly two players left every pot is contested, insured-only or
+ * opponent-only; the quote prices only the contested ones, so the insured
+ * seat keeps these on top of its cashout. Fixed once betting has closed.
+ */
+function insuranceExclusivePot(table: PokerTable, insured: number): number {
+  let pot = 0;
+  for (const p of table.getCurrentPots()) {
+    const elig = p.eligibleSeatIndices;
+    if (elig.length === 1 && elig[0] === insured) pot += p.amount;
+  }
+  return pot;
 }
 
 /** The pots BOTH remaining players can win — what an insured seat stands to win or lose. */
@@ -6652,11 +6668,14 @@ function settleInsuranceForHand(tableId: string, table: PokerTable, totalWonPerS
       continue;
     }
     const actualWon = totalWonPerSeat.get(co.seatIndex) || 0;
-    const delta = insuranceSettlementDelta(co.cashout, actualWon);
+    // R1REV-MONEY-1 — the insurance replaced only the CONTESTED pots: the seat
+    // ends with its cashout PLUS the pots only it could win (never netted away).
+    const exclusive = Math.max(0, Math.round(Number(co.exclusive) || 0));
+    const delta = insuranceSettlementDelta(co.cashout + exclusive, actualWon);
     iseat!.chipCount = Math.max(0, iseat!.chipCount + delta);
     insuranceStats.settled++;
     auditLog(co.playerId, delta >= 0 ? 'INSURANCE_PAYOUT' : 'INSURANCE_COLLECT',
-      { tableId, seatIndex: co.seatIndex, handNumber: co.handNumber, cashout: co.cashout, equityPct: co.equityPct, pot: co.pot, actualWon, delta, newStack: iseat!.chipCount });
+      { tableId, seatIndex: co.seatIndex, handNumber: co.handNumber, cashout: co.cashout, equityPct: co.equityPct, pot: co.pot, exclusive, actualWon, delta, newStack: iseat!.chipCount });
     for (const [sid, s] of playerSessions) {
       if (s.tableId === tableId && s.seatIndex === co.seatIndex) {
         io.sockets.sockets.get(sid)?.emit('insuranceSettled', { cashout: co.cashout, delta, stack: iseat!.chipCount, tableId, handNumber: co.handNumber });
@@ -8071,47 +8090,38 @@ Give feedback in this JSON format:
       // 2026-10-07 — set when the seat-restore play gate refuses (see (a2)).
       let seatRestoreRefusal: PlayRefusal | null = null;
       if (!data?.skipSeatRecovery) try {
-        const recoverName = localUser.display_name || localUser.username;
-        // (a) Post-restart orphan recovery: a Railway redeploy wipes the
-        // in-memory reservedSeats Map, but the seat survives in Redis-rehydrated
-        // table state. Find the player's orphaned seat (their name, no live
-        // session pointing at it) and synthesize a reservation so (b) claims it.
-        if (!reservedSeats.has(userId) && recoverName) {
-          let found = false;
+        // (a) 2026-10-11 (.online R1 review, R1REV-1 — P1 chip theft): the old
+        // post-restart "orphan-seat recovery (name)" matched ANY occupied human seat
+        // whose playerName equalled this account's display name and had no MAIN-
+        // seat session — another player's live extra-table seat, or any seat of a
+        // same-named account ('Player' fallbacks, 'First L.' ticket names) — and
+        // leaveTable then paid that stack to this account. Recovery is now BY
+        // ACCOUNT ONLY, exactly like tokenLogin's scan: the seat must carry this
+        // account's playerId, never be a tournament seat, never be reserved for
+        // another account, and never be played by any live session (main OR
+        // extra-table — otherSessionHoldsSeat). Locked by tests/r1ReviewFixes.test.ts.
+        if (!reservedSeats.has(userId)) {
+          const expectedPlayerId = `user_${userId}`;
           for (const t of tableManager.getTableList()) {
-            // 2026-10-10 (pe3 minor) — never a TOURNAMENT table: a display
-            // name is not an account (ticket names 'First L.' collide), and an
-            // ABSENT tournament seat (Back to Lobby, a disconnect past its
-            // reservation) is its entrant's — handed to a same-named account
-            // it was his stack to play and his entry to bust. A tournament
-            // seat comes back only BY ACCOUNT (restoreAbsentTournamentSeat,
-            // (c) below) or by its own reservation.
             if (isTournamentTable(t.tableId)) continue;
             const table = tableManager.getTable(t.tableId);
             if (!table) continue;
             for (let i = 0; i < table.seats.length; i++) {
               const seat = table.seats[i];
               if (seat.state !== 'occupied' || seat.isAI) continue;
-              if (seat.playerName !== recoverName) continue;
-              // 2026-10-10 — a seat RESERVED for another account is that
-              // account's, whatever its name (ticket names collide).
+              if (seat.playerId !== expectedPlayerId) continue;
               if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;
-              let liveSession = false;
-              for (const [sid, sess] of playerSessions) {
-                if (sid === socket.id) continue;
-                if (sess.tableId === t.tableId && sess.seatIndex === i) { liveSession = true; break; }
-              }
-              if (liveSession) continue;
+              if (otherSessionHoldsSeat(socket.id, t.tableId, i)) continue;
               reservedSeats.set(userId, {
                 userId, tableId: t.tableId, seatIndex: i,
                 playerName: seat.playerName, chips: seat.chipCount,
                 avatar: sanitizeSeatAvatar((progress.userData as any)?.avatar),
                 expiresAt: Date.now() + 60_000, cleanupTimer: undefined,
               } as any);
-              console.log(`[OAuth Reconnect] orphan-seat recovery (name): user ${userId} (${recoverName}) -> ${t.tableId} seat ${i}`);
-              found = true; break;
+              console.log(`[OAuth Reconnect] orphan-seat recovery (account): user ${userId} -> ${t.tableId} seat ${i}`);
+              break;
             }
-            if (found) break;
+            if (reservedSeats.has(userId)) break;
           }
         }
         // (a2) 2026-10-07 play gate — a player who may not play (suspended)
@@ -12693,12 +12703,17 @@ Give feedback in this JSON format:
         // P5 (2026-10-10) — a waitlist seat is a CASH buy-in: never a tournament
         // table (live or just broken) — its stack would never be cashed out.
         const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId));
-        const isHoldem = (t: any) => {
-          const tbl = tableManager.getTable(t.tableId);
-          const id = (tbl as any)?.variantId || '';
-          return !id || id === 'texas-holdem';
-        };
+        // 2026-10-11 (.online R1 review R1REV-2 / audit GAME-13) — the old test
+        // read the live instance's variantId and accepted only '' or
+        // 'texas-holdem', but every base PokerTable (Beginner's Table, Shark
+        // Tank...) carries variantId 'holdem', so since 2026-04-20 this list was
+        // ALWAYS empty: every waitlist link answered 'No tables available' after
+        // burning its one-shot ticket. Use the table LIST's `variant` (the same
+        // field quickPlay keys on — getTableList resolves it per subclass and
+        // reports 'texas-holdem' for the base table). Lock token: waitlistHoldemByListVariant
+        const isHoldem = (t: any) => t?.variant === 'texas-holdem';
         const holdem = tables.filter(isHoldem);
+        if (holdem.length === 0) console.warn('[waitlistHoldemByListVariant] no Hold\'em cash table in the list');
         holdem.sort((a, b) => a.smallBlind - b.smallBlind);
         if (holdem.length === 0) {
           failWaitlist('handler_exception', 'No tables available', { stage: 'no_tables' });
@@ -14867,6 +14882,7 @@ Give feedback in this JSON format:
       handNumber,
       equityPct: quote.equityPct,
       pot: quote.pot,
+      exclusive: insuranceExclusivePot(table, session.seatIndex),   // R1REV-MONEY-1
     });
     insuranceCashouts.set(session.tableId, list);
     offer.decided.add(session.seatIndex);

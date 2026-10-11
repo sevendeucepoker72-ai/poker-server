@@ -426,3 +426,75 @@ describe('wiring in src/index.ts', () => {
     expect(SRC).not.toContain('insuranceCashoutAmount(pot, equity)');
   });
 });
+
+// ── R1 review R1REV-MONEY-1 (2026-10-11) ─────────────────────────────────────
+// The quote prices only the pots BOTH remaining players can win. A pot only the
+// insured seat can win (here: a folded raiser's dead money above the short
+// stack's all-in) is his whatever the runout — settlement used to net it
+// against the cashout (delta = cashout - ALL winnings) and destroy it.
+describe('R1REV-MONEY-1 — an insured seat keeps the side pot only it can win', () => {
+  const RUNOUTS: Array<[string, string]> = [
+    ['Hero wins the main pot', '3s 8h 9c Jd 4s'],        // AA holds vs KK
+    ['Shorty wins the main pot', 'Kh 8d 9c Jd 4s'],      // KK makes trips
+  ];
+  for (const [label, board] of RUNOUTS) {
+    it(`${label}: Hero ends with his stack + cashout + the exclusive side pot`, () => {
+      const w = world();
+      const cfg = { tableId: 'T3', tableName: 'T3', smallBlind: 50, bigBlind: 100, ante: 0, minBuyIn: 1000 };
+      const t = new PokerTable(cfg as any);
+      w.tables.set('T3', t);
+      expect(t.sitDown(0, 'Hero', 5000, 'player-hero', false)).toBe(true);    // human, covers everyone
+      expect(t.sitDown(1, 'Shorty', 300, 'ai-short', true, true)).toBe(true); // short (below min) — all-in pre-flop
+      expect(t.sitDown(2, 'Raiser', 5000, 'ai-raise', true)).toBe(true);      // calls pre-flop, folds the flop shove
+      const hero = w.mkSocket('S-hero3');
+      w.playerSessions.set('S-hero3', { socketId: 'S-hero3', tableId: 'T3', seatIndex: 0, playerName: 'Hero', playerId: 'player-hero', trainingEnabled: false, sittingOut: false });
+      w.authSessions.set('S-hero3', { userId: 42, username: 'hero.slug' });
+      w.m.ensureInsuranceHoldWired('T3', t);
+      t.on('handResult', (d: any) => {
+        const won = new Map<number, number>();
+        for (const r of d.results) won.set(r.seatIndex, (won.get(r.seatIndex) || 0) + (r.amount || 0));
+        w.m.settleInsuranceForHand('T3', t, won);
+      });
+      const before = t.seats.reduce((a: number, s: any) => a + s.chipCount, 0);
+      expect(t.startNewHand()).toBe(true);
+      // rig: Hero AA, Shorty KK, Raiser 72o; the deck then runs burn, flop, burn, turn, burn, river
+      const hands: Record<number, string> = { 0: 'Ah Ad', 1: 'Kc Ks', 2: '7c 2d' };
+      for (const [i, h] of Object.entries(hands)) t.seats[Number(i)].holeCards = cs(h);
+      const b = cs(board);
+      const used = new Set([...cs('Ah Ad Kc Ks 7c 2d'), ...b].map(key));
+      const rest: Card[] = [];
+      for (let suit = 0; suit < 4; suit++) for (let rank = 2; rank <= 14; rank++) if (!used.has(suit * 16 + rank)) rest.push({ suit, rank } as Card);
+      (t as any).deck.cards = [rest[0], b[0], b[1], b[2], rest[1], b[3], rest[2], b[4], ...rest.slice(3)];
+      (t as any).deck.currentIndex = 0;
+      for (let g = 0; g < 30 && t.isHandInProgress() && !t.isRunoutHeld(); g++) {
+        const a = t.activeSeatIndex;
+        const owes = t.currentBetToMatch > t.seats[a].currentBet;
+        let ok: boolean;
+        if (t.currentPhase === GamePhase.PreFlop) {
+          ok = a === 0 ? (t.currentBetToMatch < 1000 ? t.playerRaise(0, 1000) : t.playerCall(0))
+            : a === 1 ? t.playerAllIn(1)
+            : (owes ? t.playerCall(a) : t.playerCheck(a));
+        } else {
+          ok = a === 0 ? t.playerAllIn(0) : (owes ? t.playerFold(a) : t.playerCheck(a));
+        }
+        expect(ok).toBe(true);
+      }
+      expect(t.isRunoutHeld()).toBe(true);
+      const q = w.m.insuranceQuoteForSeat('T3', t, 0);
+      expect(q).not.toBeNull();
+      const exclusive = t.getCurrentPots()
+        .filter((p: any) => p.eligibleSeatIndices.length === 1 && p.eligibleSeatIndices[0] === 0)
+        .reduce((a: number, p: any) => a + p.amount, 0);
+      expect(exclusive).toBeGreaterThan(0);                 // the folded raiser's dead money
+      const stackAtAccept = t.seats[0].chipCount;           // the refunded excess is back in Hero's stack
+      hero.handlers.acceptInsurance({ tableId: 'T3', handNumber: t.handNumber });
+      expect(t.currentPhase).toBe(GamePhase.HandComplete);
+      expect(t.seats[0].chipCount).toBe(stackAtAccept + q.cashout + exclusive);
+      const settled = w.audits.find((a) => a.action === 'INSURANCE_PAYOUT' || a.action === 'INSURANCE_COLLECT')!.d;
+      expect(settled).toMatchObject({ exclusive, cashout: q.cashout });
+      // only the house delta changes the table total: (cashout) - (Hero's share of the CONTESTED pots)
+      const after = t.seats.reduce((a: number, s: any) => a + s.chipCount, 0);
+      expect(after - before).toBe(settled.delta);
+    });
+  }
+});

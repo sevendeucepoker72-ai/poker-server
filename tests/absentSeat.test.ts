@@ -1234,14 +1234,20 @@ describe('minor (2026-10-10) — the post-restart orphan-seat scans never claim 
     await flush();
     expect(w.authSessions.get('S2')).toMatchObject({ userId: 102 });
     expect(w.reservedSeats.has(102)).toBe(false);                              // no synthetic reservation onto her seat
-    expect(w.playerSessions.has('S2')).toBe(false);
+    // 2026-10-11 (R1REV-1): oauthLogin's recovery is BY ACCOUNT — Bob may get HIS OWN
+    // session-less seat 1 (user_102) back, never Alice's seat 0, whatever his name.
+    const bob = w.playerSessions.get('S2');
+    if (bob) expect(bob).toMatchObject({ tableId: 't1', seatIndex: 1 });
     expect(w.reservedSeats.get(ALICE)).toBe(r);
     jest.advanceTimersByTime(SEAT_RESERVE_MS);
     await flush();
     expect(w.credits).toEqual([{ uid: ALICE, amount: 7000 }]);
   });
 
-  it('CONTROL — without the check (pre-fix) Bob\'s name scan synthesizes a reservation onto Alice\'s seat and restores it under him: his leave credits her 7,000 to BOB', async () => {
+  it('CONTROL (R1REV-1, 2026-10-11) — even WITHOUT the reserved-for-another check, the account-based scan cannot reach Alice\'s seat: Bob never sits on seat 0 and never collects her 7,000', async () => {
+    // Pre-R1REV-1 this control removed the check and Bob's NAME scan stole Alice's
+    // seat (his leave credited her 7,000 to him). oauthLogin no longer matches by
+    // name at all; the check stays as defense in depth (it guards tokenLogin too).
     const CHECK = 'if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;';
     expect(P.oauth).toContain(CHECK);
     expect(P.tokenLogin).toContain(CHECK);
@@ -1251,12 +1257,10 @@ describe('minor (2026-10-10) — the post-restart orphan-seat scans never claim 
     const s2 = w.mkSocket('S2');
     await s2.handlers.oauthLogin({ accessToken: 'oidc-bob' });
     await flush();
-    expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
+    expect(w.playerSessions.get('S2')?.seatIndex).not.toBe(0);
     w.m.handlePlayerLeave(s2);
     await flush();
-    // AUTH-3 (2026-10-11): clearGhostSeatsForUser now also clears Bob's OWN
-    // session-less seat 1 (stamped user_102) to Bob — the theft is the 7,000.
-    expect(w.credits).toContainEqual({ uid: 102, amount: 7000 });
+    expect(w.credits).not.toContainEqual({ uid: 102, amount: 7000 });
   });
 });
 
@@ -1477,12 +1481,16 @@ describe('pe3 minor — oauthLogin\'s display-name orphan scan never hands a TOU
     expect(w.table.seats[2]).toMatchObject({ state: 'occupied', chipCount: 5000, playerId: 'user_103' });
   });
 
-  it('CONTROL — the pre-fix scan: Alice\'s phone is seated on CARL\'s tournament seat (his stack, his entry)', async () => {
+  it('CONTROL (R1REV-1, 2026-10-11) — even WITHOUT the tournament skip, the account-based scan never puts Alice\'s phone on CARL\'s seat (user_103)', async () => {
+    // Pre-R1REV-1 this control removed the skip and the NAME scan seated Alice's
+    // phone on Carl's same-named tournament seat. The skip stays as defense in
+    // depth; the account match alone already refuses Carl's seat.
     expect(P.oauth).toContain(SCAN_SKIP);
     const w = sameName({ oauth: P.oauth.replace(SCAN_SKIP, '') });
     const s = w.mkSocket('S9');
     await s.handlers.oauthLogin({ accessToken: 'oidc-alice' });
-    expect(w.playerSessions.get('S9')).toMatchObject({ tableId: 't1', seatIndex: 2 });
+    expect(w.playerSessions.get('S9')?.seatIndex).not.toBe(2);
+    expect(w.table.seats[2]).toMatchObject({ state: 'occupied', chipCount: 5000, playerId: 'user_103' });
   });
 
   it('tokenLogin\'s post-restart playerId scan skips tournament tables too', () => {
