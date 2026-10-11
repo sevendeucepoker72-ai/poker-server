@@ -1034,6 +1034,16 @@ function shallowDiff(
       if (cache && key in cache) nextCache[key] = cache[key];
       continue;
     }
+    // 2026-10-11 (.online R1 contract #5, TABLEUI-7) — a key that DISAPPEARED
+    // goes out as `null`: JSON drops `undefined`, so a removed key never
+    // reached the client, which kept the stale value forever (a "Split Pot!"
+    // banner from an old hand, stale trainingData / potBreakdown / quote).
+    // null and undefined are the same "absent" value: once a key was sent as
+    // null it is not re-sent while it stays absent.
+    if (nextVal === undefined) {
+      if (prevVal !== null && prevVal !== undefined) delta[key] = null;
+      continue;
+    }
     // Primitives / null / undefined: !== is authoritative.
     const nextIsObj = typeof nextVal === 'object' && nextVal !== null;
     if (!nextIsObj) {

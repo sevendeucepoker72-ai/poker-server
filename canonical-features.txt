@@ -769,3 +769,7 @@ if (evaluations.length <= 1) {
 # uncontested winner; once per seat per hand.
 shownMuckedHands
 cards: seat.holeCards.map((c) => ({ suit: c.suit, rank: c.rank, display: (0, Card_1.cardToString)(c) })),
+#
+# 2026-10-11 (R1, H2) — TABLEUI-7 / contract #5: the per-socket gameState delta
+# sends null for a key that disappeared (JSON drops undefined).
+if (prevVal !== null && prevVal !== undefined)
