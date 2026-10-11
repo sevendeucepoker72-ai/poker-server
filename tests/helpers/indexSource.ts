@@ -32,6 +32,23 @@ export function slice(startNeedle: string, endNeedle: string, from = 0): string 
 /** A top-level function, through its closing `}` line. */
 export const fnSrc = (signature: string): string => slice(signature, '\n}\n');
 
+/**
+ * .online R2 (2026-10-11) — the ONE seat-teardown helper block of index.ts
+ * (teardownSeat + its counters, aiSeatTakeableNow, takeAiSeatForJoin,
+ * stripBotsWhenNoHumans / stripBotsAfterHandIfMarked), aiSeatsMutableNow (the
+ * strip's between-hands test) and endCashReservation (every reservation
+ * ending). Every leave / departure / ghost-cleanup / refused-restore /
+ * reservation path calls them, so a harness slicing one of those paths
+ * appends this. Scope it reads: pendingSeatRemovalAfterHand, sitOutTracker,
+ * creditSeatStackToWallet, scheduleAIAction, syncSitOutToTable, aiProfiles,
+ * aiTimeouts, pendingAutoStartTimers, tableManager, reservedSeats helpers.
+ */
+export const SEAT_TEARDOWN_SRC: string = [
+  slice('// ========== Seat teardown — ONE helper', 'if (table) stripBotsWhenNoHumans(tableId, table);\n}\n'),
+  fnSrc('function aiSeatsMutableNow('),
+  fnSrc('function endCashReservation('),
+].join('\n');
+
 /** The `socket.on('<event>', …)` registration (either layout), through `endNeedle`. */
 export function handlerSrc(event: string, endNeedle: string): string {
   let at = SRC.indexOf(`socket.on('${event}'`);

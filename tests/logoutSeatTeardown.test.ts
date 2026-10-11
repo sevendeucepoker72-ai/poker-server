@@ -34,7 +34,8 @@
 
 import fs from 'fs';
 import path from 'path';
-import { PokerTable } from '../src/game/PokerTable';
+import { PokerTable, GamePhase } from '../src/game/PokerTable';
+import { SEAT_TEARDOWN_SRC } from './helpers/indexSource';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
 import { Suit, Rank, Card } from '../src/game/Card';
 import { isClaimableGuestRow } from '../src/auth/guestClaim';
@@ -100,7 +101,7 @@ const SEAT_KEEP = slice('// ===== Tournament seat kept on leave', '// ===== end 
 /** The live HEAD (5ea0f80) `logout` handler, verbatim (`git show HEAD:src/index.ts`, lines 6391-6393). */
 const HEAD_LOGOUT_HANDLER = "socket.on('logout', async () => {\n    authSessions.delete(socket.id);\n  });";
 
-interface Parts { logout?: string | null; revoke?: string | null; tick?: string; disconnect?: string }
+interface Parts { logout?: string | null; revoke?: string | null; tick?: string; disconnect?: string; credit?: string }
 
 function compile(parts: Parts): string {
   const code = `
@@ -112,7 +113,8 @@ ${BROKEN_TABLES}
 ${IS_TOURNAMENT_RESERVATION}
 ${NOTE_NOT_CASHED}
 ${parts.tick ?? TICK_RESERVED}
-${CREDIT_SEAT}
+${parts.credit ?? CREDIT_SEAT}
+${SEAT_TEARDOWN_SRC}
 ${SEAT_KEEP}
 ${HANDLE_PLAYER_LEAVE}
 ${BUST_CHECK}
@@ -194,6 +196,9 @@ function harness(opts: HarnessOpts = {}) {
     quickTables: new Set(), lastEmoteTime: new Map(), lastReactionTime: new Map(), lastChatTime: new Map(),
     lastSentState: new Map(), lastSentJson: new Map(), MAX_SEATS: 9, SEAT_RESERVE_MS, DISCONNECT_HANDS_LIMIT: HANDS_LIMIT,
     syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {},
+    // R2 (2026-10-11): the seat-teardown helper block (SEAT_TEARDOWN_SRC) reads these.
+    scheduleAIAction() {}, DrawPhases: [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3], GamePhase, FiveCardDrawTable: class {},
+    seatPlayedByAnotherAccount: () => false,
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
     auditLog: (actor: string, action: string, details: Record<string, unknown>) => { audits.push([actor, action, details]); },
     saveProgress: async (...a: unknown[]) => { saves.push(a); return true; },
@@ -346,20 +351,23 @@ describe('S1 + T2 — a sign-out event only revokes + acks; the disconnect handl
     expect(h.table.seats[0].state).toBe('empty');
     expect(h.credits).toEqual([]);                                // 7,000 chips gone
 
-    // Mid-hand under the HEAD handler: stood up AT ONCE, nothing credited.
+    // Mid-hand under the HEAD handler: no account left to credit — nothing is
+    // ever paid to her. (R2, 2026-10-11: the leave is the ONE seat teardown now,
+    // so even this account-less leave keeps her chips in the live pot until the
+    // hand's end — it used to stand the seat up at once, destroying them — but
+    // the stack still never reaches her wallet: the regression this catches.)
     const m = harness({ logout: HEAD_LOGOUT_HANDLER, revoke: null });
     m.table.startNewHand();
     untilSeat0Invested(m.table);
     expect(m.table.isHandInProgress()).toBe(true);
     await m.emitWithAck('logout');
     await m.disconnect();
-    expect(m.table.seats[0].state).toBe('empty');                 // stood up mid-hand
+    expect(m.table.seats[0].state).toBe('occupied');              // R2: the stand-up waits for the hand's end
     expect(m.reservedSeats.has(ALICE)).toBe(false);
     playOut(m.table);
     m.expireReservation();
     await flush();
-    expect(m.credits).toEqual([]);
-    expect(m.tableChips()).toBeLessThan(17000);                   // chips destroyed
+    expect(m.credits).toEqual([]);                                // never credited
   });
 
   it('T2 ROLLBACK SAFETY — the new client against the live HEAD server: `revokeSignInTokens` is ignored (no ack), the disconnect reserves the seat and credits it exactly once; mid-hand nothing is lost', async () => {
@@ -603,9 +611,14 @@ describe('T1 — a reserved TOURNAMENT seat is never cashed out to the wallet an
   it('CONTROL — without the T1 guard (HEAD behaviour) the hand limit MINTS the tournament stack into the wallet and stands the seat up, and the tournament can never finish', async () => {
     const tick = TICK_RESERVED.replace('if (isTournamentReservation(reserved)) {', 'if (false) {');
     const disconnect = DISCONNECT_HANDLER.replace('if (isTournamentReservation(reserved)) {', 'if (false) {');
+    // R2 (2026-10-11): a reservation's cash-out now goes through teardownSeat →
+    // creditSeatStackToWallet, whose OWN tournament-table guard is a second lock;
+    // HEAD credited with a bare addChipsToUser, so the control removes both.
+    const credit = CREDIT_SEAT.replace('if (isTournamentTable(tableId)) {', 'if (false) {');
     expect(tick).not.toBe(TICK_RESERVED);
     expect(disconnect).not.toBe(DISCONNECT_HANDLER);
-    const { h, tm, id } = tournamentHarness({ tick, disconnect });
+    expect(credit).not.toBe(CREDIT_SEAT);
+    const { h, tm, id } = tournamentHarness({ tick, disconnect, credit });
     await h.disconnect();
     let started = 0;
     for (let i = 0; i < HANDS_LIMIT; i++) if (playTournamentHand(h)) started++;
@@ -618,7 +631,7 @@ describe('T1 — a reserved TOURNAMENT seat is never cashed out to the wallet an
     expect(tm.getTournament(id)!.players.find((p) => p.playerId === 'user_101')!.eliminated).toBe(false);
 
     // The expiry under HEAD with the table gone mints the reservation snapshot.
-    const b = tournamentHarness({ tick, disconnect }).h;
+    const b = tournamentHarness({ tick, disconnect, credit }).h;
     await b.disconnect();
     b.tournamentTables.delete('t1');
     b.tables.delete('t1');

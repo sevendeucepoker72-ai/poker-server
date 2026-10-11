@@ -886,3 +886,38 @@ BOT_MAX_STREET_RAISES_PREFLOP = 3
 BOT_EQUITY_BUDGET_MS = 40
 keptHoldemHoleCards(
 MIN_BUDGETED_SIMULATIONS = 64
+
+# 2026-10-11 (.online R2, S2 table lifecycle) — GAME-15/16 + Addendum: ONE seat
+# teardown (pot chips of a folded / all-in / extra-table / ghost seat wait for
+# the hand's end, the next bot acts now); never an AI seat taken mid-hand.
+# GAME-17 bots stripped only at the hand's end; the heartbeat revives a frozen
+# HandComplete table. GAME-18 bot stacks capped at 3 buy-ins, fixed-roster
+# quick tables never reload. GAME-11 / ECON-13 dealt-in-only progression,
+# sit-out limit, per-player fast mode. C11 isFirstActor / canBombPot; bomb pots
+# + straddles only at ring tables. TABLEUI-11 full state on spectate moves.
+# APPUI-21 a displaced reservation is settled. GAME-5 draw hands the turn on.
+function teardownSeat(
+seat_teardown_deferred
+takeAiSeatForJoin(
+aiSeatTakeableNow(
+stripBotsAfterHandIfMarked(tableId);
+heartbeatRestarts.handComplete++;
+reloadAndCapBotStacks(table, tableId, isFixedRosterQuickTable(tableId));
+BOT_STACK_CAP_BUYINS = 3
+dealtInSeats.has(session.seatIndex)
+SIT_OUT_HANDS_LIMIT = 30
+sit_out_limit
+tableWantsFastBots(tableId)
+stateObj.isFirstActor =
+stateObj.canBombPot =
+bomb_pot_not_allowed
+straddle_not_allowed
+table.applyBombPot(table.config.bigBlind * 2)
+emitGameState(socket, state, true);
+lastSentState.delete(sid);
+reservation_displaced_settled
+reserve_displaced
+endCashReservation(
+recordChipVelocity(tableId, table, data.results);
+chip_velocity_alert
+invalid_draw

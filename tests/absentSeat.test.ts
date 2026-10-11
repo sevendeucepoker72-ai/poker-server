@@ -33,6 +33,7 @@ import path from 'path';
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
 import { sanitizeSeatAvatar } from '../src/seatProfile';
+import { SEAT_TEARDOWN_SRC } from './helpers/indexSource';
 import {
   createLoginTracker, seatRestoreAction, planHandStartGate, masterIdFromStats, resolveSessionMasterId,
   HAND_GATE_MAX_STATUS_AGE_MS,
@@ -134,6 +135,7 @@ ${p.qualifierEntrantMasterId}
 ${p.reservationHolderAt}
 ${p.noteNotCashed}
 ${p.creditSeat}
+${SEAT_TEARDOWN_SRC}
 ${p.entrantIsAccount}
 ${p.liveSeatIndex}
 ${p.seatKeep}
@@ -262,6 +264,8 @@ function world(opts: WorldOpts = {}) {
     lastEmoteTime: new Map(), lastReactionTime: new Map(), lastChatTime: new Map(),
     syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {}, emitGameState() {},
     getGameStateForPlayer: () => ({}), scheduleAIAction() {}, log: { debug() {}, info() {} },
+    // R2 (2026-10-11): the seat-teardown helper block (SEAT_TEARDOWN_SRC) tests it.
+    FiveCardDrawTable: class {},
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
     auditLog: (actor: string, action: string, d: any) => { audits.push({ actor, action, d }); },
     saveProgress: async () => true,
@@ -1912,7 +1916,10 @@ describe('Z6 — a leave / disconnect on his own turn CHECKS when a check is fre
 
   it('wiring: the keep\'s unreserved branch acts the same way; a cash LEAVE (the seat is torn down) still folds', () => {
     expect(P.seatKeep).toContain('      if (!(owed <= 0 && table.playerCheck(session.seatIndex))) table.playerFold(session.seatIndex);\n');
-    expect(P.handlePlayerLeave).toContain('      if (table.activeSeatIndex === session.seatIndex) {\n        table.playerFold(session.seatIndex);\n');
+    // R2 (2026-10-11): the cash leave tears the seat down through teardownSeat,
+    // which folds the seat on its own turn (outside a draw round) — as before.
+    expect(P.handlePlayerLeave).toContain('teardownSeat(session.tableId, table, session.seatIndex,');
+    expect(SEAT_TEARDOWN_SRC).toContain('} else if (!DrawPhases.includes(table.currentPhase) && table.activeSeatIndex === seatIndex) {\n      table.playerFold(seatIndex);');
   });
 });
 

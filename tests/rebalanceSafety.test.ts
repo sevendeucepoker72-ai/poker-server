@@ -46,7 +46,7 @@ import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentM
 import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE_MAX_STATUS_AGE_MS } from '../src/auth/playGate';
 import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
-import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC } from './helpers/indexSource';
 
 const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
@@ -162,6 +162,7 @@ ${p.noteNotCashed}
 ${p.accountSwitch}
 ${p.handlePlayerLeave}
 ${p.creditSeat}
+${SEAT_TEARDOWN_SRC}
 ${p.helpers}
 ${p.rebalance}
 ${p.autoStart}
@@ -285,6 +286,11 @@ function world(opts: {
     const s = mkSocket(sid);
     authSessions.set(sid, { userId: uid, username: `u${uid}`, masterUserId: master });
     const seat = tables.get(tableId)!.seats[seatIndex];
+    // R2 (2026-10-11, GAME-11): handleHandComplete persists / credits only the
+    // seats DEALT INTO the hand (they hold its cards). These scenarios fake a
+    // finished hand (phase HandComplete, nothing dealt), so a live player's seat
+    // is given the two cards it would hold; a real startNewHand replaces them.
+    if (seat.state === 'occupied' && seat.holeCards.length === 0) seat.holeCards = [{ rank: 2, suit: 0 }, { rank: 7, suit: 1 }] as any;
     playerSessions.set(sid, { socketId: sid, tableId, seatIndex, playerName: seat.playerName, playerId: seat.playerId, sittingOut: false });
     s.join(`table:${tableId}`);
     return s;
@@ -1663,7 +1669,9 @@ describe('S2 — a voluntary leave from a LIVE tournament seat keeps the seat in
 
   it('wiring: handlePlayerLeave asks keepTournamentSeatOnLeave before any teardown; returnToTournamentSeat is gated first', () => {
     const hpl = P.handlePlayerLeave;
-    expect(hpl.indexOf('if (table && !keepTournamentSeatOnLeave(socket, session, table, tournamentSeat)) {')).toBeLessThan(hpl.indexOf('const deferRemoval ='));
+    // R2 (2026-10-11): the teardown itself is the ONE helper (teardownSeat), still only after the keep.
+    expect(hpl.indexOf('if (table && !keepTournamentSeatOnLeave(socket, session, table, tournamentSeat)) {')).toBeGreaterThan(-1);
+    expect(hpl.indexOf('if (table && !keepTournamentSeatOnLeave(socket, session, table, tournamentSeat)) {')).toBeLessThan(hpl.indexOf('teardownSeat('));
     const rts = P.returnToTournament;
     expect(rts.indexOf("await assertPlayable(socket, 'returnToTournamentSeat')")).toBeLessThan(rts.indexOf('restoreAbsentTournamentSeat('));
     expect(P.seatKeep).toContain('if (!tp || tp.eliminated) return false;');

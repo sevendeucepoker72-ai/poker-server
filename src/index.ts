@@ -785,6 +785,15 @@ interface PlayerSession {
   // on the next hand boundary. Cleared when the move completes or is cancelled.
   // Only meaningful on cash tables; tournament tables reject the event entirely.
   pendingSeatIndex?: number;
+  // 2026-10-11 (R2, GAME-11) — THIS player's fast-mode choice (setFastMode).
+  // The bots speed up only while every human playing at the table chose it
+  // (tableWantsFastBots); it leaves with the session. It used to be ONE
+  // table-wide flag any seated player flipped for everyone (and the client
+  // reset on mount, an admin turbo included).
+  fastMode?: boolean;
+  // R2 (GAME-11) — consecutive hands this cash seat sat out without being
+  // dealt in (standUpSeatsPastSitOutLimit stands it up at SIT_OUT_HANDS_LIMIT).
+  sitOutHands?: number;
   // Deep-link context from player app — e.g. { source: 'waitlist', gameId, venue }
   context?: {
     source: string;
@@ -1007,7 +1016,9 @@ const MAX_CONNECTIONS_PER_IP = 5;
 // Per-IP seated players: ip -> Set of tableId:seatIndex strings (collusion detection)
 const ipSeatedSlots = new Map<string, Set<string>>();
 // Chip velocity tracking: userId -> { chipsAtSessionStart, sessionStartAt }
-const chipVelocity = new Map<number, { chipsAtStart: number; sessionStartAt: number; handsThisSession: number; lastActionMs: number[] }>();
+// R2 (2026-10-11): chipsAtStart = the session's first hand-start STACK; netWon =
+// table winnings since; alerted = this session already alerted (once each).
+const chipVelocity = new Map<number, { chipsAtStart: number; sessionStartAt: number; handsThisSession: number; lastActionMs: number[]; netWon?: number; alerted?: boolean }>();
 // Bot detection: socketId -> list of action response times in ms
 const actionTimings = new Map<string, number[]>();
 // Action nonce tracking: tableId:seatIndex -> { last nonce used, last-write timestamp }
@@ -1193,7 +1204,12 @@ function scheduleAutoStart(tableId: string, delayMs = 1500): void {
 // — called from the handResult hook AFTER pots are awarded — credits the
 // remaining stack back to the wallet and stands the seat up.
 //   tableId -> seatIndex -> { who to credit }
-const pendingSeatRemovalAfterHand = new Map<string, Map<number, { userId: number; username: string }>>();
+// R2 (2026-10-11): `noCredit` — stand the seat up at the hand's end but credit
+// nothing (a seat with no account behind it, a tournament reservation's seat —
+// its chips are not wallet chips); `playerId` — the occupant the entry was made
+// for (an entry never tears down a different occupant).
+type PendingSeatRemoval = { userId: number; username: string; noCredit?: boolean; playerId?: string };
+const pendingSeatRemovalAfterHand = new Map<string, Map<number, PendingSeatRemoval>>();
 
 function processPendingSeatRemovals(tableId: string): void {
   const pending = pendingSeatRemovalAfterHand.get(tableId);
@@ -1203,12 +1219,155 @@ function processPendingSeatRemovals(tableId: string): void {
   if (!table) return;
   for (const [seatIndex, who] of pending) {
     const seat = table.seats[seatIndex];
-    if (seat && seat.state === 'occupied' && !seat.isAI) {
-      creditSeatStackToWallet(who.userId, who.username, tableId, seat, 'leave_after_hand');
+    if (seat && seat.state === 'occupied' && !seat.isAI && (!who.playerId || seat.playerId === who.playerId)) {
+      if (!who.noCredit) creditSeatStackToWallet(who.userId, who.username, tableId, seat, 'leave_after_hand');
+      seat.deadBlindOwedChips = 0;
+      seat.missedBlind = 'none';
+      sitOutTracker.get(tableId)?.delete(seatIndex);
       table.standUp(seatIndex);
     }
   }
+  syncSitOutToTable(tableId);
   broadcastGameState(tableId);
+}
+
+// ========== Seat teardown — ONE helper (.online R2, 2026-10-11: GAME-15 / GAME-16 + Addendum) ==========
+/**
+ * THE way a HUMAN seat leaves a table at any moment (a leave, an extra-table
+ * leave, a departure's extra seats, ghost cleanup, a refused seat restore, a
+ * reservation that ends). Before R2 each path decided for itself, and most
+ * stood the seat up at once: a seat's `totalInvestedThisHand` vanished from the
+ * pot with it (the pot only counts occupied seats) — the winner was short-paid
+ * whenever the leaver had FOLDED after putting chips in (only a non-folded
+ * leaver was deferred), on every extra-table seat, on ghost cleanup — and none
+ * of them handed the turn on, so the next bot sat ~30s until its turn clock.
+ *
+ *   - In a hand IN PROGRESS a seat still holding cards is taken out of it: on
+ *     the clock (outside a draw round) by playerFold, else by forceFoldSeat
+ *     (a draw round then completes if it was only waiting for him; a hand left
+ *     with one player is awarded at once). An ALL-IN seat is never folded: he
+ *     has no decision left and keeps his equity — and an accepted all-in
+ *     insurance (the runout hold) its settlement (Addendum: a leave during the
+ *     insurance window used to forfeit the pot AND void the insurance).
+ *   - Chips IN THE POT of a live hand (folded or not) → the stand-up waits for
+ *     the hand's end (pendingSeatRemovalAfterHand, registered BEFORE any fold —
+ *     audit #7: a fold can end the hand synchronously): the pot keeps every
+ *     chip; processPendingSeatRemovals credits the final stack (winnings and an
+ *     insurance settlement included) and stands the seat up.
+ *   - Otherwise → the stack is credited now (creditSeatStackToWallet — never a
+ *     tournament stack) and the seat stood up.
+ *   - Every path ends with scheduleAIAction (a bot next to act acts now).
+ * `who` null = credit nothing (a seat with no account; a caller that audits a
+ * tournament stack itself). Callers own sessions, rooms and broadcasts.
+ */
+type SeatTeardownOutcome = 'deferred' | 'stood_up' | 'none';
+const seatTeardownStats = { deferred: 0, stoodUp: 0, allInKept: 0, foldedOnClock: 0, foldedOutOfTurn: 0, awardedUncontested: 0 };
+function teardownSeat(
+  tableId: string, table: PokerTable, seatIndex: number,
+  who: { userId: number; username: string } | null, reason: string,
+): SeatTeardownOutcome {
+  const seat = table.seats[seatIndex];
+  if (!seat || seat.state !== 'occupied') return 'none';
+  // Already waiting for the hand's end — that path owns it.
+  if (pendingSeatRemovalAfterHand.get(tableId)?.has(seatIndex)) return 'deferred';
+  const live = table.isHandInProgress();
+  const inPot = live && (seat.totalInvestedThisHand || 0) > 0;
+  const stillInHand = live && !seat.folded && seat.holeCards.length > 0;
+  if (inPot) {
+    let m = pendingSeatRemovalAfterHand.get(tableId);
+    if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(tableId, m); }
+    m.set(seatIndex, who
+      ? { userId: who.userId, username: who.username, playerId: seat.playerId }
+      : { userId: 0, username: '', noCredit: true, playerId: seat.playerId });
+  }
+  if (stillInHand) {
+    if (seat.allIn) {
+      seatTeardownStats.allInKept++;
+    } else if (!DrawPhases.includes(table.currentPhase) && table.activeSeatIndex === seatIndex) {
+      table.playerFold(seatIndex);
+      seatTeardownStats.foldedOnClock++;
+    } else {
+      table.forceFoldSeat(seatIndex);
+      seatTeardownStats.foldedOutOfTurn++;
+      if (table instanceof FiveCardDrawTable) table.completeDrawRoundIfDone();
+      if (table.awardIfUncontested()) seatTeardownStats.awardedUncontested++;
+    }
+  }
+  scheduleAIAction(tableId);
+  // The fold may have ended the hand: processPendingSeatRemovals already ran.
+  if (inPot) {
+    seatTeardownStats.deferred++;
+    console.log(`[seat-teardown] ${JSON.stringify({ event: 'seat_teardown_deferred', tableId, seatIndex, reason, allIn: seat.allIn, standing: table.seats[seatIndex].state === 'occupied' })}`);
+    return 'deferred';
+  }
+  const now = table.seats[seatIndex];
+  if (now.state === 'occupied' && !now.isAI) {
+    if (who) creditSeatStackToWallet(who.userId, who.username, tableId, now, reason);
+    now.deadBlindOwedChips = 0;
+    now.missedBlind = 'none';
+    sitOutTracker.get(tableId)?.delete(seatIndex);
+    table.standUp(seatIndex);
+    syncSitOutToTable(tableId);
+  }
+  seatTeardownStats.stoodUp++;
+  return 'stood_up';
+}
+
+/**
+ * R2 (GAME-15) — may a join take this AI seat right now? Never one that is IN
+ * the hand being played (its chips are in the pot: standing it up erased them,
+ * and the joiner had no cards anyway): between hands any bot seat; mid-hand
+ * only a bot that has folded with nothing in the pot (or was not dealt in).
+ */
+function aiSeatTakeableNow(table: PokerTable, seatIndex: number): boolean {
+  const s = table.seats[seatIndex];
+  if (!s || s.state !== 'occupied' || !s.isAI) return false;
+  if (!table.isHandInProgress()) return true;
+  return (s.totalInvestedThisHand || 0) === 0 && (s.folded || s.holeCards.length === 0);
+}
+
+/** R2 (GAME-15) — free one takeable AI seat for a join (stood up, profile dropped); -1 when none. */
+function takeAiSeatForJoin(table: PokerTable, tableId: string): number {
+  for (let i = 0; i < MAX_SEATS; i++) {
+    if (!aiSeatTakeableNow(table, i)) continue;
+    table.standUp(i);
+    aiProfiles.get(tableId)?.delete(i);
+    return i;
+  }
+  return -1;
+}
+
+/**
+ * R2 (GAME-17) — the last human left: the table's bots are removed (its 24/7
+ * heartbeat re-seeds it) — but NEVER in the middle of a hand. Stripping every
+ * bot mid-hand left an orphan hand with no seats (and a table the heartbeat,
+ * which only dealt WaitingForPlayers tables, never revived). Mid-hand it is
+ * marked and done at the hand's end (stripBotsAfterHandIfMarked, from the
+ * handResult listener) if no human came back meanwhile.
+ */
+const botStripAfterHand = new Set<string>();
+function stripBotsWhenNoHumans(tableId: string, table: PokerTable): void {
+  if (table.seats.some((s) => s.state === 'occupied' && !s.isAI)) return;
+  if (!aiSeatsMutableNow(table)) {
+    botStripAfterHand.add(tableId);
+    return;
+  }
+  botStripAfterHand.delete(tableId);
+  for (let i = 0; i < MAX_SEATS; i++) {
+    if (table.seats[i].state === 'occupied' && table.seats[i].isAI) table.standUp(i);
+  }
+  aiProfiles.delete(tableId);
+  const aiT = aiTimeouts.get(tableId);
+  if (aiT) { clearTimeout(aiT.handle); aiTimeouts.delete(tableId); }
+  // The table is empty: no hand to start (the heartbeat re-seeds it).
+  const pendingStart = pendingAutoStartTimers.get(tableId);
+  if (pendingStart) { clearTimeout(pendingStart); pendingAutoStartTimers.delete(tableId); }
+}
+function stripBotsAfterHandIfMarked(tableId: string): void {
+  if (!botStripAfterHand.has(tableId)) return;
+  const table = tableManager.getTable(tableId);
+  botStripAfterHand.delete(tableId);
+  if (table) stripBotsWhenNoHumans(tableId, table);
 }
 
 // Periodic sweeper: prunes stale entries from rate-limit maps so long-running
@@ -2205,8 +2364,11 @@ const waitlistAccountMismatches = { refused: 0 };
  * tournament are left untouched; the caller decides what happens to the
  * reservation entry itself.
  */
+/** R2 (APPUI-21) — reservations ended early because the same account's next departure needed the slot. */
+const reservationsDisplaced = { count: 0 };
+
 function noteTournamentReservationNotCashed(
-  userId: number, actor: string, reserved: ReservedSeat, reason: 'reserve_hand_limit' | 'reserve_expiry',
+  userId: number, actor: string, reserved: ReservedSeat, reason: 'reserve_hand_limit' | 'reserve_expiry' | 'reserve_displaced',
 ): void {
   const t = tableManager.getTable(reserved.tableId);
   const seatNow = t?.seats?.[reserved.seatIndex];
@@ -2267,6 +2429,8 @@ const bombPotActive = new Map<string, boolean>();
 // previously force 2×BB antes EVERY hand (griefing on public cash tables).
 const bombPotCooldownUntil = new Map<string, number>();
 const BOMB_POT_COOLDOWN_MS = 5 * 60 * 1000;
+/** R2 (GAME-12) — bomb pots dealt / refused (triggerBombPot at a table that may not run one; a pending one dropped at the deal). */
+const bombPotStats = { dealt: 0, refusedAtTrigger: 0, refusedAtActivation: 0 };
 
 // ========== Dealer's Choice Tracking ==========
 // tableId -> { enabled, orbitCount, currentVariantIndex }
@@ -2469,6 +2633,23 @@ app.get('/api/health', async (_req, res) => {
       // (a forfeit, another hand, a seat that changed hands); open = windows
       // waiting right now (each lasts at most INSURANCE_DECISION_MS).
       insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
+      // 2026-10-11 (.online R2, S2 engine lane) — table lifecycle counters:
+      // seatTeardown (GAME-15/16: stand-ups deferred to the hand's end, all-in
+      // leavers kept in, out-of-turn folds, hands awarded at once), botStacks
+      // (GAME-18: bot reloads minted vs over-cap stacks burned; skipped reloads
+      // on fixed-roster quick tables), heartbeatRestarts (GAME-17: frozen
+      // HandComplete tables revived — should stay ~0), bombPots (GAME-12),
+      // sitOutLimit (GAME-11), reservationsDisplaced (APPUI-21), chipVelocity.
+      engine: {
+        seatTeardown: { ...seatTeardownStats, pendingTables: pendingSeatRemovalAfterHand.size },
+        botStacks: { ...botStackStats, capBuyIns: BOT_STACK_CAP_BUYINS },
+        heartbeatRestarts: { ...heartbeatRestarts },
+        botStripsPending: botStripAfterHand.size,
+        bombPots: { ...bombPotStats },
+        sitOutLimit: { ...sitOutLimitStats, hands: SIT_OUT_HANDS_LIMIT },
+        reservationsDisplaced: reservationsDisplaced.count,
+        chipVelocity: { ...chipVelocityStats, autoBan: CHIP_VELOCITY_AUTOBAN },
+      },
     });
   } catch (e: any) {
     res.status(503).json({ status: 'unhealthy', error: e?.message || String(e) });
@@ -3327,6 +3508,16 @@ function getGameStateForPlayer(
   // insurance quote { handNumber, cashout, equityPct, pot, expiresAt } while
   // the runout is held for its decision. Spectators always get null.
   stateObj.insuranceQuote = insuranceQuoteForSeat(table.config.tableId, table, playerSeatIndex);
+  // 2026-10-11 (.online R2, contract C11) — ALWAYS present, booleans (a
+  // spectator always gets false):
+  //   isFirstActor — THIS seat may straddle right now (TABLEUI-19: the client's
+  //     Straddle button is gated on this key, which was never sent) — a ring
+  //     table (straddleAllowedAt) and PokerTable.canStraddle (pre-flop, its
+  //     turn, nobody acted, 3+ dealt in, 2 BB affordable without going all-in);
+  //   canBombPot — this table may run a bomb pot (bombPotAllowedAt: Hold'em /
+  //     Omaha ring tables only); triggerBombPot refuses wherever it is false.
+  stateObj.isFirstActor = !!(playerSeatIndex >= 0 && straddleAllowedAt(table.config.tableId) && table.canStraddle(playerSeatIndex));
+  stateObj.canBombPot = !!(playerSeatIndex >= 0 && bombPotAllowedAt(table.config.tableId, table));
 
   // Add missed-blind info for this player. Now sourced directly from the
   // seat object (seat.deadBlindOwedChips + seat.missedBlind) — single
@@ -3873,6 +4064,134 @@ async function settlePredictionsForHand(
   }
 }
 
+/**
+ * 2026-10-11 (.online R2, GAME-11 / ECON-13) — consecutive hands a seat at a
+ * RING table (cash / private / club) may sit out — not dealt in — before it is
+ * stood up and its stack credited to the wallet. 30 hands ≈ three orbits of a
+ * full table, ~8-10 minutes at a 24/7 bot table: longer than a short break,
+ * shorter than the 10-minute client AFK that sits a player out in the first
+ * place. A sitting-out seat earns nothing (dealt-in gate in handleHandComplete)
+ * but held one of the table's few open seats forever. Tournament seats are
+ * never stood up here (P-j: dealt in, acted for while away).
+ */
+const SIT_OUT_HANDS_LIMIT = 30;
+const SIT_OUT_LIMIT_MESSAGE = 'You were sitting out for a while, so your seat was released and your chips went back to your balance.';
+const sitOutLimitStats = { stoodUp: 0 };
+function standUpSeatsPastSitOutLimit(tableId: string, table: PokerTable): void {
+  const kind = tableKindOf(tableId);
+  if (!(kind === 'cash' || kind === 'private' || kind === 'club') || challengeTables.has(tableId)) return;
+  for (const [sid, session] of [...playerSessions]) {
+    if (session.tableId !== tableId) continue;
+    const seat = table.seats[session.seatIndex];
+    if (!seat || seat.state !== 'occupied' || seat.isAI) continue;
+    if (!session.sittingOut || seat.holeCards.length > 0) { session.sitOutHands = 0; continue; }
+    session.sitOutHands = (session.sitOutHands || 0) + 1;
+    if (session.sitOutHands < SIT_OUT_HANDS_LIMIT) continue;
+    const sock = io.sockets.sockets.get(sid);
+    if (!sock) continue;   // a socket that is gone is its disconnect's to reserve
+    // The leave (cash: the stack credited, the seat stood up — teardownSeat).
+    // Only THIS table: the socket's extra-table seats stay where they are.
+    const multi = multiTableSessions.get(sid);
+    if (multi) multiTableSessions.delete(sid);
+    try {
+      handlePlayerLeave(sock, 'voluntary');
+    } finally {
+      if (multi) multiTableSessions.set(sid, multi);
+    }
+    // He keeps watching the table as a spectator (the client never sits on a
+    // frozen seat — the same steps as the suspended stand-up / `spectate`).
+    const stillThere = tableManager.getTable(tableId);
+    if (stillThere) {
+      detachSocketFromOtherTables(sock, tableId, 'spectate', 'sit_out_limit');   // P-g
+      if (!spectators.has(tableId)) spectators.set(tableId, new Set());
+      spectators.get(tableId)!.add(sock.id);
+      sock.join(`table:${tableId}`);
+      const st: any = getGameStateForPlayer(stillThere, -1, false);
+      st.isSpectator = true;
+      st.spectatorCount = spectators.get(tableId)!.size;
+      emitGameState(sock, st, true);
+      sock.emit('spectating', { tableId, tableName: stillThere.config.tableName });
+    }
+    sock.emit('sitOutToggled', { sittingOut: false, reason: 'sit_out_limit', stoodUp: true, tableId });
+    sock.emit('error', { message: SIT_OUT_LIMIT_MESSAGE, code: 'sit_out_limit', tableId });
+    sitOutLimitStats.stoodUp++;
+    console.log(`[sit-out] ${JSON.stringify({ event: 'sit_out_limit_stood_up', tableId, seatIndex: session.seatIndex, hands: SIT_OUT_HANDS_LIMIT, localUserId: authSessions.get(sid)?.userId ?? null })}`);
+  }
+}
+
+/**
+ * 2026-10-11 (.online R2, GAME P3) — the anti-cheat chip-velocity monitor, on
+ * what a player WINS AT THE TABLE. It never ran: it read `playerId` / `isAI` /
+ * `chipsWon` from 'handResult' entries that carried none of them (PokerTable
+ * .emitHandCompletion stamps them now). And it measured the WALLET (two DB
+ * reads per win), which play at a table does not move — a seated player's
+ * gains sit in his stack until he cashes out — while a daily reward or a
+ * cash-out from another table would have read as "velocity". Now: each hand,
+ * every human session DEALT INTO it (a cash table — tournament chips are not
+ * wallet chips) adds its stack change (end stack - hand-start stack, insurance
+ * settlement included) to its account's session net; once a session is
+ * CHIP_VELOCITY_MIN_HANDS hands old and nets more than
+ * CHIP_VELOCITY_MULTIPLE x its first hand's stack (at least one table buy-in),
+ * it alerts ONCE per session (log + audit CHIP_VELOCITY_ALERT, counted with
+ * the 24h decay). The automatic ban after 3 alerts is now OPT-IN
+ * (CHIP_VELOCITY_AUTOBAN=1): this heuristic has never run against real play,
+ * and a strong player beating the 24/7 bots can trip it without cheating —
+ * banning on it is the owner's call. A session ends 30 idle minutes after its
+ * last hand (the 60s sweeper).
+ */
+const CHIP_VELOCITY_MIN_HANDS = 5;
+const CHIP_VELOCITY_MULTIPLE = 10;
+const CHIP_VELOCITY_AUTOBAN = process.env.CHIP_VELOCITY_AUTOBAN === '1';
+const chipVelocityStats = { alerts: 0, autoBans: 0 };
+function recordChipVelocity(tableId: string, table: PokerTable, results: any[]): void {
+  if (isTournamentTable(tableId)) return;
+  const now = Date.now();
+  const wonSeats = new Set<number>();
+  for (const r of Array.isArray(results) ? results : []) {
+    if (r && !r.isAI && Number(r.chipsWon) > 0) wonSeats.add(r.seatIndex);
+  }
+  for (const [sid, session] of playerSessions) {
+    if (session.tableId !== tableId) continue;
+    const seat = table.seats[session.seatIndex];
+    if (!seat || seat.state !== 'occupied' || seat.isAI || seat.holeCards.length === 0) continue;
+    const auth = authSessions.get(sid);
+    if (!auth) continue;
+    const start = table.startChips.get(session.seatIndex);
+    if (start === undefined) continue;
+    const userId = auth.userId;
+    let vel = chipVelocity.get(userId);
+    if (!vel) {
+      vel = { chipsAtStart: start, sessionStartAt: now, handsThisSession: 0, lastActionMs: [], netWon: 0, alerted: false };
+      chipVelocity.set(userId, vel);
+    }
+    vel.handsThisSession++;
+    vel.netWon = (vel.netWon || 0) + (seat.chipCount - start);
+    vel.lastActionMs = [now];
+    const threshold = Math.max(vel.chipsAtStart, table.config.minBuyIn) * CHIP_VELOCITY_MULTIPLE;
+    if (vel.alerted || !wonSeats.has(session.seatIndex) || vel.handsThisSession < CHIP_VELOCITY_MIN_HANDS || vel.netWon <= threshold) continue;
+    vel.alerted = true;
+    chipVelocityStats.alerts++;
+    const alertCount = incrementChipVelocityAlert(userId);
+    const sessionMinutes = Math.round((now - vel.sessionStartAt) / 6000) / 10;
+    console.warn(`[AntiCheat] ${JSON.stringify({
+      event: 'chip_velocity_alert', userId, tableId, netWon: vel.netWon, stakeAtStart: vel.chipsAtStart,
+      hands: vel.handsThisSession, sessionMinutes, alertCount, autoBan: CHIP_VELOCITY_AUTOBAN,
+    })}`);
+    auditLog('SYSTEM', 'CHIP_VELOCITY_ALERT', { userId, tableId, netWon: vel.netWon, stakeAtStart: vel.chipsAtStart, hands: vel.handsThisSession, alertCount });
+    if (CHIP_VELOCITY_AUTOBAN && alertCount >= 3) {
+      console.warn(`[AntiCheat] Auto-banning userId=${userId} after ${alertCount} chip velocity alerts`);
+      try {
+        banUserDB(userId);
+        auditLog('SYSTEM', 'AUTO_BAN_CHIP_VELOCITY', { userId, netWon: vel.netWon, handsThisSession: vel.handsThisSession });
+        chipVelocityStats.autoBans++;
+      } catch (e) {
+        console.error('[AntiCheat] Auto-ban failed:', e);
+      }
+      chipVelocityAlerts.delete(userId);
+    }
+  }
+}
+
 function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   if (tableProgressListeners.has(tableId)) return;
   tableProgressListeners.add(tableId);
@@ -3981,6 +4300,10 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // its committed chips in the pot can be torn down: credit the remaining
     // stack to the wallet + standUp.
     processPendingSeatRemovals(tableId);
+    // R2 (GAME-17) — the last human left during this hand: its bots go now.
+    stripBotsAfterHandIfMarked(tableId);
+    // R2 (GAME-11) — a cash seat sat out too long is stood up and cashed out.
+    standUpSeatsPastSitOutLimit(tableId, table);
 
     // 2026-07-01 audit #6: schedule the next hand from the SINGLE point every
     // completion passes through. Covers hands ended by timer/watchdog/sit-out/
@@ -3988,48 +4311,11 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // Deduped — the action-path schedulers still run and simply replace this.
     scheduleAutoStart(tableId);
 
-    // Chip velocity monitoring
-    for (const result of data.results) {
-      if (!result.playerId || result.isAI) continue;
-      const session = [...playerSessions.values()].find((s) => s.tableId === tableId && s.playerId === result.playerId);
-      if (!session) continue;
-      const auth = authSessions.get(session.socketId);
-      if (!auth) continue;
-      const userId = auth.userId;
-      if (!chipVelocity.has(userId)) {
-        chipVelocity.set(userId, {
-          chipsAtStart: await getUserChips(userId),
-          sessionStartAt: Date.now(),
-          handsThisSession: 0,
-          lastActionMs: [],
-        });
-      }
-      const vel = chipVelocity.get(userId)!;
-      vel.handsThisSession++;
-      if (result.chipsWon && result.chipsWon > 0) {
-        const currentChips = await getUserChips(userId);
-        const gained = currentChips - vel.chipsAtStart;
-        const sessionMinutes = (Date.now() - vel.sessionStartAt) / 60_000;
-        if (vel.handsThisSession >= 5 && gained > vel.chipsAtStart * 10) {
-          console.warn(`[AntiCheat] Chip velocity alert: userId=${userId} gained ${gained} chips (${vel.handsThisSession} hands, ${sessionMinutes.toFixed(1)}m)`);
-          // Track alert count with decay; auto-ban after 3 alerts inside
-          // the decay window (24h). Previously this was a permanent count
-          // that could survive months of quiet play and then trip a ban
-          // on a single new alert.
-          const alertCount = incrementChipVelocityAlert(userId);
-          if (alertCount >= 3) {
-            console.warn(`[AntiCheat] Auto-banning userId=${userId} after ${alertCount} chip velocity alerts`);
-            try {
-              banUserDB(userId);
-              auditLog('SYSTEM', 'AUTO_BAN_CHIP_VELOCITY', { userId, gained, handsThisSession: vel.handsThisSession });
-            } catch (e) {
-              console.error('[AntiCheat] Auto-ban failed:', e);
-            }
-            chipVelocityAlerts.delete(userId);
-          }
-        }
-      }
-    }
+    // Chip velocity monitoring — R2 (GAME P3): it never ran (no result entry
+    // carried playerId / isAI / chipsWon — PokerTable.emitHandCompletion stamps
+    // them now) and it read the WALLET, which a seated player's play does not
+    // move: rewritten in recordChipVelocity (table winnings, from the stacks).
+    recordChipVelocity(tableId, table, data.results);
 
     // 2026-07-07 gap-fill [7] — LLM table commentary. Env-gated + throttled so it
     // bounds Anthropic spend and stays INERT (client keeps its local fallback)
@@ -4220,6 +4506,31 @@ function trimExcessAI(
   log.debug(`[LiveRoom] trimExcessAI ${tableId}: removed ${toRemove} AI seats (was ${occupied}, cap ${targetMaxOccupied}, phase ${table.currentPhase})`);
 }
 
+/**
+ * 2026-10-11 (R2, GAME-11) — fast bots at this table? Only while EVERY human
+ * session playing here (main seat or extra-table seat, sitting in) chose fast
+ * mode — at least one. A player who never chose it, or turned it off, keeps
+ * normal bot speed; a choice leaves with its session (the setter leaving ends
+ * it). The table-level turbo (fastModeTables: admin / turbo tournaments) is
+ * separate and unaffected.
+ */
+function tableWantsFastBots(tableId: string): boolean {
+  let humans = 0;
+  for (const s of playerSessions.values()) {
+    if (s.tableId !== tableId || s.sittingOut) continue;
+    if (!s.fastMode) return false;
+    humans++;
+  }
+  for (const list of multiTableSessions.values()) {
+    for (const s of list || []) {
+      if (!s || s.tableId !== tableId || s.sittingOut) continue;
+      if (!s.fastMode) return false;
+      humans++;
+    }
+  }
+  return humans > 0;
+}
+
 function scheduleAIAction(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) { console.log('[AI] No table found'); return; }
@@ -4378,7 +4689,9 @@ function scheduleAIAction(tableId: string): void {
     clearTimeout(existing.handle);
   }
 
-  const isFastMode = fastModeTables.get(tableId) || false;
+  // R2 (GAME-11) — the table's admin / tournament turbo, or every human
+  // playing here chose fast mode (one player's choice is never imposed on another).
+  const isFastMode = fastModeTables.get(tableId) || tableWantsFastBots(tableId);
   // Trust getThinkingDelay's per-difficulty range for natural variance —
   // different bots act at different times so the table doesn't feel
   // robotic. Only a hard MAX cap (2500ms) is applied, well below the 30s
@@ -4556,6 +4869,9 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
   // Update the session to reflect the new seat + clear sit-out.
   session.seatIndex = target;
   session.sittingOut = false;
+  // R2 (TABLEUI-11 / contract C11) — a seat move sends a FULL state next.
+  lastSentState.delete(session.socketId);
+  lastSentJson.delete(session.socketId);
   const tracker = sitOutTracker.get(tableId);
   if (tracker) {
     tracker.delete(target);
@@ -4570,6 +4886,72 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
   // 2026-05-12 audit: throttled to debug, was console.log
   log.debug(`[MoveSeat] ${playerName} moved to seat ${target} on ${tableId} (${chipCount} chips)`);
   return true;
+}
+
+/**
+ * 2026-10-11 (.online R2, GAME-18 — owner: "finish it for real") — the most a
+ * ring-table bot may hold between hands, in table buy-ins (config.minBuyIn —
+ * what a bot sits down and reloads with). A bot above it is reset to one
+ * buy-in before the next deal. N = 3: deep enough to play like a real stack
+ * (a human may buy in for up to 10 buy-ins), small enough that what a winning
+ * human can take from one bot in one hand is bounded. Before: a busted bot
+ * reloaded for free (~1.9M chips/hour minted fleet-wide), the winners kept
+ * every chip (measured: one bot at 54x buy-in after 300 hands), and humans
+ * cashed those unbounded stacks out. The reset burns what the reloads mint.
+ */
+const BOT_STACK_CAP_BUYINS = 3;
+const botStackStats = { reloads: 0, minted: 0, caps: 0, burned: 0, fixedRosterReloadsSkipped: 0 };
+
+/**
+ * GAME-18 — the hand-boundary bot step (autoStartNextHand, never a tournament
+ * table): a busted bot is reloaded to one buy-in, a bot above
+ * BOT_STACK_CAP_BUYINS buy-ins is reset to one. A FIXED-ROSTER quick table
+ * (heads-up, Spin & Go, career, all-in-or-fold, club challenge) is left
+ * entirely alone: its bot busting is the game's end, never a free refill.
+ */
+function reloadAndCapBotStacks(
+  table: PokerTable, tableId: string, fixedRoster: boolean,
+): { reloaded: number; minted: number; capped: number; burned: number } {
+  const out = { reloaded: 0, minted: 0, capped: 0, burned: 0 };
+  const buyIn = table.config.minBuyIn;
+  if (!(buyIn > 0)) return out;
+  for (let i = 0; i < MAX_SEATS; i++) {
+    const seat = table.seats[i];
+    if (seat.state !== 'occupied' || !seat.isAI) continue;
+    if (fixedRoster) {
+      if (seat.chipCount <= 0) botStackStats.fixedRosterReloadsSkipped++;
+      continue;
+    }
+    if (seat.chipCount <= 0) {
+      seat.chipCount = buyIn;
+      seat.eliminated = false;
+      out.reloaded++;
+      out.minted += buyIn;
+      // Addendum (R2): debug, not info — this fired for every bot bust, 24/7.
+      log.debug(`[Reload] AI ${seat.playerName} busted → reloaded to ${buyIn}`);
+    } else if (seat.chipCount > BOT_STACK_CAP_BUYINS * buyIn) {
+      out.capped++;
+      out.burned += seat.chipCount - buyIn;
+      log.debug(`[Reload] AI ${seat.playerName} stack ${seat.chipCount} over ${BOT_STACK_CAP_BUYINS}x buy-in → reset to ${buyIn}`);
+      seat.chipCount = buyIn;
+    }
+  }
+  botStackStats.reloads += out.reloaded;
+  botStackStats.minted += out.minted;
+  botStackStats.caps += out.capped;
+  botStackStats.burned += out.burned;
+  return out;
+}
+
+/**
+ * GAME-18 (with S1) — a quick table with a FIXED roster: its bots are never
+ * reloaded, capped or topped up. S1 owns the canonical predicate
+ * (`isFixedRosterTable`, exported with its quick-game END work); until the
+ * lanes merge this mirrors it: every quick-game registry plus club challenges.
+ */
+function isFixedRosterQuickTable(tableId: string): boolean {
+  return quickTables.has(tableId) || careerTables.has(tableId) || spinGoMultipliers.has(tableId)
+    || allInOrFoldTables.has(tableId) || challengeTables.has(tableId);
 }
 
 function autoStartNextHand(tableId: string): void {
@@ -4607,16 +4989,10 @@ function autoStartNextHand(tableId: string): void {
   //     reload collusion mint. A busted human stays at 0 and rebuys from their
   //     wallet (the rebuy handler, which deducts) or leaves. AI seats have no
   //     wallet, so a free reload only keeps the ring table populated — kept.
+  // R2 (GAME-18): bot stacks are CAPPED here too, and a fixed-roster quick
+  // table's bot is never reloaded (reloadAndCapBotStacks).
   if (!tournamentTables.has(tableId)) {
-    for (let i = 0; i < MAX_SEATS; i++) {
-      const seat = table.seats[i];
-      if (seat.state !== 'occupied') continue;
-      if (seat.chipCount <= 0 && seat.isAI) {
-        seat.chipCount = table.config.minBuyIn;
-        seat.eliminated = false;
-        console.log(`[Reload] AI ${seat.playerName} busted → reloaded to ${table.config.minBuyIn}`);
-      }
-    }
+    reloadAndCapBotStacks(table, tableId, isFixedRosterQuickTable(tableId));
   }
 
   // Execute any pending seat-move requests BEFORE we trim / refill AI.
@@ -4747,75 +5123,25 @@ function activateBombPotIfPending(tableId: string, table: PokerTable): boolean {
     return false;
   }
   bombPotPending.delete(tableId);
+  // 2026-10-11 (R2, GAME-12) — Hold'em / Omaha ring tables only (a private
+  // table created with the option on another variant just drops it).
+  if (!bombPotAllowedAt(tableId, table)) {
+    bombPotActive.delete(tableId);
+    bombPotStats.refusedAtActivation++;
+    return false;
+  }
+  // Every dealt-in player posts 2x the big blind as an EQUAL ante (the posted
+  // blinds are returned first — 2026-07-05 audit P2; a stack the ante takes
+  // whole is all-in — audit C17), then the flop is dealt by the TABLE ITSELF
+  // (PokerTable.applyBombPot: its own deck, burn rule and variant hooks — this
+  // function used to pull three cards off the base deck and flip the phase by
+  // hand) and the first player who can act goes (all-in on the ante → run out).
+  if (!table.applyBombPot(table.config.bigBlind * 2)) {
+    bombPotActive.delete(tableId);
+    return false;
+  }
   bombPotActive.set(tableId, true);
-
-  // All players post 2x big blind as an EQUAL ante.
-  const bombAnte = table.config.bigBlind * 2;
-  for (let i = 0; i < MAX_SEATS; i++) {
-    const seat = table.seats[i];
-    if (seat.state === 'occupied' && !seat.folded && !seat.eliminated) {
-      // 2026-07-05 audit P2 fix: activateBombPotIfPending runs AFTER
-      // startNewHand -> postBlinds, so the SB/BB have already paid their blinds
-      // (and any ante) into totalInvestedThisHand/currentBet. Charging the bomb
-      // ante on top made the two blind seats contribute blind + ante while every
-      // other seat contributed only the ante — a bomb pot must be an EQUAL wager.
-      // Refund each seat's already-posted contribution (no real betting has
-      // happened yet — this is immediately post-startNewHand) so the ante below
-      // is the sole, equal contribution for every seat.
-      seat.chipCount += seat.totalInvestedThisHand;
-      seat.totalInvestedThisHand = 0;
-      seat.currentBet = 0;
-      seat.allIn = false;
-      const deduction = Math.min(bombAnte, seat.chipCount);
-      seat.chipCount -= deduction;
-      seat.currentBet = deduction;
-      seat.totalInvestedThisHand = deduction;
-      // 2026-06-11 audit C17: a player whose stack is fully consumed by the
-      // bomb ante is all-in for this hand. Without this flag the engine treats
-      // them as a live actor with 0 chips and auto-folds them on their turn —
-      // folding them OUT of a pot they already paid into. Match every other
-      // deduction site, which sets allIn on a 0 stack.
-      if (seat.chipCount === 0) seat.allIn = true;
-    }
-  }
-
-  // Skip preflop: advance directly to flop (hole cards already dealt in startNewHand).
-  if (table.communityCards.length === 0) {
-    const deck = (table as any).deck;
-    deck.dealOne(); // burn card
-    for (let c = 0; c < 3; c++) {
-      const card = deck.dealOne();
-      if (card) table.communityCards.push(card);
-    }
-    (table as any).currentPhase = GamePhase.Flop;
-    // Ante posted — reset currentBet to 0 for the post-flop betting round.
-    table.currentBetToMatch = 0;
-    for (let i = 0; i < MAX_SEATS; i++) {
-      table.seats[i].currentBet = 0;
-    }
-    // First player after the dealer who can ACTUALLY act goes first post-flop.
-    // 2026-07-05 audit P1 fix: the old predicate `s.chipCount >= 0` is ALWAYS
-    // true, so it could seat the action on a seat that went all-in on the bomb
-    // ante — an actor who cannot act, wedging the table until the watchdog fired.
-    // Skip all-in / chipless / cardless seats (the engine's own canAct test).
-    const startIdx = (table.dealerButtonSeat + 1) % MAX_SEATS;
-    let seated = false;
-    for (let j = 0; j < MAX_SEATS; j++) {
-      const checkSeat = (startIdx + j) % MAX_SEATS;
-      const s = table.seats[checkSeat];
-      if (s.state === 'occupied' && !s.folded && !s.eliminated && !s.allIn && s.chipCount > 0 && s.holeCards.length > 0) {
-        table.activeSeatIndex = checkSeat;
-        seated = true;
-        break;
-      }
-    }
-    // If NOBODY can act (every remaining player went all-in on the ante), don't
-    // leave the table with no valid actor — hand the board runout to the engine's
-    // canonical all-in progression (mirrors startNewHand's post-first-actor check).
-    if (!seated) {
-      (table as any).advanceToNextStreet();
-    }
-  }
+  bombPotStats.dealt++;
   return true;
 }
 
@@ -4832,6 +5158,8 @@ function activateBombPotIfPending(tableId: string, table: PokerTable): boolean {
 //     scheduling and rebalancing.
 
 const LIVE_ROOM_MIN_OCCUPIED = 3;
+/** R2 (GAME-17) — hand-complete tables the heartbeat had to restart (each one was frozen). */
+const heartbeatRestarts = { handComplete: 0 };
 
 function backfillAIToMin(table: PokerTable, tableId: string, min: number): void {
   // No mid-hand roster changes — defer backfill to the between-hands window.
@@ -4880,6 +5208,23 @@ function ensureCashTableRunning(tableId: string): void {
   // Keep a minimum floor of bots so any human walk-up has action immediately.
   if (table.getOccupiedSeatCount() < LIVE_ROOM_MIN_OCCUPIED) {
     backfillAIToMin(table, tableId, LIVE_ROOM_MIN_OCCUPIED);
+  }
+
+  // 2026-10-11 (R2, GAME-17) — a table resting in HandComplete with NO start
+  // scheduled is frozen: its hand-boundary timer already ran and dealt nothing
+  // (everyone had left, the bots were stripped, < 2 stacks…) and this heartbeat
+  // only ever dealt WaitingForPlayers tables — so after a re-seed the lobby
+  // showed a "live" table that never dealt again. The hand-boundary step runs
+  // it (reload / cap / trim / fill, then the deal).
+  if (
+    table.currentPhase === GamePhase.HandComplete &&
+    table.getOccupiedSeatCount() >= 2 &&
+    !pendingAutoStartTimers.has(tableId) &&
+    !table.isCompletingHand()
+  ) {
+    heartbeatRestarts.handComplete++;
+    autoStartNextHand(tableId);
+    return;
   }
 
   // If stuck in WaitingForPlayers with ≥ 2 seated and no pending auto-start
@@ -5174,6 +5519,37 @@ function sendProgressToPlayer(socketId: string): void {
  * isAbsentTournamentSeatPastHandLimit). (Extracted verbatim from
  * handleHandComplete, same call point; the cash-table path is unchanged.)
  */
+/**
+ * 2026-10-11 (.online R2) — end a CASH seat reservation: its seat is torn down
+ * through teardownSeat (stack credited — audited CASH_OUT — and stood up; in a
+ * live hand the stand-up waits for its end, the pot keeping every chip). A seat
+ * another account's live session plays is never touched. A table that is gone
+ * pays the reservation's snapshot (as before). Returns the chips credited now
+ * (0 when deferred to the hand's end). The caller has already removed the
+ * reservation from reservedSeats and cleared its timer.
+ */
+function endCashReservation(userId: number, username: string, reserved: ReservedSeat, reason: string): number {
+  const t = tableManager.getTable(reserved.tableId);
+  if (!t) {
+    const chips = reserved.chips ?? 0;
+    if (chips > 0) {
+      addChipsToUser(userId, chips).catch((e: any) => console.warn(`[Reserve ${reason} cash-out ${userId}]`, e?.message));
+    }
+    return chips;
+  }
+  const seatNow = t.seats[reserved.seatIndex];
+  sitOutTracker.get(reserved.tableId)?.delete(reserved.seatIndex);
+  if (!seatNow || seatNow.state !== 'occupied' || seatNow.isAI || seatPlayedByAnotherAccount(userId, reserved.tableId, reserved.seatIndex)) {
+    syncSitOutToTable(reserved.tableId);
+    return 0;
+  }
+  const chips = seatNow.chipCount;
+  const outcome = teardownSeat(reserved.tableId, t, reserved.seatIndex, { userId, username }, reason);
+  syncSitOutToTable(reserved.tableId);
+  broadcastGameState(reserved.tableId);
+  return outcome === 'stood_up' ? chips : 0;
+}
+
 function tickReservedSeatHands(tableId: string): void {
   for (const [userId, reserved] of reservedSeats) {
     if (reserved.tableId === tableId) {
@@ -5187,28 +5563,13 @@ function tickReservedSeatHands(tableId: string): void {
           }
           continue;
         }
-        // Player ran out of hands — remove them from the table
-        const t = tableManager.getTable(reserved.tableId);
-        const seatNow = t?.seats?.[reserved.seatIndex];
-        // Cash out the at-table stack to the user's wallet before tearing
-        // the seat down, so disconnect-timeouts don't destroy chips.
-        const chipsToReturn = seatNow?.chipCount ?? reserved.chips ?? 0;
-        if (chipsToReturn > 0) {
-          addChipsToUser(userId, chipsToReturn).catch((e: any) =>
-            console.warn(`[Reserve hand-limit cash-out ${userId}]`, e?.message)
-          );
-        }
-        // Clean the sit-out tracker so the NEXT occupant of this seat
-        // doesn't inherit a stale sitting-out flag.
-        const tr = sitOutTracker.get(reserved.tableId);
-        if (tr) tr.delete(reserved.seatIndex);
-        if (t) {
-          t.standUp(reserved.seatIndex);
-          syncSitOutToTable(reserved.tableId);
-          console.log(`[Reserve] ${reserved.playerName} removed after ${DISCONNECT_HANDS_LIMIT} hands of sitting out (returned ${chipsToReturn} chips)`);
-        }
+        // Player ran out of hands — remove them from the table, the at-table
+        // stack credited to the wallet first (R2: through endCashReservation /
+        // teardownSeat, audited, the same as every other seat teardown).
         clearTimeout(reserved.cleanupTimer);
         reservedSeats.delete(userId);
+        const chipsToReturn = endCashReservation(userId, String(userId), reserved, 'reserve_hand_limit');
+        console.log(`[Reserve] ${reserved.playerName} removed after ${DISCONNECT_HANDS_LIMIT} hands of sitting out (returned ${chipsToReturn} chips)`);
       }
     }
   }
@@ -5231,14 +5592,23 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     broadcastGameState(tableId);
   }
 
-  // Decrement sit-out hand counter for reserved (disconnected) seats on this table
-  tickReservedSeatHands(tableId);
+  // 2026-10-11 (R2, GAME-11 / ECON-13) — the seats DEALT INTO this hand (they
+  // still hold its cards — read before the first await, a new hand deals 1.5s
+  // later). Only they played it: hands played, XP, wins / losses, position and
+  // ELO results, missions and the scratch-card tick are theirs alone. A seat
+  // sitting out, AFK or seated mid-hand used to be credited every hand (~16-22
+  // scratch cards per idle hour at the 24/7 bot tables, and every sat-out hand
+  // was an ELO loss).
+  const dealtInSeats = new Set<number>();
+  for (const s of table.seats) if (s.state === 'occupied' && s.holeCards.length > 0) dealtInSeats.add(s.seatIndex);
 
-  // Collect all human players at the table
+  // Collect the human players dealt into this hand
   const humanSessions: PlayerSession[] = [];
-  for (const [_socketId, session] of playerSessions) {
-    if (session.tableId === tableId) {
+  const dealtInSockets = new Set<string>();
+  for (const [socketId, session] of playerSessions) {
+    if (session.tableId === tableId && dealtInSeats.has(session.seatIndex)) {
       humanSessions.push(session);
+      dealtInSockets.add(socketId);
     }
   }
 
@@ -5258,6 +5628,13 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // it so the insured seat ends with exactly `cashout` (R1 2026-10-11: only
   // this hand's records, never a seat that changed hands or forfeited).
   settleInsuranceForHand(tableId, table, totalWonPerSeat);
+
+  // Decrement sit-out hand counter for reserved (disconnected) seats on this
+  // table. Addendum (R2): AFTER the insurance settlement — a reserved seat at
+  // its hand limit is cashed out and stood up here, and it used to be cashed
+  // out with its PRE-settlement stack (the insured cashout then voided as
+  // "seat changed").
+  tickReservedSeatHands(tableId);
 
   // S1 (2026-10-10) — capture this hand's tournament bust check NOW, before
   // the first await below: until it runs, this table does not deal again
@@ -5367,7 +5744,9 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   for (const [socketId, session] of playerSessions) {
     if (session.tableId === tableId) try {
       sendProgressToPlayer(socketId);
-      const authSession = authSessions.get(socketId);
+      // R2 (GAME-11 / ECON-13) — a seat not dealt into this hand earned nothing
+      // in it: no save, no scratch-card tick.
+      const authSession = dealtInSockets.has(socketId) ? authSessions.get(socketId) : undefined;
       if (authSession) {
         const clientProgress = progressionManager.getClientProgress(session.playerId) as any;
         if (clientProgress) {
@@ -5507,12 +5886,11 @@ function clearGhostSeatsForUser(
 
     const seat = table.seats[otherSession.seatIndex];
     if (seat && seat.state === 'occupied' && !seat.isAI) {
-      if (table.isHandInProgress() && table.activeSeatIndex === otherSession.seatIndex) {
-        try { table.playerFold(otherSession.seatIndex); } catch {}
-      }
       // C8: return the stack to the wallet before destroying the seat.
-      creditSeatStackToWallet(otherAuth.userId, otherAuth.username, tableId, seat, 'ghost_seat_session_scan');
-      table.standUp(otherSession.seatIndex);
+      // R2 (GAME-15/16): through teardownSeat — mid-hand pot chips wait for
+      // the hand's end (they were erased), the next bot acts now.
+      teardownSeat(tableId, table, otherSession.seatIndex,
+        { userId: otherAuth.userId, username: otherAuth.username }, 'ghost_seat_session_scan');
       cleared++;
     }
     playerSessions.delete(otherSocketId);
@@ -5541,16 +5919,19 @@ function clearGhostSeatsForUser(
       // tournamentTables while the stack is already on the new table, and
       // creditSeatStackToWallet alone would then mint it. Same audit row
       // creditSeatStackToWallet writes for a tournament stack.
+      // R2 (GAME-15/16) — the stand-up itself through teardownSeat (mid-hand
+      // pot chips wait for the hand's end); a tournament reservation is
+      // audited here and credited nothing (`who` null).
       if (isTournamentReservation(reserved)) {
         if ((rSeat.chipCount || 0) > 0) {
           auditLog(userUsername || rSeat.playerName || '', 'TOURNAMENT_STACK_NOT_CASHED', {
             userId, tableId, reason: 'ghost_seat_reserved', chips: rSeat.chipCount,
           });
         }
+        teardownSeat(tableId, table, reserved.seatIndex, null, 'ghost_seat_reserved');
       } else {
-        creditSeatStackToWallet(userId, userUsername || rSeat.playerName || '', tableId, rSeat, 'ghost_seat_reserved');
+        teardownSeat(tableId, table, reserved.seatIndex, { userId, username: userUsername || rSeat.playerName || '' }, 'ghost_seat_reserved');
       }
-      table.standUp(reserved.seatIndex);
       cleared++;
     } else if (rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
       // AUTH-3 — the reservation is stale: someone else sits there now.
@@ -5569,11 +5950,8 @@ function clearGhostSeatsForUser(
     const s = table.seats[i];
     if (s.state !== 'occupied' || s.isAI || s.playerId !== accountPlayerId) continue;
     if (otherSessionHoldsSeat('', tableId, i)) continue;   // '': ANY live session — the caller's too
-    if (table.isHandInProgress() && table.activeSeatIndex === i) {
-      try { table.playerFold(i); } catch {}
-    }
-    creditSeatStackToWallet(userId, userUsername || s.playerName || '', tableId, s, 'ghost_seat_account_stamp');
-    table.standUp(i);
+    if (pendingSeatRemovalAfterHand.get(tableId)?.has(i)) continue;   // already leaving at the hand's end
+    teardownSeat(tableId, table, i, { userId, username: userUsername || s.playerName || '' }, 'ghost_seat_account_stamp');
     cleared++;
   }
 
@@ -5620,32 +5998,11 @@ function standUpRefusedSeat(userId: number, username: string, tableId: string, s
   if (!seat || seat.state !== 'occupied' || seat.isAI) return;
   if (pendingSeatRemovalAfterHand.get(tableId)?.has(seatIndex)) return;
 
-  const deferRemoval =
-    table.isHandInProgress() &&
-    !seat.folded &&
-    (seat.totalInvestedThisHand || 0) > 0;
-  if (deferRemoval) {
-    let m = pendingSeatRemovalAfterHand.get(tableId);
-    if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(tableId, m); }
-    m.set(seatIndex, { userId, username });
-  }
-  if (table.isHandInProgress()) {
-    if (table.activeSeatIndex === seatIndex) table.playerFold(seatIndex);
-    else if (deferRemoval) table.forceFoldSeat(seatIndex);
-  }
-
+  // R2 (GAME-15 / GAME-16) — the ONE teardown: chips in a live pot (a FOLDED
+  // seat's too) wait for the hand's end, the next bot acts now.
   const tracker = sitOutTracker.get(tableId);
   if (tracker) tracker.delete(seatIndex);
-  if (!deferRemoval) {
-    // Re-read: the fold above may have ended the hand.
-    const s = table.seats[seatIndex];
-    if (s && s.state === 'occupied' && !s.isAI) {
-      s.deadBlindOwedChips = 0;
-      s.missedBlind = 'none';
-      creditSeatStackToWallet(userId, username, tableId, s, reason);
-      table.standUp(seatIndex);
-    }
-  }
+  teardownSeat(tableId, table, seatIndex, { userId, username }, reason);
   syncSitOutToTable(tableId);
   broadcastGameState(tableId);
 }
@@ -6444,6 +6801,35 @@ function tableKindOf(tableId: string): TableKind {
  * chips). Per-player game state key `rebuyAllowed`, always present.
  */
 function rebuyAllowedAt(tableId: string): boolean {
+  const kind = tableKindOf(tableId);
+  return (kind === 'cash' || kind === 'private' || kind === 'club') && !challengeTables.has(tableId);
+}
+
+/**
+ * 2026-10-11 (.online R2, GAME-12 / contract C11 `canBombPot`) — may this table
+ * run a bomb pot? Only a ring game (cash / private / club — never a tournament,
+ * a quick table or a club challenge) of Texas Hold'em or Omaha: a bomb pot is
+ * "everyone antes, deal the flop", and Short Deck / Pineapple / Stud / Draw
+ * tables were handed a 52-card community flop (cards Short Deck does not have,
+ * a board Stud and Draw do not use, Pineapple's discard skipped). triggerBombPot
+ * refuses elsewhere (`bomb_pot_not_allowed`) and activateBombPotIfPending drops
+ * a pending one (a private table created with the option on another variant).
+ */
+function bombPotAllowedAt(tableId: string, table: PokerTable): boolean {
+  const kind = tableKindOf(tableId);
+  if (!(kind === 'cash' || kind === 'private' || kind === 'club') || challengeTables.has(tableId)) return false;
+  return isPlainHoldemTable(table) || table instanceof OmahaTable;
+}
+
+/**
+ * R2 (contract C11 `isFirstActor`) — may a straddle be posted at this table at
+ * all? Ring games only (cash / private / club, never a club challenge): no
+ * straddle at a tournament table (it would change the structure everyone
+ * registered for) nor at a quick table (all-in-or-fold allows only fold /
+ * all-in; heads-up formats have no UTG). PokerTable.canStraddle decides the
+ * moment (pre-flop, first to act, nobody acted, 3+ dealt in, affordable).
+ */
+function straddleAllowedAt(tableId: string): boolean {
   const kind = tableKindOf(tableId);
   return (kind === 'cash' || kind === 'private' || kind === 'club') && !challengeTables.has(tableId);
 }
@@ -7561,7 +7947,10 @@ io.on('connection', (socket: Socket) => {
       state.spectatorCount = specSet.size;
       state.tournamentStatus = tournamentManager.getTournamentStatus(data.tournamentId);
       state.tournamentTableIds = tournament.tableIds;
-      emitGameState(socket, state);
+      // R2 (TABLEUI-11 / contract C11) — a FULL state: a delta against the
+      // socket's previous table baseline left the client with a fragment
+      // (no isSpectator, no blinds, …).
+      emitGameState(socket, state, true);
     }
 
     socket.emit('spectatingTournament', {
@@ -7605,7 +7994,8 @@ io.on('connection', (socket: Socket) => {
       state.isSpectator = true;
       state.tournamentStatus = tournamentManager.getTournamentStatus(data.tournamentId);
       state.tournamentTableIds = tournament.tableIds;
-      emitGameState(socket, state);
+      // R2 (TABLEUI-11 / contract C11) — next / prev is a different table: always a FULL state.
+      emitGameState(socket, state, true);
     }
 
     socket.emit('spectatingTournament', {
@@ -10491,29 +10881,18 @@ Give feedback in this JSON format:
             break;
           }
         }
-        // If no empty seat, try taking an AI seat
+        // If no empty seat, try taking an AI seat — R2 (GAME-15): never one in
+        // the hand being played (its pot chips were erased with it).
+        if (seatIndex === -1) seatIndex = takeAiSeatForJoin(table, tableId);
         if (seatIndex === -1) {
-          for (let i = 0; i < MAX_SEATS; i++) {
-            if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
-              table.standUp(i);
-              const profiles = aiProfiles.get(tableId);
-              if (profiles) profiles.delete(i);
-              seatIndex = i;
-              break;
-            }
-          }
-        }
-        if (seatIndex === -1) {
-          socket.emit('error', { message: 'No seats available' });
+          socket.emit('error', { message: 'No seats available', code: 'no_seat_available' });
           return;
         }
       }
 
-      // If chosen seat is occupied by AI, remove the AI first
-      if (
-        table.seats[seatIndex].state === 'occupied' &&
-        table.seats[seatIndex].isAI
-      ) {
+      // If chosen seat is occupied by AI, remove the AI first (R2: only a bot
+      // not in the hand in progress — else sitDown below refuses the seat).
+      if (aiSeatTakeableNow(table, seatIndex)) {
         table.standUp(seatIndex);
         const profiles = aiProfiles.get(tableId);
         if (profiles) profiles.delete(seatIndex);
@@ -10715,17 +11094,8 @@ Give feedback in this JSON format:
         for (let i = 0; i < MAX_SEATS; i++) {
           if (table.seats[i].state === 'empty') { targetSeat = i; break; }
         }
-        if (targetSeat === -1) {
-          for (let i = 0; i < MAX_SEATS; i++) {
-            if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
-              table.standUp(i);
-              const profiles = aiProfiles.get(candidate.tableId);
-              if (profiles) profiles.delete(i);
-              targetSeat = i;
-              break;
-            }
-          }
-        }
+        // R2 (GAME-15) — an AI seat only when it is not in the hand being played.
+        if (targetSeat === -1) targetSeat = takeAiSeatForJoin(table, candidate.tableId);
         if (targetSeat === -1) continue;
         // Re-check right before commit — if another call has already claimed
         // this seat since we found it, try the next table.
@@ -12734,17 +13104,8 @@ Give feedback in this JSON format:
             break;
           }
         }
-        if (targetSeat === -1) {
-          for (let i = 0; i < MAX_SEATS; i++) {
-            if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
-              table.standUp(i);
-              const profiles = aiProfiles.get(bestTable.tableId);
-              if (profiles) profiles.delete(i);
-              targetSeat = i;
-              break;
-            }
-          }
-        }
+        // R2 (GAME-15) — an AI seat only when it is not in the hand being played.
+        if (targetSeat === -1) targetSeat = takeAiSeatForJoin(table, bestTable.tableId);
         if (targetSeat === -1) {
           failWaitlist('handler_exception', 'No seats available', { stage: 'no_seats' });
           return;
@@ -13425,14 +13786,22 @@ Give feedback in this JSON format:
     }
 
     const drawTable = table as FiveCardDrawTable;
-    const success = drawTable.playerDraw(session.seatIndex, data.discardIndices || []);
+    // R2 (GAME-6) — the engine refuses a draw outside a draw round, by a seat
+    // not dealt in, or with anything but whole-number card indices.
+    const discards = data?.discardIndices == null ? [] : data.discardIndices;   // none = stand pat
+    const success = drawTable.playerDraw(session.seatIndex, discards);
 
     if (!success) {
-      socket.emit('error', { message: 'Invalid draw action' });
+      socket.emit('error', { message: 'Invalid draw action', code: 'invalid_draw' });
       return;
     }
 
     broadcastGameState(session.tableId);
+    // 2026-10-11 (R2, GAME-5) — the human's draw may have completed the round
+    // (the bots drew first): the next betting round's first actor — or the
+    // bots' next draws — go now. Without this a bot first to act after the
+    // human's draw sat until its 30s turn clock force-checked it.
+    scheduleAIAction(session.tableId);
   });
 
   // Chat message handler
@@ -13886,8 +14255,12 @@ Give feedback in this JSON format:
     // Only authenticated (registered) players can change fast mode
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Must be logged in to change fast mode' }); return; }
-    fastModeTables.set(session.tableId, data.enabled);
-    socket.emit('fastModeSet', { enabled: data.enabled });
+    // 2026-10-11 (R2, GAME-11) — the player's OWN preference (see
+    // PlayerSession.fastMode / tableWantsFastBots): never a table-wide switch
+    // another seated player — or the client's reset on mount — flips for
+    // everyone, and never the table's admin / tournament turbo (fastModeTables).
+    session.fastMode = data?.enabled === true;
+    socket.emit('fastModeSet', { enabled: session.fastMode });
   });
 
   // ========== Post Missed Blinds (refactored 2026-04-20) ==========
@@ -14001,6 +14374,15 @@ Give feedback in this JSON format:
     // Only players seated at the table may trigger a bomb pot
     const tableId = data?.tableId || session.tableId;
     if (session.tableId !== tableId) return;
+    // 2026-10-11 (R2, GAME-12 / C11) — Hold'em / Omaha ring tables only (the
+    // state's `canBombPot` says so; the button hides elsewhere). Refused before
+    // the cooldown is spent.
+    const bombTable = tableManager.getTable(tableId);
+    if (!bombTable || !bombPotAllowedAt(tableId, bombTable)) {
+      bombPotStats.refusedAtTrigger++;
+      socket.emit('error', { message: 'Bomb pots are only available at Hold\'em and Omaha cash tables.', code: 'bomb_pot_not_allowed' });
+      return;
+    }
 
     // 2026-06-11 audit M1: rate-limit bomb pots so a seated griefer can't force
     // 2×BB antes every hand on a public cash table. One per 5 min per table.
@@ -14920,6 +15302,12 @@ Give feedback in this JSON format:
     if (!session) return;
     const table = tableManager.getTable(session.tableId);
     if (!table) return;
+    // 2026-10-11 (R2, GAME-12 / C11) — ring tables only: never at a tournament
+    // or a quick table (the all-in-or-fold rule was bypassed by a straddle).
+    if (!straddleAllowedAt(session.tableId)) {
+      socket.emit('error', { message: 'Straddles are only available at cash tables.', code: 'straddle_not_allowed' });
+      return;
+    }
     if (table.straddle(session.seatIndex)) {
       broadcastGameState(session.tableId);
       scheduleAIAction(session.tableId);
@@ -15252,21 +15640,11 @@ Give feedback in this JSON format:
       return;
     }
 
-    // Find empty seat
-    let targetSeat = -1;
-    for (let i = 0; i < MAX_SEATS; i++) {
-      if (table.seats[i].state === 'empty') {
-        targetSeat = i;
-        break;
-      }
-      if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
-        table.standUp(i);
-        const profiles = aiProfiles.get(tableId);
-        if (profiles) profiles.delete(i);
-        targetSeat = i;
-        break;
-      }
-    }
+    // Find empty seat — R2 (GAME-15): an empty seat FIRST (this loop used to
+    // take whichever came first, a bot at seat 0 before an empty seat 5), and
+    // an AI seat only when it is not in the hand being played.
+    let targetSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < table.maxOccupiableSeats);
+    if (targetSeat === -1) targetSeat = takeAiSeatForJoin(table, tableId);
 
     if (targetSeat === -1) {
       socket.emit('error', { message: 'No seats available' });
@@ -15366,48 +15744,11 @@ Give feedback in this JSON format:
       // credit, DESTROYING the player's entire buy-in on this secondary table
       // (joinAdditionalTable deducted it at sit-down), and removed a live seat
       // mid-hand (erasing its pot contribution → short-paying the winner).
-      // Mirror handlePlayerLeave's defer-vs-credit decision exactly.
-      const deferRemoval =
-        table.isHandInProgress() &&
-        !!leavingSeat &&
-        leavingSeat.state === 'occupied' &&
-        !leavingSeat.isAI &&
-        !leavingSeat.folded &&
-        (leavingSeat.totalInvestedThisHand || 0) > 0;
-
-      // 2026-07-01 audit #7: register the deferred-removal entry BEFORE folding.
-      // A fold that ends the hand (heads-up on this table) runs
-      // processPendingSeatRemovals SYNCHRONOUSLY inside playerFold; if the entry
-      // isn't registered yet it's missed and the stack is stranded on a
-      // occupied+folded ghost seat (worse: the next startNewHand treats it as a
-      // live player). Register first.
-      if (deferRemoval && auth) {
-        let m = pendingSeatRemovalAfterHand.get(session.tableId);
-        if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(session.tableId, m); }
-        m.set(session.seatIndex, { userId: auth.userId, username: auth.username });
-      }
-
-      if (table.isHandInProgress()) {
-        if (table.activeSeatIndex === session.seatIndex) {
-          table.playerFold(session.seatIndex);
-        } else if (deferRemoval) {
-          table.forceFoldSeat(session.seatIndex);
-        }
-      }
-
-      if (deferRemoval) {
-        // Entry registered above. If the fold already ended the hand,
-        // processPendingSeatRemovals credited + stood up the seat already.
-        if (!auth && table.seats[session.seatIndex]?.state === 'occupied') {
-          // No auth to credit (shouldn't happen) — tear down rather than strand.
-          table.standUp(session.seatIndex);
-        }
-      } else {
-        // Between hands / folded / no committed chips: credit the stack back to
-        // the wallet now (tournament-safe helper skips tournament stacks), then
-        // stand up.
-        if (auth) creditSeatStackToWallet(auth.userId, auth.username, session.tableId, leavingSeat, 'leave_additional_table');
-        table.standUp(session.seatIndex);
+      // R2 (GAME-15 / GAME-16): the ONE teardown — a FOLDED seat's pot chips
+      // are kept too, an all-in keeps its hand, the next bot acts now.
+      if (leavingSeat && leavingSeat.state === 'occupied' && !leavingSeat.isAI) {
+        teardownSeat(session.tableId, table, session.seatIndex,
+          auth ? { userId: auth.userId, username: auth.username } : null, 'leave_additional_table');
       }
       broadcastGameState(session.tableId);
     }
@@ -15696,13 +16037,12 @@ Give feedback in this JSON format:
 
     // Send full state to the joining player (force full on join/reconnect)
     emitGameState(socket, getGameStateForPlayer(table, openSeat), true);
-    // Broadcast to all other players at the table using delta compression
-    for (const [sid, sess] of playerSessions) {
-      if (sess.tableId === tableId && sid !== socket.id) {
-        const peerSocket = io.sockets.sockets.get(sid);
-        if (peerSocket) emitGameState(peerSocket, getGameStateForPlayer(table, -1));
-      }
-    }
+    // R2 (GAME P3) — every other player at the table gets HIS OWN view
+    // (broadcastGameState: his seat, his cards, his keys). This used to push
+    // the SPECTATOR view (seat -1, no hole cards) to every seated peer: their
+    // cards vanished and their client merged yourSeat -1 into its state.
+    broadcastGameState(tableId);
+    scheduleAIAction(tableId);
   });
 
   // ── Coach whisper (relay from coach to student) ───────────────────────
@@ -15926,7 +16266,9 @@ function creditSeatStackToWallet(
   // wallet credit. F2 (2026-10-10): a table a rebalance just BROKE is still a
   // tournament table (its stacks are already on the target tables).
   if (isTournamentTable(tableId)) {
-    auditLog(username, 'TOURNAMENT_STACK_NOT_CASHED', { userId, tableId, reason, chips });
+    // R2 (2026-10-11): `amount` too — the row a leave wrote itself before the
+    // seat teardown became one helper (teardownSeat) carried that key.
+    auditLog(username, 'TOURNAMENT_STACK_NOT_CASHED', { userId, tableId, reason, chips, amount: chips });
     return;
   }
   addChipsToUser(userId, chips)
@@ -15982,6 +16324,24 @@ function reserveSeatForDeparture(
   // Cancel any existing reservation for this user first
   const existing = reservedSeats.get(authSession.userId);
   if (existing) clearTimeout(existing.cleanupTimer);
+  // 2026-10-11 (R2, APPUI-21) — reservations are kept per user AND seat: a
+  // second departure of the same account (another device, another table) used
+  // to OVERWRITE the first reservation — its timer cancelled, its seat left
+  // occupied with no reservation, its stack never cashed out. The displaced
+  // reservation is now ENDED properly first, exactly as its own expiry would
+  // end it: a cash seat is credited and stood up (at the hand's end if its
+  // chips are in a live pot), a tournament seat stays in play, absent (T1 —
+  // never credited; Return still finds it by account).
+  if (existing && (existing.tableId !== session.tableId || existing.seatIndex !== session.seatIndex)) {
+    reservedSeats.delete(authSession.userId);
+    reservationsDisplaced.count++;
+    if (isTournamentReservation(existing)) {
+      noteTournamentReservationNotCashed(authSession.userId, authSession.username, existing, 'reserve_displaced');
+    } else {
+      const returned = endCashReservation(authSession.userId, authSession.username, existing, 'reserve_displaced');
+      console.log(`[Reserve] ${JSON.stringify({ event: 'reservation_displaced_settled', userId: authSession.userId, tableId: existing.tableId, seatIndex: existing.seatIndex, returned })}`);
+    }
+  }
 
   const cleanupTimer = setTimeout(() => {
     const reserved = reservedSeats.get(authSession.userId);
@@ -15995,24 +16355,13 @@ function reserveSeatForDeparture(
         reservedSeats.delete(authSession.userId);
         return;
       }
-      const t = tableManager.getTable(reserved.tableId);
-      const seatNow = t?.seats?.[reserved.seatIndex];
-      const chipsToReturn = seatNow?.chipCount ?? reserved.chips ?? 0;
-      // Credit the at-table stack back to the wallet before
-      // the seat is torn down. Otherwise the chips vanish.
-      if (chipsToReturn > 0) {
-        addChipsToUser(authSession.userId, chipsToReturn).catch((e: any) =>
-          console.warn(`[Reserve expiry cash-out ${authSession.userId}]`, e?.message)
-        );
-      }
-      // Clean the sit-out tracker so the NEXT occupant of this
-      // seat doesn't inherit a stale sitting-out flag (root cause
-      // of recurring "missed blinds" popup on a fresh sit-down).
-      const tr = sitOutTracker.get(reserved.tableId);
-      if (tr) tr.delete(reserved.seatIndex);
-      if (t) t.standUp(reserved.seatIndex);
-      syncSitOutToTable(reserved.tableId);
+      // Credit the at-table stack back to the wallet before the seat is torn
+      // down (R2: endCashReservation → teardownSeat — audited; mid-hand the
+      // stand-up waits for the hand's end, the pot keeping every chip; the
+      // sit-out tracker is cleaned so the NEXT occupant of this seat doesn't
+      // inherit a stale sitting-out flag).
       reservedSeats.delete(authSession.userId);
+      const chipsToReturn = endCashReservation(authSession.userId, authSession.username, reserved, 'reserve_expiry');
       console.log(`[Reserve] Seat reservation expired for user ${authSession.userId} (returned ${chipsToReturn} chips)`);
     }
   }, SEAT_RESERVE_MS);
@@ -16092,14 +16441,13 @@ function cashOutAdditionalSeatsOnDeparture(socket: Socket, authSession: SocketAu
     for (const ms of multiD) {
       const mt = tableManager.getTable(ms.tableId);
       if (mt) {
-        if (mt.isHandInProgress() && mt.activeSeatIndex === ms.seatIndex) {
-          try { mt.playerFold(ms.seatIndex); } catch {}
-        }
+        // R2 (GAME-15) — through teardownSeat: chips in a live pot wait for
+        // that hand's end (the immediate stand-up erased them from the pot).
         const mSeat = mt.seats[ms.seatIndex];
         if (mSeat && mSeat.state === 'occupied' && !mSeat.isAI) {
-          if (authSession) creditSeatStackToWallet(authSession.userId, authSession.username, ms.tableId, mSeat, reason);
+          teardownSeat(ms.tableId, mt, ms.seatIndex,
+            authSession ? { userId: authSession.userId, username: authSession.username } : null, reason);
         }
-        mt.standUp(ms.seatIndex);
       }
       socket.leave(`table:${ms.tableId}`);
       broadcastGameState(ms.tableId);
@@ -16395,6 +16743,7 @@ function keepTournamentSeatOnLeave(
       const owed = table.currentBetToMatch - (seat.currentBet || 0);
       if (!(owed <= 0 && table.playerCheck(session.seatIndex))) table.playerFold(session.seatIndex);
       broadcastGameState(session.tableId);
+      scheduleAIAction(session.tableId);   // R2 (GAME-16) — the next bot acts now, not after its 30s clock
     }
   } finally {
     keepingTournamentSeatOnLeave.delete(socket.id);
@@ -17155,49 +17504,6 @@ function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKi
   // choice: suspended, account switch, disconnect fall-through, after an
   // admin removal's disqualification — kept unflagged and untold).
   if (table && !keepTournamentSeatOnLeave(socket, session, table, tournamentSeat)) {
-    // 2026-06-11 audit C7: decide whether this seat's teardown must be
-    // DEFERRED to hand-end. If the player is leaving mid-hand while still
-    // holding chips in the live pot (totalInvestedThisHand > 0, not folded),
-    // an immediate standUp would erase their pot contribution (calculatePots
-    // only sees occupied seats) and short-pay the winner. In that case we
-    // fold them now (dead money stays in the pot) and keep the seat until
-    // the hand resolves; processPendingSeatRemovals() does the credit+standUp.
-    const leavingSeatEarly = table.seats[session.seatIndex];
-    const deferRemoval =
-      table.isHandInProgress() &&
-      !!leavingSeatEarly &&
-      leavingSeatEarly.state === 'occupied' &&
-      !leavingSeatEarly.isAI &&
-      !leavingSeatEarly.folded &&
-      (leavingSeatEarly.totalInvestedThisHand || 0) > 0;
-
-    // 2026-07-01 audit #7: register the deferred-removal entry BEFORE folding.
-    // If the fold ends the hand (heads-up, or last live opponent), playerFold
-    // runs determineWinners → handResult → processPendingSeatRemovals()
-    // SYNCHRONOUSLY inside the fold call. If the entry isn't registered yet it
-    // is missed, and the seat's stack is stranded (occupied+folded, never
-    // credited, never stood up) on a table that may never see another
-    // handResult — lost on the next redeploy. Registering first means the
-    // synchronous teardown credits + stands it up immediately.
-    const authForDefer = authSessions.get(socket.id);
-    if (deferRemoval && authForDefer) {
-      let m = pendingSeatRemovalAfterHand.get(session.tableId);
-      if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(session.tableId, m); }
-      m.set(session.seatIndex, { userId: authForDefer.userId, username: authForDefer.username });
-    }
-
-    // Fold first if the hand is live. Active seat → playerFold (advances the
-    // turn). Non-active deferred leaver → forceFoldSeat (mark folded WITHOUT
-    // advancing, so the real actor keeps the action and the table doesn't
-    // wedge waiting on a gone player).
-    if (table.isHandInProgress()) {
-      if (table.activeSeatIndex === session.seatIndex) {
-        table.playerFold(session.seatIndex);
-      } else if (deferRemoval) {
-        table.forceFoldSeat(session.seatIndex);
-      }
-    }
-
     // Clear sit-out tracker + any dead-blind debt on the vacated seat
     // before standing up. Without this, the NEXT occupant of this seat
     // index inherits stale missed-blind state — the exact "first hand
@@ -17213,88 +17519,22 @@ function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKi
     }
     syncSitOutToTable(session.tableId);
 
-    // CRITICAL: credit the at-table stack back to the user's wallet
-    // before standUp clears it. deductChips() took the buy-in at sit-
-    // down time; if we standUp without crediting, those chips vanish.
-    //
-    // Refund failures MUST be auditable — previously this only `console.warn`d
-    // and the chips vanished silently. Now we auditLog(FAILED) so an operator
-    // can manually reconcile from the audit trail. Still fire-and-forget
-    // because we can't block the user's standUp on a DB retry loop — but
-    // the failure is permanently recorded.
-    if (deferRemoval) {
-      // C7: the committed chips stay in the pot until the hand resolves. The
-      // pending-removal entry was registered BEFORE the fold above (#7), so if
-      // the fold already ended the hand, processPendingSeatRemovals() has
-      // credited + stood the seat up already (it is now 'empty'). If the hand
-      // is still live, the entry waits for the next handResult.
-      if (!authForDefer && table.seats[session.seatIndex]?.state === 'occupied') {
-        // No auth to credit (shouldn't happen for a seated player) — fall
-        // back to immediate teardown rather than stranding the seat forever.
-        table.standUp(session.seatIndex);
-      }
-      broadcastGameState(session.tableId);
-    } else {
-      const auth = authSessions.get(socket.id);
-      const chipsToReturn = leavingSeat?.chipCount || 0;
-      // 2026-06-11 audit (tournament economy): do NOT cash out a tournament-
-      // table stack — it's tournament chips, not wallet-funded. Crediting it
-      // mints chips / lets a player extract chips still in play. See the same
-      // guard in creditSeatStackToWallet. Prizes are paid by finish position.
-      // F2: incl. a table a rebalance just broke (session not moved — the stack is already on the target table).
-      const isTournamentSeat = isTournamentTable(session.tableId);
-      if (isTournamentSeat && auth && chipsToReturn > 0) {
-        auditLog(auth.username, 'TOURNAMENT_STACK_NOT_CASHED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, reason: 'handlePlayerLeave' });
-      }
-      if (auth && chipsToReturn > 0 && !isTournamentSeat) {
-        addChipsToUser(auth.userId, chipsToReturn)
-          .then((ok) => {
-            if (!ok) {
-              console.error(`[handlePlayerLeave] addChipsToUser returned false for userId=${auth.userId}, amount=${chipsToReturn}`);
-              auditLog(auth.username, 'CASH_OUT_FAILED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, reason: 'addChipsToUser_returned_false' });
-            } else {
-              auditLog(auth.username, 'CASH_OUT', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn });
-            }
-          })
-          .catch((e: any) => {
-            console.error(`[handlePlayerLeave cash-out ${auth.userId}] amount=${chipsToReturn}`, e?.message || e);
-            if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.cashOut' }, extra: { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn } });
-            auditLog(auth.username, 'CASH_OUT_FAILED', { userId: auth.userId, tableId: session.tableId, amount: chipsToReturn, error: String(e?.message || e) });
-          });
-      }
+    // 2026-10-11 (R2, GAME-15 / GAME-16) — THE seat teardown (teardownSeat):
+    // chips in a live pot (folded or not) → the stand-up waits for the hand's
+    // end (audit C7 / #7, now for a FOLDED leaver too — his blind or call used
+    // to vanish from the pot); an all-in leaver keeps his hand (Addendum);
+    // otherwise credited (never a tournament stack — creditSeatStackToWallet,
+    // which audits both) and stood up now; the next bot acts at once.
+    const auth = authSessions.get(socket.id);
+    teardownSeat(session.tableId, table, session.seatIndex, auth ? { userId: auth.userId, username: auth.username } : null, 'handlePlayerLeave');
 
-      table.standUp(session.seatIndex);
-
-      // Check if any human players remain
-      const humanCount = table.seats.filter(
-        (s) => s.state === 'occupied' && !s.isAI
-      ).length;
-
-      if (humanCount === 0) {
-        // Remove all AI players
-        for (let i = 0; i < MAX_SEATS; i++) {
-          if (table.seats[i].state === 'occupied' && table.seats[i].isAI) {
-            table.standUp(i);
-          }
-        }
-        aiProfiles.delete(session.tableId);
-
-        // Clear any AI timeouts
-        const timeoutKey = session.tableId;
-        if (aiTimeouts.has(timeoutKey)) {
-          clearTimeout(aiTimeouts.get(timeoutKey)!.handle);
-          aiTimeouts.delete(timeoutKey);
-        }
-        // Cancel any pending auto-start hand timer — table is empty
-        const pendingStart = pendingAutoStartTimers.get(session.tableId);
-        if (pendingStart) {
-          clearTimeout(pendingStart);
-          pendingAutoStartTimers.delete(session.tableId);
-        }
-      } else {
-        broadcastGameState(session.tableId);
-      }
-    }
+    // GAME-17 — the last human gone: the bots go too, but only between hands
+    // (a seat still waiting for the hand's end is leaving — not a human staying).
+    const pendingHere = pendingSeatRemovalAfterHand.get(session.tableId);
+    const humansStaying = table.seats.some((s) => s.state === 'occupied' && !s.isAI && !pendingHere?.has(s.seatIndex));
+    if (!humansStaying) stripBotsWhenNoHumans(session.tableId, table);
+    if (!humansStaying && pendingHere && pendingHere.size > 0) botStripAfterHand.add(session.tableId);
+    broadcastGameState(session.tableId);
 
     socket.leave(`table:${session.tableId}`);
   }
@@ -17321,20 +17561,16 @@ function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKi
     for (const ms of multiSessions) {
       const mt = tableManager.getTable(ms.tableId);
       if (mt) {
-        if (mt.isHandInProgress() && mt.activeSeatIndex === ms.seatIndex) {
-          mt.playerFold(ms.seatIndex);
-        }
         // 2026-06-11 audit C9: credit the additional-table stack back to the
-        // wallet before teardown. joinAdditionalTable deducts a real buy-in
-        // for each extra seat; the old code stood these seats up WITHOUT
-        // crediting, so a multi-tabling player silently LOST every
-        // additional-table stack on leave (only the main seat was cashed
-        // out). Mirrors handlePlayerLeave's main-seat cash-out.
+        // wallet before teardown (joinAdditionalTable deducts a real buy-in).
+        // R2 (GAME-15/16): through teardownSeat — mid-hand chips in the pot
+        // wait for that hand's end (they were erased), the next bot acts now.
         const mSeat = mt.seats[ms.seatIndex];
-        if (authForMulti && mSeat && mSeat.state === 'occupied' && !mSeat.isAI) {
-          creditSeatStackToWallet(authForMulti.userId, authForMulti.username, ms.tableId, mSeat, 'additional_table_leave');
+        if (mSeat && mSeat.state === 'occupied' && !mSeat.isAI) {
+          teardownSeat(ms.tableId, mt, ms.seatIndex,
+            authForMulti ? { userId: authForMulti.userId, username: authForMulti.username } : null, 'additional_table_leave');
         }
-        mt.standUp(ms.seatIndex);
+        broadcastGameState(ms.tableId);
       }
       socket.leave(`table:${ms.tableId}`);
     }
@@ -18346,6 +18582,11 @@ function moveTournamentSeatPointers(
     s.seatIndex = toSeat;
     sock.leave(`table:${fromTableId}`);
     sock.join(`table:${toTableId}`);
+    // R2 (TABLEUI-11 / contract C11) — the next gameState for this socket is a
+    // FULL one: a delta against the OLD table's baseline gave the client a
+    // fragment of the new table.
+    lastSentState.delete(sid);
+    lastSentJson.delete(sid);
     sock.emit('playerMoved', { fromTable: fromTableId, toTable: toTableId, toSeat, tableId: toTableId });
     if (sid !== tp?.socketId) tournamentHandStartSafety.reconnectedSessionsMoved++;
     if (!firstLive) firstLive = sid;
