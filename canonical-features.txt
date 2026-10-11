@@ -965,7 +965,8 @@ reason: 'tournament_finished'
 # (win = multiplier x entry fee through the prize ledger; a leave forfeits; a
 # forced removal / admin close refunds the fee; its stack is never cashed), a
 # club challenge is a fixed-roster heads-up for its two players.
-if (!tournamentTables.has(tableId) && !isFixedRosterTable(tableId)) {
+# R2 merge: the bot step (reloadAndCapBotStacks, above) asks the ONE fixed-roster predicate.
+return isFixedRosterTable(tableId);
 event: 'quick_game_over'
 event: 'quick_table_no_human_cleaned'
 reason: 'quick_game_over'
@@ -1152,3 +1153,6 @@ progressRecords: progressionManager.size
 leaveSocialBracket
 # R2 (S3): a free wheel emote the shop also lists (fire, dead) is never charged for, nor won from a roll.
 function isFreeForEveryone(
+
+# 2026-10-11 (.online R2 merge) — season / leaderboard "chips won" = PUBLIC cash tables only; club tables feed club stats.
+function tableFeedsClubStats(

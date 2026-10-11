@@ -269,7 +269,8 @@ describe('GAME-17 — the heartbeat revives a HandComplete table nothing will de
     fnSrc('function trimExcessAI('),
     fnSrc('function fillWithAI('),
     fnSrc('function aiSeatsMutableNow('),
-    slice('const BOT_STACK_CAP_BUYINS = 3;', 'allInOrFoldTables.has(tableId) || challengeTables.has(tableId);\n}\n'),
+    slice('const BOT_STACK_CAP_BUYINS = 3;', '  return isFixedRosterTable(tableId);\n}\n'),
+    fnSrc('function isFixedRosterTable('),   // the merged predicate (S1) isFixedRosterQuickTable delegates to
     fnSrc('function autoStartNextHand('),
   ].join('\n');
 
@@ -320,7 +321,10 @@ describe('GAME-17 — the heartbeat revives a HandComplete table nothing will de
 });
 
 describe('GAME-18 — bot stacks are capped; fixed-roster quick tables never reload', () => {
-  const RELOAD = slice('const BOT_STACK_CAP_BUYINS = 3;', 'allInOrFoldTables.has(tableId) || challengeTables.has(tableId);\n}\n');
+  const RELOAD = [
+    slice('const BOT_STACK_CAP_BUYINS = 3;', '  return isFixedRosterTable(tableId);\n}\n'),
+    fnSrc('function isFixedRosterTable('),   // the merged predicate (S1) isFixedRosterQuickTable delegates to
+  ].join('\n');
   function reloadWorld() {
     const table = new PokerTable({ tableId: T, tableName: T, smallBlind: 50, bigBlind: 100, ante: 0, minBuyIn: 10000 } as any);
     const debug: string[] = [];

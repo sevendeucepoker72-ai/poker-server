@@ -6230,6 +6230,7 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // missions, achievements, chips won and the scratch tick are theirs alone.
   const handRef = { tableId, handNumber: table.handNumber };
   const countsForChipsWon = tableCountsForChipsWon(tableId);
+  const feedsClubStats = tableFeedsClubStats(tableId);
   const chipsWonDay = denverDateKey();
   const clubHandEntries: Array<{ userId: number; net: number; pot: number }> = [];
 
@@ -6262,15 +6263,19 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     // SQL (never last-writer-wins). NET, not the gross pot (`chipsWon` on the
     // result entries): a gross count grows by shoving back and forth with a
     // friend at no cost, a net one only by taking chips from someone.
+    // R2 merge — the season / leaderboard bucket takes PUBLIC cash hands only
+    // (tableCountsForChipsWon); a club table's hands still feed its club stats.
     const startStack = table.startChips.get(session.seatIndex);
-    if (countsForChipsWon && seat && !seat.isAI && seat.playerId === session.playerId && startStack !== undefined) {
+    if ((countsForChipsWon || feedsClubStats) && seat && !seat.isAI && seat.playerId === session.playerId && startStack !== undefined) {
       const auth = authSessions.get(session.socketId);
       const net = (seat.chipCount || 0) - startStack;
       if (auth?.userId) {
-        recordChipWins(auth.userId, chipsWonDay, net, 1)
-          .then(() => { economyStats.chipsWonWrites++; })
-          .catch((e: any) => { economyStats.chipsWonWriteFailures++; console.warn(`[chips-won ${auth.userId}]`, e?.message || e); });
-        clubHandEntries.push({ userId: auth.userId, net, pot: totalWonPerSeat.get(session.seatIndex) || 0 });
+        if (countsForChipsWon) {
+          recordChipWins(auth.userId, chipsWonDay, net, 1)
+            .then(() => { economyStats.chipsWonWrites++; })
+            .catch((e: any) => { economyStats.chipsWonWriteFailures++; console.warn(`[chips-won ${auth.userId}]`, e?.message || e); });
+        }
+        if (feedsClubStats) clubHandEntries.push({ userId: auth.userId, net, pot: totalWonPerSeat.get(session.seatIndex) || 0 });
       }
     }
 
@@ -8165,16 +8170,26 @@ function evictIdleProgress(): void {
 }
 
 /**
- * Is (tableId) a table whose hands move WALLET chips between players — the
- * only hands that count as "chips won" for the leaderboard windows and the
- * season (C9)? Cash, private and club tables. Never a tournament (tournament
- * chips are not wallet chips) or a quick game against bots (Spin & Go, career,
- * heads-up / all-in-or-fold snaps — their bot stacks are refilled).
+ * Is (tableId) a table whose hands count as "chips won" for the leaderboard
+ * windows and the season (C9) — the ranking the monthly season award PAYS?
+ * PUBLIC cash tables only (R2 merge, owner-approved anti-collusion rule): a
+ * private home game or a club table is a room of the players' own choosing,
+ * where friends can feed one account chips to buy a paid season place. Never
+ * a tournament (tournament chips are not wallet chips) or a quick game
+ * against bots (Spin & Go, career, heads-up / all-in-or-fold snaps).
  */
 function tableCountsForChipsWon(tableId: string): boolean {
   if (isTournamentTable(tableId)) return false;
-  const kind = tableKindOf(tableId);
-  return kind === 'cash' || kind === 'private' || kind === 'club';
+  return tableKindOf(tableId) === 'cash';
+}
+
+/**
+ * CLUBS P3 — does a hand here feed the club's own stats / XP (recordClubHand,
+ * which also checks clubTableIds)? A club's tables — counted for the club's
+ * leaderboard even though they no longer count toward the season (above).
+ */
+function tableFeedsClubStats(tableId: string): boolean {
+  return !isTournamentTable(tableId) && tableKindOf(tableId) === 'club';
 }
 
 /**

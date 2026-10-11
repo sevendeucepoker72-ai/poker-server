@@ -53,6 +53,8 @@ const H = {
 };
 const LEAVE = fnSrc('function handlePlayerLeave(');
 const AUTOSTART = fnSrc('function autoStartNextHand(');
+// R2 merge (S2, GAME-18): autoStartNextHand's bot step (reload + cap) asks the fixed-roster predicate.
+const BOT_STACKS = slice('const BOT_STACK_CAP_BUYINS = 3;', '  return isFixedRosterTable(tableId);\n}\n');
 const IS_TOURNAMENT_RESERVATION = fnSrc('function isTournamentReservation(');
 // R2 (CLUBS-4): joinClubTable finds (or re-creates) the club table's runtime table.
 const CLUB_RUNTIME = slice('const clubTablesRecreating = new Map', '\n  return job;\n}\n');
@@ -150,6 +152,7 @@ ${RETIRE}
 ${IS_TOURNAMENT_RESERVATION}
 ${CLUB_RUNTIME}
 ${LEAVE}
+${BOT_STACKS}
 ${AUTOSTART}
 function wire(socket) {
   ${Object.values(H).join('\n  ')}
@@ -752,6 +755,8 @@ describe('wiring — every quick format registers its end; the challenge table i
     expect(H.joinTable).toContain('if (challengeTables.has(tableId)) buyIn = table.config.minBuyIn;');
   });
   it("autoStartNextHand's AI reload skips fixed-roster tables (the predicate S2's loop calls)", () => {
-    expect(AUTOSTART).toContain('if (!tournamentTables.has(tableId) && !isFixedRosterTable(tableId)) {');
+    // R2 merge: S2's capped bot step, with the one fixed-roster predicate.
+    expect(AUTOSTART).toContain('reloadAndCapBotStacks(table, tableId, isFixedRosterQuickTable(tableId));');
+    expect(BOT_STACKS).toContain('function isFixedRosterQuickTable(tableId: string): boolean {\n  return isFixedRosterTable(tableId);\n}');
   });
 });
