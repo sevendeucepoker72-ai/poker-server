@@ -10677,7 +10677,7 @@ Give feedback in this JSON format:
       // cash buy-in there is treated as a tournament stack and never cashed out
       // — and Quick Play prefers the emptiest tables, which often ARE
       // tournament tables.
-      const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId));
+      const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId) && tableKindOf(t.tableId) === 'cash'); // R1 review: public cash tables only (never a Spin & Go / heads-up / AoF / career / private / club table) — locked by tests/r1ReviewFixes.test.ts
 
       // Quick Play prefers Texas Hold'em tables. Sort: holdem first,
       // then by player count, then by smallest blinds.
@@ -12702,7 +12702,7 @@ Give feedback in this JSON format:
         if (existingSession) handlePlayerLeave(socket);
         // P5 (2026-10-10) — a waitlist seat is a CASH buy-in: never a tournament
         // table (live or just broken) — its stack would never be cashed out.
-        const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId));
+        const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId) && tableKindOf(t.tableId) === 'cash'); // R1 review: public cash tables only (never a Spin & Go / heads-up / AoF / career / private / club table) — locked by tests/r1ReviewFixes.test.ts
         // 2026-10-11 (.online R1 review R1REV-2 / audit GAME-13) — the old test
         // read the live instance's variantId and accepted only '' or
         // 'texas-holdem', but every base PokerTable (Beginner's Table, Shark

@@ -120,6 +120,15 @@ function world(opts: { handlers?: Partial<typeof H>; tournament?: 'buyin' | 'qua
     tournamentManager: tm,
     spectators: new Map(), aiProfiles: new Map(), ipSeatedSlots: new Map(), quickTables: new Set(), quickGameTimers: new Map(),
     spinGoMultipliers: new Map(), allInOrFoldTables: new Set(), careerTables: new Map(), challengeTables: new Map(),
+    // R1 review (2026-10-11): quickPlay + the waitlist link keep only tableKindOf(...) === 'cash'.
+    // Mirrors index.ts tableKindOf's precedence over this harness's own sets.
+    tableKindOf: (id: string) => (tournamentTables.has(id) ? 'tournament'
+      : (scope.spinGoMultipliers as Map<string, unknown>).has(id) ? 'spingo'
+      : (scope.careerTables as Map<string, unknown>).has(id) ? 'career'
+      : (scope.allInOrFoldTables as Set<string>).has(id) ? 'aof'
+      : (scope.quickTables as Set<string>).has(id) ? 'headsup'
+      : (scope.challengeTables as Map<string, unknown>).has(id) ? 'club'
+      : 'cash'),
     MAX_SEATS: 9, clientIp: '10.0.0.1', SEAT_RESERVE_MS: 6 * 3600_000,
     io: { emit() {}, to: () => ({ emit() {} }), sockets: { sockets } },
     uuidv4: () => `u${Math.random().toString(36).slice(2, 10)}`,

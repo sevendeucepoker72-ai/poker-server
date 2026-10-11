@@ -46,6 +46,21 @@ describe('R1 review fixes', () => {
     expect(INDEX).not.toMatch(/return !id \|\| id === 'texas-holdem';/);
   });
 
+  test('R1REV-2b: the waitlist link AND quickPlay only ever consider PUBLIC CASH tables (never a stranger\'s Spin & Go / heads-up / AoF / career / private / club table)', () => {
+    // The re-verification (r1review/driver_wl2.cjs) seated a waitlist player into
+    // another player's running Spin & Go (10/20 beats Beginner's 25/50 on "lowest
+    // small blind") and into a private 5/10 home game. Both candidate lists must
+    // keep only tableKindOf(...) === 'cash'.
+    const filter = "const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId) && tableKindOf(t.tableId) === 'cash');";
+    expect(INDEX.split(filter).length - 1).toBe(2);
+    expect(INDEX).not.toMatch(/const tables = tableManager\.getTableList\(\)\.filter\(\(t\) => !isTournamentTable\(t\.tableId\)\);/);
+    // tableKindOf maps every non-public kind away from 'cash'
+    const kindFn = INDEX.slice(INDEX.indexOf('function tableKindOf('), INDEX.indexOf("return 'cash';", INDEX.indexOf('function tableKindOf(')));
+    for (const set of ['spinGoMultipliers', 'careerTables', 'allInOrFoldTables', 'quickTables', 'challengeTables', 'clubTableIds', 'privateTableIds']) {
+      expect(kindFn).toContain(`${set}.has(tableId)`);
+    }
+  });
+
   test('R1REV-2: the real TableManager lists Hold\'em cash tables under that predicate', () => {
     const tm = new TableManager();
     const list = tm.getTableList();
