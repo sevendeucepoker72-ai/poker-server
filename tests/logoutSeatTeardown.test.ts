@@ -194,6 +194,8 @@ function harness(opts: HarnessOpts = {}) {
     quickTables: new Set(), lastEmoteTime: new Map(), lastReactionTime: new Map(), lastChatTime: new Map(),
     lastSentState: new Map(), lastSentJson: new Map(), MAX_SEATS: 9, SEAT_RESERVE_MS, DISCONNECT_HANDS_LIMIT: HANDS_LIMIT,
     syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {},
+    // R2 (S1): the Spin & Go (prize format) helpers the leave / reservation paths ask.
+    isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false,
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
     auditLog: (actor: string, action: string, details: Record<string, unknown>) => { audits.push([actor, action, details]); },
     saveProgress: async (...a: unknown[]) => { saves.push(a); return true; },

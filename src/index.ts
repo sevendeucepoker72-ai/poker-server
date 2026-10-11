@@ -16,6 +16,8 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { computeStakingSplit } from './game/staking';
+import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
+import { createPrizeLedger, prizeLedgerStats } from './game/prizeLedger';
 import {
   connectRedis as connectHandStore,
   snapshotHand,
@@ -2102,9 +2104,13 @@ function absentSeatMasterId(localUserId: number, reserved: ReservedSeat | undefi
  * eliminates him through TournamentManager when his stack is gone — the same
  * thing the tournament rebalance does with a disconnected player: "reconnect
  * recovery will pick it up"). Checked against the snapshot AND the live map.
+ * R2 (ECON-8, S1) — a Spin & Go seat's reservation too (isPrizeFormatTable):
+ * its stack is the prize format's, never cashed out when the reservation
+ * ends; the seat plays on, absent, until the game is decided (and
+ * cleanupQuickTable ends the reservation with the table).
  */
 function isTournamentReservation(reserved: { tableId: string; tournament?: boolean }): boolean {
-  return reserved.tournament === true || isTournamentTable(reserved.tableId);
+  return reserved.tournament === true || isTournamentTable(reserved.tableId) || isPrizeFormatTable(reserved.tableId);
 }
 
 /**
@@ -2284,12 +2290,10 @@ const DEALERS_CHOICE_VARIANTS: VariantType[] = [
 
 // ========== REST Endpoints ==========
 
+// R2 (C1) — the same list as the socket's getTableList: ONLY joinable public
+// cash tables (never quick / tournament / private / club tables).
 app.get('/api/tables', (_req, res) => {
-  const tables = tableManager.getTableList().map((t) => ({
-    ...t,
-    spectatorCount: spectators.get(t.tableId)?.size || 0,
-  }));
-  res.json(tables);
+  res.json(publicTableList());
 });
 
 app.get('/api/health', async (_req, res) => {
@@ -4608,7 +4612,12 @@ function autoStartNextHand(tableId: string): void {
   //     reload collusion mint. A busted human stays at 0 and rebuys from their
   //     wallet (the rebuy handler, which deducts) or leaves. AI seats have no
   //     wallet, so a free reload only keeps the ring table populated — kept.
-  if (!tournamentTables.has(tableId)) {
+  //  3. R2 (S1, TOURNEY-6 / GAME-7 / ECON-8 / CLUBS-1) — NEVER on a FIXED-ROSTER
+  //     table (isFixedRosterTable: Spin & Go, career, heads-up, all-in-or-fold,
+  //     club challenge): a busted bot there is OUT — reloading it made a career
+  //     stage unwinnable, a Spin & Go endless and every quick-game win a cash-out
+  //     of house chips. Those games end when decided (quickGameEndCheck).
+  if (!tournamentTables.has(tableId) && !isFixedRosterTable(tableId)) {
     for (let i = 0; i < MAX_SEATS; i++) {
       const seat = table.seats[i];
       if (seat.state !== 'occupied') continue;
@@ -4872,6 +4881,10 @@ function ensureCashTableRunning(tableId: string): void {
   // Skip quick-play / heads-up tables (#5) — they have a fixed roster; the ring
   // heartbeat would backfill AI and break their 2-seat winner logic.
   if (quickTables.has(tableId)) return;
+  // R2 (C12 / GAME-4, S1) — a private home game nobody sits at is not kept
+  // running with bots (it is removed PRIVATE_TABLE_IDLE_MS after the last human
+  // leaves — sweepIdlePrivateTables); every one used to become a 24/7 bot table.
+  if (privateTableIds.has(tableId) && !tableHasHumanSeat(table)) return;
 
   // Trim excess AI FIRST so we don't flip-flop: if autoStartNextHand /
   // legacy fillWithAI packed the table to 9/9, drop back to the target
@@ -6430,10 +6443,26 @@ function tableKindOf(tableId: string): TableKind {
   if (spinGoMultipliers.has(tableId)) return 'spingo';
   if (careerTables.has(tableId)) return 'career';
   if (allInOrFoldTables.has(tableId)) return 'aof';
-  if (quickTables.has(tableId)) return 'headsup';
+  // R2 (CLUBS-1) — a club challenge table is ALSO a quick table now (fixed
+  // roster: no AI fill / reload, cleaned up like one), so it is told apart first.
   if (challengeTables.has(tableId) || clubTableIds.has(tableId)) return 'club';
+  if (quickTables.has(tableId)) return 'headsup';
   if (privateTableIds.has(tableId)) return 'private';
   return 'cash';
+}
+
+/**
+ * R2 (TOURNEY-6 / GAME-7 / ECON-8 / CLUBS-1) — a table with a FIXED roster:
+ * every quick format (Heads-Up Snap, Spin & Go, all-in-or-fold, career) and a
+ * club challenge. Its seats are exactly the ones it started with: a busted bot
+ * is NEVER reloaded (autoStartNextHand's AI-reload loop asks this — it used to
+ * reload busted bots to minBuyIn on every quick table, so a career stage could
+ * never be won, a Spin & Go never ended and every win cashed out house chips),
+ * no AI fill / trim / heartbeat backfill (quickTables), and the game ENDS when
+ * it is decided (quickGameEndCheck). Tournament tables have their own rules.
+ */
+function isFixedRosterTable(tableId: string): boolean {
+  return quickTables.has(tableId) || challengeTables.has(tableId);
 }
 
 /**
@@ -6457,6 +6486,207 @@ function rebuyRefusalAt(tableId: string): { message: string; code: 'rebuy_not_al
     code: 'rebuy_not_allowed',
   };
 }
+
+// ========== Who may sit where (R2, 2026-10-11 — contract C1 / C12) ==========
+// TOURNEY-11 / APPUI-40 / GAME-4 / R1REV-MONEY-3: the lobby's Cash Games list
+// showed EVERY table — tournament tables (finished ones too), Spin & Go /
+// career / heads-up / all-in-or-fold tables, other people's private home games
+// and club tables — and joinTable seated a stranger at any of them (a quick
+// table's fixed roster bumped a bot; a private game was open to anyone with the
+// lobby). Now:
+//   - the list (socket getTableList + REST /api/tables) carries ONLY joinable
+//     PUBLIC cash tables (`isPublicCashTable`), each with `kind:'cash'`,
+//     `seatsTaken`, `maxSeats`, `seats:[{index, occupied, name|null}]`,
+//     `phase`, `pot`, `variant`;
+//   - joinTable / joinAdditionalTable / quickPlay / the waitlist link refuse
+//     every other kind with code `table_not_joinable` (a tournament table keeps
+//     its P5 refusal, code `tournament_table`), BEFORE any side effect;
+//   - a private table is reached only through its invite code
+//     (joinByInviteCode, which finds ONLY private tables), a club table only
+//     through joinClubTable (membership-checked; it hands joinTable a grant
+//     object no client frame can carry), a club CHALLENGE table only by its two
+//     players.
+
+/** A plain cash table anyone may sit at from the lobby (not quick / tournament / private / club). */
+function isPublicCashTable(tableId: string): boolean {
+  return !!tableManager.getTable(tableId) && tableKindOf(tableId) === 'cash';
+}
+
+/** C1 — one joinable public cash table as the lobby list shows it (seat names through the public-name rules). */
+function publicTableListItem(t: { tableId: string; maxSeats: number } & Record<string, unknown>): Record<string, unknown> | null {
+  const table = tableManager.getTable(t.tableId);
+  if (!table) return null;
+  const maxSeats = Math.max(0, Math.min(MAX_SEATS, Number(t.maxSeats) || table.maxOccupiableSeats));
+  const seats: Array<{ index: number; occupied: boolean; name: string | null }> = [];
+  let seatsTaken = 0;
+  for (let i = 0; i < maxSeats; i++) {
+    const s = table.seats[i];
+    const occupied = !!s && s.state === 'occupied';
+    if (occupied) seatsTaken++;
+    seats.push({ index: i, occupied, name: occupied ? publicNameOf(s.playerName) : null });
+  }
+  return {
+    ...t,
+    kind: 'cash',
+    maxSeats,
+    seatsTaken,
+    seats,
+    phase: table.currentPhase,
+    pot: table.getTotalPot(),
+    spectatorCount: spectators.get(t.tableId)?.size || 0,
+  };
+}
+
+/** C1 — the lobby table list: ONLY joinable public cash tables (getTableList + /api/tables). */
+function publicTableList(): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const t of tableManager.getTableList()) {
+    if (!isPublicCashTable(t.tableId)) continue;
+    const item = publicTableListItem(t as any);
+    if (item) out.push(item);
+  }
+  return out;
+}
+
+const TABLE_NOT_JOINABLE_MESSAGE = 'That table is not open to join from the lobby.';
+const tableJoinRefusals = { refused: 0 };
+/**
+ * C1 — joinClubTable hands the joinTable listener a payload object it put in
+ * this set: the only way past the club-table refusal. A client frame is a fresh
+ * object socket.io parsed, so it can never be one of these.
+ */
+const clubJoinGrants = new WeakSet<object>();
+
+/**
+ * C1 — why `auth` may NOT take a seat at `tableId` through joinTable (null =
+ * he may). Tournament tables are refused before this (P5, `tournament_table`).
+ */
+function joinTableRefusalReason(tableId: string, auth: SocketAuthSession | undefined, viaClubGrant: boolean): string | null {
+  const challenge = challengeTables.get(tableId);
+  if (challenge) {
+    // A club challenge is a heads-up freezeout between its two players only.
+    return auth && (auth.userId === challenge.challengerId || auth.userId === challenge.challengedId) ? null : 'challenge_players_only';
+  }
+  const kind = tableKindOf(tableId);
+  // A tournament table is refused BEFORE this, with its own code (P5,
+  // refuseCashJoinAtTournamentTable — `tournament_table`).
+  if (kind === 'cash' || kind === 'tournament') return null;
+  if (kind === 'club') return viaClubGrant ? null : 'club_members_via_club';
+  if (kind === 'private') return 'invite_code_only';
+  return 'quick_game_table';
+}
+
+/** C1 — the refusal frame (`table_not_joinable`) on the handler's own channel. */
+function refuseTableNotJoinable(socket: Socket, via: string, tableId: string, reason: string, channel: 'error' | 'joinError' = 'error'): void {
+  tableJoinRefusals.refused++;
+  console.warn(`[join] ${JSON.stringify({ event: 'table_not_joinable', via, tableId, reason })}`);
+  socket.emit(channel, { message: TABLE_NOT_JOINABLE_MESSAGE, code: 'table_not_joinable', reason });
+}
+
+// ── Private home games (C12) ────────────────────────────────────────────────
+/** Who created a private table and when; the last moment a human sat there. */
+const privateTableMeta = new Map<string, { ownerUserId: number | null; createdAt: number; emptySince: number | null }>();
+/** C12 — a private table with no human seated for this long is removed. */
+const PRIVATE_TABLE_IDLE_MS = 10 * 60 * 1000;
+/** C12 — creation rate limit per account, and live private tables per account. */
+const privateTableCreateLimiter = createWindowRateLimiter(3, 10 * 60 * 1000);
+const MAX_LIVE_PRIVATE_TABLES_PER_ACCOUNT = 2;
+const privateTableStats = { created: 0, refusedRateLimited: 0, refusedTooMany: 0, removedIdle: 0 };
+
+/** A human holds a seat here (playing, absent, reserved or leaving after this hand). */
+function tableHasHumanSeat(table: PokerTable): boolean {
+  return table.seats.some((s) => s.state === 'occupied' && !s.isAI);
+}
+
+/** The invite code of a private table (first 8 chars of its id, upper-case). */
+function privateInviteCode(tableId: string): string {
+  return tableId.slice(0, 8).toUpperCase();
+}
+
+/** C12 — the private table an invite code opens (private tables ONLY), or null. */
+function privateTableByInviteCode(code: unknown): { tableId: string; table: PokerTable } | null {
+  if (typeof code !== 'string') return null;
+  const wanted = code.trim().toLowerCase();
+  if (!/^[0-9a-f]{8}$/.test(wanted)) return null;
+  for (const tableId of privateTableIds) {
+    if (tableId.slice(0, 8).toLowerCase() !== wanted) continue;
+    const table = tableManager.getTable(tableId);
+    if (table) return { tableId, table };
+  }
+  return null;
+}
+
+/**
+ * C12 — remove a private table nobody sits at any more: bots stood up, every
+ * session / spectator / room / timer of it ended. No human seat is left (the
+ * caller checked), so nothing is credited: there are no wallet chips on it.
+ */
+function removeIdlePrivateTable(tableId: string): void {
+  const table = tableManager.getTable(tableId);
+  if (table && tableHasHumanSeat(table)) return;   // someone sat down meanwhile
+  io.to(`table:${tableId}`).emit('tableClosed', { tableId, reason: 'private_table_idle' });
+  endTableViewsAndTimers(tableId);
+  if (table) for (let i = 0; i < MAX_SEATS; i++) if (table.seats[i].state === 'occupied') table.standUp(i);
+  tableManager.removeTable(tableId);
+  tableProgressListeners.delete(tableId);
+  privateTableIds.delete(tableId);
+  privateTableMeta.delete(tableId);
+  bombPotPending.delete(tableId);
+  privateTableStats.removedIdle++;
+  console.log(`[privateTable] ${JSON.stringify({ event: 'private_table_removed_idle', tableId })}`);
+}
+
+/**
+ * Every session, spectator view, room membership and timer bound to a table
+ * that is going away (a removed private table, a retired finished tournament
+ * table, a finished quick game). Seats are the caller's business.
+ */
+function endTableViewsAndTimers(tableId: string): void {
+  const room = `table:${tableId}`;
+  for (const [sid, s] of [...playerSessions]) {
+    if (s.tableId !== tableId) continue;
+    playerSessions.delete(sid);
+    releaseSeatedSlot(sid, tableId);
+    io.sockets.sockets.get(sid)?.leave(room);
+    lastSentState.delete(sid); lastSentJson.delete(sid);
+  }
+  for (const [sid, list] of multiTableSessions) {
+    const kept = list.filter((ms) => ms.tableId !== tableId);
+    if (kept.length === list.length) continue;
+    io.sockets.sockets.get(sid)?.leave(room);
+    if (kept.length > 0) multiTableSessions.set(sid, kept); else multiTableSessions.delete(sid);
+  }
+  const specs = spectators.get(tableId);
+  if (specs) {
+    for (const sid of specs) io.sockets.sockets.get(sid)?.leave(room);
+    spectators.delete(tableId);
+  }
+  pendingSeatRemovalAfterHand.delete(tableId);
+  sitOutTracker.delete(tableId);
+  aiProfiles.delete(tableId);
+  const tt = turnTimers.get(tableId); if (tt) { clearTimeout(tt.timeout); turnTimers.delete(tableId); }
+  const tw = turnWarningTimers.get(tableId); if (tw) { clearTimeout(tw.timeout); turnWarningTimers.delete(tableId); }
+  const pa = pendingAutoStartTimers.get(tableId); if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(tableId); }
+  const ai = aiTimeouts.get(tableId); if (ai) { clearTimeout(ai.handle); aiTimeouts.delete(tableId); }
+  insuranceCashouts.delete(tableId);
+  clearInsuranceOffer(tableId);
+}
+
+/** C12 — every minute: a private table with no human seat for PRIVATE_TABLE_IDLE_MS is removed. */
+function sweepIdlePrivateTables(now: number = Date.now()): void {
+  for (const tableId of [...privateTableIds]) {
+    const table = tableManager.getTable(tableId);
+    if (!table) { privateTableIds.delete(tableId); privateTableMeta.delete(tableId); continue; }
+    let meta = privateTableMeta.get(tableId);
+    if (!meta) { meta = { ownerUserId: null, createdAt: now, emptySince: null }; privateTableMeta.set(tableId, meta); }
+    if (tableHasHumanSeat(table)) { meta.emptySince = null; continue; }
+    if (meta.emptySince === null) { meta.emptySince = now; continue; }
+    if (now - meta.emptySince >= PRIVATE_TABLE_IDLE_MS) removeIdlePrivateTable(tableId);
+  }
+}
+setInterval(() => {
+  try { sweepIdlePrivateTables(); } catch (e: any) { console.error('[privateTable] sweep failed:', e?.message || e); }
+}, 60_000).unref?.();
 
 // ========== All-in insurance (R1 contract #1, 2026-10-11 — ECON-1 / TABLEUI-1) ==========
 // The house buys an all-in player's equity at 90%. Before R1 the price came
@@ -6804,9 +7034,327 @@ function publicTournamentStandings(standings: any): any {
   };
 }
 
+// R2 (ECON-17) — every prize / refund settlement: one transaction, an
+// idempotent ledger key per credit, retried until it commits (src/game/prizeLedger.ts).
+const prizeLedger = createPrizeLedger({
+  connect: () => getPool().connect() as any,
+  log: (line) => console.warn(line),
+});
+setInterval(() => {
+  if (prizeLedger.pendingCount() === 0) return;
+  prizeLedger.retryPending().catch((e: any) => console.error('[prize-ledger] retry sweep failed:', e?.message || e));
+}, 60_000).unref?.();
+
+// ========== Quick games: a real END (R2, 2026-10-11 — S1) ==========
+// TOURNEY-6 / GAME-7 / ECON-8 / CLUBS-1 + the R1 money reviewer's P2. Every
+// quick format and a club challenge is a FIXED-ROSTER game (isFixedRosterTable:
+// no AI reload / fill, no rebuy). Before R2 a busted bot was reloaded at every
+// hand boundary: heads-up / all-in-or-fold never ended, a career stage could
+// never be won (user_career_progress 0 rows), a Spin & Go never settled, and
+// a quick table nobody sat at any more kept ~200 bot reloads an hour going.
+// Now, after every hand (and after a leave / a reservation stand-up — the
+// sweep), quickGameEndCheck asks quickGameOutcome (src/game/quickGames.ts):
+//   - over → every bot seat is stood up at once (its chips are the house's: no
+//     further hand can be dealt), the result is shown (quickGameOver /
+//     careerGameComplete / clubChallengeResolved), the game is SETTLED, and the
+//     table is cleaned up QUICK_GAME_CLEANUP_DELAY_MS later;
+//   - heads-up, all-in-or-fold, career and a club challenge are CASH games:
+//     cleanupQuickTable cashes the human's stack out (session, reservation or
+//     pending removal — whoever holds the seat; his reservation ends there, so
+//     it is credited exactly once);
+//   - a Spin & Go is a PRIZE format (isPrizeFormatTable): the buy-in is an
+//     ENTRY FEE and the stack is never cashed out by anything — a human win
+//     pays multiplier x fee through the prize ledger (ECON-17: once, never
+//     marked paid before the credit), a bust pays nothing, a voluntary leave
+//     FORFEITS (it used to cash out up to 3x — more than a 2x win paid), a
+//     forced removal / the shutdown flush / an admin close refund the fee once;
+//   - a quick table with no human seat left is cleaned up by the sweep.
+interface QuickGameState {
+  format: QuickFormat;
+  /** The human who bought in (vs-bots formats); null for a club challenge. */
+  ownerUserId: number | null;
+  ownerName: string;
+  /** What he paid to start it (a Spin & Go: the prize format's entry fee). */
+  entryFee: number;
+  ended: boolean;
+  /** open → won (Spin & Go prize paid) | lost | forfeited | refunded | cashed (a cash format cleaned up). */
+  settlement: 'open' | 'won' | 'lost' | 'forfeited' | 'refunded' | 'cashed';
+  /** Heads-Up Snap's 5-minute clock ran out: decided by chips at the next hand boundary. */
+  timeUp?: boolean;
+  createdAt: number;
+  /** A club challenge starts when BOTH players sit (vs-bots formats: at once). */
+  started: boolean;
+  multiplier?: number;
+  challengeId?: number;
+  /** Format-specific end (career progress + reward). */
+  onEnd?: (outcome: { winnerSeat: number | null; humanWon: boolean }) => void;
+}
+const quickGames = new Map<string, QuickGameState>();
+const quickGameStats = {
+  started: 0, ended: 0, humanWins: 0, spinGoPrizes: 0, spinGoForfeits: 0, entryFeesRefunded: 0,
+  cleanedNoHuman: 0, cashedOut: 0,
+};
+const QUICK_GAME_RESULT_DELAY_MS = 1000;   // the final hand is seen before the result
+const QUICK_GAME_CLEANUP_DELAY_MS = 5000;  // the result is seen before the table goes
+/** A club challenge whose two players have not both sat down by then is void (no winner; stacks cashed out). */
+const CHALLENGE_JOIN_GRACE_MS = 3 * 60 * 1000;
+
+/** R2 (ECON-8) — a PRIZE format (Spin & Go): its stacks are never wallet chips. */
+function isPrizeFormatTable(tableId: string): boolean {
+  return spinGoMultipliers.has(tableId);
+}
+
+/** Start tracking a quick game: its end is checked after every hand. */
+function registerQuickGame(tableId: string, table: PokerTable, state: Omit<QuickGameState, 'ended' | 'settlement' | 'createdAt' | 'started'>): void {
+  quickGames.set(tableId, { ...state, ended: false, settlement: 'open', createdAt: Date.now(), started: state.format !== 'challenge' });
+  quickGameStats.started++;
+  table.on('handResult', () => {
+    try { quickGameEndCheck(tableId, 'hand_result'); } catch (e: any) {
+      console.error(`[QuickGame] end check failed on ${tableId}:`, e?.message || e);
+    }
+  });
+}
+
+/** The human (account) holding a quick-table seat: his session, his reservation, or a pending after-hand removal. */
+function quickSeatOwner(tableId: string, seatIndex: number): { userId: number; username: string } | null {
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId !== tableId || s.seatIndex !== seatIndex) continue;
+    const a = authSessions.get(sid);
+    if (a) return { userId: a.userId, username: a.username };
+  }
+  for (const [sid, list] of multiTableSessions) {
+    if (!list.some((s) => s.tableId === tableId && s.seatIndex === seatIndex)) continue;
+    const a = authSessions.get(sid);
+    if (a) return { userId: a.userId, username: a.username };
+  }
+  for (const [uid, r] of reservedSeats) {
+    if (r.tableId === tableId && r.seatIndex === seatIndex) return { userId: uid, username: r.playerName || String(uid) };
+  }
+  const pend = pendingSeatRemovalAfterHand.get(tableId)?.get(seatIndex);
+  return pend ? { userId: pend.userId, username: pend.username } : null;
+}
+
+/** The claims on a seat that would credit it LATER (reservation timer, pending removal) end now. */
+function endQuickSeatClaims(tableId: string, seatIndex: number): void {
+  for (const [uid, r] of [...reservedSeats]) {
+    if (r.tableId !== tableId || r.seatIndex !== seatIndex) continue;
+    clearTimeout(r.cleanupTimer);
+    reservedSeats.delete(uid);
+  }
+  pendingSeatRemovalAfterHand.get(tableId)?.delete(seatIndex);
+}
+
+/**
+ * Is this quick game decided? Never mid-hand. On a decision: every bot seat is
+ * stood up NOW (its chips are the house's — no further hand can be dealt, so a
+ * pending auto-start finds < 2 players), the clocks stop, and the result and
+ * settlement follow (finishQuickGame). Returns true when it ended the game.
+ */
+function quickGameEndCheck(tableId: string, via: string): boolean {
+  const qg = quickGames.get(tableId);
+  const table = tableManager.getTable(tableId);
+  if (!qg || !table || qg.ended || table.isHandInProgress()) return false;
+  if (qg.format === 'challenge' && !qg.started) {
+    // Not under way until BOTH players sit; never decided by who arrived first.
+    const humansSeated = table.seats.filter((s) => s.state === 'occupied' && !s.isAI).length;
+    if (humansSeated >= 2) qg.started = true;
+    else if (Date.now() - qg.createdAt < CHALLENGE_JOIN_GRACE_MS) return false;
+    else {
+      qg.ended = true;
+      quickGameStats.ended++;
+      console.log(`[QuickGame] ${JSON.stringify({ event: 'club_challenge_void_no_show', tableId, challengeId: qg.challengeId ?? null, humansSeated })}`);
+      const tv = setTimeout(() => finishQuickGame(tableId, { winnerSeat: null, humanWon: false }), QUICK_GAME_RESULT_DELAY_MS);
+      (tv as any)?.unref?.();
+      return true;
+    }
+  }
+  let outcome = quickGameOutcome(qg.format, table.seats);
+  if (!outcome.over && qg.timeUp) {
+    // Heads-Up Snap's clock ran out: the bigger stack wins (a tie goes to the human).
+    const live = table.seats.filter((s) => s.state === 'occupied' && !s.eliminated);
+    let best: (typeof live)[number] | null = null;
+    for (const s of live) if (!best || s.chipCount > best.chipCount || (s.chipCount === best.chipCount && !s.isAI)) best = s;
+    outcome = { over: true, winnerSeat: best ? best.seatIndex : null, humanWon: !!best && !best.isAI, reason: 'last_standing' };
+  }
+  if (!outcome.over) return false;
+  qg.ended = true;
+  quickGameStats.ended++;
+  if (outcome.humanWon && qg.format !== 'challenge') quickGameStats.humanWins++;
+  if (qg.format !== 'challenge') {
+    for (const s of table.seats) {
+      if (s.state !== 'occupied' || !s.isAI) continue;
+      table.standUp(s.seatIndex);
+      aiProfiles.get(tableId)?.delete(s.seatIndex);
+    }
+  }
+  const timers = quickGameTimers.get(tableId);
+  if (timers) { clearInterval(timers.blindInterval); clearTimeout(timers.gameTimeout); }
+  const pa = pendingAutoStartTimers.get(tableId);
+  if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(tableId); }
+  console.log(`[QuickGame] ${JSON.stringify({
+    event: 'quick_game_over', tableId, format: qg.format, via, winnerSeat: outcome.winnerSeat,
+    humanWon: outcome.humanWon, reason: outcome.reason, timeUp: !!qg.timeUp,
+  })}`);
+  const decided = { winnerSeat: outcome.winnerSeat, humanWon: outcome.humanWon };
+  const t = setTimeout(() => finishQuickGame(tableId, decided), QUICK_GAME_RESULT_DELAY_MS);
+  (t as any)?.unref?.();
+  return true;
+}
+
+/** Heads-Up Snap's 5-minute clock: decided now between hands, else at the end of this hand. */
+function quickGameTimeUp(tableId: string): void {
+  const qg = quickGames.get(tableId);
+  if (!qg || qg.ended) return;
+  qg.timeUp = true;
+  quickGameEndCheck(tableId, 'time_up');
+}
+
+/** A quick game's result: to the table room + the owner's other live sockets. */
+function emitQuickGameEvent(tableId: string, qg: QuickGameState, event: string, payload: Record<string, unknown>): void {
+  const room = `table:${tableId}`;
+  io.to(room).emit(event, payload);
+  if (qg.ownerUserId === null) return;
+  for (const [sid, a] of authSessions) {
+    if (a.userId !== qg.ownerUserId) continue;
+    const sock = io.sockets.sockets.get(sid);
+    if (sock && sock.connected && !sock.rooms?.has(room)) sock.emit(event, payload);
+  }
+}
+
+/** The result + the settlement of an ended quick game, then the table goes. */
+function finishQuickGame(tableId: string, outcome: { winnerSeat: number | null; humanWon: boolean }): void {
+  const qg = quickGames.get(tableId);
+  if (!qg) return;
+  const table = tableManager.getTable(tableId);
+  const winnerSeat = outcome.winnerSeat !== null && table ? table.seats[outcome.winnerSeat] : undefined;
+  const winnerName = winnerSeat && winnerSeat.state === 'occupied' ? winnerSeat.playerName : '';
+  const winnerChips = winnerSeat && winnerSeat.state === 'occupied' ? winnerSeat.chipCount : 0;
+  // A vs-bots game that ended because its human LEFT (his seat is gone — a
+  // leave already settled it) shows no result screen to anyone.
+  const humanLeft = qg.format !== 'challenge' && !!table && !tableHasHumanSeat(table);
+  try {
+    if (humanLeft) {
+      if (qg.settlement === 'open') qg.settlement = isPrizeFormatTable(tableId) ? 'lost' : 'cashed';
+    } else if (qg.format === 'spinGo') {
+      const multiplier = qg.multiplier || 2;
+      const prize = multiplier * qg.entryFee;
+      const won = outcome.humanWon && qg.ownerUserId !== null && qg.settlement === 'open';
+      if (won) {
+        qg.settlement = 'won';
+        quickGameStats.spinGoPrizes++;
+        const ownerUserId = qg.ownerUserId as number;
+        void prizeLedger.settle({
+          label: `spingo:${tableId}`,
+          credits: [{ key: `spingo:${tableId}:prize`, userId: ownerUserId, amount: prize, kind: 'SPINGO_PRIZE', details: { tableId, multiplier, entryFee: qg.entryFee } }],
+        }).then((r) => auditLog(qg.ownerName || String(ownerUserId), r.status === 'committed' ? 'SPINGO_PRIZE' : 'SPINGO_PRIZE_PENDING_RETRY',
+          { userId: ownerUserId, tableId, multiplier, prize, attempts: r.attempts }));
+      } else if (qg.settlement === 'open') {
+        qg.settlement = 'lost';
+      }
+      emitQuickGameEvent(tableId, qg, 'quickGameOver', {
+        type: 'spinGo', tableId, winner: winnerName, multiplier, prize: won ? prize : 0, won,
+        message: won ? `${winnerName} wins ${prize.toLocaleString()} chips (${multiplier}x)!`
+          : (winnerName ? `${winnerName} wins the Spin & Go.` : 'The Spin & Go is over.'),
+      });
+    } else if (qg.format === 'headsUp' || qg.format === 'allInOrFold') {
+      emitQuickGameEvent(tableId, qg, 'quickGameOver', {
+        type: qg.format, tableId, winner: winnerName, chips: winnerChips, won: outcome.humanWon,
+        message: qg.timeUp
+          ? `Time's up! ${winnerName || 'Nobody'} wins with ${winnerChips.toLocaleString()} chips!`
+          : (outcome.humanWon ? `${winnerName} wins with ${winnerChips.toLocaleString()} chips!` : `${winnerName || 'The house'} wins — better luck next time.`),
+      });
+    } else if (qg.format === 'career') {
+      qg.onEnd?.(outcome);
+    } else if (qg.format === 'challenge') {
+      const winnerUid = outcome.winnerSeat !== null ? quickSeatOwner(tableId, outcome.winnerSeat)?.userId ?? null : null;
+      if (qg.challengeId !== undefined) resolveChallenge(qg.challengeId, winnerUid).catch(() => {});
+      io.to(`table:${tableId}`).emit('clubChallengeResolved', { challengeId: qg.challengeId, winnerId: winnerUid });
+    }
+  } catch (e: any) {
+    console.error(`[QuickGame] finish failed on ${tableId}:`, e?.message || e);
+  }
+  const t = setTimeout(() => cleanupQuickTable(tableId), QUICK_GAME_CLEANUP_DELAY_MS);
+  (t as any)?.unref?.();
+}
+
+/**
+ * Refund a quick game's ENTRY FEE once (a Spin & Go interrupted by the server,
+ * an admin close or a removal that was not the player's choice). Through the
+ * prize ledger — never twice for one table.
+ */
+function refundQuickEntryFee(tableId: string, qg: QuickGameState, reason: string): Promise<unknown> {
+  if (qg.settlement !== 'open' || qg.ownerUserId === null || !(qg.entryFee > 0)) return Promise.resolve();
+  qg.settlement = 'refunded';
+  quickGameStats.entryFeesRefunded++;
+  const ownerUserId = qg.ownerUserId;
+  return prizeLedger.settle({
+    label: `quickfee:${tableId}`,
+    credits: [{ key: `quickfee:${tableId}`, userId: ownerUserId, amount: qg.entryFee, kind: 'QUICK_ENTRY_REFUND', details: { tableId, format: qg.format, reason } }],
+  }).then((r) => auditLog(qg.ownerName || String(ownerUserId), r.status === 'committed' ? 'QUICK_ENTRY_REFUND' : 'QUICK_ENTRY_REFUND_PENDING_RETRY',
+    { userId: ownerUserId, tableId, format: qg.format, amount: qg.entryFee, reason }));
+}
+
+/**
+ * R2 (ECON-8) — handlePlayerLeave on a Spin & Go seat. The prize format's
+ * stack is never cashed out: a VOLUNTARY leave forfeits the entry; a leave that
+ * is not his choice ('kept': a suspension stand-up, an admin removal, an
+ * account switch's fall-through) refunds the entry fee once. Either way his
+ * game is over: the seat is stood up and handlePlayerLeave's quick-table tail
+ * removes the table. true = handled (handlePlayerLeave skips its cash teardown).
+ */
+function leavePrizeFormatSeat(socket: Socket, session: PlayerSession, table: PokerTable, kind: TournamentSeatLeaveKind): boolean {
+  if (!isPrizeFormatTable(session.tableId)) return false;
+  const seat = table.seats[session.seatIndex];
+  if (!seat || seat.state !== 'occupied' || seat.isAI) return false;
+  const qg = quickGames.get(session.tableId);
+  if (qg && qg.settlement === 'open') {
+    if (kind === 'voluntary') {
+      qg.settlement = 'forfeited';
+      quickGameStats.spinGoForfeits++;
+      auditLog(qg.ownerName || String(qg.ownerUserId), 'SPINGO_FORFEIT', { userId: qg.ownerUserId, tableId: session.tableId, stack: seat.chipCount, entryFee: qg.entryFee });
+    } else {
+      void refundQuickEntryFee(session.tableId, qg, `leave_${kind}`);
+    }
+  }
+  if (qg) qg.ended = true;
+  sitOutTracker.get(session.tableId)?.delete(session.seatIndex);
+  seat.deadBlindOwedChips = 0;
+  seat.missedBlind = 'none';
+  endQuickSeatClaims(session.tableId, session.seatIndex);
+  table.standUp(session.seatIndex);
+  socket.leave(`table:${session.tableId}`);
+  return true;
+}
+
+/** A quick table with no human seat left is cleaned up (bots never play on alone); an undecided game is checked. */
+function sweepQuickTables(): void {
+  for (const tableId of [...quickTables]) {
+    const table = tableManager.getTable(tableId);
+    if (!table) { cleanupQuickTable(tableId); continue; }
+    const qg = quickGames.get(tableId);
+    if (qg && qg.ended) continue;   // its cleanup is already scheduled
+    // A club challenge waits (CHALLENGE_JOIN_GRACE_MS) for its two players to sit.
+    const waitingForPlayers = !!qg && qg.format === 'challenge' && !qg.started && Date.now() - qg.createdAt < CHALLENGE_JOIN_GRACE_MS;
+    if (!tableHasHumanSeat(table) && !waitingForPlayers) {
+      quickGameStats.cleanedNoHuman++;
+      console.log(`[QuickGame] ${JSON.stringify({ event: 'quick_table_no_human_cleaned', tableId, format: qg?.format ?? tableKindOf(tableId) })}`);
+      cleanupQuickTable(tableId);
+      continue;
+    }
+    quickGameEndCheck(tableId, 'sweep');
+  }
+}
+setInterval(() => {
+  try { sweepQuickTables(); } catch (e: any) { console.error('[QuickGame] sweep failed:', e?.message || e); }
+}, 15_000).unref?.();
+
 function cleanupQuickTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
+  const qg = quickGames.get(tableId);
+  // R2 (ECON-8) — a Spin & Go's stacks are the prize format's, never cashed.
+  const prizeFormat = isPrizeFormatTable(tableId);
   if (table) {
+    io.to(`table:${tableId}`).emit('tableClosed', { tableId, reason: 'quick_game_over' });
     // 2026-07-01 audit #2: credit each seated HUMAN's stack back to their wallet
     // BEFORE standUp erases it. The buy-in was deducted at join, and a natural
     // quick-game end (timer / elimination) runs neither handlePlayerLeave nor
@@ -6815,38 +7363,43 @@ function cleanupQuickTable(tableId: string): void {
     // stake incl. any mid-hand pot chips (same pattern as gracefulShutdown /
     // adminForceCloseTable). Chip-conserving: crediting winner + loser stacks
     // sums to the total bought in.
+    // R2 — the seat's owner is found through his session, his RESERVATION or a
+    // pending after-hand removal (a disconnected player was never credited
+    // here, and his reservation later paid its stale snapshot to the wallet);
+    // those claims end here, so the seat is credited exactly once.
     const inHand = table.isHandInProgress();
     const isTournament = isTournamentTable(tableId);
     for (let i = 0; i < MAX_SEATS; i++) {
       const seat = table.seats[i];
       if (!seat || seat.state !== 'occupied') continue;
       if (!seat.isAI && !isTournament) {
-        const uid = userIdForSeat(tableId, i);
-        if (uid) {
-          let uname = String(uid);
-          for (const [, a] of authSessions) if (a.userId === uid) { uname = a.username; break; }
+        const owner = quickSeatOwner(tableId, i);
+        endQuickSeatClaims(tableId, i);
+        if (owner && !prizeFormat) {
           const refund = seat.chipCount + (inHand ? (seat.totalInvestedThisHand || 0) : 0);
           if (refund > 0) {
-            addChipsToUser(uid, refund)
-              .then((ok) => auditLog(uname, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: uid, tableId, amount: refund, reason: 'quick_game_end' }))
+            quickGameStats.cashedOut++;
+            addChipsToUser(owner.userId, refund)
+              .then((ok) => auditLog(owner.username, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: owner.userId, tableId, amount: refund, reason: 'quick_game_end' }))
               .catch(() => {});
           }
+        } else if (owner && prizeFormat && seat.chipCount > 0) {
+          auditLog(owner.username, 'SPINGO_STACK_NOT_CASHED', { userId: owner.userId, tableId, chips: seat.chipCount, settlement: qg?.settlement ?? null });
         }
       }
       table.standUp(i);
     }
   }
-  aiProfiles.delete(tableId);
+  if (qg && qg.settlement === 'open') qg.settlement = prizeFormat ? 'lost' : 'cashed';
+  // A club challenge that never reached a result (both left / never both sat) is closed with no winner.
+  const unresolvedChallenge = challengeTables.get(tableId);
+  if (unresolvedChallenge && !(qg && qg.ended)) resolveChallenge(unresolvedChallenge.challengeId, null).catch(() => {});
+  quickGames.delete(tableId);
+  // Sessions / spectators / rooms / turn + AI + auto-start timers of the table end with it.
+  endTableViewsAndTimers(tableId);
   tableManager.removeTable(tableId);
   tableProgressListeners.delete(tableId);
   quickTables.delete(tableId); // #5
-
-  // #12 (2026-07-01 audit): clear the turn/warning/autostart timer entries for
-  // this table so they don't fire against a removed table (guarded no-ops, but
-  // leaked map entries otherwise).
-  const tt = turnTimers.get(tableId); if (tt) { clearTimeout(tt.timeout); turnTimers.delete(tableId); }
-  const tw = turnWarningTimers.get(tableId); if (tw) { clearTimeout(tw.timeout); turnWarningTimers.delete(tableId); }
-  const pa = pendingAutoStartTimers.get(tableId); if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(tableId); }
 
   const timers = quickGameTimers.get(tableId);
   if (timers) {
@@ -6858,15 +7411,7 @@ function cleanupQuickTable(tableId: string): void {
   spinGoMultipliers.delete(tableId);
   allInOrFoldTables.delete(tableId);
   careerTables.delete(tableId);
-  insuranceCashouts.delete(tableId);
-  clearInsuranceOffer(tableId);
   challengeTables.delete(tableId);
-
-  const timeoutKey = tableId;
-  if (aiTimeouts.has(timeoutKey)) {
-    clearTimeout(aiTimeouts.get(timeoutKey)!.handle);
-    aiTimeouts.delete(timeoutKey);
-  }
 }
 
 // ========== Socket.io Events ==========
@@ -9262,6 +9807,18 @@ Give feedback in this JSON format:
     const table = tableManager.getTable(data.tableId);
     if (!table) { socket.emit('adminForceCloseTableResult', { success: false, error: 'Table not found' }); return; }
     auditLog(auth.username, 'ADMIN_FORCE_CLOSE_TABLE', { tableId: data.tableId });
+    // R2 (S1) — a QUICK table closes through cleanupQuickTable: a cash format's
+    // stacks are cashed out to whoever holds the seat (session or reservation,
+    // exactly once); a Spin & Go's entry fee is refunded once (its stack is the
+    // prize format's, never cashed); the quick-game state ends with it.
+    if (quickTables.has(data.tableId)) {
+      const qg = quickGames.get(data.tableId);
+      if (qg && isPrizeFormatTable(data.tableId)) void refundQuickEntryFee(data.tableId, qg, 'admin_force_close');
+      io.to(`table:${data.tableId}`).emit('tableClosedByAdmin', { tableId: data.tableId });
+      cleanupQuickTable(data.tableId);
+      socket.emit('adminForceCloseTableResult', { success: true, tableId: data.tableId });
+      return;
+    }
     // Cash every seated HUMAN back to their wallet, then unseat + remove the
     // table. Refund the FULL table stake — chipCount PLUS any chips already
     // committed to a live pot (totalInvestedThisHand). creditSeatStackToWallet
@@ -9768,16 +10325,21 @@ Give feedback in this JSON format:
       return;
     }
 
-    // Redirect to the standard joinTable handler by triggering the same event on this socket
+    // Redirect to the standard joinTable handler by triggering the same event on this socket.
+    // R2 (C1) — joinTable refuses a club table to everyone else; this payload
+    // object carries the membership grant (clubJoinGrants — a client frame can
+    // never be one of these objects).
     const listeners = socket.listeners('joinTable');
     if (listeners.length > 0) {
-      (listeners[0] as Function)({
+      const grantedPayload = {
         tableId: clubTable.tableId,
         playerName: data.playerName,
         seatIndex: data.seatIndex,
         buyIn: data.buyIn,
         avatar: data.avatar,
-      });
+      };
+      clubJoinGrants.add(grantedPayload);
+      return (listeners[0] as Function)(grantedPayload);
     }
   });
 
@@ -10023,29 +10585,22 @@ Give feedback in this JSON format:
       minBuyIn: stakes, maxBuyIn: stakes, maxPlayers: 2,
     } as any);
     if (!tableId) { socket.emit('error', { message: 'Could not start the challenge table' }); return; }
-    await setChallengeTable(challengeId, tableId);
+    // R2 (CLUBS-1) — registered BEFORE any await: from its creation the table
+    // is a fixed-roster heads-up (quickTables: no AI backfill / fill / reload,
+    // never listed; tableKindOf still 'club'), seats 0-1 only, joinable only by
+    // its two players (joinTableRefusalReason).
     challengeTables.set(tableId, { challengeId, challengerId, challengedId });
-
-    // Resolve the challenge (mark completed + winner) when the heads-up match
-    // ends, then tear the table down (cleanupQuickTable refunds the winner's 2x
-    // stack + removes it). Mirrors the career/spinGo resolution pattern.
+    quickTables.add(tableId);
     const t = tableManager.getTable(tableId);
-    let resolved = false;
-    t?.on('handResult', () => {
-      setTimeout(() => {
-        if (resolved) return;
-        const tt = tableManager.getTable(tableId);
-        if (!tt) return;
-        const alive = tt.seats.filter((s) => s.state === 'occupied' && s.chipCount > 0 && !s.eliminated);
-        if (alive.length <= 1) {
-          resolved = true;
-          const winnerUid = alive.length === 1 ? (userIdForSeat(tableId, alive[0].seatIndex) ?? null) : null;
-          resolveChallenge(challengeId, winnerUid).catch(() => {});
-          io.to(`table:${tableId}`).emit('clubChallengeResolved', { challengeId, winnerId: winnerUid });
-          setTimeout(() => cleanupQuickTable(tableId), 5000);
-        }
-      }, 1000);
-    });
+    if (t) {
+      t.maxOccupiableSeats = Math.min(t.maxOccupiableSeats, 2);
+      // Resolved on a challenger's bust — or when one of them leaves (the other
+      // wins): quickGameEndCheck (format 'challenge'). The stakes are the
+      // buy-ins: cleanupQuickTable cashes the winner's (and any remaining)
+      // stack out, exactly once.
+      registerQuickGame(tableId, t, { format: 'challenge', ownerUserId: null, ownerName: 'Club Challenge', entryFee: 0, challengeId });
+    }
+    await setChallengeTable(challengeId, tableId);
 
     // Tell BOTH participants to join the table.
     const payload = { challengeId, tableId, challengerId, challengedId, stakes };
@@ -10370,12 +10925,9 @@ Give feedback in this JSON format:
 
   // ========== End Club Events ==========
 
+  // R2 (C1) — ONLY joinable public cash tables, with seats / phase / pot.
   socket.on('getTableList', async () => {
-    const tables = tableManager.getTableList().map((t) => ({
-      ...t,
-      spectatorCount: spectators.get(t.tableId)?.size || 0,
-    }));
-    socket.emit('tableList', tables);
+    socket.emit('tableList', publicTableList());
   });
 
   socket.on(
@@ -10420,6 +10972,14 @@ Give feedback in this JSON format:
       if (isTournamentTable(tableId)) {
         refuseCashJoinAtTournamentTable(socket, 'joinTable', tableId);
         return;
+      }
+      // R2 (C1) — only a joinable PUBLIC cash table: never a quick / career /
+      // Spin & Go / heads-up / all-in-or-fold table (fixed roster), a private
+      // home game (invite code only) or a club table (joinClubTable's grant
+      // only); a club challenge only by its two players. Before any side effect.
+      {
+        const notJoinable = joinTableRefusalReason(tableId, authSessions.get(socket.id), clubJoinGrants.has(data));
+        if (notJoinable) { refuseTableNotJoinable(socket, 'joinTable', tableId, notJoinable); return; }
       }
 
       // Variant sanity check — if the client told us which variant they
@@ -10554,6 +11114,9 @@ Give feedback in this JSON format:
       if (table) {
         const cap = table.config.minBuyIn * 10;
         buyIn = Math.max(table.config.minBuyIn, Math.min(buyIn || table.config.minBuyIn, cap));
+        // R2 (CLUBS-1) — a club challenge is a freezeout for its stakes: both
+        // players buy in for EXACTLY the stakes (the table's minBuyIn).
+        if (challengeTables.has(tableId)) buyIn = table.config.minBuyIn;
       }
 
       // Validate buy-in against DB balance for authenticated users. In
@@ -10631,8 +11194,10 @@ Give feedback in this JSON format:
       // Join socket room for table
       socket.join(`table:${tableId}`);
 
-      // Fill empty seats with AI
-      fillWithAI(table, tableId);
+      // Fill empty seats with AI — R2 (CLUBS-1): never at a fixed-roster table
+      // (a club challenge is joined through here: its second seat is the
+      // opponent's, never a bot's).
+      if (!isFixedRosterTable(tableId)) fillWithAI(table, tableId);
 
       // Auto-start hand if not in progress
       if (!table.isHandInProgress() && table.getOccupiedSeatCount() >= 2) {
@@ -10680,8 +11245,24 @@ Give feedback in this JSON format:
       // P5 (2026-10-10) — never a tournament table (live or just broken): a
       // cash buy-in there is treated as a tournament stack and never cashed out
       // — and Quick Play prefers the emptiest tables, which often ARE
-      // tournament tables.
-      const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId));
+      // tournament tables. R2 (C1 / GAME-4) — nor a quick, private or club
+      // table: ONLY the joinable public cash tables the lobby lists (a fresh
+      // private home game with the lowest blinds used to capture Quick Play).
+      // And a table the player can AFFORD first: it used to commit to the first
+      // candidate and answer "Insufficient chips" while a cheaper table had room.
+      const qpAuth = authSessions.get(socket.id);
+      let qpWallet = Number.POSITIVE_INFINITY;
+      if (qpAuth && !UNLIMITED_CHIPS_TESTING) {
+        qpWallet = await getUserChips(qpAuth.userId);
+        if (await buyInSocketGone(socket, 'quickPlay', 'wallet_read')) return; // F3 — nothing chosen or deducted yet
+      }
+      const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId) && tableKindOf(t.tableId) === 'cash');
+      const canAfford = (t: { tableId: string; minBuyIn?: number }) =>
+        (Number.isFinite(t.minBuyIn) ? (t.minBuyIn as number) : (tableManager.getTable(t.tableId)?.config.minBuyIn ?? 0)) <= qpWallet;
+      if (tables.length > 0 && !tables.some(canAfford)) {
+        socket.emit('error', { message: 'Insufficient chips', code: 'insufficient_chips' });
+        return;
+      }
 
       // Quick Play prefers Texas Hold'em tables. Sort: holdem first,
       // then by player count, then by smallest blinds.
@@ -10693,7 +11274,7 @@ Give feedback in this JSON format:
       // with no variantId) passed the old `!id || === 'texas-holdem'` check
       // and Quick Play happily seated Hold'em players at Draw games.
       const isHoldem = (t: any) => t?.variant === 'texas-holdem';
-      const sorted = [...tables].sort((a, b) => {
+      const sorted = tables.filter(canAfford).sort((a, b) => {   // R2 — only tables he can afford
         const ah = isHoldem(a), bh = isHoldem(b);
         if (ah !== bh) return ah ? -1 : 1;
         if (a.playerCount !== b.playerCount)
@@ -12706,7 +13287,10 @@ Give feedback in this JSON format:
         if (existingSession) handlePlayerLeave(socket);
         // P5 (2026-10-10) — a waitlist seat is a CASH buy-in: never a tournament
         // table (live or just broken) — its stack would never be cashed out.
-        const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId));
+        // R2 (C1) — and only a joinable PUBLIC cash table (never a quick /
+        // private / club table — a private home game with low blinds used to
+        // win the "lowest stakes" pick).
+        const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId) && tableKindOf(t.tableId) === 'cash');
         // 2026-10-11 (.online R1 review R1REV-2 / audit GAME-13) — the old test
         // read the live instance's variantId and accepted only '' or
         // 'texas-holdem', but every base PokerTable (Beginner's Table, Shark
@@ -14128,6 +14712,13 @@ Give feedback in this JSON format:
     table.sitDown(1, aiProfile.botName, 1000, aiPlayerId, true);
     profiles.set(1, aiProfile);
 
+    // R2 (TOURNEY-6 / money review P2) — a real END: a bust is game over (the
+    // winner's stack is cashed out by cleanupQuickTable); the 5-minute clock
+    // decides by chips at a hand boundary (quickGameTimeUp).
+    registerQuickGame(tableId, table, {
+      format: 'headsUp', ownerUserId: authHU?.userId ?? null, ownerName: playerName, entryFee: authHU ? HEADS_UP_BUYIN : 0,
+    });
+
     // Start hand immediately
     table.startNewHand();
     broadcastGameState(tableId);
@@ -14145,47 +14736,11 @@ Give feedback in this JSON format:
       t.config.bigBlind *= 2;
     }, 60000);
 
-    // Store the interval and timeout for cleanup
-    const headsUpKey = `headsup-${tableId}`;
-    const headsUpTimers = new Map<string, { blindInterval: NodeJS.Timeout; gameTimeout: NodeJS.Timeout }>();
-
-    // 5-minute game timer
+    // 5-minute game timer — R2: decided by chips (now between hands, else at
+    // the end of the hand in progress), shown, settled, cleaned up.
     const gameTimeout = setTimeout(() => {
       clearInterval(blindInterval);
-      const t = tableManager.getTable(tableId);
-      if (!t) return;
-
-      // Determine winner by chip count
-      const seat0 = t.seats[0];
-      const seat1 = t.seats[1];
-      let winnerName = '';
-      let winnerChips = 0;
-
-      if (seat0.state === 'occupied' && seat1.state === 'occupied') {
-        if (seat0.chipCount >= seat1.chipCount) {
-          winnerName = seat0.playerName;
-          winnerChips = seat0.chipCount;
-        } else {
-          winnerName = seat1.playerName;
-          winnerChips = seat1.chipCount;
-        }
-      } else if (seat0.state === 'occupied') {
-        winnerName = seat0.playerName;
-        winnerChips = seat0.chipCount;
-      } else if (seat1.state === 'occupied') {
-        winnerName = seat1.playerName;
-        winnerChips = seat1.chipCount;
-      }
-
-      io.to(`table:${tableId}`).emit('quickGameOver', {
-        type: 'headsUp',
-        winner: winnerName,
-        chips: winnerChips,
-        message: `Time's up! ${winnerName} wins with ${winnerChips} chips!`,
-      });
-
-      // Clean up
-      cleanupQuickTable(tableId);
+      quickGameTimeUp(tableId);
     }, 5 * 60 * 1000);
 
     quickGameTimers.set(tableId, { blindInterval, gameTimeout });
@@ -14229,13 +14784,7 @@ Give feedback in this JSON format:
     }
 
     // Random multiplier: 2x (60%), 3x (25%), 5x (10%), 10x (4%), 25x (1%)
-    const roll = Math.random() * 100;
-    let multiplier = 2;
-    if (roll < 1) multiplier = 25;
-    else if (roll < 5) multiplier = 10;
-    else if (roll < 15) multiplier = 5;
-    else if (roll < 40) multiplier = 3;
-    else multiplier = 2;
+    const multiplier = spinGoMultiplierFor(Math.random() * 100);
 
     const tableId = tableManager.createQuickTable(
       `Spin & Go (${multiplier}x)`,
@@ -14312,53 +14861,14 @@ Give feedback in this JSON format:
     // Store multiplier for prize calculation
     spinGoMultipliers.set(tableId, multiplier);
 
-    // Listen for eliminations - last player standing wins the REAL multiplier
-    // prize. Previously the multiplier was purely cosmetic: the winner was only
-    // credited their real table stack (~1500 = 3 buy-ins) while the UI advertised
-    // up to 12500 (25x) that was never paid.
-    let spinGoSettled = false; // exactly-once guard — handResult fires repeatedly
-    const checkElimination = () => {
-      const t = tableManager.getTable(tableId);
-      if (!t) return;
-
-      const alive = t.seats.filter(
-        (s) => s.state === 'occupied' && s.chipCount > 0 && !s.eliminated
-      );
-
-      if (!spinGoSettled && alive.length <= 1 && alive.length > 0) {
-        spinGoSettled = true;
-        clearInterval(blindInterval);
-        const winner = alive[0];
-        const prize = multiplier * 500; // real Spin & Go prize = multiplier x buy-in
-
-        // Credit the ADVERTISED prize (house-funded, like tournament/freeroll
-        // prizes) to the human winner, then ZERO their seat so no refund path
-        // (cleanupQuickTable / handlePlayerLeave) double-credits their table
-        // stack. Guests (no userId) stay wallet-isolated — no prize, as before.
-        const winnerUid = userIdForSeat(tableId, winner.seatIndex);
-        if (winnerUid) {
-          winner.chipCount = 0;
-          winner.totalInvestedThisHand = 0;
-          addChipsToUser(winnerUid, prize)
-            .then((ok) => auditLog(winner.playerName, ok ? 'SPINGO_PRIZE' : 'SPINGO_PRIZE_FAILED', { userId: winnerUid, tableId, multiplier, prize }))
-            .catch((e) => console.warn(`[spinGo prize ${winnerUid}]`, e?.message));
-        }
-
-        io.to(`table:${tableId}`).emit('quickGameOver', {
-          type: 'spinGo',
-          winner: winner.playerName,
-          multiplier,
-          prize,
-          message: `${winner.playerName} wins ${prize} chips (${multiplier}x)!`,
-        });
-
-        // Clean up after a delay
-        setTimeout(() => cleanupQuickTable(tableId), 5000);
-      }
-    };
-
-    table.on('handResult', () => {
-      setTimeout(checkElimination, 1000);
+    // R2 (ECON-8 / ECON-17) — a PRIZE format with a real end: the last player
+    // with chips wins; a human winner is paid multiplier x the entry fee
+    // ONCE through the prize ledger (never marked paid before the credit; it
+    // used to zero his stack first and swallow a failed credit); a bust pays
+    // nothing; the stack is never cashed out (isPrizeFormatTable — a leave
+    // forfeits, a forced removal / shutdown / admin close refunds the fee).
+    registerQuickGame(tableId, table, {
+      format: 'spinGo', ownerUserId: authSG?.userId ?? null, ownerName: playerName, entryFee: authSG ? SPINGO_BUYIN : 0, multiplier,
     });
 
     quickGameTimers.set(tableId, { blindInterval, gameTimeout: setTimeout(() => {}, 0) });
@@ -14448,6 +14958,11 @@ Give feedback in this JSON format:
 
     // Mark this as an all-in-or-fold table
     allInOrFoldTables.add(tableId);
+    // R2 (money review P2) — a real END: the human busts (game over) or is the
+    // last player with chips (won); his stack is cashed out by cleanupQuickTable.
+    registerQuickGame(tableId, table, {
+      format: 'allInOrFold', ownerUserId: authAOF?.userId ?? null, ownerName: playerName, entryFee: authAOF ? AOF_BUYIN : 0,
+    });
 
     table.startNewHand();
     broadcastGameState(tableId);
@@ -14575,26 +15090,14 @@ Give feedback in this JSON format:
     // Mirrors the Spin&Go elimination listener. careerGameComplete drives the
     // client's persisted career progress (previously nothing detected a win, so
     // Career Mode progress never advanced).
-    let careerResolved = false;
-    table.on('handResult', () => {
-      setTimeout(() => {
-        if (careerResolved) return;
-        const t = tableManager.getTable(tableId);
-        if (!t) return;
-        const alive = t.seats.filter((s) => s.state === 'occupied' && s.chipCount > 0 && !s.eliminated);
-        const humanAlive = alive.some((s) => s.seatIndex === 0);
-        let done = false;
-        let won = false;
-        if (alive.length <= 1) {
-          done = true;
-          won = alive.length === 1 && alive[0].seatIndex === 0;
-        } else if (!humanAlive) {
-          // Human busted while AI keep playing — the stage is a loss for them.
-          done = true;
-          won = false;
-        }
-        if (done) {
-          careerResolved = true;
+    // R2 (TOURNEY-6) — through the quick-game end (registerQuickGame): with no
+    // AI reload the stage CAN be won now (every bot busted); the human busting
+    // loses it at once. The cleanup cashes his stack out as before.
+    registerQuickGame(tableId, table, {
+      format: 'career', ownerUserId: authCareer?.userId ?? null, ownerName: careerPlayerName, entryFee: authCareer ? config.buyIn : 0,
+      onEnd: (outcome) => {
+        {
+          const won = outcome.humanWon;
           const stars = won ? 3 : 0;
           // 2026-07-07 gap-fill — PERSIST progress server-side (was localStorage
           // only → lost cross-device) and GRANT the advertised venue reward the
@@ -14632,9 +15135,8 @@ Give feedback in this JSON format:
             }
           }
           socket.emit('careerGameComplete', { venue, stage, won, stars });
-          setTimeout(() => cleanupQuickTable(tableId), 5000);
         }
-      }, 1000);
+      },
     });
 
     table.startNewHand();
@@ -15255,6 +15757,12 @@ Give feedback in this JSON format:
       refuseCashJoinAtTournamentTable(socket, 'joinAdditionalTable', tableId);
       return;
     }
+    // R2 (C1) — an extra seat only at a joinable PUBLIC cash table (never a
+    // quick / private / club table). Before the AI stand-up below.
+    if (!isPublicCashTable(tableId)) {
+      refuseTableNotJoinable(socket, 'joinAdditionalTable', tableId, joinTableRefusalReason(tableId, authSessions.get(socket.id), false) || 'not_public_cash');
+      return;
+    }
 
     // Find empty seat
     let targetSeat = -1;
@@ -15570,6 +16078,25 @@ Give feedback in this JSON format:
     const ptCheck = validateTableConfig(data, { tableName: 'Private Table', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: (bb) => bb * 20 });
     if (!ptCheck.ok) { socket.emit('error', { message: ptCheck.error, code: ptCheck.code }); return; }
     const ptCfg = ptCheck.config;
+    // R2 (C12 / GAME-4) — creation is rate-limited per account (3 per 10 min)
+    // and an account keeps at most MAX_LIVE_PRIVATE_TABLES_PER_ACCOUNT live
+    // home games: every one was a permanent 24/7 bot table before.
+    const ptAuth = authSessions.get(socket.id);
+    const ptOwner = ptAuth?.userId ?? null;
+    if (ptOwner !== null) {
+      let live = 0;
+      for (const [tid, meta] of privateTableMeta) if (meta.ownerUserId === ptOwner && tableManager.getTable(tid)) live++;
+      if (live >= MAX_LIVE_PRIVATE_TABLES_PER_ACCOUNT) {
+        privateTableStats.refusedTooMany++;
+        socket.emit('error', { message: `You already have ${live} home games open — join one of them or let it close first.`, code: 'private_table_limit' });
+        return;
+      }
+    }
+    if (!privateTableCreateLimiter.hit(`pt:${ptOwner ?? socket.id}`)) {
+      privateTableStats.refusedRateLimited++;
+      socket.emit('error', { message: 'Please wait a few minutes before creating another home game.', code: 'rate_limited' });
+      return;
+    }
     const tableId = tableManager.createVariantTable({
       tableName: ptCfg.tableName,
       smallBlind: ptCfg.smallBlind,
@@ -15578,6 +16105,17 @@ Give feedback in this JSON format:
       minBuyIn: ptCfg.minBuyIn,
     }, ptCfg.variant);
     privateTableIds.add(tableId);   // R1 contract #2 — tableKind 'private'
+    // C12 — maxSeats (2-9) honoured: no seat at or beyond it can be taken (the
+    // variant's own deck-safety cap still wins when lower). Never listed.
+    {
+      const pt = tableManager.getTable(tableId);
+      const wantSeats = Math.floor(Number(data?.maxSeats));
+      if (pt && Number.isFinite(wantSeats) && wantSeats >= 2 && wantSeats <= MAX_SEATS) {
+        pt.maxOccupiableSeats = Math.min(pt.maxOccupiableSeats, wantSeats);
+      }
+    }
+    privateTableMeta.set(tableId, { ownerUserId: ptOwner, createdAt: Date.now(), emptySince: Date.now() });
+    privateTableStats.created++;
 
     // 2026-06-11 audit M2: the createPrivateTable payload advertised straddle /
     // runItTwice / bombPot toggles but the handler dropped all three silently.
@@ -15592,8 +16130,8 @@ Give feedback in this JSON format:
       log.warn(`[createPrivateTable] ${tableId}: requested unimplemented option(s) ${[data.straddle && 'straddle', data.runItTwice && 'runItTwice'].filter(Boolean).join(', ')} — ignored`);
     }
 
-    // Simple invite code = first 8 chars of tableId
-    const inviteCode = tableId.slice(0, 8).toUpperCase();
+    // Simple invite code = first 8 chars of tableId (C12 — the ONLY way in)
+    const inviteCode = privateInviteCode(tableId);
 
     socket.emit('privateTableCreated', { tableId, inviteCode });
     console.log(`[privateTable] Created ${tableId} (invite: ${inviteCode})`);
@@ -15608,10 +16146,12 @@ Give feedback in this JSON format:
     const { inviteCode, buyIn } = data;
     const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3
     const avatar = sanitizeSeatAvatar(data.avatar);                   // AUTH-10
-    // Find table whose ID starts with the invite code (lowercased)
-    const target = tableManager.getTableByInviteCode(inviteCode.toLowerCase());
+    // R2 (C1 / C12) — an invite code opens a PRIVATE home game only. It used to
+    // match the first 8 characters of ANY table id: a quick game, a club table
+    // or a public table could be entered through it.
+    const target = privateTableByInviteCode(inviteCode);
     if (!target) {
-      socket.emit('joinError', { message: 'Table not found for that invite code.' });
+      socket.emit('joinError', { message: 'Table not found for that invite code.', code: 'invite_code_not_found' });
       return;
     }
     const { tableId, table } = target;
@@ -15700,13 +16240,15 @@ Give feedback in this JSON format:
 
     // Send full state to the joining player (force full on join/reconnect)
     emitGameState(socket, getGameStateForPlayer(table, openSeat), true);
-    // Broadcast to all other players at the table using delta compression
-    for (const [sid, sess] of playerSessions) {
-      if (sess.tableId === tableId && sid !== socket.id) {
-        const peerSocket = io.sockets.sockets.get(sid);
-        if (peerSocket) emitGameState(peerSocket, getGameStateForPlayer(table, -1));
-      }
+    // R2 (GAME P3) — the others get THEIR OWN seat's view through the normal
+    // broadcast. This loop used to send every seated peer the spectator view
+    // (seat -1): their own hole cards vanished until the next action.
+    broadcastGameState(tableId);
+    // A hand starts once two players sit (bots fill the rest), like joinTable.
+    if (!table.isHandInProgress() && table.getOccupiedSeatCount() >= 2 && table.startNewHand()) {
+      broadcastGameState(tableId);
     }
+    scheduleAIAction(tableId);
   });
 
   // ── Coach whisper (relay from coach to student) ───────────────────────
@@ -15931,6 +16473,12 @@ function creditSeatStackToWallet(
   // tournament table (its stacks are already on the target tables).
   if (isTournamentTable(tableId)) {
     auditLog(username, 'TOURNAMENT_STACK_NOT_CASHED', { userId, tableId, reason, chips });
+    return;
+  }
+  // R2 (ECON-8) — nor a Spin & Go stack: the prize format's chips (the entry
+  // fee bought the seat; the winner is paid the prize).
+  if (isPrizeFormatTable(tableId)) {
+    auditLog(username, 'SPINGO_STACK_NOT_CASHED', { userId, tableId, reason, chips });
     return;
   }
   addChipsToUser(userId, chips)
@@ -17158,6 +17706,13 @@ function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKi
   // tournamentSeatKept, never auto-restored by a sign-in) or 'kept' (not his
   // choice: suspended, account switch, disconnect fall-through, after an
   // admin removal's disqualification — kept unflagged and untold).
+  // R2 (ECON-8, S1) — a Spin & Go seat is the prize format's: never cashed out
+  // here (leavePrizeFormatSeat forfeits a voluntary leave / refunds the entry
+  // fee of a forced one, and stands the seat up; the quick-table tail below
+  // removes the table).
+  if (table && leavePrizeFormatSeat(socket, session, table, tournamentSeat)) {
+    // handled — no cash teardown for a prize-format seat
+  } else
   if (table && !keepTournamentSeatOnLeave(socket, session, table, tournamentSeat)) {
     // 2026-06-11 audit C7: decide whether this seat's teardown must be
     // DEFERRED to hand-end. If the player is leaving mid-hand while still
@@ -17315,6 +17870,10 @@ function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKi
     const qt = tableManager.getTable(session.tableId);
     if (qt && !qt.seats.some((s) => s.state === 'occupied' && !s.isAI)) {
       cleanupQuickTable(session.tableId);
+    } else if (qt) {
+      // R2 (CLUBS-1) — a club challenge whose opponent left is decided now
+      // (the one still seated wins); a vs-bots game is checked too.
+      quickGameEndCheck(session.tableId, 'leave');
     }
   }
 
@@ -17559,6 +18118,8 @@ function startTournamentGame(tournamentId: string): void {
       // P-h (round 5) — the table room as before, AND every entrant's other
       // live sockets (an away entrant in the lobby / at cash / on another tab).
       emitTournamentFinishedToEntrants(tournamentId, [tableId], data);
+      // R2 (TOURNEY-11) — the finished table is removed once the result was shown.
+      scheduleFinishedTournamentTablesRetirement(tournamentId, [tableId]);
     }
     if (event === 'playerEliminated') {
       // Round 6 — the sockets told directly by the bust check are skipped (one notice each).
@@ -17591,6 +18152,55 @@ function refundCancelledTournamentEntrants(
         .catch((e: any) => auditLog(String(userId), 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: r.refund, reason, error: String(e?.message || e) }));
     }
   }
+}
+
+/**
+ * R2 (TOURNEY-11, S1) — a FINISHED tournament's tables are removed once the
+ * result has been shown (FINISHED_TOURNAMENT_TABLE_RETIRE_MS after
+ * tournamentFinished): they used to stay forever — listed in the lobby, the
+ * winner's stack sitting on a table that never dealt again, a cash buy-in on
+ * one never cashed out (c260a3df). The room is told `tableClosed {tableId,
+ * reason:'tournament_finished', tournamentId}`; every session / spectator /
+ * reservation / timer of the table ends; its seats are stood up WITHOUT any
+ * credit (tournament chips — prizes were paid by payTournamentPrizes). The
+ * table stays a tournament table to every chip decision for its broken-table
+ * window (noteBrokenTournamentTable) in case anything still points at it.
+ */
+const FINISHED_TOURNAMENT_TABLE_RETIRE_MS = 60_000;
+const finishedTournamentTablesRetired = { tables: 0 };
+const finishedTournamentRetirements = new Set<string>();
+function scheduleFinishedTournamentTablesRetirement(tournamentId: string, tableIds: string[]): void {
+  if (!tournamentId || finishedTournamentRetirements.has(tournamentId)) return;
+  finishedTournamentRetirements.add(tournamentId);
+  const ids = [...new Set(tableIds.filter(Boolean))];
+  const timer = setTimeout(() => {
+    finishedTournamentRetirements.delete(tournamentId);
+    for (const tid of ids) retireFinishedTournamentTable(tid, tournamentId);
+  }, FINISHED_TOURNAMENT_TABLE_RETIRE_MS);
+  (timer as any)?.unref?.();
+}
+function retireFinishedTournamentTable(tableId: string, tournamentId: string): void {
+  // Only a table still mapped to THIS tournament (a table a rebalance broke is
+  // already gone; never touch a table some other tournament owns).
+  if (tournamentTables.get(tableId) !== tournamentId) return;
+  const t = tournamentManager.getTournament(tournamentId);
+  if (t && t.status === 'running') return;   // not over after all — never retire a live table
+  const table = tableManager.getTable(tableId);
+  io.to(`table:${tableId}`).emit('tableClosed', { tableId, reason: 'tournament_finished', tournamentId });
+  for (const [uid, r] of [...reservedSeats]) {
+    if (r.tableId !== tableId) continue;
+    clearTimeout(r.cleanupTimer);
+    reservedSeats.delete(uid);
+  }
+  endTableViewsAndTimers(tableId);
+  if (table) for (let i = 0; i < MAX_SEATS; i++) if (table.seats[i].state === 'occupied') table.standUp(i);
+  noteBrokenTournamentTable(tableId, tournamentId);   // still a tournament table to any chip decision
+  tournamentTables.delete(tableId);
+  fastModeTables.delete(tableId);
+  tableManager.removeTable(tableId);
+  tableProgressListeners.delete(tableId);
+  finishedTournamentTablesRetired.tables++;
+  console.log(`[Tournament] ${JSON.stringify({ event: 'finished_tournament_table_retired', tournamentId, tableId })}`);
 }
 
 // Periodically check for timed tournaments
@@ -17816,6 +18426,8 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): vo
       // P-h (round 5) — every table room as before, AND every entrant's other
       // live sockets (an away entrant in the lobby / at cash / on another tab).
       emitTournamentFinishedToEntrants(tournamentId, tournamentManager.getTournament(tournamentId)?.tableIds || [], data);
+      // R2 (TOURNEY-11) — the finished tables are removed once the result was shown.
+      scheduleFinishedTournamentTablesRetirement(tournamentId, tournamentManager.getTournament(tournamentId)?.tableIds || []);
     }
   });
 }

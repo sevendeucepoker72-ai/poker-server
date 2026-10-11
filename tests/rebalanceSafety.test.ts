@@ -245,6 +245,8 @@ function world(opts: {
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
     payTournamentPrizes: async () => {}, postQualifierResults() {},
     syncSitOutToTable() {}, broadcastGameState() {}, scheduleAIAction() {}, releaseSeatedSlot() {}, cleanupQuickTable() {},
+    // R2 (S1): the Spin & Go (prize format) helpers the leave / reservation paths ask.
+    isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false,
     getGameStateForPlayer: () => ({}), emitGameState() {}, notifyPlayer: async () => {}, userIdForSeat: () => undefined,
     ensureTableProgressListener() {}, activateBombPotIfPending() {},
     dealersChoiceState: new Map(), bombPotActive: new Map(), bombPotPending: new Map(), insuranceCashouts: new Map(),
@@ -2339,6 +2341,8 @@ describe('V2 / P-e — a kept-absent seat that busts while its player sits at CA
         },
         getTableByInviteCode: (code: string) => (ref.w!.tables.get('PRIV-1') && code === 'priv-1' ? { tableId: 'PRIV-1', table: ref.w!.tables.get('PRIV-1') } : null),
       },
+      // R2 (C12): an invite code opens a PRIVATE table only (privateTableByInviteCode).
+      privateTableByInviteCode: (code: string) => (ref.w!.tables.get('PRIV-1') && code === 'PRIV-1' ? { tableId: 'PRIV-1', table: ref.w!.tables.get('PRIV-1') } : null),
       ensureChipsForBuyIn: async () => 1_000_000, deductChips: async () => true,
       generateRandomProfile: () => ({ botName: 'HU-Bot' }),
     };

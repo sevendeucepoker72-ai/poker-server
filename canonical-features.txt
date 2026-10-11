@@ -854,3 +854,49 @@ waitlistHoldemByListVariant
 headers['x-real-ip']
 const clientIp = realClientIp(socket);
 const regIp = realClientIp(socket);
+#
+# 2026-10-11 (R2, S1) — C1 / C12 (TOURNEY-11, APPUI-40, GAME-4, R1REV-MONEY-3,
+# APPUI-20): the lobby list + /api/tables carry ONLY joinable public cash tables
+# (seats / phase / pot); joinTable / joinAdditionalTable / quickPlay / the
+# waitlist refuse every other kind (table_not_joinable); a club table only via
+# joinClubTable's grant; an invite code opens a PRIVATE table only; a private
+# table honours maxSeats, is rate-limited and removed 10 minutes after the last
+# human left; a finished tournament's tables are removed after the result.
+socket.emit('tableList', publicTableList());
+res.json(publicTableList());
+code: 'table_not_joinable'
+clubJoinGrants.add(grantedPayload);
+const target = privateTableByInviteCode(inviteCode);
+reason: 'private_table_idle'
+MAX_LIVE_PRIVATE_TABLES_PER_ACCOUNT
+pt.maxOccupiableSeats = Math.min(pt.maxOccupiableSeats, wantSeats);
+privateTableIds.has(tableId) && !tableHasHumanSeat(table)
+scheduleFinishedTournamentTablesRetirement(tournamentId,
+reason: 'tournament_finished'
+#
+# 2026-10-11 (R2, S1) — TOURNEY-6 / GAME-7 / ECON-8 / CLUBS-1 + the money
+# review's P2: fixed-roster quick tables never reload a busted bot
+# (isFixedRosterTable — the predicate autoStartNextHand's AI-reload loop asks),
+# every quick game ENDS (quickGameEndCheck: bust = game over, the stack cashed
+# out once by cleanupQuickTable — session, reservation or pending removal), a
+# quick table with no human left is cleaned up, a Spin & Go is a PRIZE format
+# (win = multiplier x entry fee through the prize ledger; a leave forfeits; a
+# forced removal / admin close refunds the fee; its stack is never cashed), a
+# club challenge is a fixed-roster heads-up for its two players.
+if (!tournamentTables.has(tableId) && !isFixedRosterTable(tableId)) {
+event: 'quick_game_over'
+event: 'quick_table_no_human_cleaned'
+reason: 'quick_game_over'
+'SPINGO_FORFEIT'
+'SPINGO_STACK_NOT_CASHED'
+key: `spingo:${tableId}:prize`
+key: `quickfee:${tableId}`
+if (!isFixedRosterTable(tableId))
+registerQuickGame(tableId, t, { format: 'challenge'
+event: 'club_challenge_void_no_show'
+#
+# 2026-10-11 (R2, S1) — ECON-17 (tournament part): every prize / refund
+# settlement is ONE transaction with an idempotent payout key per credit,
+# retried until it commits (src/game/prizeLedger.ts).
+ON CONFLICT (payout_key) DO NOTHING RETURNING payout_key
+event: 'settlement_pending_retry'

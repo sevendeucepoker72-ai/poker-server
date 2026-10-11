@@ -260,7 +260,9 @@ function world(opts: WorldOpts = {}) {
     lastSentJson: new Map(), MAX_SEATS: 9, SEAT_RESERVE_MS, DISCONNECT_HANDS_LIMIT: HANDS_LIMIT,
     // handlePlayerLeave's tail (P4 tests run a full leave).
     lastEmoteTime: new Map(), lastReactionTime: new Map(), lastChatTime: new Map(),
-    syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {}, emitGameState() {},
+    syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {},
+    // R2 (S1): the Spin & Go (prize format) helpers the leave / reservation paths ask.
+    isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false, emitGameState() {},
     getGameStateForPlayer: () => ({}), scheduleAIAction() {}, log: { debug() {}, info() {} },
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
     auditLog: (actor: string, action: string, d: any) => { audits.push({ actor, action, d }); },

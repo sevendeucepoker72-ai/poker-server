@@ -50,6 +50,8 @@ const BROKEN_TABLES = slice('const brokenTournamentTables = new Map', 'brokenTou
 const CASH_JOIN_REFUSAL = slice('const TOURNAMENT_TABLE_JOIN_MESSAGE', '\n}\n');
 const WAITLIST_MISMATCH = slice('const WAITLIST_ACCOUNT_MISMATCH_MESSAGE', 'const waitlistAccountMismatches = { refused: 0 };');
 const SEAT_NAME = slice('function seatNameForSocket(', '\n}\n');
+// R2 (C1, 2026-10-11): table kinds + who may sit where (joinTable / quickPlay / extra seat / waitlist refusals).
+const WHO_SITS = slice('// ========== Table kind (R1 contract #2, 2026-10-11) ==========', "  socket.emit(channel, { message: TABLE_NOT_JOINABLE_MESSAGE, code: 'table_not_joinable', reason });\n}\n");
 
 /** Neutralise every F3 check (the pre-F3 behaviour) — for the CONTROL tests. */
 const withoutF3 = (s: string) => s.split('await buyInSocketGone(').join('await (async (..._a: any[]) => false)(');
@@ -170,6 +172,11 @@ function world(opts: { handlers?: Partial<typeof H>; tournament?: 'buyin' | 'qua
     refundQualifierCreditOnMaster: async (id: string) => { creditRefunds.push(id); return true; },
     PLAYER_SUSPENDED_MESSAGE: 'SUSPENDED',
     accountDisplayName, sanitizeSeatAvatar,
+    // R2 (C1 / C12): Quick Play reads the wallet first (affordable tables only); an invite code opens a PRIVATE table.
+    getUserChips: async (uid: number) => { if (gates.balance) await gates.balance; return wallet.get(uid) ?? 0; },
+    UNLIMITED_CHIPS_TESTING: false,
+    publicNameOf: (n: unknown) => String(n ?? ''),
+    privateTableByInviteCode: (code: string) => (code === 'cash1' ? { tableId: 'cash1', table: tables.get('cash1') } : null),
   };
 
   const h = { ...H, ...(opts.handlers || {}) };
@@ -180,6 +187,7 @@ ${BROKEN_TABLES}
 ${CASH_JOIN_REFUSAL}
 ${WAITLIST_MISMATCH}
 ${SEAT_NAME}
+${WHO_SITS}
 function wire(socket) {
   ${Object.values(h).join('\n  ')}
 }`;
