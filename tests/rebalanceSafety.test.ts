@@ -2871,7 +2871,8 @@ describe('P-h / P-h\' — the end of a tournament reaches EVERY entrant (tournam
     expect(roomEmits.filter(([, ev]) => ev === 'tournamentFinished').map(([room]) => room)).toEqual(['table:T1']);
     expect(s1.emitted.filter(([ev]: [string]) => ev === 'tournamentFinished')).toEqual([]);
     expect(s1.emitted.filter(([ev]: [string]) => ev === 'tournamentFinishedForEntrant')).toEqual([
-      ['tournamentFinishedForEntrant', { tournamentId: w.tid, position: 1, prize: 500, tournamentName: 'Rebalance Cup' }],
+      // R2 (P3): a heads-up field pays the whole pool, 62.5 / 37.5 (the 3rd-place 20% used to vanish).
+      ['tournamentFinishedForEntrant', { tournamentId: w.tid, position: 1, prize: 625, tournamentName: 'Rebalance Cup' }],
     ]);
     expect(s0.emitted.filter(([ev]: [string]) => ev === 'tournamentFinishedForEntrant' || ev === 'tournamentFinished')).toEqual([]);   // he is in the room
     expect(w.m.tournamentFinishedNotices).toEqual({ roomBroadcasts: 1, entrantSockets: 1 });

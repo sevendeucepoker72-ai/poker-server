@@ -37,10 +37,17 @@ export interface LedgerSettlement {
   credits: LedgerCredit[];
   /** Run inside the same transaction, after the credits (e.g. mark offers paid). */
   extraStatements?: Array<{ sql: string; params: unknown[] }>;
+  /**
+   * Run FIRST in the transaction: a state transition that must affect exactly
+   * `expectRows` rows (e.g. the staking offers it settles, still unsettled).
+   * Anything else = somebody settled them meanwhile: the transaction is rolled
+   * back, nothing is credited, and the result is 'conflict' (never retried).
+   */
+  guard?: { sql: string; params: unknown[]; expectRows: number };
 }
 
 export interface LedgerResult {
-  status: 'committed' | 'failed';
+  status: 'committed' | 'failed' | 'conflict';
   /** Credits this run actually paid. */
   paid: LedgerCredit[];
   /** Credits whose key was already in the ledger (paid before — never twice). */
@@ -81,6 +88,7 @@ export const prizeLedgerStats = {
   committed: 0,
   retriedAttempts: 0,
   failedSettlements: 0,
+  conflicts: 0,
   pending: 0,
   creditsPaid: 0,
   creditsAlreadyPaid: 0,
@@ -96,7 +104,7 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
   /** Settlements that exhausted their attempts — retried by retryPending(). */
   const pending = new Map<string, LedgerSettlement>();
 
-  async function attempt(s: LedgerSettlement): Promise<Omit<LedgerResult, 'attempts' | 'status'>> {
+  async function attempt(s: LedgerSettlement): Promise<Omit<LedgerResult, 'attempts' | 'status'> & { conflict?: boolean }> {
     const client = await deps.connect();
     try {
       if (!tableReady) {
@@ -104,6 +112,13 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
         tableReady = true;
       }
       await client.query('BEGIN');
+      if (s.guard) {
+        const g = await client.query(s.guard.sql, s.guard.params);
+        if ((g.rowCount ?? 0) !== s.guard.expectRows) {
+          await client.query('ROLLBACK');
+          return { paid: [], alreadyPaid: [], noUser: [], conflict: true };
+        }
+      }
       const paid: LedgerCredit[] = [];
       const alreadyPaid: LedgerCredit[] = [];
       const noUser: LedgerCredit[] = [];
@@ -152,6 +167,12 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
       if (i > 0) prizeLedgerStats.retriedAttempts++;
       try {
         const r = await attempt(s);
+        if (r.conflict) {
+          prizeLedgerStats.conflicts++;
+          if (pending.delete(s.label)) prizeLedgerStats.pending = pending.size;
+          log(`[prize-ledger] ${JSON.stringify({ event: 'settlement_conflict', label: s.label })}`);
+          return { status: 'conflict', paid: [], alreadyPaid: [], noUser: [], attempts: i + 1 };
+        }
         prizeLedgerStats.committed++;
         prizeLedgerStats.creditsPaid += r.paid.length;
         prizeLedgerStats.creditsAlreadyPaid += r.alreadyPaid.length;
@@ -177,6 +198,7 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
       try {
         const r = await attempt(s);
         pending.delete(label);
+        if (r.conflict) { prizeLedgerStats.conflicts++; continue; }
         committed++;
         prizeLedgerStats.committed++;
         prizeLedgerStats.creditsPaid += r.paid.length;

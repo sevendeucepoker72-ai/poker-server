@@ -18,6 +18,13 @@ export interface TournamentConfig {
   isBounty?: boolean; // bounty tournament — earn chips for eliminating players
   bountyAmount?: number; // chips awarded per knockout
   startingChips?: number; // 2026-07-07 gap-fill [14] — custom starting stack (default 1000)
+  /**
+   * R2 (2026-10-11, P3) — an on-demand tournament starts at this many
+   * registrants (clamped to 2..maxPlayers). Unset (every template): min(4, max)
+   * as before. A custom tournament defaults to its maxPlayers (starts when
+   * full) unless the director set one — it used to start at 4 whatever its max.
+   */
+  minPlayers?: number;
 }
 
 export interface TournamentPlayer {
@@ -43,6 +50,16 @@ export interface TournamentPlayer {
   // A disqualified entrant is eliminated and is paid NO prize (his share stays
   // unpaid — never redistributed, never minted).
   disqualified?: boolean;
+  /** R2 (C2) — this registration's own id (the lobby's `entryId`). */
+  entryId?: string;
+  registeredAt?: number;
+  /**
+   * R2 (P3) — busted in the SAME hand as other entrants with an EQUAL pre-hand
+   * stack (markSimultaneousBustTie): they tie, and finishTournament splits the
+   * prize money of their places equally between them (TDA). Was: ordered by
+   * seat number.
+   */
+  tieGroup?: number;
 }
 
 export type TournamentStatus = 'registering' | 'running' | 'finished' | 'cancelled';
@@ -70,6 +87,16 @@ export interface Tournament {
   // is stopped and tournament tables hold at the next hand boundary (never
   // mid-hand). Resuming re-arms the blind timer and re-kicks the tables.
   paused: boolean;
+  /**
+   * R2 (TOURNEY-5) — when the CURRENT field's first registrant registered
+   * (null while nobody is registered). The stall clock of an on-demand buy-in
+   * tournament runs from here: it used to run from `createdAt` (the template's
+   * creation at boot), so the first registration more than 30 minutes after a
+   * deploy was cancelled ~10 seconds later.
+   */
+  firstRegistrationAt: number | null;
+  /** R2 — when it finished / was cancelled (finished non-template tournaments are pruned an hour later). */
+  finishedAt: number | null;
 }
 
 export const DEFAULT_BLIND_LEVELS: BlindLevel[] = [
@@ -95,6 +122,24 @@ export interface TournamentTemplate {
   isBounty?: boolean;
   bountyAmount?: number;
   startingChips?: number;
+  /** R2 — see TournamentConfig.minPlayers. */
+  minPlayers?: number;
+}
+
+/**
+ * R2 (2026-10-11, P3) — the prize split by the size of the field. The pool is
+ * split 50 / 30 / 20 (unchanged for 3 or more entrants); a field SMALLER than
+ * the paid places used to leave the missing places' shares unpaid — a
+ * 2-player event never paid its 3rd-place 20% (those chips simply vanished).
+ * Now the places that exist share the whole pool in the same proportions
+ * (2 entrants: 62.5 / 37.5) — always the whole pool (floors aside).
+ */
+export const PAYOUT_PERCENTS = [50, 30, 20];
+export function payoutSharesFor(entrants: number, percents: number[] = PAYOUT_PERCENTS): number[] {
+  const places = Math.max(0, Math.min(percents.length, Math.floor(entrants)));
+  const used = percents.slice(0, places);
+  const total = used.reduce((a, b) => a + b, 0);
+  return total > 0 ? used.map((x) => x / total) : [];
 }
 
 const SNG_BLIND_LEVELS: BlindLevel[] = [
@@ -214,6 +259,7 @@ export class TournamentManager {
       isBounty: template.isBounty || false,
       bountyAmount: template.bountyAmount || 0,
       startingChips: template.startingChips || 1000,
+      ...(template.minPlayers !== undefined ? { minPlayers: template.minPlayers } : {}),
     };
 
     const now = Date.now();
@@ -233,19 +279,77 @@ export class TournamentManager {
       playerTableMap: new Map(),
       collectedEntryFees: 0,
       paused: false,
+      firstRegistrationAt: null,
+      finishedAt: null,
     };
 
     this.tournaments.set(tournamentId, tournament);
     return tournamentId;
   }
 
-  getTournamentList(): object[] {
+  /** R2 — a tournament is gone for good: its record AND its event listeners (they used to leak, one set per tournament). */
+  private dropTournament(tournamentId: string): void {
+    this.tournaments.delete(tournamentId);
+    this.eventCallbacks.delete(tournamentId);
+  }
+
+  /** R2 — the template this tournament re-creates after it ends (templates only; ad-hoc tournaments are not resurrected). */
+  private templateOf(t: Tournament): TournamentTemplate | undefined {
+    return TOURNAMENT_TEMPLATES.find((x) => x.name === t.config.name);
+  }
+
+  /**
+   * R2 — finished / cancelled NON-template tournaments (qualifiers, custom,
+   * club, simulations) older than `maxAgeMs` are dropped with their listeners
+   * (they used to stay in memory forever). Returns the ids dropped.
+   */
+  pruneEndedTournaments(now: number = Date.now(), maxAgeMs: number = 60 * 60 * 1000): string[] {
+    const dropped: string[] = [];
+    for (const [id, t] of this.tournaments) {
+      if (t.status !== 'finished' && t.status !== 'cancelled') continue;
+      if (this.templateOf(t)) continue;   // a template is re-created by its own timer
+      if (t.finishedAt === null || now - t.finishedAt < maxAgeMs) continue;
+      this.dropTournament(id);
+      dropped.push(id);
+    }
+    return dropped;
+  }
+
+  /**
+   * R2 (P3) — a TIMED freeroll whose start passed with fewer than two
+   * registrants rolls its start forward by its interval (its registrants stay
+   * registered). It used to keep the past time forever: the lobby said
+   * "Starting soon" all day. (A timed BUY-IN event is left to the stall sweep,
+   * which cancels and refunds it.) Returns the ids rolled.
+   */
+  rollOverdueFreerollStarts(now: number = Date.now(), graceMs: number = 60 * 1000): string[] {
+    const rolled: string[] = [];
+    for (const [id, t] of this.tournaments) {
+      if (t.status !== 'registering' || t.config.startInterval <= 0 || (t.config.buyIn || 0) > 0) continue;
+      if (now < t.nextStartTime + graceMs || t.players.length >= 2) continue;
+      while (t.nextStartTime <= now) t.nextStartTime += t.config.startInterval;
+      rolled.push(id);
+    }
+    return rolled;
+  }
+
+  /**
+   * The lobby's list. R2 (C2) — `viewer` (the asking socket's account): every
+   * item carries `registered` (an entry of THIS account — by local userId or
+   * master id) and `entryId` (that entry's id, else null). Without a viewer
+   * both are false / null. `minPlayers` = the start threshold.
+   */
+  getTournamentList(viewer?: { userId?: number; masterUserId?: string | null } | null): object[] {
     const list: object[] = [];
     for (const [id, t] of this.tournaments) {
       if (t.status === 'cancelled') continue; // don't surface cancelled tournaments
       const currentBlinds = t.config.blindLevels[t.currentBlindLevel] || t.config.blindLevels[0];
       const isFreeroll = (t.config.buyIn || 0) === 0;
+      const mine = viewer ? this.entryOfAccount(id, viewer) : undefined;
       list.push({
+        registered: !!mine,
+        entryId: mine?.entryId ?? null,
+        minPlayers: this.startThreshold(t),
         tournamentId: id,
         name: t.config.name,
         buyIn: t.config.buyIn,
@@ -271,17 +375,46 @@ export class TournamentManager {
     return list;
   }
 
+  /**
+   * R2 (C2) — the entry THIS account holds in a tournament: by local userId,
+   * else by master id (a qualifier entrant has no local userId). Never by a
+   * display name or a socket.
+   */
+  entryOfAccount(tournamentId: string, account: { userId?: number; masterUserId?: string | null }): TournamentPlayer | undefined {
+    const t = this.tournaments.get(tournamentId);
+    if (!t) return undefined;
+    return t.players.find((p) =>
+      (account.userId !== undefined && p.userId !== undefined && p.userId === account.userId)
+      || (!!account.masterUserId && !!p.masterUserId && String(p.masterUserId) === String(account.masterUserId)));
+  }
+
+  /** The number of registrants an on-demand tournament starts at. */
+  private startThreshold(t: Tournament): number {
+    const max = Math.max(2, t.config.maxPlayers);
+    const want = t.config.minPlayers !== undefined ? Math.floor(t.config.minPlayers) : Math.min(4, max);
+    return Math.max(2, Math.min(max, Number.isFinite(want) ? want : 4));
+  }
+
   registerPlayer(
     tournamentId: string, playerId: string, playerName: string, socketId: string, userId?: number,
     /** F4 (2026-10-10) — the entrant's attested MASTER id (qualifier registrations); identity only, never paid by it. */
     masterUserId?: string,
-  ): { success: boolean; error?: string } {
+  ): { success: boolean; error?: string; code?: string; entryId?: string } {
     const tournament = this.tournaments.get(tournamentId);
-    if (!tournament) return { success: false, error: 'Tournament not found' };
-    if (tournament.status !== 'registering') return { success: false, error: 'Tournament not open for registration' };
-    if (tournament.players.length >= tournament.config.maxPlayers) return { success: false, error: 'Tournament is full' };
-    if (tournament.players.some((p) => p.playerId === playerId)) return { success: false, error: 'Already registered' };
+    if (!tournament) return { success: false, error: 'Tournament not found', code: 'tournament_not_found' };
+    if (tournament.status !== 'registering') return { success: false, error: 'Tournament not open for registration', code: 'registration_closed' };
+    // R2 (C2 / TOURNEY-7) — ONE entry per ACCOUNT: a second registration by the
+    // same local user or master id is refused (it used to dedupe on the random
+    // per-request playerId only — two lobby mounts registered twice, paid twice,
+    // and a freeroll could be farmed).
+    if (tournament.players.some((p) => p.playerId === playerId)
+        || this.entryOfAccount(tournamentId, { userId, masterUserId: masterUserId ?? null })) {
+      return { success: false, error: 'You are already registered for this tournament', code: 'already_registered' };
+    }
+    if (tournament.players.length >= tournament.config.maxPlayers) return { success: false, error: 'Tournament is full', code: 'tournament_full' };
 
+    const entryId = uuidv4();
+    const now = Date.now();
     tournament.players.push({
       playerId,
       playerName,
@@ -293,7 +426,10 @@ export class TournamentManager {
       bountyEarnings: 0,
       userId,
       ...(masterUserId ? { masterUserId } : {}),
+      entryId,
+      registeredAt: now,
     });
+    if (tournament.firstRegistrationAt === null) tournament.firstRegistrationAt = now;
 
     // 2026-06-11 tournament economy: a PAYING human entrant (has a userId and
     // the table has a buy-in) funds the prize pool by exactly their entry fee.
@@ -304,7 +440,43 @@ export class TournamentManager {
       tournament.collectedEntryFees += tournament.config.buyIn;
     }
 
-    return { success: true };
+    return { success: true, entryId };
+  }
+
+  /**
+   * R2 (TOURNEY-3, qualifier LATE entry) — add a NEW entrant to a RUNNING
+   * tournament (the caller seats him at the same moment with `chips`).
+   * registerPlayer refuses a running tournament; a late registrant used to be
+   * charged a qualifier credit and never seated. Refused for an account that
+   * already has an entry (a busted one re-enters through its own path).
+   */
+  addLateEntrant(
+    tournamentId: string, playerId: string, playerName: string, socketId: string, chips: number,
+    identity: { userId?: number; masterUserId?: string },
+  ): TournamentPlayer | null {
+    const t = this.tournaments.get(tournamentId);
+    if (!t || t.status !== 'running') return null;
+    if (t.players.some((p) => p.playerId === playerId)
+        || this.entryOfAccount(tournamentId, { userId: identity.userId, masterUserId: identity.masterUserId ?? null })) return null;
+    const tp: TournamentPlayer = {
+      playerId, playerName, socketId, chips, eliminated: false, finishPosition: 0, bounties: 0, bountyEarnings: 0,
+      ...(identity.userId !== undefined ? { userId: identity.userId } : {}),
+      ...(identity.masterUserId ? { masterUserId: identity.masterUserId } : {}),
+      entryId: uuidv4(), registeredAt: Date.now(),
+    };
+    t.players.push(tp);
+    if (t.config.maxPlayers < t.players.length) t.config.maxPlayers = t.players.length;
+    return tp;
+  }
+
+  /** R2 — undo addLateEntrant when the seat could not be taken after all (nothing else references him yet). */
+  removeLateEntrant(tournamentId: string, playerId: string): boolean {
+    const t = this.tournaments.get(tournamentId);
+    if (!t) return false;
+    const before = t.players.length;
+    t.players = t.players.filter((p) => p.playerId !== playerId || p.eliminated);
+    t.playerTableMap.delete(playerId);
+    return t.players.length < before;
   }
 
   /**
@@ -332,6 +504,8 @@ export class TournamentManager {
     if (!tournament || tournament.status !== 'registering') return false;
     const before = tournament.players.length;
     tournament.players = tournament.players.filter((p) => p.playerId !== playerId);
+    // R2 (TOURNEY-5) — an empty field's stall clock starts again at the next registration.
+    if (tournament.players.length === 0) tournament.firstRegistrationAt = null;
     return tournament.players.length < before;
   }
 
@@ -342,13 +516,13 @@ export class TournamentManager {
    * with no reclaim). Only flags tournaments with a real entry fee and ≥1
    * registrant. Two stall shapes:
    *   - timed (startInterval > 0): past nextStartTime + grace with < 2 players.
-   *   - on-demand (startInterval === 0): older than STALL_MS and still below the
-   *     min(4, maxPlayers) start threshold.
+   *   - on-demand (startInterval === 0): STALL_MS after its FIRST registration
+   *     (R2, TOURNEY-5 — it used to be the template's creation at boot) and
+   *     still below its start threshold.
    */
-  checkStalledTournaments(): string[] {
+  checkStalledTournaments(now: number = Date.now()): string[] {
     const STALL_MS = 30 * 60 * 1000; // 30 min
     const GRACE_MS = 5 * 60 * 1000;  // 5 min past the scheduled start
-    const now = Date.now();
     const stalled: string[] = [];
     for (const [id, t] of this.tournaments) {
       if (t.status !== 'registering') continue;
@@ -357,8 +531,8 @@ export class TournamentManager {
       if (t.config.startInterval > 0) {
         if (now >= t.nextStartTime + GRACE_MS && t.players.length < 2) stalled.push(id);
       } else {
-        const threshold = Math.min(4, t.config.maxPlayers);
-        if (now - t.createdAt >= STALL_MS && t.players.length < threshold) stalled.push(id);
+        const since = t.firstRegistrationAt ?? now;
+        if (now - since >= STALL_MS && t.players.length < this.startThreshold(t)) stalled.push(id);
       }
     }
     return stalled;
@@ -381,21 +555,51 @@ export class TournamentManager {
     tournament.status = 'cancelled';
     tournament.players = [];
     tournament.collectedEntryFees = 0;
+    tournament.firstRegistrationAt = null;
+    tournament.finishedAt = Date.now();
 
     // B1 fix (2026-07-01 review): recreate the template for the next round so a
     // stalled-and-cancelled tournament REAPPEARS in the lobby — otherwise the
     // type is filtered out of getTournamentList forever (until process restart).
     // Mirrors finishTournament's recreate; gated on a real template name so
     // ad-hoc qualifier/simulated tournaments are NOT resurrected.
-    const template = TOURNAMENT_TEMPLATES.find((t) => t.name === tournament.config.name);
+    const template = this.templateOf(tournament);
     if (template) {
-      setTimeout(() => {
-        this.tournaments.delete(tournamentId);
+      const recreate = setTimeout(() => {
+        this.dropTournament(tournamentId);
         this.createTournament(template);
       }, 10000);
+      (recreate as any)?.unref?.();   // R2 — a pending re-creation never holds the process open
     }
 
     return registrants;
+  }
+
+  /**
+   * R2 (item 1, the shutdown flush) — a RUNNING tournament cannot survive the
+   * restart (it lives in memory): it is VOIDED — status 'cancelled' (no
+   * elimination can finish it any more, so no prize is paid on top of the
+   * refund), clock stopped — and every PAYING entrant (eliminated or not) is
+   * returned with his entry fee to refund. Idempotent (a second call returns []).
+   */
+  voidRunningTournament(tournamentId: string): { playerId: string; userId?: number; entryId?: string; refund: number }[] {
+    const t = this.tournaments.get(tournamentId);
+    if (!t || t.status !== 'running') return [];
+    const fee = t.config.buyIn || 0;
+    t.status = 'cancelled';
+    t.finishedAt = Date.now();
+    if (t.blindTimer) { clearTimeout(t.blindTimer); t.blindTimer = null; }
+    return t.players.map((p) => ({
+      playerId: p.playerId, userId: p.userId, ...(p.entryId ? { entryId: p.entryId } : {}),
+      refund: fee > 0 && p.userId !== undefined ? fee : 0,
+    }));
+  }
+
+  /** R2 — the ids of tournaments in a given state (the shutdown flush, the stall / prune sweeps). */
+  tournamentIdsWithStatus(status: TournamentStatus): string[] {
+    const out: string[] = [];
+    for (const [id, t] of this.tournaments) if (t.status === status) out.push(id);
+    return out;
   }
 
   canStart(tournamentId: string): boolean {
@@ -407,8 +611,9 @@ export class TournamentManager {
     if (tournament.config.startInterval > 0) {
       return Date.now() >= tournament.nextStartTime && tournament.players.length >= 2;
     }
-    // Manual start: when full or has enough players
-    return tournament.players.length >= Math.min(4, tournament.config.maxPlayers);
+    // Manual start: when its start threshold is reached (R2 — a custom
+    // tournament's own minPlayers; templates min(4, max) as before).
+    return tournament.players.length >= this.startThreshold(tournament);
   }
 
   startTournament(tournamentId: string): { success: boolean; startingChips: number; blinds: BlindLevel } | null {
@@ -455,6 +660,7 @@ export class TournamentManager {
     tournament.blindTimer = setTimeout(() => {
       this.advanceBlindLevel(tournamentId);
     }, currentLevel.duration * 1000);
+    (tournament.blindTimer as any)?.unref?.();   // R2 — a blind clock never holds the process open
   }
 
   private advanceBlindLevel(tournamentId: string): void {
@@ -631,11 +837,30 @@ export class TournamentManager {
     return out;
   }
 
+  /**
+   * R2 (P3) — these entrants busted in the SAME hand with an EQUAL pre-hand
+   * stack: they tie (TDA). Call it before eliminating them (the bust check);
+   * their places are still assigned one by one, and finishTournament splits the
+   * prize money of all their places equally between them. Fewer than two live
+   * entrants: nothing to tie.
+   */
+  private nextTieGroup = 1;
+  markSimultaneousBustTie(tournamentId: string, playerIds: string[]): boolean {
+    const t = this.tournaments.get(tournamentId);
+    if (!t || t.status !== 'running') return false;
+    const live = t.players.filter((p) => playerIds.includes(p.playerId) && !p.eliminated);
+    if (live.length < 2) return false;
+    const group = this.nextTieGroup++;
+    for (const p of live) p.tieGroup = group;
+    return true;
+  }
+
   private finishTournament(tournamentId: string): { finished: boolean; position: number; payout: number } | null {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament) return null;
 
     tournament.status = 'finished';
+    tournament.finishedAt = Date.now();
     if (tournament.blindTimer) {
       clearTimeout(tournament.blindTimer);
       tournament.blindTimer = null;
@@ -659,22 +884,45 @@ export class TournamentManager {
     const prizePool = isFreeroll
       ? (tournament.config.prizePool || 0)
       : tournament.collectedEntryFees;
-    const payouts: Record<number, number> = {
-      1: Math.floor(prizePool * 0.50),
-      2: Math.floor(prizePool * 0.30),
-      3: Math.floor(prizePool * 0.20),
-    };
+    // R2 (P3) — the shares by the size of the field (payoutSharesFor): a
+    // 2-entrant event pays 62.5 / 37.5 — its "3rd place" 20% used to vanish.
+    const shares = payoutSharesFor(tournament.players.length);
+    const payouts: Record<number, number> = {};
+    shares.forEach((s, i) => { payouts[i + 1] = Math.floor(prizePool * s); });
+    // R2 (P3) — a TIE (busted in the same hand with equal stacks): the money of
+    // all the tied places, split equally (floors; the remainder stays unpaid —
+    // never minted).
+    const tiedPayout = new Map<number, number>();
+    const groups = new Map<number, TournamentPlayer[]>();
+    for (const p of tournament.players) {
+      if (p.tieGroup === undefined || !p.eliminated) continue;
+      const g = groups.get(p.tieGroup) || [];
+      g.push(p);
+      groups.set(p.tieGroup, g);
+    }
+    for (const [group, members] of groups) {
+      if (members.length < 2) continue;
+      const sum = members.reduce((a, p) => a + (payouts[p.finishPosition] || 0), 0);
+      tiedPayout.set(group, Math.floor(sum / members.length));
+    }
 
-    const results = tournament.players.map((p) => ({
-      playerId: p.playerId,
-      playerName: p.playerName,
-      position: p.finishPosition,
-      // 2026-10-09 — a disqualified entrant (suspended mid-tournament) is paid
-      // nothing; his position's share stays unpaid (no redistribution, no mint).
-      payout: p.disqualified ? 0 : (payouts[p.finishPosition] || 0),
-      userId: p.userId,
-      ...(p.disqualified ? { disqualified: true } : {}),
-    }));
+    const results = tournament.players.map((p) => {
+      const tied = p.tieGroup !== undefined && tiedPayout.has(p.tieGroup);
+      const base = tied ? tiedPayout.get(p.tieGroup!)! : (payouts[p.finishPosition] || 0);
+      return {
+        playerId: p.playerId,
+        playerName: p.playerName,
+        position: p.finishPosition,
+        // 2026-10-09 — a disqualified entrant (suspended mid-tournament) is paid
+        // nothing; his position's share stays unpaid (no redistribution, no mint).
+        payout: p.disqualified ? 0 : base,
+        userId: p.userId,
+        ...(p.masterUserId ? { masterUserId: p.masterUserId } : {}),
+        ...(p.entryId ? { entryId: p.entryId } : {}),
+        ...(tied ? { tied: true } : {}),
+        ...(p.disqualified ? { disqualified: true } : {}),
+      };
+    });
 
     this.emitEvent(tournamentId, 'tournamentFinished', {
       tournamentId,
@@ -682,13 +930,14 @@ export class TournamentManager {
     });
 
     // Re-create the tournament for next round after a delay
-    setTimeout(() => {
-      const template = TOURNAMENT_TEMPLATES.find((t) => t.name === tournament.config.name);
+    const recreate = setTimeout(() => {
+      const template = this.templateOf(tournament);
       if (template) {
-        this.tournaments.delete(tournamentId);
+        this.dropTournament(tournamentId);
         this.createTournament(template);
       }
     }, 10000);
+    (recreate as any)?.unref?.();   // R2 — a pending re-creation never holds the process open
 
     return { finished: true, position: 1, payout: payouts[1] || 0 };
   }

@@ -900,3 +900,50 @@ event: 'club_challenge_void_no_show'
 # retried until it commits (src/game/prizeLedger.ts).
 ON CONFLICT (payout_key) DO NOTHING RETURNING payout_key
 event: 'settlement_pending_retry'
+#
+# 2026-10-11 (R2, S1) — C2 (TOURNEY-5 / TOURNEY-7 / TOURNEY-10 / APPUI-19): one
+# tournament entry per ACCOUNT (already_registered), `registered` + `entryId`
+# per asking socket in every tournament list (per-socket broadcast), the stall
+# clock from the FIRST registration, tournamentCancelled to every registrant, a
+# stable per-account entrant id (user-<id>) that feeds progression.
+code: 'already_registered'
+registered: !!mine,
+entryId: mine?.entryId ?? null,
+function broadcastTournamentList()
+sock.emit('tournamentCancelled', payload);
+const since = t.firstRegistrationAt ?? now;
+return userId !== undefined ? `user-${userId}` : `player-
+#
+# 2026-10-11 (R2, S1) — tournament P3s: field-size prize shares (a heads-up field
+# pays the whole pool), equal-stack simultaneous busts tie (prize split), a
+# custom tournament's own minPlayers, standings for the viewer's tournament,
+# ended ad-hoc tournaments + their listeners pruned, a timed freeroll's start
+# rolled forward, TournamentManager timers unref'd.
+function payoutSharesFor(entrants, percents
+tournamentManager.markSimultaneousBustTie(tournamentId, ids)
+tournamentManager.rollOverdueFreerollStarts();
+tournamentManager.pruneEndedTournaments();
+const own = viewer ? running.find((t) => tournamentManager.entryOfAccount(t.tournamentId, viewer)) : undefined;
+#
+# 2026-10-11 (R2, S1) — ECON-17 (tournament part) + C4 (TOURNEY-8 / ECON-15 /
+# APPUI-22): prizes settle in ONE ledger transaction (idempotent keys, retried,
+# never paid before the credit); staking takes a registered tournament's UUID,
+# ESCROWS the backer's chips until the seller cashes (shares + escrow released)
+# or anything else (refunded: cancel / unregister / removal / out of the money /
+# tournament gone / server restart — each offer once, a DB guard).
+label: `tournament:${tid}`,
+const prizeKey = `tprize:${tid}:${r.entryId || r.playerId}`;
+socket.on('getStakeableTournaments', () => {
+socket.emit('myStakeableTournaments', v ? stakeableTournamentsOf(v) : []);
+code: 'stake_not_registered'
+auditLog(auth.username, 'STAKING_BUY_ESCROW'
+const STAKE_GUARD_REFUND =
+const STAKE_GUARD_PAID =
+bootSweepUnsettledStakes().catch(
+#
+# 2026-10-11 (R2, S1) — TOURNEY-9: a tournament start never takes over a socket
+# that plays a live seat elsewhere (its seat is dealt absent, tournamentSeatKept
+# atStart); more than 9 registrants are seated over balanced tables.
+keepStartSeatAbsentForLiveSeatElsewhere(tournamentId, tp, boundSid, tableId, i, result.startingChips)
+event: 'start_seat_kept_absent_live_seat_elsewhere'
+startRegisteredTournamentTables(tournamentId, result.startingChips, result.blinds);
