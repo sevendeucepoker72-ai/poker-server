@@ -7768,8 +7768,10 @@ Give feedback in this JSON format:
       if (!data?.skipSeatRecovery) tellKeptTournamentSeats(socket, oauthSession, 'voluntary', 'oauthLogin');
       hydrateAndPushProgress(socket, userId, localUser.username).catch(() => {});
 
+      // 2026-10-11 — no PII in the log: the key is a display name or a phone
+      // number; which claim it came from is enough for support.
       console.log(
-        `[OAuth] oauthLogin ok: localId=${localUser.id} phone=${phone} masterId=${oauthResult.sub}`
+        `[OAuth] oauthLogin ok: localId=${localUser.id} keyFrom=${identity.identity.source} masterId=${oauthResult.sub}`
       );
     } catch (err: any) {
       console.error('[OAuth] oauthLogin error:', err);
