@@ -594,7 +594,8 @@ describe('ECON-18 — every economy credit is audited; at / above the threshold 
 
   it('wiring: every economy credit path in index.ts goes through auditEconomyCredit', () => {
     for (const action of ['SHOP_CHIP_PACK', 'SHOP_MYSTERY_BOX', 'DAILY_LOGIN_REWARD', 'DAILY_SPIN_REWARD', 'SCRATCH_CARD_REWARD', 'BATTLE_PASS_REWARD',
-      'MISSION_REWARD', 'VIP_MONTHLY_BONUS', 'CAREER_REWARD', 'SPINGO_PRIZE_CREDIT', 'SEASON_REWARD', 'CLUB_REFERRAL_REWARD', 'BRACKET_SIDEBET_WIN',
+      // (The Spin & Go prize is S1's: r2-tourney settles it through its prize ledger.)
+      'MISSION_REWARD', 'VIP_MONTHLY_BONUS', 'CAREER_REWARD', 'SEASON_REWARD', 'CLUB_REFERRAL_REWARD', 'BRACKET_SIDEBET_WIN',
       'ACHIEVEMENT_REWARD', 'LEVEL_UP_REWARD']) {
       expect([action, SRC.includes(`'${action}'`)]).toEqual([action, true]);
     }

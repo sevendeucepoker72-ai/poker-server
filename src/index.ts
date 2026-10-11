@@ -187,7 +187,7 @@ import {
 // economy tables + users.chips BIGINT (economy/schema).
 import {
   withEconomyTx, readWallet, settleDailyLogin, settleDailySpin, settleScratchCard, settleMissionClaim, settleVipMonthly,
-  settleCareerReward, creditOnceWithRetry, purchaseCosmetic, purchaseBundle, purchaseChipPack, purchaseMysteryBox,
+  settleCareerReward, purchaseCosmetic, purchaseBundle, purchaseChipPack, purchaseMysteryBox,
   purchaseBooster, purchaseVipPass, purchaseBattlePassPremium, hasBattlePassPremium, equipItemTx, recordChipWins,
   chipsWonStandings, awardSeason, publicIdsFor, userIdForPublicId,
   type Settled, type SeasonAwardResult,
@@ -14503,18 +14503,8 @@ Give feedback in this JSON format:
         if (winnerUid) {
           winner.chipCount = 0;
           winner.totalInvestedThisHand = 0;
-          // R2 (ECON-17 / ECON-18) — the prize is ONE keyed credit
-          // (economy_credits `spingo:<table>`: ledger + chips in one
-          // transaction, retried on a transient error, never paid twice) — the
-          // seat was zeroed first and a failed addChipsToUser lost the prize.
-          creditOnceWithRetry(`spingo:${tableId}`, winnerUid, prize, 0, 'spingo_prize', { tableId, multiplier })
-            .then((r) => {
-              auditLog(`user:${winnerUid}`, r.status === 'failed' ? 'SPINGO_PRIZE_FAILED' : 'SPINGO_PRIZE', { userId: winnerUid, tableId, multiplier, prize, status: r.status });
-              if (r.status === 'credited') {
-                auditEconomyCredit(winnerUid, 'SPINGO_PRIZE_CREDIT', prize, 0, { tableId, multiplier });
-                pushProgressToUser(winnerUid, { fresh: true }).catch(() => { /* best-effort */ });
-              }
-            })
+          addChipsToUser(winnerUid, prize)
+            .then((ok) => auditLog(winner.playerName, ok ? 'SPINGO_PRIZE' : 'SPINGO_PRIZE_FAILED', { userId: winnerUid, tableId, multiplier, prize }))
             .catch((e) => console.warn(`[spinGo prize ${winnerUid}]`, e?.message));
         }
 

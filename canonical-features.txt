@@ -881,9 +881,8 @@ user_chip_wins
 season_award_runs
 seasonRewardAwarded
 meta.seasonEndsAt = endsAt;
-# ECON-17 / ECON-18: one-transaction settlements; large credits audited; the Spin & Go prize pays once.
+# ECON-17 / ECON-18: one-transaction settlements; large credits audited (the Spin & Go prize is S1's prize ledger).
 ECON_LARGE_CREDIT
-spingo:${tableId}
 # ECON-14 / APPUI-43 / APPUI-45: social bracket + prediction betting rules.
 organizer_cannot_bet
 player_cannot_bet
