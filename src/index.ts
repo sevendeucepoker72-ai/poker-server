@@ -46,6 +46,7 @@ import { HandRank } from './game/HandEvaluator';
 import { getFullTrainingData } from './training/TrainingEngine';
 import { insuranceSettlementDelta, priceInsuranceQuote, InsuranceQuote } from './game/insurance';
 import { validateTableConfig, validateChallengeStakes } from './game/tableConfigValidation';
+import { createWindowRateLimiter } from './auth/rateLimit';
 import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
@@ -6743,6 +6744,17 @@ function settleInsuranceForHand(tableId: string, table: PokerTable, totalWonPerS
   broadcastGameState(tableId); // reflect the adjusted stack to all clients
 }
 
+// ========== Battle pass season (R1 2026-10-11 — AUTH-5 / ECON-2) ==========
+// The ONE battle-pass season the server pays. claimBattlePassTier used the
+// CLIENT's seasonId as the claim key, and the tier unlock is cumulative XP
+// (it never resets), so every new seasonId re-claimed all 50 tiers (~32.5k
+// chips + 4k XP each). The client's seasonId is now ignored for the claim key,
+// the unlock check and the claims a client is shown (getDurableState). A new
+// season is a deliberate server change here — with its own XP baseline.
+const CURRENT_BATTLE_PASS_SEASON = 'season_1_the_river';
+// A full "Claim all" is <= 100 emits (50 tiers x 2 tracks): 110 per minute per account.
+const battlePassClaimLimiter = createWindowRateLimiter(110, 60_000);
+
 function cleanupQuickTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (table) {
@@ -11467,8 +11479,15 @@ Give feedback in this JSON format:
     try {
       const ctx = await ensureHydrated(socket);
       if (!ctx) { socket.emit('battlePassTierClaimed', { success: false, error: 'Not authenticated' }); return; }
+      // R1 (AUTH-5 / ECON-2) — per account, before any claim work.
+      if (!battlePassClaimLimiter.hit(String(ctx.userId))) {
+        socket.emit('battlePassTierClaimed', { success: false, error: 'rate_limited', tierId: Number(data?.tierId) || undefined });
+        return;
+      }
 
-      const seasonId = data?.seasonId || 'season_1_the_river';
+      // R1 (AUTH-5 / ECON-2) — the SERVER's season, never the client's
+      // seasonId (a new id per request re-claimed every tier).
+      const seasonId = CURRENT_BATTLE_PASS_SEASON;
       const tierId = Number(data?.tierId);
       if (!Number.isInteger(tierId) || tierId < 1 || tierId > 50) {
         socket.emit('battlePassTierClaimed', { success: false, error: 'invalid_tier' });
@@ -11611,7 +11630,7 @@ Give feedback in this JSON format:
       if (!ctx) return;
       const [inventory, bpClaims, durable, handHistory, careerProgress] = await Promise.all([
         loadInventory(ctx.userId),
-        loadBattlePassClaims(ctx.userId, data.seasonId || 'season_1_the_river'),
+        loadBattlePassClaims(ctx.userId, CURRENT_BATTLE_PASS_SEASON),   // R1 — the server's season (client seasonId ignored)
         loadDurableProgress(ctx.userId),
         loadHandHistory(ctx.userId, 100),
         loadCareerProgress(ctx.userId),

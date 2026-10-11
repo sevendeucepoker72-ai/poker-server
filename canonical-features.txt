@@ -734,3 +734,10 @@ scheduled_table_config_refused
 MIN_BUY_IN_BIG_BLINDS
 [chip-amount-refused]
 if (!allowBelowMin && (buyIn <= 0 || !Number.isInteger(buyIn)))
+#
+# 2026-10-11 (R1, H2) — AUTH-5 / ECON-2 (P0): the battle pass pays ONE server
+# season — the client's seasonId is ignored (claim key, unlock, claims shown);
+# claims are rate-limited per account.
+const seasonId = CURRENT_BATTLE_PASS_SEASON;
+.loadBattlePassClaims)(ctx.userId, CURRENT_BATTLE_PASS_SEASON)
+battlePassClaimLimiter.hit(String(ctx.userId))
