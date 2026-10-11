@@ -847,3 +847,10 @@ insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
 
 # 2026-10-11 R1 review (R1REV-2 / GAME-13): the waitlist deep link finds Hold'em tables by the table LIST variant
 waitlistHoldemByListVariant
+#
+# 2026-10-11 (R2, S1) — OPS-6: every per-IP check (connection cap, same-network
+# seat block, qualifier device cap, IP ban) keys on the REAL client address:
+# X-Real-IP first (Railway's edge overwrites it), then the first X-Forwarded-For.
+headers['x-real-ip']
+const clientIp = realClientIp(socket);
+const regIp = realClientIp(socket);

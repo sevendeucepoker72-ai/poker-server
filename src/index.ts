@@ -93,6 +93,7 @@ import { notifyPlayer } from './notifyClient';
 // (sync + async errors caught, non-object payloads refused before the body) and
 // the process logs unhandled rejections / flushes then exits on an uncaught one.
 import { installSocketListenerGuard, socketGuardStats } from './socketGuard';
+import { clientIpFromHandshake } from './net/clientIp';
 import { installProcessCrashHandlers, processCrashStats, CRASH_FLUSH_TIMEOUT_MS } from './processGuards';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
 // being migrated to log.debug so they mute under production pino level
@@ -1934,12 +1935,12 @@ function maintenanceBlocksLogin(isAdmin: boolean): boolean {
 // Resolve the REAL client IP. Railway (and most PaaS) put an edge proxy in
 // front, so socket.handshake.address is the proxy hop, not the client — an IP
 // ban on that would be ineffective or over-broad (banning a shared upstream
-// that many users share). Prefer the first X-Forwarded-For entry (the original
-// client), fall back to the socket address.
+// that many users share). 2026-10-11 (R2, OPS-6): X-Real-IP first (the edge
+// overwrites it), then the first X-Forwarded-For entry, then the socket
+// address — see src/net/clientIp.ts. Used by the IP ban, the per-IP
+// connection cap, the same-network seat block and the qualifier device cap.
 function realClientIp(socket: Socket): string {
-  const xff = socket.handshake.headers['x-forwarded-for'];
-  const first = Array.isArray(xff) ? xff[0] : (typeof xff === 'string' ? xff.split(',')[0] : '');
-  return (first || '').trim() || socket.handshake.address || '';
+  return clientIpFromHandshake(socket.handshake as any);
 }
 
 /**
@@ -6883,8 +6884,10 @@ io.on('connection', (socket: Socket) => {
       if (Sentry) Sentry.captureException(err, { tags: { area: 'socket.handler', event } });
     },
   });
-  // Per-IP connection limit
-  const clientIp = socket.handshake.address;
+  // Per-IP connection limit — R2 (OPS-6): keyed on the REAL client address
+  // (realClientIp), not the Railway proxy hop (which made the cap do nothing).
+  // Also the key of the same-network seat block (ipSeatedSlots) below.
+  const clientIp = realClientIp(socket);
   if (!ipConnections.has(clientIp)) ipConnections.set(clientIp, new Set());
   const ipSockets = ipConnections.get(clientIp)!;
   if (ipSockets.size >= MAX_CONNECTIONS_PER_IP) {
@@ -6893,8 +6896,8 @@ io.on('connection', (socket: Socket) => {
     return;
   }
   // Batch 5: reject IP-banned addresses (in-memory admin incident tool). Match
-  // on the real client IP (X-Forwarded-For aware), not the proxy hop.
-  if (bannedIPs.has(realClientIp(socket))) {
+  // on the real client IP (X-Real-IP / X-Forwarded-For aware), not the proxy hop.
+  if (bannedIPs.has(clientIp)) {
     socket.emit('error', { message: 'Access denied' });
     socket.disconnect(true);
     return;
@@ -7354,8 +7357,9 @@ io.on('connection', (socket: Socket) => {
       socket.emit('qualifierRegistrationResult', { success: false, error: 'Re-entry not available at this time' });
       return;
     }
-    // IP duplicate check — prevent multi-accounting from same device
-    const regIp = socket.handshake.address;
+    // IP duplicate check — prevent multi-accounting from same device. R2 (OPS-6):
+    // the REAL client address (realClientIp), never the Railway proxy hop.
+    const regIp = realClientIp(socket);
     const sameIpCount = qt.players.filter(p => (p as any).ip === regIp).length;
     if (sameIpCount >= 2) {
       socket.emit('qualifierRegistrationResult', { success: false, error: 'Too many registrations from this device' });
