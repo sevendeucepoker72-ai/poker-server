@@ -601,7 +601,8 @@ export class TournamentManager {
     if (t.blindTimer) { clearTimeout(t.blindTimer); t.blindTimer = null; }
     return t.players.map((p) => ({
       playerId: p.playerId, userId: p.userId, ...(p.entryId ? { entryId: p.entryId } : {}),
-      refund: fee > 0 && p.userId !== undefined ? fee : 0,
+      // A DISQUALIFIED entrant (suspended mid-tournament) is never paid — not even his fee back (2026-10-09 S4 rule).
+      refund: fee > 0 && p.userId !== undefined && !p.disqualified ? fee : 0,
     }));
   }
 

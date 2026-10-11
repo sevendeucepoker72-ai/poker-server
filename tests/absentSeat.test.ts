@@ -263,6 +263,7 @@ function world(opts: WorldOpts = {}) {
     syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {},
     // R2 (S1): the Spin & Go (prize format) helpers the leave / reservation paths ask.
     isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false, emitGameState() {},
+    shutdownFlushActive: () => false,   // R2 (item 1) — the shutdown flush is not running
     getGameStateForPlayer: () => ({}), scheduleAIAction() {}, log: { debug() {}, info() {} },
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
     auditLog: (actor: string, action: string, d: any) => { audits.push({ actor, action, d }); },
@@ -884,8 +885,9 @@ describe('U3 — a table break never credits a tournament reservation (isTournam
     expect(fnSrc('function tickReservedSeatHands(')).toContain('if (isTournamentReservation(reserved)) {');
     expect(P.departure).toContain('if (isTournamentReservation(reserved)) {');   // P4: the disconnect's reservation function
     expect(P.disconnect).toContain('reserveSeatForDeparture(authSession, session, table, seat);');
-    expect(slice('// 2. Cash out every reserved seat (disconnected but not yet expired).', '// 3. Flush every pending debounced hand-snapshot'))
-      .toContain('!isTournamentReservation(reserved)');
+    // R2 (item 1, 2026-10-11): the shutdown flush's reserved-seat claim (claimSeatsForShutdown).
+    expect(fnSrc('function claimSeatsForShutdown('))
+      .toContain('if (isTournamentReservation(reserved)) { shutdownFlushStats.seatsNotCashed++; continue; }');
   });
 });
 

@@ -998,3 +998,23 @@ while (levels[levels.length - 1].bb < 4 * stack && levels.length < 60)
 runtimeTableId = await ensureClubRuntimeTable(clubTable);
 event: 'club_table_runtime_recreated'
 code: 'club_table_unavailable'
+#
+# 2026-10-11 (R2, S1) — item 1 (GAME-3 / OPS-2 / TOURNEY-4): the shutdown /
+# crash flush CLAIMS every seat synchronously (main, extra-table, reserved,
+# after-hand removal — once each, never a tournament / Spin & Go stack) while
+# every other cash-out path and new buy-ins stand down, settles the wallet
+# credits in ONE ledger settlement, refunds buy-in tournament entry fees
+# (registering cancelled, running voided), club tournaments, staking escrow,
+# Spin & Go fees and qualifier credits — bounded.
+function shutdownFlushActive()
+`shutdown:${PROCESS_INSTANCE_ID}:${c.tableId}:${c.seatIndex}`
+take(auth.userId, ms.tableId, ms.seatIndex, 'extra_table', ms.playerId)
+take(w.userId, tableId, seatIndex, 'leave_after_hand', w.playerId);
+const regs = tournamentManager.voidRunningTournament(tid);
+`tfee:${tid}:${r.playerId}`
+releaseQualifierRegistration(qualId, qt, p, 'server_restart')
+refundQuickEntryFee(tableId, qg, 'server_restart')
+reason = 'server_restarting';
+code: 'server_restarting'
+'CASH_OUT_LEFT_TO_SHUTDOWN_FLUSH'
+'SHUTDOWN_FLUSH'

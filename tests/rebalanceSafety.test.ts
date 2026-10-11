@@ -249,6 +249,7 @@ function world(opts: {
     syncSitOutToTable() {}, broadcastGameState() {}, scheduleAIAction() {}, releaseSeatedSlot() {}, cleanupQuickTable() {},
     // R2 (S1): the Spin & Go (prize format) helpers the leave / reservation paths ask.
     isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false,
+    shutdownFlushActive: () => false,   // R2 (item 1) — the shutdown flush is not running
     getGameStateForPlayer: () => ({}), emitGameState() {}, notifyPlayer: async () => {}, userIdForSeat: () => undefined,
     ensureTableProgressListener() {}, activateBombPotIfPending() {},
     dealersChoiceState: new Map(), bombPotActive: new Map(), bombPotPending: new Map(), insuranceCashouts: new Map(),

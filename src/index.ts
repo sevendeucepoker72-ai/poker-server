@@ -1091,6 +1091,9 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // master account's split local rows into one, and the goodwill grant pays
   // 50,000 chips per person: both are chip + identity mutations.
   'ACCOUNT_MERGE', 'GOODWILL_CHIP_GRANT', 'ACHIEVEMENT_BACKFILL',
+  // 2026-10-11 (.online R2, item 1) — one row per shutdown / crash flush: what it
+  // cashed out and refunded (each credit's own durable row is in prize_payouts).
+  'SHUTDOWN_FLUSH',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -1581,7 +1584,12 @@ async function buyInSocketGone(
   expect?: BuyInExpectation,
 ): Promise<boolean> {
   let reason = 'socket_gone';
-  if (socket.connected) {
+  if (shutdownFlushActive()) {
+    // R2 (item 1) — the shutdown flush claimed the seats while this buy-in
+    // awaited: it seats nothing (its stack would be in no flush) and the
+    // deducted buy-in goes back once.
+    reason = 'server_restarting';
+  } else if (socket.connected) {
     const changed = expect ? buyInStateChanged(socket, expect) : null;
     if (!changed) return false;
     reason = changed;
@@ -1927,6 +1935,12 @@ function pushActivity(text: string): void {
 // hot game-entry handlers cheaply; an admin who needs to test simply turns
 // maintenance back off from the admin app.
 function blockedByMaintenance(socket: Socket): boolean {
+  // R2 (item 1) — the shutdown / crash flush has claimed every seat: no new
+  // buy-in may start (its stack would not be in the flush).
+  if (shutdownFlushActive()) {
+    socket.emit('error', { message: 'The server is restarting — please try again in a moment.', code: 'server_restarting' });
+    return true;
+  }
   if (!maintenanceMode) return false;
   socket.emit('maintenanceMode', { enabled: true });
   socket.emit('error', { message: 'The server is under maintenance. New games are paused — please try again shortly.' });
@@ -2701,6 +2715,8 @@ interface QualifierRegistrant {
   ip?: string;
   reEntries?: number;
   consumedCreditId?: string;
+  /** R2 — the credits his RE-ENTRIES consumed (refunded if the event dies with the process — the shutdown flush). */
+  reentryCreditIds?: string[];
   registeredAt?: number;
 }
 
@@ -2945,12 +2961,14 @@ function qualifierList(viewerMasterId: string | null, now: number = Date.now()):
  */
 function releaseQualifierRegistration(qualId: string, qt: QualifierTournamentReg, p: QualifierRegistrant, reason: string): Promise<unknown> {
   const tasks: Promise<unknown>[] = [];
-  if (p.consumedCreditId) {
-    const cid = p.consumedCreditId;
-    p.consumedCreditId = undefined;
+  // Every credit this registration consumed: its entry, and (the shutdown flush) its re-entries.
+  const creditIds = [...(p.consumedCreditId ? [p.consumedCreditId] : []), ...(p.reentryCreditIds || [])];
+  p.consumedCreditId = undefined;
+  p.reentryCreditIds = [];
+  for (const cid of creditIds) {
     tasks.push(refundQualifierCreditOnMaster(cid)
       .then((refunded) => auditLog(p.playerId, refunded ? 'QUALIFIER_CREDIT_REFUND' : 'QUALIFIER_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: cid, reason }))
-      .catch(() => { /* audited on the false branch */ }));
+      .catch(() => auditLog(p.playerId, 'QUALIFIER_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: cid, reason })));
   }
   if (qt.masterQualifierId && p.masterPlayerId) {
     const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
@@ -7522,6 +7540,10 @@ interface QuickGameState {
   challengeId?: number;
   /** Format-specific end (career progress + reward). */
   onEnd?: (outcome: { winnerSeat: number | null; humanWon: boolean }) => void;
+  /** R2 — the decided outcome, settled after QUICK_GAME_RESULT_DELAY_MS (the shutdown flush settles it at once). */
+  decided?: { winnerSeat: number | null; humanWon: boolean };
+  /** finishQuickGame ran (its result + settlement happen once). */
+  finished?: boolean;
 }
 const quickGames = new Map<string, QuickGameState>();
 const quickGameStats = {
@@ -7630,6 +7652,7 @@ function quickGameEndCheck(tableId: string, via: string): boolean {
     humanWon: outcome.humanWon, reason: outcome.reason, timeUp: !!qg.timeUp,
   })}`);
   const decided = { winnerSeat: outcome.winnerSeat, humanWon: outcome.humanWon };
+  qg.decided = decided;
   const t = setTimeout(() => finishQuickGame(tableId, decided), QUICK_GAME_RESULT_DELAY_MS);
   (t as any)?.unref?.();
   return true;
@@ -7658,7 +7681,8 @@ function emitQuickGameEvent(tableId: string, qg: QuickGameState, event: string, 
 /** The result + the settlement of an ended quick game, then the table goes. */
 function finishQuickGame(tableId: string, outcome: { winnerSeat: number | null; humanWon: boolean }): void {
   const qg = quickGames.get(tableId);
-  if (!qg) return;
+  if (!qg || qg.finished) return;
+  qg.finished = true;   // once (the shutdown flush may settle a decided game before its timer)
   const table = tableManager.getTable(tableId);
   const winnerSeat = outcome.winnerSeat !== null && table ? table.seats[outcome.winnerSeat] : undefined;
   const winnerName = winnerSeat && winnerSeat.state === 'occupied' ? winnerSeat.playerName : '';
@@ -8339,6 +8363,7 @@ io.on('connection', (socket: Socket) => {
         // Bump in-memory re-entry counter — survives until the qt is
         // garbage-collected on tournament finish.
         (existingEntry as any).reEntries = priorReEntries + 1;
+        if (consumedCreditId) (existingEntry.reentryCreditIds ||= []).push(consumedCreditId);   // R2 — refundable by the shutdown flush
         // R2 — the table he now sits at (it used to broadcast the FIRST table, wherever he was seated).
         const reentryTableId = playerSessions.get(socket.id)?.tableId || tournament.tableIds[0];
         socket.emit('qualifierRegistrationResult', {
@@ -17032,6 +17057,13 @@ function creditSeatStackToWallet(
 ): void {
   const chips = (seat && seat.chipCount) || 0;
   if (chips <= 0) return;
+  // R2 (item 1, GAME-3 / OPS-2) — the shutdown / crash flush OWNS every seat's
+  // chips from the moment it starts (it claimed each seat once): no other path
+  // credits one again.
+  if (shutdownFlushActive()) {
+    auditLog(username, 'CASH_OUT_LEFT_TO_SHUTDOWN_FLUSH', { userId, tableId, reason, chips });
+    return;
+  }
   // 2026-06-11 audit (tournament economy): NEVER credit a tournament-table
   // stack to the wallet. Tournament stacks are tournament chips, not
   // wallet-funded — entry is a separate buy-in/fee and payouts come from the
@@ -17107,6 +17139,7 @@ function reserveSeatForDeparture(
   if (existing) clearTimeout(existing.cleanupTimer);
 
   const cleanupTimer = setTimeout(() => {
+    if (shutdownFlushActive()) return;   // R2 — the shutdown flush credits reserved seats (once)
     const reserved = reservedSeats.get(authSession.userId);
     if (reserved) {
       // 2026-10-09 (T1) — a TOURNAMENT seat is never cashed out to the
@@ -21203,111 +21236,313 @@ function gracefulShutdown(signal: string, exitCode: number = 0): Promise<void> {
   shutdownPromise = runGracefulShutdown(signal);
   return shutdownPromise;
 }
+
+/**
+ * R2 (2026-10-11, GAME-3 P0 / OPS-2 / TOURNEY-4 + the sign-in reviewer's
+ * race) — from the moment the flush starts it OWNS every seat's chips. It used
+ * to credit only the main seats and the reservations, one await at a time:
+ * extra-table seats (multi-table) and seats waiting for their after-hand
+ * removal were never credited (a redeploy destroyed them), buy-in tournament
+ * entry fees and consumed qualifier credits died with the process, and while
+ * it awaited, a leaveTable or a reservation expiry could credit the same seat
+ * again. Now:
+ *   0. CLAIM — synchronously, before the first await: every creditable seat
+ *      once (main, extra-table, reserved, after-hand removal; deduped by
+ *      table:seat; never a tournament or Spin & Go stack), its chips zeroed and
+ *      every claim that could credit it later ended (session, extra-table
+ *      session, reservation + its timer, pending removal) — and
+ *      `shutdownFlushActive()` makes creditSeatStackToWallet, the reservation
+ *      expiry, the buy-in paths (buyInSocketGone) and new buy-ins
+ *      (blockedByMaintenance) stand down. Registering buy-in tournaments are
+ *      cancelled and running ones voided (their entry fees owed), open Spin &
+ *      Go games refunded their fee (a decided one settled), every qualifier
+ *      registration released (consumed credits refunded).
+ *   1. the wallet credits — seat cash-outs + entry fees — in ONE prize-ledger
+ *      settlement (idempotent keys, retried; the prize_payouts rows are the
+ *      durable audit); club tournaments through their own (one outcome);
+ *   2. staking escrow, Spin & Go fees, qualifier credits — concurrently;
+ *   3. one more try for any pending settlement; 4. progress; 5. snapshots —
+ *   every phase bounded (SHUTDOWN_FLUSH_BUDGET_MS in all, inside the crash
+ *   handler's 20s and Railway's ~30s).
+ */
+let shutdownFlushing = false;
+function shutdownFlushActive(): boolean {
+  return shutdownFlushing;
+}
+const SHUTDOWN_FLUSH_BUDGET_MS = 15_000;
+/** This process's id — the shutdown ledger keys (a flush credits a seat once, ever). */
+const PROCESS_INSTANCE_ID = uuidv4();
+const shutdownFlushStats = {
+  seatsCashedOut: 0, chipsCashedOut: 0, seatsNotCashed: 0, tournamentsCancelled: 0, tournamentsVoided: 0,
+  entryFeesRefunded: 0, clubTournamentsRefunded: 0, qualifierRegistrationsReleased: 0, spinGoFeesRefunded: 0,
+  spinGoSettled: 0, ledgerStatus: '' as string, phasesCutShort: 0,
+};
+
+interface ShutdownSeatCredit { userId: number; amount: number; tableId: string; seatIndex: number; via: string; invested: number }
+
+/**
+ * Phase 0a (synchronous) — every creditable seat claimed ONCE: what to credit,
+ * and whose progress to save. See runGracefulShutdown.
+ */
+function claimSeatsForShutdown(): { credits: ShutdownSeatCredit[]; progress: Array<{ userId: number; playerId: string }> } {
+  const credits: ShutdownSeatCredit[] = [];
+  const progress: Array<{ userId: number; playerId: string }> = [];
+  // 2026-06-11 audit C3: dedupe by PHYSICAL seat (tableId:seatIndex) — a seat
+  // referenced by two sessions / a session + a reservation is credited once; a
+  // legitimately multi-seated user is paid for each of his seats.
+  const creditedSeats = new Set<string>();
+  const take = (userId: number, tableId: string, seatIndex: number, via: string, expectPlayerId?: string, fallbackChips?: number): void => {
+    const seatKey = `${tableId}:${seatIndex}`;
+    if (creditedSeats.has(seatKey) || !(userId > 0)) return;
+    // Tournament stacks are NOT wallet-funded (a mint) — the tournament's entry
+    // fees are refunded instead; a Spin & Go stack is its prize format's (the
+    // fee is refunded). F2: a table a rebalance just broke counts.
+    if (isTournamentTable(tableId) || isPrizeFormatTable(tableId)) { creditedSeats.add(seatKey); shutdownFlushStats.seatsNotCashed++; return; }
+    const table = tableManager.getTable(tableId);
+    const seat = table?.seats?.[seatIndex];
+    if (seat && (seat.state !== 'occupied' || seat.isAI)) return;
+    if (seat && expectPlayerId && seat.playerId !== expectPlayerId) return;
+    // 2026-07-01 audit #1: mid-hand the pot is not awarded yet — the hand is
+    // abandoned and every seat gets stack + what it put in this hand
+    // (chip-conserving). INVARIANT: if table ids ever become stable so a hand
+    // is rehydrated, drop the investment term (it would double-credit).
+    const inHand = !!table && table.isHandInProgress();
+    const invested = seat && inHand ? (seat.totalInvestedThisHand || 0) : 0;
+    const amount = seat ? (seat.chipCount || 0) + invested : Math.max(0, Math.floor(Number(fallbackChips) || 0));
+    creditedSeats.add(seatKey);
+    if (seat) {
+      // Nothing is left on the seat for any other path to credit.
+      seat.chipCount = 0;
+      if (inHand) seat.totalInvestedThisHand = 0;
+    }
+    if (amount > 0) credits.push({ userId, amount, tableId, seatIndex, via, invested });
+  };
+  // Main seats (and whose progress to save).
+  for (const [socketId, session] of [...playerSessions]) {
+    const auth = authSessions.get(socketId);
+    if (auth) {
+      if (session.playerId) progress.push({ userId: auth.userId, playerId: session.playerId });
+      const table = tableManager.getTable(session.tableId);
+      const seat = table?.seats?.[session.seatIndex];
+      const seatKey = `${session.tableId}:${session.seatIndex}`;
+      if (seat && seat.state === 'occupied' && !creditedSeats.has(seatKey) && !isTournamentTable(session.tableId)) {
+        take(auth.userId, session.tableId, session.seatIndex, 'seated', session.playerId);
+      }
+    }
+    playerSessions.delete(socketId);
+  }
+  // Extra-table seats (multi-table) — never credited before R2.
+  for (const [socketId, list] of [...multiTableSessions]) {
+    const auth = authSessions.get(socketId);
+    if (auth) for (const ms of list || []) take(auth.userId, ms.tableId, ms.seatIndex, 'extra_table', ms.playerId);
+    multiTableSessions.delete(socketId);
+  }
+  // Reserved seats (disconnected, not expired) — their expiry timers end here.
+  for (const [userId, reserved] of [...reservedSeats]) {
+    clearTimeout(reserved.cleanupTimer);
+    reservedSeats.delete(userId);
+    // T1: isTournamentReservation also covers a table a break took out of tournamentTables.
+    if (isTournamentReservation(reserved)) { shutdownFlushStats.seatsNotCashed++; continue; }
+    take(userId, reserved.tableId, reserved.seatIndex, 'reserved', undefined, reserved.chips);
+  }
+  // Seats waiting for their after-hand removal (a leaver folded with chips in
+  // the pot) — never credited before R2. S2's entries may carry `noCredit`
+  // (nothing owed) and the seat's `playerId` (credited only if it still holds it).
+  for (const [tableId, pend] of [...pendingSeatRemovalAfterHand]) {
+    for (const [seatIndex, who] of pend) {
+      const w = who as { userId: number; noCredit?: boolean; playerId?: string };
+      if (w.noCredit || !(w.userId > 0)) continue;
+      take(w.userId, tableId, seatIndex, 'leave_after_hand', w.playerId);
+    }
+    pendingSeatRemovalAfterHand.delete(tableId);
+  }
+  return { credits, progress };
+}
+
+/**
+ * Phase 0b (synchronous) — the money that lives only in this process's
+ * tournaments: every REGISTERING buy-in tournament cancelled and every RUNNING
+ * one voided (no prize can follow), each paying entrant's fee owed (a club
+ * tournament's through its own settlement — one outcome); staking escrow of
+ * every such tournament to refund; registrants told (tournamentCancelled).
+ */
+function claimTournamentRefundsForShutdown(): {
+  entryFees: LedgerCredit[]; clubRefunds: Array<{ clubTid: number; liveId: string; entrants: Array<{ userId: number; amount: number }> }>; stakes: string[];
+} {
+  const entryFees: LedgerCredit[] = [];
+  const clubRefunds: Array<{ clubTid: number; liveId: string; entrants: Array<{ userId: number; amount: number }> }> = [];
+  const stakes: string[] = [];
+  const owe = (tid: string, regs: Array<{ playerId: string; userId?: number; refund: number }>) => {
+    const clubTid = clubLiveTournaments.get(tid);
+    const owed = regs.filter((r) => r.userId !== undefined && r.refund > 0);
+    if (clubTid !== undefined) {
+      clubRefunds.push({ clubTid, liveId: tid, entrants: owed.map((r) => ({ userId: r.userId as number, amount: r.refund })) });
+    } else {
+      for (const r of owed) {
+        entryFees.push({
+          key: `tfee:${tid}:${r.playerId}`, userId: r.userId as number, amount: r.refund, kind: 'TOURNAMENT_ENTRY_REFUND',
+          details: { tournamentId: tid, reason: 'server_restart' },
+        });
+      }
+    }
+    for (const r of regs) { try { tellTournamentCancelled(tid, r, 'server_restart'); } catch { /* the sockets are going anyway */ } }
+  };
+  for (const tid of tournamentManager.tournamentIdsWithStatus('registering')) {
+    stakes.push(tid);
+    const regs = tournamentManager.cancelTournament(tid);
+    if (regs.length > 0) shutdownFlushStats.tournamentsCancelled++;
+    owe(tid, regs);
+  }
+  for (const tid of tournamentManager.tournamentIdsWithStatus('running')) {
+    stakes.push(tid);
+    const regs = tournamentManager.voidRunningTournament(tid);
+    shutdownFlushStats.tournamentsVoided++;
+    owe(tid, regs);
+  }
+  return { entryFees, clubRefunds, stakes };
+}
+
+/**
+ * Phase 0c (synchronous claim, async work) — open Spin & Go games: an
+ * undecided one refunds its fee (its stack is never cashed), a decided one
+ * settles now (its prize, or nothing); every qualifier registration of an
+ * event that dies with the process is released — every consumed credit
+ * (entry + re-entries) refunded on the master, its master row dropped — and a
+ * re-entry chip buy-in owed back. Returns the async work.
+ */
+function claimQuickAndQualifierRefundsForShutdown(entryFees: LedgerCredit[]): Promise<unknown>[] {
+  const tasks: Promise<unknown>[] = [];
+  for (const [tableId, qg] of [...quickGames]) {
+    if (qg.format !== 'spinGo' || qg.settlement !== 'open') continue;
+    if (qg.ended && qg.decided) { finishQuickGame(tableId, qg.decided); shutdownFlushStats.spinGoSettled++; continue; }
+    shutdownFlushStats.spinGoFeesRefunded++;
+    tasks.push(refundQuickEntryFee(tableId, qg, 'server_restart'));
+  }
+  for (const [qualId, qt] of [...qualifierTournaments]) {
+    if (qt.status === 'finished') continue;
+    for (const p of qt.players) {
+      shutdownFlushStats.qualifierRegistrationsReleased++;
+      tasks.push(releaseQualifierRegistration(qualId, qt, p, 'server_restart'));
+      const rebuys = Math.max(0, Math.floor(Number(p.reEntries) || 0)) * Math.max(0, Math.floor(Number(qt.buyIn) || 0));
+      if (rebuys > 0 && p.localUserId) {
+        entryFees.push({
+          key: `qrebuy:${qualId}:${p.playerId}:${PROCESS_INSTANCE_ID}`, userId: p.localUserId, amount: rebuys, kind: 'QUALIFIER_REENTRY_BUYIN_REFUND',
+          details: { qualifierId: qualId, reEntries: p.reEntries, reason: 'server_restart' },
+        });
+      }
+    }
+    qt.status = 'finished';
+    qt.cancelled = true;
+    qt.finishedAt = Date.now();
+  }
+  return tasks;
+}
+
+/** Phase 1 — the seat cash-outs + entry fees: ONE ledger settlement (idempotent, retried). */
+async function settleShutdownCredits(seats: ShutdownSeatCredit[], entryFees: LedgerCredit[]): Promise<void> {
+  const credits: LedgerCredit[] = [
+    ...seats.map((c) => ({
+      key: `shutdown:${PROCESS_INSTANCE_ID}:${c.tableId}:${c.seatIndex}`, userId: c.userId, amount: c.amount, kind: 'SHUTDOWN_CASH_OUT',
+      details: { tableId: c.tableId, seatIndex: c.seatIndex, via: c.via, ...(c.invested > 0 ? { pot: c.invested } : {}) },
+    })),
+    ...entryFees,
+  ];
+  if (credits.length === 0) { shutdownFlushStats.ledgerStatus = 'nothing_owed'; return; }
+  const r = await prizeLedger.settle({ label: `shutdown:${PROCESS_INSTANCE_ID}`, credits });
+  shutdownFlushStats.ledgerStatus = r.status;
+  for (const c of r.paid) {
+    if (c.kind === 'SHUTDOWN_CASH_OUT') { shutdownFlushStats.seatsCashedOut++; shutdownFlushStats.chipsCashedOut += c.amount; }
+    else shutdownFlushStats.entryFeesRefunded++;
+    console.log(`[Shutdown] ${c.kind} ${c.amount} for user ${c.userId} ${JSON.stringify(c.details || {})}`);
+  }
+  if (r.status !== 'committed') {
+    // Never silent: every credit the flush could not settle is in the log (and Sentry) to reconcile.
+    for (const c of credits) console.error(`[Shutdown] NOT SETTLED ${c.kind} ${c.amount} for user ${c.userId} ${JSON.stringify(c.details || {})}`);
+    if (Sentry) Sentry.captureMessage(`shutdown flush: ${credits.length} credit(s) not settled (${r.error || r.status})`);
+  }
+}
+
+/** Phase 4 — progress (xp / level / achievements / stats) of every seated account (once each). */
+async function flushProgressForShutdown(progress: Array<{ userId: number; playerId: string }>): Promise<void> {
+  const seen = new Set<number>();
+  for (const { userId, playerId } of progress) {
+    if (seen.has(userId)) continue;
+    seen.add(userId);
+    try {
+      const prog = progressionManager.getClientProgress(playerId) as any;
+      if (!prog || !prog.hydrated) continue;
+      await saveProgress(userId, {
+        xp: prog.xp,
+        level: prog.level,
+        achievements: prog.achievements || [],
+        stats: {
+          handsPlayed: prog.totalHandsPlayed,
+          handsWon: prog.handsWon,
+          biggestPot: prog.biggestPot,
+          bestStreak: prog.bestStreak,
+          bluffWins: prog.bluffWins,
+          allInWins: prog.allInWins,
+          chatMessagesSent: prog.chatMessagesSent,
+          straightFlushHits: prog.straightFlushHits,
+          fullHouseHits: prog.fullHouseHits,
+          quadsHits: prog.quadsHits,
+          royalFlushHits: prog.royalFlushHits,
+          tournamentsWon: prog.tournamentsWon,
+          tournamentsPlayed: prog.tournamentsPlayed,
+          variantsPlayed: prog.variantsPlayed || [],
+        },
+      });
+    } catch (e: any) {
+      console.warn(`[Shutdown] progress flush failed for user ${userId}:`, e?.message);
+    }
+  }
+}
+
 async function runGracefulShutdown(signal: string): Promise<void> {
   if (shutdownInProgress) return;
   shutdownInProgress = true;
   console.log(`[Shutdown] ${signal} received — preserving player state...`);
+  const deadline = Date.now() + SHUTDOWN_FLUSH_BUDGET_MS;
+  /** Await `work`, but never past the flush budget (the phase is logged as cut short). */
+  const bounded = async (label: string, work: Promise<unknown>): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cut = new Promise<'cut'>((resolve) => { timer = setTimeout(() => resolve('cut'), Math.max(0, deadline - Date.now())); });
+    try {
+      const r = await Promise.race([work.then(() => 'done' as const, (e: any) => { console.warn(`[Shutdown] ${label} failed:`, e?.message || e); return 'done' as const; }), cut]);
+      if (r === 'cut') { shutdownFlushStats.phasesCutShort++; console.error(`[Shutdown] ${label} cut short by the ${SHUTDOWN_FLUSH_BUDGET_MS}ms flush budget`); }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
 
   try {
-    // 1. Cash out every seated human player and flush their progress.
-    const seenUserIds = new Set<number>();
-    // 2026-06-11 audit C3: dedupe the cash-out by PHYSICAL seat
-    // (tableId:seatIndex), not just by userId. seenUserIds prevents the
-    // active-vs-reserved double, but a single seat referenced by two live
-    // sessions (a stale ghost socket + the real one, mid-reconnect) would
-    // otherwise be credited TWICE. Crediting per distinct seat also still
-    // pays a legitimately multi-seated user for each of their seats.
-    const creditedSeats = new Set<string>();
-    for (const [socketId, session] of playerSessions) {
-      try {
-        const auth = authSessions.get(socketId);
-        if (!auth) continue;
-        const table = tableManager.getTable(session.tableId);
-        const seat = table?.seats?.[session.seatIndex];
-        const seatKey = `${session.tableId}:${session.seatIndex}`;
-        // Tournament stacks are NOT wallet-funded — never cash them out (would
-        // mint). They persist with the tournament (or are lost if the
-        // tournament can't rehydrate), but they must not hit the wallet.
-        // F2: a table a rebalance just broke counts (isTournamentTable).
-        if (seat && seat.state === 'occupied' && !creditedSeats.has(seatKey) && !isTournamentTable(session.tableId)) {
-          // 2026-07-01 audit #1: refund the FULL table stake. Mid-hand the pot
-          // has NOT been awarded yet (determineWinners sets phase=HandComplete),
-          // so chips already committed this hand (totalInvestedThisHand) would be
-          // DESTROYED on a mid-hand redeploy — Redis rehydration is dead
-          // (per-process table UUIDs never match a saved snapshot, so nothing
-          // restores them). Abandon the hand and refund stack + investment; this
-          // is chip-conserving (every player gets back exactly what they had on
-          // the table). At HandComplete/WaitingForPlayers the pot is already in
-          // chipCount, so invested is NOT added (would double-credit the winner).
-          //
-          // INVARIANT: if you ever make table IDs stable to revive rehydration,
-          // you MUST drop the totalInvestedThisHand term here — restoring the
-          // hand AND refunding its pot would double-credit.
-          const inHand = !!table && table.isHandInProgress();
-          const invested = inHand ? (seat.totalInvestedThisHand || 0) : 0;
-          const refund = seat.chipCount + invested;
-          if (refund > 0) {
-            creditedSeats.add(seatKey);
-            await addChipsToUser(auth.userId, refund);
-            console.log(`[Shutdown] Cashed out ${refund} chips (stack ${seat.chipCount}${invested > 0 ? ` + pot ${invested}` : ''}) for user ${auth.userId} (seat ${session.seatIndex})`);
-          }
-        }
-        const prog = progressionManager.getClientProgress(session.playerId) as any;
-        if (prog && prog.hydrated) {
-          await saveProgress(auth.userId, {
-            xp: prog.xp,
-            level: prog.level,
-            achievements: prog.achievements || [],
-            stats: {
-              handsPlayed: prog.totalHandsPlayed,
-              handsWon: prog.handsWon,
-              biggestPot: prog.biggestPot,
-              bestStreak: prog.bestStreak,
-              bluffWins: prog.bluffWins,
-              allInWins: prog.allInWins,
-              chatMessagesSent: prog.chatMessagesSent,
-              straightFlushHits: prog.straightFlushHits,
-              fullHouseHits: prog.fullHouseHits,
-              quadsHits: prog.quadsHits,
-              royalFlushHits: prog.royalFlushHits,
-              tournamentsWon: prog.tournamentsWon,
-              tournamentsPlayed: prog.tournamentsPlayed,
-              variantsPlayed: prog.variantsPlayed || [],
-            },
-          });
-        }
-        seenUserIds.add(auth.userId);
-      } catch (e: any) {
-        console.warn(`[Shutdown] flush failed for socket ${socketId}:`, e?.message);
-      }
-    }
+    // 0. CLAIM — synchronously, before the first await (see the header).
+    shutdownFlushing = true;
+    let seats: ReturnType<typeof claimSeatsForShutdown> = { credits: [], progress: [] };
+    let tourneys: ReturnType<typeof claimTournamentRefundsForShutdown> = { entryFees: [], clubRefunds: [], stakes: [] };
+    let sideTasks: Promise<unknown>[] = [];
+    try { seats = claimSeatsForShutdown(); } catch (e: any) { console.error('[Shutdown] seat claim failed:', e?.message || e); }
+    try { tourneys = claimTournamentRefundsForShutdown(); } catch (e: any) { console.error('[Shutdown] tournament claim failed:', e?.message || e); }
+    try { sideTasks = claimQuickAndQualifierRefundsForShutdown(tourneys.entryFees); } catch (e: any) { console.error('[Shutdown] quick / qualifier claim failed:', e?.message || e); }
 
-    // 2. Cash out every reserved seat (disconnected but not yet expired).
-    for (const [userId, reserved] of reservedSeats) {
-      if (seenUserIds.has(userId)) continue;
-      try {
-        const table = tableManager.getTable(reserved.tableId);
-        const seat = table?.seats?.[reserved.seatIndex];
-        // #1: include the in-hand pot investment so a mid-hand redeploy refunds
-        // (not destroys) the reserved player's committed chips. See the seated
-        // loop above for the full rationale + the rehydration invariant.
-        const inHand = !!table && table.isHandInProgress();
-        const invested = inHand ? (seat?.totalInvestedThisHand || 0) : 0;
-        const chips = (seat?.chipCount ?? reserved.chips ?? 0) + invested;
-        const seatKey = `${reserved.tableId}:${reserved.seatIndex}`;
-        // T1: isTournamentReservation also covers a reservation whose table a
-        // tournament table break already took out of tournamentTables.
-        if (chips > 0 && !creditedSeats.has(seatKey) && !isTournamentReservation(reserved)) {
-          creditedSeats.add(seatKey);
-          await addChipsToUser(userId, chips);
-          console.log(`[Shutdown] Cashed out ${chips} reserved chips (invested ${invested}) for user ${userId}`);
-        }
-      } catch (e: any) {
-        console.warn(`[Shutdown] reserved flush failed for user ${userId}:`, e?.message);
-      }
-    }
+    // 1. The wallet credits: seat cash-outs + entry fees in ONE ledger settlement.
+    await bounded('cash-outs', settleShutdownCredits(seats.credits, tourneys.entryFees));
 
-    // 3. Flush every pending debounced hand-snapshot to Redis.
+    // 2. Club tournaments (one outcome each), staking escrow, Spin & Go fees, qualifier credits.
+    shutdownFlushStats.clubTournamentsRefunded += tourneys.clubRefunds.length;
+    await bounded('refunds', Promise.allSettled([
+      ...tourneys.clubRefunds.map((c) => refundClubTournamentEntrants(c.clubTid, c.liveId, c.entrants, 'server_restart')),
+      ...tourneys.stakes.map((tid) => refundStakesOf(tid, 'server_restart')),
+      ...sideTasks,
+    ]));
+
+    // 3. Any settlement still pending (a prize / refund a DB blip delayed): one more try.
+    await bounded('pending settlements', prizeLedger.retryPending());
+
+    // 4. Progress.
+    await bounded('progress', flushProgressForShutdown(seats.progress));
+
+    // 5. Flush every pending debounced hand-snapshot to Redis.
     //    Without this, the last ~100ms of state (the debounce window)
     //    could be lost on restart — the new process would rehydrate
     //    from a snapshot that's one action behind reality. Also
@@ -21321,11 +21556,12 @@ async function runGracefulShutdown(signal: string): Promise<void> {
           snapshotHand(t.tableId, table.serializeSnapshot(), 0); // bypass debounce
         }
       }
-      await flushAllHandSnapshots();
+      await bounded('hand snapshots', flushAllHandSnapshots());
     } catch (e: any) {
       console.warn('[Shutdown] hand-snapshot flush failed:', e?.message);
     }
 
+    auditLog('SYSTEM', 'SHUTDOWN_FLUSH', { signal, instance: PROCESS_INSTANCE_ID, ...shutdownFlushStats });
     console.log('[Shutdown] State preserved. Exiting.');
   } catch (err: any) {
     console.error('[Shutdown] fatal error during flush:', err?.message);
