@@ -219,6 +219,37 @@ export class PokerTable extends EventEmitter {
    */
   public wentToShowdown: boolean = false;
 
+  /**
+   * 2026-10-11 (.online R1, ECON-1 / TABLEUI-1) — the all-in insurance
+   * DECISION WINDOW. runOutBoard() deals every remaining board card in the same
+   * tick the betting closes, so "all-in and called, board not complete" (the
+   * only moment insurance may be offered — R1 contract #1) never existed long
+   * enough for anyone to accept. index.ts installs `runoutHoldDecider`; when the
+   * betting closes with board cards to come, runOutBoard asks it ONCE per hand
+   * whether to HOLD the runout. While held the hand stays on its street with NO
+   * actor (activeSeatIndex -1, so every action, turn timer and auto-act is a
+   * no-op) until index.ts calls releaseRunoutHold() (accept / decline / the
+   * window's timer). A second runOutBoard() while held (the wedge watchdog's
+   * advanceTurn fallback) releases it too, so a lost timer can never wedge the
+   * table. No decider installed (every engine test, every variant table the
+   * decider declines) = unchanged behaviour.
+   */
+  public runoutHoldDecider: ((table: PokerTable) => boolean) | null = null;
+  private _runoutHeld = false;
+  private _runoutHoldAskedForHand = -1;
+
+  /** Is the runout held for an insurance decision right now? */
+  isRunoutHeld(): boolean {
+    return this._runoutHeld;
+  }
+
+  /** End the insurance hold: deal the rest of the board and settle the hand. False when nothing was held. */
+  releaseRunoutHold(): boolean {
+    if (!this._runoutHeld) return false;
+    this.runOutBoard();
+    return true;
+  }
+
   /** Action log for the current hand (for hand history) */
   public actionLog: ActionLogEntry[] = [];
 
@@ -305,6 +336,13 @@ export class PokerTable extends EventEmitter {
     // (human, AI fill, quick-play), not just the lobby-advertised count.
     if (seatIndex >= this.maxOccupiableSeats) return false;
     if (this.seats[seatIndex].state !== 'empty') return false;
+    // 2026-10-11 (.online R1, AUTH-4) — a stack is never negative, NaN or
+    // infinite, and a fresh buy-in is a positive whole number of chips, whatever
+    // the table's minBuyIn says. A private table created with minBuyIn
+    // -1,000,000 seated a NEGATIVE buy-in (its deductChips(-n) had credited the
+    // wallet) — a mint. A relocation (allowBelowMin) may carry a busted 0.
+    if (typeof buyIn !== 'number' || !Number.isFinite(buyIn) || buyIn < 0) return false;
+    if (!allowBelowMin && (buyIn <= 0 || !Number.isInteger(buyIn))) return false;
     // A seat MOVE relocates an existing stack — it is not a fresh buy-in, so it
     // must NOT be blocked by minBuyIn (a player whose stack fell below the
     // minimum after losses would otherwise have their whole stack destroyed
@@ -671,6 +709,7 @@ export class PokerTable extends EventEmitter {
     this.lastAggressorSeat = -1;
     this.actionLog = [];
     this.wentToShowdown = false; // set true only on a contested showdown (>= 2 tabled)
+    this._runoutHeld = false;    // R1 insurance window — never carried into a new hand
 
     // Capture starting chip counts for hand history
     this.startChips = new Map();
@@ -1742,6 +1781,39 @@ export class PokerTable extends EventEmitter {
   }
 
   protected runOutBoard(): void {
+    // 2026-10-11 (R1) — the insurance decision window (see runoutHoldDecider).
+    if (this._runoutHeld) {
+      this._runoutHeld = false; // released (index.ts) or the watchdog's fallback: run out now
+    } else if (
+      this.runoutHoldDecider &&
+      this._runoutHoldAskedForHand !== this.handNumber &&
+      this.communityCards.length < 5
+    ) {
+      this._runoutHoldAskedForHand = this.handNumber;
+      let hold = false;
+      try {
+        hold = this.runoutHoldDecider(this) === true;
+      } catch (e: any) {
+        console.error('[PokerTable] runoutHoldDecider threw (ignored, board runs out):', e?.message || e);
+      }
+      if (hold) {
+        this._runoutHeld = true;
+        this.activeSeatIndex = -1;
+        // The betting is over: nobody may OWE a decision while held. The
+        // closed street's bets are already in the pot (accumulateInvestments),
+        // but currentBetToMatch still held the all-in amount — a watchdog
+        // advanceTurn would have handed the caller a phantom bet to call
+        // (or fold!). With nothing to match, nextActor() finds nobody and the
+        // fallback goes straight to the runout.
+        this.currentBetToMatch = 0;
+        for (const s of this.seats) if (s.state === 'occupied') s.currentBet = 0;
+        // Nobody acts: index.ts's turn timer is disarmed by this turnChanged
+        // (armTurnTimer arms nothing for seat -1) and stateVersion moves on.
+        this.emit('turnChanged', { seatIndex: -1 });
+        this.emit('runoutHeld', { handNumber: this.handNumber });
+        return;
+      }
+    }
     // Deal remaining community cards without betting
     while (this.communityCards.length < 5) {
       const before = this.communityCards.length;
@@ -2141,17 +2213,22 @@ export class PokerTable extends EventEmitter {
       players: this.seats
         .filter(s => s.state === 'occupied' && !s.eliminated)
         .map(s => {
+          // 2026-07-05 audit fix: never expose hole cards for a hand won
+          // uncontested (no showdown) — the winner never showed. Only reveal
+          // non-folded hands when the hand actually reached a contested showdown.
+          // 2026-10-11 (.online R1, TABLEUI-6): nor their STRENGTH — the hand
+          // name was computed for every non-folded seat, so the replay of an
+          // uncontested pot said "Two Pair, Kings and 7s" next to hidden cards
+          // (888 of 8,463 stored records). Masked cards = no hand name.
+          const shown = !s.folded && this.wentToShowdown && s.holeCards.length > 0;
           const allCards = [...s.holeCards, ...this.communityCards];
           // R7: `>= 4` for non-community games so 4-card Badugi evaluates.
-          const handRes = (allCards.length >= 5 || (!this.usesCommunityCards() && s.holeCards.length >= 4)) && !s.folded
+          const handRes = shown && (allCards.length >= 5 || (!this.usesCommunityCards() && s.holeCards.length >= 4))
             ? this.evaluatePlayerHand(s.holeCards, this.communityCards) : null;
           return {
             seatIndex: s.seatIndex,
             name: s.playerName,
-            // 2026-07-05 audit fix: never expose hole cards for a hand won
-            // uncontested (no showdown) — the winner never showed. Only reveal
-            // non-folded hands when the hand actually reached a contested showdown.
-            holeCards: (s.folded || !this.wentToShowdown) ? null : (s.holeCards.length > 0 ? [...s.holeCards] : null),
+            holeCards: shown ? [...s.holeCards] : null,
             startChips: this.startChips.get(s.seatIndex) || 0,
             endChips: s.chipCount,
             actions: this.actionLog

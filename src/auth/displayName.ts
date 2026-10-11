@@ -20,8 +20,11 @@ export const DISPLAY_NAME_RE = /^[A-Za-z0-9 _.'-]+$/;
 export const DISPLAY_NAME_MIN = 2;
 export const DISPLAY_NAME_MAX = 20;
 
+// Merge of R1 lanes (2026-10-11): the SAME phone rule as
+// social/publicIdentity.isPhoneLike (7+ digits anywhere, letters or not), so a
+// seat name and a leaderboard/profile name never disagree about one account.
 function looksLikePhone(v: string): boolean {
-  return !/[A-Za-z]/.test(v) && v.replace(/[^0-9]/g, '').length >= 7;
+  return (v.match(/\d/g) || []).length >= 7;
 }
 
 /** True when `v` may be shown to other players as-is. */

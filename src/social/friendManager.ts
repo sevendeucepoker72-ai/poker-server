@@ -6,6 +6,8 @@
 // 2026-06-18 — Phase 3a of the .online remediation (build the mock features
 // for real). Client: components/ui/FriendSystem.jsx.
 import { getPool } from '../auth/authManager';
+// 2026-10-11 (R1, APPUI-14) — friends see each other's public display name, never users.username.
+import { publicDisplayName } from './publicIdentity';
 
 export interface FriendRow {
   userId: number;
@@ -85,17 +87,17 @@ export async function listFriends(userId: number): Promise<FriendRow[]> {
   const pool = getPool();
   const r = await pool.query(
     `SELECT f.user_lo, f.user_hi, f.requested_by, f.status,
-            u.id AS other_id, u.username AS other_name
+            u.id AS other_id, u.display_name AS other_name
        FROM friendships f
        JOIN users u ON u.id = (CASE WHEN f.user_lo=$1 THEN f.user_hi ELSE f.user_lo END)
       WHERE f.user_lo=$1 OR f.user_hi=$1
-      ORDER BY f.status DESC, u.username ASC`,
+      ORDER BY f.status DESC, LOWER(COALESCE(u.display_name, '')) ASC, u.id ASC`,
     [userId]
   );
   return r.rows.map((row: any) => {
     let status: FriendRow['status'];
     if (row.status === 'accepted') status = 'accepted';
     else status = row.requested_by === userId ? 'pending_out' : 'pending_in';
-    return { userId: row.other_id, username: row.other_name, status };
+    return { userId: row.other_id, username: publicDisplayName(row.other_name), status };
   });
 }

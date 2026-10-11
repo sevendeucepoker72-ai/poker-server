@@ -247,6 +247,15 @@ export class SevenStudTable extends PokerTable {
       return;
     }
 
+    // 2026-10-11 (.online R1, APPUI-2 class) — reveal NOTHING for an
+    // UNCONTESTED pot (everyone else folded): this override used to put the
+    // lone winner's hole cards (down cards included) and his hand's name into
+    // the hand result every player's state carries. The award below is
+    // unchanged; only a CONTESTED showdown (>= 2 tabled) reveals hands — the
+    // base rule, which also lets getGameStateForPlayer show the tabled seats.
+    const contested = evaluations.length >= 2;
+    if (contested) this.wentToShowdown = true;
+
     // Build pot tiers using the manager
     const pots = this.sidePotManager.calculatePots(
       this.seats.filter(s => s.state === 'occupied' && !s.eliminated).map(s => ({
@@ -264,7 +273,7 @@ export class SevenStudTable extends PokerTable {
     const showdownHands: ShowdownHandInfo[] = [];
     const results: HandWinResult[] = [];
 
-    for (const ev of evaluations) {
+    for (const ev of contested ? evaluations : []) {
       const seat = this.seats[ev.seatIndex];
       showdownHands.push({
         seatIndex: ev.seatIndex,
@@ -370,6 +379,11 @@ export class SevenStudTable extends PokerTable {
           }
         }
       }
+    }
+
+    // R1 — an uncontested winner's strength is not public either.
+    if (!contested) {
+      for (const w of winnerInfos) { w.handName = 'Won by fold'; w.bestFiveCards = []; }
     }
 
     this.lastHandResult = {

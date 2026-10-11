@@ -152,6 +152,10 @@ export class OmahaTable extends PokerTable {
         bestFiveCards: [],
       });
     } else {
+      // 2026-10-11 (.online R1, APPUI-2) — a CONTESTED showdown (>= 2 tabled):
+      // the only time hole cards are revealed (the base rule — this override
+      // never set it, so its history showed an UNCONTESTED winner's cards).
+      if (nonFolded.length >= 2) this.wentToShowdown = true;
       // Evaluate all hands for showdown display
       for (const info of nonFolded) {
         const seat = this.seats[info.seatIndex];
@@ -374,15 +378,21 @@ export class OmahaTable extends PokerTable {
       players: this.seats
         .filter(s => s.state === 'occupied' && !s.eliminated)
         .map(s => {
+          // 2026-10-11 (.online R1, APPUI-2 / TABLEUI-6) — exactly the base
+          // rule: cards (and the hand name) only for a non-folded seat at a
+          // CONTESTED showdown. This used to reveal every non-folded seat —
+          // the uncontested winner's four hole cards went to the whole table
+          // and into every player's stored hand history.
+          const shown = !s.folded && this.wentToShowdown && s.holeCards.length > 0;
           let handRes: { handName: string } | null = null;
-          if (!s.folded && s.holeCards.length >= 4 && this.communityCards.length >= 3) {
+          if (shown && s.holeCards.length >= 4 && this.communityCards.length >= 3) {
             const hiLo = evaluateOmahaHiLo(s.holeCards, this.communityCards);
             handRes = { handName: hiLo.high.handName };
           }
           return {
             seatIndex: s.seatIndex,
             name: s.playerName,
-            holeCards: s.folded ? null : (s.holeCards.length > 0 ? [...s.holeCards] : null),
+            holeCards: shown ? [...s.holeCards] : null,
             startChips: this.startChips.get(s.seatIndex) || 0,
             endChips: s.chipCount,
             actions: this.actionLog

@@ -43,15 +43,19 @@ import {
 import { ProgressionManager, lifetimeAchievementsUnlockedByLevel, maxXpAtLevel } from './progression/ProgressionManager';
 import { sanitizeClientProgressSave, PAYOUT_KEYS_FROM_CLIENT } from './progression/clientProgressSave';
 import { HandRank } from './game/HandEvaluator';
-import { getFullTrainingData, calculateEquity } from './training/TrainingEngine';
-import { insuranceCashoutAmount, insuranceSettlementDelta } from './game/insurance';
+import { getFullTrainingData } from './training/TrainingEngine';
+import { insuranceSettlementDelta, priceInsuranceQuote, InsuranceQuote } from './game/insurance';
+import { validateTableConfig, validateChallengeStakes } from './game/tableConfigValidation';
+import { createWindowRateLimiter } from './auth/rateLimit';
+import { publicNameOf, PUBLIC_NAME_FALLBACK, isPublicDisplayName, LISTABLE_USER_SQL } from './social/publicIdentity';
+import { createHash } from 'crypto';
 import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims } from './auth/authManager';
+import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus } from './auth/oauthValidator';
 import {
   resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
@@ -883,6 +887,16 @@ function shallowDiff(
     // Reference equality: same object → definitely unchanged, skip.
     if (prevVal === nextVal) {
       if (cache && key in cache) nextCache[key] = cache[key];
+      continue;
+    }
+    // 2026-10-11 (.online R1 contract #5, TABLEUI-7) — a key that DISAPPEARED
+    // goes out as `null`: JSON drops `undefined`, so a removed key never
+    // reached the client, which kept the stale value forever (a "Split Pot!"
+    // banner from an old hand, stale trainingData / potBreakdown / quote).
+    // null and undefined are the same "absent" value: once a key was sent as
+    // null it is not re-sent while it stays absent.
+    if (nextVal === undefined) {
+      if (prevVal !== null && prevVal !== undefined) delta[key] = null;
       continue;
     }
     // Primitives / null / undefined: !== is authoritative.
@@ -2449,6 +2463,12 @@ app.get('/api/health', async (_req, res) => {
       resumeSessions: { enabled: !!RESUME_SIGNING_KEY, ...resumeStats, signOut: { ...signOutStats } },
       // 2026-10-09 — R2 guest carry-over.
       guestClaims: { ...guestClaimStats },
+      // 2026-10-11 (.online R1, ECON-1) — all-in insurance: decision windows
+      // opened / seats quoted / accepted / declined / refused accepts, windows
+      // ended by timeout vs every seat deciding, settlements, voided records
+      // (a forfeit, another hand, a seat that changed hands); open = windows
+      // waiting right now (each lasts at most INSURANCE_DECISION_MS).
+      insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
     });
   } catch (e: any) {
     res.status(503).json({ status: 'unhealthy', error: e?.message || String(e) });
@@ -2769,20 +2789,34 @@ setInterval(() => syncQualifierSchedule(), 30 * 60 * 1000);
 // 2026-07-07 gap-fill [10] — shared table-creation from a scheduled-table config.
 // Used by BOTH the manual Activate handler and the auto-fire sweep so the two
 // paths can never drift.
-async function createTableFromScheduledConfig(clubId: number, cfg: any): Promise<string> {
+/** R1 (AUTH-4) — a scheduled club table's stored config, validated with the defaults this helper always used. */
+function validateScheduledTableConfig(cfg: unknown) {
+  return validateTableConfig(cfg, { tableName: 'Scheduled Table', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 });
+}
+
+async function createTableFromScheduledConfig(clubId: number, cfg: any): Promise<string | null> {
+  // 2026-10-11 (R1, AUTH-4) — validated again here: the row may predate the
+  // scheduleClubTable check. An invalid config creates NO table (null).
+  const check = validateScheduledTableConfig(cfg);
+  if (!check.ok) {
+    console.warn(`[ClubSweep] ${JSON.stringify({ event: 'scheduled_table_config_refused', clubId, error: check.error })}`);
+    return null;
+  }
   const clubInfoResult = await getClubInfo(clubId);
   const clubName = clubInfoResult.club?.name || 'Club';
-  const variant = (cfg.variant || 'texas-holdem') as VariantType;
+  const variant = check.config.variant;
   const tableConfig = {
-    tableName: `[${clubName}] ${cfg.tableName || 'Scheduled Table'}`,
-    smallBlind: cfg.smallBlind || 25,
-    bigBlind: cfg.bigBlind || 50,
+    tableName: `[${clubName}] ${check.config.tableName}`,
+    smallBlind: check.config.smallBlind,
+    bigBlind: check.config.bigBlind,
     ante: 0,
-    minBuyIn: cfg.minBuyIn || 1000,
+    minBuyIn: check.config.minBuyIn,
   };
-  return variant === 'texas-holdem'
+  const tableId = variant === 'texas-holdem'
     ? tableManager.createTable(tableConfig)
     : tableManager.createVariantTable(tableConfig, variant);
+  clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
+  return tableId;
 }
 
 // 2026-07-07 gap-fill [10] — auto-fire due scheduled/recurring club tables. Runs
@@ -2809,6 +2843,7 @@ async function sweepScheduledClubTables(): Promise<void> {
         if (!claimed) continue;
         const cfg = JSON.parse(row.tableConfig || '{}');
         const tableId = await createTableFromScheduledConfig(row.clubId, cfg);
+        if (!tableId) continue;   // R1 — an invalid stored config never becomes a table (nor recurs)
         if (row.recurring) await rescheduleRecurring(row.id);
         io.emit('scheduledClubTableActivated', { success: true, tableId, clubId: row.clubId });
         console.log(`[ClubSweep] auto-activated scheduled table ${row.id} (club ${row.clubId}) -> ${tableId}`);
@@ -3280,6 +3315,19 @@ function getGameStateForPlayer(
   stateObj.isTournament = !!stateTournamentId;
   stateObj.tournamentId = stateTournamentId;
 
+  // 2026-10-11 (R1 contract #2) — what kind of table this is and whether a
+  // rebuy is allowed here, ALWAYS present (the `rebuy` handler refuses with
+  // `rebuy_not_allowed` where it is false), plus the buy-in bounds the
+  // rebuy / top-up controls use (rebuy clamps to [minBuyIn, 10 x minBuyIn]).
+  stateObj.tableKind = tableKindOf(table.config.tableId);
+  stateObj.rebuyAllowed = rebuyAllowedAt(table.config.tableId);
+  stateObj.minBuyIn = table.config.minBuyIn;
+  stateObj.maxBuyIn = table.config.minBuyIn * 10;
+  // R1 contract #1 — ALWAYS present: null, or THIS seat's own all-in
+  // insurance quote { handNumber, cashout, equityPct, pot, expiresAt } while
+  // the runout is held for its decision. Spectators always get null.
+  stateObj.insuranceQuote = insuranceQuoteForSeat(table.config.tableId, table, playerSeatIndex);
+
   // Add missed-blind info for this player. Now sourced directly from the
   // seat object (seat.deadBlindOwedChips + seat.missedBlind) — single
   // source of truth after the audit refactor.
@@ -3588,6 +3636,7 @@ function broadcastGameState(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
   ensureTurnTimerWired(tableId);
+  ensureInsuranceHoldWired(tableId, table); // R1 — the insurance decision window (cash Hold'em only)
 
   // Send personalized state to each player at the table
   for (const [socketId, session] of playerSessions) {
@@ -5205,30 +5254,10 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
 
   // All-in insurance settlement — BEFORE bust removal, so an insured player who
   // was outdrawn keeps their locked-in cashout instead of busting. The engine
-  // already credited the pot to seat.chipCount; we adjust it so the insured
-  // seat ends with exactly `cashout` (delta>0 = house pays, delta<0 = house
-  // collects the margin). Adjusts the LIVE stack — the wallet syncs on cashout,
-  // so no double-count. Heads-up only, so no side-pot eligibility to reconcile.
-  const insCashouts = insuranceCashouts.get(tableId);
-  if (insCashouts && insCashouts.length) {
-    for (const co of insCashouts) {
-      const iseat = table.seats[co.seatIndex];
-      if (!iseat || iseat.state !== 'occupied') continue;
-      const actualWon = totalWonPerSeat.get(co.seatIndex) || 0;
-      const delta = insuranceSettlementDelta(co.cashout, actualWon);
-      iseat.chipCount = Math.max(0, iseat.chipCount + delta);
-      auditLog(co.playerId, delta >= 0 ? 'INSURANCE_PAYOUT' : 'INSURANCE_COLLECT',
-        { tableId, seatIndex: co.seatIndex, cashout: co.cashout, actualWon, delta, newStack: iseat.chipCount });
-      for (const [sid, s] of playerSessions) {
-        if (s.tableId === tableId && s.seatIndex === co.seatIndex) {
-          io.sockets.sockets.get(sid)?.emit('insuranceSettled', { cashout: co.cashout, delta, stack: iseat.chipCount });
-          break;
-        }
-      }
-    }
-    insuranceCashouts.delete(tableId);
-    broadcastGameState(tableId); // reflect the adjusted stack to all clients
-  }
+  // already credited the pot to seat.chipCount; settleInsuranceForHand adjusts
+  // it so the insured seat ends with exactly `cashout` (R1 2026-10-11: only
+  // this hand's records, never a seat that changed hands or forfeited).
+  settleInsuranceForHand(tableId, table, totalWonPerSeat);
 
   // S1 (2026-10-10) — capture this hand's tournament bust check NOW, before
   // the first await below: until it runs, this table does not deal again
@@ -6374,11 +6403,386 @@ const careerTables = new Map<string, { venue: number; stage: number }>();
 // All-in insurance cashouts locked in for the CURRENT hand, per table. Settled
 // at hand-complete (before bust removal) and cleared. Server-computed amount —
 // the client's suggested figure is never trusted.
-const insuranceCashouts = new Map<string, Array<{ seatIndex: number; playerId: string; userId?: number; cashout: number }>>();
+const insuranceCashouts = new Map<string, Array<{ seatIndex: number; playerId: string; userId?: number; cashout: number; handNumber: number; equityPct: number; pot: number }>>();
 
 // Club-challenge heads-up tables: tableId -> the challenge being played on it.
 // The stakes are the buy-in, so chips flow through the normal join/cleanup paths.
 const challengeTables = new Map<string, { challengeId: number; challengerId: number; challengedId: number }>();
+
+// ========== Table kind (R1 contract #2, 2026-10-11) ==========
+// Private home games and club tables are ordinary cash tables to the engine;
+// these record which they are (created by createPrivateTable / createClubTable
+// / a scheduled club table) so every per-player game state can say so.
+const privateTableIds = new Set<string>();
+const clubTableIds = new Set<string>();
+
+type TableKind = 'cash' | 'private' | 'club' | 'tournament' | 'spingo' | 'career' | 'headsup' | 'aof';
+
+/**
+ * R1 contract #2 — what kind of table this is (per-player game state key
+ * `tableKind`, always present). Quick tables are told apart by the registry
+ * each create path fills before the table's first broadcast; a quick table in
+ * none of the per-mode registries is the heads-up snap.
+ */
+function tableKindOf(tableId: string): TableKind {
+  if (isTournamentTable(tableId)) return 'tournament';
+  if (spinGoMultipliers.has(tableId)) return 'spingo';
+  if (careerTables.has(tableId)) return 'career';
+  if (allInOrFoldTables.has(tableId)) return 'aof';
+  if (quickTables.has(tableId)) return 'headsup';
+  if (challengeTables.has(tableId) || clubTableIds.has(tableId)) return 'club';
+  if (privateTableIds.has(tableId)) return 'private';
+  return 'cash';
+}
+
+/**
+ * R1 contract #2 / TOURNEY-1 — may a seated player top up (`rebuy`) here?
+ * Never at a tournament table nor at any quick table (Spin & Go / career /
+ * heads-up / all-in-or-fold: fixed-buy-in games whose settlement pays a prize,
+ * so a rebuy was destroyed on a win — users 1541 + 4481 lost 5,000 each), and
+ * never in a club CHALLENGE (a freezeout whose winner is the last one with
+ * chips). Per-player game state key `rebuyAllowed`, always present.
+ */
+function rebuyAllowedAt(tableId: string): boolean {
+  const kind = tableKindOf(tableId);
+  return (kind === 'cash' || kind === 'private' || kind === 'club') && !challengeTables.has(tableId);
+}
+
+/** The `rebuy` handler's refusal (stable code `rebuy_not_allowed`) where rebuyAllowedAt is false, else null. */
+function rebuyRefusalAt(tableId: string): { message: string; code: 'rebuy_not_allowed' } | null {
+  if (rebuyAllowedAt(tableId)) return null;
+  return {
+    message: isTournamentTable(tableId) ? 'Rebuys are disabled in tournaments' : 'Rebuys are not available at this table',
+    code: 'rebuy_not_allowed',
+  };
+}
+
+// ========== All-in insurance (R1 contract #1, 2026-10-11 — ECON-1 / TABLEUI-1) ==========
+// The house buys an all-in player's equity at 90%. Before R1 the price came
+// from the training engine's PERCENT equity against a random hand, read as a
+// 0..1 fraction (every quote clamped to 90% of the pot: 1.47M chips minted
+// 09-12..10-07), was offered before the opponent had even called, and at any
+// table. Now:
+//   - ELIGIBLE (insuranceCandidates): a cash Hold'em table (cash / private /
+//     club — never tournament, qualifier, quick or club-challenge tables), a
+//     hand in progress with board cards to come, EXACTLY two players in it, the
+//     seat all-in, human, with a live session, the betting closed (the runout
+//     is HELD — PokerTable.runoutHoldDecider), not accepted / declined yet.
+//   - PRICE (priceInsuranceQuote): round(0.9 * equity * contested pot), the
+//     equity against the opponent's ACTUAL cards — exact with <= 2 board cards
+//     to come, a deterministic Monte Carlo pre-flop.
+//   - WINDOW: the engine deals the whole board in the tick the betting closes,
+//     so a hand with an eligible seat holds its runout INSURANCE_DECISION_MS
+//     (or until every quoted seat accepted / declined), then runs out normally.
+//   - ACCEPT re-validates all of it and records EXACTLY the quoted cashout;
+//     settlement (settleInsuranceForHand) makes the insured stack end the hand
+//     with that cashout. A seat that forfeits (leaves -> folded) voids it.
+const INSURANCE_DECISION_MS = 7000;
+interface InsuranceOffer {
+  handNumber: number;
+  boardKey: string;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  /** seatIndex -> its quote (only the seats that were quoted). */
+  quotes: Map<number, InsuranceQuote>;
+  /** Seats that accepted or declined (their quote is gone). */
+  decided: Set<number>;
+}
+const insuranceOffers = new Map<string, InsuranceOffer>();
+const insuranceStats = { windows: 0, quotes: 0, accepted: 0, declined: 0, refused: 0, releasedTimeout: 0, releasedDecided: 0, settled: 0, voided: 0 };
+
+const insuranceBoardKey = (table: PokerTable): string => table.communityCards.map((c) => `${c.rank}.${c.suit}`).join(',');
+
+/** Texas Hold'em proper: the base engine itself (every variant subclasses PokerTable). Dealer's Choice only relabels. */
+function isPlainHoldemTable(table: PokerTable): boolean {
+  return Object.getPrototypeOf(table) === PokerTable.prototype && table.variantId === 'holdem';
+}
+
+/** A live session (main or extra-table) plays this seat. */
+function seatHasAnySession(tableId: string, seatIndex: number): boolean {
+  if (seatHasLiveSession(tableId, seatIndex)) return true;
+  for (const list of multiTableSessions.values()) {
+    if (Array.isArray(list) && list.some((s) => s && s.tableId === tableId && s.seatIndex === seatIndex)) return true;
+  }
+  return false;
+}
+
+/**
+ * R1 contract #1 — the seats that may insure this hand, each with its one
+ * opponent: everything except "the betting is closed", which the caller adds
+ * (runOutBoard asking the decider, or the runout hold being in place).
+ */
+function insuranceCandidates(tableId: string, table: PokerTable): Array<{ seatIndex: number; opponent: number }> {
+  const kind = tableKindOf(tableId);
+  if (!(kind === 'cash' || kind === 'private' || kind === 'club') || challengeTables.has(tableId)) return [];
+  if (!isPlainHoldemTable(table)) return [];
+  if (!table.isHandInProgress() || table.communityCards.length >= 5) return [];
+  const inHand = table.seats.filter((s) => s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0);
+  if (inHand.length !== 2 || inHand.some((s) => s.holeCards.length !== 2)) return [];
+  const out: Array<{ seatIndex: number; opponent: number }> = [];
+  for (const s of inHand) {
+    if (!s.allIn || s.isAI || !seatHasAnySession(tableId, s.seatIndex)) continue;
+    out.push({ seatIndex: s.seatIndex, opponent: inHand.find((o) => o.seatIndex !== s.seatIndex)!.seatIndex });
+  }
+  return out;
+}
+
+/** The pots BOTH remaining players can win — what an insured seat stands to win or lose. */
+function insuranceContestedPot(table: PokerTable, a: number, b: number): number {
+  let pot = 0;
+  for (const p of table.getCurrentPots()) {
+    if (p.eligibleSeatIndices.includes(a) && p.eligibleSeatIndices.includes(b)) pot += p.amount;
+  }
+  return pot;
+}
+
+/**
+ * PokerTable.runoutHoldDecider — the betting just closed with board cards to
+ * come. Quote every eligible seat; hold the runout when at least one quote
+ * exists (a hand nobody can insure runs out at once, exactly as before).
+ */
+function decideInsuranceHold(tableId: string, table: PokerTable): boolean {
+  const candidates = insuranceCandidates(tableId, table);
+  if (candidates.length === 0) return false;
+  const expiresAt = Date.now() + INSURANCE_DECISION_MS;
+  const quotes = new Map<number, InsuranceQuote>();
+  for (const c of candidates) {
+    const q = priceInsuranceQuote({
+      tableId,
+      handNumber: table.handNumber,
+      hero: table.seats[c.seatIndex].holeCards,
+      villain: table.seats[c.opponent].holeCards,
+      board: table.communityCards,
+      contestedPot: insuranceContestedPot(table, c.seatIndex, c.opponent),
+      expiresAt,
+    });
+    if (q) quotes.set(c.seatIndex, q);
+  }
+  if (quotes.size === 0) return false;
+  clearInsuranceOffer(tableId);
+  const handNumber = table.handNumber;
+  const offer: InsuranceOffer = { handNumber, boardKey: insuranceBoardKey(table), expiresAt, timer: null, quotes, decided: new Set() };
+  offer.timer = setTimeout(() => releaseInsuranceHold(tableId, handNumber, 'timeout'), INSURANCE_DECISION_MS);
+  (offer.timer as any)?.unref?.();
+  insuranceOffers.set(tableId, offer);
+  insuranceStats.windows++;
+  insuranceStats.quotes += quotes.size;
+  log.info(`[insurance] ${JSON.stringify({ event: 'insurance_window_open', tableId, handNumber, seats: [...quotes.keys()], boardCards: table.communityCards.length })}`);
+  return true;
+}
+
+const wiredInsuranceHold = new WeakSet<object>();
+function ensureInsuranceHoldWired(tableId: string, table: PokerTable): void {
+  if (wiredInsuranceHold.has(table)) return;
+  wiredInsuranceHold.add(table);
+  table.runoutHoldDecider = (t: PokerTable) => decideInsuranceHold(tableId, t);
+}
+
+function clearInsuranceOffer(tableId: string): void {
+  const offer = insuranceOffers.get(tableId);
+  if (!offer) return;
+  if (offer.timer) clearTimeout(offer.timer);
+  insuranceOffers.delete(tableId);
+}
+
+/**
+ * End the decision window of `handNumber`: the board runs out and the hand is
+ * settled (settleInsuranceForHand, inside the handResult listener), then the
+ * next hand is scheduled exactly as after a player's hand-ending action.
+ */
+function releaseInsuranceHold(tableId: string, handNumber: number, reason: 'timeout' | 'decided'): void {
+  const offer = insuranceOffers.get(tableId);
+  if (offer && offer.handNumber === handNumber) clearInsuranceOffer(tableId);
+  const table = tableManager.getTable(tableId);
+  if (!table || table.handNumber !== handNumber || !table.isRunoutHeld()) return;
+  if (reason === 'timeout') insuranceStats.releasedTimeout++;
+  else insuranceStats.releasedDecided++;
+  table.releaseRunoutHold();
+  broadcastGameState(tableId);
+  if (table.currentPhase === GamePhase.HandComplete) scheduleAutoStart(tableId, 3000);
+  else scheduleAIAction(tableId);
+}
+
+/** Every quoted seat accepted or declined → no reason to keep the table waiting. */
+function releaseInsuranceHoldIfDecided(tableId: string, handNumber: number): void {
+  const offer = insuranceOffers.get(tableId);
+  if (!offer || offer.handNumber !== handNumber) return;
+  for (const seatIndex of offer.quotes.keys()) if (!offer.decided.has(seatIndex)) return;
+  releaseInsuranceHold(tableId, handNumber, 'decided');
+}
+
+/**
+ * R1 contract #1 — this seat's `insuranceQuote` (per-player game state, always
+ * present): its quote while the runout is held for it and it is still
+ * eligible, else null. Spectators (-1) and everyone else always get null.
+ */
+function insuranceQuoteForSeat(tableId: string, table: PokerTable, seatIndex: number): InsuranceQuote | null {
+  if (seatIndex < 0) return null;
+  const offer = insuranceOffers.get(tableId);
+  if (!offer || offer.handNumber !== table.handNumber || !table.isRunoutHeld()) return null;
+  if (offer.decided.has(seatIndex)) return null;
+  const quote = offer.quotes.get(seatIndex);
+  if (!quote || offer.boardKey !== insuranceBoardKey(table)) return null;
+  if (!insuranceCandidates(tableId, table).some((c) => c.seatIndex === seatIndex)) return null;
+  return quote;
+}
+
+/**
+ * At hand complete (handleHandComplete, BEFORE bust removal): every insured
+ * seat ends the hand with EXACTLY its cashout — the engine already credited
+ * its pot winnings, the delta is (cashout - won): > 0 the house pays an
+ * outdrawn player, < 0 it keeps the margin of a winner. Adjusts the LIVE stack
+ * (the wallet syncs at cash-out). VOID when the record is not this hand's, the
+ * seat changed hands, or the seat folded (a leave forfeits the hand — and the
+ * insurance with it: otherwise insure-then-leave paid the cashout while the
+ * opponent took the whole pot).
+ */
+function settleInsuranceForHand(tableId: string, table: PokerTable, totalWonPerSeat: Map<number, number>): void {
+  const insCashouts = insuranceCashouts.get(tableId);
+  if (!insCashouts || insCashouts.length === 0) return;
+  insuranceCashouts.delete(tableId);
+  for (const co of insCashouts) {
+    const iseat = table.seats[co.seatIndex];
+    const voidReason = co.handNumber !== table.handNumber ? 'other_hand'
+      : (!iseat || iseat.state !== 'occupied' || iseat.playerId !== co.playerId) ? 'seat_changed'
+      : iseat.folded ? 'forfeited' : null;
+    if (voidReason) {
+      insuranceStats.voided++;
+      auditLog(co.playerId, 'INSURANCE_VOID', { tableId, seatIndex: co.seatIndex, handNumber: co.handNumber, cashout: co.cashout, reason: voidReason });
+      continue;
+    }
+    const actualWon = totalWonPerSeat.get(co.seatIndex) || 0;
+    const delta = insuranceSettlementDelta(co.cashout, actualWon);
+    iseat!.chipCount = Math.max(0, iseat!.chipCount + delta);
+    insuranceStats.settled++;
+    auditLog(co.playerId, delta >= 0 ? 'INSURANCE_PAYOUT' : 'INSURANCE_COLLECT',
+      { tableId, seatIndex: co.seatIndex, handNumber: co.handNumber, cashout: co.cashout, equityPct: co.equityPct, pot: co.pot, actualWon, delta, newStack: iseat!.chipCount });
+    for (const [sid, s] of playerSessions) {
+      if (s.tableId === tableId && s.seatIndex === co.seatIndex) {
+        io.sockets.sockets.get(sid)?.emit('insuranceSettled', { cashout: co.cashout, delta, stack: iseat!.chipCount, tableId, handNumber: co.handNumber });
+        break;
+      }
+    }
+  }
+  broadcastGameState(tableId); // reflect the adjusted stack to all clients
+}
+
+// ========== Battle pass season (R1 2026-10-11 — AUTH-5 / ECON-2) ==========
+// The ONE battle-pass season the server pays. claimBattlePassTier used the
+// CLIENT's seasonId as the claim key, and the tier unlock is cumulative XP
+// (it never resets), so every new seasonId re-claimed all 50 tiers (~32.5k
+// chips + 4k XP each). The client's seasonId is now ignored for the claim key,
+// the unlock check and the claims a client is shown (getDurableState). A new
+// season is a deliberate server change here — with its own XP baseline.
+const CURRENT_BATTLE_PASS_SEASON = 'season_1_the_river';
+// A full "Claim all" is <= 100 emits (50 tiers x 2 tracks): 110 per minute per account.
+const battlePassClaimLimiter = createWindowRateLimiter(110, 60_000);
+
+// R1 contract #4 — showMuckedHand: one reveal per (table, hand, seat).
+const shownMuckedHands = new Set<string>();
+
+/**
+ * R1 (2026-10-11, ECON-19) — wallet chips the account has OUT ON TABLES right
+ * now: every seat a live session of his plays (main or extra table, any of
+ * his sockets), his reserved (disconnected) seat and any seat whose removal
+ * waits for the hand's end — its stack, plus what it has in the pot of a hand
+ * in progress. Tournament chips are not wallet chips (never counted). The
+ * broke refill counts these: claiming +5,000 while the chips sat on a table
+ * (then topping up / cashing out) cycled free chips.
+ */
+function chipsOnTablesOfUser(userId: number): number {
+  const seen = new Set<string>();
+  let total = 0;
+  const count = (tableId: string, seatIndex: number): void => {
+    const key = `${tableId}:${seatIndex}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (isTournamentTable(tableId)) return;
+    const t = tableManager.getTable(tableId);
+    const seat = t?.seats?.[seatIndex];
+    if (!t || !seat || seat.state !== 'occupied' || seat.isAI) return;
+    total += Math.max(0, seat.chipCount || 0) + (t.isHandInProgress() ? Math.max(0, seat.totalInvestedThisHand || 0) : 0);
+  };
+  for (const [sid, a] of authSessions) {
+    if (a?.userId !== userId) continue;
+    const main = playerSessions.get(sid);
+    if (main) count(main.tableId, main.seatIndex);
+    for (const extra of multiTableSessions.get(sid) || []) if (extra) count(extra.tableId, extra.seatIndex);
+  }
+  const reserved = reservedSeats.get(userId);
+  if (reserved && reserved.expiresAt > Date.now() && !isTournamentReservation(reserved)) count(reserved.tableId, reserved.seatIndex);
+  for (const [tableId, seats] of pendingSeatRemovalAfterHand) {
+    for (const [seatIndex, who] of seats) if (who.userId === userId) count(tableId, seatIndex);
+  }
+  return total;
+}
+
+// ========== Public names (R1 2026-10-11 — ECON-3 / AUTH-7 / APPUI-1, P0 PII) ==========
+// users.username is a LOGIN handle (phone numbers, first.last slugs) and is
+// never sent to another player: they see the public display name
+// (social/publicIdentity — whitelist-valid, not phone-like, else 'Player').
+const playerSearchLimiter = createWindowRateLimiter(30, 30_000);
+const usernameCheckLimiter = createWindowRateLimiter(20, 60_000);
+const publicNameCache = new Map<number, { name: string; at: number }>();
+const PUBLIC_NAME_CACHE_MS = 60_000;
+/** The public name of a local account (cached 60s; 'Player' when unknown or on a DB error). */
+async function publicNameForUser(userId: number | undefined | null): Promise<string> {
+  if (!userId) return PUBLIC_NAME_FALLBACK;
+  const hit = publicNameCache.get(userId);
+  if (hit && Date.now() - hit.at < PUBLIC_NAME_CACHE_MS) return hit.name;
+  try {
+    const name = (await getPublicNames([userId])).get(userId) ?? PUBLIC_NAME_FALLBACK;
+    if (publicNameCache.size >= 5_000) publicNameCache.clear();
+    publicNameCache.set(userId, { name, at: Date.now() });
+    return name;
+  } catch {
+    return PUBLIC_NAME_FALLBACK;
+  }
+}
+
+/** A staking offer as other players see it: display names, no account ids. */
+async function publicStakingOffers(offers: any[]): Promise<any[]> {
+  const ids: number[] = [];
+  for (const o of offers) {
+    ids.push(Number(o.sellerId));
+    for (const b of Array.isArray(o.backers) ? o.backers : []) ids.push(Number(b?.userId));
+  }
+  let names = new Map<number, string>();
+  try { names = await getPublicNames(ids); } catch { /* every name falls back to 'Player' */ }
+  const nameOf = (id: unknown) => names.get(Number(id)) ?? PUBLIC_NAME_FALLBACK;
+  return offers.map((o) => ({
+    id: o.id,
+    tournamentId: o.tournamentId,
+    totalPct: o.totalPct,
+    pricePerPct: o.pricePerPct,
+    playerName: nameOf(o.sellerId),
+    remaining: o.remaining,
+    backers: (Array.isArray(o.backers) ? o.backers : []).map((b: any) => ({ name: nameOf(b?.userId), pct: Number(b?.pct) || 0 })),
+    createdAt: o.createdAt,
+  }));
+}
+
+/**
+ * Tournament standings as other players see them: names through the public
+ * rules (a qualifier entrant's registration name could be his login handle),
+ * and the entrant ids — a qualifier entrant's id WAS his login handle — as
+ * opaque per-tournament tokens (stable across polls, so the bracket's
+ * elimination diff still works).
+ */
+function publicTournamentStandings(standings: any): any {
+  if (!standings) return standings;
+  const token = (playerId: unknown) => 'e' + createHash('sha256').update(String(standings.tournamentId) + '|' + String(playerId)).digest('hex').slice(0, 12);
+  return {
+    ...standings,
+    eliminationOrder: (Array.isArray(standings.eliminationOrder) ? standings.eliminationOrder : []).map(token),
+    players: (Array.isArray(standings.players) ? standings.players : []).map((p: any) => ({
+      playerId: token(p.playerId),
+      playerName: publicNameOf(p.playerName),
+      chipCount: p.chipCount,
+      finishPosition: p.finishPosition,
+    })),
+  };
+}
 
 function cleanupQuickTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
@@ -6435,6 +6839,7 @@ function cleanupQuickTable(tableId: string): void {
   allInOrFoldTables.delete(tableId);
   careerTables.delete(tableId);
   insuranceCashouts.delete(tableId);
+  clearInsuranceOffer(tableId);
   challengeTables.delete(tableId);
 
   const timeoutKey = tableId;
@@ -7193,10 +7598,22 @@ io.on('connection', (socket: Socket) => {
   });
 
   socket.on('checkUsername', async (data: { username: string }) => {
-    const name = (data.username || '').trim();
-    if (name.length < 2) { socket.emit('checkUsernameResult', { available: null, username: name }); return; }
-    const taken = await isUsernameTaken(name);
-    socket.emit('checkUsernameResult', { available: !taken, username: name });
+    // R1 (AUTH-7) — this answered "is this LOGIN HANDLE taken?" for anyone:
+    // an oracle for which phone numbers have accounts. Now: signed-in players
+    // only, rate-limited, and it answers what a name picker needs — is this
+    // DISPLAY NAME free (the same case-insensitive rule setDisplayName
+    // enforces; the caller's own name counts as free). No client called it.
+    const auth = authSessions.get(socket.id);
+    const name = (typeof data?.username === 'string' ? data.username : '').trim().slice(0, 40);
+    if (!auth?.userId) { socket.emit('checkUsernameResult', { available: null, username: name, error: 'login_required' }); return; }
+    if (!usernameCheckLimiter.hit(String(auth.userId))) { socket.emit('checkUsernameResult', { available: null, username: name, error: 'rate_limited' }); return; }
+    if (!isPublicDisplayName(name)) { socket.emit('checkUsernameResult', { available: null, username: name }); return; }
+    try {
+      const holders = await findUsersByDisplayName(name, 2);
+      socket.emit('checkUsernameResult', { available: holders.every((h) => h.id === auth.userId), username: name });
+    } catch {
+      socket.emit('checkUsernameResult', { available: null, username: name });
+    }
   });
 
   // ========== LLM Post-Hand Coach ==========
@@ -7367,7 +7784,7 @@ Give feedback in this JSON format:
       );
       stakingOffers.set(id, offer);
       auditLog(auth.username, 'STAKING_OFFER_CREATED', { offerId: id, tournamentId: offer.tournamentId, totalPct: offer.totalPct, pricePerPct: offer.pricePerPct });
-      io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
+      io.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
       socket.emit('stakeCreated', { id });
     } catch (e: any) {
       console.error('[Staking] createStake DB error:', e.message);
@@ -7456,7 +7873,7 @@ Give feedback in this JSON format:
       if (settled) stakingOffers.delete(data.offerId);
 
       auditLog(auth.username, 'STAKING_BUY', { offerId: data.offerId, pct: data.pct, totalCost, sellerId: offer.sellerId });
-      io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
+      io.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
       replyBuyStake({ success: true });
     } catch (e: any) {
       await client.query('ROLLBACK').catch(() => {});
@@ -7468,7 +7885,7 @@ Give feedback in this JSON format:
   });
 
   socket.on('getStakes', async () => {
-    socket.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
+    socket.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
   });
 
   // OAuth2 login: validate access token from auth server.
@@ -8389,7 +8806,14 @@ Give feedback in this JSON format:
     try {
       const period = data?.period || 'alltime';
       const entries = await getLeaderboard(50, period);
-      socket.emit('leaderboardData', { period, entries });
+      // R1 (ECON-3) — public display names only (no admin / banned /
+      // tombstone rows), and the viewer's own row flagged by the server
+      // (`isYou`) instead of shipping account ids.
+      const viewer = authSessions.get(socket.id)?.userId;
+      socket.emit('leaderboardData', {
+        period,
+        entries: entries.map(({ userId, ...e }) => ({ ...e, isYou: viewer !== undefined && userId === viewer })),
+      });
     } catch {
       socket.emit('leaderboardData', { period: data?.period || 'alltime', entries: [] });
     }
@@ -8397,9 +8821,16 @@ Give feedback in this JSON format:
 
   socket.on('searchPlayers', async (data: { query: string }) => {
     try {
-      const q = (data?.query || '').trim();
+      // R1 (ECON-3 / APPUI-1) — signed-in players only, rate-limited per
+      // account, on the DISPLAY NAME; results carry a name and a level only
+      // (no username, no chips, no account id — `id` is a list key).
+      const auth = authSessions.get(socket.id);
+      if (!auth?.userId) { socket.emit('playerSearchResults', { results: [], error: 'login_required' }); return; }
+      if (!playerSearchLimiter.hit(String(auth.userId))) { socket.emit('playerSearchResults', { results: [], error: 'rate_limited' }); return; }
+      const q = (typeof data?.query === 'string' ? data.query : '').trim().slice(0, 20);
       if (q.length < 2) { socket.emit('playerSearchResults', { results: [] }); return; }
-      socket.emit('playerSearchResults', { results: await searchUsers(q) });
+      const rows = await searchUsers(q, 10);
+      socket.emit('playerSearchResults', { results: rows.map((r, i) => ({ id: `r${i}`, username: r.displayName, displayName: r.displayName, level: r.level })) });
     } catch {
       socket.emit('playerSearchResults', { results: [] });
     }
@@ -9021,7 +9452,9 @@ Give feedback in this JSON format:
         socket.emit('seasonLeaderboardAwarded', { success: false, error: 'already_awarded', seasonKey });
         return;
       }
-      const { rows } = await client.query('SELECT id, username, chips FROM users WHERE banned = FALSE ORDER BY chips DESC LIMIT 3');
+      // R1 (ECON-3 / ECON-11) — ranked like the leaderboard it advertises:
+      // never an admin, banned, tombstone or retired guest row.
+      const { rows } = await client.query(`SELECT id, display_name, chips FROM users WHERE ${LISTABLE_USER_SQL} ORDER BY chips DESC LIMIT 3`);
       const results: any[] = [];
       for (let i = 0; i < rows.length && i < REWARDS.length; i++) {
         const u = rows[i];
@@ -9035,7 +9468,7 @@ Give feedback in this JSON format:
           `INSERT INTO user_inventory (user_id, item_type, item_id) VALUES ($1,'badge',$2) ON CONFLICT (user_id, item_type, item_id) DO NOTHING`,
           [u.id, rw.badge]
         );
-        results.push({ username: u.username, place: rw.place, chips: rw.chips, badge: rw.badge });
+        results.push({ userId: u.id, displayName: publicNameOf(u.display_name), place: rw.place, chips: rw.chips, badge: rw.badge });
       }
       await client.query('COMMIT');
       // Audit AFTER commit — the movements are now durable.
@@ -9198,7 +9631,10 @@ Give feedback in this JSON format:
 
   socket.on('getClubInfo', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
-    const result = await getClubInfo(data.clubId, auth?.userId);
+    // R1 (CLUBS-2) — the join code is in the answer only for an active member (clubManager.getClubInfo).
+    const clubId = Number(data?.clubId);
+    if (!Number.isInteger(clubId) || clubId <= 0) { socket.emit('clubInfo', { success: false, error: 'Club not found' }); return; }
+    const result = await getClubInfo(clubId, auth?.userId);
     socket.emit('clubInfo', result);
   });
 
@@ -9261,7 +9697,14 @@ Give feedback in this JSON format:
   socket.on('createClubTable', async (data: { clubId: number; config: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await createClubTable(auth.userId, data.clubId, data.config);
+    // 2026-10-11 (R1, AUTH-4) — the club table's numbers become a real cash
+    // table's buy-in: validated before anything is stored (same rules as a
+    // home game; clubManager's own defaults for absent fields).
+    const ctCheck = validateTableConfig(data?.config, {
+      tableName: '', smallBlind: 5, bigBlind: 10, ante: 0, minBuyIn: (bb) => bb * 20, maxBuyIn: (bb) => bb * 100,
+    });
+    if (!ctCheck.ok) { socket.emit('error', { message: ctCheck.error, code: ctCheck.code }); return; }
+    const result = await createClubTable(auth.userId, data.clubId, ctCheck.config);
     if (result.success && result.table) {
       // Create a real table in the TableManager
       const clubInfoResult = await getClubInfo(data.clubId);
@@ -9278,6 +9721,7 @@ Give feedback in this JSON format:
         ? tableManager.createTable(tableConfig)
         : tableManager.createVariantTable(tableConfig, variant);
       if (tableId) {
+        clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
         await updateClubTableId(result.table.id, tableId);
         result.table.tableId = tableId;
       }
@@ -9519,7 +9963,12 @@ Give feedback in this JSON format:
     if (ccGate) { emitPlayRefusal(socket, ccGate); return; }
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await createChallenge(data.clubId, auth.userId, data.challengedId, data.stakes);
+    // 2026-10-11 (R1, AUTH-4) — the stakes ARE both players' buy-in (the
+    // challenge table's minBuyIn): a whole number of chips in range, never 0 /
+    // negative / fractional / huge.
+    const csCheck = validateChallengeStakes(data?.stakes);
+    if (!csCheck.ok) { socket.emit('error', { message: csCheck.error, code: csCheck.code }); return; }
+    const result = await createChallenge(data.clubId, auth.userId, data.challengedId, csCheck.stakes);
     if (result.success) {
       socket.emit('clubChallengeCreated', result);
     } else {
@@ -9537,6 +9986,15 @@ Give feedback in this JSON format:
     const result = await acceptChallenge(data.challengeId, auth.userId);
     if (!result.success || !result.challenge) { socket.emit('error', { message: result.error }); return; }
     const { id: challengeId, challengerId, challengedId, stakes } = result.challenge;
+    // R1 (AUTH-4) — a challenge stored before the createClubChallenge check
+    // may carry any stakes: never spawn a table on bad ones (it is closed with
+    // no winner instead; nothing was bought in yet).
+    const caStakes = validateChallengeStakes(stakes);
+    if (!caStakes.ok) {
+      resolveChallenge(challengeId, null).catch(() => {});
+      socket.emit('error', { message: caStakes.error, code: caStakes.code });
+      return;
+    }
 
     // Spawn a heads-up table where the STAKES are the buy-in. Both players buy in
     // `stakes` via the normal join path; the winner takes the 2x pot when the
@@ -9608,7 +10066,11 @@ Give feedback in this JSON format:
   socket.on('scheduleClubTable', async (data: { clubId: number; config: any; scheduledTime: string; recurring: boolean; recurrencePattern?: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await scheduleTable(data.clubId, auth.userId, data.config, data.scheduledTime, data.recurring, data.recurrencePattern);
+    // 2026-10-11 (R1, AUTH-4) — the stored config becomes a real cash table
+    // when it fires: validated now (and again when it is created).
+    const stCheck = validateScheduledTableConfig(data?.config);
+    if (!stCheck.ok) { socket.emit('error', { message: stCheck.error, code: stCheck.code }); return; }
+    const result = await scheduleTable(data.clubId, auth.userId, stCheck.config, data.scheduledTime, data.recurring, data.recurrencePattern);
     if (result.success) {
       socket.emit('clubTableScheduled', result);
     } else {
@@ -9629,6 +10091,7 @@ Give feedback in this JSON format:
       // 2026-07-07 gap-fill [10] — create via the shared helper so the manual
       // Activate button and the auto-fire sweep produce byte-identical tables.
       const tableId = await createTableFromScheduledConfig(data.clubId, result.tableConfig);
+      if (!tableId) { socket.emit('error', { message: 'Invalid table settings for this scheduled table', code: 'invalid_table_config' }); return; }
       socket.emit('scheduledClubTableActivated', { success: true, tableId });
     } else {
       socket.emit('error', { message: result.error });
@@ -10926,19 +11389,33 @@ Give feedback in this JSON format:
       if (!ctx) { socket.emit('refillResult', { success: false, error: 'Not authenticated' }); return; }
       const REFILL_THRESHOLD = 5000; // = cheapest cash table min buy-in
       const REFILL_AMOUNT = 5000;
+      // R1 (ECON-19) — "broke" counts the chips he has on tables too: the
+      // wallet + every non-tournament stack of his must be under the
+      // threshold. Refused `chips_on_table` (with the amount) otherwise.
+      const onTable = chipsOnTablesOfUser(ctx.userId);
+      const tableChipsRefusal = async () => {
+        const current = await getUserChips(ctx.userId).catch(() => null);
+        socket.emit('refillResult', {
+          success: false, error: 'chips_on_table', chips: current, onTable,
+          message: `You still have ${onTable.toLocaleString('en-US')} chips at a table — the refill is only for an empty bankroll.`,
+        });
+      };
+      if (onTable >= REFILL_THRESHOLD) { await tableChipsRefusal(); return; }
       // H6 fix (2026-07-01): atomic check-and-add. The old read-then-add let
       // two concurrent broke-state emits both pass the `current < threshold`
       // check and each add 5,000 (+10,000). refillBrokeUser puts the predicate
-      // inside the UPDATE so exactly one concurrent call applies.
-      const newBalance = await refillBrokeUser(ctx.userId, REFILL_THRESHOLD, REFILL_AMOUNT);
+      // inside the UPDATE so exactly one concurrent call applies (R1: against
+      // the threshold minus the chips on tables).
+      const newBalance = await refillBrokeUser(ctx.userId, REFILL_THRESHOLD - onTable, REFILL_AMOUNT);
       if (newBalance == null) {
         const current = await getUserChips(ctx.userId);
+        if (onTable > 0 && current < REFILL_THRESHOLD) { await tableChipsRefusal(); return; }
         socket.emit('refillResult', { success: false, error: 'not_broke', chips: current });
         return;
       }
       try { const p = progressionManager.getProgress(ctx.playerId); if (p) p.chips = newBalance; } catch {}
       const uname = authSessions.get(socket.id)?.username || String(ctx.userId);
-      auditLog(uname, 'BROKE_REFILL', { added: REFILL_AMOUNT, newBalance });
+      auditLog(uname, 'BROKE_REFILL', { added: REFILL_AMOUNT, newBalance, onTable });
       socket.emit('refillResult', { success: true, added: REFILL_AMOUNT, chips: newBalance });
       sendProgressToPlayer(socket.id);
     } catch (err: any) {
@@ -11080,8 +11557,15 @@ Give feedback in this JSON format:
     try {
       const ctx = await ensureHydrated(socket);
       if (!ctx) { socket.emit('battlePassTierClaimed', { success: false, error: 'Not authenticated' }); return; }
+      // R1 (AUTH-5 / ECON-2) — per account, before any claim work.
+      if (!battlePassClaimLimiter.hit(String(ctx.userId))) {
+        socket.emit('battlePassTierClaimed', { success: false, error: 'rate_limited', tierId: Number(data?.tierId) || undefined });
+        return;
+      }
 
-      const seasonId = data?.seasonId || 'season_1_the_river';
+      // R1 (AUTH-5 / ECON-2) — the SERVER's season, never the client's
+      // seasonId (a new id per request re-claimed every tier).
+      const seasonId = CURRENT_BATTLE_PASS_SEASON;
       const tierId = Number(data?.tierId);
       if (!Number.isInteger(tierId) || tierId < 1 || tierId > 50) {
         socket.emit('battlePassTierClaimed', { success: false, error: 'invalid_tier' });
@@ -11224,7 +11708,7 @@ Give feedback in this JSON format:
       if (!ctx) return;
       const [inventory, bpClaims, durable, handHistory, careerProgress] = await Promise.all([
         loadInventory(ctx.userId),
-        loadBattlePassClaims(ctx.userId, data.seasonId || 'season_1_the_river'),
+        loadBattlePassClaims(ctx.userId, CURRENT_BATTLE_PASS_SEASON),   // R1 — the server's season (client seasonId ignored)
         loadDurableProgress(ctx.userId),
         loadHandHistory(ctx.userId, 100),
         loadCareerProgress(ctx.userId),
@@ -12470,8 +12954,14 @@ Give feedback in this JSON format:
     // owned by TournamentManager; a self-serve rebuy would let them
     // un-eliminate with a client-chosen stack and corrupt standings +
     // payouts. Mirror the moveSeat tournament gate.
-    if (isTournamentTable(session.tableId)) {
-      socket.emit('error', { message: 'Rebuys are disabled in tournaments' });
+    // 2026-10-11 (R1 contract #2, TOURNEY-1) — and never at a QUICK table
+    // (Spin & Go / career / heads-up / all-in-or-fold) or a club challenge:
+    // their settlement pays a fixed prize, so a top-up (poker-3d's auto-rebuy
+    // sent minBuyIn || 5000) was destroyed on a win. Same rule as the
+    // `rebuyAllowed` game-state key; refused before anything is deducted.
+    const rebuyRefusal = rebuyRefusalAt(session.tableId);
+    if (rebuyRefusal) {
+      socket.emit('error', rebuyRefusal);
       return;
     }
     // Don't allow rebuys in the middle of a hand while the player is
@@ -13061,18 +13551,29 @@ Give feedback in this JSON format:
     const auth = authSessions.get(socket.id);
     if (!auth?.userId) return;
     try {
-      let targetId = data?.userId;
-      if (!targetId && data?.name) {
-        const q = String(data.name).trim();
-        const matches = await searchUsers(q, 5);
-        const exact = matches.find(m => m.username.toLowerCase() === q.toLowerCase()) || matches[0];
-        targetId = exact?.id;
+      // R1 (APPUI-14) — a name resolves only to an EXACT (case-insensitive)
+      // display-name match of ONE listable account: never the first partial
+      // LIKE match of a login handle (which friended a stranger). FriendSystem
+      // sends {name} (what the player typed); {userId} (a friends-list row) is
+      // checked to be a real, listable account.
+      let targetId: number | undefined;
+      if (data?.userId !== undefined && data?.userId !== null) {
+        const n = Number(data.userId);
+        if (Number.isInteger(n) && n > 0 && (await getPublicNames([n])).has(n)) targetId = n;
+      } else if (typeof data?.name === 'string' && data.name.trim()) {
+        const matches = await findUsersByDisplayName(data.name.trim(), 2);
+        if (matches.length > 1) {
+          socket.emit('friendError', { message: 'More than one player uses that name — add them from their profile or a table instead.', code: 'friend_name_ambiguous' });
+          return;
+        }
+        targetId = matches[0]?.id;
       }
-      if (!targetId) { socket.emit('friendError', { message: 'Player not found' }); return; }
+      if (!targetId) { socket.emit('friendError', { message: 'Player not found', code: 'friend_not_found' }); return; }
       const res = await sendFriendRequest(auth.userId, targetId);
       if (!res.ok) { socket.emit('friendError', { message: res.error || 'Failed' }); return; }
       socket.emit('friendRequestSent', { status: res.status });
-      for (const [sid, a] of authSessions) if (a?.userId === targetId) io.to(sid).emit('friendRequestReceived', { from: auth.username });
+      const fromName = await publicNameForUser(auth.userId);   // R1 — never the login handle
+      for (const [sid, a] of authSessions) if (a?.userId === targetId) io.to(sid).emit('friendRequestReceived', { from: fromName });
     } catch (e) { socket.emit('friendError', { message: 'Failed to send request' }); }
   });
   socket.on('acceptFriendRequest', async (data: { userId: number }) => {
@@ -13091,7 +13592,8 @@ Give feedback in this JSON format:
   socket.on('inviteFriendToTable', async (data: { userId: number; tableId?: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth?.userId || !data?.userId) return;
-    for (const [sid, a] of authSessions) if (a?.userId === data.userId) io.to(sid).emit('tableInvite', { from: auth.username, tableId: data.tableId || null });
+    const inviterName = await publicNameForUser(auth.userId);   // R1 — never the login handle
+    for (const [sid, a] of authSessions) if (a?.userId === data.userId) io.to(sid).emit('tableInvite', { from: inviterName, tableId: data.tableId || null });
     socket.emit('friendInviteSent', { userId: data.userId });
   });
 
@@ -13418,23 +13920,40 @@ Give feedback in this JSON format:
     broadcastGameState(session.tableId);
   });
 
-  // ========== Show Mucked Hand ==========
-  socket.on('showMuckedHand', async (data: { cards: any[] }) => {
-    const session = playerSessions.get(socket.id);
-    if (!session || !data?.cards?.length) return;
-
+  // ========== Show Mucked Hand — R1 contract #4 (2026-10-11, TABLEUI-5) ==========
+  // Broadcasts the seat's REAL hole cards to the table: the client's `cards`
+  // used to be relayed as-is (fake cards — or `[null]` / 'x', which crashed
+  // every client at the table). Allowed for a player who FOLDED this hand, or
+  // for the UNCONTESTED winner once the hand is over (a contested showdown
+  // already tabled his cards). Once per seat per hand; nothing for spectators
+  // or bots. Payload: `{ tableId? }` (any `cards` are ignored).
+  // `muckedHandRevealed { playerName, seatIndex, tableId, handNumber, cards: [{suit, rank, display}], timestamp }`.
+  socket.on('showMuckedHand', async (data: { tableId?: string; cards?: unknown } = {}) => {
+    const main = playerSessions.get(socket.id);
+    const wanted = typeof data?.tableId === 'string' && data.tableId ? data.tableId : main?.tableId;
+    const session = main && main.tableId === wanted
+      ? main
+      : (multiTableSessions.get(socket.id) || []).find((s) => s && s.tableId === wanted);
+    if (!session) return;
     const table = tableManager.getTable(session.tableId);
     if (!table) return;
-
     const seat = table.seats[session.seatIndex];
-    // Only allow showing if player folded this hand
-    if (!seat || !seat.folded) return;
-
-    // Broadcast the reveal to everyone at the table
+    if (!seat || seat.state !== 'occupied' || seat.isAI || seat.holeCards.length === 0) return;
+    const handOver = table.currentPhase === GamePhase.HandComplete || table.currentPhase === GamePhase.Showdown;
+    const uncontestedWinner = handOver && !seat.folded && !table.wentToShowdown
+      && !!table.lastHandResult && table.lastHandResult.handNumber === table.handNumber
+      && table.lastHandResult.winners.some((w) => w.seatIndex === session.seatIndex);
+    if (!seat.folded && !uncontestedWinner) return;
+    const key = `${session.tableId}:${table.handNumber}:${session.seatIndex}`;
+    if (shownMuckedHands.has(key)) return;
+    if (shownMuckedHands.size >= 10_000) shownMuckedHands.clear();
+    shownMuckedHands.add(key);
     io.to(`table:${session.tableId}`).emit('muckedHandRevealed', {
-      playerName: session.playerName,
+      playerName: seat.playerName,
       seatIndex: session.seatIndex,
-      cards: data.cards,
+      tableId: session.tableId,
+      handNumber: table.handNumber,
+      cards: seat.holeCards.map((c) => ({ suit: c.suit, rank: c.rank, display: cardToString(c) })),
       timestamp: Date.now(),
     });
   });
@@ -14303,46 +14822,78 @@ Give feedback in this JSON format:
     });
   });
 
-  // ========== All-In Insurance (cashout) ==========
-  // A player all-in with cards to come can lock in a guaranteed cashout instead
-  // of gambling the runout. The house is the counterparty (buys their equity at
-  // a 10% discount). v1 is scoped to HEADS-UP all-ins so the total pot equals
-  // the eligible pot (no side-pot mis-pricing). The amount is computed
-  // server-side from real Monte-Carlo equity — the client's figure is ignored.
-  socket.on('acceptInsurance', () => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
+  // ========== All-In Insurance (cashout) — R1 contract #1 (2026-10-11) ==========
+  // The quote is SERVER state: the eligible seat's game state carries
+  // `insuranceQuote` while the runout is held for it (decideInsuranceHold). The
+  // client names the hand it saw the quote in — `acceptInsurance { tableId,
+  // handNumber }` — and sends NO numbers; any it sends are ignored. Everything
+  // is re-validated here and the cashout recorded is EXACTLY the quote's.
+  // Answers: `insuranceAccepted { cashout, equityPct, tableId, handNumber }`, or
+  // `error { message, code }` with a stable code: insurance_not_seated /
+  // insurance_stale_hand (no / another handNumber — an old client) /
+  // insurance_already_accepted / insurance_unavailable.
+  const insuranceSessionFor = (tableId: unknown): PlayerSession | undefined => {
+    const main = playerSessions.get(socket.id);
+    if (typeof tableId !== 'string' || !tableId || main?.tableId === tableId) return main;
+    return (multiTableSessions.get(socket.id) || []).find((s) => s && s.tableId === tableId);
+  };
+  socket.on('acceptInsurance', (data: { tableId?: string; handNumber?: number } = {}) => {
+    const refuse = (code: string, message: string): void => {
+      insuranceStats.refused++;
+      socket.emit('error', { message, code });
+    };
+    const session = insuranceSessionFor(data?.tableId);
+    if (!session) { refuse('insurance_not_seated', 'You are not seated at that table.'); return; }
     const table = tableManager.getTable(session.tableId);
-    if (!table) return;
+    if (!table) { refuse('insurance_not_seated', 'You are not seated at that table.'); return; }
+    const handNumber = Number(data?.handNumber);
+    if (!Number.isInteger(handNumber) || handNumber !== table.handNumber) {
+      refuse('insurance_stale_hand', 'That insurance offer is no longer available.');
+      return;
+    }
+    const already = (insuranceCashouts.get(session.tableId) || []).some((c) => c.seatIndex === session.seatIndex && c.handNumber === handNumber);
+    if (already) { refuse('insurance_already_accepted', 'Insurance is already locked in for this hand.'); return; }
+    const quote = insuranceQuoteForSeat(session.tableId, table, session.seatIndex);
+    const offer = insuranceOffers.get(session.tableId);
     const seat = table.seats[session.seatIndex];
-    if (!seat || seat.state !== 'occupied' || !seat.allIn || seat.folded) return;
-    // Community-card game with cards still to come.
-    const vId = String((table as any).config?.variantId || (table as any).variantId || '').toLowerCase();
-    const isCommunity = /holdem|omaha|short|royal/.test(vId) || seat.holeCards.length <= 4;
-    if (!isCommunity || table.communityCards.length >= 5) return;
-    // Exactly one live opponent (heads-up all-in) → total pot === eligible pot.
-    const liveOpponents = table.seats.filter(
-      (s, i) => i !== session.seatIndex && s.state === 'occupied' && !s.folded && !s.eliminated
-    );
-    if (liveOpponents.length !== 1) return;
-    // One cashout per seat per hand.
+    if (!quote || !offer || !seat) { refuse('insurance_unavailable', 'Insurance is not available for this hand.'); return; }
+
     const list = insuranceCashouts.get(session.tableId) || [];
-    if (list.some((c) => c.seatIndex === session.seatIndex)) return;
-
-    const isOmaha = vId.includes('omaha');
-    const equity = calculateEquity(seat.holeCards, table.communityCards, 1, isOmaha); // 0..1
-    const pot = table.getTotalPot();
-    const cashout = insuranceCashoutAmount(pot, equity);
-    if (cashout <= 0) return;
-
     list.push({
       seatIndex: session.seatIndex,
-      playerId: session.playerId,
+      playerId: seat.playerId,
       userId: authSessions.get(socket.id)?.userId,
-      cashout,
+      cashout: quote.cashout,
+      handNumber,
+      equityPct: quote.equityPct,
+      pot: quote.pot,
     });
     insuranceCashouts.set(session.tableId, list);
-    socket.emit('insuranceAccepted', { cashout, equityPct: Math.round(equity * 100) });
+    offer.decided.add(session.seatIndex);
+    insuranceStats.accepted++;
+    auditLog(authSessions.get(socket.id)?.username || seat.playerId, 'INSURANCE_ACCEPTED', {
+      tableId: session.tableId, handNumber, seatIndex: session.seatIndex, cashout: quote.cashout, equityPct: quote.equityPct, pot: quote.pot,
+    });
+    socket.emit('insuranceAccepted', { cashout: quote.cashout, equityPct: quote.equityPct, tableId: session.tableId, handNumber });
+    broadcastGameState(session.tableId); // the quote leaves this seat's state
+    releaseInsuranceHoldIfDecided(session.tableId, handNumber);
+  });
+
+  // Optional (additive to contract #1): the player waved the offer away — his
+  // quote goes, and once every quoted seat has decided the board runs out at
+  // once instead of waiting out the window. Silent on anything invalid.
+  socket.on('declineInsurance', (data: { tableId?: string; handNumber?: number } = {}) => {
+    const session = insuranceSessionFor(data?.tableId);
+    if (!session) return;
+    const table = tableManager.getTable(session.tableId);
+    const handNumber = Number(data?.handNumber);
+    if (!table || !Number.isInteger(handNumber) || handNumber !== table.handNumber) return;
+    const offer = insuranceOffers.get(session.tableId);
+    if (!offer || offer.handNumber !== handNumber || !offer.quotes.has(session.seatIndex) || offer.decided.has(session.seatIndex)) return;
+    offer.decided.add(session.seatIndex);
+    insuranceStats.declined++;
+    broadcastGameState(session.tableId);
+    releaseInsuranceHoldIfDecided(session.tableId, handNumber);
   });
 
   // ========== Straddle ==========
@@ -14366,7 +14917,11 @@ Give feedback in this JSON format:
   // in) and returns only non-PII profile fields (no chips/email/phone).
   socket.on('requestProfile', async (data: { username: string }) => {
     if (!authSessions.get(socket.id)) return; // signed-in viewers only
-    const uname = String(data?.username || '').trim();
+    // R1 (APPUI-14 / AUTH-7) — `username` is the NAME the viewer clicked (a
+    // seat / leaderboard name): it is looked up as an exact DISPLAY NAME
+    // (case-insensitive, listable rows), echoed back as `username` (the
+    // client matches on it) — never a login handle.
+    const uname = String(data?.username || '').trim().slice(0, 40);
     if (!uname) return;
     const emptyProfile = {
       username: uname, level: 1, elo: 500, wins: 0, losses: 0, totalHands: 0,
@@ -14374,10 +14929,10 @@ Give feedback in this JSON format:
       unlockedAchievements: [] as string[], sessionHistory: null, handHistory: [] as any[],
     };
     try {
-      const { rows } = await getPool().query(
-        `SELECT username, level, stats, achievements FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1`,
-        [uname]
-      );
+      const match = isPublicDisplayName(uname) ? (await findUsersByDisplayName(uname, 1))[0] : undefined;
+      const { rows } = match
+        ? await getPool().query(`SELECT level, stats, achievements FROM users WHERE id = $1`, [match.id])
+        : { rows: [] as any[] };
       if (rows.length === 0) { socket.emit('profileData', { ...emptyProfile, notFound: true }); return; }
       const u = rows[0];
       let stats: any = {};
@@ -14387,7 +14942,8 @@ Give feedback in this JSON format:
       const totalHands = stats.handsPlayed || stats.totalHandsPlayed || 0;
       const wins = stats.handsWon || 0;
       socket.emit('profileData', {
-        username: u.username,
+        username: uname,
+        displayName: match!.displayName,
         level: u.level || 1,
         elo: stats.elo || 500,
         wins,
@@ -14425,7 +14981,7 @@ Give feedback in this JSON format:
       const running = (tournamentManager.getTournamentList() as any[]).find((t) => t.status === 'running');
       tid = running?.tournamentId;
     }
-    socket.emit('tournamentStandings', tid ? tournamentManager.getTournamentStandings(tid, tableManager) : null);
+    socket.emit('tournamentStandings', tid ? publicTournamentStandings(tournamentManager.getTournamentStandings(tid, tableManager)) : null);   // R1 — public names, opaque ids
   });
 
   socket.on('registerTournament', async (data: { tournamentId: string; playerName: string }) => {
@@ -14987,13 +15543,21 @@ Give feedback in this JSON format:
     // (App's global handler shows the C5 notice).
     const ptGate = await assertPlayable(socket, 'createPrivateTable');
     if (ptGate) { emitPlayRefusal(socket, ptGate); return; }
+    // 2026-10-11 (R1, AUTH-4 — live mint) — every number of the home game is
+    // validated: minBuyIn -1,000,000 made every invite buy-in NEGATIVE
+    // (deductChips(-n) credited the wallet, sitDown seated it). Refused on
+    // `error` with a stable code; nothing is created.
+    const ptCheck = validateTableConfig(data, { tableName: 'Private Table', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: (bb) => bb * 20 });
+    if (!ptCheck.ok) { socket.emit('error', { message: ptCheck.error, code: ptCheck.code }); return; }
+    const ptCfg = ptCheck.config;
     const tableId = tableManager.createVariantTable({
-      tableName: data.tableName || 'Private Table',
-      smallBlind: Math.max(1, data.smallBlind || 25),
-      bigBlind: Math.max(2, data.bigBlind || 50),
-      ante: data.ante || 0,
-      minBuyIn: data.minBuyIn || 1000,
-    }, (data.variant as any) || 'texas-holdem');
+      tableName: ptCfg.tableName,
+      smallBlind: ptCfg.smallBlind,
+      bigBlind: ptCfg.bigBlind,
+      ante: ptCfg.ante,
+      minBuyIn: ptCfg.minBuyIn,
+    }, ptCfg.variant);
+    privateTableIds.add(tableId);   // R1 contract #2 — tableKind 'private'
 
     // 2026-06-11 audit M2: the createPrivateTable payload advertised straddle /
     // runItTwice / bombPot toggles but the handler dropped all three silently.
@@ -15135,7 +15699,9 @@ Give feedback in this JSON format:
     if (data.targetSocketId === socket.id) return;
     io.to(data.targetSocketId).emit('coachWhisper', {
       message: data.message,
-      coachName: data.coachName || auth.username,
+      // R1 — the coach's public name (the client's coachName was spoofable,
+      // the fallback was the login handle).
+      coachName: await publicNameForUser(auth.userId),
     });
   });
 
