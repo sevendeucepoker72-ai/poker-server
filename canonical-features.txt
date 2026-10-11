@@ -701,3 +701,18 @@ if (!(owed <= 0 && table.playerCheck(session.seatIndex)))
 # round-7 review: one seat, one session (a stale disconnect never acts for a seat another socket plays; tokenLogin's orphan scan skips it).
 otherSessionHoldsSeat
 disconnect_seat_not_his_after_save
+#
+# 2026-10-11 (.online R1, contract #6; AUTH-2 / OPS-1 / CLUBS-3) — crash safety.
+# Every socket listener is guarded (sync throw / rejected promise logged with
+# the event name, ack answered server_error; a non-object payload refused before
+# the body); unhandledRejection is logged and the process keeps running; an
+# uncaughtException runs the SIGTERM cash-out flush (bounded) and exits 1. The
+# @socket.io/redis-adapter (single replica; its publish rejection crashed prod
+# on 2026-09-12) is removed. Pinned by tests/crashSafety.test.ts.
+[socket-handler-error]
+[socket-payload-rejected]
+installSocketListenerGuard
+[process-unhandled-rejection]
+[process-uncaught-exception]
+gracefulShutdown('uncaughtException', 1)
+crashSafety

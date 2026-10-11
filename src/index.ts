@@ -80,6 +80,11 @@ import {
   type GuestClaimDeps, type PgPoolLike,
 } from './auth/guestClaim';
 import { notifyPlayer } from './notifyClient';
+// 2026-10-11 (R1 contract #6) — crash safety: every socket listener is wrapped
+// (sync + async errors caught, non-object payloads refused before the body) and
+// the process logs unhandled rejections / flushes then exits on an uncaught one.
+import { installSocketListenerGuard, socketGuardStats } from './socketGuard';
+import { installProcessCrashHandlers, processCrashStats, CRASH_FLUSH_TIMEOUT_MS } from './processGuards';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
 // being migrated to log.debug so they mute under production pino level
 // (info+) without losing the field structure for ops/debug builds.
@@ -188,6 +193,22 @@ if (process.env.SENTRY_DSN) {
   }
 }
 
+// 2026-10-11 (R1 contract #6; OPS-1 / AUTH-2 / CLUBS-3) — process-level crash
+// handlers, installed before anything async starts. An unhandled rejection is
+// logged and the server KEEPS RUNNING; an uncaught exception is logged, then the
+// SIGTERM flush (gracefulShutdown: every seated / reserved stack credited back,
+// progress saved) runs with a bounded wait, then exit(1). Before this, one stray
+// rejection exited the process WITHOUT that flush (2026-09-12: the Redis
+// adapter's publish rejected during a Redis redeploy). See processGuards.ts.
+installProcessCrashHandlers({
+  flush: () => gracefulShutdown('uncaughtException', 1),
+  flushTimeoutMs: CRASH_FLUSH_TIMEOUT_MS,
+  log: (line) => console.error(line),
+  capture: (err, kind) => {
+    if (Sentry) Sentry.captureException(err, { tags: { area: `process.${kind}` } });
+  },
+});
+
 // ========== Server Setup ==========
 
 const app = express();
@@ -231,19 +252,14 @@ const io = new Server(httpServer, {
 
 const PORT = parseInt(process.env.PORT || '3001');
 
-// Redis adapter for Socket.io (optional — for multi-instance scaling)
-if (process.env.REDIS_URL) {
-  import('@socket.io/redis-adapter').then(({ createAdapter }) => {
-    import('redis').then(({ createClient }) => {
-      const pubClient = createClient({ url: process.env.REDIS_URL });
-      const subClient = pubClient.duplicate();
-      Promise.all([pubClient.connect(), subClient.connect()]).then(() => {
-        io.adapter(createAdapter(pubClient, subClient));
-        console.log('[Redis] Socket.io adapter connected');
-      }).catch(err => console.warn('[Redis] Connection failed, running without:', err.message));
-    });
-  }).catch(() => console.warn('[Redis] @socket.io/redis-adapter not available'));
-}
+// 2026-10-11 (OPS-1) — the @socket.io/redis-adapter block that lived here is
+// GONE. poker-server runs ONE replica (all table state is in this process's
+// memory), so cross-instance broadcast did nothing, while its pub/sub clients
+// had no 'error' listeners and its fire-and-forget publish rejected on every
+// Redis restart: on 2026-09-12 a Railway Redis redeploy (ECONNRESET) exited the
+// process and skipped the SIGTERM cash-out flush. The hand-snapshot store
+// (redisStore.ts, REDIS_URL) is separate and unchanged. Scaling past one
+// replica needs shared table state first, not just an adapter.
 
 // ---------------------------------------------------------------------------
 // Auth-error telemetry (observability ONLY)
@@ -2435,6 +2451,14 @@ app.get('/api/health', async (_req, res) => {
         statsColumnType: _statsColumnType,
         stampDurable: _statsColumnType === 'jsonb',
         ...identityGuardStats,
+      },
+      // 2026-10-11 (R1 contract #6) — crash safety. Counts only. A climbing
+      // socketListeners.handlerErrors / process.unhandledRejections is a bug to
+      // fix (the event is in the `[socket-handler-error]` /
+      // `[process-unhandled-rejection]` log line) — the server stayed up.
+      crashSafety: {
+        socketListeners: { ...socketGuardStats },
+        process: { ...processCrashStats },
       },
       // 2026-10-10 — one person, one local row (auth/accountMerge.ts). Counts
       // only, no ids: the identity gate, the master-first resolver (splitSeen
@@ -6542,6 +6566,18 @@ function cleanupQuickTable(tableId: string): void {
 // ========== Socket.io Events ==========
 
 io.on('connection', (socket: Socket) => {
+  // 2026-10-11 (R1 contract #6) — FIRST, before any socket.on below: every
+  // listener registered on this socket runs guarded (socketGuard.ts) — a sync
+  // throw / rejected promise is logged `[socket-handler-error]` with the event
+  // name and an ack (if any) answered { success:false, error:'server_error' };
+  // a payload-taking listener refuses a non-object payload before its body
+  // (`[socket-payload-rejected]`). One bad frame no longer exits the process.
+  installSocketListenerGuard(socket, {
+    log: (line) => console.error(line),
+    onHandlerError: (event, err) => {
+      if (Sentry) Sentry.captureException(err, { tags: { area: 'socket.handler', event } });
+    },
+  });
   // Per-IP connection limit
   const clientIp = socket.handshake.address;
   if (!ipConnections.has(clientIp)) ipConnections.set(clientIp, new Set());
@@ -10000,7 +10036,7 @@ Give feedback in this JSON format:
       buyIn: number;
       avatar?: string;
       expectedVariant?: string;
-    }) => { (async () => {
+    }) => { return (async () => {
       if (blockedByMaintenance(socket)) return;
       // 2026-10-07 play gate — before ANY side effect below (spectator scrub,
       // leaving the old table, standing up an AI). Also covers club tables
@@ -10270,7 +10306,7 @@ Give feedback in this JSON format:
 
   socket.on(
     'quickPlay',
-    (data: { playerName: string; avatar?: string }) => { (async () => {
+    (data: { playerName: string; avatar?: string }) => { return (async () => {
       if (blockedByMaintenance(socket)) return;
       // 2026-10-07 play gate — before the scrub / leave / AI stand-up below.
       const qpGate = await assertPlayable(socket, 'quickPlay');
@@ -12532,7 +12568,7 @@ Give feedback in this JSON format:
     emitGameState(socket, state, true);
   });
 
-  socket.on('rebuy', async (data: { amount?: number } = {}) => { (async () => {
+  socket.on('rebuy', async (data: { amount?: number } = {}) => { return (async () => {
     // 2026-10-07 play gate — a rebuy puts fresh chips in play.
     const rbGate = await assertPlayable(socket, 'rebuy');
     if (rbGate) { emitPlayRefusal(socket, rbGate); return; }
@@ -18949,7 +18985,21 @@ httpServer.listen(PORT, async () => {
 // - users.chips (at-table stack added back)
 // - xp/level/achievements/stats (via saveProgress)
 let shutdownInProgress = false;
-async function gracefulShutdown(signal: string) {
+// 2026-10-11 (R1 contract #6) — also the CRASH flush: the uncaughtException
+// handler (processGuards.ts) awaits gracefulShutdown('uncaughtException', 1)
+// with a bounded wait, then exits 1. A second call while a flush is running
+// (a crash during a SIGTERM flush) gets the SAME in-flight promise — it never
+// starts a second flush and never cuts the running one short — and the
+// highest requested exit code wins.
+let shutdownPromise: Promise<void> | null = null;
+let shutdownExitCode = 0;
+function gracefulShutdown(signal: string, exitCode: number = 0): Promise<void> {
+  if (exitCode > shutdownExitCode) shutdownExitCode = exitCode;
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = runGracefulShutdown(signal);
+  return shutdownPromise;
+}
+async function runGracefulShutdown(signal: string): Promise<void> {
   if (shutdownInProgress) return;
   shutdownInProgress = true;
   console.log(`[Shutdown] ${signal} received — preserving player state...`);
@@ -19078,9 +19128,10 @@ async function gracefulShutdown(signal: string) {
     if (Sentry) Sentry.captureException(err, { tags: { area: 'shutdown.flush' } });
   } finally {
     // Give the logger a moment, then exit so Railway can finish the redeploy.
-    setTimeout(() => process.exit(0), 500);
+    // Exit code 1 when a crash asked for this flush (shutdownExitCode).
+    setTimeout(() => process.exit(shutdownExitCode), 500);
   }
 }
 
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
+process.on('SIGINT',  () => { void gracefulShutdown('SIGINT'); });
