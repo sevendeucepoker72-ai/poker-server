@@ -323,21 +323,21 @@ export class SidePotManager {
   }
 
   /**
-   * Order seat indices clockwise from dealer position.
-   * `totalSeats` MUST be the physical capacity (TABLE_SEAT_COUNT), not a
-   * filtered length. Exposed as `static` so variant code (e.g., OmahaTable)
-   * can reuse it for hi-lo split distribution.
+   * Order seat indices clockwise starting with the FIRST SEAT LEFT OF THE
+   * BUTTON (the button itself is last). `totalSeats` MUST be the physical
+   * capacity (TABLE_SEAT_COUNT), not a filtered length. Exposed as `static` so
+   * variant code (e.g., OmahaTable) can reuse it for hi-lo split distribution.
+   * 2026-10-11 (.online R2, GAME P3) — the odd chip goes to the first winner
+   * left of the button (TDA); the old distance put the BUTTON first, so a
+   * button that split a pot always took the odd chip.
    */
   public static orderClockwiseFromDealer(
     seatIndices: number[],
     dealerSeat: number,
     totalSeats: number = TABLE_SEAT_COUNT
   ): number[] {
-    return [...seatIndices].sort((a, b) => {
-      const distA = (a - dealerSeat + totalSeats) % totalSeats;
-      const distB = (b - dealerSeat + totalSeats) % totalSeats;
-      return distA - distB;
-    });
+    const leftOfButton = (seat: number) => (((seat - dealerSeat - 1) % totalSeats) + totalSeats) % totalSeats;
+    return [...seatIndices].sort((a, b) => leftOfButton(a) - leftOfButton(b));
   }
 
   /**

@@ -70,6 +70,11 @@ export class ShortDeckTable extends PokerTable {
     // Use CardDeck.shuffle() to generate a commitment and seed the PRNG
     const commitment = this.deck.shuffle(this.handNumber);
     this._shortDeckCommitment = commitment;
+    // 2026-10-11 (.online R2, GAME P3) — commit the hash to the table BEFORE the
+    // deal, exactly like the base resetDeck: this override never emitted it, so
+    // a Short Deck hand had no pre-hand commitment for /api/fairness and the
+    // clients (its seed was still revealed at hand end).
+    this.emit('deckCommitment', { hash: commitment.hash, handNumber: commitment.handNumber });
 
     // Build short deck cards: only 6 through Ace
     const shortDeckCards: Card[] = [];
@@ -120,7 +125,10 @@ export class ShortDeckTable extends PokerTable {
         if (
           this.seats[seat].state === 'occupied' &&
           !this.seats[seat].eliminated &&
-          this.seats[seat].chipCount >= 0
+          this.seats[seat].chipCount >= 0 &&
+          // R2 (GAME P3) — never a SITTING-OUT seat (startNewHand starts it
+          // folded; the base deal skips it — this override dealt it cards).
+          !this.seats[seat].folded
         ) {
           const card = this.dealShortDeckCard();
           if (card) {
@@ -152,6 +160,31 @@ export class ShortDeckTable extends PokerTable {
   private dealShortDeckCard(): Card | null {
     if (this._shortDeckIndex >= this._shortDeckCards.length) return null;
     return this._shortDeckCards[this._shortDeckIndex++];
+  }
+
+  /**
+   * 2026-10-11 (.online R2, GAME P3) — the rabbit hunt comes off THIS table's
+   * 36-card deck, with its own burn rule (dealCommunityCards above always burns
+   * one), then the deal pointer is rewound. The base version read the unused
+   * 52-card deck: it "revealed" 2s-5s and cards that were never going to come.
+   */
+  computeRabbitBoard(): Card[] {
+    if (this.communityCards.length >= 5) return [];
+    const savedIndex = this._shortDeckIndex;
+    const board: Card[] = [];
+    const dealStreet = (count: number) => {
+      this.dealShortDeckCard(); // burn
+      for (let i = 0; i < count; i++) {
+        const c = this.dealShortDeckCard();
+        if (c) board.push(c);
+      }
+    };
+    let have = this.communityCards.length;
+    if (have < 3) { dealStreet(3); have = 3; } // flop
+    if (have < 4) { dealStreet(1); have = 4; } // turn
+    if (have < 5) { dealStreet(1); }           // river
+    this._shortDeckIndex = savedIndex; // rewind — non-mutating
+    return board;
   }
 
   /**

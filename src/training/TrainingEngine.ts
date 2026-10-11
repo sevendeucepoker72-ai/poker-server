@@ -101,8 +101,38 @@ function compareShortDeck(a: HandResult, b: HandResult, shortDeck: boolean): num
 }
 
 /**
+ * 2026-10-11 (.online R2, GAME-8) — the two hole cards a HOLD'EM-style hand
+ * plays when it holds more: a (Crazy) Pineapple seat keeps all but its weakest
+ * card (PineappleTable.autoDiscardOne drops the lowest rank, ties to the lowest
+ * suit). calculateEquity's Hold'em model is only ever run on these two.
+ */
+export function keptHoldemHoleCards(hole: Card[]): Card[] {
+  if (!hole || hole.length <= 2) return hole;
+  const cards = hole.slice();
+  while (cards.length > 2) {
+    let worst = 0;
+    for (let i = 1; i < cards.length; i++) {
+      const c = cards[i];
+      const w = cards[worst];
+      if (c.rank < w.rank || (c.rank === w.rank && c.suit < w.suit)) worst = i;
+    }
+    cards.splice(worst, 1);
+  }
+  return cards;
+}
+
+/** GAME-8 — simulations a time-budgeted equity always completes before it may stop early. */
+const MIN_BUDGETED_SIMULATIONS = 64;
+
+/**
  * Monte Carlo equity calculation.
  * Runs 500 simulations to estimate win probability.
+ * 2026-10-11 (.online R2, GAME-8): a Hold'em (non-Omaha) equity is computed for
+ * at most TWO hole cards — a Stud bot's 7 cards made every simulation evaluate
+ * 12-card hands (~1s of blocking CPU per decision, a fake 80-96% equity) — and
+ * `maxMs` (> 0) bounds the wall-clock time: the loop stops after at least
+ * MIN_BUDGETED_SIMULATIONS once the budget is spent (the bots pass one). The
+ * result is over the simulations actually run.
  */
 export function calculateEquity(
   holeCards: Card[],
@@ -123,12 +153,16 @@ export function calculateEquity(
   // so straight/flush frequencies are realistic, and applies the short-deck rule
   // that a FLUSH beats a FULL HOUSE. Was previously mis-modeled on a full 52-card
   // deck with standard rankings, making short-deck equity simply wrong.
-  shortDeck: boolean = false
+  shortDeck: boolean = false,
+  maxMs: number = 0
 ): number {
   if (holeCards.length < 2) return 50;
   if (numOpponents < 1) return 100;
+  if (!omaha && holeCards.length > 2) holeCards = keptHoldemHoleCards(holeCards);
 
   const NUM_SIMULATIONS = 500;
+  const deadline = maxMs > 0 ? Date.now() + maxMs : 0;
+  let simsRun = 0;
   const narrow = oppMinPctile > 0 && !omaha;
   let wins = 0;
   let ties = 0;
@@ -147,10 +181,13 @@ export function calculateEquity(
   const cardsNeeded = communityNeeded + numOpponents * holePerOpp;
 
   for (let sim = 0; sim < NUM_SIMULATIONS; sim++) {
+    // GAME-8 — the time budget (checked every 16 simulations past the minimum).
+    if (deadline && sim >= MIN_BUDGETED_SIMULATIONS && (sim & 15) === 0 && Date.now() > deadline) break;
     // Shuffle remaining deck for this simulation
     shuffleArray(remainingDeck);
 
     if (remainingDeck.length < cardsNeeded) break;
+    simsRun++;
 
     let idx = 0;
 
@@ -227,8 +264,10 @@ export function calculateEquity(
     }
   }
 
-  // Win percentage: wins + ties/2
-  const equity = ((wins + ties / 2) / NUM_SIMULATIONS) * 100;
+  // Win percentage: wins + ties/2, over the simulations actually run (a
+  // budgeted run may stop early; a deck too small for the field runs none).
+  if (simsRun === 0) return 50;
+  const equity = ((wins + ties / 2) / simsRun) * 100;
   return Math.round(equity * 10) / 10;
 }
 

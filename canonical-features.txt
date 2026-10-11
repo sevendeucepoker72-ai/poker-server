@@ -847,3 +847,85 @@ insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
 
 # 2026-10-11 R1 review (R1REV-2 / GAME-13): the waitlist deep link finds Hold'em tables by the table LIST variant
 waitlistHoldemByListVariant
+
+# 2026-10-11 (.online R2, S2 engine) — GAME-10 a seat taken mid-hand sits folded
+# until the next deal; a cardless seat never contests a pot (base, Omaha hi-lo,
+# Stud hi-lo). GAME-9 fixed limit is capped at a bet and three raises; the
+# table counts its own raises per street. C11 canStraddle (isFirstActor).
+# GAME-12 the engine deals a bomb pot itself. GAME-15/16 awardIfUncontested +
+# completeDrawRoundIfDone. GAME-6 draws only in a draw round by a dealt-in seat.
+# GAME-14 Omaha hi-lo all-fold refund. GAME P3: odd chip left of the button,
+# handResult names its player, Stud bring-in mandatory, Short Deck commitment +
+# rabbit hunt from its own deck.
+seat.folded = this.isHandInProgress();
+folded: s.folded || s.holeCards.length === 0,
+FIXED_LIMIT_MAX_BET_LEVELS = 4
+isRaiseCapped()
+this.raisesThisStreet++;
+canStraddle(seatIndex)
+applyBombPot(ante)
+awardIfUncontested()
+chipsWon: r.amount
+leftOfButton(
+FiveCardDrawTable.DRAW_PHASES.includes(this.currentPhase)
+completeDrawRoundIfDone()
+this.postBringIn(bringInSeat)
+posted bring-in
+(.online R2, GAME-14) — degenerate ALL-FOLD
+this.emit('deckCommitment', { hash: commitment.hash, handNumber: commitment.handNumber });
+this._shortDeckIndex = savedIndex;
+
+# 2026-10-11 (.online R2, S2 bots) — GAME-8 every Stud / draw variant takes its
+# own hand-strength path; the Hold'em equity sees at most 2 hole cards and is
+# time-budgeted. GAME-9 bots stop re-raising past a per-street cap; re-raises
+# are sized off the bet faced.
+STUD_VARIANT_IDS
+DRAW_VARIANT_IDS
+limitBotRaiseWar(
+BOT_MAX_STREET_RAISES_PREFLOP = 3
+BOT_EQUITY_BUDGET_MS = 40
+keptHoldemHoleCards(
+MIN_BUDGETED_SIMULATIONS = 64
+
+# 2026-10-11 (.online R2, S2 table lifecycle) — GAME-15/16 + Addendum: ONE seat
+# teardown (pot chips of a folded / all-in / extra-table / ghost seat wait for
+# the hand's end, the next bot acts now); never an AI seat taken mid-hand.
+# GAME-17 bots stripped only at the hand's end; the heartbeat revives a frozen
+# HandComplete table. GAME-18 bot stacks capped at 3 buy-ins, fixed-roster
+# quick tables never reload. GAME-11 / ECON-13 dealt-in-only progression,
+# sit-out limit, per-player fast mode. C11 isFirstActor / canBombPot; bomb pots
+# + straddles only at ring tables. TABLEUI-11 full state on spectate moves.
+# APPUI-21 a displaced reservation is settled. GAME-5 draw hands the turn on.
+function teardownSeat(
+seat_teardown_deferred
+takeAiSeatForJoin(
+aiSeatTakeableNow(
+stripBotsAfterHandIfMarked(tableId);
+heartbeatRestarts.handComplete++;
+reloadAndCapBotStacks(table, tableId, isFixedRosterQuickTable(tableId));
+BOT_STACK_CAP_BUYINS = 3
+dealtInSeats.has(session.seatIndex)
+SIT_OUT_HANDS_LIMIT = 30
+sit_out_limit
+tableWantsFastBots(tableId)
+stateObj.isFirstActor =
+stateObj.canBombPot =
+bomb_pot_not_allowed
+straddle_not_allowed
+table.applyBombPot(table.config.bigBlind * 2)
+emitGameState(socket, state, true);
+lastSentState.delete(sid);
+reservation_displaced_settled
+reserve_displaced
+endCashReservation(
+recordChipVelocity(tableId, table, data.results);
+chip_velocity_alert
+invalid_draw
+
+# 2026-10-11 (.online R2, S2 follow-up) — an all-in seat torn down keeps its
+# hand only at a ring table (wallet chips; a tournament / fixed-roster quick
+# seat's hand is dead); the guest-claim seat cash-out and the admin-DQ absent
+# tournament seat go through the one teardown.
+seat.allIn && leaverKeepsAllInHand(tableId)
+foldSeatOutOfHand(table, seatIndex)
+teardownSeat(tableId, table, seatIndex, null, reason)

@@ -20,7 +20,7 @@
  */
 import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { TournamentManager } from '../src/game/TournamentManager';
-import { SRC, slice, fnSrc, load, flush } from './helpers/indexSource';
+import { SRC, slice, fnSrc, load, flush, SEAT_TEARDOWN_SRC } from './helpers/indexSource';
 
 const ALICE = 101;
 const SEAT_RESERVE_MS = 6 * 3600_000;
@@ -91,6 +91,7 @@ ${p.noteNotCashed}
 ${p.gateState}
 ${p.rebalanceIsHeld}
 ${p.creditSeat}
+${SEAT_TEARDOWN_SRC}
 ${p.handlePlayerLeave}
 ${p.helpers}
 ${p.rebalance}
@@ -158,7 +159,8 @@ describe('F2 — a disconnect / leave in the break window never credits a tourna
     w.m.handlePlayerLeave(w.s2);
     await flush();
     expect(w.credits).toEqual([]);
-    expect(w.notCashed()).toEqual([expect.objectContaining({ userId: ALICE, reason: 'handlePlayerLeave', amount: 7000 })]);
+    // R2 (2026-10-11): the leave credits through teardownSeat → creditSeatStackToWallet (its audit row: chips).
+    expect(w.notCashed()).toEqual([expect.objectContaining({ userId: ALICE, reason: 'handlePlayerLeave', chips: 7000 })]);
   });
 
   it('creditSeatStackToWallet (ghost-seat cleanup, refused seat, extra-table teardown) on the broken table: nothing credited', async () => {
@@ -250,7 +252,10 @@ describe('F2 — CONTROL: deciding by tournamentTables alone (pre-F2) MINTS the 
   });
 
   it('leave in the window → credited at once (pre-F2)', async () => {
-    const w = world({ handlePlayerLeave: P.handlePlayerLeave.replace('const isTournamentSeat = isTournamentTable(session.tableId);', 'const isTournamentSeat = tournamentTables.has(session.tableId);') });
+    // R2 (2026-10-11): the leave's credit decision now lives in creditSeatStackToWallet (teardownSeat).
+    const creditSeat = P.creditSeat.replace('if (isTournamentTable(tableId)) {', 'if (tournamentTables.has(tableId)) {');
+    expect(creditSeat).not.toBe(P.creditSeat);
+    const w = world({ creditSeat });
     breakT1(w);
     w.m.handlePlayerLeave(w.s2);
     await flush();

@@ -423,36 +423,44 @@ describe('Stud — C13 ante/bring-in (not SB/BB) + R4 action order by exposed ha
     minBuyIn: 1000, maxPlayers: 9,
   });
 
-  test('C13: startNewHand posts NO SB/BB — betting line starts at 0 for the bring-in', () => {
+  // 2026-10-11 (.online R2, GAME P3) — the bring-in is now MANDATORY: the low
+  // door card posts it as a forced bet when Third Street is dealt (it was an
+  // optional action the player could simply check). C13 still holds: no SB / BB
+  // is ever posted, and the ante is dead money.
+  test('C13 + R2: startNewHand posts NO SB/BB — only the bring-in (a forced small-blind-sized bet by the low door card)', () => {
     const t = new SevenStudTable(scfg(0), false, false);
     seatPlayers(t, 3);
     (t as any).startNewHand();
-    // The whole point: currentBetToMatch === 0 so the ThirdStreet bring-in
-    // branch fires. A posted BB would have left this at 50.
-    expect(t.currentBetToMatch).toBe(0);
     const occupied = t.seats.filter(s => s.state === 'occupied');
+    const posted = occupied.filter(s => s.currentBet > 0);
+    expect(posted).toHaveLength(1);                         // the bring-in only — no live SB/BB
+    expect(posted[0].currentBet).toBe(25);
+    expect(posted[0].totalInvestedThisHand).toBe(25);
+    expect(t.currentBetToMatch).toBe(25);
     for (const s of occupied) {
-      expect(s.currentBet).toBe(0);              // no live SB/BB posted
-      expect(s.totalInvestedThisHand).toBe(0);   // nothing forced yet (ante 0, bring-in posted on action)
       expect(s.holeCards.length).toBe(3);        // 2 down + 1 up dealt
+      if (s !== posted[0]) { expect(s.currentBet).toBe(0); expect(s.totalInvestedThisHand).toBe(0); }
     }
-    expect(t.activeSeatIndex).toBeGreaterThanOrEqual(0); // a bring-in actor was chosen
+    expect(t.activeSeatIndex).toBeGreaterThanOrEqual(0);
+    expect(t.activeSeatIndex).not.toBe(posted[0].seatIndex); // the action starts on its left
   });
 
-  test('C13: with an ante configured, every active seat antes; line still starts at 0', () => {
+  test('C13: with an ante configured, every active seat antes (dead money); the bring-in seat also posts its bring-in', () => {
     const t = new SevenStudTable(scfg(50), false, false);
     seatPlayers(t, 3, 5000);
     (t as any).startNewHand();
-    expect(t.currentBetToMatch).toBe(0);
+    expect(t.currentBetToMatch).toBe(25);
     const occupied = t.seats.filter(s => s.state === 'occupied');
     for (const s of occupied) {
-      expect(s.totalInvestedThisHand).toBe(50); // ante only (bring-in not auto-posted at deal)
-      expect(s.chipCount).toBe(4950);           // ante deducted from stack
-      expect(s.currentBet).toBe(0);             // ante is dead money, not a bet
+      const bringIn = s.currentBet === 25 ? 25 : 0;
+      expect(s.currentBet).toBe(bringIn);       // the ante is dead money, never a bet
+      expect(s.totalInvestedThisHand).toBe(50 + bringIn);
+      expect(s.chipCount).toBe(4950 - bringIn);
     }
+    expect(occupied.filter(s => s.currentBet === 25)).toHaveLength(1);
   });
 
-  test('2026-07-05 P1 fix: a sitting-out seat is NOT charged the Stud ante', () => {
+  test('2026-07-05 P1 fix: a sitting-out seat is NOT charged the Stud ante (nor dealt, nor the bring-in — R2)', () => {
     const t = new SevenStudTable(scfg(50), false, false);
     seatPlayers(t, 4, 5000);
     (t as any).setSittingOutSeats([1]); // seat 1 sits out this hand
@@ -461,12 +469,14 @@ describe('Stud — C13 ante/bring-in (not SB/BB) + R4 action order by exposed ha
     // hand; the seat must keep its full stack now.
     expect(t.seats[1].chipCount).toBe(5000);
     expect(t.seats[1].totalInvestedThisHand).toBe(0);
-    // Every other occupied seat still antes normally.
+    expect(t.seats[1].holeCards).toHaveLength(0);
+    // Every other occupied seat still antes normally (one of them also brings it in).
     const active = t.seats.filter((s, i) => s.state === 'occupied' && i !== 1);
     expect(active.length).toBeGreaterThanOrEqual(2);
     for (const s of active) {
-      expect(s.totalInvestedThisHand).toBe(50);
-      expect(s.chipCount).toBe(4950);
+      const bringIn = s.currentBet === 25 ? 25 : 0;
+      expect(s.totalInvestedThisHand).toBe(50 + bringIn);
+      expect(s.chipCount).toBe(4950 - bringIn);
     }
   });
 

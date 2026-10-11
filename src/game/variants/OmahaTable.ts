@@ -113,13 +113,14 @@ export class OmahaTable extends PokerTable {
     // TDA Rule 41: refund uncalled top-stack excess before pot calculation
     this.refundUncalledBets();
 
+    // GAME-10 (R2) — a seat with no cards never contests the pot (as the base award).
     const seatInfos: SeatInfo[] = this.seats
       .filter(s => s.state === 'occupied' && !s.eliminated)
       .map(s => ({
         seatIndex: s.seatIndex,
         chipCount: s.chipCount,
         totalInvestedThisHand: s.totalInvestedThisHand,
-        folded: s.folded,
+        folded: s.folded || s.holeCards.length === 0,
         allIn: s.allIn,
         holeCards: s.holeCards,
         state: s.state,
@@ -130,7 +131,18 @@ export class OmahaTable extends PokerTable {
     const showdownHands: ShowdownHandInfo[] = [];
     const winnerInfos: WinnerInfo[] = [];
 
-    if (nonFolded.length === 1) {
+    if (nonFolded.length === 0) {
+      // 2026-10-11 (.online R2, GAME-14) — degenerate ALL-FOLD (the blind
+      // posters left mid-hand and were force-folded, then the last live seat
+      // folded): nobody can win, so every seat gets its OWN stake back — the
+      // base rule (PokerTable.determineWinners, 2026-07-01 audit #1). This
+      // override used to fall into the pot loop, find no eligible seat and
+      // "orphan" the whole pot (15,000 on the table became 14,850). Nothing is
+      // pushed to results: a refund is not a win.
+      for (const s of seatInfos) {
+        if (s.totalInvestedThisHand > 0) this.seats[s.seatIndex].chipCount += s.totalInvestedThisHand;
+      }
+    } else if (nonFolded.length === 1) {
       // Last player standing wins everything
       const totalPot = seatInfos.reduce((sum, s) => sum + s.totalInvestedThisHand, 0);
       const winner = nonFolded[0];

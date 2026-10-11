@@ -17,7 +17,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import { fnSrc, slice, load } from './helpers/indexSource';
+import { fnSrc, slice, load, SEAT_TEARDOWN_SRC } from './helpers/indexSource';
 import { PokerTable } from '../src/game/PokerTable';
 
 const T = 'cash-1';
@@ -27,7 +27,9 @@ const ATTACKER = 200;
 const CURRENT = fnSrc('function clearGhostSeatsForUser(')
   + fnSrc('function seatPlayedByAnotherAccount(')
   + fnSrc('function otherSessionHoldsSeat(')
-  + slice('function seatReservedByOtherAccount(', '\n}\n');
+  + slice('function seatReservedByOtherAccount(', '\n}\n')
+  // R2 (2026-10-11): every ghost seat is stood up through the ONE seat teardown.
+  + SEAT_TEARDOWN_SRC;
 const HEAD = fs.readFileSync(path.join(__dirname, 'fixtures', 'clearGhostSeatsForUser.b7fcd15.ts.txt'), 'utf8');
 
 function world(code: string, opts: { tournament?: boolean } = {}) {
