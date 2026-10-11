@@ -16324,14 +16324,15 @@ function reserveSeatForDeparture(
   // Cancel any existing reservation for this user first
   const existing = reservedSeats.get(authSession.userId);
   if (existing) clearTimeout(existing.cleanupTimer);
-  // 2026-10-11 (R2, APPUI-21) — reservations are kept per user AND seat: a
-  // second departure of the same account (another device, another table) used
-  // to OVERWRITE the first reservation — its timer cancelled, its seat left
-  // occupied with no reservation, its stack never cashed out. The displaced
-  // reservation is now ENDED properly first, exactly as its own expiry would
-  // end it: a cash seat is credited and stood up (at the hand's end if its
-  // chips are in a live pot), a tournament seat stays in play, absent (T1 —
-  // never credited; Return still finds it by account).
+  // 2026-10-11 (R2, APPUI-21) — reservedSeats still holds ONE reservation per
+  // account (keyed by userId; ~70 readers across the server rely on that). A
+  // second departure of the same account for a DIFFERENT seat (another device,
+  // another table) used to OVERWRITE the first reservation — its timer
+  // cancelled, its seat left occupied with no reservation, its stack never
+  // cashed out. The displaced reservation is now ENDED properly first, exactly
+  // as its own expiry would end it: a cash seat is credited and stood up (at
+  // the hand's end if its chips are in a live pot), a tournament seat stays in
+  // play, absent (T1 — never credited; Return still finds it by account).
   if (existing && (existing.tableId !== session.tableId || existing.seatIndex !== session.seatIndex)) {
     reservedSeats.delete(authSession.userId);
     reservationsDisplaced.count++;
