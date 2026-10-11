@@ -723,3 +723,14 @@ rebuy_not_allowed
 stateObj.tableKind = 
 stateObj.rebuyAllowed = 
 stateObj.minBuyIn = 
+#
+# 2026-10-11 (R1, H2) — AUTH-4 (P0 mint): every client-created table config is
+# validated (private / club / scheduled club tables, club challenge stakes);
+# deductChips / addChipsToUser / addStarsToUser refuse non-positive or
+# fractional amounts before any SQL; sitDown refuses a non-positive fresh buy-in.
+invalid_table_config
+invalid_challenge_stakes
+scheduled_table_config_refused
+MIN_BUY_IN_BIG_BLINDS
+[chip-amount-refused]
+if (!allowBelowMin && (buyIn <= 0 || !Number.isInteger(buyIn)))

@@ -45,6 +45,7 @@ import { sanitizeClientProgressSave, PAYOUT_KEYS_FROM_CLIENT } from './progressi
 import { HandRank } from './game/HandEvaluator';
 import { getFullTrainingData } from './training/TrainingEngine';
 import { insuranceSettlementDelta, priceInsuranceQuote, InsuranceQuote } from './game/insurance';
+import { validateTableConfig, validateChallengeStakes } from './game/tableConfigValidation';
 import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
@@ -2879,20 +2880,34 @@ setInterval(() => syncQualifierSchedule(), 30 * 60 * 1000);
 // 2026-07-07 gap-fill [10] — shared table-creation from a scheduled-table config.
 // Used by BOTH the manual Activate handler and the auto-fire sweep so the two
 // paths can never drift.
-async function createTableFromScheduledConfig(clubId: number, cfg: any): Promise<string> {
+/** R1 (AUTH-4) — a scheduled club table's stored config, validated with the defaults this helper always used. */
+function validateScheduledTableConfig(cfg: unknown) {
+  return validateTableConfig(cfg, { tableName: 'Scheduled Table', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 });
+}
+
+async function createTableFromScheduledConfig(clubId: number, cfg: any): Promise<string | null> {
+  // 2026-10-11 (R1, AUTH-4) — validated again here: the row may predate the
+  // scheduleClubTable check. An invalid config creates NO table (null).
+  const check = validateScheduledTableConfig(cfg);
+  if (!check.ok) {
+    console.warn(`[ClubSweep] ${JSON.stringify({ event: 'scheduled_table_config_refused', clubId, error: check.error })}`);
+    return null;
+  }
   const clubInfoResult = await getClubInfo(clubId);
   const clubName = clubInfoResult.club?.name || 'Club';
-  const variant = (cfg.variant || 'texas-holdem') as VariantType;
+  const variant = check.config.variant;
   const tableConfig = {
-    tableName: `[${clubName}] ${cfg.tableName || 'Scheduled Table'}`,
-    smallBlind: cfg.smallBlind || 25,
-    bigBlind: cfg.bigBlind || 50,
+    tableName: `[${clubName}] ${check.config.tableName}`,
+    smallBlind: check.config.smallBlind,
+    bigBlind: check.config.bigBlind,
     ante: 0,
-    minBuyIn: cfg.minBuyIn || 1000,
+    minBuyIn: check.config.minBuyIn,
   };
-  return variant === 'texas-holdem'
+  const tableId = variant === 'texas-holdem'
     ? tableManager.createTable(tableConfig)
     : tableManager.createVariantTable(tableConfig, variant);
+  clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
+  return tableId;
 }
 
 // 2026-07-07 gap-fill [10] — auto-fire due scheduled/recurring club tables. Runs
@@ -2919,6 +2934,7 @@ async function sweepScheduledClubTables(): Promise<void> {
         if (!claimed) continue;
         const cfg = JSON.parse(row.tableConfig || '{}');
         const tableId = await createTableFromScheduledConfig(row.clubId, cfg);
+        if (!tableId) continue;   // R1 — an invalid stored config never becomes a table (nor recurs)
         if (row.recurring) await rescheduleRecurring(row.id);
         io.emit('scheduledClubTableActivated', { success: true, tableId, clubId: row.clubId });
         console.log(`[ClubSweep] auto-activated scheduled table ${row.id} (club ${row.clubId}) -> ${tableId}`);
@@ -9604,7 +9620,14 @@ Give feedback in this JSON format:
   socket.on('createClubTable', async (data: { clubId: number; config: any }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await createClubTable(auth.userId, data.clubId, data.config);
+    // 2026-10-11 (R1, AUTH-4) — the club table's numbers become a real cash
+    // table's buy-in: validated before anything is stored (same rules as a
+    // home game; clubManager's own defaults for absent fields).
+    const ctCheck = validateTableConfig(data?.config, {
+      tableName: '', smallBlind: 5, bigBlind: 10, ante: 0, minBuyIn: (bb) => bb * 20, maxBuyIn: (bb) => bb * 100,
+    });
+    if (!ctCheck.ok) { socket.emit('error', { message: ctCheck.error, code: ctCheck.code }); return; }
+    const result = await createClubTable(auth.userId, data.clubId, ctCheck.config);
     if (result.success && result.table) {
       // Create a real table in the TableManager
       const clubInfoResult = await getClubInfo(data.clubId);
@@ -9621,6 +9644,7 @@ Give feedback in this JSON format:
         ? tableManager.createTable(tableConfig)
         : tableManager.createVariantTable(tableConfig, variant);
       if (tableId) {
+        clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
         await updateClubTableId(result.table.id, tableId);
         result.table.tableId = tableId;
       }
@@ -9862,7 +9886,12 @@ Give feedback in this JSON format:
     if (ccGate) { emitPlayRefusal(socket, ccGate); return; }
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await createChallenge(data.clubId, auth.userId, data.challengedId, data.stakes);
+    // 2026-10-11 (R1, AUTH-4) — the stakes ARE both players' buy-in (the
+    // challenge table's minBuyIn): a whole number of chips in range, never 0 /
+    // negative / fractional / huge.
+    const csCheck = validateChallengeStakes(data?.stakes);
+    if (!csCheck.ok) { socket.emit('error', { message: csCheck.error, code: csCheck.code }); return; }
+    const result = await createChallenge(data.clubId, auth.userId, data.challengedId, csCheck.stakes);
     if (result.success) {
       socket.emit('clubChallengeCreated', result);
     } else {
@@ -9880,6 +9909,15 @@ Give feedback in this JSON format:
     const result = await acceptChallenge(data.challengeId, auth.userId);
     if (!result.success || !result.challenge) { socket.emit('error', { message: result.error }); return; }
     const { id: challengeId, challengerId, challengedId, stakes } = result.challenge;
+    // R1 (AUTH-4) — a challenge stored before the createClubChallenge check
+    // may carry any stakes: never spawn a table on bad ones (it is closed with
+    // no winner instead; nothing was bought in yet).
+    const caStakes = validateChallengeStakes(stakes);
+    if (!caStakes.ok) {
+      resolveChallenge(challengeId, null).catch(() => {});
+      socket.emit('error', { message: caStakes.error, code: caStakes.code });
+      return;
+    }
 
     // Spawn a heads-up table where the STAKES are the buy-in. Both players buy in
     // `stakes` via the normal join path; the winner takes the 2x pot when the
@@ -9951,7 +9989,11 @@ Give feedback in this JSON format:
   socket.on('scheduleClubTable', async (data: { clubId: number; config: any; scheduledTime: string; recurring: boolean; recurrencePattern?: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await scheduleTable(data.clubId, auth.userId, data.config, data.scheduledTime, data.recurring, data.recurrencePattern);
+    // 2026-10-11 (R1, AUTH-4) — the stored config becomes a real cash table
+    // when it fires: validated now (and again when it is created).
+    const stCheck = validateScheduledTableConfig(data?.config);
+    if (!stCheck.ok) { socket.emit('error', { message: stCheck.error, code: stCheck.code }); return; }
+    const result = await scheduleTable(data.clubId, auth.userId, stCheck.config, data.scheduledTime, data.recurring, data.recurrencePattern);
     if (result.success) {
       socket.emit('clubTableScheduled', result);
     } else {
@@ -9972,6 +10014,7 @@ Give feedback in this JSON format:
       // 2026-07-07 gap-fill [10] — create via the shared helper so the manual
       // Activate button and the auto-fire sweep produce byte-identical tables.
       const tableId = await createTableFromScheduledConfig(data.clubId, result.tableConfig);
+      if (!tableId) { socket.emit('error', { message: 'Invalid table settings for this scheduled table', code: 'invalid_table_config' }); return; }
       socket.emit('scheduledClubTableActivated', { success: true, tableId });
     } else {
       socket.emit('error', { message: result.error });
@@ -15357,13 +15400,21 @@ Give feedback in this JSON format:
     // (App's global handler shows the C5 notice).
     const ptGate = await assertPlayable(socket, 'createPrivateTable');
     if (ptGate) { emitPlayRefusal(socket, ptGate); return; }
+    // 2026-10-11 (R1, AUTH-4 — live mint) — every number of the home game is
+    // validated: minBuyIn -1,000,000 made every invite buy-in NEGATIVE
+    // (deductChips(-n) credited the wallet, sitDown seated it). Refused on
+    // `error` with a stable code; nothing is created.
+    const ptCheck = validateTableConfig(data, { tableName: 'Private Table', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: (bb) => bb * 20 });
+    if (!ptCheck.ok) { socket.emit('error', { message: ptCheck.error, code: ptCheck.code }); return; }
+    const ptCfg = ptCheck.config;
     const tableId = tableManager.createVariantTable({
-      tableName: data.tableName || 'Private Table',
-      smallBlind: Math.max(1, data.smallBlind || 25),
-      bigBlind: Math.max(2, data.bigBlind || 50),
-      ante: data.ante || 0,
-      minBuyIn: data.minBuyIn || 1000,
-    }, (data.variant as any) || 'texas-holdem');
+      tableName: ptCfg.tableName,
+      smallBlind: ptCfg.smallBlind,
+      bigBlind: ptCfg.bigBlind,
+      ante: ptCfg.ante,
+      minBuyIn: ptCfg.minBuyIn,
+    }, ptCfg.variant);
+    privateTableIds.add(tableId);   // R1 contract #2 — tableKind 'private'
 
     // 2026-06-11 audit M2: the createPrivateTable payload advertised straddle /
     // runItTwice / bombPot toggles but the handler dropped all three silently.

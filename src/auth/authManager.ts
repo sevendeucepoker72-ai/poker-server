@@ -1002,7 +1002,26 @@ export interface ChipQueryable {
   query(text: string, params?: unknown[]): Promise<{ rowCount?: number | null }>;
 }
 
+/**
+ * 2026-10-11 (.online R1, AUTH-4) — a chip / star movement is a positive
+ * whole number. `chips = chips - $1` with a NEGATIVE amount is a credit (a
+ * private table with minBuyIn -1,000,000 minted that way), and an
+ * `addChipsToUser` with one is an unchecked debit; NaN / fractions failed in
+ * Postgres anyway. Refused here before any SQL (logged `[chip-amount-refused]`)
+ * as the second line of defence behind the handlers' own validation. Every
+ * caller was checked: none moves a negative or fractional amount on purpose.
+ */
+function isPositiveWholeAmount(amount: unknown): amount is number {
+  return typeof amount === 'number' && Number.isInteger(amount) && amount > 0;
+}
+function refuseAmount(fn: string, userId: number, amount: unknown): false {
+  console.warn(`[chip-amount-refused] ${JSON.stringify({ fn, userId, amount: String(amount) })}`);
+  return false;
+}
+
 export async function deductChips(userId: number, amount: number, db?: ChipQueryable): Promise<boolean> {
+  // A deduction of nothing is never a valid buy-in / fee either (0 refused too).
+  if (!isPositiveWholeAmount(amount)) return refuseAmount('deductChips', userId, amount);
   try {
     const { rowCount } = await (db || pool).query('UPDATE users SET chips = chips - $1 WHERE id = $2 AND chips >= $1', [amount, userId]);
     return (rowCount ?? 0) > 0;
@@ -1010,6 +1029,8 @@ export async function deductChips(userId: number, amount: number, db?: ChipQuery
 }
 
 export async function addChipsToUser(userId: number, chips: number, db?: ChipQueryable): Promise<boolean> {
+  if (chips === 0) return true; // nothing to credit (no write; same result as before)
+  if (!isPositiveWholeAmount(chips)) return refuseAmount('addChipsToUser', userId, chips);
   try { await (db || pool).query('UPDATE users SET chips = chips + $1 WHERE id = $2', [chips, userId]); return true; } catch { return false; }
 }
 
@@ -1187,9 +1208,12 @@ export async function persistStars(userId: number, stars: number): Promise<void>
  *  writes, so grants can't clobber each other. Use for daily rewards,
  *  battle pass, scratch cards, shop refunds — anywhere a delta is added. */
 export async function addStarsToUser(userId: number, stars: number): Promise<boolean> {
+  // R1 (AUTH-4) — a negative, fractional or non-numeric grant is refused (it
+  // used to be floored / clamped silently); 0 stays a no-op success.
+  if (stars === 0) return true;
+  if (!isPositiveWholeAmount(stars)) return refuseAmount('addStarsToUser', userId, stars);
   try {
-    const amount = Math.max(0, Math.floor(stars));
-    if (amount === 0) return true;
+    const amount = stars;
     await pool.query('UPDATE users SET stars = stars + $1 WHERE id = $2', [amount, userId]);
     return true;
   } catch (e: any) {

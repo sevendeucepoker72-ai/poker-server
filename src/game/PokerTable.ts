@@ -336,6 +336,13 @@ export class PokerTable extends EventEmitter {
     // (human, AI fill, quick-play), not just the lobby-advertised count.
     if (seatIndex >= this.maxOccupiableSeats) return false;
     if (this.seats[seatIndex].state !== 'empty') return false;
+    // 2026-10-11 (.online R1, AUTH-4) — a stack is never negative, NaN or
+    // infinite, and a fresh buy-in is a positive whole number of chips, whatever
+    // the table's minBuyIn says. A private table created with minBuyIn
+    // -1,000,000 seated a NEGATIVE buy-in (its deductChips(-n) had credited the
+    // wallet) — a mint. A relocation (allowBelowMin) may carry a busted 0.
+    if (typeof buyIn !== 'number' || !Number.isFinite(buyIn) || buyIn < 0) return false;
+    if (!allowBelowMin && (buyIn <= 0 || !Number.isInteger(buyIn))) return false;
     // A seat MOVE relocates an existing stack — it is not a fresh buy-in, so it
     // must NOT be blocked by minBuyIn (a player whose stack fell below the
     // minimum after losses would otherwise have their whole stack destroyed
