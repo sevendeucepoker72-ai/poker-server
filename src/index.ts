@@ -17,6 +17,7 @@ import {
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
 import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK } from './game/qualifierSchedule';
+import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
 import { EscrowOffer, normalizeBackers, planEscrowRefund, planCashedSettlement, validateStakeOffer } from './game/stakingEscrow';
 import {
@@ -135,6 +136,11 @@ import {
   getClubTournaments,
   registerForClubTournament,
   startClubTournament,
+  // R2 (TOURNEY-14) — club tournaments played for real.
+  cancelClubTournament,
+  setClubTournamentLive,
+  endClubTournament,
+  strandedClubTournaments,
   createChallenge,
   acceptChallenge,
   setChallengeTable,
@@ -3147,6 +3153,78 @@ function pruneFinishedQualifiers(now: number = Date.now()): void {
 // 2026-07-07 gap-fill [10] — shared table-creation from a scheduled-table config.
 // Used by BOTH the manual Activate handler and the auto-fire sweep so the two
 // paths can never drift.
+// ========== Club tables survive a redeploy (R2, CLUBS-4) ==========
+/** The club table rules (createClubTable's own defaults) — the same check at creation and re-creation. */
+function validateClubTableConfig(cfg: unknown) {
+  return validateTableConfig(cfg, {
+    tableName: '', smallBlind: 5, bigBlind: 10, ante: 0, minBuyIn: (bb) => bb * 20, maxBuyIn: (bb) => bb * 100,
+  });
+}
+
+/** A club table's runtime table from its (validated) stored numbers: '[Club] name', tableKind 'club', its seat count. */
+async function createClubRuntimeTable(clubId: number, cfg: { tableName: string; variant?: string; smallBlind: number; bigBlind: number; minBuyIn: number; maxSeats?: number }): Promise<string | null> {
+  let clubName = 'Club';
+  try { clubName = (await getClubInfo(clubId)).club?.name || 'Club'; } catch { /* the default name */ }
+  const variant = (cfg.variant || 'texas-holdem') as VariantType;
+  const tableConfig = {
+    tableName: `[${clubName}] ${cfg.tableName}`,
+    smallBlind: cfg.smallBlind,
+    bigBlind: cfg.bigBlind,
+    ante: 0,
+    minBuyIn: cfg.minBuyIn,
+  };
+  const tableId = variant === 'texas-holdem'
+    ? tableManager.createTable(tableConfig)
+    : tableManager.createVariantTable(tableConfig, variant);
+  if (!tableId) return null;
+  clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
+  const t = tableManager.getTable(tableId);
+  const seats = Number(cfg.maxSeats);
+  if (t && Number.isInteger(seats) && seats >= 2) t.maxOccupiableSeats = Math.min(t.maxOccupiableSeats, seats);
+  return tableId;
+}
+
+/**
+ * R2 (CLUBS-4) — a club table's RUNTIME table. Tables live in memory: every
+ * redeploy dropped them while club_tables kept pointing at the dead id, so a
+ * member's join failed ("Table not found") until a manager created a new
+ * table. Now the runtime table is (re)created from the stored config when it is
+ * missing — at a member's join and when the club's tables are listed — and the
+ * row is re-pointed at it (one creation at a time per club table). A closed
+ * (inactive) table or an invalid stored config gets none.
+ */
+const clubTablesRecreating = new Map<number, Promise<string | null>>();
+const clubTableRuntimeStats = { recreated: 0, refusedInvalid: 0 };
+async function ensureClubRuntimeTable(ct: {
+  id: number; clubId: number; tableName: string; variant: string; smallBlind: number; bigBlind: number;
+  minBuyIn: number; maxBuyIn?: number; maxSeats?: number; isActive: boolean; tableId?: string;
+}): Promise<string | null> {
+  if (ct.tableId && tableManager.getTable(ct.tableId)) return ct.tableId;
+  if (!ct.isActive) return null;
+  const inFlight = clubTablesRecreating.get(ct.id);
+  if (inFlight) return inFlight;
+  const job = (async (): Promise<string | null> => {
+    const check = validateClubTableConfig({
+      tableName: ct.tableName, variant: ct.variant, smallBlind: ct.smallBlind, bigBlind: ct.bigBlind,
+      minBuyIn: ct.minBuyIn, maxBuyIn: ct.maxBuyIn, ...(ct.maxSeats ? { maxSeats: ct.maxSeats } : {}),
+    });
+    if (!check.ok) {
+      clubTableRuntimeStats.refusedInvalid++;
+      console.warn(`[Clubs] ${JSON.stringify({ event: 'club_table_recreate_refused', clubTableId: ct.id, error: check.error })}`);
+      return null;
+    }
+    const tableId = await createClubRuntimeTable(ct.clubId, check.config);
+    if (!tableId) return null;
+    await updateClubTableId(ct.id, tableId);
+    ct.tableId = tableId;
+    clubTableRuntimeStats.recreated++;
+    console.log(`[Clubs] ${JSON.stringify({ event: 'club_table_runtime_recreated', clubTableId: ct.id, clubId: ct.clubId, tableId })}`);
+    return tableId;
+  })().finally(() => clubTablesRecreating.delete(ct.id));
+  clubTablesRecreating.set(ct.id, job);
+  return job;
+}
+
 /** R1 (AUTH-4) — a scheduled club table's stored config, validated with the defaults this helper always used. */
 function validateScheduledTableConfig(cfg: unknown) {
   return validateTableConfig(cfg, { tableName: 'Scheduled Table', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 });
@@ -6600,7 +6678,7 @@ async function registrantMasterId(p: { socketId: string; userId?: number }): Pro
   return null;
 }
 
-async function screenAndStartTournament(tournamentId: string, via: 'register' | 'timed'): Promise<void> {
+async function screenAndStartTournament(tournamentId: string, via: 'register' | 'timed' | 'club'): Promise<void> {
   if (tournamentStartScreensInFlight.has(tournamentId)) return;
   const t0 = tournamentManager.getTournament(tournamentId);
   if (!t0 || t0.status !== 'registering') return;
@@ -6619,7 +6697,7 @@ async function screenAndStartTournament(tournamentId: string, via: 'register' | 
       // re-reads each one from the LIVE tournament and refunds only on a real
       // removal (auth/playGate.ts).
       const removed = await removeSuspendedRegistrants(
-        tournamentManager, tournamentId, suspended, (userId, amount) => addChipsToUser(userId, amount),
+        tournamentManager, tournamentId, suspended, entryFeeRefunder(tournamentId),   // R2 — a club buy-in through its ledger key
       );
       for (const r of removed) {
         if (r.userId !== null && (r.refunded > 0 || r.refundFailed)) {
@@ -10694,22 +10772,10 @@ Give feedback in this JSON format:
     if (!ctCheck.ok) { socket.emit('error', { message: ctCheck.error, code: ctCheck.code }); return; }
     const result = await createClubTable(auth.userId, data.clubId, ctCheck.config);
     if (result.success && result.table) {
-      // Create a real table in the TableManager
-      const clubInfoResult = await getClubInfo(data.clubId);
-      const clubName = clubInfoResult.club?.name || 'Club';
-      const variant = (result.table.variant || 'texas-holdem') as VariantType;
-      const tableConfig = {
-        tableName: `[${clubName}] ${result.table.tableName}`,
-        smallBlind: result.table.smallBlind,
-        bigBlind: result.table.bigBlind,
-        ante: 0,
-        minBuyIn: result.table.minBuyIn,
-      };
-      const tableId = variant === 'texas-holdem'
-        ? tableManager.createTable(tableConfig)
-        : tableManager.createVariantTable(tableConfig, variant);
+      // Create a real table in the TableManager — R2 (CLUBS-4): the same
+      // helper that re-creates it after a redeploy (ensureClubRuntimeTable).
+      const tableId = await createClubRuntimeTable(data.clubId, { ...result.table, maxSeats: ctCheck.config.maxSeats ?? result.table.maxSeats });
       if (tableId) {
-        clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
         await updateClubTableId(result.table.id, tableId);
         result.table.tableId = tableId;
       }
@@ -10721,6 +10787,10 @@ Give feedback in this JSON format:
 
   socket.on('getClubTables', async (data: { clubId: number }) => {
     const result = await getClubTables(data.clubId);
+    // R2 (CLUBS-4) — a table a redeploy dropped is re-created for the list (a joinable id).
+    for (const t of result.tables || []) {
+      try { await ensureClubRuntimeTable(t); } catch (e: any) { console.warn('[Clubs] club table re-create failed:', e?.message || e); }
+    }
     socket.emit('clubTables', result);
   });
 
@@ -10737,8 +10807,12 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'You must be a club member to join this table' });
       return;
     }
-    if (!clubTable.tableId) {
-      socket.emit('error', { message: 'Table not yet created. Ask a manager to create it.' });
+    // R2 (CLUBS-4) — its runtime table, re-created from the stored config if a
+    // redeploy dropped it (it used to answer "not yet created" forever).
+    let runtimeTableId: string | null = null;
+    try { runtimeTableId = await ensureClubRuntimeTable(clubTable); } catch (e: any) { console.warn('[Clubs] club table re-create failed:', e?.message || e); }
+    if (!runtimeTableId) {
+      socket.emit('error', { message: clubTable.isActive ? 'This club table is not available right now. Ask a manager to check it.' : 'This club table was closed.', code: 'club_table_unavailable' });
       return;
     }
 
@@ -10749,7 +10823,7 @@ Give feedback in this JSON format:
     const listeners = socket.listeners('joinTable');
     if (listeners.length > 0) {
       const grantedPayload = {
-        tableId: clubTable.tableId,
+        tableId: runtimeTableId,
         playerName: data.playerName,
         seatIndex: data.seatIndex,
         buyIn: data.buyIn,
@@ -10930,23 +11004,73 @@ Give feedback in this JSON format:
     if (crGate) { emitPlayRefusal(socket, crGate); return; }
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await registerForClubTournament(data.tournamentId, auth.userId);
+    // R2 (TOURNEY-14) — the buy-in is CHARGED with the registration (one
+    // transaction) and an unregister (the same toggle) refunds what it paid.
+    const result = await registerForClubTournament(Number(data?.tournamentId), auth.userId);
     if (result.success) {
-      socket.emit('clubTournamentRegistered', { tournamentId: data.tournamentId, registered: result.registered });
+      if (result.registered && (result.charged || 0) > 0) {
+        clubTournamentStats.buyIns++;
+        auditLog(auth.username, 'CLUB_TOURNAMENT_BUYIN', { clubTournamentId: Number(data?.tournamentId), amount: result.charged });
+      }
+      if (!result.registered && (result.refunded || 0) > 0) {
+        clubTournamentStats.unregisterRefunds++;
+        auditLog(auth.username, 'CLUB_TOURNAMENT_REFUND', { clubTournamentId: Number(data?.tournamentId), amount: result.refunded, reason: 'unregistered' });
+      }
+      socket.emit('clubTournamentRegistered', {
+        tournamentId: data.tournamentId, registered: result.registered,
+        ...(result.charged ? { charged: result.charged } : {}), ...(result.refunded ? { refunded: result.refunded } : {}),
+      });
     } else {
-      socket.emit('error', { message: result.error });
+      socket.emit('error', { message: result.error, ...(result.code ? { code: result.code } : {}) });
     }
   });
 
+  // R2 (TOURNEY-14) — the start is REAL: the paid registrations become a live
+  // tournament (launchClubTournament — dealt through the shared start path);
+  // it used to flip a status column and deal nothing.
   socket.on('startClubTournament', async (data: { tournamentId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await startClubTournament(data.tournamentId, auth.userId);
-    if (result.success) {
-      socket.emit('clubTournamentStarted', { tournamentId: data.tournamentId });
-    } else {
-      socket.emit('error', { message: result.error });
+    const result = await startClubTournament(Number(data?.tournamentId), auth.userId);
+    if (!result.success || !result.tournament || !result.entrants) {
+      socket.emit('error', { message: result.error, ...(result.code ? { code: result.code } : {}) });
+      return;
     }
+    for (const r of result.refunded || []) {
+      if (r.paid > 0) auditLog(String(r.userId), 'CLUB_TOURNAMENT_REFUND', { clubTournamentId: result.tournament.id, amount: r.paid, reason: 'not_paid_in_full_at_start' });
+    }
+    let liveId: string | null = null;
+    try {
+      liveId = await launchClubTournament({ tournament: result.tournament, entrants: result.entrants });
+    } catch (e: any) {
+      // The claim stands (running) with every buy-in transferred: refund them all.
+      clubTournamentStats.startFailed++;
+      console.error('[ClubTournament] start failed — refunding the entrants:', e?.message || e);
+      void refundClubTournamentEntrants(result.tournament.id, '', result.entrants.map((x) => ({ userId: x.userId, amount: x.paid })), 'start_failed');
+      socket.emit('error', { message: 'Could not start the tournament — every buy-in was refunded.', code: 'start_failed' });
+      return;
+    }
+    socket.emit('clubTournamentStarted', { tournamentId: data.tournamentId, liveTournamentId: liveId, entrants: result.entrants.length });
+    broadcastTournamentList();
+  });
+
+  // R2 (TOURNEY-14) — cancel BEFORE the start (owner / manager): every
+  // registration refunded what it paid, each member told.
+  socket.on('cancelClubTournament', async (data: { tournamentId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
+    const tid = Number(data?.tournamentId);
+    const result = await cancelClubTournament(tid, auth.userId);
+    if (!result.success) { socket.emit('error', { message: result.error, ...(result.code ? { code: result.code } : {}) }); return; }
+    clubTournamentStats.cancelledBeforeStart++;
+    for (const r of result.refunded || []) {
+      if (r.paid > 0) auditLog(String(r.userId), 'CLUB_TOURNAMENT_REFUND', { clubTournamentId: tid, amount: r.paid, reason: 'cancelled_by_club' });
+      for (const [sid, a] of authSessions) {
+        if (a.userId !== r.userId) continue;
+        io.sockets.sockets.get(sid)?.emit('clubTournamentCancelled', { tournamentId: tid, clubId: result.clubId, refunded: r.paid, reason: 'cancelled_by_club' });
+      }
+    }
+    socket.emit('clubTournamentCancelled', { tournamentId: tid, clubId: result.clubId, refundedPlayers: (result.refunded || []).length, reason: 'cancelled_by_club' });
   });
 
   // ========== Club Challenges ==========
@@ -15922,8 +16046,9 @@ Give feedback in this JSON format:
     const data = args[0] && typeof args[0] === 'object' ? args[0] as { tournamentId?: unknown } : {};
     let tid = typeof data.tournamentId === 'string' && data.tournamentId ? data.tournamentId : undefined;
     if (!tid) {
-      const running = (tournamentManager.getTournamentList() as any[]).filter((t) => t.status === 'running');
       const viewer = tournamentViewerOf(socket.id);
+      // R2 (TOURNEY-14) — asked WITH the viewer: his own (unlisted) club tournament is in it.
+      const running = (tournamentManager.getTournamentList(viewer) as any[]).filter((t) => t.status === 'running');
       const own = viewer ? running.find((t) => tournamentManager.entryOfAccount(t.tournamentId, viewer)) : undefined;
       tid = (own || running[0])?.tournamentId;
     }
@@ -15945,7 +16070,8 @@ Give feedback in this JSON format:
     // the deduct. The deducted fee + the pool increment in registerPlayer stay
     // in lockstep so Σpayouts ≤ Σcollected (never mints).
     const tourn = tournamentManager.getTournament(data.tournamentId);
-    if (!tourn) { socket.emit('error', { message: 'Tournament not found', code: 'tournament_not_found', tournamentId: data.tournamentId }); return; }
+    // R2 (TOURNEY-14) — a CLUB tournament is entered through its club (members, buy-in paid there), never here.
+    if (!tourn || tourn.config.unlisted) { socket.emit('error', { message: 'Tournament not found', code: 'tournament_not_found', tournamentId: data.tournamentId }); return; }
     const entryFee = tourn.config.buyIn || 0;
     const authT = authSessions.get(socket.id);
     // R2 (C2 / TOURNEY-7 / TOURNEY-10) — ONE entry per ACCOUNT under ONE stable
@@ -18706,8 +18832,17 @@ function refundCancelledTournamentEntrants(
   registrants: Array<{ playerId: string; userId?: number; masterUserId?: string; socketId?: string; refund: number }>,
   reason: string,
 ): void {
+  // R2 (TOURNEY-14) — a CLUB tournament's buy-ins were paid to the club: they
+  // come back in ONE ledger settlement under the club keys, which also moves
+  // the club row to 'cancelled' (refundClubTournamentEntrants) — never twice,
+  // never alongside its prizes.
+  const clubTid = clubLiveTournaments.get(tournamentId);
+  if (clubTid !== undefined) {
+    const owed = registrants.filter((r) => r.userId !== undefined && r.refund > 0).map((r) => ({ userId: r.userId as number, amount: r.refund }));
+    void refundClubTournamentEntrants(clubTid, tournamentId, owed, reason);
+  }
   for (const r of registrants) {
-    if (r.userId !== undefined && r.refund > 0) {
+    if (clubTid === undefined && r.userId !== undefined && r.refund > 0) {
       const userId = r.userId;
       addChipsToUser(userId, r.refund)
         .then((ok) => auditLog(String(userId), ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: r.refund, reason }))
@@ -18720,6 +18855,145 @@ function refundCancelledTournamentEntrants(
   // R2 (C4) — and every backer of every seller in it gets his escrow back.
   void refundStakesOf(tournamentId, 'tournament_cancelled');
 }
+
+// ========== Club tournaments played for real (R2, TOURNEY-14) ==========
+/** A STARTED club tournament's live TournamentManager id → its club_tournaments id (this process). */
+const clubLiveTournaments = new Map<string, number>();
+const clubTournamentStats = {
+  buyIns: 0, unregisterRefunds: 0, started: 0, startFailed: 0, finished: 0, cancelledRefunded: 0,
+  cancelledBeforeStart: 0, strandedSwept: 0,
+};
+/** A club tournament's ONE outcome, inside the settling transaction: running → finished (prizes) or running → cancelled (refunds). */
+const CLUB_TOURNAMENT_OUTCOME_GUARD = `UPDATE club_tournaments SET status = $2 WHERE id = $1 AND status = 'running' RETURNING id`;
+
+/** The ledger key of a club entrant's buy-in refund after the start: the same in every path, so it is paid once. */
+function clubEntryRefundKey(clubTournamentId: number, userId: number): string {
+  return `clubfee:${clubTournamentId}:${userId}`;
+}
+
+/**
+ * R2 (TOURNEY-14) — a STARTED club tournament that will not finish (its start
+ * screen left fewer than two players, the shutdown flush voided it, the boot
+ * sweep found it orphaned by a restart): every entrant's buy-in back in ONE
+ * ledger settlement that also moves the club row running → cancelled — so it
+ * can never be refunded twice, nor alongside its prizes. Never throws.
+ */
+async function refundClubTournamentEntrants(
+  clubTid: number, liveId: string, entrants: Array<{ userId: number; amount: number }>, reason: string,
+): Promise<'committed' | 'failed' | 'conflict'> {
+  const r = await prizeLedger.settle({
+    label: `club-tournament-refund:${clubTid}`,
+    credits: entrants.filter((e) => e.amount > 0).map((e) => ({
+      key: clubEntryRefundKey(clubTid, e.userId), userId: e.userId, amount: e.amount, kind: 'CLUB_TOURNAMENT_REFUND',
+      details: { clubTournamentId: clubTid, tournamentId: liveId || null, reason },
+    })),
+    guards: [{ sql: CLUB_TOURNAMENT_OUTCOME_GUARD, params: [clubTid, 'cancelled'], expectRows: 1 }],
+  });
+  if (r.status === 'committed') {
+    clubTournamentStats.cancelledRefunded++;
+    for (const c of r.paid) auditLog(String(c.userId), 'CLUB_TOURNAMENT_REFUND', { ...c.details, amount: c.amount });
+  } else if (r.status === 'failed') {
+    auditLog('SYSTEM', 'CLUB_TOURNAMENT_REFUND_PENDING_RETRY', { clubTournamentId: clubTid, tournamentId: liveId || null, entrants: entrants.length, reason, error: r.error || null });
+  }
+  return r.status;
+}
+
+/**
+ * R2 — how a registrant removed before the start (the suspension screen) is
+ * refunded: a CLUB tournament's buy-in through the ledger under its club key
+ * (so a later void / boot sweep cannot refund him again); any other entry fee
+ * through the additive path, as before.
+ */
+function entryFeeRefunder(tournamentId: string): (userId: number, amount: number) => Promise<boolean> {
+  const clubTid = clubLiveTournaments.get(tournamentId);
+  if (clubTid === undefined) return (userId, amount) => addChipsToUser(userId, amount);
+  return async (userId, amount) => {
+    const r = await prizeLedger.settle({
+      label: `club-entry-refund:${clubTid}:${userId}`,
+      credits: [{ key: clubEntryRefundKey(clubTid, userId), userId, amount, kind: 'CLUB_TOURNAMENT_REFUND', details: { clubTournamentId: clubTid, tournamentId, reason: 'removed_at_start' } }],
+    });
+    return r.status === 'committed';
+  };
+}
+
+/** A live socket signed in as this local account (any), or ''. */
+function liveSocketOfUser(userId: number): string {
+  for (const [sid, a] of authSessions) {
+    if (a.userId !== userId) continue;
+    const s = io.sockets.sockets.get(sid);
+    if (s && s.connected) return sid;
+  }
+  return '';
+}
+
+/**
+ * R2 (TOURNEY-14) — the club START made real: the claimed row's paid
+ * registrations become the entrants of a NEW TournamentManager tournament —
+ * unlisted (its members only), its prize pool the buy-ins they paid, the
+ * club's blind structure continued to an end — then the shared start path
+ * (the suspension screen, then the deal; more than nine entrants over
+ * balanced tables). An entrant the tournament cannot take is refunded at
+ * once. Returns the live tournament id.
+ */
+async function launchClubTournament(claim: {
+  tournament: { id: number; clubId: number; name: string; buyIn: number; startingChips: number; blindStructure: string };
+  entrants: Array<{ userId: number; paid: number }>;
+}): Promise<string> {
+  const ct = claim.tournament;
+  let clubName = 'Club';
+  try { clubName = (await getClubInfo(ct.clubId)).club?.name || 'Club'; } catch { /* the default name */ }
+  let names = new Map<number, string>();
+  try { names = await getPublicNames(claim.entrants.map((e) => e.userId)); } catch { /* 'Player' */ }
+  const liveId = tournamentManager.createTournament({
+    name: `[${clubName}] ${ct.name}`.slice(0, 80),
+    buyIn: ct.buyIn, prizePool: 0, maxPlayers: Math.max(2, claim.entrants.length), startInterval: 0,
+    blindLevels: clubTournamentBlindLevels(ct.blindStructure, ct.startingChips), startingChips: ct.startingChips,
+    minPlayers: 2, unlisted: true,
+  });
+  clubLiveTournaments.set(liveId, ct.id);
+  const notEntered: Array<{ userId: number; amount: number }> = [];
+  for (const e of claim.entrants) {
+    const playerId = tournamentEntrantPlayerId(e.userId);
+    const name = names.get(e.userId) ?? PUBLIC_NAME_FALLBACK;
+    const r = tournamentManager.registerPlayer(liveId, playerId, name, liveSocketOfUser(e.userId), e.userId);
+    if (r.success) progressionManager.getOrCreateProgress(playerId, name, e.userId);
+    else notEntered.push({ userId: e.userId, amount: e.paid });
+  }
+  for (const n of notEntered) {
+    const refund = entryFeeRefunder(liveId);
+    const ok = await refund(n.userId, n.amount);
+    auditLog(String(n.userId), ok ? 'CLUB_TOURNAMENT_REFUND' : 'CLUB_TOURNAMENT_REFUND_FAILED', { clubTournamentId: ct.id, tournamentId: liveId, amount: n.amount, reason: 'not_entered' });
+  }
+  try { await setClubTournamentLive(ct.id, liveId); } catch (e: any) { console.error('[ClubTournament] live id not stored:', e?.message || e); }
+  clubTournamentStats.started++;
+  console.log(`[ClubTournament] ${JSON.stringify({ event: 'club_tournament_started', clubTournamentId: ct.id, tournamentId: liveId, entrants: claim.entrants.length - notEntered.length })}`);
+  void screenAndStartTournament(liveId, 'club');
+  return liveId;
+}
+
+/**
+ * R2 (TOURNEY-14) — at boot (delayed like the staking sweep: Railway starts the
+ * new container before it stops the old one, whose shutdown flush settles its
+ * own): a club tournament left 'running' belongs to a tournament that died
+ * with the previous process. Its buy-ins are refunded (club keys — a flush
+ * that already refunded them makes this a no-op), unless its prizes were paid
+ * (then it only needed its status).
+ */
+async function bootSweepStrandedClubTournaments(): Promise<void> {
+  const stranded = await strandedClubTournaments();
+  for (const s of stranded) {
+    if (s.liveTournamentId && tournamentManager.getTournament(s.liveTournamentId)) continue;   // this process plays it
+    if (s.liveTournamentId) {
+      const paid = await getPool().query('SELECT 1 FROM prize_payouts WHERE payout_key LIKE $1 LIMIT 1', [`tprize:${s.liveTournamentId}:%`]).catch(() => ({ rowCount: 0 }));
+      if ((paid.rowCount || 0) > 0) { await endClubTournament(s.id, 'finished').catch(() => false); continue; }
+    }
+    const st = await refundClubTournamentEntrants(s.id, s.liveTournamentId || '', s.entrants.map((e) => ({ userId: e.userId, amount: e.paid })), 'server_restart');
+    if (st === 'committed') clubTournamentStats.strandedSwept++;
+  }
+}
+setTimeout(() => {
+  bootSweepStrandedClubTournaments().catch((e: any) => console.error('[ClubTournament] boot sweep failed:', e?.message || e));
+}, 90_000).unref?.();
 
 // ========== Tournament registration — per account, per socket (R2, C2) ==========
 /** The account a socket asks as (its local userId + master id), or null. */
@@ -18846,6 +19120,8 @@ setInterval(() => {
   // tournaments (and their event listeners) are dropped after an hour.
   tournamentManager.rollOverdueFreerollStarts();
   tournamentManager.pruneEndedTournaments();
+  // R2 (TOURNEY-14) — a club tournament's mapping lives as long as its tournament.
+  for (const liveId of [...clubLiveTournaments.keys()]) if (!tournamentManager.getTournament(liveId)) clubLiveTournaments.delete(liveId);
   broadcastTournamentList();
 }, 10000);
 
@@ -19552,12 +19828,17 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
       const extraStatements = refundOfferIds.length > 0
         ? [{ sql: 'UPDATE staking_offers SET refunded_at = NOW(), paid_out_at = NULL WHERE id = ANY($1::uuid[])', params: [refundOfferIds] }]
         : [];
+      // R2 (TOURNEY-14) — a CLUB tournament has ONE outcome: these prizes, or its
+      // buy-ins refunded (a cancel / void / boot sweep) — the club row moves
+      // running → finished in the same transaction, or nothing is paid.
+      const clubTid = clubLiveTournaments.get(tid);
       const res = await prizeLedger.settle({
         label: `tournament:${tid}`,
         credits,
         // The guard marks EVERY offer it settles as paid, atomically with the
         // credits; refunded ones are then re-marked (extraStatements, same txn).
         ...(allOfferIds.length > 0 ? { guard: { sql: STAKE_GUARD_PAID, params: [allOfferIds], expectRows: allOfferIds.length } } : {}),
+        ...(clubTid !== undefined ? { guards: [{ sql: CLUB_TOURNAMENT_OUTCOME_GUARD, params: [clubTid, 'finished'], expectRows: 1 }] } : {}),
         extraStatements,
       });
       if (res.status === 'conflict') { tournamentPrizeStats.conflictsReplanned++; continue; }
@@ -19567,6 +19848,7 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
         return;
       }
       tournamentPrizeStats.committed++;
+      if (clubTid !== undefined) clubTournamentStats.finished++;
       stakingStats.paidOffers += paidOfferIds.length;
       stakingStats.refundedOffers += refundOfferIds.length;
       const nameOf = (uid: number) => (data?.results || []).find((x) => x.userId === uid)?.playerName || String(uid);

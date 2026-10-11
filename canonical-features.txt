@@ -976,3 +976,25 @@ r2Play: {
 return { ...o, isMine: mine, sellerUserId: mine ? viewerUserId : null };
 sock.emit('stakingUpdated', { offers: stakingOffersForViewer(raw, pub, authSessions.get(sid)?.userId) });
 tellStakingCredit(c.userId, 'stakeRefunded', { offerId: offer.id, tournamentId, amount: c.amount, reason });
+#
+# 2026-10-11 (R2, S1) — TOURNEY-14: club tournaments played for real — the
+# buy-in charged with the registration (refunded once on unregister / cancel),
+# the start creates an unlisted TournamentManager tournament for the paid
+# members (shared suspension screen + start), ONE outcome per club tournament
+# (prizes or refunds, guarded in the settling transaction), the boot sweep
+# refunds one orphaned by a restart. CLUBS-4: a club table's runtime table is
+# re-created on demand after a redeploy.
+const CLUB_TOURNAMENT_OUTCOME_GUARD =
+return `clubfee:${clubTournamentId}:${userId}`;
+void screenAndStartTournament(liveId, 'club');
+minPlayers: 2, unlisted: true,
+t.config.unlisted && !mine
+!tourn || tourn.config.unlisted
+'CLUB_TOURNAMENT_BUYIN'
+socket.on('cancelClubTournament'
+event: 'club_tournament_started'
+WHERE tournamentId = $1 AND transferredAt IS NULL AND paid >= $2
+while (levels[levels.length - 1].bb < 4 * stack && levels.length < 60)
+runtimeTableId = await ensureClubRuntimeTable(clubTable);
+event: 'club_table_runtime_recreated'
+code: 'club_table_unavailable'

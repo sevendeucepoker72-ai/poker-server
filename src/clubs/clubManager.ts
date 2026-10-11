@@ -1,6 +1,8 @@
 import { getPool } from '../auth/authManager';
 // 2026-10-11 (R1, ECON-3 / AUTH-7) — club views show the public display name, never users.username.
 import { publicDisplayName } from '../social/publicIdentity';
+// 2026-10-11 (.online R2, TOURNEY-14) — club tournament numbers a manager may set.
+import { clubTournamentNumbers } from '../game/clubTournaments';
 
 // ========== Types ==========
 
@@ -175,11 +177,13 @@ export interface ClubTournament {
   buyIn: number;
   startingChips: number;
   maxPlayers: number;
-  status: 'scheduled' | 'registering' | 'running' | 'finished';
+  status: 'scheduled' | 'registering' | 'running' | 'finished' | 'cancelled';
   scheduledAt: string;
   startedAt: string | null;
   createdBy: number;
   registeredCount?: number;
+  /** R2 — the live tournament a started club tournament plays (TournamentManager id). */
+  liveTournamentId?: string | null;
 }
 
 export interface ClubChallenge {
@@ -449,6 +453,15 @@ export async function initClubTables(): Promise<void> {
   // invited_user_id: stable identity for a pending invite so it survives the invitee
   // renaming their display name (accept/decline/list matched by mutable username).
   await pool.query(`ALTER TABLE club_invitations ADD COLUMN IF NOT EXISTS invited_user_id INTEGER DEFAULT NULL`).catch(() => {});
+
+  // ── 2026-10-11 (.online R2, TOURNEY-14) — club tournaments are played for
+  // real: the buy-in each registration PAID (refunded exactly once on
+  // unregister / cancel), when it moved into the live tournament's prize pool
+  // (the start — from then on the tournament settles it), and that live
+  // tournament's id.
+  await pool.query(`ALTER TABLE club_tournament_registrations ADD COLUMN IF NOT EXISTS paid INTEGER NOT NULL DEFAULT 0`).catch((e) => console.error('[Clubs] club_tournament_registrations.paid:', e?.message));
+  await pool.query(`ALTER TABLE club_tournament_registrations ADD COLUMN IF NOT EXISTS transferredAt TIMESTAMPTZ DEFAULT NULL`).catch((e) => console.error('[Clubs] club_tournament_registrations.transferredAt:', e?.message));
+  await pool.query(`ALTER TABLE club_tournaments ADD COLUMN IF NOT EXISTS liveTournamentId TEXT DEFAULT NULL`).catch((e) => console.error('[Clubs] club_tournaments.liveTournamentId:', e?.message));
 
   console.log('[Clubs] Database tables initialized (with social features)');
 }
@@ -1339,6 +1352,13 @@ export async function getActivityFeed(
 }
 
 // ========== Club Tournaments ==========
+// 2026-10-11 (.online R2, TOURNEY-14) — played for real: the buy-in is charged
+// at registration (atomically with the registration row, `paid`), refunded
+// exactly once on unregister / cancel (atomically with the row's removal); the
+// start (owner / manager) moves every paid registration into a real
+// TournamentManager tournament (index.ts) — `transferredAt` marks the money as
+// the live tournament's from then on (its prizes, or its refunds if it is
+// cancelled / voided).
 
 export async function createClubTournament(
   clubId: number,
@@ -1357,39 +1377,41 @@ export async function createClubTournament(
   if (!role || (role !== 'owner' && role !== 'manager')) {
     return { success: false, error: 'Only owners and managers can create tournaments' };
   }
-  if (!config.name || config.name.trim().length < 2) {
+  if (!config || typeof config.name !== 'string' || config.name.trim().length < 2) {
     return { success: false, error: 'Tournament name must be at least 2 characters' };
   }
 
   const pool = getPool();
-  const format = config.format || 'freezeout';
-  const blindStructure = config.blindStructure || [
+  const format = config.format === 'rebuy' || config.format === 'bounty' ? config.format : 'freezeout';
+  const blindStructure = Array.isArray(config.blindStructure) && config.blindStructure.length > 0 ? config.blindStructure.slice(0, 40) : [
     { level: 1, smallBlind: 25, bigBlind: 50, ante: 0, duration: 15 },
     { level: 2, smallBlind: 50, bigBlind: 100, ante: 0, duration: 15 },
     { level: 3, smallBlind: 100, bigBlind: 200, ante: 25, duration: 15 },
   ];
-  const buyIn = config.buyIn || 100;
-  const startingChips = config.startingChips || 5000;
-  const maxPlayers = Math.min(200, Math.max(2, config.maxPlayers || 20));
+  // R2 — whole numbers in range (a free club tournament, buyIn 0, is real: it
+  // used to become 100 through `|| 100`).
+  const { buyIn, startingChips, maxPlayers } = clubTournamentNumbers(config);
+  const name = config.name.trim().slice(0, 60);
+  const scheduledAt = typeof config.scheduledAt === 'string' && config.scheduledAt ? config.scheduledAt.slice(0, 40) : new Date().toISOString();
 
   try {
     const result = await pool.query(
       `INSERT INTO club_tournaments (clubId, name, format, blindStructure, buyIn, startingChips, maxPlayers, status, scheduledAt, createdBy)
        VALUES ($1, $2, $3, $4, $5, $6, $7, 'registering', $8, $9) RETURNING id`,
-      [clubId, config.name.trim(), format, JSON.stringify(blindStructure), buyIn, startingChips, maxPlayers, config.scheduledAt, managerId]
+      [clubId, name, format, JSON.stringify(blindStructure), buyIn, startingChips, maxPlayers, scheduledAt, managerId]
     );
 
     const tournament: ClubTournament = {
       id: result.rows[0].id as number,
       clubId,
-      name: config.name.trim(),
+      name,
       format,
       blindStructure,
       buyIn,
       startingChips,
       maxPlayers,
       status: 'registering',
-      scheduledAt: config.scheduledAt,
+      scheduledAt,
       startedAt: null,
       createdBy: managerId,
       registeredCount: 0,
@@ -1432,58 +1454,233 @@ export async function getClubTournaments(
     startedAt: r.startedat,
     createdBy: r.createdby,
     registeredCount: r.registeredcount || 0,
+    liveTournamentId: r.livetournamentid ?? null,
   }));
 
   return { success: true, tournaments };
 }
 
+/**
+ * Register (or, when already registered, UNregister — the toggle the client
+ * uses) for a club tournament. R2: the buy-in is charged in the SAME
+ * transaction as the registration row (`paid`), and an unregister refunds
+ * exactly what that row paid, in the same transaction as its removal — never
+ * a registration without its charge, never a refund twice.
+ */
 export async function registerForClubTournament(
   tournamentId: number,
   userId: number
-): Promise<{ success: boolean; error?: string; registered?: boolean }> {
+): Promise<{ success: boolean; error?: string; code?: string; registered?: boolean; charged?: number; refunded?: number }> {
   const pool = getPool();
   const tourney = (await pool.query('SELECT * FROM club_tournaments WHERE id = $1', [tournamentId])).rows[0] as any;
-  if (!tourney) return { success: false, error: 'Tournament not found' };
-  if (tourney.status !== 'registering') return { success: false, error: 'Tournament is not accepting registrations' };
+  if (!tourney) return { success: false, error: 'Tournament not found', code: 'tournament_not_found' };
+  if (tourney.status !== 'registering') return { success: false, error: 'Tournament is not accepting registrations', code: 'registration_closed' };
 
   if (!(await isClubMember(tourney.clubid, userId))) {
-    return { success: false, error: 'You must be a club member to register' };
-  }
-
-  const regCount = ((await pool.query('SELECT COUNT(*)::int as cnt FROM club_tournament_registrations WHERE tournamentId = $1', [tournamentId])).rows[0] as any).cnt;
-  if (regCount >= tourney.maxplayers) {
-    return { success: false, error: 'Tournament is full' };
+    return { success: false, error: 'You must be a club member to register', code: 'not_a_member' };
   }
 
   const existing = (await pool.query('SELECT id FROM club_tournament_registrations WHERE tournamentId = $1 AND userId = $2', [tournamentId, userId])).rows[0];
-  if (existing) {
-    // Unregister
-    await pool.query('DELETE FROM club_tournament_registrations WHERE tournamentId = $1 AND userId = $2', [tournamentId, userId]);
-    return { success: true, registered: false };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    if (existing) {
+      // Unregister: the row and its refund together (only before the start).
+      const del = await client.query(
+        `DELETE FROM club_tournament_registrations
+          WHERE tournamentId = $1 AND userId = $2 AND transferredAt IS NULL
+            AND (SELECT status FROM club_tournaments WHERE id = $1) = 'registering'
+          RETURNING paid`,
+        [tournamentId, userId]
+      );
+      if (!del.rowCount) { await client.query('ROLLBACK'); return { success: false, error: 'Tournament is not accepting registrations', code: 'registration_closed' }; }
+      const paid = Math.max(0, Number(del.rows[0].paid) || 0);
+      if (paid > 0) await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [paid, userId]);
+      await client.query('COMMIT');
+      return { success: true, registered: false, refunded: paid };
+    }
+    const regCount = ((await client.query('SELECT COUNT(*)::int as cnt FROM club_tournament_registrations WHERE tournamentId = $1', [tournamentId])).rows[0] as any).cnt;
+    if (regCount >= tourney.maxplayers) { await client.query('ROLLBACK'); return { success: false, error: 'Tournament is full', code: 'tournament_full' }; }
+    const buyIn = Math.max(0, Math.floor(Number(tourney.buyin) || 0));
+    if (buyIn > 0) {
+      const charged = await client.query('UPDATE users SET chips = chips - $1 WHERE id = $2 AND chips >= $1', [buyIn, userId]);
+      if (!charged.rowCount) {
+        await client.query('ROLLBACK');
+        return { success: false, error: `You need ${buyIn.toLocaleString()} chips to enter this tournament`, code: 'insufficient_chips' };
+      }
+    }
+    const ins = await client.query(
+      `INSERT INTO club_tournament_registrations (tournamentId, userId, paid)
+       SELECT $1, $2, $3 WHERE (SELECT status FROM club_tournaments WHERE id = $1) = 'registering'
+       ON CONFLICT (tournamentId, userId) DO NOTHING
+       RETURNING id`,
+      [tournamentId, userId, buyIn]
+    );
+    if (!ins.rowCount) {
+      // Registered meanwhile (another tab) or no longer registering: nothing charged.
+      await client.query('ROLLBACK');
+      return { success: false, error: 'Tournament is not accepting registrations', code: 'registration_closed' };
+    }
+    await client.query('COMMIT');
+    return { success: true, registered: true, charged: buyIn };
+  } catch (err: any) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[Clubs] club tournament registration failed:', err?.message || err);
+    return { success: false, error: 'Registration failed — no chips were moved. Please try again.', code: 'registration_failed' };
+  } finally {
+    client.release();
   }
-
-  await pool.query('INSERT INTO club_tournament_registrations (tournamentId, userId) VALUES ($1, $2)', [tournamentId, userId]);
-  return { success: true, registered: true };
 }
 
+/**
+ * R2 — the START (owner / manager): the row moves registering → running and
+ * every PAID registration is marked transferred (its buy-in now belongs to the
+ * live tournament the caller creates) in ONE transaction. Needs two paid
+ * registrations. A registration that paid less than the buy-in (none exist —
+ * pre-R2 registrations were free) is removed and refunded what it paid, never
+ * entered for free.
+ */
 export async function startClubTournament(
   tournamentId: number,
   userId: number
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{
+  success: boolean; error?: string; code?: string;
+  tournament?: { id: number; clubId: number; name: string; buyIn: number; startingChips: number; blindStructure: string };
+  entrants?: Array<{ userId: number; paid: number }>;
+  refunded?: Array<{ userId: number; paid: number }>;
+}> {
   const pool = getPool();
   const tourney = (await pool.query('SELECT * FROM club_tournaments WHERE id = $1', [tournamentId])).rows[0] as any;
-  if (!tourney) return { success: false, error: 'Tournament not found' };
+  if (!tourney) return { success: false, error: 'Tournament not found', code: 'tournament_not_found' };
 
   const role = await getMemberRole(tourney.clubid, userId);
   if (!role || (role !== 'owner' && role !== 'manager')) {
-    return { success: false, error: 'Only owners and managers can start tournaments' };
+    return { success: false, error: 'Only owners and managers can start tournaments', code: 'not_allowed' };
   }
   if (tourney.status !== 'registering') {
-    return { success: false, error: 'Tournament cannot be started in current state' };
+    return { success: false, error: 'Tournament cannot be started in current state', code: 'registration_closed' };
   }
+  const buyIn = Math.max(0, Math.floor(Number(tourney.buyin) || 0));
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const claim = await client.query(
+      `UPDATE club_tournaments SET status = 'running', startedAt = now() WHERE id = $1 AND status = 'registering' RETURNING id`,
+      [tournamentId]
+    );
+    if (!claim.rowCount) { await client.query('ROLLBACK'); return { success: false, error: 'Tournament cannot be started in current state', code: 'registration_closed' }; }
+    const moved = await client.query(
+      `UPDATE club_tournament_registrations SET transferredAt = now()
+        WHERE tournamentId = $1 AND transferredAt IS NULL AND paid >= $2
+        RETURNING userId, paid`,
+      [tournamentId, buyIn]
+    );
+    if ((moved.rowCount || 0) < 2) {
+      await client.query('ROLLBACK');
+      return { success: false, error: 'At least 2 registered players are needed to start', code: 'not_enough_players' };
+    }
+    const stray = await client.query(
+      'DELETE FROM club_tournament_registrations WHERE tournamentId = $1 AND transferredAt IS NULL RETURNING userId, paid',
+      [tournamentId]
+    );
+    const refunded: Array<{ userId: number; paid: number }> = [];
+    for (const r of stray.rows as any[]) {
+      const paid = Math.max(0, Number(r.paid) || 0);
+      if (paid > 0) await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [paid, r.userid]);
+      refunded.push({ userId: Number(r.userid), paid });
+    }
+    await client.query('COMMIT');
+    return {
+      success: true,
+      tournament: {
+        id: tourney.id, clubId: tourney.clubid, name: tourney.name, buyIn,
+        startingChips: Number(tourney.startingchips) || 5000, blindStructure: tourney.blindstructure || '[]',
+      },
+      entrants: (moved.rows as any[]).map((r) => ({ userId: Number(r.userid), paid: Number(r.paid) || 0 })),
+      refunded,
+    };
+  } catch (err: any) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[Clubs] club tournament start failed:', err?.message || err);
+    return { success: false, error: 'Could not start the tournament — please try again.', code: 'start_failed' };
+  } finally {
+    client.release();
+  }
+}
 
-  await pool.query("UPDATE club_tournaments SET status = $1, startedAt = now() WHERE id = $2", ['running', tournamentId]);
-  return { success: true };
+/**
+ * R2 — CANCEL before the start (owner / manager): the row becomes 'cancelled'
+ * and every registration is removed and refunded what it paid — one
+ * transaction (each once).
+ */
+export async function cancelClubTournament(
+  tournamentId: number,
+  userId: number
+): Promise<{ success: boolean; error?: string; code?: string; clubId?: number; refunded?: Array<{ userId: number; paid: number }> }> {
+  const pool = getPool();
+  const tourney = (await pool.query('SELECT * FROM club_tournaments WHERE id = $1', [tournamentId])).rows[0] as any;
+  if (!tourney) return { success: false, error: 'Tournament not found', code: 'tournament_not_found' };
+  const role = await getMemberRole(tourney.clubid, userId);
+  if (!role || (role !== 'owner' && role !== 'manager')) {
+    return { success: false, error: 'Only owners and managers can cancel tournaments', code: 'not_allowed' };
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const claim = await client.query(
+      `UPDATE club_tournaments SET status = 'cancelled' WHERE id = $1 AND status IN ('registering', 'scheduled') RETURNING id`,
+      [tournamentId]
+    );
+    if (!claim.rowCount) { await client.query('ROLLBACK'); return { success: false, error: 'Only a tournament that has not started can be cancelled', code: 'registration_closed' }; }
+    const regs = await client.query(
+      'DELETE FROM club_tournament_registrations WHERE tournamentId = $1 AND transferredAt IS NULL RETURNING userId, paid',
+      [tournamentId]
+    );
+    const refunded: Array<{ userId: number; paid: number }> = [];
+    for (const r of regs.rows as any[]) {
+      const paid = Math.max(0, Number(r.paid) || 0);
+      if (paid > 0) await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [paid, r.userid]);
+      refunded.push({ userId: Number(r.userid), paid });
+    }
+    await client.query('COMMIT');
+    return { success: true, clubId: tourney.clubid, refunded };
+  } catch (err: any) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[Clubs] club tournament cancel failed:', err?.message || err);
+    return { success: false, error: 'Could not cancel the tournament — please try again.', code: 'cancel_failed' };
+  } finally {
+    client.release();
+  }
+}
+
+/** R2 — the live tournament a started club tournament plays (index.ts, after creating it). */
+export async function setClubTournamentLive(tournamentId: number, liveTournamentId: string): Promise<void> {
+  await getPool().query('UPDATE club_tournaments SET liveTournamentId = $1 WHERE id = $2', [liveTournamentId, tournamentId]);
+}
+
+/** R2 — a started club tournament's end: 'finished' or 'cancelled' (only from 'running'). */
+export async function endClubTournament(tournamentId: number, status: 'finished' | 'cancelled'): Promise<boolean> {
+  const r = await getPool().query(`UPDATE club_tournaments SET status = $1 WHERE id = $2 AND status = 'running' RETURNING id`, [status, tournamentId]);
+  return (r.rowCount || 0) > 0;
+}
+
+/**
+ * R2 — club tournaments left 'running' by a previous process (tournaments live
+ * in memory): each with its live id and the buy-ins its registrations
+ * transferred into it — for the boot sweep's refund.
+ */
+export async function strandedClubTournaments(): Promise<Array<{ id: number; liveTournamentId: string | null; entrants: Array<{ userId: number; paid: number }> }>> {
+  const pool = getPool();
+  const rows = (await pool.query(`SELECT id, liveTournamentId FROM club_tournaments WHERE status = 'running'`)).rows as any[];
+  const out: Array<{ id: number; liveTournamentId: string | null; entrants: Array<{ userId: number; paid: number }> }> = [];
+  for (const r of rows) {
+    const regs = (await pool.query(
+      'SELECT userId, paid FROM club_tournament_registrations WHERE tournamentId = $1 AND transferredAt IS NOT NULL',
+      [r.id]
+    )).rows as any[];
+    out.push({ id: Number(r.id), liveTournamentId: r.livetournamentid ?? null, entrants: regs.map((x) => ({ userId: Number(x.userid), paid: Number(x.paid) || 0 })) });
+  }
+  return out;
 }
 
 // ========== Club Challenges ==========

@@ -44,6 +44,8 @@ export interface LedgerSettlement {
    * back, nothing is credited, and the result is 'conflict' (never retried).
    */
   guard?: { sql: string; params: unknown[]; expectRows: number };
+  /** More guards, run after `guard`, each with the same rule (R2: a club tournament's one outcome — prizes OR refunds). */
+  guards?: Array<{ sql: string; params: unknown[]; expectRows: number }>;
 }
 
 export interface LedgerResult {
@@ -112,9 +114,9 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
         tableReady = true;
       }
       await client.query('BEGIN');
-      if (s.guard) {
-        const g = await client.query(s.guard.sql, s.guard.params);
-        if ((g.rowCount ?? 0) !== s.guard.expectRows) {
+      for (const guard of [...(s.guard ? [s.guard] : []), ...(s.guards || [])]) {
+        const g = await client.query(guard.sql, guard.params);
+        if ((g.rowCount ?? 0) !== guard.expectRows) {
           await client.query('ROLLBACK');
           return { paid: [], alreadyPaid: [], noUser: [], conflict: true };
         }

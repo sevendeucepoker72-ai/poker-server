@@ -54,6 +54,8 @@ const H = {
 const LEAVE = fnSrc('function handlePlayerLeave(');
 const AUTOSTART = fnSrc('function autoStartNextHand(');
 const IS_TOURNAMENT_RESERVATION = fnSrc('function isTournamentReservation(');
+// R2 (CLUBS-4): joinClubTable finds (or re-creates) the club table's runtime table.
+const CLUB_RUNTIME = slice('const clubTablesRecreating = new Map', '\n  return job;\n}\n');
 
 function world(opts: { wallets?: Record<number, number> } = {}) {
   const db = createFakeLedgerDb(opts.wallets ?? { [ALICE]: 1_000_000, [BOB]: 1_000_000 });
@@ -146,6 +148,7 @@ ${WHO}
 ${QUICK}
 ${RETIRE}
 ${IS_TOURNAMENT_RESERVATION}
+${CLUB_RUNTIME}
 ${LEAVE}
 ${AUTOSTART}
 function wire(socket) {

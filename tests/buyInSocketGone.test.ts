@@ -58,6 +58,8 @@ const QUALIFIER_HELPERS = [
   fnSrc('function qualifierListItem('),
   slice('/** R2 (TOURNEY-9) — the answer when a qualifier seat would take over', '\n  return null;\n}\n'),
   fnSrc('function socketPlaysLiveSeatElsewhere('),
+  // R2 (CLUBS-4): joinClubTable finds (or re-creates) the club table's runtime table.
+  slice('const clubTablesRecreating = new Map', '\n  return job;\n}\n'),
 ].join('\n');
 // R2 (C1, 2026-10-11): table kinds + who may sit where (joinTable / quickPlay / extra seat / waitlist refusals).
 const WHO_SITS = slice('// ========== Table kind (R1 contract #2, 2026-10-11) ==========', "  socket.emit(channel, { message: TABLE_NOT_JOINABLE_MESSAGE, code: 'table_not_joinable', reason });\n}\n");

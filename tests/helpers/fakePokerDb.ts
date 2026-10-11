@@ -22,16 +22,37 @@ export interface FakeOffer {
   seller_entry_id: string | null;
 }
 
+/** R2 (TOURNEY-14 / CLUBS-4) — the club rows the club tournament + club table paths touch. */
+export interface FakeClubTournament {
+  id: number; clubid: number; name: string; format: string; blindstructure: string; buyin: number; startingchips: number;
+  maxplayers: number; status: string; scheduledat: string; startedat: string | null; createdby: number; livetournamentid: string | null;
+}
+export interface FakeClubReg { tournamentid: number; userid: number; paid: number; transferredat: string | null }
+export interface FakeClubTable {
+  id: number; clubid: number; tablename: string; variant: string; smallblind: number; bigblind: number; minbuyin: number;
+  maxbuyin: number; maxseats: number; isactive: number; tableid: string | null;
+}
+
 interface State {
   wallets: Map<number, number>;
   payouts: Map<string, { userId: number; amount: number; kind: string; credited: boolean }>;
   offers: Map<string, FakeOffer>;
+  clubs: Map<number, { id: number; name: string }>;
+  members: Array<{ clubid: number; userid: number; role: string; status: string }>;
+  clubTournaments: Map<number, FakeClubTournament>;
+  clubRegs: FakeClubReg[];
+  clubTables: Map<number, FakeClubTable>;
 }
 
 const clone = (s: State): State => ({
   wallets: new Map(s.wallets),
   payouts: new Map([...s.payouts].map(([k, v]) => [k, { ...v }])),
   offers: new Map([...s.offers].map(([k, v]) => [k, { ...v, backers: JSON.parse(JSON.stringify(v.backers)) }])),
+  clubs: new Map([...s.clubs].map(([k, v]) => [k, { ...v }])),
+  members: s.members.map((m) => ({ ...m })),
+  clubTournaments: new Map([...s.clubTournaments].map(([k, v]) => [k, { ...v }])),
+  clubRegs: s.clubRegs.map((r) => ({ ...r })),
+  clubTables: new Map([...s.clubTables].map(([k, v]) => [k, { ...v }])),
 });
 
 export function createFakePokerDb(wallets: Record<number, number> = {}) {
@@ -39,10 +60,112 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
     wallets: new Map(Object.entries(wallets).map(([k, v]) => [Number(k), v])),
     payouts: new Map(),
     offers: new Map(),
+    clubs: new Map(),
+    members: [],
+    clubTournaments: new Map(),
+    clubRegs: [],
+    clubTables: new Map(),
   };
+  let clubSeq = 0;
   const failures: Array<{ pattern: RegExp; times: number }> = [];
   const statements: string[] = [];
   const now = () => new Date().toISOString();
+
+  const res = (rows: any[]) => ({ rows, rowCount: rows.length });
+  /** The club statements (whitespace-normalized SQL), or null when `q` is not one of them. */
+  function clubQuery(q: string, params: any[]): { rows: any[]; rowCount: number } | null {
+    const S = state;
+    if (/^SELECT \* FROM club_tournaments WHERE id = \$1$/i.test(q)) { const t = S.clubTournaments.get(Number(params[0])); return res(t ? [{ ...t }] : []); }
+    if (/^SELECT role FROM club_members WHERE clubId = \$1 AND userId = \$2 AND status = \$3$/i.test(q)) {
+      return res(S.members.filter((m) => m.clubid === Number(params[0]) && m.userid === Number(params[1]) && m.status === params[2]).map((m) => ({ role: m.role })));
+    }
+    if (/^SELECT id FROM club_tournament_registrations WHERE tournamentId = \$1 AND userId = \$2$/i.test(q)) {
+      return res(S.clubRegs.filter((r) => r.tournamentid === Number(params[0]) && r.userid === Number(params[1])).map(() => ({ id: 1 })));
+    }
+    if (/^DELETE FROM club_tournament_registrations WHERE tournamentId = \$1 AND userId = \$2 AND transferredAt IS NULL AND \(SELECT status FROM club_tournaments WHERE id = \$1\) = 'registering' RETURNING paid$/i.test(q)) {
+      const t = S.clubTournaments.get(Number(params[0]));
+      if (!t || t.status !== 'registering') return res([]);
+      const hit = S.clubRegs.filter((r) => r.tournamentid === Number(params[0]) && r.userid === Number(params[1]) && r.transferredat === null);
+      S.clubRegs = S.clubRegs.filter((r) => !hit.includes(r));
+      return res(hit.map((r) => ({ paid: r.paid })));
+    }
+    if (/^SELECT COUNT\(\*\)::int as cnt FROM club_tournament_registrations WHERE tournamentId = \$1$/i.test(q)) {
+      return res([{ cnt: S.clubRegs.filter((r) => r.tournamentid === Number(params[0])).length }]);
+    }
+    if (/^INSERT INTO club_tournament_registrations \(tournamentId, userId, paid\) SELECT \$1, \$2, \$3 WHERE \(SELECT status FROM club_tournaments WHERE id = \$1\) = 'registering' ON CONFLICT \(tournamentId, userId\) DO NOTHING RETURNING id$/i.test(q)) {
+      const [tid, uid, paid] = params.map(Number);
+      if (S.clubTournaments.get(tid)?.status !== 'registering') return res([]);
+      if (S.clubRegs.some((r) => r.tournamentid === tid && r.userid === uid)) return res([]);
+      S.clubRegs.push({ tournamentid: tid, userid: uid, paid, transferredat: null });
+      return res([{ id: S.clubRegs.length }]);
+    }
+    if (/^UPDATE club_tournaments SET status = 'running', startedAt = now\(\) WHERE id = \$1 AND status = 'registering' RETURNING id$/i.test(q)) {
+      const t = S.clubTournaments.get(Number(params[0]));
+      if (!t || t.status !== 'registering') return res([]);
+      t.status = 'running'; t.startedat = now();
+      return res([{ id: t.id }]);
+    }
+    if (/^UPDATE club_tournament_registrations SET transferredAt = now\(\) WHERE tournamentId = \$1 AND transferredAt IS NULL AND paid >= \$2 RETURNING userId, paid$/i.test(q)) {
+      const hit = S.clubRegs.filter((r) => r.tournamentid === Number(params[0]) && r.transferredat === null && r.paid >= Number(params[1]));
+      for (const r of hit) r.transferredat = now();
+      return res(hit.map((r) => ({ userid: r.userid, paid: r.paid })));
+    }
+    if (/^DELETE FROM club_tournament_registrations WHERE tournamentId = \$1 AND transferredAt IS NULL RETURNING userId, paid$/i.test(q)) {
+      const hit = S.clubRegs.filter((r) => r.tournamentid === Number(params[0]) && r.transferredat === null);
+      S.clubRegs = S.clubRegs.filter((r) => !hit.includes(r));
+      return res(hit.map((r) => ({ userid: r.userid, paid: r.paid })));
+    }
+    if (/^UPDATE club_tournaments SET status = 'cancelled' WHERE id = \$1 AND status IN \('registering', 'scheduled'\) RETURNING id$/i.test(q)) {
+      const t = S.clubTournaments.get(Number(params[0]));
+      if (!t || (t.status !== 'registering' && t.status !== 'scheduled')) return res([]);
+      t.status = 'cancelled';
+      return res([{ id: t.id }]);
+    }
+    if (/^UPDATE club_tournaments SET liveTournamentId = \$1 WHERE id = \$2$/i.test(q)) {
+      const t = S.clubTournaments.get(Number(params[1]));
+      if (t) t.livetournamentid = String(params[0]);
+      return res(t ? [{}] : []);
+    }
+    if (/^UPDATE club_tournaments SET status = \$1 WHERE id = \$2 AND status = 'running' RETURNING id$/i.test(q)) {
+      const t = S.clubTournaments.get(Number(params[1]));
+      if (!t || t.status !== 'running') return res([]);
+      t.status = String(params[0]);
+      return res([{ id: t.id }]);
+    }
+    if (/^UPDATE club_tournaments SET status = \$2 WHERE id = \$1 AND status = 'running' RETURNING id$/i.test(q)) {
+      const t = S.clubTournaments.get(Number(params[0]));
+      if (!t || t.status !== 'running') return res([]);
+      t.status = String(params[1]);
+      return res([{ id: t.id }]);
+    }
+    if (/^SELECT id, liveTournamentId FROM club_tournaments WHERE status = 'running'$/i.test(q)) {
+      return res([...S.clubTournaments.values()].filter((t) => t.status === 'running').map((t) => ({ id: t.id, livetournamentid: t.livetournamentid })));
+    }
+    if (/^SELECT userId, paid FROM club_tournament_registrations WHERE tournamentId = \$1 AND transferredAt IS NOT NULL$/i.test(q)) {
+      return res(S.clubRegs.filter((r) => r.tournamentid === Number(params[0]) && r.transferredat !== null).map((r) => ({ userid: r.userid, paid: r.paid })));
+    }
+    if (/^SELECT 1 FROM prize_payouts WHERE payout_key LIKE \$1 LIMIT 1$/i.test(q)) {
+      const prefix = String(params[0]).replace(/%$/, '');
+      return res([...S.payouts.keys()].filter((k) => k.startsWith(prefix)).slice(0, 1).map(() => ({ '?column?': 1 })));
+    }
+    if (/^INSERT INTO club_tournaments \(clubId, name, format, blindStructure, buyIn, startingChips, maxPlayers, status, scheduledAt, createdBy\)/i.test(q)) {
+      const id = ++clubSeq;
+      const [clubid, name, format, blindstructure, buyin, startingchips, maxplayers, scheduledat, createdby] = params;
+      S.clubTournaments.set(id, { id, clubid, name, format, blindstructure, buyin, startingchips, maxplayers, status: 'registering', scheduledat, startedat: null, createdby, livetournamentid: null });
+      return res([{ id }]);
+    }
+    if (/^SELECT \* FROM club_tables WHERE id = \$1$/i.test(q)) { const t = S.clubTables.get(Number(params[0])); return res(t ? [{ ...t }] : []); }
+    if (/^SELECT \* FROM club_tables WHERE clubId = \$1 AND isActive = 1$/i.test(q)) {
+      return res([...S.clubTables.values()].filter((t) => t.clubid === Number(params[0]) && t.isactive === 1).map((t) => ({ ...t })));
+    }
+    if (/^UPDATE club_tables SET tableId = \$1 WHERE id = \$2$/i.test(q)) {
+      const t = S.clubTables.get(Number(params[1]));
+      if (t) t.tableid = String(params[0]);
+      return res(t ? [{}] : []);
+    }
+    if (/^SELECT \* FROM clubs WHERE id = \$1$/i.test(q)) { const c = S.clubs.get(Number(params[0])); return res(c ? [{ id: c.id, name: c.name, clubcode: 'X', ownerid: 1, settings: '{}', description: '' }] : []); }
+    return null;
+  }
 
   async function query(sql: string, params: any[] = [], tx?: { snap: State | null }): Promise<{ rows: any[]; rowCount: number }> {
     statements.push(sql.replace(/\s+/g, ' ').trim().slice(0, 90));
@@ -53,7 +176,10 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
     if (/^BEGIN/i.test(q)) { if (tx) tx.snap = clone(state); return { rows: [], rowCount: 0 }; }
     if (/^COMMIT/i.test(q)) { if (tx) tx.snap = null; return { rows: [], rowCount: 0 }; }
     if (/^ROLLBACK/i.test(q)) { if (tx && tx.snap) { state = tx.snap; tx.snap = null; } return { rows: [], rowCount: 0 }; }
-    if (/^SELECT 1/i.test(q)) return { rows: [{ '?column?': 1 }], rowCount: 1 };
+    if (/^SELECT 1;?$/i.test(q)) return { rows: [{ '?column?': 1 }], rowCount: 1 };
+    // ── R2 club tournaments / club tables (TOURNEY-14 / CLUBS-4) ──
+    const club = clubQuery(q, params);
+    if (club) return club;
     // ── users ──
     if (/^UPDATE users SET chips = chips \+ \$1 WHERE id = \$2/i.test(q)) {
       const [amount, uid] = params;
@@ -147,6 +273,12 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
     get wallets() { return state.wallets; },
     get payouts() { return state.payouts; },
     get offers() { return state.offers; },
+    // R2 (TOURNEY-14 / CLUBS-4) — club rows.
+    get clubTournaments() { return state.clubTournaments; },
+    get clubRegs() { return state.clubRegs; },
+    get clubTables() { return state.clubTables; },
+    get members() { return state.members; },
+    get clubs() { return state.clubs; },
     statements,
     failNext(pattern: RegExp, times = 1) { failures.push({ pattern, times }); },
   };

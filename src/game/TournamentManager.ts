@@ -25,6 +25,12 @@ export interface TournamentConfig {
    * full) unless the director set one — it used to start at 4 whatever its max.
    */
   minPlayers?: number;
+  /**
+   * R2 (TOURNEY-14) — a CLUB tournament: listed only to its own entrants
+   * (getTournamentList) and never open to registerTournament (its members are
+   * entered by the club start, their buy-ins already paid to the club).
+   */
+  unlisted?: boolean;
 }
 
 export interface TournamentPlayer {
@@ -124,6 +130,8 @@ export interface TournamentTemplate {
   startingChips?: number;
   /** R2 — see TournamentConfig.minPlayers. */
   minPlayers?: number;
+  /** R2 — see TournamentConfig.unlisted (a club tournament). */
+  unlisted?: boolean;
 }
 
 /**
@@ -260,6 +268,7 @@ export class TournamentManager {
       bountyAmount: template.bountyAmount || 0,
       startingChips: template.startingChips || 1000,
       ...(template.minPlayers !== undefined ? { minPlayers: template.minPlayers } : {}),
+      ...(template.unlisted ? { unlisted: true } : {}),
     };
 
     const now = Date.now();
@@ -343,9 +352,10 @@ export class TournamentManager {
     const list: object[] = [];
     for (const [id, t] of this.tournaments) {
       if (t.status === 'cancelled') continue; // don't surface cancelled tournaments
+      const mine = viewer ? this.entryOfAccount(id, viewer) : undefined;
+      if (t.config.unlisted && !mine) continue;   // R2 — a club tournament: its own entrants only
       const currentBlinds = t.config.blindLevels[t.currentBlindLevel] || t.config.blindLevels[0];
       const isFreeroll = (t.config.buyIn || 0) === 0;
-      const mine = viewer ? this.entryOfAccount(id, viewer) : undefined;
       list.push({
         registered: !!mine,
         entryId: mine?.entryId ?? null,
