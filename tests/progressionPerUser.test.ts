@@ -175,24 +175,34 @@ describe('ECON-9 / ECON-10 — ONE progress record per account', () => {
 
 describe('ECON-12 — hydrated only after every read succeeded', () => {
   it('failed reads leave the record un-hydrated (nothing persisted, no payout, no push payload); the background re-load fills it with the DB values', async () => {
-    user(11, { level: 40, chips: 77777, stats: { handsPlayed: 300, handsWon: 120 }, achievements: ['first_win'] });
-    db.failBundle = 3;                                      // all three immediate attempts fail
-    const pm = freshPm();
-    const rec = pm.getOrCreateProgress('player-q', 'Q', 11);
-    await flush();
-    expect(rec.hydrated).toBe(false);
-    pm.recordHandPlayed('player-q', 'holdem');
-    pm.recordHandWon('player-q', 100, 3);
-    await pm.flushPending();
-    expect(db.settleCalls).toEqual([]);                     // nothing paid from a fresh-init record
-    expect(rec.chips).toBe(0);                              // the optimistic first_win was taken back at once
-    await new Promise((r) => setTimeout(r, 30));            // background re-load
-    await flush();
-    expect(rec.hydrated).toBe(true);
-    expect(rec.level).toBe(40);
-    expect(rec.chips).toBe(77777);
-    expect(rec.totalHandsPlayed).toBe(301);                 // DB 300 + the hand counted before the load (a delta)
-    expect(rec.handsWon).toBe(121);
+    // The background re-load is a timer: the clock is faked so it fires only
+    // when the test advances it (under a loaded CI box a real 5ms timer fired
+    // during the first flush and the record was already hydrated).
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+    try {
+      user(11, { level: 40, chips: 77777, stats: { handsPlayed: 300, handsWon: 120 }, achievements: ['first_win'] });
+      db.failBundle = 3;                                      // all three immediate attempts fail
+      const pm = freshPm();                                   // background re-load 5ms later
+      const rec = pm.getOrCreateProgress('player-q', 'Q', 11);
+      await flush();
+      expect(rec.hydrated).toBe(false);
+      expect(db.bundleCalls).toBe(3);
+      pm.recordHandPlayed('player-q', 'holdem');
+      pm.recordHandWon('player-q', 100, 3);
+      await pm.flushPending();
+      expect(db.settleCalls).toEqual([]);                     // nothing paid from a fresh-init record
+      expect(rec.chips).toBe(0);                              // the optimistic first_win was taken back at once
+      jest.advanceTimersByTime(10);                           // the background re-load
+      await flush();
+      expect(db.bundleCalls).toBe(4);
+      expect(rec.hydrated).toBe(true);
+      expect(rec.level).toBe(40);
+      expect(rec.chips).toBe(77777);
+      expect(rec.totalHandsPlayed).toBe(301);                 // DB 300 + the hand counted before the load (a delta)
+      expect(rec.handsWon).toBe(121);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it('CONTROL — the pre-R2 loaders returned [] on an error: today\'s daily achievements read as "none" and paid again (here: the ledger blocks the re-pay)', async () => {
