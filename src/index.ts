@@ -6688,20 +6688,20 @@ async function cashOutSeatsBeforeGuestClaim(guestUserId: number): Promise<void> 
     if (!table || !seat || seat.state !== 'occupied' || seat.isAI) return true; // nothing seated there
     if (tournamentSeat || isTournamentTable(tableId)) return false;
     if (pendingSeatRemovalAfterHand.get(tableId)?.has(seatIndex)) return true;
-    if (table.isHandInProgress() && !seat.folded && (seat.totalInvestedThisHand || 0) > 0) {
+    // R2 (2026-10-11, GAME-15) — chips in a LIVE pot, folded or not (a FOLDED
+    // seat's blind / call used to leave the pot with the immediate stand-up
+    // below), wait for the hand's end: the deferred path credits the guest row.
+    if (table.isHandInProgress() && (seat.totalInvestedThisHand || 0) > 0) {
       standUpRefusedSeat(guestUserId, label, tableId, seatIndex, reason);
       console.warn(`[guest-claim] ${JSON.stringify({ event: 'guest_claim_seat_deferred', guestUserId, tableId, seatIndex })}`);
       return true;
     }
-    if (table.isHandInProgress() && table.activeSeatIndex === seatIndex) table.playerFold(seatIndex);
-    const s = table.seats[seatIndex];
-    if (!s || s.state !== 'occupied' || s.isAI) return true;
-    const chips = s.chipCount || 0;
-    sitOutTracker.get(tableId)?.delete(seatIndex);
-    s.deadBlindOwedChips = 0;
-    s.missedBlind = 'none';
-    table.standUp(seatIndex);
-    syncSitOutToTable(tableId);
+    // R2 (GAME-15 / GAME-16) — out of the hand through the ONE teardown (a seat
+    // still in the hand is folded — the next bot acts now — then stood up).
+    // `who` null: teardownSeat credits nothing; the stack is credited below and
+    // AWAITED, so the claim moves it.
+    const chips = seat.chipCount || 0;
+    if (teardownSeat(tableId, table, seatIndex, null, reason) !== 'stood_up') return true;
     broadcastGameState(tableId);
     if (chips > 0) {
       credits.push(addChipsToUser(guestUserId, chips).then((ok) =>

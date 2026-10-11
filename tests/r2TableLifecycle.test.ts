@@ -452,3 +452,112 @@ describe('APPUI-21 — a second departure of the same account never strands the 
     expect(w.credits).toEqual([]);
   });
 });
+
+describe('GAME-15 / GAME-16 — the guest-claim pre-step tears seats down through the ONE helper', () => {
+  const GUEST = 501;
+  const GUEST_SRC = [
+    fnSrc('async function cashOutSeatsBeforeGuestClaim('),
+    fnSrc('function standUpRefusedSeat('),
+    fnSrc('function processPendingSeatRemovals('),
+    SEAT_TEARDOWN_SRC,
+  ].join('\n');
+
+  /** `players` seated on one real table; the guest's live session points at whichever seat `pick` chooses after the deal. */
+  function guestWorld(players: number, code = GUEST_SRC) {
+    const table = new PokerTable({ tableId: T, tableName: T, smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 } as any);
+    for (let i = 0; i < players; i++) table.sitDown(i, `P${i}`, 5000, `p${i}`, false);
+    const walletCredits: Array<{ uid: number; amount: number }> = [];   // addChipsToUser — the AWAITED path
+    const deferredCredits: Array<{ uid: number; chips: number; reason: string }> = [];   // the hand's-end path
+    const scheduled: string[] = [];
+    const playerSessions = new Map<string, any>();
+    const authSessions = new Map<string, any>([['SG', { userId: GUEST, username: 'guest' }]]);
+    const scope: Record<string, unknown> = {
+      tableManager: { getTable: (id: string) => (id === T ? table : undefined) },
+      pendingSeatRemovalAfterHand: new Map(), sitOutTracker: new Map(), aiProfiles: new Map(), aiTimeouts: new Map(),
+      pendingAutoStartTimers: new Map(), reservedSeats: new Map(), playerSessions, multiTableSessions: new Map(), authSessions,
+      io: { sockets: { sockets: new Map() } }, releaseSeatedSlot() {},
+      isTournamentTable: () => false, isTournamentReservation: () => false,
+      addChipsToUser: async (uid: number, amount: number) => { walletCredits.push({ uid, amount }); return true; },
+      creditSeatStackToWallet: (uid: number, _u: string, _t: string, seat: any, reason: string) => deferredCredits.push({ uid, chips: seat.chipCount, reason }),
+      auditLog() {}, scheduleAIAction: (id: string) => scheduled.push(id), syncSitOutToTable() {}, broadcastGameState() {},
+      DrawPhases: DRAWS, FiveCardDrawTable, GamePhase, MAX_SEATS, console: quiet,
+    };
+    const { exports: m } = load(code, scope, '{ cashOutSeatsBeforeGuestClaim, processPendingSeatRemovals }');
+    table.on('handResult', () => m.processPendingSeatRemovals(T));
+    const guestAt = (seatIndex: number) => playerSessions.set('SG', { socketId: 'SG', tableId: T, seatIndex, playerName: `P${seatIndex}`, playerId: `p${seatIndex}` });
+    const conserved = () => table.seats.reduce((s, x) => s + (x.state === 'occupied' ? x.chipCount + (table.isHandInProgress() ? x.totalInvestedThisHand : 0) : 0), 0)
+      + walletCredits.reduce((s, c) => s + c.amount, 0) + deferredCredits.reduce((s, c) => s + c.chips, 0);
+    return { table, m, walletCredits, deferredCredits, scheduled, guestAt, conserved };
+  }
+
+  /** 3-handed: the small blind calls nothing — it FOLDS with its 25 in the pot. */
+  function foldedSmallBlind(w: ReturnType<typeof guestWorld>) {
+    w.table.startNewHand();
+    const sb = w.table.seats.findIndex((s) => s.currentBet === 25);
+    let g = 0;
+    while (w.table.activeSeatIndex !== sb && g++ < 5) w.table.playerCall(w.table.activeSeatIndex);
+    expect(w.table.playerFold(sb)).toBe(true);
+    expect(w.table.isHandInProgress()).toBe(true);
+    return sb;
+  }
+
+  it('a FOLDED guest seat with chips in the live pot waits for the hand\'s end (credited once, nothing destroyed)', async () => {
+    const w = guestWorld(3);
+    const sb = foldedSmallBlind(w);
+    w.guestAt(sb);
+    await w.m.cashOutSeatsBeforeGuestClaim(GUEST);
+    expect(w.table.seats[sb].state).toBe('occupied');              // the pot still holds its 25
+    expect(w.walletCredits).toEqual([]);
+    playOut(w.table);
+    expect(w.table.seats[sb].state).toBe('empty');
+    expect(w.deferredCredits).toEqual([{ uid: GUEST, chips: 4975, reason: 'leave_after_hand' }]);
+    expect(w.conserved()).toBe(15000);
+  });
+
+  it('CONTROL — pre-R2 (only a NON-folded seat deferred, else stood up at once): the folded guest\'s 25 left the pot', async () => {
+    const code = GUEST_SRC
+      .replace('if (table.isHandInProgress() && (seat.totalInvestedThisHand || 0) > 0) {',
+        'if (table.isHandInProgress() && !seat.folded && (seat.totalInvestedThisHand || 0) > 0) {')
+      .replace("if (teardownSeat(tableId, table, seatIndex, null, reason) !== 'stood_up') return true;",
+        "if (table.isHandInProgress() && table.activeSeatIndex === seatIndex) table.playerFold(seatIndex); sitOutTracker.get(tableId)?.delete(seatIndex); table.standUp(seatIndex); syncSitOutToTable(tableId);");
+    expect(code).not.toBe(GUEST_SRC);
+    const w = guestWorld(3, code);
+    const sb = foldedSmallBlind(w);
+    w.guestAt(sb);
+    await w.m.cashOutSeatsBeforeGuestClaim(GUEST);
+    expect(w.table.seats[sb].state).toBe('empty');
+    playOut(w.table);
+    expect(w.conserved()).toBe(15000 - 25);
+  });
+
+  it('the guest ON THE CLOCK with nothing in the pot is folded, the next bot is scheduled now, the stack credited (awaited)', async () => {
+    const w = guestWorld(4);
+    w.table.startNewHand();
+    const utg = w.table.activeSeatIndex;
+    expect(w.table.seats[utg].totalInvestedThisHand).toBe(0);
+    w.guestAt(utg);
+    await w.m.cashOutSeatsBeforeGuestClaim(GUEST);
+    expect(w.table.seats[utg].state).toBe('empty');
+    expect(w.table.activeSeatIndex).not.toBe(utg);
+    expect(w.scheduled).toContain(T);                                 // GAME-16: was never scheduled here
+    expect(w.walletCredits).toEqual([{ uid: GUEST, amount: 5000 }]);
+    playOut(w.table);
+    expect(w.conserved()).toBe(20000);
+  });
+
+  it('a guest seat dealt in but NOT on the clock is folded out of turn (not left live while stood up); the hand plays on', async () => {
+    const w = guestWorld(4);
+    w.table.startNewHand();
+    const utg = w.table.activeSeatIndex;
+    const idle = w.table.seats.findIndex((s) => s.state === 'occupied' && s.seatIndex !== utg && s.totalInvestedThisHand === 0);
+    expect(idle).toBeGreaterThanOrEqual(0);
+    w.guestAt(idle);
+    await w.m.cashOutSeatsBeforeGuestClaim(GUEST);
+    expect(w.table.seats[idle].state).toBe('empty');
+    expect(w.table.activeSeatIndex).toBe(utg);                        // the real actor keeps the action
+    expect(w.walletCredits).toEqual([{ uid: GUEST, amount: 5000 }]);
+    playOut(w.table);
+    expect(w.table.currentPhase).toBe(GamePhase.HandComplete);
+    expect(w.conserved()).toBe(20000);
+  });
+});
