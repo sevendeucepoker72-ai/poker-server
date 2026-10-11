@@ -13881,7 +13881,7 @@ Give feedback in this JSON format:
       // BEFORE the escrow (and again, atomically, by the recording INSERT). The
       // bettor is shown by his PUBLIC name (it was his login handle).
       const bettorName = await publicNameForUser(auth.userId);
-      const bettorNames = [bettorName, auth.displayName || ''].filter((n) => n && n !== PUBLIC_NAME_FALLBACK);
+      const bettorNames = Array.from(new Set([bettorName, auth.displayName || ''].filter((n) => n && n !== PUBLIC_NAME_FALLBACK)));
       const refusal = await sideBetRefusal(bracketIdIn, auth.userId, bettorNames);
       if (refusal) { socket.emit('socialBracketError', { message: refusal.error, code: refusal.code }); return; }
       const chips = await getUserChips(auth.userId);

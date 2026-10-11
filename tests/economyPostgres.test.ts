@@ -3,8 +3,9 @@
  * Postgres (the SQL proof: ledgers, row locks, the Denver streak, the BIGINT
  * migration with the merged-credit trigger, concurrency).
  *
- * Runs only when ECONOMY_TEST_PG_URL points at a THROWAWAY database (never
- * prod): e.g. `docker run --rm -e POSTGRES_PASSWORD=x -p 55432:5432 postgres:18`
+ * Runs only when ECONOMY_TEST_PG_URL points at a FRESH THROWAWAY database
+ * (never prod; the BIGINT migration test needs the INTEGER column initDB
+ * creates, so recreate the container between runs): e.g. `docker run --rm -e POSTGRES_PASSWORD=x -p 55432:5432 postgres:18`
  * then ECONOMY_TEST_PG_URL=postgres://postgres:x@localhost:55432/postgres.
  * Skipped otherwise (CI has no Postgres) — the same behaviour is pinned with
  * fakes in economySettlements.test.ts / progressionPerUser.test.ts.
@@ -84,6 +85,8 @@ d('economy on a real Postgres', () => {
     });
 
     it('users.chips INTEGER → BIGINT: the merged-credit trigger is dropped and re-created identically in ONE transaction; values kept; idempotent; int8 reads back as a number', async () => {
+      const typeBefore = (await pool.query(`SELECT data_type FROM information_schema.columns WHERE table_name='users' AND column_name='chips'`)).rows[0].data_type;
+      if (typeBefore !== 'integer') throw new Error(`needs a FRESH database: users.chips is already ${typeBefore} (a previous run migrated it) — recreate the throwaway container`);
       const id = await mkUser({ chips: 2_000_000_000 });
       const trigBefore = (await pool.query(`SELECT pg_get_triggerdef(oid) AS def FROM pg_trigger WHERE tgrelid='users'::regclass AND NOT tgisinternal`)).rows.map((r: any) => r.def);
       expect(trigBefore.length).toBe(1);
