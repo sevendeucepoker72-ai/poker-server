@@ -773,3 +773,8 @@ cards: seat.holeCards.map((c) => ({ suit: c.suit, rank: c.rank, display: (0, Car
 # 2026-10-11 (R1, H2) — TABLEUI-7 / contract #5: the per-socket gameState delta
 # sends null for a key that disappeared (JSON drops undefined).
 if (prevVal !== null && prevVal !== undefined)
+#
+# 2026-10-11 (R1, H2) — ECON-19: the broke refill counts the account's chips on
+# (non-tournament) tables; refused chips_on_table otherwise.
+chips_on_table
+const onTable = chipsOnTablesOfUser(ctx.userId);

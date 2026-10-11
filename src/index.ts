@@ -6770,6 +6770,42 @@ const battlePassClaimLimiter = createWindowRateLimiter(110, 60_000);
 // R1 contract #4 — showMuckedHand: one reveal per (table, hand, seat).
 const shownMuckedHands = new Set<string>();
 
+/**
+ * R1 (2026-10-11, ECON-19) — wallet chips the account has OUT ON TABLES right
+ * now: every seat a live session of his plays (main or extra table, any of
+ * his sockets), his reserved (disconnected) seat and any seat whose removal
+ * waits for the hand's end — its stack, plus what it has in the pot of a hand
+ * in progress. Tournament chips are not wallet chips (never counted). The
+ * broke refill counts these: claiming +5,000 while the chips sat on a table
+ * (then topping up / cashing out) cycled free chips.
+ */
+function chipsOnTablesOfUser(userId: number): number {
+  const seen = new Set<string>();
+  let total = 0;
+  const count = (tableId: string, seatIndex: number): void => {
+    const key = `${tableId}:${seatIndex}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (isTournamentTable(tableId)) return;
+    const t = tableManager.getTable(tableId);
+    const seat = t?.seats?.[seatIndex];
+    if (!t || !seat || seat.state !== 'occupied' || seat.isAI) return;
+    total += Math.max(0, seat.chipCount || 0) + (t.isHandInProgress() ? Math.max(0, seat.totalInvestedThisHand || 0) : 0);
+  };
+  for (const [sid, a] of authSessions) {
+    if (a?.userId !== userId) continue;
+    const main = playerSessions.get(sid);
+    if (main) count(main.tableId, main.seatIndex);
+    for (const extra of multiTableSessions.get(sid) || []) if (extra) count(extra.tableId, extra.seatIndex);
+  }
+  const reserved = reservedSeats.get(userId);
+  if (reserved && reserved.expiresAt > Date.now() && !isTournamentReservation(reserved)) count(reserved.tableId, reserved.seatIndex);
+  for (const [tableId, seats] of pendingSeatRemovalAfterHand) {
+    for (const [seatIndex, who] of seats) if (who.userId === userId) count(tableId, seatIndex);
+  }
+  return total;
+}
+
 // ========== Public names (R1 2026-10-11 — ECON-3 / AUTH-7 / APPUI-1, P0 PII) ==========
 // users.username is a LOGIN handle (phone numbers, first.last slugs) and is
 // never sent to another player: they see the public display name
@@ -11439,19 +11475,33 @@ Give feedback in this JSON format:
       if (!ctx) { socket.emit('refillResult', { success: false, error: 'Not authenticated' }); return; }
       const REFILL_THRESHOLD = 5000; // = cheapest cash table min buy-in
       const REFILL_AMOUNT = 5000;
+      // R1 (ECON-19) — "broke" counts the chips he has on tables too: the
+      // wallet + every non-tournament stack of his must be under the
+      // threshold. Refused `chips_on_table` (with the amount) otherwise.
+      const onTable = chipsOnTablesOfUser(ctx.userId);
+      const tableChipsRefusal = async () => {
+        const current = await getUserChips(ctx.userId).catch(() => null);
+        socket.emit('refillResult', {
+          success: false, error: 'chips_on_table', chips: current, onTable,
+          message: `You still have ${onTable.toLocaleString('en-US')} chips at a table — the refill is only for an empty bankroll.`,
+        });
+      };
+      if (onTable >= REFILL_THRESHOLD) { await tableChipsRefusal(); return; }
       // H6 fix (2026-07-01): atomic check-and-add. The old read-then-add let
       // two concurrent broke-state emits both pass the `current < threshold`
       // check and each add 5,000 (+10,000). refillBrokeUser puts the predicate
-      // inside the UPDATE so exactly one concurrent call applies.
-      const newBalance = await refillBrokeUser(ctx.userId, REFILL_THRESHOLD, REFILL_AMOUNT);
+      // inside the UPDATE so exactly one concurrent call applies (R1: against
+      // the threshold minus the chips on tables).
+      const newBalance = await refillBrokeUser(ctx.userId, REFILL_THRESHOLD - onTable, REFILL_AMOUNT);
       if (newBalance == null) {
         const current = await getUserChips(ctx.userId);
+        if (onTable > 0 && current < REFILL_THRESHOLD) { await tableChipsRefusal(); return; }
         socket.emit('refillResult', { success: false, error: 'not_broke', chips: current });
         return;
       }
       try { const p = progressionManager.getProgress(ctx.playerId); if (p) p.chips = newBalance; } catch {}
       const uname = authSessions.get(socket.id)?.username || String(ctx.userId);
-      auditLog(uname, 'BROKE_REFILL', { added: REFILL_AMOUNT, newBalance });
+      auditLog(uname, 'BROKE_REFILL', { added: REFILL_AMOUNT, newBalance, onTable });
       socket.emit('refillResult', { success: true, added: REFILL_AMOUNT, chips: newBalance });
       sendProgressToPlayer(socket.id);
     } catch (err: any) {
