@@ -2213,17 +2213,22 @@ export class PokerTable extends EventEmitter {
       players: this.seats
         .filter(s => s.state === 'occupied' && !s.eliminated)
         .map(s => {
+          // 2026-07-05 audit fix: never expose hole cards for a hand won
+          // uncontested (no showdown) — the winner never showed. Only reveal
+          // non-folded hands when the hand actually reached a contested showdown.
+          // 2026-10-11 (.online R1, TABLEUI-6): nor their STRENGTH — the hand
+          // name was computed for every non-folded seat, so the replay of an
+          // uncontested pot said "Two Pair, Kings and 7s" next to hidden cards
+          // (888 of 8,463 stored records). Masked cards = no hand name.
+          const shown = !s.folded && this.wentToShowdown && s.holeCards.length > 0;
           const allCards = [...s.holeCards, ...this.communityCards];
           // R7: `>= 4` for non-community games so 4-card Badugi evaluates.
-          const handRes = (allCards.length >= 5 || (!this.usesCommunityCards() && s.holeCards.length >= 4)) && !s.folded
+          const handRes = shown && (allCards.length >= 5 || (!this.usesCommunityCards() && s.holeCards.length >= 4))
             ? this.evaluatePlayerHand(s.holeCards, this.communityCards) : null;
           return {
             seatIndex: s.seatIndex,
             name: s.playerName,
-            // 2026-07-05 audit fix: never expose hole cards for a hand won
-            // uncontested (no showdown) — the winner never showed. Only reveal
-            // non-folded hands when the hand actually reached a contested showdown.
-            holeCards: (s.folded || !this.wentToShowdown) ? null : (s.holeCards.length > 0 ? [...s.holeCards] : null),
+            holeCards: shown ? [...s.holeCards] : null,
             startChips: this.startChips.get(s.seatIndex) || 0,
             endChips: s.chipCount,
             actions: this.actionLog

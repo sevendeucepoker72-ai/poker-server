@@ -756,3 +756,10 @@ usernameCheckLimiter.hit(
 publicStakingOffers(
 publicTournamentStandings(
 friend_name_ambiguous
+#
+# 2026-10-11 (R1, H2) — APPUI-2 (P0 hole-card leak) + TABLEUI-6: a hand record
+# shows cards — and a hand name — only for a non-folded seat at a CONTESTED
+# showdown (base + Omaha hi-lo + Stud hi-lo).
+const shown = !s.folded && this.wentToShowdown && s.holeCards.length > 0;
+if (nonFolded.length >= 2)
+if (evaluations.length <= 1) {

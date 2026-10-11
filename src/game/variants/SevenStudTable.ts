@@ -242,10 +242,16 @@ export class SevenStudTable extends PokerTable {
         low: evaluateLowHand(s.holeCards),
       }));
 
-    if (evaluations.length === 0) {
+    // 2026-10-11 (.online R1, APPUI-2 class) — an UNCONTESTED pot (everyone
+    // else folded) goes through the base: 'Won by fold', nothing revealed. This
+    // override used to put the lone winner's hole cards (down cards included)
+    // and his hand's name into the hand result every player's state carries.
+    if (evaluations.length <= 1) {
       super.determineWinners();
       return;
     }
+    // A contested showdown: the base rule for revealing the tabled hands.
+    this.wentToShowdown = true;
 
     // Build pot tiers using the manager
     const pots = this.sidePotManager.calculatePots(
