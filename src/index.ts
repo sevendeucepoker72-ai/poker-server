@@ -6757,6 +6757,9 @@ const CURRENT_BATTLE_PASS_SEASON = 'season_1_the_river';
 // A full "Claim all" is <= 100 emits (50 tiers x 2 tracks): 110 per minute per account.
 const battlePassClaimLimiter = createWindowRateLimiter(110, 60_000);
 
+// R1 contract #4 — showMuckedHand: one reveal per (table, hand, seat).
+const shownMuckedHands = new Set<string>();
+
 // ========== Public names (R1 2026-10-11 — ECON-3 / AUTH-7 / APPUI-1, P0 PII) ==========
 // users.username is a LOGIN handle (phone numbers, first.last slugs) and is
 // never sent to another player: they see the public display name
@@ -13933,23 +13936,40 @@ Give feedback in this JSON format:
     broadcastGameState(session.tableId);
   });
 
-  // ========== Show Mucked Hand ==========
-  socket.on('showMuckedHand', async (data: { cards: any[] }) => {
-    const session = playerSessions.get(socket.id);
-    if (!session || !data?.cards?.length) return;
-
+  // ========== Show Mucked Hand — R1 contract #4 (2026-10-11, TABLEUI-5) ==========
+  // Broadcasts the seat's REAL hole cards to the table: the client's `cards`
+  // used to be relayed as-is (fake cards — or `[null]` / 'x', which crashed
+  // every client at the table). Allowed for a player who FOLDED this hand, or
+  // for the UNCONTESTED winner once the hand is over (a contested showdown
+  // already tabled his cards). Once per seat per hand; nothing for spectators
+  // or bots. Payload: `{ tableId? }` (any `cards` are ignored).
+  // `muckedHandRevealed { playerName, seatIndex, tableId, handNumber, cards: [{suit, rank, display}], timestamp }`.
+  socket.on('showMuckedHand', async (data: { tableId?: string; cards?: unknown } = {}) => {
+    const main = playerSessions.get(socket.id);
+    const wanted = typeof data?.tableId === 'string' && data.tableId ? data.tableId : main?.tableId;
+    const session = main && main.tableId === wanted
+      ? main
+      : (multiTableSessions.get(socket.id) || []).find((s) => s && s.tableId === wanted);
+    if (!session) return;
     const table = tableManager.getTable(session.tableId);
     if (!table) return;
-
     const seat = table.seats[session.seatIndex];
-    // Only allow showing if player folded this hand
-    if (!seat || !seat.folded) return;
-
-    // Broadcast the reveal to everyone at the table
+    if (!seat || seat.state !== 'occupied' || seat.isAI || seat.holeCards.length === 0) return;
+    const handOver = table.currentPhase === GamePhase.HandComplete || table.currentPhase === GamePhase.Showdown;
+    const uncontestedWinner = handOver && !seat.folded && !table.wentToShowdown
+      && !!table.lastHandResult && table.lastHandResult.handNumber === table.handNumber
+      && table.lastHandResult.winners.some((w) => w.seatIndex === session.seatIndex);
+    if (!seat.folded && !uncontestedWinner) return;
+    const key = `${session.tableId}:${table.handNumber}:${session.seatIndex}`;
+    if (shownMuckedHands.has(key)) return;
+    if (shownMuckedHands.size >= 10_000) shownMuckedHands.clear();
+    shownMuckedHands.add(key);
     io.to(`table:${session.tableId}`).emit('muckedHandRevealed', {
-      playerName: session.playerName,
+      playerName: seat.playerName,
       seatIndex: session.seatIndex,
-      cards: data.cards,
+      tableId: session.tableId,
+      handNumber: table.handNumber,
+      cards: seat.holeCards.map((c) => ({ suit: c.suit, rank: c.rank, display: cardToString(c) })),
       timestamp: Date.now(),
     });
   });
