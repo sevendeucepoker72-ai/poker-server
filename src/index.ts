@@ -1634,13 +1634,22 @@ const assertPlayableForSocket = createAssertPlayable({
  * `extraMasterIds` adds identities proven by the request itself (e.g. the
  * verified deep-link ticket's user id) — if ANY attached id is suspended, refuse.
  */
-function assertPlayable(
+async function assertPlayable(
   socket: Socket,
   where: string,
   extraMasterIds: Array<string | null | undefined> = [],
   opts: AssertPlayableOptions = {},
 ): Promise<PlayRefusal | null> {
-  return assertPlayableForSocket(socket.id, where, extraMasterIds, opts);
+  const refusal = await assertPlayableForSocket(socket.id, where, extraMasterIds, opts);
+  if (refusal) return refusal;
+  // AUTH-12 (2026-10-11) — a locally BANNED account (banUser / adminIPBan:
+  // users.banned) is refused at EVERY play entry, like a master suspension
+  // (code player_suspended, the owner's sentence; fails open on a DB error,
+  // logged). Before, only joinTable, the Return and the seat restores checked
+  // it — a banned player could still quick-play, register for tournaments, take
+  // a waitlist seat or rebuy. banUser does not kick, so a live session needs it.
+  const auth = authSessions.get(socket.id);
+  return auth ? bannedAccountRefusal(auth.userId, where) : null;
 }
 
 /** Refuse on the generic `error` channel (lobby joins, quick modes, tournaments, clubs, rebuy). */
@@ -7580,6 +7589,15 @@ Give feedback in this JSON format:
         return;
       }
       const localUser = upsert.user;
+      // AUTH-12 (2026-10-11) — a BANNED row (banUser / adminIPBan) signs in
+      // nowhere: refused before any session, seat restore or progress push.
+      if (localUser.banned) {
+        failLogin(socket, {
+          code: 'player_suspended', message: PLAYER_SUSPENDED_MESSAGE, via: 'oauthLogin', requestId,
+          detail: { local_user_id: localUser.id, banned: true },
+        });
+        return;
+      }
 
       const userId = localUser.id;
       const progress = await loadProgress(userId);
@@ -7897,6 +7915,16 @@ Give feedback in this JSON format:
           return;
         }
         const _tlLocalUser = _tlUpsert.user;
+        // AUTH-12 (2026-10-11) — a BANNED row signs in nowhere (the legacy
+        // HS256 branch below already refuses one in getUserFromToken).
+        if (_tlLocalUser.banned) {
+          socket.emit('tokenLoginResult', { success: false, message: PLAYER_SUSPENDED_MESSAGE });
+          failLogin(socket, {
+            code: 'player_suspended', message: PLAYER_SUSPENDED_MESSAGE, via: 'tokenLogin', requestId: tlRequestId,
+            detail: { local_user_id: _tlLocalUser.id, banned: true }, onlyWhenAttributed: true,
+          });
+          return;
+        }
         const userId = _tlLocalUser.id;
         const progress = await loadProgress(userId);
         // 2026-08-17 P3 — MISLABEL FIX. When the token is a VALID OIDC token but
@@ -11491,6 +11519,11 @@ Give feedback in this JSON format:
           socket.emit('maintenanceMode', { enabled: true });
           return;
         }
+        // AUTH-12 (2026-10-11) — a BANNED row signs in nowhere.
+        if (localUser.banned) {
+          failTicket('player_suspended', PLAYER_SUSPENDED_MESSAGE, { local_user_id: localUser.id, banned: true });
+          return;
+        }
 
         // 4. Set auth session + emit loginResult in the shape the client expects.
         // Stamp masterUserId + phone so ticket-login users can use qualifiers /
@@ -12042,6 +12075,7 @@ Give feedback in this JSON format:
         // a resume token below; a pre-existing session on the socket (an OIDC
         // login) has its own refresh flow and gets none.
         let wlBootstrapSession: { userId: number; username: string; masterUserId: string; displayName?: string | null } | null = null;
+        let wlBootstrapBanned = false;   // AUTH-12 (2026-10-11)
         try {
           if (!authSessions.has(socket.id)) {
             try {
@@ -12092,7 +12126,11 @@ Give feedback in this JSON format:
                   });
                 }
               }
-              if (wlRow && !authSessions.has(socket.id)) {
+              if (wlRow?.banned) {
+                // AUTH-12 (2026-10-11) — a BANNED row signs in nowhere: no session,
+                // the link is refused below (nothing seated, nothing deducted).
+                wlBootstrapBanned = true;
+              } else if (wlRow && !authSessions.has(socket.id)) {
                 // 2026-10-07 — masterUserId = the VERIFIED ticket's user id (the
                 // same attestation authWithTicket stamps on its session).
                 // P4 (2026-10-10) — only if no sign-in landed on this socket
@@ -12116,6 +12154,10 @@ Give feedback in this JSON format:
         // bootstrap: a login like any other (U1) — drop a session the bootstrap
         // set on the dead socket and stop before the AI eviction and buy-in.
         if (loginSocketGone(socket, 'joinWithWaitlistContext', 'auth_bootstrap', { localUserId: wlBootstrapSession?.userId })) return;
+        if (wlBootstrapBanned) {
+          failWaitlist('player_suspended', PLAYER_SUSPENDED_MESSAGE);
+          return;
+        }
 
         // If we still don't have an auth session after the bootstrap attempt,
         // abort rather than seating an unauthenticated player who will then

@@ -755,3 +755,10 @@ seatNameForSocket
 sanitizeSeatAvatar
 accountDisplayName
 a.displayName = data.name.trim()
+#
+# 2026-10-11 (.online R1, AUTH-12) — a locally BANNED account is refused at every
+# play entry (assertPlayable → bannedAccountRefusal, player_suspended) and at
+# sign-in (oauthLogin, tokenLogin, authWithTicket, the waitlist link). Pinned by
+# tests/bans.test.ts.
+return auth ? bannedAccountRefusal(auth.userId, where) : null;
+wlBootstrapBanned
