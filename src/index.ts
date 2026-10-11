@@ -2573,6 +2573,12 @@ app.get('/api/health', async (_req, res) => {
       resumeSessions: { enabled: !!RESUME_SIGNING_KEY, ...resumeStats, signOut: { ...signOutStats } },
       // 2026-10-09 — R2 guest carry-over.
       guestClaims: { ...guestClaimStats },
+      // 2026-10-11 (.online R1, ECON-1) — all-in insurance: decision windows
+      // opened / seats quoted / accepted / declined / refused accepts, windows
+      // ended by timeout vs every seat deciding, settlements, voided records
+      // (a forfeit, another hand, a seat that changed hands); open = windows
+      // waiting right now (each lasts at most INSURANCE_DECISION_MS).
+      insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
     });
   } catch (e: any) {
     res.status(503).json({ status: 'unhealthy', error: e?.message || String(e) });
@@ -9719,7 +9725,9 @@ Give feedback in this JSON format:
   socket.on('getClubInfo', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
     // R1 (CLUBS-2) — the join code is in the answer only for an active member (clubManager.getClubInfo).
-    const result = await getClubInfo(Number(data?.clubId), auth?.userId);
+    const clubId = Number(data?.clubId);
+    if (!Number.isInteger(clubId) || clubId <= 0) { socket.emit('clubInfo', { success: false, error: 'Club not found' }); return; }
+    const result = await getClubInfo(clubId, auth?.userId);
     socket.emit('clubInfo', result);
   });
 

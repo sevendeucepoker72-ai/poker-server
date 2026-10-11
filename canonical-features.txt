@@ -782,3 +782,5 @@ const onTable = chipsOnTablesOfUser(ctx.userId);
 # 2026-10-11 (R1, H2) — CLUBS-2: getClubInfo includes the join code only for an
 # active member (walking SERIAL ids no longer reveals private clubs' codes).
 ...(myRole ? { clubCode: club.clubCode } : {}),
+# R1 (H2) — insurance counters on /api/health.
+insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
