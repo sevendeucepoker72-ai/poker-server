@@ -17,6 +17,9 @@
 import { PokerTable } from '../src/game/PokerTable';
 import { TournamentManager } from '../src/game/TournamentManager';
 import { SRC, slice, handlerSrc, load, flush, deferred } from './helpers/indexSource';
+// R1 contract #3 (2026-10-11): the seat paths name the seat from the ACCOUNT and allowlist the avatar.
+import { accountDisplayName } from '../src/auth/displayName';
+import { sanitizeSeatAvatar } from '../src/seatProfile';
 
 const ALICE = 101;
 const BOB = 102;
@@ -46,6 +49,7 @@ const BROKEN_TABLES = slice('const brokenTournamentTables = new Map', 'brokenTou
 // P5 / P4 (2026-10-10): the tournament-table refusal and the waitlist account-mismatch constants.
 const CASH_JOIN_REFUSAL = slice('const TOURNAMENT_TABLE_JOIN_MESSAGE', '\n}\n');
 const WAITLIST_MISMATCH = slice('const WAITLIST_ACCOUNT_MISMATCH_MESSAGE', 'const waitlistAccountMismatches = { refused: 0 };');
+const SEAT_NAME = slice('function seatNameForSocket(', '\n}\n');
 
 /** Neutralise every F3 check (the pre-F3 behaviour) — for the CONTROL tests. */
 const withoutF3 = (s: string) => s.split('await buyInSocketGone(').join('await (async (..._a: any[]) => false)(');
@@ -165,6 +169,7 @@ function world(opts: { handlers?: Partial<typeof H>; tournament?: 'buyin' | 'qua
     consumeQualifierCreditOnMaster: async () => { calls.consume++; if (gates.consume) await gates.consume; return { consumed: true, creditId: 'credit-1' }; },
     refundQualifierCreditOnMaster: async (id: string) => { creditRefunds.push(id); return true; },
     PLAYER_SUSPENDED_MESSAGE: 'SUSPENDED',
+    accountDisplayName, sanitizeSeatAvatar,
   };
 
   const h = { ...H, ...(opts.handlers || {}) };
@@ -174,6 +179,7 @@ ${LOGIN_GONE}
 ${BROKEN_TABLES}
 ${CASH_JOIN_REFUSAL}
 ${WAITLIST_MISMATCH}
+${SEAT_NAME}
 function wire(socket) {
   ${Object.values(h).join('\n  ')}
 }`;
@@ -190,7 +196,8 @@ function wire(socket) {
       join() {}, leave() {},
     };
     sockets.set(id, s);
-    if (signedIn) authSessions.set(id, { userId: ALICE, username: 'alice.player', masterUserId: 'm-alice' });
+    // R1 contract #3 (2026-10-11): a signed-in session carries the account display name the seat shows.
+    if (signedIn) authSessions.set(id, { userId: ALICE, username: 'alice.player', masterUserId: 'm-alice', displayName: 'Alice' });
     m.wire(s);
     return s;
   };
@@ -500,7 +507,7 @@ describe('P3 — a buy-in on a LIVE socket whose ACCOUNT changed during the dedu
     w.gates.deduct = gate.p;
     await run(w, p, s);
     // Another account's sign-in lands on this socket (P4's switch has already reserved / left Alice's seat).
-    w.authSessions.set('S1', { userId: BOB, username: 'bob.player', masterUserId: 'm-bob' });
+    w.authSessions.set('S1', { userId: BOB, username: 'bob.player', masterUserId: 'm-bob', displayName: 'Bob' });
     if (p.event === 'rebuy') w.playerSessions.delete('S1');
     gate.resolve();
     await flush();
@@ -633,7 +640,7 @@ describe('P3 — joins: the socket\'s seat or the table changed during the deduc
     w.gates.consume = gate.p;
     s.handlers.registerQualifierTournament({ qualifierId: 'weekly-qualifier', playerName: 'Alice', phone: '' });
     await flush();
-    w.authSessions.set('S1', { userId: BOB, username: 'bob.player', masterUserId: 'm-bob' });
+    w.authSessions.set('S1', { userId: BOB, username: 'bob.player', masterUserId: 'm-bob', displayName: 'Bob' });
     gate.resolve();
     await flush();
     expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);
@@ -745,7 +752,7 @@ describe('P5 — a CASH buy-in never lands on a tournament table (live or just b
 
 describe('P4 — a waitlist link never seats or charges the OTHER account signed in on the socket', () => {
   const link = PATHS.find((x) => (x.event as string) === 'waitlist')!;
-  const signedInAs = (w: ReturnType<typeof world>, session: any = { userId: BOB, username: 'bob.player', masterUserId: 'm-bob' }) => {
+  const signedInAs = (w: ReturnType<typeof world>, session: any = { userId: BOB, username: 'bob.player', masterUserId: 'm-bob', displayName: 'Bob' }) => {
     const s = w.mkSocket('S1', false);
     w.authSessions.set('S1', session);
     return s;
@@ -786,7 +793,7 @@ describe('P4 — a waitlist link never seats or charges the OTHER account signed
     w.gates.me = gate.p;
     void s.handlers.joinWithWaitlistContext({ token: 'tkt', context: {} });
     await flush();
-    w.authSessions.set('S1', { userId: BOB, username: 'bob.player', masterUserId: 'm-bob' });   // Bob's oauthLogin finished meanwhile
+    w.authSessions.set('S1', { userId: BOB, username: 'bob.player', masterUserId: 'm-bob', displayName: 'Bob' });   // Bob's oauthLogin finished meanwhile
     gate.resolve();
     await flush();
     expect(w.authSessions.get('S1')).toMatchObject({ userId: BOB });
@@ -816,7 +823,7 @@ describe('pe3 minor — the waitlist link\'s buy-in cancellation says so on BOTH
     const gate = deferred();
     w.gates.deduct = gate.p;
     await run(w, p, s);
-    w.authSessions.set('S1', { userId: BOB, username: 'bob.player', masterUserId: 'm-bob' });
+    w.authSessions.set('S1', { userId: BOB, username: 'bob.player', masterUserId: 'm-bob', displayName: 'Bob' });
     gate.resolve();
     await flush();
     const err = w.emitted.find(([ev, d]) => ev === 'error' && d?.cancelCode);

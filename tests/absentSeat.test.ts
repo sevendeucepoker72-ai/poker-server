@@ -32,6 +32,7 @@ import fs from 'fs';
 import path from 'path';
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
+import { sanitizeSeatAvatar } from '../src/seatProfile';
 import {
   createLoginTracker, seatRestoreAction, planHandStartGate, masterIdFromStats, resolveSessionMasterId,
   HAND_GATE_MAX_STATUS_AGE_MS,
@@ -320,6 +321,7 @@ function world(opts: WorldOpts = {}) {
       : tok === 'oidc-bob' ? { valid: true, sub: 'm-bob', username: 'Bob', isAdmin: false } : { valid: false }),
     reportAuthEvent() {},
     resolveLoginIdentity: () => ({ ok: true, identity: { key: 'alice.player', displayName: 'Alice', source: 'username' } }),
+    sanitizeSeatAvatar,   // R1 (2026-10-11): the orphan scans allowlist the reservation avatar
     upsertOidcLocalUser: async (a: { sub: string }) => ({ ok: true, user: { ...users.get(a.sub === 'm-bob' ? 102 : ALICE) } }),
     loadProgress: async (uid: number) => {
       if (ctl.loadProgressGate) await ctl.loadProgressGate;

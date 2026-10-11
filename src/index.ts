@@ -62,6 +62,8 @@ import {
 // row, or an unowned row only with an attested phone (never by a name).
 import { createOrAdoptMasterRow, masterRowStats } from './auth/masterRow';
 import { accountDisplayName } from './auth/displayName';
+// 2026-10-11 (R1 contract #3; AUTH-10) — seat avatars are allowlisted (no photo, hex colors).
+import { sanitizeSeatAvatar } from './seatProfile';
 import {
   findLocalUserByMasterId, awaitIdentityGate, releaseIdentityGate, scheduleBootAccountOps, isMergedTombstone,
   withMasterLock, identityStampPatch, MasterLookupError,
@@ -1239,7 +1241,27 @@ setInterval(() => {
 // by the play gate (resolveMasterId) for sessions with no attested master id
 // (legacy HS256 tokenLogin, password login). It does NOT stand in for
 // masterUserId anywhere else — see GateSession in auth/playGate.ts.
-const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null }>();
+// 2026-10-11 (R1 contract #3) — displayName: the ACCOUNT's display name (users.display_name,
+// else the row's public name), set by every sign-in and by setDisplayName; what
+// seatNameForSocket shows. `username` is NOT a display value (a phone, a slug, `m:<id>`).
+const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null; displayName?: string | null }>();
+
+/**
+ * 2026-10-11 (R1 contract #3; audit AUTH-6, APPUI-13, TOURNEY-12) — the name
+ * every seat, quick game, tournament / qualifier registration, waitlist seat and
+ * chat line shows for this socket. A SIGNED-IN socket always shows its ACCOUNT's
+ * display name (session `displayName`) through the display-name whitelist
+ * (auth/displayName.ts — the setDisplayName rule; never a phone number), else
+ * 'Player'. Whatever name the client sent is IGNORED: it let anyone sit and chat
+ * as anyone else (and fed the old name-based ghost scan, AUTH-3), outside the
+ * whitelist, or as a non-string that crashed every viewer's table. A socket with
+ * no account (only under the ONLINE_GUEST_PLAY_ENABLED rollback) gets its
+ * client name through the same whitelist. Always a non-empty string.
+ */
+function seatNameForSocket(socket: Socket, clientName?: unknown): string {
+  const auth = authSessions.get(socket.id);
+  return accountDisplayName(auth ? auth.displayName : clientName);
+}
 
 // ────────────────────────────────────────────────────────────────────────
 // 2026-10-07 — PLAY GATE (auth/playGate.ts has the full rationale).
@@ -6544,7 +6566,7 @@ io.on('connection', (socket: Socket) => {
     if (result.success && result.userData) {
       // P4 (2026-10-10) — never rebind this socket under another account's seat.
       releaseSocketForAccountSwitch(socket, result.userData.id, 'register');
-      authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username, statsMasterUserId: null });
+      authSessions.set(socket.id, { userId: result.userData.id, username: result.userData.username, statsMasterUserId: null, displayName: result.userData.username });
     }
     socket.emit('registerResult', result);
   });
@@ -6556,6 +6578,9 @@ io.on('connection', (socket: Socket) => {
     const result = await setDisplayName(auth.userId, data.name);
     if (result.success) {
       auth.username = data.name.trim(); // Update session
+      // R1 contract #3 — seats / chat show the account's display name: every
+      // live session of this account takes the new (validated) one.
+      for (const a of authSessions.values()) if (a.userId === auth.userId) a.displayName = data.name.trim();
       socket.emit('setDisplayNameResult', { success: true, displayName: data.name.trim() });
     } else {
       socket.emit('setDisplayNameResult', result);
@@ -6936,7 +6961,7 @@ io.on('connection', (socket: Socket) => {
     qt.players.push({
       playerId: auth.username || phone,
       masterPlayerId: masterId,
-      playerName: data.playerName || auth.username,
+      playerName: seatNameForSocket(socket, data.playerName),   // R1 contract #3
       phone: phone,
       socketId: socket.id,
       ip: regIp,
@@ -7247,7 +7272,7 @@ Give feedback in this JSON format:
     const room = `voice_${data.tableId}`;
     socket.join(room);
     // Use the authenticated username, not the one the client sent.
-    socket.to(room).emit('voicePeerJoined', { socketId: socket.id, username: auth.username });
+    socket.to(room).emit('voicePeerJoined', { socketId: socket.id, username: seatNameForSocket(socket) });   // R1 contract #3
   });
   socket.on('voiceLeave', async (data: { tableId: string }) => {
     if (!authSessions.get(socket.id)) return;
@@ -7258,7 +7283,7 @@ Give feedback in this JSON format:
   socket.on('voiceOffer', async (data: { to: string; offer: any; username: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth || !data?.to) return;
-    io.to(data.to).emit('voiceOffer', { from: socket.id, offer: data.offer, username: auth.username });
+    io.to(data.to).emit('voiceOffer', { from: socket.id, offer: data.offer, username: seatNameForSocket(socket) });
   });
   socket.on('voiceAnswer', async (data: { to: string; answer: any }) => {
     if (!authSessions.get(socket.id) || !data?.to) return;
@@ -7590,6 +7615,7 @@ Give feedback in this JSON format:
         username: localUser.username,
         masterUserId: String(oauthResult.sub),  // master-API users.id = qualifier player_id
         phone: String(phone),
+        displayName: localUser.display_name || localUser.username,   // R1 contract #3
       });
       // Q3 (2026-10-10) — kept: after every await below, the seat is restored
       // only while the socket is still signed in as THIS session's account.
@@ -7644,7 +7670,7 @@ Give feedback in this JSON format:
               reservedSeats.set(userId, {
                 userId, tableId: t.tableId, seatIndex: i,
                 playerName: seat.playerName, chips: seat.chipCount,
-                avatar: (progress.userData as any)?.avatar ?? undefined,
+                avatar: sanitizeSeatAvatar((progress.userData as any)?.avatar),
                 expiresAt: Date.now() + 60_000, cleanupTimer: undefined,
               } as any);
               console.log(`[OAuth Reconnect] orphan-seat recovery (name): user ${userId} (${recoverName}) -> ${t.tableId} seat ${i}`);
@@ -7910,6 +7936,7 @@ Give feedback in this JSON format:
             username: _tlLocalUser.username,
             masterUserId: String(oauthResult.sub),
             phone: String(_tlPhone),
+            displayName: _tlLocalUser.display_name || _tlLocalUser.username,   // R1 contract #3
           });
           // Q3 (2026-10-10) — kept for the overtake check after the gate below.
           const tlSession = authSessions.get(socket.id)!;
@@ -7953,7 +7980,7 @@ Give feedback in this JSON format:
                   seatIndex: i,
                   playerName: seat.playerName,
                   chips: seat.chipCount,
-                  avatar: (progress.userData as any).avatar ?? undefined,
+                  avatar: sanitizeSeatAvatar((progress.userData as any).avatar),
                   expiresAt: Date.now() + 60_000,
                   cleanupTimer: undefined,
                 } as any);
@@ -8071,7 +8098,7 @@ Give feedback in this JSON format:
         // fall back to the local row's stats stamp (null for guest rows).
         // P4 (2026-10-10) — never rebind this socket under another account's seat.
         releaseSocketForAccountSwitch(socket, userId, 'tokenLogin_legacy');
-        authSessions.set(socket.id, { userId, username: result.userData.username, statsMasterUserId: masterIdFromStats(result.userData.stats) });
+        authSessions.set(socket.id, { userId, username: result.userData.username, statsMasterUserId: masterIdFromStats(result.userData.stats), displayName: result.userData.username });
         // Q3 (2026-10-10) — kept for the overtake check after the gate below.
         const legacySession = authSessions.get(socket.id)!;
 
@@ -9111,8 +9138,8 @@ Give feedback in this JSON format:
     if (result.success) {
       socket.emit('clubJoined', result);
       if (result.club && result.status === 'active') {
-        await addActivity(result.club.id, 'member_join', { username: auth.username });
-        await sendClubMessage(result.club.id, auth.userId, auth.username, `${auth.username} joined the club`, 'system');
+        await addActivity(result.club.id, 'member_join', { username: seatNameForSocket(socket) });
+        await sendClubMessage(result.club.id, auth.userId, seatNameForSocket(socket), `${seatNameForSocket(socket)} joined the club`, 'system');
       }
     } else {
       socket.emit('error', { message: result.error });
@@ -9125,8 +9152,8 @@ Give feedback in this JSON format:
     const result = await leaveClub(auth.userId, data.clubId);
     if (result.success) {
       socket.emit('clubLeft', { clubId: data.clubId });
-      await addActivity(data.clubId, 'member_leave', { username: auth.username });
-      await sendClubMessage(data.clubId, auth.userId, auth.username, `${auth.username} left the club`, 'system');
+      await addActivity(data.clubId, 'member_leave', { username: seatNameForSocket(socket) });
+      await sendClubMessage(data.clubId, auth.userId, seatNameForSocket(socket), `${seatNameForSocket(socket)} left the club`, 'system');
     } else {
       socket.emit('error', { message: result.error });
     }
@@ -9325,11 +9352,11 @@ Give feedback in this JSON format:
     if (!msgText) { socket.emit('error', { message: 'Empty message' }); return; }
 
     const msgType = data.type || 'chat';
-    const result = await sendClubMessage(data.clubId, auth.userId, auth.username, msgText, msgType);
+    const result = await sendClubMessage(data.clubId, auth.userId, seatNameForSocket(socket), msgText, msgType);   // R1 contract #3
     if (result.success && result.message) {
       io.to(`club:${data.clubId}`).emit('clubMessage', result.message);
       if (msgType === 'announcement') {
-        await addActivity(data.clubId, 'announcement', { username: auth.username, message: data.message });
+        await addActivity(data.clubId, 'announcement', { username: seatNameForSocket(socket), message: data.message });
       }
     } else {
       socket.emit('error', { message: result.error });
@@ -9654,7 +9681,7 @@ Give feedback in this JSON format:
   socket.on('inviteToClub', async (data: { clubId: number; invitedUsername: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await inviteToClub(data.clubId, auth.userId, auth.username || '', data.invitedUsername);
+    const result = await inviteToClub(data.clubId, auth.userId, seatNameForSocket(socket), data.invitedUsername);
     if (result.success) {
       socket.emit('invitationSent', result);
     } else {
@@ -9993,12 +10020,11 @@ Give feedback in this JSON format:
       // handler, before any side effect.)
       const authForJoin = authSessions.get(socket.id);
 
-      // Sanitize playerName
-      playerName = playerName.trim().slice(0, 30).replace(/[<>&"']/g, '');
-      if (!playerName) {
-        socket.emit('error', { message: 'Invalid player name' });
-        return;
-      }
+      // R1 contract #3 (2026-10-11) — the ACCOUNT's display name; the client's
+      // playerName is ignored for a signed-in socket (it used to be any string
+      // with only <>&"' stripped — impersonation, and a non-string crashed every
+      // viewer). Always a whitelist-valid, non-empty string.
+      playerName = seatNameForSocket(socket, data.playerName);
 
       // Block same-IP multi-seating at the same table (collusion prevention)
       const tableSlotKey = `${tableId}`;
@@ -10085,7 +10111,7 @@ Give feedback in this JSON format:
         playerId,
         trainingEnabled: false,
         sittingOut: false,
-        avatar: data.avatar || undefined,
+        avatar: sanitizeSeatAvatar(data.avatar),   // AUTH-10
       };
       // P-g — again at the commit: a spectate during the buy-in awaits ends here.
       detachSocketFromOtherTables(socket, tableId, 'seat', 'joinTable');
@@ -10130,7 +10156,7 @@ Give feedback in this JSON format:
       if (qpGate) { emitPlayRefusal(socket, qpGate); return; }
       // F3 (2026-10-10) — before the leave / AI stand-up below, on a socket that already dropped.
       if (await buyInSocketGone(socket, 'quickPlay', 'gate')) return;
-      const { playerName } = data;
+      const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3
 
       // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
       // See joinTable handler above for the full rationale — same bug
@@ -10283,7 +10309,7 @@ Give feedback in this JSON format:
         playerId,
         trainingEnabled: false,
         sittingOut: false,
-        avatar: data.avatar || undefined,
+        avatar: sanitizeSeatAvatar(data.avatar),   // AUTH-10
       };
       detachSocketFromOtherTables(socket, chosenTableId, 'seat', 'quickPlay');   // P-g — at the commit too
       playerSessions.set(socket.id, session);
@@ -11477,7 +11503,7 @@ Give feedback in this JSON format:
         if (loginSocketGone(socket, 'authWithTicket', 'before_session', { localUserId: localUser.id })) return;
         // P4 (2026-10-10) — never rebind this socket under another account's seat.
         releaseSocketForAccountSwitch(socket, localUser.id, 'authWithTicket');
-        authSessions.set(socket.id, { userId: localUser.id, username: localUser.username, masterUserId: String(remoteUserId), phone: String(phone) });
+        authSessions.set(socket.id, { userId: localUser.id, username: localUser.username, masterUserId: String(remoteUserId), phone: String(phone), displayName: localUser.display_name || localUser.username });
         const userData = {
           id: localUser.id,
           username: localUser.username,
@@ -11634,6 +11660,7 @@ Give feedback in this JSON format:
         authSessions.set(socket.id, {
           userId, username: row.username, masterUserId: claims.masterUserId,
           ...(claims.phone ? { phone: claims.phone } : {}),
+          displayName: row.display_name || row.username,   // R1 contract #3
         });
         // Q3 (2026-10-10) — kept for the overtake check after the gate below.
         const rsSession = authSessions.get(socket.id)!;
@@ -12014,7 +12041,7 @@ Give feedback in this JSON format:
         // D1 — the session THIS bootstrap created (if any). Only that one gets
         // a resume token below; a pre-existing session on the socket (an OIDC
         // login) has its own refresh flow and gets none.
-        let wlBootstrapSession: { userId: number; username: string; masterUserId: string } | null = null;
+        let wlBootstrapSession: { userId: number; username: string; masterUserId: string; displayName?: string | null } | null = null;
         try {
           if (!authSessions.has(socket.id)) {
             try {
@@ -12072,7 +12099,7 @@ Give feedback in this JSON format:
                 // during the awaits above (that session is then judged by the
                 // account check below, never overwritten), and never under a
                 // seat this account did not buy (releaseSocketForAccountSwitch).
-                wlBootstrapSession = { userId: wlRow.id, username: wlRow.username, masterUserId: String(remoteUserId) };
+                wlBootstrapSession = { userId: wlRow.id, username: wlRow.username, masterUserId: String(remoteUserId), displayName: wlRow.display_name || wlRow.username };
                 releaseSocketForAccountSwitch(socket, wlRow.id, 'joinWithWaitlistContext');
                 authSessions.set(socket.id, wlBootstrapSession);
               }
@@ -12183,8 +12210,8 @@ Give feedback in this JSON format:
         // 4) Seat the player. Use existing session's playerName if available,
         //    else fall back to a generic name (the client's auth flow supplies
         //    the real name via loginResult, this handler runs after login).
-        const existingName = playerSessions.get(socket.id)?.playerName;
-        const playerName = existingName || `Player-${remoteUserId.slice(0, 6)}`;
+        // R1 contract #3 — the signed-in account's display name.
+        const playerName = seatNameForSocket(socket);
         const playerId = `player-${uuidv4()}`;
         // Ghost-seat defense (authWithTicket path): clear any lingering
         // seat from a previous session before re-seating.
@@ -12875,7 +12902,7 @@ Give feedback in this JSON format:
     progressionManager.recordAction(session.playerId, 'chat');
 
     const chatMsg = {
-      playerName: session.playerName,
+      playerName: seatNameForSocket(socket, session.playerName),   // R1 contract #3
       message: data.message,
       timestamp: Date.now(),
     };
@@ -13455,7 +13482,7 @@ Give feedback in this JSON format:
     const huGate = await assertPlayable(socket, 'quickHeadsUp'); // 2026-10-07 play gate
     if (huGate) { emitPlayRefusal(socket, huGate); return; }
     if (await buyInSocketGone(socket, 'quickHeadsUp', 'gate')) return; // F3 (2026-10-10)
-    const { playerName } = data;
+    const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3 (also the table's public title)
 
     // Leave existing table if any
     const existingSession = playerSessions.get(socket.id);
@@ -13589,7 +13616,7 @@ Give feedback in this JSON format:
     const sgGate = await assertPlayable(socket, 'quickSpinGo'); // 2026-10-07 play gate
     if (sgGate) { emitPlayRefusal(socket, sgGate); return; }
     if (await buyInSocketGone(socket, 'quickSpinGo', 'gate')) return; // F3 (2026-10-10)
-    const { playerName } = data;
+    const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3
 
     const existingSession = playerSessions.get(socket.id);
     if (existingSession) {
@@ -13762,7 +13789,7 @@ Give feedback in this JSON format:
     const aofGate = await assertPlayable(socket, 'quickAllInOrFold'); // 2026-10-07 play gate
     if (aofGate) { emitPlayRefusal(socket, aofGate); return; }
     if (await buyInSocketGone(socket, 'quickAllInOrFold', 'gate')) return; // F3 (2026-10-10)
-    const { playerName } = data;
+    const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3
 
     const existingSession = playerSessions.get(socket.id);
     if (existingSession) {
@@ -13860,7 +13887,7 @@ Give feedback in this JSON format:
     const { venue, stage } = data;
 
     const existingSession = playerSessions.get(socket.id);
-    const careerPlayerName = existingSession?.playerName || 'Player';
+    const careerPlayerName = seatNameForSocket(socket);   // R1 contract #3
 
     if (existingSession) {
       handlePlayerLeave(socket);
@@ -14051,7 +14078,7 @@ Give feedback in this JSON format:
     io.to(`table:${session.tableId}`).emit('emote', {
       seatIndex: session.seatIndex,
       emoteId: data.emoteId,
-      playerName: session.playerName,
+      playerName: seatNameForSocket(socket, session.playerName),
     });
   });
 
@@ -14070,7 +14097,7 @@ Give feedback in this JSON format:
     io.to(`table:${session.tableId}`).emit('tableReaction', {
       seatIndex: session.seatIndex,
       reactionId: data.reactionId,
-      playerName: session.playerName,
+      playerName: seatNameForSocket(socket, session.playerName),
     });
   });
 
@@ -14365,7 +14392,7 @@ Give feedback in this JSON format:
     if (await buyInSocketGone(socket, 'registerTournament', 'gate')) return; // F3 (2026-10-10)
     const session = playerSessions.get(socket.id);
     const playerId = session?.playerId || `player-${uuidv4()}`;
-    const playerName = data.playerName || session?.playerName || 'Player';
+    const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3 (TOURNEY-12)
 
     // 2026-06-11 tournament economy: real entry fee. If the tournament has a
     // buy-in, the player must be logged in and pay it from their wallet — this
@@ -14594,7 +14621,9 @@ Give feedback in this JSON format:
     const atGate = await assertPlayable(socket, 'joinAdditionalTable');
     if (atGate) { emitPlayRefusal(socket, atGate); return; }
     if (await buyInSocketGone(socket, 'joinAdditionalTable', 'gate')) return; // F3 (2026-10-10) — before the AI stand-up
-    const { tableId, playerName, buyIn, avatar } = data;
+    const { tableId, buyIn } = data;
+    const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3
+    const avatar = sanitizeSeatAvatar(data.avatar);                   // AUTH-10
     const table = tableManager.getTable(tableId);
     if (!table) {
       socket.emit('error', { message: 'Table not found' });
@@ -14679,7 +14708,7 @@ Give feedback in this JSON format:
       playerId,
       trainingEnabled: false,
       sittingOut: false,
-      avatar: avatar || undefined,
+      avatar,
     };
 
     // P-g (round 5) — an extra seat ends any spectating (its main seat and
@@ -14948,7 +14977,9 @@ Give feedback in this JSON format:
     const icGate = await assertPlayable(socket, 'joinByInviteCode');
     if (icGate) { socket.emit('joinError', { message: icGate.message, code: icGate.code }); return; }
     if (await buyInSocketGone(socket, 'joinByInviteCode', 'gate')) return; // F3 (2026-10-10)
-    const { inviteCode, playerName, buyIn, avatar } = data;
+    const { inviteCode, buyIn } = data;
+    const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3
+    const avatar = sanitizeSeatAvatar(data.avatar);                   // AUTH-10
     // Find table whose ID starts with the invite code (lowercased)
     const target = tableManager.getTableByInviteCode(inviteCode.toLowerCase());
     if (!target) {
@@ -15030,7 +15061,7 @@ Give feedback in this JSON format:
 
     const session: PlayerSession = {
       socketId: socket.id, tableId, seatIndex: openSeat, playerName, playerId,
-      trainingEnabled: false, sittingOut: false, avatar: avatar || undefined,
+      trainingEnabled: false, sittingOut: false, avatar,
     };
     detachSocketFromOtherTables(socket, tableId, 'seat', 'joinByInviteCode');   // P-g — at the commit too
     playerSessions.set(socket.id, session);
@@ -15301,7 +15332,7 @@ function releaseSeatedSlot(socketId: string, tableId: string): void {
 }
 
 /** One socket's signed-in account (the values of `authSessions`). */
-type SocketAuthSession = { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null };
+type SocketAuthSession = { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null; displayName?: string | null };
 
 /**
  * The 'disconnect' handler's MAIN-seat reservation, extracted unchanged

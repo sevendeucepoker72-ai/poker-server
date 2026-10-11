@@ -744,3 +744,14 @@ ADMIN_PASSWORD is set but no longer used
 seatPlayedByAnotherAccount
 ghost_seat_account_stamp
 ghost_reservation_not_his
+#
+# 2026-10-11 (.online R1, contract #3; AUTH-6 / APPUI-13 / TOURNEY-12 / AUTH-10) —
+# a signed-in socket's seat / quick game / tournament + qualifier registration /
+# waitlist seat / chat line shows the ACCOUNT's display name (session
+# displayName, setDisplayName whitelist, never a phone or the m:<id> username,
+# else 'Player'); the client's playerName is ignored. Seat avatars keep only the
+# customizer's known fields (no photo, #hex colors). Pinned by tests/seatNames.test.ts.
+seatNameForSocket
+sanitizeSeatAvatar
+accountDisplayName
+a.displayName = data.name.trim()
