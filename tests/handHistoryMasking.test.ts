@@ -88,16 +88,18 @@ describe('uncontested pots reveal nothing — no cards, no hand name', () => {
     expect(secret.length).toBeGreaterThan(10);
   });
 
-  it('Stud Hi-Lo: the uncontested winner\'s cards and hand name are NOT in the hand result (base "Won by fold")', () => {
+  it('Stud Hi-Lo: the uncontested winner\'s cards and hand name are NOT in the hand result ("Won by fold")', () => {
     const t = new SevenStudTable(cfg('S1'), false, true);
     const records = seat3(t);
+    let potNames: string[] = [];
+    t.once('handResult', (d: any) => { potNames = d.results.map((r: any) => r.potName); });
     expect(t.startNewHand()).toBe(true);
     foldToOne(t);
     expect(t.wentToShowdown).toBe(false);
+    expect(potNames[0]).toBe('Main Pot (High)');            // still the hi-lo override's own award
     expect(t.lastHandResult!.showdownHands).toEqual([]);
-    expect(t.lastHandResult!.winners.map((w) => w.handName)).toEqual(['Won by fold']);
-    expect(records).toHaveLength(1);                         // the base path records it — masked
-    expect(records[0].players.every((p) => p.holeCards === null && p.handName === null)).toBe(true);
+    expect(t.lastHandResult!.winners.map((w) => [w.handName, w.bestFiveCards])).toEqual([['Won by fold', []]]);
+    expect(records).toEqual([]);                             // Stud hi-lo records no history (unchanged)
   });
 });
 

@@ -762,7 +762,7 @@ friend_name_ambiguous
 # showdown (base + Omaha hi-lo + Stud hi-lo).
 const shown = !s.folded && this.wentToShowdown && s.holeCards.length > 0;
 if (nonFolded.length >= 2)
-if (evaluations.length <= 1) {
+const contested = evaluations.length >= 2;
 #
 # 2026-10-11 (R1, H2) — TABLEUI-5 / contract #4: showMuckedHand broadcasts the
 # seat's REAL hole cards (client cards ignored); folded players or the
