@@ -8,3 +8,6 @@ data/*.db
 # Never commit FTP / deploy credentials
 .ftp-credentials
 .ftp-credentials.local
+# SQLite side files (WAL / shared memory) — never commit: the committed
+# data/poker.db-wal carried old password hashes (2026-10-11, AUTH-15).
+data/*.db-*

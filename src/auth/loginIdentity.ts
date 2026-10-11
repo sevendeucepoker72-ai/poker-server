@@ -177,10 +177,9 @@ export interface LoginFailurePayload {
  * CONVERTED as of this change: `oauthLogin`, `tokenLogin`, `authWithTicket`,
  * `joinWithWaitlistContext`.
  *
- * STILL UNCONVERTED, deliberately: the password `login` handler (index.ts,
- * `socket.on('login')`), which poker-3d does not use — its login screen
- * redirects to the OIDC /authorize flow and only emits `register` for guests.
- * If a client ever starts emitting `login` on a shared socket, convert it too.
+ * The password `login` handler was REMOVED 2026-10-11 (AUTH-8): poker-3d has
+ * not emitted it since 2026-04-20 (its login screen redirects to the OIDC
+ * /authorize flow).
  *
  * THE STANDING RULE, since this has now been got wrong twice: before claiming
  * coverage, `grep -n "loginResult" src/index.ts` and check EVERY emitter, and

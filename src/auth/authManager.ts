@@ -6,7 +6,7 @@ import crypto from 'crypto';
 // or as JSON text depending on the live column type (see probeStatsColumnType
 // in index.ts — /api/health reports the answer). Using it instead of a bare
 // JSON.parse is what stops mergeUserStats from silently wiping the column.
-import { parseStatsColumn, masterIdGuardSql } from './loginIdentity';
+import { parseStatsColumn } from './loginIdentity';
 
 // JWT secret. H1 (2026-07-01 audit): the old guard keyed the fatal check on
 // NODE_ENV==='production' ONLY, but Railway uses nixpacks and does NOT set
@@ -44,33 +44,6 @@ export const DEFAULT_CHIPS = 50000; // 2026-06-12 — starting bankroll raised 1
 export const DEFAULT_LEVEL = 1;
 export const DEFAULT_XP = 0;
 
-// Rate limiter (in-memory, no DB needed)
-const loginAttempts = new Map<string, { attempts: number; firstAttemptAt: number; lockedUntil: number }>();
-const RATE_LIMIT = { maxAttempts: 5, windowMs: 15 * 60 * 1000, lockoutMs: 5 * 60 * 1000 };
-
-function checkLoginRateLimit(username: string): { blocked: boolean; lockoutSecsLeft: number } {
-  const key = username.trim().toLowerCase();
-  const entry = loginAttempts.get(key);
-  if (!entry) return { blocked: false, lockoutSecsLeft: 0 };
-  const now = Date.now();
-  if (entry.lockedUntil > now) return { blocked: true, lockoutSecsLeft: Math.ceil((entry.lockedUntil - now) / 1000) };
-  if (now - entry.firstAttemptAt > RATE_LIMIT.windowMs) { loginAttempts.delete(key); return { blocked: false, lockoutSecsLeft: 0 }; }
-  return { blocked: false, lockoutSecsLeft: 0 };
-}
-
-function recordFailedLogin(username: string): { lockoutSecsLeft: number } {
-  const key = username.trim().toLowerCase();
-  const now = Date.now();
-  let entry = loginAttempts.get(key);
-  if (!entry || now - entry.firstAttemptAt > RATE_LIMIT.windowMs) entry = { attempts: 0, firstAttemptAt: now, lockedUntil: 0 };
-  entry.attempts += 1;
-  if (entry.attempts >= RATE_LIMIT.maxAttempts) { entry.lockedUntil = now + RATE_LIMIT.lockoutMs; loginAttempts.set(key, entry); return { lockoutSecsLeft: Math.ceil(RATE_LIMIT.lockoutMs / 1000) }; }
-  loginAttempts.set(key, entry);
-  return { lockoutSecsLeft: 0 };
-}
-
-function clearLoginAttempts(username: string): void { loginAttempts.delete(username.trim().toLowerCase()); }
-
 const USERNAME_REGEX = /^[a-zA-Z0-9_-]{3,20}$/;
 
 export interface UserData {
@@ -92,15 +65,6 @@ export interface AuthResult {
   success: boolean;
   error?: string;
   token?: string;
-  /**
-   * 2026-10-07 (play gate, N3) — SERVER-SIDE ONLY. The master-API users.id
-   * that the master's own POST /users/login just authenticated (phone +
-   * password), set only when loginUserAsync succeeded through the master.
-   * index.ts's `login` handler uses it to identify the player to the play
-   * gate and strips it before emitting loginResult. Never set from a local-DB
-   * fallback login (nothing attested it).
-   */
-  attestedMasterUserId?: string;
   userData?: {
     id: number;
     username: string;
@@ -478,20 +442,15 @@ export async function initDB(): Promise<void> {
 
   console.log('[Auth] Persistence sweep DDL applied');
 
-  // Seed admin accounts
-  const adminPassword = process.env.ADMIN_PASSWORD;
-  const adminPhone = process.env.ADMIN_PHONE || '7202780636';
-
-  if (adminPassword) {
-    const hash = bcrypt.hashSync(adminPassword, BCRYPT_ROUNDS);
-    await pool.query(`
-      INSERT INTO users (username, password_hash, is_admin) VALUES ($1, $2, TRUE)
-      ON CONFLICT (LOWER(username)) DO UPDATE SET password_hash = $2, is_admin = TRUE
-    `, [adminPhone, hash]).catch(() => {
-      // Fallback if the unique index conflict doesn't work
-      pool.query(`UPDATE users SET password_hash = $1, is_admin = TRUE WHERE LOWER(username) = LOWER($2)`, [hash, adminPhone]).catch(() => {});
-    });
-    console.log(`[Auth] Admin user "${adminPhone}" seeded/synced`);
+  // 2026-10-11 (AUTH-8 / AUTH-15) — NO admin seed any more. Every boot used to
+  // upsert a row keyed on ADMIN_PHONE (unset on Railway, so a hardcoded real
+  // phone number in this PUBLIC repo) with password_hash = ADMIN_PASSWORD and
+  // is_admin = TRUE: an unowned is_admin row whose only use was the socket
+  // password `login` (removed) — and, through the name-keyed sign-in upsert
+  // (AUTH-1, fixed), a takeover target. Admin rights come from the master
+  // account (the OIDC is_admin claim, granted onto the master's own row).
+  if (process.env.ADMIN_PASSWORD) {
+    console.warn('[Auth] ADMIN_PASSWORD is set but no longer used (no admin seed, no password login since 2026-10-11) — remove it from the environment.');
   }
 
   console.log('[Auth] PostgreSQL database initialized');
@@ -562,184 +521,13 @@ export async function registerUser(username: string, password: string): Promise<
   return { success: true, token, userData: formatUserData(user) };
 }
 
-// Master API auth
-const MASTER_API_BASE = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
-
-async function authenticateWithMasterAPI(phone: string, password: string): Promise<any | null> {
-  // 6s hard timeout. Previously this fetch had no timeout, so when the
-  // master API was slow the login would hang until Node's default TCP
-  // timeout (~2 min) — by which time the client had already given up and
-  // the user saw "login timed out" with no upstream error logged.
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 6000);
-  try {
-    const res = await fetch(`${MASTER_API_BASE}/users/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phone, password }),
-      signal: controller.signal,
-    });
-    const data: any = await res.json();
-    return (data.success && data.data) ? data.data : null;
-  } catch (err: any) {
-    if (err?.name === 'AbortError') {
-      console.error('[Auth] Master API login timed out after 6s');
-    } else {
-      console.error('[Auth] Master API login failed:', err);
-    }
-    return null;
-  } finally {
-    clearTimeout(timeoutId);
-  }
-}
-
-async function syncMasterUser(masterData: any, password: string): Promise<UserData> {
-  const phone = masterData.phoneNumber;
-  const displayName = masterData.firstName
-    ? `${masterData.firstName} ${(masterData.lastName || '')[0] || ''}.`.trim()
-    : masterData.username || phone;
-  const isAdmin = masterData.roles?.includes('siteAdmin') || masterData.roles?.includes('leagueAdmin') || false;
-  const hash = bcrypt.hashSync(password, BCRYPT_ROUNDS);
-
-  // 2026-10-10 — ONE PERSON, ONE ROW (auth/accountMerge.ts): the master account
-  // the master API just authenticated signs in to ITS row, exactly like
-  // oauthLogin / tokenLogin / authWithTicket / the waitlist link. Keyed on the
-  // phone alone, this path would create a fresh unlinked 50,000-chip row under
-  // a phone username the one-time merge freed. Lazy require: accountMerge
-  // imports ProgressionManager, which imports this module. A lookup that cannot
-  // be answered THROWS (MasterLookupError) — never "no row" — and the caller
-  // refuses the sign-in.
-  const masterId = masterData?.id != null && String(masterData.id).trim() ? String(masterData.id).trim() : '';
-  if (masterId) {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { findLocalUserByMasterId } = require('./accountMerge') as typeof import('./accountMerge');
-    const byMaster = await findLocalUserByMasterId(pool, masterId);
-    if (byMaster) {
-      const { rows: upd } = await pool.query(
-        // Round-7 review — admin is GRANT-ONLY here, as on the OIDC path: a
-        // roles list without admin (the master swallows a failed roles query
-        // into []) must never revoke it from the master's one row.
-        `UPDATE users SET password_hash = $2, is_admin = (is_admin OR $3), display_name = COALESCE(display_name, $4) WHERE id = $1 RETURNING *`,
-        [byMaster.id, hash, isAdmin, displayName],
-      );
-      return rowToUserData(upd[0] || byMaster);
-    }
-  }
-
-  // 2026-10-10 — now master-first above and ownership-GUARDED below (a phone
-  // row another master owns is never signed in to). History:
-  // 2026-08-17 P2 — DELIBERATELY LEFT UNGUARDED (assessed, not overlooked).
-  // The P0 display-name takeover guard (see index.ts upsertOidcLocalUser and
-  // auth/loginIdentity.ts) covers the two OIDC socket-login upserts. This one
-  // and authWithTicket step 3b are the other two conflict sites and both stay
-  // as they are, because they key on `phone` — the master API's phone number,
-  // else its UNIQUE SLUG. Neither is a value a user can set to impersonate
-  // someone else, so the "rename yourself to an admin's display name" path
-  // that motivated the guard does not exist here. Adding a fail-closed refusal
-  // to the password-login path during a live sign-in outage would be a strictly
-  // worse trade. Revisit when the real `master_user_id` column lands — at that
-  // point ALL FOUR sites should key on the attested sub and this note dies.
-  const { rows } = await pool.query(
-    `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     ON CONFLICT (LOWER(username)) DO UPDATE SET password_hash = $3, is_admin = (users.is_admin OR $8), display_name = COALESCE(users.display_name, $2)
-     ${masterId ? `WHERE ${masterIdGuardSql('$9')}` : ''}
-     RETURNING *`,
-    [phone, displayName, hash, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, JSON.stringify({
-      masterPhone: phone, masterUsername: masterData.username,
-      // 2026-10-10 — a NEW row is this master's (found master-first next time).
-      ...(masterId ? { masterUserId: masterId } : {}),
-    }), isAdmin, ...(masterId ? [masterId] : [])]
-  );
-
-  // 2026-10-10 — an EXISTING phone row (ON CONFLICT: the INSERT's stats were not
-  // written) that no master owns yet is stamped as this one's, so every path
-  // finds it by master id from now on (the master-first lookup above found no
-  // row for this master, so this cannot create a second). A row another master
-  // owns is left alone.
-  if (rows.length > 0 && masterId) {
-    try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { identityStampPatch } = require('./accountMerge') as typeof import('./accountMerge');
-      const owner = parseStatsColumn(rows[0].stats).masterUserId;
-      if (owner == null || owner === '') {
-        const patch = identityStampPatch(rows[0].stats, { masterUserId: masterId, masterUsername: masterData.username });
-        if (patch) await mergeUserStats(rows[0].id, patch);
-      }
-    } catch (e: any) {
-      console.warn('[Auth] syncMasterUser master stamp failed (non-fatal):', e?.message);
-    }
-  }
-
-  if (rows.length > 0) return rowToUserData(rows[0]);
-  // Fallback: query existing
-  const fallback = await pool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [phone]);
-  // Round-7 review — under the ownership guard, no row back means this phone's
-  // row is ANOTHER master account's (a phone number that moved between
-  // accounts): never sign in to it — and its password / admin were not touched.
-  if (masterId && fallback.rows[0]) {
-    const owner = parseStatsColumn(fallback.rows[0].stats).masterUserId;
-    if (owner != null && owner !== '' && String(owner) !== masterId) {
-      throw new Error(`identity_conflict: phone row ${fallback.rows[0].id} belongs to another master account`);
-    }
-  }
-  return rowToUserData(fallback.rows[0]);
-}
-
-export function loginUser(username: string, password: string): AuthResult {
-  // Sync version — kept for backwards compatibility but should not be used
-  // Use loginUserAsync instead
-  return { success: false, error: 'Use loginUserAsync for PostgreSQL' };
-}
-
-export async function loginUserAsync(username: string, password: string): Promise<AuthResult> {
-  if (!username || !password) return { success: false, error: 'Phone number and password are required' };
-
-  const rateCheck = checkLoginRateLimit(username);
-  if (rateCheck.blocked) return { success: false, error: `Too many failed attempts. Try again in ${rateCheck.lockoutSecsLeft}s` } as any;
-
-  // Try master API first
-  const masterUser = await authenticateWithMasterAPI(username, password);
-  if (masterUser) {
-    let localUser: UserData;
-    try {
-      localUser = await syncMasterUser(masterUser, password);
-    } catch (e: any) {
-      // 2026-10-10 — e.g. the master-first lookup could not be answered: refuse
-      // (retryable) rather than guess a row.
-      console.warn('[Auth] syncMasterUser failed (login refused, retryable):', e?.message);
-      return { success: false, error: 'The server is busy right now — please try again.' } as any;
-    }
-    clearLoginAttempts(username);
-    const token = generateToken(localUser.id, localUser.username, localUser.tokenVersion || 0);
-    // 2026-10-07 (play gate, N3) — hand the master id the master just
-    // authenticated back to the caller (in memory only; see AuthResult).
-    // 2026-10-10 — syncMasterUser now resolves the master's ONE row first and
-    // stamps a new / unowned phone row with this master id (every sign-in path
-    // resolves master-first, so the stamp no longer moves anyone to another
-    // row; see auth/accountMerge.ts).
-    const attestedMasterUserId = masterUser.id != null && String(masterUser.id).trim()
-      ? String(masterUser.id).trim()
-      : undefined;
-    return { success: true, token, userData: formatUserData(localUser), attestedMasterUserId };
-  }
-
-  // Fall back to local DB
-  const { rows } = await pool.query('SELECT * FROM users WHERE LOWER(username) = LOWER($1)', [username.trim()]);
-  if (rows.length > 0) {
-    const user = rowToUserData(rows[0]);
-    if (user.banned) return { success: false, error: 'This account has been banned' };
-    const valid = bcrypt.compareSync(password, rows[0].password_hash);
-    if (valid) {
-      clearLoginAttempts(username);
-      const token = generateToken(user.id, user.username, user.tokenVersion || 0);
-      return { success: true, token, userData: formatUserData(user) };
-    }
-  }
-
-  recordFailedLogin(username);
-  return { success: false, error: 'Invalid phone number or password' } as any;
-}
+// 2026-10-11 (AUTH-8) — the password login is gone: authenticateWithMasterAPI,
+// syncMasterUser, loginUser and loginUserAsync (+ their in-memory lockout) were
+// only reached from the socket `login` handler, removed from index.ts (no client
+// has emitted it since 2026-04-20). loginUserAsync fell back to a LOCAL
+// bcrypt.compareSync on ANY master failure (stale passwords, the ADMIN_PASSWORD
+// seed of the is_admin row 1, a lockout checked before the await, ~100ms of
+// blocked event loop per attempt). Sign-in is OIDC / ticket / resume only.
 
 export async function getUserFromToken(token: string): Promise<AuthResult> {
   try {

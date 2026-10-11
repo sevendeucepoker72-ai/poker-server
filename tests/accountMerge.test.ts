@@ -120,7 +120,7 @@ describe('planAccountMerge — Josh 868 + 890', () => {
 
 describe('planAccountMerge — edges', () => {
   it('three rows: one survivor, two tombstones, all balances summed', () => {
-    const rows = [row({ id: 662, username: '7202984894', chips: 50_000 }), row({ id: 1350, chips: 364_278, level: 28, stars: 2723 }), row({ id: 1364, chips: 70_710, level: 12, stars: 507 })];
+    const rows = [row({ id: 662, username: '5550006620', chips: 50_000 }), row({ id: 1350, chips: 364_278, level: 28, stars: 2723 }), row({ id: 1364, chips: 70_710, level: 12, stars: 507 })];
     const p = planAccountMerge(M, rows, NOW);
     expect(p.loserIds).toHaveLength(2);
     expect(p.survivor.chips).toBe(50_000 + 364_278 + 70_710);

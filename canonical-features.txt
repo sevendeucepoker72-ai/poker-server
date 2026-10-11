@@ -160,7 +160,9 @@ requestId
 # The REAL fix (a master_user_id column + unique index, keyed on the attested
 # `sub`) needs a Railway Postgres migration and is still outstanding.
 # ============================================================
-identity_conflict
+# 2026-10-11: token `identity_conflict` RETIRED — no sign-in path refuses for a
+# name collision any more (AUTH-1, below: nothing is bound by a name) and its
+# last runtime use, the password login's syncMasterUser, was removed (AUTH-8).
 masterUserId
 #
 # 2026-10-11 (.online R1, AUTH-1) — the warn / enforce mode switch above is
@@ -725,3 +727,10 @@ installSocketListenerGuard
 [process-uncaught-exception]
 gracefulShutdown('uncaughtException', 1)
 crashSafety
+#
+# 2026-10-11 (.online R1, AUTH-8 / AUTH-15) — no password login, no admin seed.
+# The socket `login` handler (unused by every client since 2026-04-20) and its
+# local bcrypt fallback are removed; initDB no longer seeds an is_admin row from
+# ADMIN_PASSWORD (a set value only logs this reminder); ADMIN_PHONE has no
+# hardcoded default. Pinned by tests/playGate.test.ts (AUTH-8 test).
+ADMIN_PASSWORD is set but no longer used

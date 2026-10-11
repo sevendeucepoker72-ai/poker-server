@@ -51,7 +51,7 @@ import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims } from './auth/authManager';
+import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus } from './auth/oauthValidator';
 import {
   resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
@@ -6485,41 +6485,17 @@ io.on('connection', (socket: Socket) => {
 
   // ========== Auth Events ==========
 
-  socket.on('login', trackLogin(socket, 'login', async (data: { phone?: string; username?: string; password: string }) => {
-    const phone = data.phone || data.username || '';
-    // Phone is PII — log only the last 4 digits so the audit trail is useful
-    // for support without exposing the full number in shared log aggregators.
-    console.log(`[Auth] Login attempt: phone="****${String(phone).slice(-4)}", hasPassword=${!!data?.password}`);
-    const result = await loginUserAsync(phone, data.password);
-    console.log(`[Auth] Login result: success=${result.success}, error=${result.error || 'none'}`);
-    // 2026-10-07 (play gate, N3) — attestedMasterUserId is the master id the
-    // master's own /users/login just authenticated. It is server-side only:
-    // stripped from the loginResult frame below (same wire shape as before).
-    const { attestedMasterUserId, ...wireResult } = result;
-    if (result.success && result.userData) {
-      // P4 (2026-10-10) — never rebind this socket under another account's seat.
-      releaseSocketForAccountSwitch(socket, result.userData.id, 'login');
-      authSessions.set(socket.id, {
-        userId: result.userData.id,
-        username: result.userData.username,
-        // Play gate identity for this session. Deliberately the GATE-ONLY
-        // field (statsMasterUserId), not `masterUserId`: it identifies the
-        // player for the suspension / account check, and must not grant the
-        // master-id-keyed privileges (qualifier entry, credit redemption)
-        // that only the OIDC / ticket paths confer (see GateSession in
-        // auth/playGate.ts). Prefer the id the master just authenticated;
-        // fall back to the local row's stats stamp (local-DB fallback login,
-        // master unreachable) — null means login_required at play time.
-        statsMasterUserId: attestedMasterUserId || masterIdFromStats(result.userData.stats),
-      });
-    }
-    socket.emit('loginResult', wireResult);
-    // Proactively hydrate + push playerProgress so the client never
-    // renders the fresh-init level:1 / xp:0 state after a redeploy.
-    if (result.success && result.userData) {
-      hydrateAndPushProgress(socket, result.userData.id, result.userData.username).catch(() => {});
-    }
-  }));
+  // 2026-10-11 (AUTH-8) — the socket password `login` handler is REMOVED.
+  // No poker-3d bundle has emitted `login` since 2026-04-20 (3aa3561 moved the
+  // login screen to the OIDC /authorize flow; checked in src AND the live
+  // bundle index-B34X2lLn.js; 0 "Login attempt" lines in 48h of prod logs), and
+  // it was a liability: on ANY master /users/login failure it fell back to a
+  // LOCAL bcrypt compare (stale passwords; the ADMIN_PASSWORD seed of row 1 —
+  // the is_admin admin row), its lockout was checked before the awaited master
+  // call (parallel attempts bypassed it) and the synchronous ~100ms
+  // bcrypt.compareSync blocked the event loop for every table (a DoS). Sign-in
+  // is oauthLogin / tokenLogin / authWithTicket / resumeSession; socket.io
+  // ignores an unknown event, so an ancient bundle's `login` gets no answer.
 
   // 2026-10-07 OWNER DECISION — GUEST PLAY IS OFF for everyone: nobody plays
   // .online without an American Pub Poker account. `register` is the old
@@ -11372,7 +11348,7 @@ Give feedback in this JSON format:
         // (which DID get phoneNumber and stored that as the local username),
         // a fresh authWithTicket would now miss their existing row (lookup
         // by username='josh.hall2' wouldn't match the existing
-        // username='7202780636') and create a duplicate. Look up by
+        // username=<the phone digits>) and create a duplicate. Look up by
         // masterUserId first — that's stable across both code paths.
         //
         // 2026-10-10 — ONE PERSON, ONE ROW (auth/accountMerge.ts). The whole
@@ -18603,8 +18579,12 @@ initDB().then(async () => {
   // "disconnect wiped my wallet" bug (fixed in commit 03b5170). Guarded
   // by a JSONB flag in users.stats so this only runs once per admin even
   // across redeploys.
-  try {
-    const adminPhone = process.env.ADMIN_PHONE || '7202780636';
+  // 2026-10-11 (AUTH-15) — no hardcoded phone default any more (it was a real
+  // phone number in a PUBLIC repo): this runs only when ADMIN_PHONE is set,
+  // and never prints the phone. (Both grants were applied long ago — verified
+  // 2026-10-11 — so with ADMIN_PHONE unset, as on Railway, nothing changes.)
+  const adminPhone = (process.env.ADMIN_PHONE || '').trim();
+  if (adminPhone) try {
     const pool = getPool();
     const { rows } = await pool.query(
       `SELECT id, chips, stats FROM users WHERE username = $1 OR username ILIKE $2 LIMIT 1`,
@@ -18633,7 +18613,7 @@ initDB().then(async () => {
             amount: GRANT_AMOUNT,
             reason: 'disconnect_chip_wipe_03b5170',
           });
-          console.log(`[Recovery] Granted ${GRANT_AMOUNT.toLocaleString()} chips to admin userId=${user.id} (${adminPhone})`);
+          console.log(`[Recovery] Granted ${GRANT_AMOUNT.toLocaleString()} chips to admin userId=${user.id}`);
         } else {
           console.warn(`[Recovery] addChipsToUser failed for userId=${user.id} — grant NOT marked applied (will retry next boot)`);
         }
@@ -18657,7 +18637,7 @@ initDB().then(async () => {
             amount: STARS_GRANT,
             reason: 'persistStars_prehydrate_clobber',
           });
-          console.log(`[Recovery] Granted ${STARS_GRANT.toLocaleString()} stars to admin userId=${user.id} (${adminPhone})`);
+          console.log(`[Recovery] Granted ${STARS_GRANT.toLocaleString()} stars to admin userId=${user.id}`);
         } else {
           console.warn(`[Recovery] addStarsToUser failed for userId=${user.id} — grant NOT marked applied (will retry next boot)`);
         }

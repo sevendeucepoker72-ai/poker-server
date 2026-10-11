@@ -1060,7 +1060,6 @@ describe('P4 — a login that switches a socket to ANOTHER account never inherit
 
   it('wiring: every login releases the socket right before it binds the new account', () => {
     const sites = [
-      ["socket.on('login'", "releaseSocketForAccountSwitch(socket, result.userData.id, 'login');"],
       ["socket.on('register'", "releaseSocketForAccountSwitch(socket, result.userData.id, 'register');"],
       ["socket.on('oauthLogin'", "releaseSocketForAccountSwitch(socket, userId, 'oauthLogin');"],
       ["socket.on('tokenLogin'", "releaseSocketForAccountSwitch(socket, userId, 'tokenLogin');"],

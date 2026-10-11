@@ -748,7 +748,8 @@ describe('index.ts — every play-entry handler is gated before its first side e
   });
 
   // ── 2026-10-07 review fixes ────────────────────────────────────────────
-  it.each(['login', 'oauthLogin', 'tokenLogin', 'authWithTicket', 'resumeSession'])(
+  // 2026-10-11 (AUTH-8): the password `login` handler is removed (see below).
+  it.each(['oauthLogin', 'tokenLogin', 'authWithTicket', 'resumeSession'])(
     '%s is registered through trackLogin (the gate can wait for it)',
     (event) => {
       const re = new RegExp(`socket\\.on\\(\\s*'${event}',\\s*trackLogin\\(socket, '${event}', async \\(`);
@@ -861,12 +862,17 @@ describe('index.ts — every play-entry handler is gated before its first side e
     expect(fn).toContain("assertPlayable(socket, `${via}:seatRestore`, [], { waitForLogin: false })");
   });
 
-  it('password `login`: identifies the player by the master-attested id and never puts it on the wire', () => {
-    const body = handlerBody('login');
-    expect(body).toContain('const { attestedMasterUserId, ...wireResult } = result;');
-    expect(body).toContain('statsMasterUserId: attestedMasterUserId || masterIdFromStats(result.userData.stats)');
-    expect(body).toContain("socket.emit('loginResult', wireResult);");
-    expect(body).not.toContain("socket.emit('loginResult', result)");
+  it('AUTH-8 (2026-10-11): the socket password `login` handler and its local-bcrypt fallback are GONE', () => {
+    expect(src).not.toMatch(/socket\.on\(\s*'login'/);
+    expect(src).not.toContain('loginUserAsync');
+    const am = fs.readFileSync(path.join(__dirname, '..', 'src', 'auth', 'authManager.ts'), 'utf8');
+    for (const gone of ['loginUserAsync', 'syncMasterUser', 'authenticateWithMasterAPI', 'compareSync', 'checkLoginRateLimit']) {
+      expect({ gone, present: am.includes(gone + '(') }).toEqual({ gone, present: false });
+    }
+    // No admin seed from ADMIN_PASSWORD, no hardcoded ADMIN_PHONE default.
+    expect(am).not.toMatch(/ADMIN_PHONE \|\| '\d/);
+    expect(am).not.toContain('INSERT INTO users (username, password_hash, is_admin)');
+    expect(src).not.toMatch(/ADMIN_PHONE \|\| '\d/);
   });
 
   // ── 2026-10-09 "Fix all of it" ─────────────────────────────────────────
@@ -963,7 +969,7 @@ describe('index.ts — every play-entry handler is gated before its first side e
     expect(wl).toContain('? resumeFieldsFor(lu.id, wlBootstrapSession.masterUserId, lu.token_version, { isAdmin: !!lu.is_admin })');
     expect(wl).toContain('wlBootstrapSession = { userId: wlRow.id, username: wlRow.username, masterUserId: String(remoteUserId) };');
     // OIDC logins and the password login issue NONE.
-    for (const ev of ['oauthLogin', 'tokenLogin', 'login']) expect(handlerBody(ev)).not.toContain('resumeFieldsFor(');
+    for (const ev of ['oauthLogin', 'tokenLogin']) expect(handlerBody(ev)).not.toContain('resumeFieldsFor(');
     // The only call sites in the file: the two issuers + the resume refresh
     // (+ the definition) — and every call states isAdmin.
     expect(src.split('resumeFieldsFor(').length - 1).toBe(4);
