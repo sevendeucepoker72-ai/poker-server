@@ -929,3 +929,174 @@ invalid_draw
 seat.allIn && leaverKeepsAllInHand(tableId)
 foldSeatOutOfHand(table, seatIndex)
 teardownSeat(tableId, table, seatIndex, null, reason)
+#
+# 2026-10-11 (R2, S1) — OPS-6: every per-IP check (connection cap, same-network
+# seat block, qualifier device cap, IP ban) keys on the REAL client address:
+# X-Real-IP first (Railway's edge overwrites it), then the first X-Forwarded-For.
+headers['x-real-ip']
+const clientIp = realClientIp(socket);
+const regIp = realClientIp(socket);
+#
+# 2026-10-11 (R2, S1) — C1 / C12 (TOURNEY-11, APPUI-40, GAME-4, R1REV-MONEY-3,
+# APPUI-20): the lobby list + /api/tables carry ONLY joinable public cash tables
+# (seats / phase / pot); joinTable / joinAdditionalTable / quickPlay / the
+# waitlist refuse every other kind (table_not_joinable); a club table only via
+# joinClubTable's grant; an invite code opens a PRIVATE table only; a private
+# table honours maxSeats, is rate-limited and removed 10 minutes after the last
+# human left; a finished tournament's tables are removed after the result.
+socket.emit('tableList', publicTableList());
+res.json(publicTableList());
+code: 'table_not_joinable'
+clubJoinGrants.add(grantedPayload);
+const target = privateTableByInviteCode(inviteCode);
+reason: 'private_table_idle'
+MAX_LIVE_PRIVATE_TABLES_PER_ACCOUNT
+pt.maxOccupiableSeats = Math.min(pt.maxOccupiableSeats, wantSeats);
+privateTableIds.has(tableId) && !tableHasHumanSeat(table)
+scheduleFinishedTournamentTablesRetirement(tournamentId,
+reason: 'tournament_finished'
+#
+# 2026-10-11 (R2, S1) — TOURNEY-6 / GAME-7 / ECON-8 / CLUBS-1 + the money
+# review's P2: fixed-roster quick tables never reload a busted bot
+# (isFixedRosterTable — the predicate autoStartNextHand's AI-reload loop asks),
+# every quick game ENDS (quickGameEndCheck: bust = game over, the stack cashed
+# out once by cleanupQuickTable — session, reservation or pending removal), a
+# quick table with no human left is cleaned up, a Spin & Go is a PRIZE format
+# (win = multiplier x entry fee through the prize ledger; a leave forfeits; a
+# forced removal / admin close refunds the fee; its stack is never cashed), a
+# club challenge is a fixed-roster heads-up for its two players.
+if (!tournamentTables.has(tableId) && !isFixedRosterTable(tableId)) {
+event: 'quick_game_over'
+event: 'quick_table_no_human_cleaned'
+reason: 'quick_game_over'
+'SPINGO_FORFEIT'
+'SPINGO_STACK_NOT_CASHED'
+key: `spingo:${tableId}:prize`
+key: `quickfee:${tableId}`
+if (!isFixedRosterTable(tableId))
+registerQuickGame(tableId, t, { format: 'challenge'
+event: 'club_challenge_void_no_show'
+#
+# 2026-10-11 (R2, S1) — ECON-17 (tournament part): every prize / refund
+# settlement is ONE transaction with an idempotent payout key per credit,
+# retried until it commits (src/game/prizeLedger.ts).
+ON CONFLICT (payout_key) DO NOTHING RETURNING payout_key
+event: 'settlement_pending_retry'
+#
+# 2026-10-11 (R2, S1) — C2 (TOURNEY-5 / TOURNEY-7 / TOURNEY-10 / APPUI-19): one
+# tournament entry per ACCOUNT (already_registered), `registered` + `entryId`
+# per asking socket in every tournament list (per-socket broadcast), the stall
+# clock from the FIRST registration, tournamentCancelled to every registrant, a
+# stable per-account entrant id (user-<id>) that feeds progression.
+code: 'already_registered'
+registered: !!mine,
+entryId: mine?.entryId ?? null,
+function broadcastTournamentList()
+sock.emit('tournamentCancelled', payload);
+const since = t.firstRegistrationAt ?? now;
+return userId !== undefined ? `user-${userId}` : `player-
+#
+# 2026-10-11 (R2, S1) — tournament P3s: field-size prize shares (a heads-up field
+# pays the whole pool), equal-stack simultaneous busts tie (prize split), a
+# custom tournament's own minPlayers, standings for the viewer's tournament,
+# ended ad-hoc tournaments + their listeners pruned, a timed freeroll's start
+# rolled forward, TournamentManager timers unref'd.
+function payoutSharesFor(entrants, percents
+tournamentManager.markSimultaneousBustTie(tournamentId, ids)
+tournamentManager.rollOverdueFreerollStarts();
+tournamentManager.pruneEndedTournaments();
+const own = viewer ? running.find((t) => tournamentManager.entryOfAccount(t.tournamentId, viewer)) : undefined;
+#
+# 2026-10-11 (R2, S1) — ECON-17 (tournament part) + C4 (TOURNEY-8 / ECON-15 /
+# APPUI-22): prizes settle in ONE ledger transaction (idempotent keys, retried,
+# never paid before the credit); staking takes a registered tournament's UUID,
+# ESCROWS the backer's chips until the seller cashes (shares + escrow released)
+# or anything else (refunded: cancel / unregister / removal / out of the money /
+# tournament gone / server restart — each offer once, a DB guard).
+label: `tournament:${tid}`,
+const prizeKey = `tprize:${tid}:${r.entryId || r.playerId}`;
+socket.on('getStakeableTournaments', () => {
+socket.emit('myStakeableTournaments', v ? stakeableTournamentsOf(v) : []);
+code: 'stake_not_registered'
+auditLog(auth.username, 'STAKING_BUY_ESCROW'
+const STAKE_GUARD_REFUND =
+const STAKE_GUARD_PAID =
+bootSweepUnsettledStakes().catch(
+#
+# 2026-10-11 (R2, S1) — TOURNEY-9: a tournament start never takes over a socket
+# that plays a live seat elsewhere (its seat is dealt absent, tournamentSeatKept
+# atStart); more than 9 registrants are seated over balanced tables.
+keepStartSeatAbsentForLiveSeatElsewhere(tournamentId, tp, boundSid, tableId, i, result.startingChips)
+event: 'start_seat_kept_absent_live_seat_elsewhere'
+startRegisteredTournamentTables(tournamentId, result.startingChips, result.blinds);
+#
+# 2026-10-11 (R2, S1) — C3 qualifiers (TOURNEY-2 / TOURNEY-3 / TOURNEY-13 /
+# AUTH-9 / APPUI-44): the registry is the master schedule (data.schedule), one
+# entry per master qualifier id, never an invented event; registrations keyed on
+# the master account; a late entry is seated at once or its credit refunded; a
+# qualifier seat never takes over a live seat elsewhere (TOURNEY-9); a qualifier
+# with too few players is cancelled and refunded; results carry each socket's
+# own place + wonSeat (myResult); the results POST is retried.
+QUALIFIER_SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000
+code: 'qualifier_not_found'
+refuseQualifier('signup_not_open'
+refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
+const existingEntry = qt.players.find((p) => !!p.masterPlayerId && p.masterPlayerId === masterId);
+'QUALIFIER_LATE_ENTRY_SEATED'
+event: 'qualifier_late_entry_seated'
+void cancelQualifierEvent(qualId, qt, 'too_few_players');
+setInterval(() => tickQualifierAutoStart(), 30000);
+registeredCount: qt.players.length, players: qt.players.length, tournamentId: qt.tournamentId,
+qualifierId: qualId, myResult: mine ? { place: mine.place, wonSeat: mine.wonSeat } : null,
+const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop:
+'QUALIFIER_RESULTS_POST_FAILED'
+r2Play: {
+#
+# 2026-10-11 (R2, S1) — C4 as K3 reads it: the marketplace per socket with its
+# own isMine (and the seller id on his own offers only); every refunded backer
+# is told stakeRefunded {offerId, tournamentId, amount, reason}.
+return { ...o, isMine: mine, sellerUserId: mine ? viewerUserId : null };
+sock.emit('stakingUpdated', { offers: stakingOffersForViewer(raw, pub, authSessions.get(sid)?.userId) });
+tellStakingCredit(c.userId, 'stakeRefunded', { offerId: offer.id, tournamentId, amount: c.amount, reason });
+#
+# 2026-10-11 (R2, S1) — TOURNEY-14: club tournaments played for real — the
+# buy-in charged with the registration (refunded once on unregister / cancel),
+# the start creates an unlisted TournamentManager tournament for the paid
+# members (shared suspension screen + start), ONE outcome per club tournament
+# (prizes or refunds, guarded in the settling transaction), the boot sweep
+# refunds one orphaned by a restart. CLUBS-4: a club table's runtime table is
+# re-created on demand after a redeploy.
+const CLUB_TOURNAMENT_OUTCOME_GUARD =
+return `clubfee:${clubTournamentId}:${userId}`;
+void screenAndStartTournament(liveId, 'club');
+minPlayers: 2, unlisted: true,
+t.config.unlisted && !mine
+!tourn || tourn.config.unlisted
+'CLUB_TOURNAMENT_BUYIN'
+socket.on('cancelClubTournament'
+event: 'club_tournament_started'
+WHERE tournamentId = $1 AND transferredAt IS NULL AND paid >= $2
+while (levels[levels.length - 1].bb < 4 * stack && levels.length < 60)
+runtimeTableId = await ensureClubRuntimeTable(clubTable);
+event: 'club_table_runtime_recreated'
+code: 'club_table_unavailable'
+#
+# 2026-10-11 (R2, S1) — item 1 (GAME-3 / OPS-2 / TOURNEY-4): the shutdown /
+# crash flush CLAIMS every seat synchronously (main, extra-table, reserved,
+# after-hand removal — once each, never a tournament / Spin & Go stack) while
+# every other cash-out path and new buy-ins stand down, settles the wallet
+# credits in ONE ledger settlement, refunds buy-in tournament entry fees
+# (registering cancelled, running voided), club tournaments, staking escrow,
+# Spin & Go fees and qualifier credits — bounded.
+function shutdownFlushActive()
+`shutdown:${PROCESS_INSTANCE_ID}:${c.tableId}:${c.seatIndex}`
+take(auth.userId, ms.tableId, ms.seatIndex, 'extra_table', ms.playerId)
+take(w.userId, tableId, seatIndex, 'leave_after_hand', w.playerId);
+const regs = tournamentManager.voidRunningTournament(tid);
+`tfee:${tid}:${r.playerId}`
+releaseQualifierRegistration(qualId, qt, p, 'server_restart')
+refundQuickEntryFee(tableId, qg, 'server_restart')
+reason = 'server_restarting';
+code: 'server_restarting'
+'CASH_OUT_LEFT_TO_SHUTDOWN_FLUSH'
+'SHUTDOWN_FLUSH'

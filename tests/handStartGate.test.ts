@@ -203,7 +203,7 @@ describe('S4 — TournamentManager.disqualifyPlayers: a suspended entrant is NEV
     tm.disqualifyPlayer(id, 'pA');            // finishes the tournament — B still unflagged
     tm.disqualifyPlayer(id, 'pB');            // too late: already finished
     const b = getResults()!.find((r: any) => r.playerId === 'pB');
-    expect(b).toMatchObject({ position: 1, payout: 1000 }); // 50% of 2×1000 to a suspended player
+    expect(b).toMatchObject({ position: 1, payout: 1250 }); // 62.5% (R2: heads-up pays the whole pool) of 2×1000 to a suspended player
     expect(b).not.toHaveProperty('disqualified');
   });
 

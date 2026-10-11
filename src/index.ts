@@ -15,7 +15,11 @@ import {
   HandHistoryRecord,
   PokerTableSnapshot,
 } from './game/PokerTable';
-import { computeStakingSplit } from './game/staking';
+import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK } from './game/qualifierSchedule';
+import { clubTournamentBlindLevels } from './game/clubTournaments';
+import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
+import { EscrowOffer, normalizeBackers, planEscrowRefund, planCashedSettlement, validateStakeOffer } from './game/stakingEscrow';
 import {
   connectRedis as connectHandStore,
   snapshotHand,
@@ -93,6 +97,7 @@ import { notifyPlayer } from './notifyClient';
 // (sync + async errors caught, non-object payloads refused before the body) and
 // the process logs unhandled rejections / flushes then exits on an uncaught one.
 import { installSocketListenerGuard, socketGuardStats } from './socketGuard';
+import { clientIpFromHandshake } from './net/clientIp';
 import { installProcessCrashHandlers, processCrashStats, CRASH_FLUSH_TIMEOUT_MS } from './processGuards';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
 // being migrated to log.debug so they mute under production pino level
@@ -131,6 +136,11 @@ import {
   getClubTournaments,
   registerForClubTournament,
   startClubTournament,
+  // R2 (TOURNEY-14) — club tournaments played for real.
+  cancelClubTournament,
+  setClubTournamentLive,
+  endClubTournament,
+  strandedClubTournaments,
   createChallenge,
   acceptChallenge,
   setChallengeTable,
@@ -1092,6 +1102,9 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // master account's split local rows into one, and the goodwill grant pays
   // 50,000 chips per person: both are chip + identity mutations.
   'ACCOUNT_MERGE', 'GOODWILL_CHIP_GRANT', 'ACHIEVEMENT_BACKFILL',
+  // 2026-10-11 (.online R2, item 1) — one row per shutdown / crash flush: what it
+  // cashed out and refunded (each credit's own durable row is in prize_payouts).
+  'SHUTDOWN_FLUSH',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -1761,7 +1774,12 @@ async function buyInSocketGone(
   expect?: BuyInExpectation,
 ): Promise<boolean> {
   let reason = 'socket_gone';
-  if (socket.connected) {
+  if (shutdownFlushActive()) {
+    // R2 (item 1) — the shutdown flush claimed the seats while this buy-in
+    // awaited: it seats nothing (its stack would be in no flush) and the
+    // deducted buy-in goes back once.
+    reason = 'server_restarting';
+  } else if (socket.connected) {
     const changed = expect ? buyInStateChanged(socket, expect) : null;
     if (!changed) return false;
     reason = changed;
@@ -2107,6 +2125,12 @@ function pushActivity(text: string): void {
 // hot game-entry handlers cheaply; an admin who needs to test simply turns
 // maintenance back off from the admin app.
 function blockedByMaintenance(socket: Socket): boolean {
+  // R2 (item 1) — the shutdown / crash flush has claimed every seat: no new
+  // buy-in may start (its stack would not be in the flush).
+  if (shutdownFlushActive()) {
+    socket.emit('error', { message: 'The server is restarting — please try again in a moment.', code: 'server_restarting' });
+    return true;
+  }
   if (!maintenanceMode) return false;
   socket.emit('maintenanceMode', { enabled: true });
   socket.emit('error', { message: 'The server is under maintenance. New games are paused — please try again shortly.' });
@@ -2124,12 +2148,12 @@ function maintenanceBlocksLogin(isAdmin: boolean): boolean {
 // Resolve the REAL client IP. Railway (and most PaaS) put an edge proxy in
 // front, so socket.handshake.address is the proxy hop, not the client — an IP
 // ban on that would be ineffective or over-broad (banning a shared upstream
-// that many users share). Prefer the first X-Forwarded-For entry (the original
-// client), fall back to the socket address.
+// that many users share). 2026-10-11 (R2, OPS-6): X-Real-IP first (the edge
+// overwrites it), then the first X-Forwarded-For entry, then the socket
+// address — see src/net/clientIp.ts. Used by the IP ban, the per-IP
+// connection cap, the same-network seat block and the qualifier device cap.
 function realClientIp(socket: Socket): string {
-  const xff = socket.handshake.headers['x-forwarded-for'];
-  const first = Array.isArray(xff) ? xff[0] : (typeof xff === 'string' ? xff.split(',')[0] : '');
-  return (first || '').trim() || socket.handshake.address || '';
+  return clientIpFromHandshake(socket.handshake as any);
 }
 
 /**
@@ -2291,9 +2315,13 @@ function absentSeatMasterId(localUserId: number, reserved: ReservedSeat | undefi
  * eliminates him through TournamentManager when his stack is gone — the same
  * thing the tournament rebalance does with a disconnected player: "reconnect
  * recovery will pick it up"). Checked against the snapshot AND the live map.
+ * R2 (ECON-8, S1) — a Spin & Go seat's reservation too (isPrizeFormatTable):
+ * its stack is the prize format's, never cashed out when the reservation
+ * ends; the seat plays on, absent, until the game is decided (and
+ * cleanupQuickTable ends the reservation with the table).
  */
 function isTournamentReservation(reserved: { tableId: string; tournament?: boolean }): boolean {
-  return reserved.tournament === true || isTournamentTable(reserved.tableId);
+  return reserved.tournament === true || isTournamentTable(reserved.tableId) || isPrizeFormatTable(reserved.tableId);
 }
 
 /**
@@ -2478,12 +2506,10 @@ const DEALERS_CHOICE_VARIANTS: VariantType[] = [
 
 // ========== REST Endpoints ==========
 
+// R2 (C1) — the same list as the socket's getTableList: ONLY joinable public
+// cash tables (never quick / tournament / private / club tables).
 app.get('/api/tables', (_req, res) => {
-  const tables = tableManager.getTableList().map((t) => ({
-    ...t,
-    spectatorCount: spectators.get(t.tableId)?.size || 0,
-  }));
-  res.json(tables);
+  res.json(publicTableList());
 });
 
 app.get('/api/health', async (_req, res) => {
@@ -2681,6 +2707,24 @@ app.get('/api/health', async (_req, res) => {
         reservationsDisplaced: reservationsDisplaced.count,
         chipVelocity: { ...chipVelocityStats, autoBan: CHIP_VELOCITY_AUTOBAN },
       },
+      // 2026-10-11 (.online R2, S1) — tournaments, qualifiers, quick games,
+      // home games, staking, the prize ledger. Counts only, no ids.
+      // prizeLedger.pending > 0 = settlements waiting for their retry (a DB
+      // blip); qualifiers.resultPosts.failed > 0 = a results POST the master
+      // never took (audited QUALIFIER_RESULTS_POST_FAILED — seats NOT awarded).
+      r2Play: {
+        prizeLedger: { ...prizeLedgerStats },
+        tournamentPrizes: { ...tournamentPrizeStats },
+        tournamentCancelledNotices: { ...tournamentCancelledNotices },
+        tournamentStartsKeptAbsent: tournamentStartsKeptAbsent.seats,
+        staking: { ...stakingStats, openOffers: stakingOffers.size },
+        qualifiers: {
+          sync: { ...qualifierSyncStats }, registry: qualifierTournaments.size, cancellations: { ...qualifierCancellations },
+          lateEntries: { ...qualifierLateEntries }, resultPosts: { ...qualifierResultPosts },
+        },
+        quickGames: { ...quickGameStats, live: quickGames.size },
+        privateTables: { ...privateTableStats },
+      },
     });
   } catch (e: any) {
     res.status(503).json({ status: 'unhealthy', error: e?.message || String(e) });
@@ -2854,10 +2898,38 @@ interface QualifierTournamentReg {
   buyIn?: number;
   maxReEntries?: number;
   requiresQualifierCredit?: boolean;
-  players: { playerId: string; masterPlayerId?: string; playerName: string; phone: string; socketId: string; reEntries?: number; consumedCreditId?: string }[];
+  players: QualifierRegistrant[];
   status: 'registering' | 'starting' | 'running' | 'finished';
   tournamentId: string | null; // linked TournamentManager ID once started
   blindStructure: any[];
+  // ── R2 (2026-10-11, C3 / TOURNEY-2 / TOURNEY-3) — ONE registry entry per
+  // MASTER qualifier (keyed by its master id), only for events the master
+  // schedule lists, with a real lifecycle (registering → running → finished).
+  /** The lobby catalog key the master maps this type to ('weekly-qualifier'). */
+  clientQualifierId?: string;
+  /** When the master schedule last listed it (an event dropped from it before its start is cancelled + refunded). */
+  lastSeenInSchedule?: number;
+  finishedAt?: number | null;
+  /** Ended without being played (too few players / taken off the schedule) — every consumed credit refunded. */
+  cancelled?: boolean;
+  /** The final standings (C3): each finisher's own place + whether that place wins a championship seat. */
+  results?: Array<{ masterUserId: string | null; playerName: string; place: number; wonSeat: boolean }> | null;
+}
+
+/** R2 (TOURNEY-3 / AUTH-9) — a registration is the MASTER account's (masterPlayerId), never a login handle / phone / name. */
+interface QualifierRegistrant {
+  playerId: string;
+  masterPlayerId?: string;
+  localUserId?: number;
+  playerName: string;
+  phone: string;
+  socketId: string;
+  ip?: string;
+  reEntries?: number;
+  consumedCreditId?: string;
+  /** R2 — the credits his RE-ENTRIES consumed (refunded if the event dies with the process — the shutdown flush). */
+  reentryCreditIds?: string[];
+  registeredAt?: number;
 }
 
 const qualifierTournaments = new Map<string, QualifierTournamentReg>();
@@ -2954,6 +3026,14 @@ async function issueQualifierCreditOnMaster(masterId: string, tier: string, note
 // Sync qualifier schedule from master API so qualifierTournaments has real
 // scheduledAt values (instead of client-side guessed dates) and masterQualifierId
 // for registration persistence and result reporting.
+// R2 (2026-10-11, TOURNEY-2 / C3) — the master answers `{ success, data:
+// { schedule } }`: this read `body.schedule`, found nothing, and the registry
+// stayed EMPTY (so registerQualifierTournament invented a qualifier 7 days
+// out). Now (parseMasterSchedule): one registry entry PER MASTER QUALIFIER,
+// keyed by its master id; its time / name / type follow the master until it
+// starts; an event that disappears from the schedule before it starts is
+// cancelled (every consumed credit refunded). Nothing is ever invented.
+const qualifierSyncStats = { syncs: 0, failures: 0, lastSyncAt: null as string | null, listed: 0, cancelledOffSchedule: 0 };
 async function syncQualifierSchedule(): Promise<void> {
   const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
   if (!tok) return; // no token configured — skip
@@ -2962,45 +3042,419 @@ async function syncQualifierSchedule(): Promise<void> {
     const resp = await fetch(`${base}/qualifiers/schedule`, {
       headers: { 'X-Internal-Token': tok },
     });
-    if (!resp.ok) { console.warn('[QualifierSync] schedule fetch failed:', resp.status); return; }
-    const body = await resp.json() as { schedule?: Array<{ id: number; clientQualifierId: string; type: string; name: string; scheduledAt: string | null }> };
-    const list = body?.schedule;
-    if (!Array.isArray(list)) return;
-    for (const q of list) {
-      const mapKey = q.clientQualifierId; // e.g. 'weekly-qualifier'
-      const existing = qualifierTournaments.get(mapKey);
-      if (existing) {
-        if (q.scheduledAt) existing.scheduledAt = q.scheduledAt;
-        existing.masterQualifierId = String(q.id);
-      } else {
-        qualifierTournaments.set(mapKey, {
-          qualifierId: mapKey,
-          qualifierType: q.type,
-          qualifierName: q.name,
-          scheduledAt: q.scheduledAt || new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
-          masterQualifierId: String(q.id),
-          startingStack: 50000,
-          maxPlayers: 999,
-          requiresQualifierCredit: true,
-          players: [],
-          status: 'registering',
-          tournamentId: null,
-          blindStructure: [],
-        });
-      }
-    }
-    console.log(`[QualifierSync] synced ${list.length} qualifiers`);
+    if (!resp.ok) { qualifierSyncStats.failures++; console.warn('[QualifierSync] schedule fetch failed:', resp.status); return; }
+    applyQualifierSchedule(parseMasterSchedule(await resp.json()), Date.now());
   } catch (err: any) {
+    qualifierSyncStats.failures++;
     console.warn('[QualifierSync] error:', err?.message);
   }
 }
-// Run 5 s after startup (lets secrets load) then every 30 min
+
+/** R2 — fold the master schedule into the registry (see syncQualifierSchedule). */
+function applyQualifierSchedule(list: MasterScheduleEntry[], now: number): void {
+  const listed = new Set<string>();
+  for (const q of list) {
+    if (q.status !== 'open') continue;
+    listed.add(q.id);
+    const existing = qualifierTournaments.get(q.id);
+    if (existing) {
+      existing.lastSeenInSchedule = now;
+      // The master owns the time / name until the event STARTS.
+      if (existing.status === 'registering' && !existing.tournamentId) {
+        existing.scheduledAt = new Date(q.scheduledAt).toISOString();
+        existing.qualifierName = q.name;
+        existing.qualifierType = q.type;
+        existing.clientQualifierId = q.clientQualifierId;
+      }
+      continue;
+    }
+    // A brand-new event whose late registration already ended is not opened.
+    if (now > qualifierWindows(q.scheduledAt).lateRegUntil) continue;
+    qualifierTournaments.set(q.id, {
+      qualifierId: q.id,
+      masterQualifierId: q.id,
+      clientQualifierId: q.clientQualifierId,
+      qualifierType: q.type,
+      qualifierName: q.name,
+      scheduledAt: new Date(q.scheduledAt).toISOString(),
+      startingStack: QUALIFIER_BASE_STACK,
+      maxPlayers: 999,
+      requiresQualifierCredit: true,
+      players: [],
+      status: 'registering',
+      tournamentId: null,
+      blindStructure: qualifierStructure(QUALIFIER_BASE_STACK).levels,
+      lastSeenInSchedule: now,
+      finishedAt: null,
+      results: null,
+    });
+  }
+  // Taken off the schedule before it started (the master closed / moved it):
+  // cancelled — every consumed credit refunded, registrants told.
+  for (const [id, qt] of [...qualifierTournaments]) {
+    if (listed.has(id) || qt.status !== 'registering' || qt.tournamentId) continue;
+    cancelQualifierEvent(id, qt, 'removed_from_schedule');
+    qualifierSyncStats.cancelledOffSchedule++;
+  }
+  qualifierSyncStats.syncs++;
+  qualifierSyncStats.listed = listed.size;
+  qualifierSyncStats.lastSyncAt = new Date(now).toISOString();
+  console.log(`[QualifierSync] synced ${list.length} qualifiers (${listed.size} open)`);
+}
+// Run 5 s after startup (lets secrets load) then every 30 min — R2: every 10
+// minutes (a moved start time / a new week's event shows up within minutes).
 setTimeout(() => syncQualifierSchedule(), 5000);
-setInterval(() => syncQualifierSchedule(), 30 * 60 * 1000);
+setInterval(() => syncQualifierSchedule(), 10 * 60 * 1000);
+
+/**
+ * R2 (C3) — the registry entry a client's `qualifierId` names: the MASTER id;
+ * else the lobby catalog key ('weekly-qualifier') → the current event of that
+ * kind (not finished; the soonest). Never an invented one.
+ */
+function qualifierEventFor(qualifierId: unknown): [string, QualifierTournamentReg] | null {
+  if (typeof qualifierId !== 'string' || !qualifierId) return null;
+  const direct = qualifierTournaments.get(qualifierId);
+  if (direct) return [qualifierId, direct];
+  let best: [string, QualifierTournamentReg] | null = null;
+  for (const [id, qt] of qualifierTournaments) {
+    if (qt.clientQualifierId !== qualifierId || qt.status === 'finished') continue;
+    if (!best || new Date(qt.scheduledAt).getTime() < new Date(best[1].scheduledAt).getTime()) best = [id, qt];
+  }
+  return best;
+}
+
+/** R2 (C3) — one qualifier as the lobby shows it, for an asking master account (or none). */
+function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, viewerMasterId: string | null): Record<string, unknown> {
+  const at = new Date(qt.scheduledAt).getTime();
+  const w = qualifierWindows(at);
+  const phase = qt.status === 'finished' ? 'finished' : (qt.status === 'running' || qt.status === 'starting') ? 'running' : 'pending';
+  const status = qualifierStatusOf(phase, at, now);
+  const mine = viewerMasterId ? qt.players.find((p) => p.masterPlayerId === viewerMasterId) : undefined;
+  const myResult = viewerMasterId && qt.results ? qt.results.find((r) => r.masterUserId === viewerMasterId) : undefined;
+  const seatsForTop = seatsForTopOf(qt.qualifierType);
+  return {
+    qualifierId: id,
+    masterQualifierId: qt.masterQualifierId ?? id,
+    clientQualifierId: qt.clientQualifierId ?? null,
+    type: qt.qualifierType,
+    name: qt.qualifierName,
+    scheduledAt: new Date(at).toISOString(),
+    signupOpensAt: new Date(w.signupOpensAt).toISOString(),
+    signupClosesAt: new Date(w.signupClosesAt).toISOString(),
+    lateRegUntil: new Date(w.lateRegUntil).toISOString(),
+    status,
+    registered: !!mine,
+    players: qt.players.length,
+    structure: qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK),
+    seatsForTop,
+    tournamentId: qt.tournamentId,
+    ...(qt.cancelled ? { cancelled: true } : {}),
+    // The asking account's own result (C3): `myResult {place, wonSeat}` (+ the same two at the top level).
+    myResult: myResult ? { place: myResult.place, wonSeat: myResult.wonSeat } : null,
+    ...(myResult ? { place: myResult.place, wonSeat: myResult.wonSeat } : {}),
+    // Pre-R2 names (older lobbies): the same values.
+    qualifierType: qt.qualifierType,
+    qualifierName: qt.qualifierName,
+    registeredCount: qt.players.length,
+    signupOpen: status === 'registering' || (status === 'running' && now <= w.lateRegUntil),
+  };
+}
+
+/** C3 — every listed qualifier (finished ones for a day, for their results), soonest first. */
+function qualifierList(viewerMasterId: string | null, now: number = Date.now()): Array<Record<string, unknown>> {
+  return [...qualifierTournaments.entries()]
+    .sort((a, b) => new Date(a[1].scheduledAt).getTime() - new Date(b[1].scheduledAt).getTime())
+    .map(([id, qt]) => qualifierListItem(id, qt, now, viewerMasterId));
+}
+
+/**
+ * R2 — refund a registrant's consumed qualifier credit on the master and
+ * drop his master registration row. Never throws; audited.
+ */
+function releaseQualifierRegistration(qualId: string, qt: QualifierTournamentReg, p: QualifierRegistrant, reason: string): Promise<unknown> {
+  const tasks: Promise<unknown>[] = [];
+  // Every credit this registration consumed: its entry, and (the shutdown flush) its re-entries.
+  const creditIds = [...(p.consumedCreditId ? [p.consumedCreditId] : []), ...(p.reentryCreditIds || [])];
+  p.consumedCreditId = undefined;
+  p.reentryCreditIds = [];
+  for (const cid of creditIds) {
+    tasks.push(refundQualifierCreditOnMaster(cid)
+      .then((refunded) => auditLog(p.playerId, refunded ? 'QUALIFIER_CREDIT_REFUND' : 'QUALIFIER_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: cid, reason }))
+      .catch(() => auditLog(p.playerId, 'QUALIFIER_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: cid, reason })));
+  }
+  if (qt.masterQualifierId && p.masterPlayerId) {
+    const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+    const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+    tasks.push(fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+      body: JSON.stringify({ userId: p.masterPlayerId }),
+    }).catch((e: any) => console.warn('[Qualifier] unregister persist failed:', e?.message)));
+  }
+  return Promise.all(tasks);
+}
+
+/** R2 — every live socket signed in as this master account. */
+function socketsOfMaster(masterId: string | undefined): Socket[] {
+  if (!masterId) return [];
+  const out: Socket[] = [];
+  for (const [sid, a] of authSessions) {
+    if (String(a.masterUserId || a.statsMasterUserId || '') !== String(masterId)) continue;
+    const s = io.sockets.sockets.get(sid);
+    if (s && s.connected) out.push(s);
+  }
+  return out;
+}
+
+/** R2 (TOURNEY-9) — the answer when a qualifier seat would take over a socket that plays a live seat elsewhere. */
+const QUALIFIER_LEAVE_TABLE_FIRST = 'Leave your current table first, then enter the qualifier.';
+const qualifierLateEntries = { seated: 0, refundedNoSeat: 0 };
+
+/** R2 — the master's registration row for this event (so the master knows who entered). Fire-and-forget. */
+function persistQualifierRegistration(qt: QualifierTournamentReg, masterId: string): void {
+  if (!qt.masterQualifierId || !masterId) return;
+  const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+  const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+    body: JSON.stringify({ userId: masterId }),
+  }).catch((e: any) => console.warn('[QualifierReg] persist failed:', e?.message));
+}
+
+/** R2 (C3) — the registration count to every lobby: a NUMBER (`players` / `registeredCount`), never names. */
+function broadcastQualifierUpdate(qualId: string, qt: QualifierTournamentReg): void {
+  const item = qualifierListItem(qualId, qt, Date.now(), null);
+  io.emit('qualifierTournamentUpdate', {
+    qualifierId: qualId, status: item.status, registeredCount: qt.players.length, players: qt.players.length, tournamentId: qt.tournamentId,
+  });
+}
+
+/** R2 — give back a FIRST entry's consumed credit (the entry did not happen). Audited; never throws. */
+async function refundQualifierEntryCredit(actor: string, qualId: string, creditId: string, reason: string): Promise<boolean> {
+  let refunded = false;
+  try { refunded = await refundQualifierCreditOnMaster(creditId); } catch { refunded = false; }
+  if (reason === 'no_seat') qualifierLateEntries.refundedNoSeat++;
+  auditLog(actor, refunded ? 'QUALIFIER_ENTRY_CREDIT_REFUND' : 'QUALIFIER_ENTRY_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId, reason });
+  return refunded;
+}
+
+/** R2 — give back a RE-ENTRY's chip buy-in (additive, once) and its consumed credit. Audited; never throws. */
+async function refundQualifierReentryCharges(
+  userId: number, username: string, qualId: string, buyIn: number, creditId: string | null, reason: string,
+): Promise<void> {
+  if (buyIn > 0) {
+    let ok = false;
+    try { ok = !!(await addChipsToUser(userId, buyIn)); } catch { ok = false; }
+    auditLog(username, ok ? 'QUALIFIER_REENTRY_BUYIN_REFUND' : 'QUALIFIER_REENTRY_BUYIN_REFUND_FAILED', { qualifierId: qualId, buyIn, reason });
+  }
+  if (creditId) {
+    let refunded = false;
+    try { refunded = await refundQualifierCreditOnMaster(creditId); } catch { refunded = false; }
+    auditLog(username, refunded ? 'QUALIFIER_REENTRY_CREDIT_REFUND' : 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId, reason });
+  }
+}
+
+/**
+ * R2 (TOURNEY-3) — a LATE first entry into a RUNNING qualifier: a NEW entrant
+ * (TournamentManager.addLateEntrant) seated at once with the starting stack on
+ * an empty seat of the least-full table, this socket's session bound to it
+ * (P-g detach first). null = no seat (none free, the tournament is over): the
+ * caller refunds the credit — never a consumed credit without a seat. The
+ * caller has checked the socket plays no live seat elsewhere (TOURNEY-9).
+ */
+function seatQualifierLateEntrant(socket: Socket, qt: QualifierTournamentReg, reg: QualifierRegistrant): { tableId: string; seatIndex: number } | null {
+  const tournamentId = qt.tournamentId;
+  const tournament = tournamentId ? tournamentManager.getTournament(tournamentId) : undefined;
+  if (!tournamentId || !tournament || tournament.status !== 'running') return null;
+  const stack = qt.startingStack || QUALIFIER_BASE_STACK;
+  const tables = tournament.tableIds
+    .map((tid) => ({ tid, table: tableManager.getTable(tid) }))
+    .filter((x): x is { tid: string; table: PokerTable } => !!x.table)
+    .sort((a, b) => a.table.getOccupiedSeatCount() - b.table.getOccupiedSeatCount());
+  for (const { tid, table } of tables) {
+    for (let s = 0; s < table.seats.length; s++) {
+      if (table.seats[s].state !== 'empty') continue;
+      if (!tournamentManager.addLateEntrant(tournamentId, reg.playerId, reg.playerName, socket.id, stack, { masterUserId: reg.masterPlayerId })) return null;
+      if (!table.sitDown(s, reg.playerName, stack, reg.playerId, false)) {
+        tournamentManager.removeLateEntrant(tournamentId, reg.playerId);
+        continue;
+      }
+      tournamentManager.setPlayerTable(tournamentId, reg.playerId, tid);
+      // P-g — one table view per socket: no other table's spectating / rooms.
+      detachSocketFromOtherTables(socket, tid, 'seat', 'qualifierLateEntry');
+      playerSessions.set(socket.id, {
+        socketId: socket.id, tableId: tid, seatIndex: s, playerName: reg.playerName, playerId: reg.playerId,
+        trainingEnabled: false, sittingOut: false,
+      });
+      for (const ttid of tournament.tableIds) spectators.get(ttid)?.delete(socket.id);
+      socket.join(`table:${tid}`);
+      console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_late_entry_seated', tournamentId, tableId: tid, seatIndex: s })}`);
+      return { tableId: tid, seatIndex: s };
+    }
+  }
+  return null;
+}
+
+/**
+ * R2 (TOURNEY-3) — a qualifier that will not be played (too few players by the
+ * end of late registration, or taken off the schedule): 'finished' +
+ * `cancelled`, every consumed credit refunded, every registrant told
+ * (`qualifierCancelled {qualifierId, reason, creditRefunded}`).
+ */
+const qualifierCancellations = { cancelled: 0, creditsRefunded: 0 };
+function cancelQualifierEvent(qualId: string, qt: QualifierTournamentReg, reason: string): Promise<unknown> {
+  qt.status = 'finished';
+  qt.cancelled = true;
+  qt.finishedAt = Date.now();
+  qualifierCancellations.cancelled++;
+  const players = qt.players.slice();
+  const tasks = players.map((p) => {
+    const hadCredit = !!p.consumedCreditId;
+    if (hadCredit) qualifierCancellations.creditsRefunded++;
+    for (const s of socketsOfMaster(p.masterPlayerId)) s.emit('qualifierCancelled', { qualifierId: qualId, reason, creditRefunded: hadCredit });
+    return releaseQualifierRegistration(qualId, qt, p, reason);
+  });
+  io.emit('qualifierTournamentUpdate', { qualifierId: qualId, status: 'finished', cancelled: true, registeredCount: 0, players: 0 });
+  console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_cancelled', qualifierId: qualId, reason, registrants: players.length })}`);
+  return Promise.all(tasks);
+}
+
+/**
+ * R2 (C3 / TOURNEY-3 / TOURNEY-13) — the qualifier's tournament FINISHED:
+ * 'finished', and its standings kept — each finisher's place and whether
+ * that place wins a championship seat (seatsForTop: the master's seat places —
+ * weekly top 3, monthly top 6, TOC winner; the master's per-player seat cap
+ * can still pass a capped player's seat down, and its own seat notice is
+ * authoritative) — then every registrant's live sockets get `qualifierResults
+ * {qualifierId, myResult: {place, wonSeat} | null, place, wonSeat, seatsForTop,
+ * results}` (his own; null / false when he did not finish). The table rooms'
+ * `tournamentFinished` carries the same per socket (emitTournamentFinishedToEntrants).
+ */
+function markQualifierFinished(tournamentId: string, data: { results?: Array<{ playerId: string; playerName: string; position: number; disqualified?: boolean }> }): void {
+  for (const [qualId, qt] of qualifierTournaments) {
+    if (qt.tournamentId !== tournamentId || qt.status === 'finished') continue;
+    const seats = seatsForTopOf(qt.qualifierType);
+    const results = (data?.results || [])
+      .filter((r) => r.position > 0 && !r.disqualified)
+      .map((r) => {
+        const reg = qt.players.find((p) => p.playerId === r.playerId);
+        return { masterUserId: reg?.masterPlayerId ?? null, playerName: publicNameOf(r.playerName), place: r.position, wonSeat: r.position <= seats };
+      })
+      .sort((a, b) => a.place - b.place);
+    qt.status = 'finished';
+    qt.finishedAt = Date.now();
+    qt.results = results;
+    const publicResults = results.map((r) => ({ place: r.place, playerName: r.playerName, wonSeat: r.wonSeat }));
+    for (const p of qt.players) {
+      const mine = results.find((r) => r.masterUserId && r.masterUserId === p.masterPlayerId);
+      for (const s of socketsOfMaster(p.masterPlayerId)) {
+        s.emit('qualifierResults', {
+          qualifierId: qualId, myResult: mine ? { place: mine.place, wonSeat: mine.wonSeat } : null,
+          place: mine?.place ?? null, wonSeat: !!mine?.wonSeat, seatsForTop: seats, results: publicResults,
+        });
+      }
+    }
+    io.emit('qualifierTournamentUpdate', { qualifierId: qualId, status: 'finished', tournamentId, registeredCount: qt.players.length, players: qt.players.length });
+  }
+}
+
+/** R2 (C3) — the qualifier event a tournament plays, if any. */
+function qualifierOfTournament(tournamentId: string): { qualId: string; qt: QualifierTournamentReg } | null {
+  for (const [qualId, qt] of qualifierTournaments) if (qt.tournamentId === tournamentId) return { qualId, qt };
+  return null;
+}
+
+/** R2 (C3) — one socket's account's own qualifier result (`myResult`), or null (not a finisher / not signed in). */
+function qualifierResultOf(qt: QualifierTournamentReg, auth: SocketAuthSession | undefined): { place: number; wonSeat: boolean } | null {
+  const master = auth ? String(auth.masterUserId || auth.statsMasterUserId || '') : '';
+  if (!master || !qt.results) return null;
+  const r = qt.results.find((x) => !!x.masterUserId && x.masterUserId === master);
+  return r ? { place: r.place, wonSeat: r.wonSeat } : null;
+}
+
+/** R2 — finished qualifiers stay listed a day (their results), then leave the registry. */
+function pruneFinishedQualifiers(now: number = Date.now()): void {
+  for (const [id, qt] of [...qualifierTournaments]) {
+    if (qt.status === 'finished' && (qt.finishedAt ?? 0) > 0 && now - (qt.finishedAt as number) > 24 * 3600_000) qualifierTournaments.delete(id);
+  }
+}
 
 // 2026-07-07 gap-fill [10] — shared table-creation from a scheduled-table config.
 // Used by BOTH the manual Activate handler and the auto-fire sweep so the two
 // paths can never drift.
+// ========== Club tables survive a redeploy (R2, CLUBS-4) ==========
+/** The club table rules (createClubTable's own defaults) — the same check at creation and re-creation. */
+function validateClubTableConfig(cfg: unknown) {
+  return validateTableConfig(cfg, {
+    tableName: '', smallBlind: 5, bigBlind: 10, ante: 0, minBuyIn: (bb) => bb * 20, maxBuyIn: (bb) => bb * 100,
+  });
+}
+
+/** A club table's runtime table from its (validated) stored numbers: '[Club] name', tableKind 'club', its seat count. */
+async function createClubRuntimeTable(clubId: number, cfg: { tableName: string; variant?: string; smallBlind: number; bigBlind: number; minBuyIn: number; maxSeats?: number }): Promise<string | null> {
+  let clubName = 'Club';
+  try { clubName = (await getClubInfo(clubId)).club?.name || 'Club'; } catch { /* the default name */ }
+  const variant = (cfg.variant || 'texas-holdem') as VariantType;
+  const tableConfig = {
+    tableName: `[${clubName}] ${cfg.tableName}`,
+    smallBlind: cfg.smallBlind,
+    bigBlind: cfg.bigBlind,
+    ante: 0,
+    minBuyIn: cfg.minBuyIn,
+  };
+  const tableId = variant === 'texas-holdem'
+    ? tableManager.createTable(tableConfig)
+    : tableManager.createVariantTable(tableConfig, variant);
+  if (!tableId) return null;
+  clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
+  const t = tableManager.getTable(tableId);
+  const seats = Number(cfg.maxSeats);
+  if (t && Number.isInteger(seats) && seats >= 2) t.maxOccupiableSeats = Math.min(t.maxOccupiableSeats, seats);
+  return tableId;
+}
+
+/**
+ * R2 (CLUBS-4) — a club table's RUNTIME table. Tables live in memory: every
+ * redeploy dropped them while club_tables kept pointing at the dead id, so a
+ * member's join failed ("Table not found") until a manager created a new
+ * table. Now the runtime table is (re)created from the stored config when it is
+ * missing — at a member's join and when the club's tables are listed — and the
+ * row is re-pointed at it (one creation at a time per club table). A closed
+ * (inactive) table or an invalid stored config gets none.
+ */
+const clubTablesRecreating = new Map<number, Promise<string | null>>();
+const clubTableRuntimeStats = { recreated: 0, refusedInvalid: 0 };
+async function ensureClubRuntimeTable(ct: {
+  id: number; clubId: number; tableName: string; variant: string; smallBlind: number; bigBlind: number;
+  minBuyIn: number; maxBuyIn?: number; maxSeats?: number; isActive: boolean; tableId?: string;
+}): Promise<string | null> {
+  if (ct.tableId && tableManager.getTable(ct.tableId)) return ct.tableId;
+  if (!ct.isActive) return null;
+  const inFlight = clubTablesRecreating.get(ct.id);
+  if (inFlight) return inFlight;
+  const job = (async (): Promise<string | null> => {
+    const check = validateClubTableConfig({
+      tableName: ct.tableName, variant: ct.variant, smallBlind: ct.smallBlind, bigBlind: ct.bigBlind,
+      minBuyIn: ct.minBuyIn, maxBuyIn: ct.maxBuyIn, ...(ct.maxSeats ? { maxSeats: ct.maxSeats } : {}),
+    });
+    if (!check.ok) {
+      clubTableRuntimeStats.refusedInvalid++;
+      console.warn(`[Clubs] ${JSON.stringify({ event: 'club_table_recreate_refused', clubTableId: ct.id, error: check.error })}`);
+      return null;
+    }
+    const tableId = await createClubRuntimeTable(ct.clubId, check.config);
+    if (!tableId) return null;
+    await updateClubTableId(ct.id, tableId);
+    ct.tableId = tableId;
+    clubTableRuntimeStats.recreated++;
+    console.log(`[Clubs] ${JSON.stringify({ event: 'club_table_runtime_recreated', clubTableId: ct.id, clubId: ct.clubId, tableId })}`);
+    return tableId;
+  })().finally(() => clubTablesRecreating.delete(ct.id));
+  clubTablesRecreating.set(ct.id, job);
+  return job;
+}
+
 /** R1 (AUTH-4) — a scheduled club table's stored config, validated with the defaults this helper always used. */
 function validateScheduledTableConfig(cfg: unknown) {
   return validateTableConfig(cfg, { tableName: 'Scheduled Table', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 });
@@ -3075,48 +3529,37 @@ setTimeout(() => sweepScheduledClubTables(), 15000);
 setInterval(() => sweepScheduledClubTables(), 60 * 1000);
 
 // REST endpoint: get qualifier tournament registrations
+// R2 (C3) — ONLY the qualifiers the master schedule lists (the registry), in
+// the C3 shape; no player names or phones (the socket list adds the asking
+// account's own `registered`).
 app.get('/api/qualifier-tournaments', (_req, res) => {
-  const list: any[] = [];
-  for (const [id, qt] of qualifierTournaments) {
-    list.push({
-      qualifierId: id,
-      qualifierType: qt.qualifierType,
-      qualifierName: qt.qualifierName,
-      scheduledAt: qt.scheduledAt,
-      registeredCount: qt.players.length,
-      maxPlayers: qt.maxPlayers,
-      status: qt.status,
-      tournamentId: qt.tournamentId,
-      players: qt.players.map(p => ({ name: p.playerName })),
-    });
-  }
-  res.json({ success: true, tournaments: list });
+  res.json({ success: true, tournaments: qualifierList(null) });
 });
 
-// REST endpoint: get specific qualifier tournament
+// REST endpoint: get specific qualifier tournament (by master id or catalog key)
 app.get('/api/qualifier-tournaments/:qualifierId', (req, res) => {
-  const qt = qualifierTournaments.get(req.params.qualifierId);
-  if (!qt) return res.json({ success: false, error: 'Not found' });
-  res.json({
-    success: true,
-    tournament: {
-      ...qt,
-      players: qt.players.map(p => ({ name: p.playerName, phone: p.phone.slice(-4) })),
-    },
-  });
+  const found = qualifierEventFor(req.params.qualifierId);
+  if (!found) return res.json({ success: false, error: 'Not found' });
+  res.json({ success: true, tournament: qualifierListItem(found[0], found[1], Date.now(), null) });
 });
 
 /**
  * Auto-start qualifier tournaments when scheduled time arrives.
  * Runs every 30 seconds.
+ * R2 (TOURNEY-3) — a qualifier still without two players when its late
+ * registration ends is CANCELLED (every consumed credit refunded) — it used to
+ * wait forever with the credits gone; finished ones leave after a day.
  */
-setInterval(() => {
-  const now = Date.now();
+function tickQualifierAutoStart(now: number = Date.now()): void {
+  pruneFinishedQualifiers(now);
   for (const [qualId, qt] of qualifierTournaments) {
     if (qt.status !== 'registering') continue;
     const scheduledTime = new Date(qt.scheduledAt).getTime();
     if (now < scheduledTime) continue;
-    if (qt.players.length < 2) continue;
+    if (qt.players.length < 2) {
+      if (now > qualifierWindows(scheduledTime).lateRegUntil) void cancelQualifierEvent(qualId, qt, 'too_few_players');
+      continue;
+    }
 
     // Time to start!
     qt.status = 'starting';
@@ -3166,13 +3609,16 @@ setInterval(() => {
         tournamentId: result.tournamentId,
         playerCount: playerCount,
         tableCount: result.tableCount,
+        registeredCount: playerCount,   // R2 (C3) — numbers
+        players: playerCount,
       });
     } else {
       qt.status = 'registering'; // revert on failure
       console.error(`[QualifierTournament] Failed to start ${qt.qualifierName}`);
     }
   }
-}, 30000);
+}
+setInterval(() => tickQualifierAutoStart(), 30000);
 
 /**
  * 2026-10-07 — qualifier PRE-START SUSPENSION SCREEN.
@@ -3222,12 +3668,8 @@ async function screenQualifierRegistrants(qualId: string, qt: QualifierTournamen
       }).catch((e) => console.warn('[play-gate] qualifier unregister persist failed:', e?.message));
     }
   }
-  io.emit('qualifierTournamentUpdate', {
-    qualifierId: qualId,
-    status: qt.status,
-    registeredCount: qt.players.length,
-    players: qt.players.map((p) => ({ name: p.playerName })),
-  });
+  // R2 (C3) — the count as a NUMBER (it listed every registrant's name to every lobby).
+  broadcastQualifierUpdate(qualId, qt);
 }
 setInterval(() => {
   const now = Date.now();
@@ -4976,13 +5418,12 @@ function reloadAndCapBotStacks(
 
 /**
  * GAME-18 (with S1) — a quick table with a FIXED roster: its bots are never
- * reloaded, capped or topped up. S1 owns the canonical predicate
- * (`isFixedRosterTable`, exported with its quick-game END work); until the
- * lanes merge this mirrors it: every quick-game registry plus club challenges.
+ * reloaded, capped or topped up. One predicate: S1's `isFixedRosterTable`
+ * (every quick format — heads-up, Spin & Go, all-in-or-fold, career — is
+ * registered in quickTables at creation, and a club challenge in both).
  */
 function isFixedRosterQuickTable(tableId: string): boolean {
-  return quickTables.has(tableId) || careerTables.has(tableId) || spinGoMultipliers.has(tableId)
-    || allInOrFoldTables.has(tableId) || challengeTables.has(tableId);
+  return isFixedRosterTable(tableId);
 }
 
 function autoStartNextHand(tableId: string): void {
@@ -5020,8 +5461,13 @@ function autoStartNextHand(tableId: string): void {
   //     reload collusion mint. A busted human stays at 0 and rebuys from their
   //     wallet (the rebuy handler, which deducts) or leaves. AI seats have no
   //     wallet, so a free reload only keeps the ring table populated — kept.
+  //  3. R2 (S1, TOURNEY-6 / GAME-7 / ECON-8 / CLUBS-1) — NEVER on a FIXED-ROSTER
+  //     table (isFixedRosterTable: Spin & Go, career, heads-up, all-in-or-fold,
+  //     club challenge): a busted bot there is OUT — reloading it made a career
+  //     stage unwinnable, a Spin & Go endless and every quick-game win a cash-out
+  //     of house chips. Those games end when decided (quickGameEndCheck).
   // R2 (GAME-18): bot stacks are CAPPED here too, and a fixed-roster quick
-  // table's bot is never reloaded (reloadAndCapBotStacks).
+  // table's bot is never reloaded nor capped (reloadAndCapBotStacks).
   if (!tournamentTables.has(tableId)) {
     reloadAndCapBotStacks(table, tableId, isFixedRosterQuickTable(tableId));
   }
@@ -5230,6 +5676,10 @@ function ensureCashTableRunning(tableId: string): void {
   // Skip quick-play / heads-up tables (#5) — they have a fixed roster; the ring
   // heartbeat would backfill AI and break their 2-seat winner logic.
   if (quickTables.has(tableId)) return;
+  // R2 (C12 / GAME-4, S1) — a private home game nobody sits at is not kept
+  // running with bots (it is removed PRIVATE_TABLE_IDLE_MS after the last human
+  // leaves — sweepIdlePrivateTables); every one used to become a 24/7 bot table.
+  if (privateTableIds.has(tableId) && !tableHasHumanSeat(table)) return;
 
   // Trim excess AI FIRST so we don't flip-flop: if autoStartNextHand /
   // legacy fillWithAI packed the table to 9/9, drop back to the target
@@ -6633,7 +7083,7 @@ async function registrantMasterId(p: { socketId: string; userId?: number }): Pro
   return null;
 }
 
-async function screenAndStartTournament(tournamentId: string, via: 'register' | 'timed'): Promise<void> {
+async function screenAndStartTournament(tournamentId: string, via: 'register' | 'timed' | 'club'): Promise<void> {
   if (tournamentStartScreensInFlight.has(tournamentId)) return;
   const t0 = tournamentManager.getTournament(tournamentId);
   if (!t0 || t0.status !== 'registering') return;
@@ -6652,7 +7102,7 @@ async function screenAndStartTournament(tournamentId: string, via: 'register' | 
       // re-reads each one from the LIVE tournament and refunds only on a real
       // removal (auth/playGate.ts).
       const removed = await removeSuspendedRegistrants(
-        tournamentManager, tournamentId, suspended, (userId, amount) => addChipsToUser(userId, amount),
+        tournamentManager, tournamentId, suspended, entryFeeRefunder(tournamentId),   // R2 — a club buy-in through its ledger key
       );
       for (const r of removed) {
         if (r.userId !== null && (r.refunded > 0 || r.refundFailed)) {
@@ -6664,6 +7114,8 @@ async function screenAndStartTournament(tournamentId: string, via: 'register' | 
           event: 'tournament_registrant_removed_suspended', tournamentId, via, masterId: r.masterId,
           localUserId: r.userId, refunded: r.refunded,
         })}`);
+        // R2 (C4) — a seller removed before the start (a no-show): his backers' escrow back.
+        if (r.userId !== null) void refundStakesOf(tournamentId, 'seller_removed', r.userId);
       }
       // S4 — fewer than two eligible registrants left: cancel + refund the
       // rest through the existing cancel path (each entrant refunded once —
@@ -6679,7 +7131,7 @@ async function screenAndStartTournament(tournamentId: string, via: 'register' | 
     }
     if (tournamentManager.canStart(tournamentId)) startTournamentGame(tournamentId);
     if (suspended.length > 0 || tournamentManager.getTournament(tournamentId)?.status === 'running') {
-      io.emit('tournamentList', tournamentManager.getTournamentList());
+      broadcastTournamentList();
     }
   } catch (e: any) {
     // Not reachable in practice (every lookup above fails open on its own).
@@ -6817,10 +7269,26 @@ function tableKindOf(tableId: string): TableKind {
   if (spinGoMultipliers.has(tableId)) return 'spingo';
   if (careerTables.has(tableId)) return 'career';
   if (allInOrFoldTables.has(tableId)) return 'aof';
-  if (quickTables.has(tableId)) return 'headsup';
+  // R2 (CLUBS-1) — a club challenge table is ALSO a quick table now (fixed
+  // roster: no AI fill / reload, cleaned up like one), so it is told apart first.
   if (challengeTables.has(tableId) || clubTableIds.has(tableId)) return 'club';
+  if (quickTables.has(tableId)) return 'headsup';
   if (privateTableIds.has(tableId)) return 'private';
   return 'cash';
+}
+
+/**
+ * R2 (TOURNEY-6 / GAME-7 / ECON-8 / CLUBS-1) — a table with a FIXED roster:
+ * every quick format (Heads-Up Snap, Spin & Go, all-in-or-fold, career) and a
+ * club challenge. Its seats are exactly the ones it started with: a busted bot
+ * is NEVER reloaded (autoStartNextHand's AI-reload loop asks this — it used to
+ * reload busted bots to minBuyIn on every quick table, so a career stage could
+ * never be won, a Spin & Go never ended and every win cashed out house chips),
+ * no AI fill / trim / heartbeat backfill (quickTables), and the game ENDS when
+ * it is decided (quickGameEndCheck). Tournament tables have their own rules.
+ */
+function isFixedRosterTable(tableId: string): boolean {
+  return quickTables.has(tableId) || challengeTables.has(tableId);
 }
 
 /**
@@ -6873,6 +7341,207 @@ function rebuyRefusalAt(tableId: string): { message: string; code: 'rebuy_not_al
     code: 'rebuy_not_allowed',
   };
 }
+
+// ========== Who may sit where (R2, 2026-10-11 — contract C1 / C12) ==========
+// TOURNEY-11 / APPUI-40 / GAME-4 / R1REV-MONEY-3: the lobby's Cash Games list
+// showed EVERY table — tournament tables (finished ones too), Spin & Go /
+// career / heads-up / all-in-or-fold tables, other people's private home games
+// and club tables — and joinTable seated a stranger at any of them (a quick
+// table's fixed roster bumped a bot; a private game was open to anyone with the
+// lobby). Now:
+//   - the list (socket getTableList + REST /api/tables) carries ONLY joinable
+//     PUBLIC cash tables (`isPublicCashTable`), each with `kind:'cash'`,
+//     `seatsTaken`, `maxSeats`, `seats:[{index, occupied, name|null}]`,
+//     `phase`, `pot`, `variant`;
+//   - joinTable / joinAdditionalTable / quickPlay / the waitlist link refuse
+//     every other kind with code `table_not_joinable` (a tournament table keeps
+//     its P5 refusal, code `tournament_table`), BEFORE any side effect;
+//   - a private table is reached only through its invite code
+//     (joinByInviteCode, which finds ONLY private tables), a club table only
+//     through joinClubTable (membership-checked; it hands joinTable a grant
+//     object no client frame can carry), a club CHALLENGE table only by its two
+//     players.
+
+/** A plain cash table anyone may sit at from the lobby (not quick / tournament / private / club). */
+function isPublicCashTable(tableId: string): boolean {
+  return !!tableManager.getTable(tableId) && tableKindOf(tableId) === 'cash';
+}
+
+/** C1 — one joinable public cash table as the lobby list shows it (seat names through the public-name rules). */
+function publicTableListItem(t: { tableId: string; maxSeats: number } & Record<string, unknown>): Record<string, unknown> | null {
+  const table = tableManager.getTable(t.tableId);
+  if (!table) return null;
+  const maxSeats = Math.max(0, Math.min(MAX_SEATS, Number(t.maxSeats) || table.maxOccupiableSeats));
+  const seats: Array<{ index: number; occupied: boolean; name: string | null }> = [];
+  let seatsTaken = 0;
+  for (let i = 0; i < maxSeats; i++) {
+    const s = table.seats[i];
+    const occupied = !!s && s.state === 'occupied';
+    if (occupied) seatsTaken++;
+    seats.push({ index: i, occupied, name: occupied ? publicNameOf(s.playerName) : null });
+  }
+  return {
+    ...t,
+    kind: 'cash',
+    maxSeats,
+    seatsTaken,
+    seats,
+    phase: table.currentPhase,
+    pot: table.getTotalPot(),
+    spectatorCount: spectators.get(t.tableId)?.size || 0,
+  };
+}
+
+/** C1 — the lobby table list: ONLY joinable public cash tables (getTableList + /api/tables). */
+function publicTableList(): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  for (const t of tableManager.getTableList()) {
+    if (!isPublicCashTable(t.tableId)) continue;
+    const item = publicTableListItem(t as any);
+    if (item) out.push(item);
+  }
+  return out;
+}
+
+const TABLE_NOT_JOINABLE_MESSAGE = 'That table is not open to join from the lobby.';
+const tableJoinRefusals = { refused: 0 };
+/**
+ * C1 — joinClubTable hands the joinTable listener a payload object it put in
+ * this set: the only way past the club-table refusal. A client frame is a fresh
+ * object socket.io parsed, so it can never be one of these.
+ */
+const clubJoinGrants = new WeakSet<object>();
+
+/**
+ * C1 — why `auth` may NOT take a seat at `tableId` through joinTable (null =
+ * he may). Tournament tables are refused before this (P5, `tournament_table`).
+ */
+function joinTableRefusalReason(tableId: string, auth: SocketAuthSession | undefined, viaClubGrant: boolean): string | null {
+  const challenge = challengeTables.get(tableId);
+  if (challenge) {
+    // A club challenge is a heads-up freezeout between its two players only.
+    return auth && (auth.userId === challenge.challengerId || auth.userId === challenge.challengedId) ? null : 'challenge_players_only';
+  }
+  const kind = tableKindOf(tableId);
+  // A tournament table is refused BEFORE this, with its own code (P5,
+  // refuseCashJoinAtTournamentTable — `tournament_table`).
+  if (kind === 'cash' || kind === 'tournament') return null;
+  if (kind === 'club') return viaClubGrant ? null : 'club_members_via_club';
+  if (kind === 'private') return 'invite_code_only';
+  return 'quick_game_table';
+}
+
+/** C1 — the refusal frame (`table_not_joinable`) on the handler's own channel. */
+function refuseTableNotJoinable(socket: Socket, via: string, tableId: string, reason: string, channel: 'error' | 'joinError' = 'error'): void {
+  tableJoinRefusals.refused++;
+  console.warn(`[join] ${JSON.stringify({ event: 'table_not_joinable', via, tableId, reason })}`);
+  socket.emit(channel, { message: TABLE_NOT_JOINABLE_MESSAGE, code: 'table_not_joinable', reason });
+}
+
+// ── Private home games (C12) ────────────────────────────────────────────────
+/** Who created a private table and when; the last moment a human sat there. */
+const privateTableMeta = new Map<string, { ownerUserId: number | null; createdAt: number; emptySince: number | null }>();
+/** C12 — a private table with no human seated for this long is removed. */
+const PRIVATE_TABLE_IDLE_MS = 10 * 60 * 1000;
+/** C12 — creation rate limit per account, and live private tables per account. */
+const privateTableCreateLimiter = createWindowRateLimiter(3, 10 * 60 * 1000);
+const MAX_LIVE_PRIVATE_TABLES_PER_ACCOUNT = 2;
+const privateTableStats = { created: 0, refusedRateLimited: 0, refusedTooMany: 0, removedIdle: 0 };
+
+/** A human holds a seat here (playing, absent, reserved or leaving after this hand). */
+function tableHasHumanSeat(table: PokerTable): boolean {
+  return table.seats.some((s) => s.state === 'occupied' && !s.isAI);
+}
+
+/** The invite code of a private table (first 8 chars of its id, upper-case). */
+function privateInviteCode(tableId: string): string {
+  return tableId.slice(0, 8).toUpperCase();
+}
+
+/** C12 — the private table an invite code opens (private tables ONLY), or null. */
+function privateTableByInviteCode(code: unknown): { tableId: string; table: PokerTable } | null {
+  if (typeof code !== 'string') return null;
+  const wanted = code.trim().toLowerCase();
+  if (!/^[0-9a-f]{8}$/.test(wanted)) return null;
+  for (const tableId of privateTableIds) {
+    if (tableId.slice(0, 8).toLowerCase() !== wanted) continue;
+    const table = tableManager.getTable(tableId);
+    if (table) return { tableId, table };
+  }
+  return null;
+}
+
+/**
+ * C12 — remove a private table nobody sits at any more: bots stood up, every
+ * session / spectator / room / timer of it ended. No human seat is left (the
+ * caller checked), so nothing is credited: there are no wallet chips on it.
+ */
+function removeIdlePrivateTable(tableId: string): void {
+  const table = tableManager.getTable(tableId);
+  if (table && tableHasHumanSeat(table)) return;   // someone sat down meanwhile
+  io.to(`table:${tableId}`).emit('tableClosed', { tableId, reason: 'private_table_idle' });
+  endTableViewsAndTimers(tableId);
+  if (table) for (let i = 0; i < MAX_SEATS; i++) if (table.seats[i].state === 'occupied') table.standUp(i);
+  tableManager.removeTable(tableId);
+  tableProgressListeners.delete(tableId);
+  privateTableIds.delete(tableId);
+  privateTableMeta.delete(tableId);
+  bombPotPending.delete(tableId);
+  privateTableStats.removedIdle++;
+  console.log(`[privateTable] ${JSON.stringify({ event: 'private_table_removed_idle', tableId })}`);
+}
+
+/**
+ * Every session, spectator view, room membership and timer bound to a table
+ * that is going away (a removed private table, a retired finished tournament
+ * table, a finished quick game). Seats are the caller's business.
+ */
+function endTableViewsAndTimers(tableId: string): void {
+  const room = `table:${tableId}`;
+  for (const [sid, s] of [...playerSessions]) {
+    if (s.tableId !== tableId) continue;
+    playerSessions.delete(sid);
+    releaseSeatedSlot(sid, tableId);
+    io.sockets.sockets.get(sid)?.leave(room);
+    lastSentState.delete(sid); lastSentJson.delete(sid);
+  }
+  for (const [sid, list] of multiTableSessions) {
+    const kept = list.filter((ms) => ms.tableId !== tableId);
+    if (kept.length === list.length) continue;
+    io.sockets.sockets.get(sid)?.leave(room);
+    if (kept.length > 0) multiTableSessions.set(sid, kept); else multiTableSessions.delete(sid);
+  }
+  const specs = spectators.get(tableId);
+  if (specs) {
+    for (const sid of specs) io.sockets.sockets.get(sid)?.leave(room);
+    spectators.delete(tableId);
+  }
+  pendingSeatRemovalAfterHand.delete(tableId);
+  sitOutTracker.delete(tableId);
+  aiProfiles.delete(tableId);
+  const tt = turnTimers.get(tableId); if (tt) { clearTimeout(tt.timeout); turnTimers.delete(tableId); }
+  const tw = turnWarningTimers.get(tableId); if (tw) { clearTimeout(tw.timeout); turnWarningTimers.delete(tableId); }
+  const pa = pendingAutoStartTimers.get(tableId); if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(tableId); }
+  const ai = aiTimeouts.get(tableId); if (ai) { clearTimeout(ai.handle); aiTimeouts.delete(tableId); }
+  insuranceCashouts.delete(tableId);
+  clearInsuranceOffer(tableId);
+}
+
+/** C12 — every minute: a private table with no human seat for PRIVATE_TABLE_IDLE_MS is removed. */
+function sweepIdlePrivateTables(now: number = Date.now()): void {
+  for (const tableId of [...privateTableIds]) {
+    const table = tableManager.getTable(tableId);
+    if (!table) { privateTableIds.delete(tableId); privateTableMeta.delete(tableId); continue; }
+    let meta = privateTableMeta.get(tableId);
+    if (!meta) { meta = { ownerUserId: null, createdAt: now, emptySince: null }; privateTableMeta.set(tableId, meta); }
+    if (tableHasHumanSeat(table)) { meta.emptySince = null; continue; }
+    if (meta.emptySince === null) { meta.emptySince = now; continue; }
+    if (now - meta.emptySince >= PRIVATE_TABLE_IDLE_MS) removeIdlePrivateTable(tableId);
+  }
+}
+setInterval(() => {
+  try { sweepIdlePrivateTables(); } catch (e: any) { console.error('[privateTable] sweep failed:', e?.message || e); }
+}, 60_000).unref?.();
 
 // ========== All-in insurance (R1 contract #1, 2026-10-11 — ECON-1 / TABLEUI-1) ==========
 // The house buys an all-in player's equity at 90%. Before R1 the price came
@@ -7199,6 +7868,19 @@ async function publicStakingOffers(offers: any[]): Promise<any[]> {
 }
 
 /**
+ * R2 (C4) — the marketplace as ONE viewer sees it (`pub` = publicStakingOffers
+ * of `raw`, same order): `isMine` — his own offer, by ACCOUNT (the client hid
+ * the Buy button on another seller's offer whose NAME matched) — and, on his
+ * own offers only, `sellerUserId` (no other account's id: R1).
+ */
+function stakingOffersForViewer(raw: any[], pub: any[], viewerUserId: number | undefined): any[] {
+  return pub.map((o, i) => {
+    const mine = viewerUserId !== undefined && Number(raw[i]?.sellerId) === viewerUserId;
+    return { ...o, isMine: mine, sellerUserId: mine ? viewerUserId : null };
+  });
+}
+
+/**
  * Tournament standings as other players see them: names through the public
  * rules (a qualifier entrant's registration name could be his login handle),
  * and the entrant ids — a qualifier entrant's id WAS his login handle — as
@@ -7220,9 +7902,333 @@ function publicTournamentStandings(standings: any): any {
   };
 }
 
+// R2 (ECON-17) — every prize / refund settlement: one transaction, an
+// idempotent ledger key per credit, retried until it commits (src/game/prizeLedger.ts).
+const prizeLedger = createPrizeLedger({
+  connect: () => getPool().connect() as any,
+  log: (line) => console.warn(line),
+});
+setInterval(() => {
+  if (prizeLedger.pendingCount() === 0) return;
+  prizeLedger.retryPending().catch((e: any) => console.error('[prize-ledger] retry sweep failed:', e?.message || e));
+}, 60_000).unref?.();
+
+// ========== Quick games: a real END (R2, 2026-10-11 — S1) ==========
+// TOURNEY-6 / GAME-7 / ECON-8 / CLUBS-1 + the R1 money reviewer's P2. Every
+// quick format and a club challenge is a FIXED-ROSTER game (isFixedRosterTable:
+// no AI reload / fill, no rebuy). Before R2 a busted bot was reloaded at every
+// hand boundary: heads-up / all-in-or-fold never ended, a career stage could
+// never be won (user_career_progress 0 rows), a Spin & Go never settled, and
+// a quick table nobody sat at any more kept ~200 bot reloads an hour going.
+// Now, after every hand (and after a leave / a reservation stand-up — the
+// sweep), quickGameEndCheck asks quickGameOutcome (src/game/quickGames.ts):
+//   - over → every bot seat is stood up at once (its chips are the house's: no
+//     further hand can be dealt), the result is shown (quickGameOver /
+//     careerGameComplete / clubChallengeResolved), the game is SETTLED, and the
+//     table is cleaned up QUICK_GAME_CLEANUP_DELAY_MS later;
+//   - heads-up, all-in-or-fold, career and a club challenge are CASH games:
+//     cleanupQuickTable cashes the human's stack out (session, reservation or
+//     pending removal — whoever holds the seat; his reservation ends there, so
+//     it is credited exactly once);
+//   - a Spin & Go is a PRIZE format (isPrizeFormatTable): the buy-in is an
+//     ENTRY FEE and the stack is never cashed out by anything — a human win
+//     pays multiplier x fee through the prize ledger (ECON-17: once, never
+//     marked paid before the credit), a bust pays nothing, a voluntary leave
+//     FORFEITS (it used to cash out up to 3x — more than a 2x win paid), a
+//     forced removal / the shutdown flush / an admin close refund the fee once;
+//   - a quick table with no human seat left is cleaned up by the sweep.
+interface QuickGameState {
+  format: QuickFormat;
+  /** The human who bought in (vs-bots formats); null for a club challenge. */
+  ownerUserId: number | null;
+  ownerName: string;
+  /** What he paid to start it (a Spin & Go: the prize format's entry fee). */
+  entryFee: number;
+  ended: boolean;
+  /** open → won (Spin & Go prize paid) | lost | forfeited | refunded | cashed (a cash format cleaned up). */
+  settlement: 'open' | 'won' | 'lost' | 'forfeited' | 'refunded' | 'cashed';
+  /** Heads-Up Snap's 5-minute clock ran out: decided by chips at the next hand boundary. */
+  timeUp?: boolean;
+  createdAt: number;
+  /** A club challenge starts when BOTH players sit (vs-bots formats: at once). */
+  started: boolean;
+  multiplier?: number;
+  challengeId?: number;
+  /** Format-specific end (career progress + reward). */
+  onEnd?: (outcome: { winnerSeat: number | null; humanWon: boolean }) => void;
+  /** R2 — the decided outcome, settled after QUICK_GAME_RESULT_DELAY_MS (the shutdown flush settles it at once). */
+  decided?: { winnerSeat: number | null; humanWon: boolean };
+  /** finishQuickGame ran (its result + settlement happen once). */
+  finished?: boolean;
+}
+const quickGames = new Map<string, QuickGameState>();
+const quickGameStats = {
+  started: 0, ended: 0, humanWins: 0, spinGoPrizes: 0, spinGoForfeits: 0, entryFeesRefunded: 0,
+  cleanedNoHuman: 0, cashedOut: 0,
+};
+const QUICK_GAME_RESULT_DELAY_MS = 1000;   // the final hand is seen before the result
+const QUICK_GAME_CLEANUP_DELAY_MS = 5000;  // the result is seen before the table goes
+/** A club challenge whose two players have not both sat down by then is void (no winner; stacks cashed out). */
+const CHALLENGE_JOIN_GRACE_MS = 3 * 60 * 1000;
+
+/** R2 (ECON-8) — a PRIZE format (Spin & Go): its stacks are never wallet chips. */
+function isPrizeFormatTable(tableId: string): boolean {
+  return spinGoMultipliers.has(tableId);
+}
+
+/** Start tracking a quick game: its end is checked after every hand. */
+function registerQuickGame(tableId: string, table: PokerTable, state: Omit<QuickGameState, 'ended' | 'settlement' | 'createdAt' | 'started'>): void {
+  quickGames.set(tableId, { ...state, ended: false, settlement: 'open', createdAt: Date.now(), started: state.format !== 'challenge' });
+  quickGameStats.started++;
+  table.on('handResult', () => {
+    try { quickGameEndCheck(tableId, 'hand_result'); } catch (e: any) {
+      console.error(`[QuickGame] end check failed on ${tableId}:`, e?.message || e);
+    }
+  });
+}
+
+/** The human (account) holding a quick-table seat: his session, his reservation, or a pending after-hand removal. */
+function quickSeatOwner(tableId: string, seatIndex: number): { userId: number; username: string } | null {
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId !== tableId || s.seatIndex !== seatIndex) continue;
+    const a = authSessions.get(sid);
+    if (a) return { userId: a.userId, username: a.username };
+  }
+  for (const [sid, list] of multiTableSessions) {
+    if (!list.some((s) => s.tableId === tableId && s.seatIndex === seatIndex)) continue;
+    const a = authSessions.get(sid);
+    if (a) return { userId: a.userId, username: a.username };
+  }
+  for (const [uid, r] of reservedSeats) {
+    if (r.tableId === tableId && r.seatIndex === seatIndex) return { userId: uid, username: r.playerName || String(uid) };
+  }
+  const pend = pendingSeatRemovalAfterHand.get(tableId)?.get(seatIndex);
+  return pend ? { userId: pend.userId, username: pend.username } : null;
+}
+
+/** The claims on a seat that would credit it LATER (reservation timer, pending removal) end now. */
+function endQuickSeatClaims(tableId: string, seatIndex: number): void {
+  for (const [uid, r] of [...reservedSeats]) {
+    if (r.tableId !== tableId || r.seatIndex !== seatIndex) continue;
+    clearTimeout(r.cleanupTimer);
+    reservedSeats.delete(uid);
+  }
+  pendingSeatRemovalAfterHand.get(tableId)?.delete(seatIndex);
+}
+
+/**
+ * Is this quick game decided? Never mid-hand. On a decision: every bot seat is
+ * stood up NOW (its chips are the house's — no further hand can be dealt, so a
+ * pending auto-start finds < 2 players), the clocks stop, and the result and
+ * settlement follow (finishQuickGame). Returns true when it ended the game.
+ */
+function quickGameEndCheck(tableId: string, via: string): boolean {
+  const qg = quickGames.get(tableId);
+  const table = tableManager.getTable(tableId);
+  if (!qg || !table || qg.ended || table.isHandInProgress()) return false;
+  if (qg.format === 'challenge' && !qg.started) {
+    // Not under way until BOTH players sit; never decided by who arrived first.
+    const humansSeated = table.seats.filter((s) => s.state === 'occupied' && !s.isAI).length;
+    if (humansSeated >= 2) qg.started = true;
+    else if (Date.now() - qg.createdAt < CHALLENGE_JOIN_GRACE_MS) return false;
+    else {
+      qg.ended = true;
+      quickGameStats.ended++;
+      console.log(`[QuickGame] ${JSON.stringify({ event: 'club_challenge_void_no_show', tableId, challengeId: qg.challengeId ?? null, humansSeated })}`);
+      const tv = setTimeout(() => finishQuickGame(tableId, { winnerSeat: null, humanWon: false }), QUICK_GAME_RESULT_DELAY_MS);
+      (tv as any)?.unref?.();
+      return true;
+    }
+  }
+  let outcome = quickGameOutcome(qg.format, table.seats);
+  if (!outcome.over && qg.timeUp) {
+    // Heads-Up Snap's clock ran out: the bigger stack wins (a tie goes to the human).
+    const live = table.seats.filter((s) => s.state === 'occupied' && !s.eliminated);
+    let best: (typeof live)[number] | null = null;
+    for (const s of live) if (!best || s.chipCount > best.chipCount || (s.chipCount === best.chipCount && !s.isAI)) best = s;
+    outcome = { over: true, winnerSeat: best ? best.seatIndex : null, humanWon: !!best && !best.isAI, reason: 'last_standing' };
+  }
+  if (!outcome.over) return false;
+  qg.ended = true;
+  quickGameStats.ended++;
+  if (outcome.humanWon && qg.format !== 'challenge') quickGameStats.humanWins++;
+  if (qg.format !== 'challenge') {
+    for (const s of table.seats) {
+      if (s.state !== 'occupied' || !s.isAI) continue;
+      table.standUp(s.seatIndex);
+      aiProfiles.get(tableId)?.delete(s.seatIndex);
+    }
+  }
+  const timers = quickGameTimers.get(tableId);
+  if (timers) { clearInterval(timers.blindInterval); clearTimeout(timers.gameTimeout); }
+  const pa = pendingAutoStartTimers.get(tableId);
+  if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(tableId); }
+  console.log(`[QuickGame] ${JSON.stringify({
+    event: 'quick_game_over', tableId, format: qg.format, via, winnerSeat: outcome.winnerSeat,
+    humanWon: outcome.humanWon, reason: outcome.reason, timeUp: !!qg.timeUp,
+  })}`);
+  const decided = { winnerSeat: outcome.winnerSeat, humanWon: outcome.humanWon };
+  qg.decided = decided;
+  const t = setTimeout(() => finishQuickGame(tableId, decided), QUICK_GAME_RESULT_DELAY_MS);
+  (t as any)?.unref?.();
+  return true;
+}
+
+/** Heads-Up Snap's 5-minute clock: decided now between hands, else at the end of this hand. */
+function quickGameTimeUp(tableId: string): void {
+  const qg = quickGames.get(tableId);
+  if (!qg || qg.ended) return;
+  qg.timeUp = true;
+  quickGameEndCheck(tableId, 'time_up');
+}
+
+/** A quick game's result: to the table room + the owner's other live sockets. */
+function emitQuickGameEvent(tableId: string, qg: QuickGameState, event: string, payload: Record<string, unknown>): void {
+  const room = `table:${tableId}`;
+  io.to(room).emit(event, payload);
+  if (qg.ownerUserId === null) return;
+  for (const [sid, a] of authSessions) {
+    if (a.userId !== qg.ownerUserId) continue;
+    const sock = io.sockets.sockets.get(sid);
+    if (sock && sock.connected && !sock.rooms?.has(room)) sock.emit(event, payload);
+  }
+}
+
+/** The result + the settlement of an ended quick game, then the table goes. */
+function finishQuickGame(tableId: string, outcome: { winnerSeat: number | null; humanWon: boolean }): void {
+  const qg = quickGames.get(tableId);
+  if (!qg || qg.finished) return;
+  qg.finished = true;   // once (the shutdown flush may settle a decided game before its timer)
+  const table = tableManager.getTable(tableId);
+  const winnerSeat = outcome.winnerSeat !== null && table ? table.seats[outcome.winnerSeat] : undefined;
+  const winnerName = winnerSeat && winnerSeat.state === 'occupied' ? winnerSeat.playerName : '';
+  const winnerChips = winnerSeat && winnerSeat.state === 'occupied' ? winnerSeat.chipCount : 0;
+  // A vs-bots game that ended because its human LEFT (his seat is gone — a
+  // leave already settled it) shows no result screen to anyone.
+  const humanLeft = qg.format !== 'challenge' && !!table && !tableHasHumanSeat(table);
+  try {
+    if (humanLeft) {
+      if (qg.settlement === 'open') qg.settlement = isPrizeFormatTable(tableId) ? 'lost' : 'cashed';
+    } else if (qg.format === 'spinGo') {
+      const multiplier = qg.multiplier || 2;
+      const prize = multiplier * qg.entryFee;
+      const won = outcome.humanWon && qg.ownerUserId !== null && qg.settlement === 'open';
+      if (won) {
+        qg.settlement = 'won';
+        quickGameStats.spinGoPrizes++;
+        const ownerUserId = qg.ownerUserId as number;
+        void prizeLedger.settle({
+          label: `spingo:${tableId}`,
+          credits: [{ key: `spingo:${tableId}:prize`, userId: ownerUserId, amount: prize, kind: 'SPINGO_PRIZE', details: { tableId, multiplier, entryFee: qg.entryFee } }],
+        }).then((r) => auditLog(qg.ownerName || String(ownerUserId), r.status === 'committed' ? 'SPINGO_PRIZE' : 'SPINGO_PRIZE_PENDING_RETRY',
+          { userId: ownerUserId, tableId, multiplier, prize, attempts: r.attempts }));
+      } else if (qg.settlement === 'open') {
+        qg.settlement = 'lost';
+      }
+      emitQuickGameEvent(tableId, qg, 'quickGameOver', {
+        type: 'spinGo', tableId, winner: winnerName, multiplier, prize: won ? prize : 0, won,
+        message: won ? `${winnerName} wins ${prize.toLocaleString()} chips (${multiplier}x)!`
+          : (winnerName ? `${winnerName} wins the Spin & Go.` : 'The Spin & Go is over.'),
+      });
+    } else if (qg.format === 'headsUp' || qg.format === 'allInOrFold') {
+      emitQuickGameEvent(tableId, qg, 'quickGameOver', {
+        type: qg.format, tableId, winner: winnerName, chips: winnerChips, won: outcome.humanWon,
+        message: qg.timeUp
+          ? `Time's up! ${winnerName || 'Nobody'} wins with ${winnerChips.toLocaleString()} chips!`
+          : (outcome.humanWon ? `${winnerName} wins with ${winnerChips.toLocaleString()} chips!` : `${winnerName || 'The house'} wins — better luck next time.`),
+      });
+    } else if (qg.format === 'career') {
+      qg.onEnd?.(outcome);
+    } else if (qg.format === 'challenge') {
+      const winnerUid = outcome.winnerSeat !== null ? quickSeatOwner(tableId, outcome.winnerSeat)?.userId ?? null : null;
+      if (qg.challengeId !== undefined) resolveChallenge(qg.challengeId, winnerUid).catch(() => {});
+      io.to(`table:${tableId}`).emit('clubChallengeResolved', { challengeId: qg.challengeId, winnerId: winnerUid });
+    }
+  } catch (e: any) {
+    console.error(`[QuickGame] finish failed on ${tableId}:`, e?.message || e);
+  }
+  const t = setTimeout(() => cleanupQuickTable(tableId), QUICK_GAME_CLEANUP_DELAY_MS);
+  (t as any)?.unref?.();
+}
+
+/**
+ * Refund a quick game's ENTRY FEE once (a Spin & Go interrupted by the server,
+ * an admin close or a removal that was not the player's choice). Through the
+ * prize ledger — never twice for one table.
+ */
+function refundQuickEntryFee(tableId: string, qg: QuickGameState, reason: string): Promise<unknown> {
+  if (qg.settlement !== 'open' || qg.ownerUserId === null || !(qg.entryFee > 0)) return Promise.resolve();
+  qg.settlement = 'refunded';
+  quickGameStats.entryFeesRefunded++;
+  const ownerUserId = qg.ownerUserId;
+  return prizeLedger.settle({
+    label: `quickfee:${tableId}`,
+    credits: [{ key: `quickfee:${tableId}`, userId: ownerUserId, amount: qg.entryFee, kind: 'QUICK_ENTRY_REFUND', details: { tableId, format: qg.format, reason } }],
+  }).then((r) => auditLog(qg.ownerName || String(ownerUserId), r.status === 'committed' ? 'QUICK_ENTRY_REFUND' : 'QUICK_ENTRY_REFUND_PENDING_RETRY',
+    { userId: ownerUserId, tableId, format: qg.format, amount: qg.entryFee, reason }));
+}
+
+/**
+ * R2 (ECON-8) — handlePlayerLeave on a Spin & Go seat. The prize format's
+ * stack is never cashed out: a VOLUNTARY leave forfeits the entry; a leave that
+ * is not his choice ('kept': a suspension stand-up, an admin removal, an
+ * account switch's fall-through) refunds the entry fee once. Either way his
+ * game is over: the seat is stood up and handlePlayerLeave's quick-table tail
+ * removes the table. true = handled (handlePlayerLeave skips its cash teardown).
+ */
+function leavePrizeFormatSeat(socket: Socket, session: PlayerSession, table: PokerTable, kind: TournamentSeatLeaveKind): boolean {
+  if (!isPrizeFormatTable(session.tableId)) return false;
+  const seat = table.seats[session.seatIndex];
+  if (!seat || seat.state !== 'occupied' || seat.isAI) return false;
+  const qg = quickGames.get(session.tableId);
+  if (qg && qg.settlement === 'open') {
+    if (kind === 'voluntary') {
+      qg.settlement = 'forfeited';
+      quickGameStats.spinGoForfeits++;
+      auditLog(qg.ownerName || String(qg.ownerUserId), 'SPINGO_FORFEIT', { userId: qg.ownerUserId, tableId: session.tableId, stack: seat.chipCount, entryFee: qg.entryFee });
+    } else {
+      void refundQuickEntryFee(session.tableId, qg, `leave_${kind}`);
+    }
+  }
+  if (qg) qg.ended = true;
+  sitOutTracker.get(session.tableId)?.delete(session.seatIndex);
+  seat.deadBlindOwedChips = 0;
+  seat.missedBlind = 'none';
+  endQuickSeatClaims(session.tableId, session.seatIndex);
+  table.standUp(session.seatIndex);
+  socket.leave(`table:${session.tableId}`);
+  return true;
+}
+
+/** A quick table with no human seat left is cleaned up (bots never play on alone); an undecided game is checked. */
+function sweepQuickTables(): void {
+  for (const tableId of [...quickTables]) {
+    const table = tableManager.getTable(tableId);
+    if (!table) { cleanupQuickTable(tableId); continue; }
+    const qg = quickGames.get(tableId);
+    if (qg && qg.ended) continue;   // its cleanup is already scheduled
+    // A club challenge waits (CHALLENGE_JOIN_GRACE_MS) for its two players to sit.
+    const waitingForPlayers = !!qg && qg.format === 'challenge' && !qg.started && Date.now() - qg.createdAt < CHALLENGE_JOIN_GRACE_MS;
+    if (!tableHasHumanSeat(table) && !waitingForPlayers) {
+      quickGameStats.cleanedNoHuman++;
+      console.log(`[QuickGame] ${JSON.stringify({ event: 'quick_table_no_human_cleaned', tableId, format: qg?.format ?? tableKindOf(tableId) })}`);
+      cleanupQuickTable(tableId);
+      continue;
+    }
+    quickGameEndCheck(tableId, 'sweep');
+  }
+}
+setInterval(() => {
+  try { sweepQuickTables(); } catch (e: any) { console.error('[QuickGame] sweep failed:', e?.message || e); }
+}, 15_000).unref?.();
+
 function cleanupQuickTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
+  const qg = quickGames.get(tableId);
+  // R2 (ECON-8) — a Spin & Go's stacks are the prize format's, never cashed.
+  const prizeFormat = isPrizeFormatTable(tableId);
   if (table) {
+    io.to(`table:${tableId}`).emit('tableClosed', { tableId, reason: 'quick_game_over' });
     // 2026-07-01 audit #2: credit each seated HUMAN's stack back to their wallet
     // BEFORE standUp erases it. The buy-in was deducted at join, and a natural
     // quick-game end (timer / elimination) runs neither handlePlayerLeave nor
@@ -7231,38 +8237,43 @@ function cleanupQuickTable(tableId: string): void {
     // stake incl. any mid-hand pot chips (same pattern as gracefulShutdown /
     // adminForceCloseTable). Chip-conserving: crediting winner + loser stacks
     // sums to the total bought in.
+    // R2 — the seat's owner is found through his session, his RESERVATION or a
+    // pending after-hand removal (a disconnected player was never credited
+    // here, and his reservation later paid its stale snapshot to the wallet);
+    // those claims end here, so the seat is credited exactly once.
     const inHand = table.isHandInProgress();
     const isTournament = isTournamentTable(tableId);
     for (let i = 0; i < MAX_SEATS; i++) {
       const seat = table.seats[i];
       if (!seat || seat.state !== 'occupied') continue;
       if (!seat.isAI && !isTournament) {
-        const uid = userIdForSeat(tableId, i);
-        if (uid) {
-          let uname = String(uid);
-          for (const [, a] of authSessions) if (a.userId === uid) { uname = a.username; break; }
+        const owner = quickSeatOwner(tableId, i);
+        endQuickSeatClaims(tableId, i);
+        if (owner && !prizeFormat) {
           const refund = seat.chipCount + (inHand ? (seat.totalInvestedThisHand || 0) : 0);
           if (refund > 0) {
-            addChipsToUser(uid, refund)
-              .then((ok) => auditLog(uname, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: uid, tableId, amount: refund, reason: 'quick_game_end' }))
+            quickGameStats.cashedOut++;
+            addChipsToUser(owner.userId, refund)
+              .then((ok) => auditLog(owner.username, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: owner.userId, tableId, amount: refund, reason: 'quick_game_end' }))
               .catch(() => {});
           }
+        } else if (owner && prizeFormat && seat.chipCount > 0) {
+          auditLog(owner.username, 'SPINGO_STACK_NOT_CASHED', { userId: owner.userId, tableId, chips: seat.chipCount, settlement: qg?.settlement ?? null });
         }
       }
       table.standUp(i);
     }
   }
-  aiProfiles.delete(tableId);
+  if (qg && qg.settlement === 'open') qg.settlement = prizeFormat ? 'lost' : 'cashed';
+  // A club challenge that never reached a result (both left / never both sat) is closed with no winner.
+  const unresolvedChallenge = challengeTables.get(tableId);
+  if (unresolvedChallenge && !(qg && qg.ended)) resolveChallenge(unresolvedChallenge.challengeId, null).catch(() => {});
+  quickGames.delete(tableId);
+  // Sessions / spectators / rooms / turn + AI + auto-start timers of the table end with it.
+  endTableViewsAndTimers(tableId);
   tableManager.removeTable(tableId);
   tableProgressListeners.delete(tableId);
   quickTables.delete(tableId); // #5
-
-  // #12 (2026-07-01 audit): clear the turn/warning/autostart timer entries for
-  // this table so they don't fire against a removed table (guarded no-ops, but
-  // leaked map entries otherwise).
-  const tt = turnTimers.get(tableId); if (tt) { clearTimeout(tt.timeout); turnTimers.delete(tableId); }
-  const tw = turnWarningTimers.get(tableId); if (tw) { clearTimeout(tw.timeout); turnWarningTimers.delete(tableId); }
-  const pa = pendingAutoStartTimers.get(tableId); if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(tableId); }
 
   const timers = quickGameTimers.get(tableId);
   if (timers) {
@@ -7274,15 +8285,7 @@ function cleanupQuickTable(tableId: string): void {
   spinGoMultipliers.delete(tableId);
   allInOrFoldTables.delete(tableId);
   careerTables.delete(tableId);
-  insuranceCashouts.delete(tableId);
-  clearInsuranceOffer(tableId);
   challengeTables.delete(tableId);
-
-  const timeoutKey = tableId;
-  if (aiTimeouts.has(timeoutKey)) {
-    clearTimeout(aiTimeouts.get(timeoutKey)!.handle);
-    aiTimeouts.delete(timeoutKey);
-  }
 }
 
 // ========== Socket.io Events ==========
@@ -7300,8 +8303,10 @@ io.on('connection', (socket: Socket) => {
       if (Sentry) Sentry.captureException(err, { tags: { area: 'socket.handler', event } });
     },
   });
-  // Per-IP connection limit
-  const clientIp = socket.handshake.address;
+  // Per-IP connection limit — R2 (OPS-6): keyed on the REAL client address
+  // (realClientIp), not the Railway proxy hop (which made the cap do nothing).
+  // Also the key of the same-network seat block (ipSeatedSlots) below.
+  const clientIp = realClientIp(socket);
   if (!ipConnections.has(clientIp)) ipConnections.set(clientIp, new Set());
   const ipSockets = ipConnections.get(clientIp)!;
   if (ipSockets.size >= MAX_CONNECTIONS_PER_IP) {
@@ -7310,8 +8315,8 @@ io.on('connection', (socket: Socket) => {
     return;
   }
   // Batch 5: reject IP-banned addresses (in-memory admin incident tool). Match
-  // on the real client IP (X-Forwarded-For aware), not the proxy hop.
-  if (bannedIPs.has(realClientIp(socket))) {
+  // on the real client IP (X-Real-IP / X-Forwarded-For aware), not the proxy hop.
+  if (bannedIPs.has(clientIp)) {
     socket.emit('error', { message: 'Access denied' });
     socket.disconnect(true);
     return;
@@ -7508,58 +8513,49 @@ io.on('connection', (socket: Socket) => {
       return;
     }
 
-    const qualId = data.qualifierId;
-    let qt = qualifierTournaments.get(qualId);
-
-    // Create registration if it doesn't exist yet
-    if (!qt) {
-      // Default config — frontend should send these but fallback to defaults
-      qt = {
-        qualifierId: qualId,
-        qualifierType: qualId.includes('monthly') ? 'monthly' : 'weekly',
-        qualifierName: qualId.includes('monthly') ? 'Monthly Major Qualifier' : 'Weekly Qualifier',
-        scheduledAt: new Date(Date.now() + 7 * 86400000).toISOString(), // default: 7 days from now
-        startingStack: 50000,
-        maxPlayers: 999,
-        players: [],
-        status: 'registering',
-        tournamentId: null,
-        blindStructure: [],
-        requiresQualifierCredit: true,
-      };
-      qualifierTournaments.set(qualId, qt);
+    // R2 (2026-10-11, C3 / TOURNEY-2 / TOURNEY-3) — ONLY an event the master
+    // schedule lists: its master id, or the lobby catalog key
+    // ('weekly-qualifier') → the current event of that kind
+    // (qualifierEventFor). This used to CREATE one when the registry had none
+    // — 7 days out, one per TYPE, never finished — so the lobby said "Signup
+    // opens in 165h" and nobody ever played a qualifier.
+    const found = qualifierEventFor(data?.qualifierId);
+    if (!found) {
+      socket.emit('qualifierRegistrationResult', { success: false, code: 'qualifier_not_found', error: 'This qualifier is not on the schedule right now.', qualifierId: data?.qualifierId });
+      return;
     }
+    const [qualId, qt] = found;
+    const refuseQualifier = (code: string, error: string, extra: Record<string, unknown> = {}) =>
+      socket.emit('qualifierRegistrationResult', { success: false, code, error, qualifierId: qualId, ...extra });
 
-    const LATE_REG_WINDOW_MS = 1.5 * 60 * 60 * 1000; // 1.5 hours after start
-    const SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000; // 3 hours before start
-    const phone = (data.phone || '').trim();
-
-    // Signup window: opens 3 hours before scheduledAt, closes 1.5 hours after scheduledAt
+    // Signup window (qualifierWindows): opens 3 hours before the start; closes
+    // — late registration included — 90 minutes after it.
     const scheduledTime = new Date(qt.scheduledAt).getTime();
     const now = Date.now();
-    const signupOpensAt = scheduledTime - SIGNUP_OPENS_BEFORE_MS;
-    const signupClosesAt = scheduledTime + LATE_REG_WINDOW_MS;
-
-    if (now < signupOpensAt) {
-      const opensIn = Math.ceil((signupOpensAt - now) / 60000);
+    const windows = qualifierWindows(scheduledTime);
+    if (qt.status === 'finished') {
+      refuseQualifier('registration_closed', qt.cancelled ? 'This qualifier was cancelled.' : 'This qualifier has finished.');
+      return;
+    }
+    if (now < windows.signupOpensAt) {
+      const opensIn = Math.ceil((windows.signupOpensAt - now) / 60000);
       const h = Math.floor(opensIn / 60);
       const m = opensIn % 60;
       const timeStr = h > 0 ? `${h}h ${m}m` : `${m}m`;
-      socket.emit('qualifierRegistrationResult', { success: false, error: `Signup opens in ${timeStr}` });
+      refuseQualifier('signup_not_open', `Signup opens in ${timeStr}`, { signupOpensAt: new Date(windows.signupOpensAt).toISOString() });
       return;
     }
 
-    if (now > signupClosesAt) {
-      socket.emit('qualifierRegistrationResult', { success: false, error: 'Signup window has closed' });
+    if (now > windows.signupClosesAt) {
+      refuseQualifier('signup_closed', 'Signup window has closed');
       return;
     }
 
-    // Check if tournament is in late-registration window (running but within 1.5 hours)
-    const isLateReg = qt.status === 'running' && qt.tournamentId &&
-      (now - scheduledTime) < LATE_REG_WINDOW_MS;
+    // Late registration: the event is RUNNING and its late window is still open.
+    const isLateReg = qt.status === 'running' && !!qt.tournamentId && now <= windows.lateRegUntil;
 
     if (qt.status !== 'registering' && !isLateReg) {
-      socket.emit('qualifierRegistrationResult', { success: false, error: 'Tournament is no longer accepting registrations' });
+      refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
       return;
     }
 
@@ -7571,19 +8567,22 @@ io.on('connection', (socket: Socket) => {
     // Placed before BOTH the re-entry and first-entry branches so it covers all
     // entry paths.
     if (!(await isPlayerQualified(masterId, qt.qualifierType))) {
-      socket.emit('qualifierRegistrationResult', { success: false, error: `You need a ${qt.qualifierType} qualifier credit to enter. Earn one by finishing top-5 in a live game (weekly) or finishing top-20% of your league standings (monthly).` });
+      refuseQualifier('not_qualified', `You need a ${qt.qualifierType} qualifier credit to enter. Earn one by finishing top-5 in a live game (weekly) or finishing top-20% of your league standings (monthly).`);
       return;
     }
 
-    // Check if player is already registered and NOT eliminated (can't double-enter)
-    const existingEntry = qt.players.find(p => p.playerId === (auth.username || phone) || (phone && p.phone === phone));
+    // Check if player is already registered and NOT eliminated (can't double-enter).
+    // R2 (TOURNEY-3 / AUTH-9) — the entry is the MASTER ACCOUNT's: it used to be
+    // matched by the login handle or a CLIENT-SENT phone (anyone could type
+    // another player's number — and unregister him).
+    const existingEntry = qt.players.find((p) => !!p.masterPlayerId && p.masterPlayerId === masterId);
     if (existingEntry) {
       // Check if they were eliminated — if so, allow re-entry (costs another credit)
       const tournament = qt.tournamentId ? tournamentManager.getTournament(qt.tournamentId) : null;
       const wasEliminated = tournament?.players.find(p => p.playerId === existingEntry.playerId)?.eliminated;
 
       if (!wasEliminated) {
-        socket.emit('qualifierRegistrationResult', { success: false, error: 'Already registered and still playing' });
+        refuseQualifier('already_registered', tournament ? 'Already registered and still playing' : 'You are already registered for this qualifier.', { registered: true });
         return;
       }
 
@@ -7601,7 +8600,16 @@ io.on('connection', (socket: Socket) => {
         const maxReEntries = qt.maxReEntries ?? MAX_RE_ENTRIES_DEFAULT;
         const priorReEntries = (existingEntry as any).reEntries || 0;
         if (priorReEntries >= maxReEntries) {
-          socket.emit('qualifierRegistrationResult', { success: false, error: `Re-entry limit reached (${maxReEntries})` });
+          refuseQualifier('reentry_limit', `Re-entry limit reached (${maxReEntries})`);
+          return;
+        }
+        // R2 (TOURNEY-9) — the re-entry binds THIS socket to its new seat; a
+        // socket that plays a live seat elsewhere (a cash game, another
+        // tournament, an extra table) is refused before anything is charged —
+        // its session used to be MOVED off that seat, which then played on
+        // with nobody behind it.
+        if (socketPlaysLiveSeatElsewhere(socket.id, '')) {
+          refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
           return;
         }
 
@@ -7692,6 +8700,14 @@ io.on('connection', (socket: Socket) => {
           }
         }
 
+        // R2 (TOURNEY-9) — re-checked after the awaits: a socket that sat down
+        // elsewhere meanwhile is never moved off that seat (both charges back).
+        if (socketPlaysLiveSeatElsewhere(socket.id, '')) {
+          await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'seated_elsewhere');
+          refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
+          return;
+        }
+
         // (d) NOW re-seat. Find a table with empty seats.
         const startingStack = qt.startingStack || 50000;
         let seated = false;
@@ -7763,19 +8779,33 @@ io.on('connection', (socket: Socket) => {
         // Bump in-memory re-entry counter — survives until the qt is
         // garbage-collected on tournament finish.
         (existingEntry as any).reEntries = priorReEntries + 1;
-        socket.emit('qualifierRegistrationResult', { success: true, qualifierId: qualId, reentry: true });
-        broadcastGameState(tournament.tableIds[0]);
+        if (consumedCreditId) (existingEntry.reentryCreditIds ||= []).push(consumedCreditId);   // R2 — refundable by the shutdown flush
+        // R2 — the table he now sits at (it used to broadcast the FIRST table, wherever he was seated).
+        const reentryTableId = playerSessions.get(socket.id)?.tableId || tournament.tableIds[0];
+        socket.emit('qualifierRegistrationResult', {
+          success: true, qualifierId: qualId, reentry: true, registered: true,
+          tournamentId: qt.tournamentId, tableId: reentryTableId, registeredCount: qt.players.length,
+        });
+        broadcastGameState(reentryTableId);
         return;
       }
 
-      socket.emit('qualifierRegistrationResult', { success: false, error: 'Re-entry not available at this time' });
+      refuseQualifier('reentry_unavailable', 'Re-entry not available at this time');
       return;
     }
-    // IP duplicate check — prevent multi-accounting from same device
-    const regIp = socket.handshake.address;
-    const sameIpCount = qt.players.filter(p => (p as any).ip === regIp).length;
+    // IP duplicate check — prevent multi-accounting from same device. R2 (OPS-6):
+    // the REAL client address (realClientIp), never the Railway proxy hop.
+    const regIp = realClientIp(socket);
+    const sameIpCount = qt.players.filter((p) => p.ip === regIp).length;
     if (sameIpCount >= 2) {
-      socket.emit('qualifierRegistrationResult', { success: false, error: 'Too many registrations from this device' });
+      refuseQualifier('too_many_from_device', 'Too many registrations from this device');
+      return;
+    }
+    // R2 (TOURNEY-3 + TOURNEY-9) — a LATE first entry is SEATED at once
+    // (seat-or-refund), so it never takes over a socket that plays a live seat
+    // elsewhere: refused before a credit is consumed.
+    if (isLateReg && socketPlaysLiveSeatElsewhere(socket.id, '')) {
+      refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
       return;
     }
 
@@ -7791,14 +8821,14 @@ io.on('connection', (socket: Socket) => {
       if (!consumeRes.consumed) {
         if (consumeRes.error === 'http_423') {
           // Master refused: player suspended ("86'd") — see the re-entry branch.
-          socket.emit('qualifierRegistrationResult', { success: false, error: PLAYER_SUSPENDED_MESSAGE, code: 'player_suspended' });
+          socket.emit('qualifierRegistrationResult', { success: false, error: PLAYER_SUSPENDED_MESSAGE, code: 'player_suspended', qualifierId: qualId });
           return;
         }
         if (consumeRes.error) console.error('[QualifierEntry] credit consume failed:', consumeRes.error);
-        socket.emit('qualifierRegistrationResult', {
-          success: false,
-          error: consumeRes.error ? 'Server error consuming qualifier credit — please try again.' : 'No qualifier credits available — your credit may have already been used.',
-        });
+        refuseQualifier(
+          consumeRes.error ? 'credit_error' : 'no_credit',
+          consumeRes.error ? 'Server error consuming qualifier credit — please try again.' : 'No qualifier credits available — your credit may have already been used.',
+        );
         return;
       }
       entryCreditId = consumeRes.creditId || null;
@@ -7808,121 +8838,139 @@ io.on('connection', (socket: Socket) => {
       lastQualifierFetch = 0;
     }
 
-    qt.players.push({
-      playerId: auth.username || phone,
+    // R2 — re-read after the consume (it awaited the master): the same account
+    // may have registered meanwhile (another tab), or the event moved on. The
+    // credit just consumed goes back — never a credit without an entry.
+    const dupe = qt.players.find((p) => p.masterPlayerId === masterId);
+    const lateNow = qt.status === 'running' && !!qt.tournamentId && Date.now() <= windows.lateRegUntil;
+    if (qualifierTournaments.get(qualId) !== qt || dupe || (qt.status !== 'registering' && !lateNow)) {
+      if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, dupe ? 'already_registered' : 'registration_closed');
+      if (dupe) refuseQualifier('already_registered', 'You are already registered for this qualifier.', { registered: true });
+      else refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
+      return;
+    }
+
+    // R2 (TOURNEY-3 / AUTH-9 / TOURNEY-10) — the registration is the MASTER
+    // account's; its tournament entrant id is the account's stable one (it was
+    // the LOGIN HANDLE — shown to every player in the results).
+    const registrant: QualifierRegistrant = {
+      playerId: tournamentEntrantPlayerId(auth.userId),
       masterPlayerId: masterId,
+      localUserId: auth.userId,
       playerName: seatNameForSocket(socket, data.playerName),   // R1 contract #3
-      phone: phone,
+      phone: '',
       socketId: socket.id,
       ip: regIp,
-      // Remember the consumed credit so unregister can refund it (NEW-3 fix).
+      // Remember the consumed credit so unregister / a cancellation can refund it (NEW-3 fix).
       consumedCreditId: entryCreditId || undefined,
-    } as any);
+      registeredAt: Date.now(),
+    };
 
-    // Persist to master DB so registrations survive server restarts
-    if (qt.masterQualifierId && masterId) { // masterId declared above (OIDC sub)
-      const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
-      const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
-      fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
-        body: JSON.stringify({ userId: masterId }),
-      }).catch(e => console.warn('[QualifierReg] persist failed:', e?.message));
+    if (qt.status !== 'registering') {
+      // R2 (TOURNEY-3) — a LATE first entry into the RUNNING qualifier: seated
+      // NOW or the credit goes back. It used to be pushed into a field that
+      // had already been dealt — the credit consumed, no seat, ever.
+      const lateState: BuyInExpectation = {
+        userId: auth.userId,
+        answer: () => refuseQualifier('buy_in_cancelled', BUY_IN_CANCELLED_MESSAGE),
+      };
+      if (await buyInSocketGone(socket, 'registerQualifierTournament_late', 'credit_consume', undefined, lateState)) {
+        if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, socket.connected ? 'user_changed' : 'socket_gone');
+        return;
+      }
+      if (socketPlaysLiveSeatElsewhere(socket.id, '')) {
+        if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, 'seated_elsewhere');
+        refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
+        return;
+      }
+      const seat = seatQualifierLateEntrant(socket, qt, registrant);
+      if (!seat) {
+        if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, 'no_seat');
+        refuseQualifier('no_seat', 'No seat is free in this qualifier right now — your qualifier credit was returned.');
+        return;
+      }
+      qt.players.push(registrant);
+      persistQualifierRegistration(qt, masterId);
+      progressionManager.getOrCreateProgress(registrant.playerId, registrant.playerName, auth.userId);
+      qualifierLateEntries.seated++;
+      auditLog(auth.username, 'QUALIFIER_LATE_ENTRY_SEATED', { qualifierId: qualId, tournamentId: qt.tournamentId, tableId: seat.tableId, seatIndex: seat.seatIndex });
+      socket.emit('qualifierRegistrationResult', {
+        success: true, qualifierId: qualId, registered: true, lateEntry: true,
+        tournamentId: qt.tournamentId, tableId: seat.tableId, registeredCount: qt.players.length,
+      });
+      const lateT = qt.tournamentId ? tournamentManager.getTournament(qt.tournamentId) : undefined;
+      socket.emit('qualifierTournamentStarted', {
+        qualifierId: qualId, tournamentId: qt.tournamentId, tableId: seat.tableId,
+        tableCount: lateT?.tableIds.length ?? 1, playerCount: qt.players.length, lateEntry: true,
+      });
+      broadcastGameState(seat.tableId);
+      broadcastQualifierUpdate(qualId, qt);
+      return;
     }
+
+    qt.players.push(registrant);
+    // Persist to master DB (the master's registration row for this event).
+    persistQualifierRegistration(qt, masterId);
+    // TOURNEY-10 — his progression entry exists before his first qualifier hand.
+    progressionManager.getOrCreateProgress(registrant.playerId, registrant.playerName, auth.userId);
 
     socket.emit('qualifierRegistrationResult', {
       success: true,
       qualifierId: qualId,
+      registered: true,
       registeredCount: qt.players.length,
     });
 
-    // Broadcast updated count to all clients
-    io.emit('qualifierTournamentUpdate', {
-      qualifierId: qualId,
-      status: qt.status,
-      registeredCount: qt.players.length,
-      players: qt.players.map(p => ({ name: p.playerName })),
-    });
+    // Broadcast the updated count to all clients (a NUMBER — C3; never names).
+    broadcastQualifierUpdate(qualId, qt);
   });
 
-  // Unregister from a qualifier tournament
+  // Unregister from a qualifier tournament.
+  // R2 (TOURNEY-3 / AUTH-9) — by the MASTER account (it matched the login
+  // handle, which setDisplayName could change — one player unregistered
+  // another), answered every time, and through releaseQualifierRegistration:
+  // the consumed credit refunded, the master's registration row dropped.
   socket.on('unregisterQualifierTournament', async (data: { qualifierId: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) return;
-
-    const qt = qualifierTournaments.get(data.qualifierId);
-    if (!qt || qt.status !== 'registering') return;
-
-    const removedPlayer = qt.players.find(p => p.playerId === auth.username);
-    qt.players = qt.players.filter(p => p.playerId !== auth.username);
-
-    // Refund the qualifier credit that registration consumed (NEW-3 fix,
-    // 2026-07-01). Previously register→unregister permanently burned the
-    // credit, leaving the player unqualified with nothing to show for it.
-    if (removedPlayer?.consumedCreditId) {
-      const cid = removedPlayer.consumedCreditId;
-      refundQualifierCreditOnMaster(cid)
-        .then(refunded => auditLog(
-          auth.username,
-          refunded ? 'QUALIFIER_UNREG_CREDIT_REFUND' : 'QUALIFIER_UNREG_CREDIT_REFUND_FAILED',
-          { qualifierId: data.qualifierId, creditId: cid }
-        ))
-        .catch(() => { /* audited above on the false branch */ });
+    const masterId = auth.masterUserId ? String(auth.masterUserId) : '';
+    const found = qualifierEventFor(data?.qualifierId);
+    if (!found) {
+      socket.emit('qualifierRegistrationResult', { success: false, code: 'qualifier_not_found', error: 'This qualifier is not on the schedule right now.', qualifierId: data?.qualifierId });
+      return;
     }
-
-    // Persist unregistration to master DB
-    if (qt.masterQualifierId && removedPlayer?.masterPlayerId) {
-      const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
-      const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
-      fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
-        body: JSON.stringify({ userId: removedPlayer.masterPlayerId }),
-      }).catch(e => console.warn('[QualifierUnreg] persist failed:', e?.message));
+    const [qualId, qt] = found;
+    const removedPlayer = masterId ? qt.players.find((p) => p.masterPlayerId === masterId) : undefined;
+    if (!removedPlayer) {
+      // Not registered (any more): the answer a client needs is "not registered".
+      socket.emit('qualifierRegistrationResult', { success: true, qualifierId: qualId, registeredCount: qt.players.length, unregistered: true, registered: false });
+      return;
     }
+    if (qt.status !== 'registering') {
+      socket.emit('qualifierRegistrationResult', { success: false, code: 'registration_closed', error: 'This qualifier has already started.', qualifierId: qualId, registered: true });
+      return;
+    }
+    qt.players = qt.players.filter((p) => p !== removedPlayer);
+    void releaseQualifierRegistration(qualId, qt, removedPlayer, 'unregistered');
 
     socket.emit('qualifierRegistrationResult', {
       success: true,
-      qualifierId: data.qualifierId,
+      qualifierId: qualId,
       registeredCount: qt.players.length,
       unregistered: true,
+      registered: false,
     });
-
-    io.emit('qualifierTournamentUpdate', {
-      qualifierId: data.qualifierId,
-      status: qt.status,
-      registeredCount: qt.players.length,
-      players: qt.players.map(p => ({ name: p.playerName })),
-    });
+    broadcastQualifierUpdate(qualId, qt);
   });
 
-  // Get qualifier tournament registrations
+  // Get qualifier tournament registrations.
+  // R2 (C3) — ONLY the events the master schedule lists, in the C3 shape, with
+  // `registered` for the ASKING account (the lobby recognises its own
+  // registration after a reload) — never other players' names.
   socket.on('getQualifierTournaments', async () => {
-    const SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000;
-    const SIGNUP_CLOSES_AFTER_MS = 1.5 * 60 * 60 * 1000;
-    const now = Date.now();
-    const list: any[] = [];
-    for (const [id, qt] of qualifierTournaments) {
-      const scheduledTime = new Date(qt.scheduledAt).getTime();
-      const signupOpensAt = new Date(scheduledTime - SIGNUP_OPENS_BEFORE_MS).toISOString();
-      const signupClosesAt = new Date(scheduledTime + SIGNUP_CLOSES_AFTER_MS).toISOString();
-      const signupOpen = now >= (scheduledTime - SIGNUP_OPENS_BEFORE_MS) && now <= (scheduledTime + SIGNUP_CLOSES_AFTER_MS);
-      list.push({
-        qualifierId: id,
-        qualifierType: qt.qualifierType,
-        qualifierName: qt.qualifierName,
-        scheduledAt: qt.scheduledAt,
-        signupOpensAt,
-        signupClosesAt,
-        signupOpen,
-        registeredCount: qt.players.length,
-        maxPlayers: qt.maxPlayers,
-        status: qt.status,
-        tournamentId: qt.tournamentId,
-        players: qt.players.map(p => ({ name: p.playerName })),
-      });
-    }
-    socket.emit('qualifierTournamentList', list);
+    const auth = authSessions.get(socket.id);
+    const viewerMasterId = auth ? (String(auth.masterUserId || auth.statsMasterUserId || '') || null) : null;
+    socket.emit('qualifierTournamentList', qualifierList(viewerMasterId));
   });
 
   // ========== Tournament Spectator Mode ==========
@@ -8161,32 +9209,23 @@ Give feedback in this JSON format:
   });
 
   // ========== Staking Marketplace ==========
-  // In-memory cache hydrated from DB on first use. Chips move via deductChips /
-  // addChipsToUser (atomic SQL) on each buyStake — no longer purely social.
-  const stakingOffers: Map<string, any> = (global as any).__stakingOffers || ((global as any).__stakingOffers = new Map());
-  if (!(global as any).__stakingHydrated) {
-    (global as any).__stakingHydrated = true;
-    getPool().query(`SELECT * FROM staking_offers WHERE settled_at IS NULL ORDER BY created_at ASC`)
-      .then(({ rows }) => {
-        for (const r of rows) {
-          stakingOffers.set(r.id, {
-            id: r.id,
-            tournamentId: r.tournament_id,
-            totalPct: Number(r.total_pct),
-            pricePerPct: Number(r.price_per_pct),
-            playerName: r.player_name,
-            sellerId: r.seller_id,
-            remaining: Number(r.remaining),
-            backers: r.backers || [],
-            createdAt: new Date(r.created_at).getTime(),
-          });
-        }
-        console.log(`[Staking] Hydrated ${rows.length} open offers from DB`);
-      })
-      .catch((e: any) => console.warn('[Staking] Hydration failed:', e.message));
-  }
+  // R2 (2026-10-11, C4 — TOURNEY-8 / ECON-15 / APPUI-22): an offer names the
+  // UUID of a tournament the SELLER is registered in (still registering); a
+  // purchase is ESCROWED (deducted from the backer, credited to nobody) until
+  // the tournament settles (payTournamentPrizes: the seller cashes → shares +
+  // escrow released; anything else → refunded) or is refunded earlier
+  // (cancelled, the seller unregistered / removed, the tournament gone — the
+  // staking sweeps). The marketplace is the module-level `stakingOffers` (open
+  // offers only); nothing pre-R2 is re-listed (escrow-less legacy offers are
+  // closed by the boot sweep).
 
-  socket.on('createStake', async (data: { tournamentId: string; totalPct: number; pricePerPct: number }) => {
+  // C4 — the tournaments this account may sell action in: `myStakeableTournaments [{tournamentId, name, startsAt}]`.
+  socket.on('getStakeableTournaments', () => {
+    const v = tournamentViewerOf(socket.id);
+    socket.emit('myStakeableTournaments', v ? stakeableTournamentsOf(v) : []);
+  });
+
+  socket.on('createStake', async (data: { tournamentId: string; percent?: number; pricePerPercent?: number; totalPct?: number; pricePerPct?: number }) => {
     // 2026-10-09 play gate — selling action in a tournament is playing it.
     // StakingMarketplace has no failure event for a sell, so the refusal goes
     // on `error` (App's global handler shows the C5 notice).
@@ -8198,34 +9237,57 @@ Give feedback in this JSON format:
     // text. The texts are unchanged (older bundles show them as they are).
     const auth = authSessions.get(socket.id);
     if (!auth?.userId) { socket.emit('error', { message: 'Sign in to create a staking offer', code: 'stake_sign_in_required' }); return; }
-    if (!data || !data.tournamentId || typeof data.totalPct !== 'number' || data.totalPct <= 0 || data.totalPct > 100) {
-      socket.emit('error', { message: 'Invalid staking offer', code: 'stake_invalid_offer' }); return;
+    // C4 — `{ tournamentId, percent, pricePerPercent }` (the pre-R2 names
+    // totalPct / pricePerPct are still read): whole numbers, 1-100 % and
+    // 1-1,000,000 chips per percent.
+    const v = validateStakeOffer(data || {});
+    if (!v.ok) {
+      socket.emit('error', { message: v.code === 'stake_invalid_price' ? 'Invalid price per percent' : 'Invalid staking offer', code: v.code });
+      return;
     }
-    if (typeof data.pricePerPct !== 'number' || data.pricePerPct <= 0 || data.pricePerPct > 1_000_000) {
-      socket.emit('error', { message: 'Invalid price per percent', code: 'stake_invalid_price' }); return;
+    // C4 — a tournament he is REGISTERED in, still registering (it used to be
+    // any free text — no settlement could ever find it).
+    const tournamentId = typeof data.tournamentId === 'string' ? data.tournamentId : '';
+    const tourn = tournamentId ? tournamentManager.getTournament(tournamentId) : undefined;
+    const viewer = tournamentViewerOf(socket.id);
+    const entry = tourn && viewer ? tournamentManager.entryOfAccount(tournamentId, viewer) : undefined;
+    if (!tourn || tourn.status !== 'registering' || !entry || entry.userId !== auth.userId) {
+      socket.emit('error', { message: 'Pick a tournament you are registered in that has not started yet.', code: 'stake_not_registered' });
+      return;
+    }
+    // Never more than 100% of his action across his offers in this tournament.
+    let alreadyOffered = 0;
+    for (const o of stakingOffers.values()) if (o.tournamentId === tournamentId && o.sellerId === auth.userId) alreadyOffered += Number(o.totalPct) || 0;
+    if (alreadyOffered + v.percent > 100) {
+      socket.emit('error', { message: `You can sell at most ${Math.max(0, 100 - alreadyOffered)}% more of this tournament.`, code: 'stake_invalid_offer' });
+      return;
     }
     const id = uuidv4();
+    const playerName = seatNameForSocket(socket);   // the public display name (server-derived)
     const offer = {
       id,
-      tournamentId: String(data.tournamentId).slice(0, 64),
-      totalPct: data.totalPct,
-      pricePerPct: data.pricePerPct,
-      playerName: auth.username,        // server-derived, not client-supplied
+      tournamentId,
+      totalPct: v.percent,
+      pricePerPct: v.pricePerPercent,
+      playerName,
       sellerId: auth.userId,
-      remaining: data.totalPct,
-      backers: [] as { name: string; userId?: number; pct: number }[],
+      remaining: v.percent,
+      backers: [] as { name: string; userId?: number; pct: number; paid: number }[],
       createdAt: Date.now(),
+      escrow: true,
     };
     try {
+      await ensureStakingSchema();
       await getPool().query(
-        `INSERT INTO staking_offers (id, tournament_id, total_pct, price_per_pct, remaining, seller_id, player_name, backers)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, '[]')`,
-        [id, offer.tournamentId, offer.totalPct, offer.pricePerPct, offer.remaining, offer.sellerId, offer.playerName]
+        `INSERT INTO staking_offers (id, tournament_id, total_pct, price_per_pct, remaining, seller_id, player_name, backers, escrow, seller_entry_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, '[]', TRUE, $8)`,
+        [id, offer.tournamentId, offer.totalPct, offer.pricePerPct, offer.remaining, offer.sellerId, offer.playerName, entry.entryId ?? null]
       );
       stakingOffers.set(id, offer);
+      stakingStats.offersCreated++;
       auditLog(auth.username, 'STAKING_OFFER_CREATED', { offerId: id, tournamentId: offer.tournamentId, totalPct: offer.totalPct, pricePerPct: offer.pricePerPct });
-      io.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
-      socket.emit('stakeCreated', { id });
+      broadcastStakingOffers();   // R1 — display names, no ids
+      socket.emit('stakeCreated', { id, tournamentId, percent: offer.totalPct, pricePerPercent: offer.pricePerPct });
     } catch (e: any) {
       console.error('[Staking] createStake DB error:', e.message);
       socket.emit('error', { message: 'Failed to create staking offer', code: 'stake_create_failed' });
@@ -8246,12 +9308,15 @@ Give feedback in this JSON format:
     if (bsGate) { replyBuyStake({ success: false, error: bsGate.message, code: bsGate.code }); return; }
     const auth = authSessions.get(socket.id);
     if (!auth?.userId) { replyBuyStake({ success: false, error: 'Sign in to back a player' }); return; }
-    if (!bsOfferId || typeof data.pct !== 'number' || data.pct <= 0) {
+    if (!bsOfferId || typeof data.pct !== 'number' || !Number.isInteger(data.pct) || data.pct <= 0) {
       replyBuyStake({ success: false, error: 'Invalid purchase' }); return;
     }
     const offer = stakingOffers.get(data.offerId);
     if (!offer || offer.remaining < data.pct) { replyBuyStake({ success: false, error: 'Offer unavailable' }); return; }
     if (offer.sellerId === auth.userId) { replyBuyStake({ success: false, error: 'Cannot back your own offer' }); return; }
+    // C4 — only while its tournament is still registering (never into a running one).
+    const offerTournament = tournamentManager.getTournament(offer.tournamentId);
+    if (!offerTournament || offerTournament.status !== 'registering') { replyBuyStake({ success: false, error: 'Offer unavailable' }); return; }
     // 2026-10-09 — never move a backer's chips to a SELLER who is suspended:
     // he cannot play the tournament the backer is buying into. Answered as an
     // unavailable offer — nothing about the seller's status is disclosed.
@@ -8277,22 +9342,22 @@ Give feedback in this JSON format:
         return;
       }
 
-      // Credit seller within the same transaction.
-      await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [totalCost, offer.sellerId]);
-
-      // Update the offer row. 2026-07-05 audit P3 fix: decrement `remaining`
-      // ATOMICALLY in SQL with a `remaining >= $pct` guard, and append the backer
-      // via jsonb concat, instead of computing an absolute value from the possibly-
-      // stale in-memory `offer.remaining`. Two concurrent buys of the same offer
-      // used to both read remaining=100 and each write an absolute value, over-
-      // selling past 100%. The guard now serializes them: the loser gets 0 rows.
-      const newBacker = { name: auth.username, userId: auth.userId, pct: data.pct };
+      // R2 (C4) — the chips are ESCROWED: credited to NOBODY now (the seller
+      // used to be paid here, and the backer was never paid back). The backer
+      // record carries what he paid (`paid`), released to the seller only if
+      // he cashes, else refunded.
+      // 2026-07-05 audit P3 fix: decrement `remaining` ATOMICALLY in SQL with a
+      // `remaining >= $pct` guard, and append the backer via jsonb concat. Two
+      // concurrent buys of the same offer used to both read remaining=100 and
+      // each write an absolute value, over-selling past 100%. The guard now
+      // serializes them: the loser gets 0 rows. R2: and only an UNSETTLED offer.
+      const newBacker = { name: seatNameForSocket(socket), userId: auth.userId, pct: data.pct, paid: totalCost };
       const { rows: updRows, rowCount: updCount } = await client.query(
         `UPDATE staking_offers
             SET remaining = remaining - $1,
                 backers = COALESCE(backers, '[]'::jsonb) || $2::jsonb,
                 settled_at = CASE WHEN remaining - $1 <= 0 THEN NOW() ELSE settled_at END
-          WHERE id = $3 AND remaining >= $1
+          WHERE id = $3 AND remaining >= $1 AND paid_out_at IS NULL AND refunded_at IS NULL
           RETURNING remaining`,
         [data.pct, JSON.stringify([newBacker]), data.offerId]
       );
@@ -8303,17 +9368,18 @@ Give feedback in this JSON format:
         return;
       }
       const dbRemaining = Number(updRows[0].remaining);
-      const settled = dbRemaining <= 0;
+      const soldOut = dbRemaining <= 0;
 
       await client.query('COMMIT');
 
       // Reconcile in-memory cache from the authoritative DB value.
       offer.remaining = dbRemaining;
       offer.backers = [...offer.backers, newBacker];
-      if (settled) stakingOffers.delete(data.offerId);
+      if (soldOut) stakingOffers.delete(data.offerId);
+      stakingStats.purchases++;
 
-      auditLog(auth.username, 'STAKING_BUY', { offerId: data.offerId, pct: data.pct, totalCost, sellerId: offer.sellerId });
-      io.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
+      auditLog(auth.username, 'STAKING_BUY_ESCROW', { offerId: data.offerId, pct: data.pct, totalCost, sellerId: offer.sellerId, tournamentId: offer.tournamentId });
+      broadcastStakingOffers();   // R1 — display names, no ids
       replyBuyStake({ success: true });
     } catch (e: any) {
       await client.query('ROLLBACK').catch(() => {});
@@ -8325,7 +9391,9 @@ Give feedback in this JSON format:
   });
 
   socket.on('getStakes', async () => {
-    socket.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
+    // R1 — display names, no other account's ids; R2 (C4) — `isMine` for THIS socket's account.
+    const rawOffers = Array.from(stakingOffers.values());
+    socket.emit('stakingUpdated', { offers: stakingOffersForViewer(rawOffers, await publicStakingOffers(rawOffers), authSessions.get(socket.id)?.userId) });
   });
 
   // OAuth2 login: validate access token from auth server.
@@ -9679,6 +10747,18 @@ Give feedback in this JSON format:
     const table = tableManager.getTable(data.tableId);
     if (!table) { socket.emit('adminForceCloseTableResult', { success: false, error: 'Table not found' }); return; }
     auditLog(auth.username, 'ADMIN_FORCE_CLOSE_TABLE', { tableId: data.tableId });
+    // R2 (S1) — a QUICK table closes through cleanupQuickTable: a cash format's
+    // stacks are cashed out to whoever holds the seat (session or reservation,
+    // exactly once); a Spin & Go's entry fee is refunded once (its stack is the
+    // prize format's, never cashed); the quick-game state ends with it.
+    if (quickTables.has(data.tableId)) {
+      const qg = quickGames.get(data.tableId);
+      if (qg && isPrizeFormatTable(data.tableId)) void refundQuickEntryFee(data.tableId, qg, 'admin_force_close');
+      io.to(`table:${data.tableId}`).emit('tableClosedByAdmin', { tableId: data.tableId });
+      cleanupQuickTable(data.tableId);
+      socket.emit('adminForceCloseTableResult', { success: true, tableId: data.tableId });
+      return;
+    }
     // Cash every seated HUMAN back to their wallet, then unseat + remove the
     // table. Refund the FULL table stake — chipCount PLUS any chips already
     // committed to a live pot (totalInvestedThisHand). creditSeatStackToWallet
@@ -10137,22 +11217,10 @@ Give feedback in this JSON format:
     if (!ctCheck.ok) { socket.emit('error', { message: ctCheck.error, code: ctCheck.code }); return; }
     const result = await createClubTable(auth.userId, data.clubId, ctCheck.config);
     if (result.success && result.table) {
-      // Create a real table in the TableManager
-      const clubInfoResult = await getClubInfo(data.clubId);
-      const clubName = clubInfoResult.club?.name || 'Club';
-      const variant = (result.table.variant || 'texas-holdem') as VariantType;
-      const tableConfig = {
-        tableName: `[${clubName}] ${result.table.tableName}`,
-        smallBlind: result.table.smallBlind,
-        bigBlind: result.table.bigBlind,
-        ante: 0,
-        minBuyIn: result.table.minBuyIn,
-      };
-      const tableId = variant === 'texas-holdem'
-        ? tableManager.createTable(tableConfig)
-        : tableManager.createVariantTable(tableConfig, variant);
+      // Create a real table in the TableManager — R2 (CLUBS-4): the same
+      // helper that re-creates it after a redeploy (ensureClubRuntimeTable).
+      const tableId = await createClubRuntimeTable(data.clubId, { ...result.table, maxSeats: ctCheck.config.maxSeats ?? result.table.maxSeats });
       if (tableId) {
-        clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
         await updateClubTableId(result.table.id, tableId);
         result.table.tableId = tableId;
       }
@@ -10164,6 +11232,10 @@ Give feedback in this JSON format:
 
   socket.on('getClubTables', async (data: { clubId: number }) => {
     const result = await getClubTables(data.clubId);
+    // R2 (CLUBS-4) — a table a redeploy dropped is re-created for the list (a joinable id).
+    for (const t of result.tables || []) {
+      try { await ensureClubRuntimeTable(t); } catch (e: any) { console.warn('[Clubs] club table re-create failed:', e?.message || e); }
+    }
     socket.emit('clubTables', result);
   });
 
@@ -10180,21 +11252,30 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'You must be a club member to join this table' });
       return;
     }
-    if (!clubTable.tableId) {
-      socket.emit('error', { message: 'Table not yet created. Ask a manager to create it.' });
+    // R2 (CLUBS-4) — its runtime table, re-created from the stored config if a
+    // redeploy dropped it (it used to answer "not yet created" forever).
+    let runtimeTableId: string | null = null;
+    try { runtimeTableId = await ensureClubRuntimeTable(clubTable); } catch (e: any) { console.warn('[Clubs] club table re-create failed:', e?.message || e); }
+    if (!runtimeTableId) {
+      socket.emit('error', { message: clubTable.isActive ? 'This club table is not available right now. Ask a manager to check it.' : 'This club table was closed.', code: 'club_table_unavailable' });
       return;
     }
 
-    // Redirect to the standard joinTable handler by triggering the same event on this socket
+    // Redirect to the standard joinTable handler by triggering the same event on this socket.
+    // R2 (C1) — joinTable refuses a club table to everyone else; this payload
+    // object carries the membership grant (clubJoinGrants — a client frame can
+    // never be one of these objects).
     const listeners = socket.listeners('joinTable');
     if (listeners.length > 0) {
-      (listeners[0] as Function)({
-        tableId: clubTable.tableId,
+      const grantedPayload = {
+        tableId: runtimeTableId,
         playerName: data.playerName,
         seatIndex: data.seatIndex,
         buyIn: data.buyIn,
         avatar: data.avatar,
-      });
+      };
+      clubJoinGrants.add(grantedPayload);
+      return (listeners[0] as Function)(grantedPayload);
     }
   });
 
@@ -10368,23 +11449,73 @@ Give feedback in this JSON format:
     if (crGate) { emitPlayRefusal(socket, crGate); return; }
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await registerForClubTournament(data.tournamentId, auth.userId);
+    // R2 (TOURNEY-14) — the buy-in is CHARGED with the registration (one
+    // transaction) and an unregister (the same toggle) refunds what it paid.
+    const result = await registerForClubTournament(Number(data?.tournamentId), auth.userId);
     if (result.success) {
-      socket.emit('clubTournamentRegistered', { tournamentId: data.tournamentId, registered: result.registered });
+      if (result.registered && (result.charged || 0) > 0) {
+        clubTournamentStats.buyIns++;
+        auditLog(auth.username, 'CLUB_TOURNAMENT_BUYIN', { clubTournamentId: Number(data?.tournamentId), amount: result.charged });
+      }
+      if (!result.registered && (result.refunded || 0) > 0) {
+        clubTournamentStats.unregisterRefunds++;
+        auditLog(auth.username, 'CLUB_TOURNAMENT_REFUND', { clubTournamentId: Number(data?.tournamentId), amount: result.refunded, reason: 'unregistered' });
+      }
+      socket.emit('clubTournamentRegistered', {
+        tournamentId: data.tournamentId, registered: result.registered,
+        ...(result.charged ? { charged: result.charged } : {}), ...(result.refunded ? { refunded: result.refunded } : {}),
+      });
     } else {
-      socket.emit('error', { message: result.error });
+      socket.emit('error', { message: result.error, ...(result.code ? { code: result.code } : {}) });
     }
   });
 
+  // R2 (TOURNEY-14) — the start is REAL: the paid registrations become a live
+  // tournament (launchClubTournament — dealt through the shared start path);
+  // it used to flip a status column and deal nothing.
   socket.on('startClubTournament', async (data: { tournamentId: number }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
-    const result = await startClubTournament(data.tournamentId, auth.userId);
-    if (result.success) {
-      socket.emit('clubTournamentStarted', { tournamentId: data.tournamentId });
-    } else {
-      socket.emit('error', { message: result.error });
+    const result = await startClubTournament(Number(data?.tournamentId), auth.userId);
+    if (!result.success || !result.tournament || !result.entrants) {
+      socket.emit('error', { message: result.error, ...(result.code ? { code: result.code } : {}) });
+      return;
     }
+    for (const r of result.refunded || []) {
+      if (r.paid > 0) auditLog(String(r.userId), 'CLUB_TOURNAMENT_REFUND', { clubTournamentId: result.tournament.id, amount: r.paid, reason: 'not_paid_in_full_at_start' });
+    }
+    let liveId: string | null = null;
+    try {
+      liveId = await launchClubTournament({ tournament: result.tournament, entrants: result.entrants });
+    } catch (e: any) {
+      // The claim stands (running) with every buy-in transferred: refund them all.
+      clubTournamentStats.startFailed++;
+      console.error('[ClubTournament] start failed — refunding the entrants:', e?.message || e);
+      void refundClubTournamentEntrants(result.tournament.id, '', result.entrants.map((x) => ({ userId: x.userId, amount: x.paid })), 'start_failed');
+      socket.emit('error', { message: 'Could not start the tournament — every buy-in was refunded.', code: 'start_failed' });
+      return;
+    }
+    socket.emit('clubTournamentStarted', { tournamentId: data.tournamentId, liveTournamentId: liveId, entrants: result.entrants.length });
+    broadcastTournamentList();
+  });
+
+  // R2 (TOURNEY-14) — cancel BEFORE the start (owner / manager): every
+  // registration refunded what it paid, each member told.
+  socket.on('cancelClubTournament', async (data: { tournamentId: number }) => {
+    const auth = authSessions.get(socket.id);
+    if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
+    const tid = Number(data?.tournamentId);
+    const result = await cancelClubTournament(tid, auth.userId);
+    if (!result.success) { socket.emit('error', { message: result.error, ...(result.code ? { code: result.code } : {}) }); return; }
+    clubTournamentStats.cancelledBeforeStart++;
+    for (const r of result.refunded || []) {
+      if (r.paid > 0) auditLog(String(r.userId), 'CLUB_TOURNAMENT_REFUND', { clubTournamentId: tid, amount: r.paid, reason: 'cancelled_by_club' });
+      for (const [sid, a] of authSessions) {
+        if (a.userId !== r.userId) continue;
+        io.sockets.sockets.get(sid)?.emit('clubTournamentCancelled', { tournamentId: tid, clubId: result.clubId, refunded: r.paid, reason: 'cancelled_by_club' });
+      }
+    }
+    socket.emit('clubTournamentCancelled', { tournamentId: tid, clubId: result.clubId, refundedPlayers: (result.refunded || []).length, reason: 'cancelled_by_club' });
   });
 
   // ========== Club Challenges ==========
@@ -10440,29 +11571,22 @@ Give feedback in this JSON format:
       minBuyIn: stakes, maxBuyIn: stakes, maxPlayers: 2,
     } as any);
     if (!tableId) { socket.emit('error', { message: 'Could not start the challenge table' }); return; }
-    await setChallengeTable(challengeId, tableId);
+    // R2 (CLUBS-1) — registered BEFORE any await: from its creation the table
+    // is a fixed-roster heads-up (quickTables: no AI backfill / fill / reload,
+    // never listed; tableKindOf still 'club'), seats 0-1 only, joinable only by
+    // its two players (joinTableRefusalReason).
     challengeTables.set(tableId, { challengeId, challengerId, challengedId });
-
-    // Resolve the challenge (mark completed + winner) when the heads-up match
-    // ends, then tear the table down (cleanupQuickTable refunds the winner's 2x
-    // stack + removes it). Mirrors the career/spinGo resolution pattern.
+    quickTables.add(tableId);
     const t = tableManager.getTable(tableId);
-    let resolved = false;
-    t?.on('handResult', () => {
-      setTimeout(() => {
-        if (resolved) return;
-        const tt = tableManager.getTable(tableId);
-        if (!tt) return;
-        const alive = tt.seats.filter((s) => s.state === 'occupied' && s.chipCount > 0 && !s.eliminated);
-        if (alive.length <= 1) {
-          resolved = true;
-          const winnerUid = alive.length === 1 ? (userIdForSeat(tableId, alive[0].seatIndex) ?? null) : null;
-          resolveChallenge(challengeId, winnerUid).catch(() => {});
-          io.to(`table:${tableId}`).emit('clubChallengeResolved', { challengeId, winnerId: winnerUid });
-          setTimeout(() => cleanupQuickTable(tableId), 5000);
-        }
-      }, 1000);
-    });
+    if (t) {
+      t.maxOccupiableSeats = Math.min(t.maxOccupiableSeats, 2);
+      // Resolved on a challenger's bust — or when one of them leaves (the other
+      // wins): quickGameEndCheck (format 'challenge'). The stakes are the
+      // buy-ins: cleanupQuickTable cashes the winner's (and any remaining)
+      // stack out, exactly once.
+      registerQuickGame(tableId, t, { format: 'challenge', ownerUserId: null, ownerName: 'Club Challenge', entryFee: 0, challengeId });
+    }
+    await setChallengeTable(challengeId, tableId);
 
     // Tell BOTH participants to join the table.
     const payload = { challengeId, tableId, challengerId, challengedId, stakes };
@@ -10787,12 +11911,9 @@ Give feedback in this JSON format:
 
   // ========== End Club Events ==========
 
+  // R2 (C1) — ONLY joinable public cash tables, with seats / phase / pot.
   socket.on('getTableList', async () => {
-    const tables = tableManager.getTableList().map((t) => ({
-      ...t,
-      spectatorCount: spectators.get(t.tableId)?.size || 0,
-    }));
-    socket.emit('tableList', tables);
+    socket.emit('tableList', publicTableList());
   });
 
   socket.on(
@@ -10837,6 +11958,14 @@ Give feedback in this JSON format:
       if (isTournamentTable(tableId)) {
         refuseCashJoinAtTournamentTable(socket, 'joinTable', tableId);
         return;
+      }
+      // R2 (C1) — only a joinable PUBLIC cash table: never a quick / career /
+      // Spin & Go / heads-up / all-in-or-fold table (fixed roster), a private
+      // home game (invite code only) or a club table (joinClubTable's grant
+      // only); a club challenge only by its two players. Before any side effect.
+      {
+        const notJoinable = joinTableRefusalReason(tableId, authSessions.get(socket.id), clubJoinGrants.has(data));
+        if (notJoinable) { refuseTableNotJoinable(socket, 'joinTable', tableId, notJoinable); return; }
       }
 
       // Variant sanity check — if the client told us which variant they
@@ -10960,6 +12089,9 @@ Give feedback in this JSON format:
       if (table) {
         const cap = table.config.minBuyIn * 10;
         buyIn = Math.max(table.config.minBuyIn, Math.min(buyIn || table.config.minBuyIn, cap));
+        // R2 (CLUBS-1) — a club challenge is a freezeout for its stakes: both
+        // players buy in for EXACTLY the stakes (the table's minBuyIn).
+        if (challengeTables.has(tableId)) buyIn = table.config.minBuyIn;
       }
 
       // Validate buy-in against DB balance for authenticated users. In
@@ -11037,8 +12169,10 @@ Give feedback in this JSON format:
       // Join socket room for table
       socket.join(`table:${tableId}`);
 
-      // Fill empty seats with AI
-      fillWithAI(table, tableId);
+      // Fill empty seats with AI — R2 (CLUBS-1): never at a fixed-roster table
+      // (a club challenge is joined through here: its second seat is the
+      // opponent's, never a bot's).
+      if (!isFixedRosterTable(tableId)) fillWithAI(table, tableId);
 
       // Auto-start hand if not in progress
       if (!table.isHandInProgress() && table.getOccupiedSeatCount() >= 2) {
@@ -11086,8 +12220,24 @@ Give feedback in this JSON format:
       // P5 (2026-10-10) — never a tournament table (live or just broken): a
       // cash buy-in there is treated as a tournament stack and never cashed out
       // — and Quick Play prefers the emptiest tables, which often ARE
-      // tournament tables.
-      const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId) && tableKindOf(t.tableId) === 'cash'); // R1 review: public cash tables only (never a Spin & Go / heads-up / AoF / career / private / club table) — locked by tests/r1ReviewFixes.test.ts
+      // tournament tables. R2 (C1 / GAME-4) — nor a quick, private or club
+      // table: ONLY the joinable public cash tables the lobby lists (a fresh
+      // private home game with the lowest blinds used to capture Quick Play).
+      // And a table the player can AFFORD first: it used to commit to the first
+      // candidate and answer "Insufficient chips" while a cheaper table had room.
+      const qpAuth = authSessions.get(socket.id);
+      let qpWallet = Number.POSITIVE_INFINITY;
+      if (qpAuth && !UNLIMITED_CHIPS_TESTING) {
+        qpWallet = await getUserChips(qpAuth.userId);
+        if (await buyInSocketGone(socket, 'quickPlay', 'wallet_read')) return; // F3 — nothing chosen or deducted yet
+      }
+      const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId) && tableKindOf(t.tableId) === 'cash');
+      const canAfford = (t: { tableId: string; minBuyIn?: number }) =>
+        (Number.isFinite(t.minBuyIn) ? (t.minBuyIn as number) : (tableManager.getTable(t.tableId)?.config.minBuyIn ?? 0)) <= qpWallet;
+      if (tables.length > 0 && !tables.some(canAfford)) {
+        socket.emit('error', { message: 'Insufficient chips', code: 'insufficient_chips' });
+        return;
+      }
 
       // Quick Play prefers Texas Hold'em tables. Sort: holdem first,
       // then by player count, then by smallest blinds.
@@ -11099,7 +12249,7 @@ Give feedback in this JSON format:
       // with no variantId) passed the old `!id || === 'texas-holdem'` check
       // and Quick Play happily seated Hold'em players at Draw games.
       const isHoldem = (t: any) => t?.variant === 'texas-holdem';
-      const sorted = [...tables].sort((a, b) => {
+      const sorted = tables.filter(canAfford).sort((a, b) => {   // R2 — only tables he can afford
         const ah = isHoldem(a), bh = isHoldem(b);
         if (ah !== bh) return ah ? -1 : 1;
         if (a.playerCount !== b.playerCount)
@@ -13103,7 +14253,10 @@ Give feedback in this JSON format:
         if (existingSession) handlePlayerLeave(socket);
         // P5 (2026-10-10) — a waitlist seat is a CASH buy-in: never a tournament
         // table (live or just broken) — its stack would never be cashed out.
-        const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId) && tableKindOf(t.tableId) === 'cash'); // R1 review: public cash tables only (never a Spin & Go / heads-up / AoF / career / private / club table) — locked by tests/r1ReviewFixes.test.ts
+        // R2 (C1) — and only a joinable PUBLIC cash table (never a quick /
+        // private / club table — a private home game with low blinds used to
+        // win the "lowest stakes" pick).
+        const tables = tableManager.getTableList().filter((t) => !isTournamentTable(t.tableId) && tableKindOf(t.tableId) === 'cash');
         // 2026-10-11 (.online R1 review R1REV-2 / audit GAME-13) — the old test
         // read the live instance's variantId and accepted only '' or
         // 'texas-holdem', but every base PokerTable (Beginner's Table, Shark
@@ -14537,6 +15690,13 @@ Give feedback in this JSON format:
     table.sitDown(1, aiProfile.botName, 1000, aiPlayerId, true);
     profiles.set(1, aiProfile);
 
+    // R2 (TOURNEY-6 / money review P2) — a real END: a bust is game over (the
+    // winner's stack is cashed out by cleanupQuickTable); the 5-minute clock
+    // decides by chips at a hand boundary (quickGameTimeUp).
+    registerQuickGame(tableId, table, {
+      format: 'headsUp', ownerUserId: authHU?.userId ?? null, ownerName: playerName, entryFee: authHU ? HEADS_UP_BUYIN : 0,
+    });
+
     // Start hand immediately
     table.startNewHand();
     broadcastGameState(tableId);
@@ -14554,47 +15714,11 @@ Give feedback in this JSON format:
       t.config.bigBlind *= 2;
     }, 60000);
 
-    // Store the interval and timeout for cleanup
-    const headsUpKey = `headsup-${tableId}`;
-    const headsUpTimers = new Map<string, { blindInterval: NodeJS.Timeout; gameTimeout: NodeJS.Timeout }>();
-
-    // 5-minute game timer
+    // 5-minute game timer — R2: decided by chips (now between hands, else at
+    // the end of the hand in progress), shown, settled, cleaned up.
     const gameTimeout = setTimeout(() => {
       clearInterval(blindInterval);
-      const t = tableManager.getTable(tableId);
-      if (!t) return;
-
-      // Determine winner by chip count
-      const seat0 = t.seats[0];
-      const seat1 = t.seats[1];
-      let winnerName = '';
-      let winnerChips = 0;
-
-      if (seat0.state === 'occupied' && seat1.state === 'occupied') {
-        if (seat0.chipCount >= seat1.chipCount) {
-          winnerName = seat0.playerName;
-          winnerChips = seat0.chipCount;
-        } else {
-          winnerName = seat1.playerName;
-          winnerChips = seat1.chipCount;
-        }
-      } else if (seat0.state === 'occupied') {
-        winnerName = seat0.playerName;
-        winnerChips = seat0.chipCount;
-      } else if (seat1.state === 'occupied') {
-        winnerName = seat1.playerName;
-        winnerChips = seat1.chipCount;
-      }
-
-      io.to(`table:${tableId}`).emit('quickGameOver', {
-        type: 'headsUp',
-        winner: winnerName,
-        chips: winnerChips,
-        message: `Time's up! ${winnerName} wins with ${winnerChips} chips!`,
-      });
-
-      // Clean up
-      cleanupQuickTable(tableId);
+      quickGameTimeUp(tableId);
     }, 5 * 60 * 1000);
 
     quickGameTimers.set(tableId, { blindInterval, gameTimeout });
@@ -14638,13 +15762,7 @@ Give feedback in this JSON format:
     }
 
     // Random multiplier: 2x (60%), 3x (25%), 5x (10%), 10x (4%), 25x (1%)
-    const roll = Math.random() * 100;
-    let multiplier = 2;
-    if (roll < 1) multiplier = 25;
-    else if (roll < 5) multiplier = 10;
-    else if (roll < 15) multiplier = 5;
-    else if (roll < 40) multiplier = 3;
-    else multiplier = 2;
+    const multiplier = spinGoMultiplierFor(Math.random() * 100);
 
     const tableId = tableManager.createQuickTable(
       `Spin & Go (${multiplier}x)`,
@@ -14721,53 +15839,14 @@ Give feedback in this JSON format:
     // Store multiplier for prize calculation
     spinGoMultipliers.set(tableId, multiplier);
 
-    // Listen for eliminations - last player standing wins the REAL multiplier
-    // prize. Previously the multiplier was purely cosmetic: the winner was only
-    // credited their real table stack (~1500 = 3 buy-ins) while the UI advertised
-    // up to 12500 (25x) that was never paid.
-    let spinGoSettled = false; // exactly-once guard — handResult fires repeatedly
-    const checkElimination = () => {
-      const t = tableManager.getTable(tableId);
-      if (!t) return;
-
-      const alive = t.seats.filter(
-        (s) => s.state === 'occupied' && s.chipCount > 0 && !s.eliminated
-      );
-
-      if (!spinGoSettled && alive.length <= 1 && alive.length > 0) {
-        spinGoSettled = true;
-        clearInterval(blindInterval);
-        const winner = alive[0];
-        const prize = multiplier * 500; // real Spin & Go prize = multiplier x buy-in
-
-        // Credit the ADVERTISED prize (house-funded, like tournament/freeroll
-        // prizes) to the human winner, then ZERO their seat so no refund path
-        // (cleanupQuickTable / handlePlayerLeave) double-credits their table
-        // stack. Guests (no userId) stay wallet-isolated — no prize, as before.
-        const winnerUid = userIdForSeat(tableId, winner.seatIndex);
-        if (winnerUid) {
-          winner.chipCount = 0;
-          winner.totalInvestedThisHand = 0;
-          addChipsToUser(winnerUid, prize)
-            .then((ok) => auditLog(winner.playerName, ok ? 'SPINGO_PRIZE' : 'SPINGO_PRIZE_FAILED', { userId: winnerUid, tableId, multiplier, prize }))
-            .catch((e) => console.warn(`[spinGo prize ${winnerUid}]`, e?.message));
-        }
-
-        io.to(`table:${tableId}`).emit('quickGameOver', {
-          type: 'spinGo',
-          winner: winner.playerName,
-          multiplier,
-          prize,
-          message: `${winner.playerName} wins ${prize} chips (${multiplier}x)!`,
-        });
-
-        // Clean up after a delay
-        setTimeout(() => cleanupQuickTable(tableId), 5000);
-      }
-    };
-
-    table.on('handResult', () => {
-      setTimeout(checkElimination, 1000);
+    // R2 (ECON-8 / ECON-17) — a PRIZE format with a real end: the last player
+    // with chips wins; a human winner is paid multiplier x the entry fee
+    // ONCE through the prize ledger (never marked paid before the credit; it
+    // used to zero his stack first and swallow a failed credit); a bust pays
+    // nothing; the stack is never cashed out (isPrizeFormatTable — a leave
+    // forfeits, a forced removal / shutdown / admin close refunds the fee).
+    registerQuickGame(tableId, table, {
+      format: 'spinGo', ownerUserId: authSG?.userId ?? null, ownerName: playerName, entryFee: authSG ? SPINGO_BUYIN : 0, multiplier,
     });
 
     quickGameTimers.set(tableId, { blindInterval, gameTimeout: setTimeout(() => {}, 0) });
@@ -14857,6 +15936,11 @@ Give feedback in this JSON format:
 
     // Mark this as an all-in-or-fold table
     allInOrFoldTables.add(tableId);
+    // R2 (money review P2) — a real END: the human busts (game over) or is the
+    // last player with chips (won); his stack is cashed out by cleanupQuickTable.
+    registerQuickGame(tableId, table, {
+      format: 'allInOrFold', ownerUserId: authAOF?.userId ?? null, ownerName: playerName, entryFee: authAOF ? AOF_BUYIN : 0,
+    });
 
     table.startNewHand();
     broadcastGameState(tableId);
@@ -14984,26 +16068,14 @@ Give feedback in this JSON format:
     // Mirrors the Spin&Go elimination listener. careerGameComplete drives the
     // client's persisted career progress (previously nothing detected a win, so
     // Career Mode progress never advanced).
-    let careerResolved = false;
-    table.on('handResult', () => {
-      setTimeout(() => {
-        if (careerResolved) return;
-        const t = tableManager.getTable(tableId);
-        if (!t) return;
-        const alive = t.seats.filter((s) => s.state === 'occupied' && s.chipCount > 0 && !s.eliminated);
-        const humanAlive = alive.some((s) => s.seatIndex === 0);
-        let done = false;
-        let won = false;
-        if (alive.length <= 1) {
-          done = true;
-          won = alive.length === 1 && alive[0].seatIndex === 0;
-        } else if (!humanAlive) {
-          // Human busted while AI keep playing — the stage is a loss for them.
-          done = true;
-          won = false;
-        }
-        if (done) {
-          careerResolved = true;
+    // R2 (TOURNEY-6) — through the quick-game end (registerQuickGame): with no
+    // AI reload the stage CAN be won now (every bot busted); the human busting
+    // loses it at once. The cleanup cashes his stack out as before.
+    registerQuickGame(tableId, table, {
+      format: 'career', ownerUserId: authCareer?.userId ?? null, ownerName: careerPlayerName, entryFee: authCareer ? config.buyIn : 0,
+      onEnd: (outcome) => {
+        {
+          const won = outcome.humanWon;
           const stars = won ? 3 : 0;
           // 2026-07-07 gap-fill — PERSIST progress server-side (was localStorage
           // only → lost cross-device) and GRANT the advertised venue reward the
@@ -15041,9 +16113,8 @@ Give feedback in this JSON format:
             }
           }
           socket.emit('careerGameComplete', { venue, stage, won, stars });
-          setTimeout(() => cleanupQuickTable(tableId), 5000);
         }
-      }, 1000);
+      },
     });
 
     table.startNewHand();
@@ -15402,19 +16473,27 @@ Give feedback in this JSON format:
 
   // ========== Tournament System ==========
 
+  // R2 (C2) — every item carries `registered` + `entryId` for THIS socket's account.
   socket.on('getTournaments', async () => {
-    socket.emit('tournamentList', tournamentManager.getTournamentList());
+    socket.emit('tournamentList', tournamentManager.getTournamentList(tournamentViewerOf(socket.id)));
   });
 
   // Live Bracket: full standings roster (alive/eliminated + live chip counts) for
   // the TournamentBracket UI, which otherwise renders empty (no data source).
   // Defaults to the first running tournament so the lobby can just ask without
   // knowing an id. The client polls this while the bracket modal is open.
-  socket.on('getTournamentStandings', (data: { tournamentId?: string }) => {
-    let tid = data?.tournamentId;
+  // R2 (P3) — without an id: the VIEWER's running tournament (the one his
+  // account has an entry in) first, then the first running one — it used to be
+  // whichever tournament happened to be first in the list.
+  socket.on('getTournamentStandings', (...args: unknown[]) => {
+    const data = args[0] && typeof args[0] === 'object' ? args[0] as { tournamentId?: unknown } : {};
+    let tid = typeof data.tournamentId === 'string' && data.tournamentId ? data.tournamentId : undefined;
     if (!tid) {
-      const running = (tournamentManager.getTournamentList() as any[]).find((t) => t.status === 'running');
-      tid = running?.tournamentId;
+      const viewer = tournamentViewerOf(socket.id);
+      // R2 (TOURNEY-14) — asked WITH the viewer: his own (unlisted) club tournament is in it.
+      const running = (tournamentManager.getTournamentList(viewer) as any[]).filter((t) => t.status === 'running');
+      const own = viewer ? running.find((t) => tournamentManager.entryOfAccount(t.tournamentId, viewer)) : undefined;
+      tid = (own || running[0])?.tournamentId;
     }
     socket.emit('tournamentStandings', tid ? publicTournamentStandings(tournamentManager.getTournamentStandings(tid, tableManager)) : null);   // R1 — public names, opaque ids
   });
@@ -15425,8 +16504,6 @@ Give feedback in this JSON format:
     const rtGate = await assertPlayable(socket, 'registerTournament');
     if (rtGate) { emitPlayRefusal(socket, rtGate); return; }
     if (await buyInSocketGone(socket, 'registerTournament', 'gate')) return; // F3 (2026-10-10)
-    const session = playerSessions.get(socket.id);
-    const playerId = session?.playerId || `player-${uuidv4()}`;
     const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3 (TOURNEY-12)
 
     // 2026-06-11 tournament economy: real entry fee. If the tournament has a
@@ -15436,9 +16513,20 @@ Give feedback in this JSON format:
     // the deduct. The deducted fee + the pool increment in registerPlayer stay
     // in lockstep so Σpayouts ≤ Σcollected (never mints).
     const tourn = tournamentManager.getTournament(data.tournamentId);
-    if (!tourn) { socket.emit('error', { message: 'Tournament not found' }); return; }
+    // R2 (TOURNEY-14) — a CLUB tournament is entered through its club (members, buy-in paid there), never here.
+    if (!tourn || tourn.config.unlisted) { socket.emit('error', { message: 'Tournament not found', code: 'tournament_not_found', tournamentId: data.tournamentId }); return; }
     const entryFee = tourn.config.buyIn || 0;
     const authT = authSessions.get(socket.id);
+    // R2 (C2 / TOURNEY-7 / TOURNEY-10) — ONE entry per ACCOUNT under ONE stable
+    // entrant id (tournamentEntrantPlayerId): refused BEFORE the entry fee is
+    // touched (it used to dedupe on a random per-request id: two lobby mounts
+    // registered — and paid — twice).
+    const viewer = tournamentViewerOf(socket.id);
+    if (viewer && tournamentManager.entryOfAccount(data.tournamentId, viewer)) {
+      socket.emit('error', { message: 'You are already registered for this tournament', code: 'already_registered', tournamentId: data.tournamentId });
+      return;
+    }
+    const playerId = tournamentEntrantPlayerId(authT?.userId);
     if (entryFee > 0) {
       if (!authT) { socket.emit('error', { message: 'Log in to enter a buy-in tournament' }); return; }
       // P3 (2026-10-10) — the entry is registered to socket + userId: the socket
@@ -15458,9 +16546,14 @@ Give feedback in this JSON format:
       }, regState)) return;
     }
 
-    const result = tournamentManager.registerPlayer(data.tournamentId, playerId, playerName, socket.id, authT?.userId);
+    const result = tournamentManager.registerPlayer(
+      data.tournamentId, playerId, playerName, socket.id, authT?.userId,
+      authT ? (viewer?.masterUserId || undefined) : undefined,
+    );
     if (result.success) {
-      socket.emit('tournamentRegistered', { tournamentId: data.tournamentId });
+      // TOURNEY-10 — his progression entry exists (hydrated from the DB) before his first tournament hand.
+      if (authT) progressionManager.getOrCreateProgress(playerId, playerName, authT.userId);
+      socket.emit('tournamentRegistered', { tournamentId: data.tournamentId, entryId: result.entryId ?? null });
 
       // Check if tournament can auto-start. 2026-10-09 — through the
       // suspension screen: every registrant is re-checked before the start.
@@ -15474,11 +16567,11 @@ Give feedback in this JSON format:
         await addChipsToUser(authT.userId, entryFee);
         auditLog(authT.username, 'TOURNAMENT_ENTRY_REFUND', { tournamentId: data.tournamentId, entryFee });
       }
-      socket.emit('error', { message: result.error || 'Registration failed' });
+      socket.emit('error', { message: result.error || 'Registration failed', code: result.code || 'registration_failed', tournamentId: data.tournamentId });
     }
 
     // Broadcast updated list
-    io.emit('tournamentList', tournamentManager.getTournamentList());
+    broadcastTournamentList();
   });
 
   // Unregister from a still-registering tournament and REFUND the entry fee
@@ -15490,11 +16583,11 @@ Give feedback in this JSON format:
     const tourn = tournamentManager.getTournament(data.tournamentId);
     if (!tourn) { socket.emit('error', { message: 'Tournament not found' }); return; }
     if (tourn.status !== 'registering') { socket.emit('error', { message: 'Cannot unregister after the tournament has started' }); return; }
-    // Prefer the caller's EXACT playerId registration (a user with two tabs can
-    // have two rows — registerPlayer dedups on playerId only); fall back to a
-    // userId match only if no playerId row exists.
-    const reg = (session?.playerId && tourn.players.find((p) => p.playerId === session.playerId))
-      || (authT && tourn.players.find((p) => p.userId === authT.userId))
+    // R2 (C2) — the caller's ACCOUNT's entry (one per account now); a socket
+    // with no account only the entry its current seat id registered.
+    const viewerT = tournamentViewerOf(socket.id);
+    const reg = (viewerT && tournamentManager.entryOfAccount(data.tournamentId, viewerT))
+      || (!authT && session?.playerId && tourn.players.find((p) => p.playerId === session.playerId && p.userId === undefined))
       || undefined;
     if (!reg) { socket.emit('tournamentUnregistered', { tournamentId: data.tournamentId, refunded: 0 }); return; }
     const entryFee = tourn.config.buyIn || 0;
@@ -15506,8 +16599,10 @@ Give feedback in this JSON format:
       refunded = ok ? entryFee : 0;
       auditLog(authT?.username || String(reg.userId), ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId: data.tournamentId, entryFee, reason: 'unregister' });
     }
+    // R2 (C4) — a seller who unregistered: his backers get their escrow back.
+    if (removed && reg.userId !== undefined) void refundStakesOf(data.tournamentId, 'seller_unregistered', reg.userId);
     socket.emit('tournamentUnregistered', { tournamentId: data.tournamentId, refunded });
-    io.emit('tournamentList', tournamentManager.getTournamentList());
+    broadcastTournamentList();
   });
 
   // Start a simulated multi-table tournament
@@ -15591,6 +16686,11 @@ Give feedback in this JSON format:
           duration: Math.max(30, Math.min(Math.floor((Number(l?.duration) || 5) * 60), 3600)),
         }))
         .filter((l: any) => l.sb > 0 && l.bb >= l.sb);
+      // R2 (P3) — the start threshold: the director's `minPlayers` (2..max),
+      // else the field must be FULL (it used to start at 4 whatever its max —
+      // a 9-max custom event started 4-handed).
+      const rawMin = Math.floor(Number(cfg.minPlayers));
+      const minPlayers = Number.isFinite(rawMin) && rawMin > 0 ? Math.max(2, Math.min(rawMin, maxPlayers)) : maxPlayers;
       const template = {
         name,
         buyIn,
@@ -15601,11 +16701,12 @@ Give feedback in this JSON format:
         isBounty,
         bountyAmount,
         startingChips,
+        minPlayers,
       };
       const tournamentId = tournamentManager.createTournament(template);
-      auditLog(auth.username, 'CREATE_CUSTOM_TOURNAMENT', { tournamentId, name, buyIn, maxPlayers, startingChips, isBounty });
-      socket.emit('customTournamentCreated', { tournamentId, name });
-      io.emit('tournamentList', tournamentManager.getTournamentList());
+      auditLog(auth.username, 'CREATE_CUSTOM_TOURNAMENT', { tournamentId, name, buyIn, maxPlayers, minPlayers, startingChips, isBounty });
+      socket.emit('customTournamentCreated', { tournamentId, name, minPlayers });
+      broadcastTournamentList();
     } catch (err: any) {
       console.error('[createCustomTournament]', err);
       socket.emit('error', { message: 'Failed to create tournament' });
@@ -15629,7 +16730,7 @@ Give feedback in this JSON format:
       // On resume, re-kick any table that stalled at the hand boundary while paused.
       if (!data.paused) scheduleAutoStart(tid);
     }
-    io.emit('tournamentList', tournamentManager.getTournamentList());
+    broadcastTournamentList();
   });
 
   socket.on('advanceTournamentLevel', async (data: { tournamentId: string }) => {
@@ -15639,7 +16740,7 @@ Give feedback in this JSON format:
     // The blindLevelUp event listener (startTournamentGame) mutates the live table
     // blinds + broadcasts, so a manual advance rides that path automatically.
     auditLog(auth.username, 'TOURNAMENT_ADVANCE_LEVEL', { tournamentId: data.tournamentId, advanced: !!level });
-    io.emit('tournamentList', tournamentManager.getTournamentList());
+    broadcastTournamentList();
   });
 
   socket.on('rebalanceTournament', async (data: { tournamentId: string }) => {
@@ -15668,6 +16769,12 @@ Give feedback in this JSON format:
     // tournament table (its stack would never be cashed out). Before the AI stand-up.
     if (isTournamentTable(tableId)) {
       refuseCashJoinAtTournamentTable(socket, 'joinAdditionalTable', tableId);
+      return;
+    }
+    // R2 (C1) — an extra seat only at a joinable PUBLIC cash table (never a
+    // quick / private / club table). Before the AI stand-up below.
+    if (!isPublicCashTable(tableId)) {
+      refuseTableNotJoinable(socket, 'joinAdditionalTable', tableId, joinTableRefusalReason(tableId, authSessions.get(socket.id), false) || 'not_public_cash');
       return;
     }
 
@@ -15938,6 +17045,25 @@ Give feedback in this JSON format:
     const ptCheck = validateTableConfig(data, { tableName: 'Private Table', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: (bb) => bb * 20 });
     if (!ptCheck.ok) { socket.emit('error', { message: ptCheck.error, code: ptCheck.code }); return; }
     const ptCfg = ptCheck.config;
+    // R2 (C12 / GAME-4) — creation is rate-limited per account (3 per 10 min)
+    // and an account keeps at most MAX_LIVE_PRIVATE_TABLES_PER_ACCOUNT live
+    // home games: every one was a permanent 24/7 bot table before.
+    const ptAuth = authSessions.get(socket.id);
+    const ptOwner = ptAuth?.userId ?? null;
+    if (ptOwner !== null) {
+      let live = 0;
+      for (const [tid, meta] of privateTableMeta) if (meta.ownerUserId === ptOwner && tableManager.getTable(tid)) live++;
+      if (live >= MAX_LIVE_PRIVATE_TABLES_PER_ACCOUNT) {
+        privateTableStats.refusedTooMany++;
+        socket.emit('error', { message: `You already have ${live} home games open — join one of them or let it close first.`, code: 'private_table_limit' });
+        return;
+      }
+    }
+    if (!privateTableCreateLimiter.hit(`pt:${ptOwner ?? socket.id}`)) {
+      privateTableStats.refusedRateLimited++;
+      socket.emit('error', { message: 'Please wait a few minutes before creating another home game.', code: 'rate_limited' });
+      return;
+    }
     const tableId = tableManager.createVariantTable({
       tableName: ptCfg.tableName,
       smallBlind: ptCfg.smallBlind,
@@ -15946,6 +17072,17 @@ Give feedback in this JSON format:
       minBuyIn: ptCfg.minBuyIn,
     }, ptCfg.variant);
     privateTableIds.add(tableId);   // R1 contract #2 — tableKind 'private'
+    // C12 — maxSeats (2-9) honoured: no seat at or beyond it can be taken (the
+    // variant's own deck-safety cap still wins when lower). Never listed.
+    {
+      const pt = tableManager.getTable(tableId);
+      const wantSeats = Math.floor(Number(data?.maxSeats));
+      if (pt && Number.isFinite(wantSeats) && wantSeats >= 2 && wantSeats <= MAX_SEATS) {
+        pt.maxOccupiableSeats = Math.min(pt.maxOccupiableSeats, wantSeats);
+      }
+    }
+    privateTableMeta.set(tableId, { ownerUserId: ptOwner, createdAt: Date.now(), emptySince: Date.now() });
+    privateTableStats.created++;
 
     // 2026-06-11 audit M2: the createPrivateTable payload advertised straddle /
     // runItTwice / bombPot toggles but the handler dropped all three silently.
@@ -15960,8 +17097,8 @@ Give feedback in this JSON format:
       log.warn(`[createPrivateTable] ${tableId}: requested unimplemented option(s) ${[data.straddle && 'straddle', data.runItTwice && 'runItTwice'].filter(Boolean).join(', ')} — ignored`);
     }
 
-    // Simple invite code = first 8 chars of tableId
-    const inviteCode = tableId.slice(0, 8).toUpperCase();
+    // Simple invite code = first 8 chars of tableId (C12 — the ONLY way in)
+    const inviteCode = privateInviteCode(tableId);
 
     socket.emit('privateTableCreated', { tableId, inviteCode });
     console.log(`[privateTable] Created ${tableId} (invite: ${inviteCode})`);
@@ -15976,10 +17113,12 @@ Give feedback in this JSON format:
     const { inviteCode, buyIn } = data;
     const playerName = seatNameForSocket(socket, data.playerName);   // R1 contract #3
     const avatar = sanitizeSeatAvatar(data.avatar);                   // AUTH-10
-    // Find table whose ID starts with the invite code (lowercased)
-    const target = tableManager.getTableByInviteCode(inviteCode.toLowerCase());
+    // R2 (C1 / C12) — an invite code opens a PRIVATE home game only. It used to
+    // match the first 8 characters of ANY table id: a quick game, a club table
+    // or a public table could be entered through it.
+    const target = privateTableByInviteCode(inviteCode);
     if (!target) {
-      socket.emit('joinError', { message: 'Table not found for that invite code.' });
+      socket.emit('joinError', { message: 'Table not found for that invite code.', code: 'invite_code_not_found' });
       return;
     }
     const { tableId, table } = target;
@@ -16068,11 +17207,14 @@ Give feedback in this JSON format:
 
     // Send full state to the joining player (force full on join/reconnect)
     emitGameState(socket, getGameStateForPlayer(table, openSeat), true);
-    // R2 (GAME P3) — every other player at the table gets HIS OWN view
-    // (broadcastGameState: his seat, his cards, his keys). This used to push
-    // the SPECTATOR view (seat -1, no hole cards) to every seated peer: their
-    // cards vanished and their client merged yourSeat -1 into its state.
+    // R2 (GAME P3) — the others get THEIR OWN seat's view through the normal
+    // broadcast. This loop used to send every seated peer the spectator view
+    // (seat -1): their own hole cards vanished until the next action.
     broadcastGameState(tableId);
+    // A hand starts once two players sit (bots fill the rest), like joinTable.
+    if (!table.isHandInProgress() && table.getOccupiedSeatCount() >= 2 && table.startNewHand()) {
+      broadcastGameState(tableId);
+    }
     scheduleAIAction(tableId);
   });
 
@@ -16286,6 +17428,13 @@ function creditSeatStackToWallet(
 ): void {
   const chips = (seat && seat.chipCount) || 0;
   if (chips <= 0) return;
+  // R2 (item 1, GAME-3 / OPS-2) — the shutdown / crash flush OWNS every seat's
+  // chips from the moment it starts (it claimed each seat once): no other path
+  // credits one again.
+  if (shutdownFlushActive()) {
+    auditLog(username, 'CASH_OUT_LEFT_TO_SHUTDOWN_FLUSH', { userId, tableId, reason, chips });
+    return;
+  }
   // 2026-06-11 audit (tournament economy): NEVER credit a tournament-table
   // stack to the wallet. Tournament stacks are tournament chips, not
   // wallet-funded — entry is a separate buy-in/fee and payouts come from the
@@ -16300,6 +17449,12 @@ function creditSeatStackToWallet(
     // R2 (2026-10-11): `amount` too — the row a leave wrote itself before the
     // seat teardown became one helper (teardownSeat) carried that key.
     auditLog(username, 'TOURNAMENT_STACK_NOT_CASHED', { userId, tableId, reason, chips, amount: chips });
+    return;
+  }
+  // R2 (ECON-8) — nor a Spin & Go stack: the prize format's chips (the entry
+  // fee bought the seat; the winner is paid the prize).
+  if (isPrizeFormatTable(tableId)) {
+    auditLog(username, 'SPINGO_STACK_NOT_CASHED', { userId, tableId, reason, chips });
     return;
   }
   addChipsToUser(userId, chips)
@@ -16376,6 +17531,7 @@ function reserveSeatForDeparture(
   }
 
   const cleanupTimer = setTimeout(() => {
+    if (shutdownFlushActive()) return;   // R2 — the shutdown flush credits reserved seats (once)
     const reserved = reservedSeats.get(authSession.userId);
     if (reserved) {
       // 2026-10-09 (T1) — a TOURNAMENT seat is never cashed out to the
@@ -17231,9 +18387,26 @@ function finishedEntrantIsAccount(e: FinishedTournamentEntrant, auth: SocketAuth
  */
 function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: string[], data: any): void {
   const rooms = [...new Set(roomTableIds.filter(Boolean).map((tid) => `table:${tid}`))];
-  for (const room of rooms) io.to(room).emit('tournamentFinished', data);
-  tournamentFinishedNotices.roomBroadcasts += rooms.length;
   const id = data?.tournamentId || tournamentId;
+  // R2 (C3 / TOURNEY-13) — a QUALIFIER pays seats, not chips: its room frame
+  // is the same `data` plus, PER SOCKET, that socket's own result —
+  // `myResult {place, wonSeat} | null` (and `place` / `wonSeat`), with
+  // `isQualifier`, `qualifierId`, `seatsForTop` — so the Game Over screen says
+  // "you finished 3rd — you won a seat" instead of "<winner> wins 0 chips".
+  // Each socket in the rooms gets ONE frame. Every other tournament: the
+  // rooms' broadcast exactly as before.
+  const q = qualifierOfTournament(id);
+  if (!q) {
+    for (const room of rooms) io.to(room).emit('tournamentFinished', data);
+  } else {
+    const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop: seatsForTopOf(q.qt.qualifierType) };
+    for (const [sid, sock] of io.sockets.sockets) {
+      if (!sock || !rooms.some((r) => sock.rooms?.has(r))) continue;
+      const mine = qualifierResultOf(q.qt, authSessions.get(sid));
+      sock.emit('tournamentFinished', { ...data, ...common, myResult: mine, ...(mine ? { place: mine.place, wonSeat: mine.wonSeat } : {}) });
+    }
+  }
+  tournamentFinishedNotices.roomBroadcasts += rooms.length;
   const rec = noteFinishedTournament(id, data);
   const tournamentName = tournamentManager.getTournament(id)?.config.name || 'Tournament';
   let told = 0;
@@ -17243,8 +18416,11 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
     const sock = io.sockets.sockets.get(sid);
     if (!sock || !sock.connected) continue;
     if (rooms.some((r) => sock.rooms?.has(r))) continue;   // the room's frame reached it
+    const qMine = q ? qualifierResultOf(q.qt, a) : null;
     sock.emit('tournamentFinishedForEntrant', {
       tournamentId: id, position: e.position, ...(e.prize ? { prize: e.prize } : {}), tournamentName,
+      // R2 (C3) — a qualifier entrant: his own seat result too.
+      ...(q ? { isQualifier: true, qualifierId: q.qualId, myResult: qMine, wonSeat: !!qMine?.wonSeat } : {}),
     });
     told++;
   }
@@ -17525,6 +18701,13 @@ function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKi
   // tournamentSeatKept, never auto-restored by a sign-in) or 'kept' (not his
   // choice: suspended, account switch, disconnect fall-through, after an
   // admin removal's disqualification — kept unflagged and untold).
+  // R2 (ECON-8, S1) — a Spin & Go seat is the prize format's: never cashed out
+  // here (leavePrizeFormatSeat forfeits a voluntary leave / refunds the entry
+  // fee of a forced one, and stands the seat up; the quick-table tail below
+  // removes the table).
+  if (table && leavePrizeFormatSeat(socket, session, table, tournamentSeat)) {
+    // handled — no cash teardown for a prize-format seat
+  } else
   if (table && !keepTournamentSeatOnLeave(socket, session, table, tournamentSeat)) {
     // Clear sit-out tracker + any dead-blind debt on the vacated seat
     // before standing up. Without this, the NEXT occupant of this seat
@@ -17573,6 +18756,10 @@ function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKi
     const qt = tableManager.getTable(session.tableId);
     if (qt && !qt.seats.some((s) => s.state === 'occupied' && !s.isAI)) {
       cleanupQuickTable(session.tableId);
+    } else if (qt) {
+      // R2 (CLUBS-1) — a club challenge whose opponent left is decided now
+      // (the one still seated wins); a vs-bots game is checked too.
+      quickGameEndCheck(session.tableId, 'leave');
     }
   }
 
@@ -17668,12 +18855,107 @@ function bindRegistrantSocket(tournamentId: string, tp: TournamentPlayer): strin
   return bound;
 }
 
+/**
+ * R2 (TOURNEY-9) — does this socket PLAY a live seat elsewhere: a main session
+ * on an occupied, not-busted seat at another table, or any extra-table seat?
+ */
+function socketPlaysLiveSeatElsewhere(sid: string, tableId: string): boolean {
+  const s = playerSessions.get(sid);
+  if (s && s.tableId !== tableId) {
+    const seat = tableManager.getTable(s.tableId)?.seats[s.seatIndex];
+    if (seat && seat.state === 'occupied' && !seat.eliminated) return true;
+  }
+  return (multiTableSessions.get(sid) || []).some((ms) => ms && ms.tableId !== tableId);
+}
+
+/**
+ * R2 (TOURNEY-9) — a tournament start NEVER takes over a socket that plays a
+ * live seat elsewhere (a cash game, another tournament, an extra table).
+ * bindRegistrantSocket picked his own socket, but binding it moved its session
+ * off that seat: the seat played on with nobody behind it — blinded away, or
+ * destroyed at the next redeploy (the stack was in no session or reservation).
+ * Instead his tournament seat is dealt in ABSENT, like a registrant whose
+ * socket is gone, and that socket is told where it is —
+ * `tournamentSeatKept {tournamentId, tableId, seatIndex, tournamentName, chips,
+ * atStart:true}` — so the client offers Return (returnToTournamentSeat once he
+ * left the other table). true = kept absent (the caller binds nothing).
+ */
+const tournamentStartsKeptAbsent = { seats: 0 };
+function keepStartSeatAbsentForLiveSeatElsewhere(
+  tournamentId: string, tp: TournamentPlayer, boundSid: string, tableId: string, seatIndex: number, chips: number,
+): boolean {
+  if (!socketPlaysLiveSeatElsewhere(boundSid, tableId)) return false;
+  tp.socketId = '';
+  tournamentStartsKeptAbsent.seats++;
+  io.sockets.sockets.get(boundSid)?.emit('tournamentSeatKept', {
+    tournamentId, tableId, seatIndex, chips, atStart: true,
+    tournamentName: tournamentManager.getTournament(tournamentId)?.config.name || 'Tournament',
+  });
+  console.log(`[Tournament] ${JSON.stringify({ event: 'start_seat_kept_absent_live_seat_elsewhere', tournamentId, tableId, seatIndex, playerId: tp.playerId })}`);
+  return true;
+}
+
+/**
+ * R2 — a registered tournament with MORE than one table's worth of entrants
+ * (more than 9 — a template that filled during its start screen, a custom /
+ * club event). startTournamentGame dealt only the first nine: the rest were
+ * alive in TournamentManager with no seat and the tournament could never
+ * finish. Seated round-robin over ceil(N / 9) tables (balanced), each
+ * registrant bound like a single-table start (bindRegistrantSocket +
+ * TOURNEY-9), then the shared multi-table bootstrap (deal, listeners,
+ * rebalance on eliminations).
+ */
+function startRegisteredTournamentTables(tournamentId: string, startingChips: number, blinds: { sb: number; bb: number; ante: number }): void {
+  const tournament = tournamentManager.getTournament(tournamentId);
+  if (!tournament) return;
+  const seatsPerTable = 9;
+  const tableCount = Math.max(1, Math.ceil(tournament.players.length / seatsPerTable));
+  const tableIds: string[] = [];
+  for (let k = 0; k < tableCount; k++) {
+    const tid = tableManager.createQuickTable(`Tournament: ${tournament.config.name} — Table ${k + 1}`, seatsPerTable, blinds.sb, blinds.bb, startingChips);
+    tableIds.push(tid);
+    tournamentTables.set(tid, tournamentId);
+  }
+  tournamentManager.setTableIds(tournamentId, tableIds);
+  tournament.players.forEach((tp, i) => {
+    const tid = tableIds[i % tableCount];
+    const seatIdx = Math.floor(i / tableCount);
+    const table = tableManager.getTable(tid);
+    if (!table || !table.sitDown(seatIdx, tp.playerName, startingChips, tp.playerId, false)) return;
+    tournamentManager.setPlayerTable(tournamentId, tp.playerId, tid);
+    const boundSid = bindRegistrantSocket(tournamentId, tp);
+    if (!boundSid) return;
+    if (keepStartSeatAbsentForLiveSeatElsewhere(tournamentId, tp, boundSid, tid, seatIdx, startingChips)) return;
+    const sock = io.sockets.sockets.get(boundSid);
+    if (sock) detachSocketFromOtherTables(sock, tid, 'seat', 'startRegisteredTournamentTables');   // P-g
+    playerSessions.set(boundSid, {
+      socketId: boundSid, tableId: tid, seatIndex: seatIdx, playerName: tp.playerName, playerId: tp.playerId,
+      trainingEnabled: false, sittingOut: false,
+    });
+    if (sock) {
+      sock.join(`table:${tid}`);
+      sock.emit('tournamentStarted', {
+        tournamentId, tableId: tid, name: tournament.config.name, startingChips,
+        blinds: { sb: blinds.sb, bb: blinds.bb, ante: blinds.ante }, tableCount,
+      });
+    }
+  });
+  bootstrapTournamentTables(tournamentId, tableIds);
+  console.log(`[Tournament] ${JSON.stringify({ event: 'registered_tournament_multi_table_start', tournamentId, players: tournament.players.length, tableCount })}`);
+}
+
 function startTournamentGame(tournamentId: string): void {
   const result = tournamentManager.startTournament(tournamentId);
   if (!result) return;
 
   const tournament = tournamentManager.getTournament(tournamentId);
   if (!tournament) return;
+
+  // R2 — more than one table's worth of entrants: every one of them is seated.
+  if (tournament.players.length > 9) {
+    startRegisteredTournamentTables(tournamentId, result.startingChips, result.blinds);
+    return;
+  }
 
   const blinds = result.blinds;
   const tableId = tableManager.createQuickTable(
@@ -17697,6 +18979,8 @@ function startTournamentGame(tournamentId: string): void {
     // signed in as THIS registrant (bindRegistrantSocket); none → seat absent.
     const boundSid = bindRegistrantSocket(tournamentId, tp);
     if (!boundSid) continue;
+    // R2 (TOURNEY-9) — never over a live seat that socket plays elsewhere.
+    if (keepStartSeatAbsentForLiveSeatElsewhere(tournamentId, tp, boundSid, tableId, i, result.startingChips)) continue;
     const session: PlayerSession = {
       socketId: boundSid,
       tableId,
@@ -17813,6 +19097,8 @@ function startTournamentGame(tournamentId: string): void {
       // P-h (round 5) — the table room as before, AND every entrant's other
       // live sockets (an away entrant in the lobby / at cash / on another tab).
       emitTournamentFinishedToEntrants(tournamentId, [tableId], data);
+      // R2 (TOURNEY-11) — the finished table is removed once the result was shown.
+      scheduleFinishedTournamentTablesRetirement(tournamentId, [tableId]);
     }
     if (event === 'playerEliminated') {
       // Round 6 — the sockets told directly by the bust check are skipped (one notice each).
@@ -17834,17 +19120,273 @@ function startTournamentGame(tournamentId: string): void {
  */
 function refundCancelledTournamentEntrants(
   tournamentId: string,
-  registrants: Array<{ playerId: string; userId?: number; refund: number }>,
+  registrants: Array<{ playerId: string; userId?: number; masterUserId?: string; socketId?: string; refund: number }>,
   reason: string,
 ): void {
+  // R2 (TOURNEY-14) — a CLUB tournament's buy-ins were paid to the club: they
+  // come back in ONE ledger settlement under the club keys, which also moves
+  // the club row to 'cancelled' (refundClubTournamentEntrants) — never twice,
+  // never alongside its prizes.
+  const clubTid = clubLiveTournaments.get(tournamentId);
+  if (clubTid !== undefined) {
+    const owed = registrants.filter((r) => r.userId !== undefined && r.refund > 0).map((r) => ({ userId: r.userId as number, amount: r.refund }));
+    void refundClubTournamentEntrants(clubTid, tournamentId, owed, reason);
+  }
   for (const r of registrants) {
-    if (r.userId !== undefined && r.refund > 0) {
+    if (clubTid === undefined && r.userId !== undefined && r.refund > 0) {
       const userId = r.userId;
       addChipsToUser(userId, r.refund)
         .then((ok) => auditLog(String(userId), ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: r.refund, reason }))
         .catch((e: any) => auditLog(String(userId), 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: r.refund, reason, error: String(e?.message || e) }));
     }
+    // R2 (C2 / TOURNEY-5) — every registrant is TOLD (he used to just vanish
+    // from the field): `tournamentCancelled {tournamentId, refunded, reason}`.
+    tellTournamentCancelled(tournamentId, r, reason);
   }
+  // R2 (C4) — and every backer of every seller in it gets his escrow back.
+  void refundStakesOf(tournamentId, 'tournament_cancelled');
+}
+
+// ========== Club tournaments played for real (R2, TOURNEY-14) ==========
+/** A STARTED club tournament's live TournamentManager id → its club_tournaments id (this process). */
+const clubLiveTournaments = new Map<string, number>();
+const clubTournamentStats = {
+  buyIns: 0, unregisterRefunds: 0, started: 0, startFailed: 0, finished: 0, cancelledRefunded: 0,
+  cancelledBeforeStart: 0, strandedSwept: 0,
+};
+/** A club tournament's ONE outcome, inside the settling transaction: running → finished (prizes) or running → cancelled (refunds). */
+const CLUB_TOURNAMENT_OUTCOME_GUARD = `UPDATE club_tournaments SET status = $2 WHERE id = $1 AND status = 'running' RETURNING id`;
+
+/** The ledger key of a club entrant's buy-in refund after the start: the same in every path, so it is paid once. */
+function clubEntryRefundKey(clubTournamentId: number, userId: number): string {
+  return `clubfee:${clubTournamentId}:${userId}`;
+}
+
+/**
+ * R2 (TOURNEY-14) — a STARTED club tournament that will not finish (its start
+ * screen left fewer than two players, the shutdown flush voided it, the boot
+ * sweep found it orphaned by a restart): every entrant's buy-in back in ONE
+ * ledger settlement that also moves the club row running → cancelled — so it
+ * can never be refunded twice, nor alongside its prizes. Never throws.
+ */
+async function refundClubTournamentEntrants(
+  clubTid: number, liveId: string, entrants: Array<{ userId: number; amount: number }>, reason: string,
+): Promise<'committed' | 'failed' | 'conflict'> {
+  const r = await prizeLedger.settle({
+    label: `club-tournament-refund:${clubTid}`,
+    credits: entrants.filter((e) => e.amount > 0).map((e) => ({
+      key: clubEntryRefundKey(clubTid, e.userId), userId: e.userId, amount: e.amount, kind: 'CLUB_TOURNAMENT_REFUND',
+      details: { clubTournamentId: clubTid, tournamentId: liveId || null, reason },
+    })),
+    guards: [{ sql: CLUB_TOURNAMENT_OUTCOME_GUARD, params: [clubTid, 'cancelled'], expectRows: 1 }],
+  });
+  if (r.status === 'committed') {
+    clubTournamentStats.cancelledRefunded++;
+    for (const c of r.paid) auditLog(String(c.userId), 'CLUB_TOURNAMENT_REFUND', { ...c.details, amount: c.amount });
+  } else if (r.status === 'failed') {
+    auditLog('SYSTEM', 'CLUB_TOURNAMENT_REFUND_PENDING_RETRY', { clubTournamentId: clubTid, tournamentId: liveId || null, entrants: entrants.length, reason, error: r.error || null });
+  }
+  return r.status;
+}
+
+/**
+ * R2 — how a registrant removed before the start (the suspension screen) is
+ * refunded: a CLUB tournament's buy-in through the ledger under its club key
+ * (so a later void / boot sweep cannot refund him again); any other entry fee
+ * through the additive path, as before.
+ */
+function entryFeeRefunder(tournamentId: string): (userId: number, amount: number) => Promise<boolean> {
+  const clubTid = clubLiveTournaments.get(tournamentId);
+  if (clubTid === undefined) return (userId, amount) => addChipsToUser(userId, amount);
+  return async (userId, amount) => {
+    const r = await prizeLedger.settle({
+      label: `club-entry-refund:${clubTid}:${userId}`,
+      credits: [{ key: clubEntryRefundKey(clubTid, userId), userId, amount, kind: 'CLUB_TOURNAMENT_REFUND', details: { clubTournamentId: clubTid, tournamentId, reason: 'removed_at_start' } }],
+    });
+    return r.status === 'committed';
+  };
+}
+
+/** A live socket signed in as this local account (any), or ''. */
+function liveSocketOfUser(userId: number): string {
+  for (const [sid, a] of authSessions) {
+    if (a.userId !== userId) continue;
+    const s = io.sockets.sockets.get(sid);
+    if (s && s.connected) return sid;
+  }
+  return '';
+}
+
+/**
+ * R2 (TOURNEY-14) — the club START made real: the claimed row's paid
+ * registrations become the entrants of a NEW TournamentManager tournament —
+ * unlisted (its members only), its prize pool the buy-ins they paid, the
+ * club's blind structure continued to an end — then the shared start path
+ * (the suspension screen, then the deal; more than nine entrants over
+ * balanced tables). An entrant the tournament cannot take is refunded at
+ * once. Returns the live tournament id.
+ */
+async function launchClubTournament(claim: {
+  tournament: { id: number; clubId: number; name: string; buyIn: number; startingChips: number; blindStructure: string };
+  entrants: Array<{ userId: number; paid: number }>;
+}): Promise<string> {
+  const ct = claim.tournament;
+  let clubName = 'Club';
+  try { clubName = (await getClubInfo(ct.clubId)).club?.name || 'Club'; } catch { /* the default name */ }
+  let names = new Map<number, string>();
+  try { names = await getPublicNames(claim.entrants.map((e) => e.userId)); } catch { /* 'Player' */ }
+  const liveId = tournamentManager.createTournament({
+    name: `[${clubName}] ${ct.name}`.slice(0, 80),
+    buyIn: ct.buyIn, prizePool: 0, maxPlayers: Math.max(2, claim.entrants.length), startInterval: 0,
+    blindLevels: clubTournamentBlindLevels(ct.blindStructure, ct.startingChips), startingChips: ct.startingChips,
+    minPlayers: 2, unlisted: true,
+  });
+  clubLiveTournaments.set(liveId, ct.id);
+  const notEntered: Array<{ userId: number; amount: number }> = [];
+  for (const e of claim.entrants) {
+    const playerId = tournamentEntrantPlayerId(e.userId);
+    const name = names.get(e.userId) ?? PUBLIC_NAME_FALLBACK;
+    const r = tournamentManager.registerPlayer(liveId, playerId, name, liveSocketOfUser(e.userId), e.userId);
+    if (r.success) progressionManager.getOrCreateProgress(playerId, name, e.userId);
+    else notEntered.push({ userId: e.userId, amount: e.paid });
+  }
+  for (const n of notEntered) {
+    const refund = entryFeeRefunder(liveId);
+    const ok = await refund(n.userId, n.amount);
+    auditLog(String(n.userId), ok ? 'CLUB_TOURNAMENT_REFUND' : 'CLUB_TOURNAMENT_REFUND_FAILED', { clubTournamentId: ct.id, tournamentId: liveId, amount: n.amount, reason: 'not_entered' });
+  }
+  try { await setClubTournamentLive(ct.id, liveId); } catch (e: any) { console.error('[ClubTournament] live id not stored:', e?.message || e); }
+  clubTournamentStats.started++;
+  console.log(`[ClubTournament] ${JSON.stringify({ event: 'club_tournament_started', clubTournamentId: ct.id, tournamentId: liveId, entrants: claim.entrants.length - notEntered.length })}`);
+  void screenAndStartTournament(liveId, 'club');
+  return liveId;
+}
+
+/**
+ * R2 (TOURNEY-14) — at boot (delayed like the staking sweep: Railway starts the
+ * new container before it stops the old one, whose shutdown flush settles its
+ * own): a club tournament left 'running' belongs to a tournament that died
+ * with the previous process. Its buy-ins are refunded (club keys — a flush
+ * that already refunded them makes this a no-op), unless its prizes were paid
+ * (then it only needed its status).
+ */
+async function bootSweepStrandedClubTournaments(): Promise<void> {
+  const stranded = await strandedClubTournaments();
+  for (const s of stranded) {
+    if (s.liveTournamentId && tournamentManager.getTournament(s.liveTournamentId)) continue;   // this process plays it
+    if (s.liveTournamentId) {
+      const paid = await getPool().query('SELECT 1 FROM prize_payouts WHERE payout_key LIKE $1 LIMIT 1', [`tprize:${s.liveTournamentId}:%`]).catch(() => ({ rowCount: 0 }));
+      if ((paid.rowCount || 0) > 0) { await endClubTournament(s.id, 'finished').catch(() => false); continue; }
+    }
+    const st = await refundClubTournamentEntrants(s.id, s.liveTournamentId || '', s.entrants.map((e) => ({ userId: e.userId, amount: e.paid })), 'server_restart');
+    if (st === 'committed') clubTournamentStats.strandedSwept++;
+  }
+}
+setTimeout(() => {
+  bootSweepStrandedClubTournaments().catch((e: any) => console.error('[ClubTournament] boot sweep failed:', e?.message || e));
+}, 90_000).unref?.();
+
+// ========== Tournament registration — per account, per socket (R2, C2) ==========
+/** The account a socket asks as (its local userId + master id), or null. */
+function tournamentViewerOf(socketId: string): { userId: number; masterUserId: string | null } | null {
+  const a = authSessions.get(socketId);
+  if (!a) return null;
+  return { userId: a.userId, masterUserId: a.masterUserId ? String(a.masterUserId) : (a.statsMasterUserId || null) };
+}
+
+/**
+ * C2 — the tournament list goes to EVERY socket with ITS OWN `registered` /
+ * `entryId` flags (a single io.emit carried none, so the lobby lost the
+ * player's registration on every 10s refresh — TOURNEY-7 / APPUI-19).
+ */
+function broadcastTournamentList(): void {
+  for (const [sid, sock] of io.sockets.sockets) {
+    if (!sock || !sock.connected) continue;
+    sock.emit('tournamentList', tournamentManager.getTournamentList(tournamentViewerOf(sid)));
+  }
+}
+
+/** C2 — `tournamentCancelled` to every live socket of a registrant (by account; an account-less one by his socket). */
+const tournamentCancelledNotices = { told: 0 };
+function tellTournamentCancelled(
+  tournamentId: string, r: { userId?: number; masterUserId?: string; socketId?: string; refund: number }, reason: string,
+): void {
+  const payload = { tournamentId, refunded: Math.max(0, Math.floor(r.refund || 0)), reason };
+  const told = new Set<string>();
+  for (const [sid, a] of authSessions) {
+    const mine = (r.userId !== undefined && a.userId === r.userId)
+      || (!!r.masterUserId && String(a.masterUserId || a.statsMasterUserId || '') === String(r.masterUserId));
+    if (!mine) continue;
+    const sock = io.sockets.sockets.get(sid);
+    if (sock && sock.connected) { sock.emit('tournamentCancelled', payload); told.add(sid); }
+  }
+  if (told.size === 0 && r.userId === undefined && !r.masterUserId && r.socketId) {
+    const sock = io.sockets.sockets.get(r.socketId);
+    if (sock && sock.connected && !authSessions.has(r.socketId)) { sock.emit('tournamentCancelled', payload); told.add(r.socketId); }
+  }
+  tournamentCancelledNotices.told += told.size;
+}
+
+/**
+ * R2 (C2 / TOURNEY-10) — the stable tournament identity of an account: ONE
+ * entrant id per account (`user-<local id>`, the same key as the account's
+ * lobby progress entry, so tournament hands and results feed its progression —
+ * XP, stats, achievements). It used to be the socket's current cash seat id or
+ * a random one per request (two lobby mounts registered twice; a random id had
+ * no progress entry, so tournament play earned nothing). An account-less
+ * socket (guest-play rollback only) keeps a random id.
+ */
+function tournamentEntrantPlayerId(userId: number | undefined): string {
+  return userId !== undefined ? `user-${userId}` : `player-${uuidv4()}`;
+}
+
+/**
+ * R2 (TOURNEY-11, S1) — a FINISHED tournament's tables are removed once the
+ * result has been shown (FINISHED_TOURNAMENT_TABLE_RETIRE_MS after
+ * tournamentFinished): they used to stay forever — listed in the lobby, the
+ * winner's stack sitting on a table that never dealt again, a cash buy-in on
+ * one never cashed out (c260a3df). The room is told `tableClosed {tableId,
+ * reason:'tournament_finished', tournamentId}`; every session / spectator /
+ * reservation / timer of the table ends; its seats are stood up WITHOUT any
+ * credit (tournament chips — prizes were paid by payTournamentPrizes). The
+ * table stays a tournament table to every chip decision for its broken-table
+ * window (noteBrokenTournamentTable) in case anything still points at it.
+ */
+const FINISHED_TOURNAMENT_TABLE_RETIRE_MS = 60_000;
+const finishedTournamentTablesRetired = { tables: 0 };
+const finishedTournamentRetirements = new Set<string>();
+function scheduleFinishedTournamentTablesRetirement(tournamentId: string, tableIds: string[]): void {
+  if (!tournamentId || finishedTournamentRetirements.has(tournamentId)) return;
+  finishedTournamentRetirements.add(tournamentId);
+  const ids = [...new Set(tableIds.filter(Boolean))];
+  const timer = setTimeout(() => {
+    finishedTournamentRetirements.delete(tournamentId);
+    for (const tid of ids) retireFinishedTournamentTable(tid, tournamentId);
+  }, FINISHED_TOURNAMENT_TABLE_RETIRE_MS);
+  (timer as any)?.unref?.();
+}
+function retireFinishedTournamentTable(tableId: string, tournamentId: string): void {
+  // Only a table still mapped to THIS tournament (a table a rebalance broke is
+  // already gone; never touch a table some other tournament owns).
+  if (tournamentTables.get(tableId) !== tournamentId) return;
+  const t = tournamentManager.getTournament(tournamentId);
+  if (t && t.status === 'running') return;   // not over after all — never retire a live table
+  const table = tableManager.getTable(tableId);
+  io.to(`table:${tableId}`).emit('tableClosed', { tableId, reason: 'tournament_finished', tournamentId });
+  for (const [uid, r] of [...reservedSeats]) {
+    if (r.tableId !== tableId) continue;
+    clearTimeout(r.cleanupTimer);
+    reservedSeats.delete(uid);
+  }
+  endTableViewsAndTimers(tableId);
+  if (table) for (let i = 0; i < MAX_SEATS; i++) if (table.seats[i].state === 'occupied') table.standUp(i);
+  noteBrokenTournamentTable(tableId, tournamentId);   // still a tournament table to any chip decision
+  tournamentTables.delete(tableId);
+  fastModeTables.delete(tableId);
+  tableManager.removeTable(tableId);
+  tableProgressListeners.delete(tableId);
+  finishedTournamentTablesRetired.tables++;
+  console.log(`[Tournament] ${JSON.stringify({ event: 'finished_tournament_table_retired', tournamentId, tableId })}`);
 }
 
 // Periodically check for timed tournaments
@@ -17864,7 +19406,14 @@ setInterval(() => {
       console.warn(`[Tournament] cancelled stalled tournament ${id}, refunded ${registrants.length} entrant(s)`);
     }
   }
-  io.emit('tournamentList', tournamentManager.getTournamentList());
+  // R2 (P3) — a timed freeroll whose start passed without two players moves
+  // its start forward (never "Starting soon" all day); ended ad-hoc
+  // tournaments (and their event listeners) are dropped after an hour.
+  tournamentManager.rollOverdueFreerollStarts();
+  tournamentManager.pruneEndedTournaments();
+  // R2 (TOURNEY-14) — a club tournament's mapping lives as long as its tournament.
+  for (const liveId of [...clubLiveTournaments.keys()]) if (!tournamentManager.getTournament(liveId)) clubLiveTournaments.delete(liveId);
+  broadcastTournamentList();
 }, 10000);
 
 // ========== Multi-Table Tournament Simulation ==========
@@ -17913,7 +19462,11 @@ function startQualifierTournament(
     prizePool: 0,
     maxPlayers: players.length,
     startInterval: 0,
-    blindLevels: DEFAULT_BLIND_LEVELS,
+    // R2 (TOURNEY-13 / C3) — the structure the lobby is shown (qualifierStructure):
+    // the advertised 20-minute levels scaled to the real stack, continued until
+    // it must end. It ran 10/20 blinds on a 50,000 stack — a qualifier that never ended.
+    blindLevels: qualifierBlindLevels(startingStack),
+    startingChips: startingStack,
   });
 
   const tournament = tournamentManager.getTournament(tournamentId);
@@ -17970,6 +19523,8 @@ function startQualifierTournament(
     const tp = tournament.players.find((x) => x.playerId === p.id);
     const boundSid = tp ? bindRegistrantSocket(tournamentId, tp) : null;
     if (!boundSid) continue;
+    // R2 (TOURNEY-9) — never over a live seat that socket plays elsewhere.
+    if (tp && keepStartSeatAbsentForLiveSeatElsewhere(tournamentId, tp, boundSid, tid, seatIdx, startingStack)) continue;
     const sess: PlayerSession = {
       socketId: boundSid,
       tableId: tid,
@@ -18067,9 +19622,13 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): vo
     if (event === 'tournamentFinished') {
       void payTournamentPrizes(data).catch(() => {}); // funded prize payouts + staking settlement (mint-free, idempotent)
       postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
+      // R2 (C3) — the qualifier is FINISHED, its standings kept and told (place + wonSeat per registrant).
+      markQualifierFinished(data?.tournamentId || tournamentId, data);
       // P-h (round 5) — every table room as before, AND every entrant's other
       // live sockets (an away entrant in the lobby / at cash / on another tab).
       emitTournamentFinishedToEntrants(tournamentId, tournamentManager.getTournament(tournamentId)?.tableIds || [], data);
+      // R2 (TOURNEY-11) — the finished tables are removed once the result was shown.
+      scheduleFinishedTournamentTablesRetirement(tournamentId, tournamentManager.getTournament(tournamentId)?.tableIds || []);
     }
   });
 }
@@ -18253,6 +19812,8 @@ function startMultiTableTournament(
 // monthly credits). Fire-and-forget; safe to call for non-qualifier tournaments
 // (the master API matches by tournamentId against qualifierTournaments Map).
 const postedQualifierResults = new Set<string>();
+/** R2 (TOURNEY-3) — the results POST to the master (it awards the championship seats): posted / retried / failed for good. */
+const qualifierResultPosts = { posted: 0, retried: 0, failed: 0 };
 function postQualifierResults(tournamentId: string, data: { results?: Array<{ playerId: string; playerName: string; position: number; payout: number; userId?: number; disqualified?: boolean }> }): void {
   if (!tournamentId || postedQualifierResults.has(tournamentId)) return;
   // Find the qualifier that owns this tournament
@@ -18287,17 +19848,213 @@ function postQualifierResults(tournamentId: string, data: { results?: Array<{ pl
     })
     .filter(r => r.playerId); // only players we can map to master DB
   if (mappedResults.length === 0) return;
-  fetch(`${_base}/qualifiers/${masterQualifierId}/results/internal`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
-    body: JSON.stringify({ results: mappedResults }),
-  }).catch(e => console.warn('[QualifierResults] post failed:', e?.message));
+  // R2 (TOURNEY-3) — this POST is what awards the championship seats: a
+  // failure (or a non-2xx answer) is RETRIED with backoff (the master upserts
+  // results, so a retry is safe) and audited when it finally fails — it used
+  // to be fired once with the error only logged.
+  const url = `${_base}/qualifiers/${masterQualifierId}/results/internal`;
+  const post = (attempt: number): void => {
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+      body: JSON.stringify({ results: mappedResults }),
+    }).then((res: any) => {
+      if (res && res.ok === false) throw new Error(`http_${res.status}`);
+      qualifierResultPosts.posted++;
+    }).catch((e: any) => {
+      if (attempt < 4) {
+        qualifierResultPosts.retried++;
+        const t = setTimeout(() => post(attempt + 1), 5000 * 2 ** attempt);
+        (t as any)?.unref?.();
+        return;
+      }
+      qualifierResultPosts.failed++;
+      console.error('[QualifierResults] post failed for good:', e?.message);
+      auditLog('SYSTEM', 'QUALIFIER_RESULTS_POST_FAILED', { tournamentId, masterQualifierId, results: mappedResults.length, error: String(e?.message || e) });
+    });
+  };
+  post(0);
 }
 
 // results that carry a userId (paying humans). Idempotent per tournamentId so
 // a duplicate tournamentFinished event can't double-pay.
+// R2 (ECON-17) — this set only keeps the NON-money side effects (progression,
+// the ticker) to one run. The MONEY is the prize ledger's: one transaction for
+// the whole tournament (every prize, every backer share, every escrow release /
+// refund, the offers marked settled), idempotent per credit, retried until it
+// commits — never "paid" before the credit (the set used to be marked first and
+// a failed addChipsToUser was only logged).
 const paidOutTournaments = new Set<string>();
-async function payTournamentPrizes(data: { tournamentId?: string; results?: Array<{ playerId: string; playerName: string; position: number; payout: number; userId?: number; disqualified?: boolean }> }): Promise<void> {
+/** Tournaments whose staking settlement is under way (the refund sweeps leave their offers alone). */
+const tournamentsSettlingStakes = new Set<string>();
+const tournamentPrizeStats = { settlements: 0, committed: 0, pendingRetry: 0, conflictsReplanned: 0 };
+
+// ========== Staking with escrow (R2, 2026-10-11 — contract C4) ==========
+// TOURNEY-8 / ECON-15 / APPUI-22. An offer names the UUID of a tournament the
+// seller is registered in; a backer's payment is ESCROWED (deducted from him,
+// credited to nobody) until settlement — the seller CASHES: shares paid +
+// escrow released to him; anything else (cancelled, unregistered / removed
+// before the start, busted out of the money, the tournament died with the
+// process): every backer refunded. Planning: src/game/stakingEscrow.ts; money:
+// the prize ledger (a guard moves each offer from unsettled to paid / refunded
+// in the same transaction, so an offer is settled exactly once even across two
+// instances).
+/** The open marketplace (offers still buyable), by id. */
+const stakingOffers = new Map<string, any>();
+const stakingStats = { offersCreated: 0, purchases: 0, refundedOffers: 0, paidOffers: 0, bootSweepRefunded: 0, sweepRefunded: 0 };
+let stakingSchemaReady: Promise<void> | null = null;
+function ensureStakingSchema(): Promise<void> {
+  if (!stakingSchemaReady) {
+    stakingSchemaReady = (async () => {
+      const pool = getPool();
+      await pool.query('ALTER TABLE staking_offers ADD COLUMN IF NOT EXISTS escrow BOOLEAN NOT NULL DEFAULT FALSE');
+      await pool.query('ALTER TABLE staking_offers ADD COLUMN IF NOT EXISTS refunded_at TIMESTAMPTZ');
+      await pool.query('ALTER TABLE staking_offers ADD COLUMN IF NOT EXISTS seller_entry_id TEXT');
+    })().catch((e) => { stakingSchemaReady = null; throw e; });
+  }
+  return stakingSchemaReady;
+}
+
+/** Unsettled ESCROW offers (by tournament, optionally one seller). */
+async function loadUnsettledEscrowOffers(tournamentId: string, sellerId?: number): Promise<EscrowOffer[]> {
+  await ensureStakingSchema();
+  const { rows } = await getPool().query(
+    `SELECT id, seller_id, backers FROM staking_offers
+      WHERE tournament_id = $1 AND escrow = TRUE AND paid_out_at IS NULL AND refunded_at IS NULL
+        AND ($2::int IS NULL OR seller_id = $2)`,
+    [tournamentId, sellerId ?? null],
+  );
+  return rows.map((r: any) => ({ id: String(r.id), sellerId: Number(r.seller_id), backers: normalizeBackers(r.backers) }));
+}
+
+const STAKE_GUARD_REFUND = `UPDATE staking_offers SET refunded_at = NOW() WHERE id = ANY($1::uuid[]) AND paid_out_at IS NULL AND refunded_at IS NULL RETURNING id`;
+const STAKE_GUARD_PAID = `UPDATE staking_offers SET paid_out_at = NOW(), settled_at = COALESCE(settled_at, NOW()) WHERE id = ANY($1::uuid[]) AND paid_out_at IS NULL AND refunded_at IS NULL RETURNING id`;
+
+/** Tell a backer (every live socket of his) about a payout / refund — after the commit. */
+function tellStakingCredit(userId: number, event: 'stakingPayout' | 'stakeRefunded', payload: Record<string, unknown>): void {
+  for (const [sid, a] of authSessions) {
+    if (a.userId !== userId) continue;
+    io.sockets.sockets.get(sid)?.emit(event, payload);
+  }
+}
+
+/**
+ * C4 — refund every backer of these offers (each offer once: the guard), one
+ * settlement per offer. Never throws. Returns how many offers were refunded.
+ */
+async function refundEscrowOffers(offers: EscrowOffer[], reason: string, tournamentId: string): Promise<number> {
+  let refunded = 0;
+  for (const offer of offers) {
+    stakingOffers.delete(offer.id);
+    const credits = planEscrowRefund(offer, reason);
+    const r = await prizeLedger.settle({
+      label: `stake-refund:${offer.id}`,
+      guard: { sql: STAKE_GUARD_REFUND, params: [[offer.id]], expectRows: 1 },
+      credits: credits.map((c) => ({ ...c, details: { ...c.details, tournamentId } })),
+    });
+    if (r.status !== 'committed') continue;
+    refunded++;
+    stakingStats.refundedOffers++;
+    for (const c of r.paid) {
+      auditLog(String(c.userId), 'STAKING_REFUND', { offerId: offer.id, tournamentId, amount: c.amount, reason });
+      tellStakingCredit(c.userId, 'stakeRefunded', { offerId: offer.id, tournamentId, amount: c.amount, reason });
+    }
+  }
+  if (refunded > 0) broadcastStakingOffers();
+  return refunded;
+}
+
+/** C4 — refund the escrow of every unsettled offer of a tournament (or of one seller in it). */
+async function refundStakesOf(tournamentId: string, reason: string, sellerId?: number): Promise<number> {
+  if (tournamentsSettlingStakes.has(tournamentId)) return 0;
+  try {
+    return await refundEscrowOffers(await loadUnsettledEscrowOffers(tournamentId, sellerId), reason, tournamentId);
+  } catch (e: any) {
+    console.error(`[Staking] refund (${reason}) failed for ${tournamentId}:`, e?.message || e);
+    return 0;
+  }
+}
+
+/**
+ * The marketplace to every socket: public names, no other account's ids —
+ * R2 (C4): per socket, with ITS `isMine` flags (stakingOffersForViewer).
+ */
+function broadcastStakingOffers(): void {
+  const raw = Array.from(stakingOffers.values());
+  publicStakingOffers(raw)
+    .then((pub) => {
+      for (const [sid, sock] of io.sockets.sockets) {
+        if (!sock || !sock.connected) continue;
+        sock.emit('stakingUpdated', { offers: stakingOffersForViewer(raw, pub, authSessions.get(sid)?.userId) });
+      }
+    })
+    .catch(() => { /* a failed name lookup only delays the next refresh */ });
+}
+
+/**
+ * C4 — every minute: an offer whose tournament is gone or cancelled without a
+ * settlement (a template dropped after its end, a voided tournament) is
+ * refunded; an offer whose tournament STARTED leaves the marketplace (no
+ * buying into a running tournament).
+ */
+async function sweepStakingOffers(): Promise<void> {
+  for (const [id, o] of [...stakingOffers]) {
+    const t = tournamentManager.getTournament(o.tournamentId);
+    if (t && t.status === 'registering') continue;
+    stakingOffers.delete(id);
+    if (t && (t.status === 'running' || t.status === 'finished')) continue;   // settled at the finish
+    if (tournamentsSettlingStakes.has(o.tournamentId)) continue;
+    stakingStats.sweepRefunded += await refundStakesOf(o.tournamentId, t ? 'tournament_cancelled' : 'tournament_gone');
+  }
+}
+setInterval(() => { sweepStakingOffers().catch((e: any) => console.error('[Staking] sweep failed:', e?.message || e)); }, 60_000).unref?.();
+
+/**
+ * C4 — at boot every escrow offer left unsettled belongs to a tournament that
+ * died with the previous process (tournaments live in memory): its backers
+ * are refunded. Delayed STAKING_BOOT_SWEEP_DELAY_MS — Railway starts the new
+ * container BEFORE it stops the old one, whose shutdown flush settles its own
+ * offers (the guard settles each offer once either way).
+ */
+const STAKING_BOOT_SWEEP_DELAY_MS = 90_000;
+async function bootSweepUnsettledStakes(): Promise<void> {
+  await ensureStakingSchema();
+  const { rows } = await getPool().query(
+    `SELECT id, seller_id, backers, tournament_id FROM staking_offers
+      WHERE escrow = TRUE AND paid_out_at IS NULL AND refunded_at IS NULL AND created_at < $1`,
+    [new Date(PROCESS_STARTED_AT).toISOString()],
+  );
+  for (const r of rows) {
+    const offer: EscrowOffer = { id: String(r.id), sellerId: Number(r.seller_id), backers: normalizeBackers(r.backers) };
+    stakingStats.bootSweepRefunded += await refundEscrowOffers([offer], 'server_restart', String(r.tournament_id));
+  }
+  // Legacy (pre-escrow) offers paid the seller at purchase: closed, nothing to move.
+  await getPool().query(
+    `UPDATE staking_offers SET settled_at = COALESCE(settled_at, NOW()), paid_out_at = COALESCE(paid_out_at, NOW())
+      WHERE escrow = FALSE AND paid_out_at IS NULL AND created_at < $1`,
+    [new Date(PROCESS_STARTED_AT).toISOString()],
+  );
+}
+const PROCESS_STARTED_AT = Date.now();
+setTimeout(() => {
+  bootSweepUnsettledStakes().catch((e: any) => console.error('[Staking] boot sweep failed:', e?.message || e));
+}, STAKING_BOOT_SWEEP_DELAY_MS).unref?.();
+
+/** C4 — the tournaments this account may sell action in: registering, with his entry. */
+function stakeableTournamentsOf(account: { userId: number; masterUserId: string | null }): Array<{ tournamentId: string; name: string; startsAt: string | null }> {
+  const out: Array<{ tournamentId: string; name: string; startsAt: string | null }> = [];
+  for (const item of tournamentManager.getTournamentList(account) as any[]) {
+    if (item.status !== 'registering' || !item.registered) continue;
+    out.push({
+      tournamentId: item.tournamentId,
+      name: item.name,
+      startsAt: item.nextStartTime > 0 ? new Date(item.nextStartTime).toISOString() : null,
+    });
+  }
+  return out;
+}
+
+async function payTournamentPrizes(data: { tournamentId?: string; results?: Array<{ playerId: string; playerName: string; position: number; payout: number; userId?: number; disqualified?: boolean; entryId?: string }> }): Promise<void> {
   const tid = data?.tournamentId;
   if (!tid || paidOutTournaments.has(tid)) return;
   paidOutTournaments.add(tid);
@@ -18318,95 +20075,88 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
   const champ = (data?.results || []).find((r) => r.position === 1 && r.userId !== undefined && !r.disqualified);
   if (champ?.playerName) pushActivity(`♠ ${champ.playerName} won a tournament!`);
 
-  for (const r of data?.results || []) {
-    // A disqualified entrant's payout is already 0 (finishTournament); the
-    // explicit check keeps that true whatever the payout table says.
-    if (r.userId === undefined || !(r.payout > 0) || r.disqualified) continue;
-
-    // Batch 5c — staking settlement. If this player SOLD action in this
-    // tournament, each backer receives their pct of the prize and the seller
-    // keeps the remainder. The total paid always equals r.payout (no mint /
-    // no destruction): sellerAmount = payout − Σ(payable backer amounts), and
-    // any backer we can't resolve to a userId leaves their share with the
-    // seller. DB-idempotent via paid_out_at so a re-fire can't double-pay
-    // backers.
-    let sellerAmount = r.payout;
-    const backerPayouts: { userId: number; name: string; amount: number; pct: number }[] = [];
-    try {
-      const { rows } = await getPool().query(
-        `SELECT id, backers FROM staking_offers WHERE tournament_id = $1 AND seller_id = $2 AND paid_out_at IS NULL`,
-        [tid, r.userId]
-      );
-      if (rows.length > 0) {
-        const offerIds: string[] = [];
-        const collected: { userId: number; name: string; pct: number }[] = [];
-        for (const row of rows) {
-          offerIds.push(row.id);
-          const backers = Array.isArray(row.backers) ? row.backers : [];
-          for (const b of backers) {
-            const pct = Number(b.pct) || 0;
-            if (pct <= 0) continue;
-            collected.push({ userId: Number(b.userId) || 0, name: String(b.name || ''), pct });
-          }
-        }
-        // Resolve legacy (userId-less) backers by username.
-        for (const b of collected) {
-          if (!b.userId && b.name) {
-            const ur = await getPool().query('SELECT id FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1', [b.name]);
-            if (ur.rows.length) b.userId = Number(ur.rows[0].id);
-          }
-        }
-        // Pure conservation-safe split (tested in TournamentEconomy.test.ts).
-        const split = computeStakingSplit(r.payout, collected);
-        sellerAmount = split.sellerAmount;
-        backerPayouts.push(...split.backerPayouts);
-        // Mark these offers settled so a re-fire can't pay backers twice.
-        await getPool().query(`UPDATE staking_offers SET paid_out_at = NOW() WHERE id = ANY($1::uuid[])`, [offerIds]);
+  // R2 (ECON-17 + C4) — the money. Planned from the results and the
+  // tournament's unsettled escrow offers, settled in ONE ledger transaction
+  // (re-planned once if a refund settled an offer meanwhile — the guard).
+  tournamentsSettlingStakes.add(tid);
+  tournamentPrizeStats.settlements++;
+  try {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let offers: EscrowOffer[] = [];
+      try { offers = await loadUnsettledEscrowOffers(tid); } catch (e: any) {
+        // Prizes are still paid; the offers stay unsettled and are refunded by
+        // the sweeps (backers whole — nothing minted or lost).
+        console.error(`[TournamentPrize ${tid}] staking offers unreadable — prizes settle without staking:`, e?.message || e);
+        offers = [];
       }
-    } catch (e: any) {
-      // On any staking-lookup error, fall back to paying the seller the full
-      // prize (never strand chips) and skip backer payouts this run.
-      console.error(`[Staking settle ${tid}/${r.userId}]`, e?.message || e);
-      sellerAmount = r.payout;
-      backerPayouts.length = 0;
+      const credits: LedgerCredit[] = [];
+      const paidOfferIds: string[] = [];
+      const refundOfferIds: string[] = [];
+      const handled = new Set<string>();
+      for (const r of data?.results || []) {
+        // A disqualified entrant's payout is already 0 (finishTournament); the
+        // explicit check keeps that true whatever the payout table says.
+        if (r.userId === undefined || !(r.payout > 0) || r.disqualified) continue;
+        const prizeKey = `tprize:${tid}:${r.entryId || r.playerId}`;
+        const mine = offers.filter((o) => o.sellerId === r.userId);
+        if (mine.length === 0) {
+          credits.push({ key: prizeKey, userId: r.userId, amount: r.payout, kind: 'TOURNAMENT_PRIZE', details: { tournamentId: tid, position: r.position } });
+          continue;
+        }
+        const plan = planCashedSettlement(mine, r.userId, r.payout, prizeKey, { tournamentId: tid, position: r.position });
+        if (plan.sellerPrize) credits.push({ ...plan.sellerPrize, kind: 'TOURNAMENT_PRIZE' });
+        credits.push(...plan.credits);
+        for (const o of mine) { paidOfferIds.push(o.id); handled.add(o.id); }
+      }
+      // Every other offer: its seller did not cash (busted out of the money,
+      // disqualified, never made the field) — his backers get their escrow back.
+      for (const o of offers) {
+        if (handled.has(o.id)) continue;
+        credits.push(...planEscrowRefund(o, 'not_in_the_money').map((c) => ({ ...c, details: { ...c.details, tournamentId: tid } })));
+        refundOfferIds.push(o.id);
+      }
+      const allOfferIds = [...paidOfferIds, ...refundOfferIds];
+      const extraStatements = refundOfferIds.length > 0
+        ? [{ sql: 'UPDATE staking_offers SET refunded_at = NOW(), paid_out_at = NULL WHERE id = ANY($1::uuid[])', params: [refundOfferIds] }]
+        : [];
+      // R2 (TOURNEY-14) — a CLUB tournament has ONE outcome: these prizes, or its
+      // buy-ins refunded (a cancel / void / boot sweep) — the club row moves
+      // running → finished in the same transaction, or nothing is paid.
+      const clubTid = clubLiveTournaments.get(tid);
+      const res = await prizeLedger.settle({
+        label: `tournament:${tid}`,
+        credits,
+        // The guard marks EVERY offer it settles as paid, atomically with the
+        // credits; refunded ones are then re-marked (extraStatements, same txn).
+        ...(allOfferIds.length > 0 ? { guard: { sql: STAKE_GUARD_PAID, params: [allOfferIds], expectRows: allOfferIds.length } } : {}),
+        ...(clubTid !== undefined ? { guards: [{ sql: CLUB_TOURNAMENT_OUTCOME_GUARD, params: [clubTid, 'finished'], expectRows: 1 }] } : {}),
+        extraStatements,
+      });
+      if (res.status === 'conflict') { tournamentPrizeStats.conflictsReplanned++; continue; }
+      if (res.status === 'failed') {
+        tournamentPrizeStats.pendingRetry++;
+        auditLog('SYSTEM', 'TOURNAMENT_PRIZE_PENDING_RETRY', { tournamentId: tid, credits: credits.length, error: res.error || null });
+        return;
+      }
+      tournamentPrizeStats.committed++;
+      if (clubTid !== undefined) clubTournamentStats.finished++;
+      stakingStats.paidOffers += paidOfferIds.length;
+      stakingStats.refundedOffers += refundOfferIds.length;
+      const nameOf = (uid: number) => (data?.results || []).find((x) => x.userId === uid)?.playerName || String(uid);
+      for (const c of res.paid) {
+        auditLog(nameOf(c.userId), c.kind, { userId: c.userId, ...c.details, amount: c.amount });
+        if (c.kind === 'STAKING_PAYOUT' && (c.details as any)?.offerId) {
+          tellStakingCredit(c.userId, 'stakingPayout', { amount: c.amount, sellerName: nameOf(Number((c.details as any).sellerId)), tournamentId: tid });
+        } else if (c.kind === 'STAKING_REFUND') {
+          tellStakingCredit(c.userId, 'stakeRefunded', { offerId: (c.details as any)?.offerId ?? null, tournamentId: tid, amount: c.amount, reason: 'not_in_the_money' });
+        }
+      }
+      for (const c of res.noUser) auditLog(String(c.userId), 'TOURNAMENT_PRIZE_NO_USER_ROW', { ...c.details, amount: c.amount });
+      return;
     }
-
-    if (sellerAmount > 0) {
-      addChipsToUser(r.userId, sellerAmount)
-        .then((ok: boolean) => {
-          auditLog(r.playerName || String(r.userId), ok ? 'TOURNAMENT_PRIZE' : 'TOURNAMENT_PRIZE_FAILED',
-            { userId: r.userId, tournamentId: tid, position: r.position, payout: sellerAmount, staked: backerPayouts.length > 0 });
-        })
-        .catch((e: any) => {
-          console.error(`[TournamentPrize ${r.userId}] payout=${sellerAmount}`, e?.message || e);
-          if (Sentry) Sentry.captureException(e, { tags: { area: 'chip.tournamentPrize' }, extra: { userId: r.userId, tournamentId: tid, payout: sellerAmount } });
-          auditLog(r.playerName || String(r.userId), 'TOURNAMENT_PRIZE_FAILED', { userId: r.userId, tournamentId: tid, payout: sellerAmount, error: String(e?.message || e) });
-        });
-    }
-    for (const b of backerPayouts) {
-      addChipsToUser(b.userId, b.amount)
-        .then((ok: boolean) => {
-          auditLog(b.name || String(b.userId), ok ? 'STAKING_PAYOUT' : 'STAKING_PAYOUT_FAILED',
-            { userId: b.userId, tournamentId: tid, sellerId: r.userId, pct: b.pct, amount: b.amount });
-          // Notify online backers so they see the payout (chips are already
-          // credited to the DB; this just surfaces it). Offline backers see it
-          // on next load via the fresh balance.
-          if (ok) {
-            for (const [sid, a] of authSessions) {
-              if (a.userId === b.userId) {
-                io.to(sid).emit('stakingPayout', { amount: b.amount, sellerName: r.playerName || '', tournamentId: tid });
-                const pid = playerSessions.get(sid)?.playerId;
-                if (pid) { const p = progressionManager.getProgress(pid); if (p) p.chips = (p.chips || 0) + b.amount; }
-                sendProgressToPlayer(sid);
-              }
-            }
-          }
-        })
-        .catch((e: any) => {
-          console.error(`[StakingPayout ${b.userId}] amount=${b.amount}`, e?.message || e);
-          auditLog(b.name || String(b.userId), 'STAKING_PAYOUT_FAILED', { userId: b.userId, tournamentId: tid, amount: b.amount, error: String(e?.message || e) });
-        });
-    }
+    auditLog('SYSTEM', 'TOURNAMENT_PRIZE_CONFLICT_UNRESOLVED', { tournamentId: tid });
+  } finally {
+    tournamentsSettlingStakes.delete(tid);
   }
 }
 
@@ -18978,6 +20728,22 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
     if (!s.eliminated || unsettledLeftover(s)) bustedSeatIdx.push(i);
   }
   bustedSeatIdx.sort((a, b) => (startChips.get(a) || 0) - (startChips.get(b) || 0));
+  // R2 (P3) — entrants busted in THIS hand with an EQUAL pre-hand stack TIE
+  // (TDA): marked before their eliminations, so finishTournament splits the
+  // prize money of their places equally (it used to go by seat number).
+  if (check) {
+    const byStack = new Map<number, string[]>();
+    for (const i of bustedSeatIdx) {
+      const s = table.seats[i];
+      if (!s || check.bustedThisHand.get(i) !== s.playerId) continue;
+      const st = startChips.get(i) || 0;
+      if (st <= 0) continue;
+      const ids = byStack.get(st) || [];
+      ids.push(s.playerId);
+      byStack.set(st, ids);
+    }
+    for (const ids of byStack.values()) if (ids.length >= 2) tournamentManager.markSimultaneousBustTie(tournamentId, ids);
+  }
   let bustRank = 0;
   for (const i of bustedSeatIdx) {
     const seat = table.seats[i];
@@ -19733,111 +21499,313 @@ function gracefulShutdown(signal: string, exitCode: number = 0): Promise<void> {
   shutdownPromise = runGracefulShutdown(signal);
   return shutdownPromise;
 }
+
+/**
+ * R2 (2026-10-11, GAME-3 P0 / OPS-2 / TOURNEY-4 + the sign-in reviewer's
+ * race) — from the moment the flush starts it OWNS every seat's chips. It used
+ * to credit only the main seats and the reservations, one await at a time:
+ * extra-table seats (multi-table) and seats waiting for their after-hand
+ * removal were never credited (a redeploy destroyed them), buy-in tournament
+ * entry fees and consumed qualifier credits died with the process, and while
+ * it awaited, a leaveTable or a reservation expiry could credit the same seat
+ * again. Now:
+ *   0. CLAIM — synchronously, before the first await: every creditable seat
+ *      once (main, extra-table, reserved, after-hand removal; deduped by
+ *      table:seat; never a tournament or Spin & Go stack), its chips zeroed and
+ *      every claim that could credit it later ended (session, extra-table
+ *      session, reservation + its timer, pending removal) — and
+ *      `shutdownFlushActive()` makes creditSeatStackToWallet, the reservation
+ *      expiry, the buy-in paths (buyInSocketGone) and new buy-ins
+ *      (blockedByMaintenance) stand down. Registering buy-in tournaments are
+ *      cancelled and running ones voided (their entry fees owed), open Spin &
+ *      Go games refunded their fee (a decided one settled), every qualifier
+ *      registration released (consumed credits refunded).
+ *   1. the wallet credits — seat cash-outs + entry fees — in ONE prize-ledger
+ *      settlement (idempotent keys, retried; the prize_payouts rows are the
+ *      durable audit); club tournaments through their own (one outcome);
+ *   2. staking escrow, Spin & Go fees, qualifier credits — concurrently;
+ *   3. one more try for any pending settlement; 4. progress; 5. snapshots —
+ *   every phase bounded (SHUTDOWN_FLUSH_BUDGET_MS in all, inside the crash
+ *   handler's 20s and Railway's ~30s).
+ */
+let shutdownFlushing = false;
+function shutdownFlushActive(): boolean {
+  return shutdownFlushing;
+}
+const SHUTDOWN_FLUSH_BUDGET_MS = 15_000;
+/** This process's id — the shutdown ledger keys (a flush credits a seat once, ever). */
+const PROCESS_INSTANCE_ID = uuidv4();
+const shutdownFlushStats = {
+  seatsCashedOut: 0, chipsCashedOut: 0, seatsNotCashed: 0, tournamentsCancelled: 0, tournamentsVoided: 0,
+  entryFeesRefunded: 0, clubTournamentsRefunded: 0, qualifierRegistrationsReleased: 0, spinGoFeesRefunded: 0,
+  spinGoSettled: 0, ledgerStatus: '' as string, phasesCutShort: 0,
+};
+
+interface ShutdownSeatCredit { userId: number; amount: number; tableId: string; seatIndex: number; via: string; invested: number }
+
+/**
+ * Phase 0a (synchronous) — every creditable seat claimed ONCE: what to credit,
+ * and whose progress to save. See runGracefulShutdown.
+ */
+function claimSeatsForShutdown(): { credits: ShutdownSeatCredit[]; progress: Array<{ userId: number; playerId: string }> } {
+  const credits: ShutdownSeatCredit[] = [];
+  const progress: Array<{ userId: number; playerId: string }> = [];
+  // 2026-06-11 audit C3: dedupe by PHYSICAL seat (tableId:seatIndex) — a seat
+  // referenced by two sessions / a session + a reservation is credited once; a
+  // legitimately multi-seated user is paid for each of his seats.
+  const creditedSeats = new Set<string>();
+  const take = (userId: number, tableId: string, seatIndex: number, via: string, expectPlayerId?: string, fallbackChips?: number): void => {
+    const seatKey = `${tableId}:${seatIndex}`;
+    if (creditedSeats.has(seatKey) || !(userId > 0)) return;
+    // Tournament stacks are NOT wallet-funded (a mint) — the tournament's entry
+    // fees are refunded instead; a Spin & Go stack is its prize format's (the
+    // fee is refunded). F2: a table a rebalance just broke counts.
+    if (isTournamentTable(tableId) || isPrizeFormatTable(tableId)) { creditedSeats.add(seatKey); shutdownFlushStats.seatsNotCashed++; return; }
+    const table = tableManager.getTable(tableId);
+    const seat = table?.seats?.[seatIndex];
+    if (seat && (seat.state !== 'occupied' || seat.isAI)) return;
+    if (seat && expectPlayerId && seat.playerId !== expectPlayerId) return;
+    // 2026-07-01 audit #1: mid-hand the pot is not awarded yet — the hand is
+    // abandoned and every seat gets stack + what it put in this hand
+    // (chip-conserving). INVARIANT: if table ids ever become stable so a hand
+    // is rehydrated, drop the investment term (it would double-credit).
+    const inHand = !!table && table.isHandInProgress();
+    const invested = seat && inHand ? (seat.totalInvestedThisHand || 0) : 0;
+    const amount = seat ? (seat.chipCount || 0) + invested : Math.max(0, Math.floor(Number(fallbackChips) || 0));
+    creditedSeats.add(seatKey);
+    if (seat) {
+      // Nothing is left on the seat for any other path to credit.
+      seat.chipCount = 0;
+      if (inHand) seat.totalInvestedThisHand = 0;
+    }
+    if (amount > 0) credits.push({ userId, amount, tableId, seatIndex, via, invested });
+  };
+  // Main seats (and whose progress to save).
+  for (const [socketId, session] of [...playerSessions]) {
+    const auth = authSessions.get(socketId);
+    if (auth) {
+      if (session.playerId) progress.push({ userId: auth.userId, playerId: session.playerId });
+      const table = tableManager.getTable(session.tableId);
+      const seat = table?.seats?.[session.seatIndex];
+      const seatKey = `${session.tableId}:${session.seatIndex}`;
+      if (seat && seat.state === 'occupied' && !creditedSeats.has(seatKey) && !isTournamentTable(session.tableId)) {
+        take(auth.userId, session.tableId, session.seatIndex, 'seated', session.playerId);
+      }
+    }
+    playerSessions.delete(socketId);
+  }
+  // Extra-table seats (multi-table) — never credited before R2.
+  for (const [socketId, list] of [...multiTableSessions]) {
+    const auth = authSessions.get(socketId);
+    if (auth) for (const ms of list || []) take(auth.userId, ms.tableId, ms.seatIndex, 'extra_table', ms.playerId);
+    multiTableSessions.delete(socketId);
+  }
+  // Reserved seats (disconnected, not expired) — their expiry timers end here.
+  for (const [userId, reserved] of [...reservedSeats]) {
+    clearTimeout(reserved.cleanupTimer);
+    reservedSeats.delete(userId);
+    // T1: isTournamentReservation also covers a table a break took out of tournamentTables.
+    if (isTournamentReservation(reserved)) { shutdownFlushStats.seatsNotCashed++; continue; }
+    take(userId, reserved.tableId, reserved.seatIndex, 'reserved', undefined, reserved.chips);
+  }
+  // Seats waiting for their after-hand removal (a leaver folded with chips in
+  // the pot) — never credited before R2. S2's entries may carry `noCredit`
+  // (nothing owed) and the seat's `playerId` (credited only if it still holds it).
+  for (const [tableId, pend] of [...pendingSeatRemovalAfterHand]) {
+    for (const [seatIndex, who] of pend) {
+      const w = who as { userId: number; noCredit?: boolean; playerId?: string };
+      if (w.noCredit || !(w.userId > 0)) continue;
+      take(w.userId, tableId, seatIndex, 'leave_after_hand', w.playerId);
+    }
+    pendingSeatRemovalAfterHand.delete(tableId);
+  }
+  return { credits, progress };
+}
+
+/**
+ * Phase 0b (synchronous) — the money that lives only in this process's
+ * tournaments: every REGISTERING buy-in tournament cancelled and every RUNNING
+ * one voided (no prize can follow), each paying entrant's fee owed (a club
+ * tournament's through its own settlement — one outcome); staking escrow of
+ * every such tournament to refund; registrants told (tournamentCancelled).
+ */
+function claimTournamentRefundsForShutdown(): {
+  entryFees: LedgerCredit[]; clubRefunds: Array<{ clubTid: number; liveId: string; entrants: Array<{ userId: number; amount: number }> }>; stakes: string[];
+} {
+  const entryFees: LedgerCredit[] = [];
+  const clubRefunds: Array<{ clubTid: number; liveId: string; entrants: Array<{ userId: number; amount: number }> }> = [];
+  const stakes: string[] = [];
+  const owe = (tid: string, regs: Array<{ playerId: string; userId?: number; refund: number }>) => {
+    const clubTid = clubLiveTournaments.get(tid);
+    const owed = regs.filter((r) => r.userId !== undefined && r.refund > 0);
+    if (clubTid !== undefined) {
+      clubRefunds.push({ clubTid, liveId: tid, entrants: owed.map((r) => ({ userId: r.userId as number, amount: r.refund })) });
+    } else {
+      for (const r of owed) {
+        entryFees.push({
+          key: `tfee:${tid}:${r.playerId}`, userId: r.userId as number, amount: r.refund, kind: 'TOURNAMENT_ENTRY_REFUND',
+          details: { tournamentId: tid, reason: 'server_restart' },
+        });
+      }
+    }
+    for (const r of regs) { try { tellTournamentCancelled(tid, r, 'server_restart'); } catch { /* the sockets are going anyway */ } }
+  };
+  for (const tid of tournamentManager.tournamentIdsWithStatus('registering')) {
+    stakes.push(tid);
+    const regs = tournamentManager.cancelTournament(tid);
+    if (regs.length > 0) shutdownFlushStats.tournamentsCancelled++;
+    owe(tid, regs);
+  }
+  for (const tid of tournamentManager.tournamentIdsWithStatus('running')) {
+    stakes.push(tid);
+    const regs = tournamentManager.voidRunningTournament(tid);
+    shutdownFlushStats.tournamentsVoided++;
+    owe(tid, regs);
+  }
+  return { entryFees, clubRefunds, stakes };
+}
+
+/**
+ * Phase 0c (synchronous claim, async work) — open Spin & Go games: an
+ * undecided one refunds its fee (its stack is never cashed), a decided one
+ * settles now (its prize, or nothing); every qualifier registration of an
+ * event that dies with the process is released — every consumed credit
+ * (entry + re-entries) refunded on the master, its master row dropped — and a
+ * re-entry chip buy-in owed back. Returns the async work.
+ */
+function claimQuickAndQualifierRefundsForShutdown(entryFees: LedgerCredit[]): Promise<unknown>[] {
+  const tasks: Promise<unknown>[] = [];
+  for (const [tableId, qg] of [...quickGames]) {
+    if (qg.format !== 'spinGo' || qg.settlement !== 'open') continue;
+    if (qg.ended && qg.decided) { finishQuickGame(tableId, qg.decided); shutdownFlushStats.spinGoSettled++; continue; }
+    shutdownFlushStats.spinGoFeesRefunded++;
+    tasks.push(refundQuickEntryFee(tableId, qg, 'server_restart'));
+  }
+  for (const [qualId, qt] of [...qualifierTournaments]) {
+    if (qt.status === 'finished') continue;
+    for (const p of qt.players) {
+      shutdownFlushStats.qualifierRegistrationsReleased++;
+      tasks.push(releaseQualifierRegistration(qualId, qt, p, 'server_restart'));
+      const rebuys = Math.max(0, Math.floor(Number(p.reEntries) || 0)) * Math.max(0, Math.floor(Number(qt.buyIn) || 0));
+      if (rebuys > 0 && p.localUserId) {
+        entryFees.push({
+          key: `qrebuy:${qualId}:${p.playerId}:${PROCESS_INSTANCE_ID}`, userId: p.localUserId, amount: rebuys, kind: 'QUALIFIER_REENTRY_BUYIN_REFUND',
+          details: { qualifierId: qualId, reEntries: p.reEntries, reason: 'server_restart' },
+        });
+      }
+    }
+    qt.status = 'finished';
+    qt.cancelled = true;
+    qt.finishedAt = Date.now();
+  }
+  return tasks;
+}
+
+/** Phase 1 — the seat cash-outs + entry fees: ONE ledger settlement (idempotent, retried). */
+async function settleShutdownCredits(seats: ShutdownSeatCredit[], entryFees: LedgerCredit[]): Promise<void> {
+  const credits: LedgerCredit[] = [
+    ...seats.map((c) => ({
+      key: `shutdown:${PROCESS_INSTANCE_ID}:${c.tableId}:${c.seatIndex}`, userId: c.userId, amount: c.amount, kind: 'SHUTDOWN_CASH_OUT',
+      details: { tableId: c.tableId, seatIndex: c.seatIndex, via: c.via, ...(c.invested > 0 ? { pot: c.invested } : {}) },
+    })),
+    ...entryFees,
+  ];
+  if (credits.length === 0) { shutdownFlushStats.ledgerStatus = 'nothing_owed'; return; }
+  const r = await prizeLedger.settle({ label: `shutdown:${PROCESS_INSTANCE_ID}`, credits });
+  shutdownFlushStats.ledgerStatus = r.status;
+  for (const c of r.paid) {
+    if (c.kind === 'SHUTDOWN_CASH_OUT') { shutdownFlushStats.seatsCashedOut++; shutdownFlushStats.chipsCashedOut += c.amount; }
+    else shutdownFlushStats.entryFeesRefunded++;
+    console.log(`[Shutdown] ${c.kind} ${c.amount} for user ${c.userId} ${JSON.stringify(c.details || {})}`);
+  }
+  if (r.status !== 'committed') {
+    // Never silent: every credit the flush could not settle is in the log (and Sentry) to reconcile.
+    for (const c of credits) console.error(`[Shutdown] NOT SETTLED ${c.kind} ${c.amount} for user ${c.userId} ${JSON.stringify(c.details || {})}`);
+    if (Sentry) Sentry.captureMessage(`shutdown flush: ${credits.length} credit(s) not settled (${r.error || r.status})`);
+  }
+}
+
+/** Phase 4 — progress (xp / level / achievements / stats) of every seated account (once each). */
+async function flushProgressForShutdown(progress: Array<{ userId: number; playerId: string }>): Promise<void> {
+  const seen = new Set<number>();
+  for (const { userId, playerId } of progress) {
+    if (seen.has(userId)) continue;
+    seen.add(userId);
+    try {
+      const prog = progressionManager.getClientProgress(playerId) as any;
+      if (!prog || !prog.hydrated) continue;
+      await saveProgress(userId, {
+        xp: prog.xp,
+        level: prog.level,
+        achievements: prog.achievements || [],
+        stats: {
+          handsPlayed: prog.totalHandsPlayed,
+          handsWon: prog.handsWon,
+          biggestPot: prog.biggestPot,
+          bestStreak: prog.bestStreak,
+          bluffWins: prog.bluffWins,
+          allInWins: prog.allInWins,
+          chatMessagesSent: prog.chatMessagesSent,
+          straightFlushHits: prog.straightFlushHits,
+          fullHouseHits: prog.fullHouseHits,
+          quadsHits: prog.quadsHits,
+          royalFlushHits: prog.royalFlushHits,
+          tournamentsWon: prog.tournamentsWon,
+          tournamentsPlayed: prog.tournamentsPlayed,
+          variantsPlayed: prog.variantsPlayed || [],
+        },
+      });
+    } catch (e: any) {
+      console.warn(`[Shutdown] progress flush failed for user ${userId}:`, e?.message);
+    }
+  }
+}
+
 async function runGracefulShutdown(signal: string): Promise<void> {
   if (shutdownInProgress) return;
   shutdownInProgress = true;
   console.log(`[Shutdown] ${signal} received — preserving player state...`);
+  const deadline = Date.now() + SHUTDOWN_FLUSH_BUDGET_MS;
+  /** Await `work`, but never past the flush budget (the phase is logged as cut short). */
+  const bounded = async (label: string, work: Promise<unknown>): Promise<void> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cut = new Promise<'cut'>((resolve) => { timer = setTimeout(() => resolve('cut'), Math.max(0, deadline - Date.now())); });
+    try {
+      const r = await Promise.race([work.then(() => 'done' as const, (e: any) => { console.warn(`[Shutdown] ${label} failed:`, e?.message || e); return 'done' as const; }), cut]);
+      if (r === 'cut') { shutdownFlushStats.phasesCutShort++; console.error(`[Shutdown] ${label} cut short by the ${SHUTDOWN_FLUSH_BUDGET_MS}ms flush budget`); }
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
 
   try {
-    // 1. Cash out every seated human player and flush their progress.
-    const seenUserIds = new Set<number>();
-    // 2026-06-11 audit C3: dedupe the cash-out by PHYSICAL seat
-    // (tableId:seatIndex), not just by userId. seenUserIds prevents the
-    // active-vs-reserved double, but a single seat referenced by two live
-    // sessions (a stale ghost socket + the real one, mid-reconnect) would
-    // otherwise be credited TWICE. Crediting per distinct seat also still
-    // pays a legitimately multi-seated user for each of their seats.
-    const creditedSeats = new Set<string>();
-    for (const [socketId, session] of playerSessions) {
-      try {
-        const auth = authSessions.get(socketId);
-        if (!auth) continue;
-        const table = tableManager.getTable(session.tableId);
-        const seat = table?.seats?.[session.seatIndex];
-        const seatKey = `${session.tableId}:${session.seatIndex}`;
-        // Tournament stacks are NOT wallet-funded — never cash them out (would
-        // mint). They persist with the tournament (or are lost if the
-        // tournament can't rehydrate), but they must not hit the wallet.
-        // F2: a table a rebalance just broke counts (isTournamentTable).
-        if (seat && seat.state === 'occupied' && !creditedSeats.has(seatKey) && !isTournamentTable(session.tableId)) {
-          // 2026-07-01 audit #1: refund the FULL table stake. Mid-hand the pot
-          // has NOT been awarded yet (determineWinners sets phase=HandComplete),
-          // so chips already committed this hand (totalInvestedThisHand) would be
-          // DESTROYED on a mid-hand redeploy — Redis rehydration is dead
-          // (per-process table UUIDs never match a saved snapshot, so nothing
-          // restores them). Abandon the hand and refund stack + investment; this
-          // is chip-conserving (every player gets back exactly what they had on
-          // the table). At HandComplete/WaitingForPlayers the pot is already in
-          // chipCount, so invested is NOT added (would double-credit the winner).
-          //
-          // INVARIANT: if you ever make table IDs stable to revive rehydration,
-          // you MUST drop the totalInvestedThisHand term here — restoring the
-          // hand AND refunding its pot would double-credit.
-          const inHand = !!table && table.isHandInProgress();
-          const invested = inHand ? (seat.totalInvestedThisHand || 0) : 0;
-          const refund = seat.chipCount + invested;
-          if (refund > 0) {
-            creditedSeats.add(seatKey);
-            await addChipsToUser(auth.userId, refund);
-            console.log(`[Shutdown] Cashed out ${refund} chips (stack ${seat.chipCount}${invested > 0 ? ` + pot ${invested}` : ''}) for user ${auth.userId} (seat ${session.seatIndex})`);
-          }
-        }
-        const prog = progressionManager.getClientProgress(session.playerId) as any;
-        if (prog && prog.hydrated) {
-          await saveProgress(auth.userId, {
-            xp: prog.xp,
-            level: prog.level,
-            achievements: prog.achievements || [],
-            stats: {
-              handsPlayed: prog.totalHandsPlayed,
-              handsWon: prog.handsWon,
-              biggestPot: prog.biggestPot,
-              bestStreak: prog.bestStreak,
-              bluffWins: prog.bluffWins,
-              allInWins: prog.allInWins,
-              chatMessagesSent: prog.chatMessagesSent,
-              straightFlushHits: prog.straightFlushHits,
-              fullHouseHits: prog.fullHouseHits,
-              quadsHits: prog.quadsHits,
-              royalFlushHits: prog.royalFlushHits,
-              tournamentsWon: prog.tournamentsWon,
-              tournamentsPlayed: prog.tournamentsPlayed,
-              variantsPlayed: prog.variantsPlayed || [],
-            },
-          });
-        }
-        seenUserIds.add(auth.userId);
-      } catch (e: any) {
-        console.warn(`[Shutdown] flush failed for socket ${socketId}:`, e?.message);
-      }
-    }
+    // 0. CLAIM — synchronously, before the first await (see the header).
+    shutdownFlushing = true;
+    let seats: ReturnType<typeof claimSeatsForShutdown> = { credits: [], progress: [] };
+    let tourneys: ReturnType<typeof claimTournamentRefundsForShutdown> = { entryFees: [], clubRefunds: [], stakes: [] };
+    let sideTasks: Promise<unknown>[] = [];
+    try { seats = claimSeatsForShutdown(); } catch (e: any) { console.error('[Shutdown] seat claim failed:', e?.message || e); }
+    try { tourneys = claimTournamentRefundsForShutdown(); } catch (e: any) { console.error('[Shutdown] tournament claim failed:', e?.message || e); }
+    try { sideTasks = claimQuickAndQualifierRefundsForShutdown(tourneys.entryFees); } catch (e: any) { console.error('[Shutdown] quick / qualifier claim failed:', e?.message || e); }
 
-    // 2. Cash out every reserved seat (disconnected but not yet expired).
-    for (const [userId, reserved] of reservedSeats) {
-      if (seenUserIds.has(userId)) continue;
-      try {
-        const table = tableManager.getTable(reserved.tableId);
-        const seat = table?.seats?.[reserved.seatIndex];
-        // #1: include the in-hand pot investment so a mid-hand redeploy refunds
-        // (not destroys) the reserved player's committed chips. See the seated
-        // loop above for the full rationale + the rehydration invariant.
-        const inHand = !!table && table.isHandInProgress();
-        const invested = inHand ? (seat?.totalInvestedThisHand || 0) : 0;
-        const chips = (seat?.chipCount ?? reserved.chips ?? 0) + invested;
-        const seatKey = `${reserved.tableId}:${reserved.seatIndex}`;
-        // T1: isTournamentReservation also covers a reservation whose table a
-        // tournament table break already took out of tournamentTables.
-        if (chips > 0 && !creditedSeats.has(seatKey) && !isTournamentReservation(reserved)) {
-          creditedSeats.add(seatKey);
-          await addChipsToUser(userId, chips);
-          console.log(`[Shutdown] Cashed out ${chips} reserved chips (invested ${invested}) for user ${userId}`);
-        }
-      } catch (e: any) {
-        console.warn(`[Shutdown] reserved flush failed for user ${userId}:`, e?.message);
-      }
-    }
+    // 1. The wallet credits: seat cash-outs + entry fees in ONE ledger settlement.
+    await bounded('cash-outs', settleShutdownCredits(seats.credits, tourneys.entryFees));
 
-    // 3. Flush every pending debounced hand-snapshot to Redis.
+    // 2. Club tournaments (one outcome each), staking escrow, Spin & Go fees, qualifier credits.
+    shutdownFlushStats.clubTournamentsRefunded += tourneys.clubRefunds.length;
+    await bounded('refunds', Promise.allSettled([
+      ...tourneys.clubRefunds.map((c) => refundClubTournamentEntrants(c.clubTid, c.liveId, c.entrants, 'server_restart')),
+      ...tourneys.stakes.map((tid) => refundStakesOf(tid, 'server_restart')),
+      ...sideTasks,
+    ]));
+
+    // 3. Any settlement still pending (a prize / refund a DB blip delayed): one more try.
+    await bounded('pending settlements', prizeLedger.retryPending());
+
+    // 4. Progress.
+    await bounded('progress', flushProgressForShutdown(seats.progress));
+
+    // 5. Flush every pending debounced hand-snapshot to Redis.
     //    Without this, the last ~100ms of state (the debounce window)
     //    could be lost on restart — the new process would rehydrate
     //    from a snapshot that's one action behind reality. Also
@@ -19851,11 +21819,12 @@ async function runGracefulShutdown(signal: string): Promise<void> {
           snapshotHand(t.tableId, table.serializeSnapshot(), 0); // bypass debounce
         }
       }
-      await flushAllHandSnapshots();
+      await bounded('hand snapshots', flushAllHandSnapshots());
     } catch (e: any) {
       console.warn('[Shutdown] hand-snapshot flush failed:', e?.message);
     }
 
+    auditLog('SYSTEM', 'SHUTDOWN_FLUSH', { signal, instance: PROCESS_INSTANCE_ID, ...shutdownFlushStats });
     console.log('[Shutdown] State preserved. Exiting.');
   } catch (err: any) {
     console.error('[Shutdown] fatal error during flush:', err?.message);

@@ -43,6 +43,8 @@
  */
 import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
+// R2 (C3, 2026-10-11): startQualifierTournament runs the qualifier structure (qualifierBlindLevels).
+import { qualifierBlindLevels } from '../src/game/qualifierSchedule';
 import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE_MAX_STATUS_AGE_MS } from '../src/auth/playGate';
 import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
@@ -246,6 +248,9 @@ function world(opts: {
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
     payTournamentPrizes: async () => {}, postQualifierResults() {},
     syncSitOutToTable() {}, broadcastGameState() {}, scheduleAIAction() {}, releaseSeatedSlot() {}, cleanupQuickTable() {},
+    // R2 (S1): the Spin & Go (prize format) helpers the leave / reservation paths ask.
+    isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false,
+    shutdownFlushActive: () => false,   // R2 (item 1) — the shutdown flush is not running
     getGameStateForPlayer: () => ({}), emitGameState() {}, notifyPlayer: async () => {}, userIdForSeat: () => undefined,
     ensureTableProgressListener() {}, activateBombPotIfPending() {},
     dealersChoiceState: new Map(), bombPotActive: new Map(), bombPotPending: new Map(), insuranceCashouts: new Map(),
@@ -1122,7 +1127,7 @@ describe('minor (2026-10-10) — a tournament start binds a registrant\'s seat o
     };
     const { exports } = load(`${HELPERS}\n${start}`, {
       tournamentManager: tm, tournamentTables: new Map(), fastModeTables: new Map(), authSessions, playerSessions,
-      io: { to: () => { const op: any = { emit() {}, except: () => op }; return op; }, emit() {}, sockets: { sockets: live } }, DEFAULT_BLIND_LEVELS,
+      io: { to: () => { const op: any = { emit() {}, except: () => op }; return op; }, emit() {}, sockets: { sockets: live } }, DEFAULT_BLIND_LEVELS, qualifierBlindLevels,
       tableManager: {
         createQuickTable: (name: string, _seats: number, sb: number, bb: number, buyIn: number) => {
           const id = `T${++n}`;
@@ -2347,6 +2352,8 @@ describe('V2 / P-e — a kept-absent seat that busts while its player sits at CA
         },
         getTableByInviteCode: (code: string) => (ref.w!.tables.get('PRIV-1') && code === 'priv-1' ? { tableId: 'PRIV-1', table: ref.w!.tables.get('PRIV-1') } : null),
       },
+      // R2 (C12): an invite code opens a PRIVATE table only (privateTableByInviteCode).
+      privateTableByInviteCode: (code: string) => (ref.w!.tables.get('PRIV-1') && code === 'PRIV-1' ? { tableId: 'PRIV-1', table: ref.w!.tables.get('PRIV-1') } : null),
       ensureChipsForBuyIn: async () => 1_000_000, deductChips: async () => true,
       generateRandomProfile: () => ({ botName: 'HU-Bot' }),
     };
@@ -2875,7 +2882,8 @@ describe('P-h / P-h\' — the end of a tournament reaches EVERY entrant (tournam
     expect(roomEmits.filter(([, ev]) => ev === 'tournamentFinished').map(([room]) => room)).toEqual(['table:T1']);
     expect(s1.emitted.filter(([ev]: [string]) => ev === 'tournamentFinished')).toEqual([]);
     expect(s1.emitted.filter(([ev]: [string]) => ev === 'tournamentFinishedForEntrant')).toEqual([
-      ['tournamentFinishedForEntrant', { tournamentId: w.tid, position: 1, prize: 500, tournamentName: 'Rebalance Cup' }],
+      // R2 (P3): a heads-up field pays the whole pool, 62.5 / 37.5 (the 3rd-place 20% used to vanish).
+      ['tournamentFinishedForEntrant', { tournamentId: w.tid, position: 1, prize: 625, tournamentName: 'Rebalance Cup' }],
     ]);
     expect(s0.emitted.filter(([ev]: [string]) => ev === 'tournamentFinishedForEntrant' || ev === 'tournamentFinished')).toEqual([]);   // he is in the room
     expect(w.m.tournamentFinishedNotices).toEqual({ roomBroadcasts: 1, entrantSockets: 1 });

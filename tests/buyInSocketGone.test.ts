@@ -16,10 +16,12 @@
  */
 import { PokerTable } from '../src/game/PokerTable';
 import { TournamentManager } from '../src/game/TournamentManager';
-import { SRC, slice, handlerSrc, load, flush, deferred } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
 // R1 contract #3 (2026-10-11): the seat paths name the seat from the ACCOUNT and allowlist the avatar.
 import { accountDisplayName } from '../src/auth/displayName';
 import { sanitizeSeatAvatar } from '../src/seatProfile';
+// R2 (C3, 2026-10-11): qualifier windows / list item / structure (registerQualifierTournament reads the registry by master id).
+import { qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, QUALIFIER_BASE_STACK } from '../src/game/qualifierSchedule';
 
 const ALICE = 101;
 const BOB = 102;
@@ -50,6 +52,17 @@ const BROKEN_TABLES = slice('const brokenTournamentTables = new Map', 'brokenTou
 const CASH_JOIN_REFUSAL = slice('const TOURNAMENT_TABLE_JOIN_MESSAGE', '\n}\n');
 const WAITLIST_MISMATCH = slice('const WAITLIST_ACCOUNT_MISMATCH_MESSAGE', 'const waitlistAccountMismatches = { refused: 0 };');
 const SEAT_NAME = slice('function seatNameForSocket(', '\n}\n');
+// R2 (C3 / TOURNEY-3 / TOURNEY-9, 2026-10-11): the registry lookup, the C3 list item, the seat-or-refund helpers and the live-seat check.
+const QUALIFIER_HELPERS = [
+  fnSrc('function qualifierEventFor('),
+  fnSrc('function qualifierListItem('),
+  slice('/** R2 (TOURNEY-9) — the answer when a qualifier seat would take over', '\n  return null;\n}\n'),
+  fnSrc('function socketPlaysLiveSeatElsewhere('),
+  // R2 (CLUBS-4): joinClubTable finds (or re-creates) the club table's runtime table.
+  slice('const clubTablesRecreating = new Map', '\n  return job;\n}\n'),
+].join('\n');
+// R2 (C1, 2026-10-11): table kinds + who may sit where (joinTable / quickPlay / extra seat / waitlist refusals).
+const WHO_SITS = slice('// ========== Table kind (R1 contract #2, 2026-10-11) ==========', "  socket.emit(channel, { message: TABLE_NOT_JOINABLE_MESSAGE, code: 'table_not_joinable', reason });\n}\n");
 
 /** Neutralise every F3 check (the pre-F3 behaviour) — for the CONTROL tests. */
 const withoutF3 = (s: string) => s.split('await buyInSocketGone(').join('await (async (..._a: any[]) => false)(');
@@ -179,6 +192,12 @@ function world(opts: { handlers?: Partial<typeof H>; tournament?: 'buyin' | 'qua
     refundQualifierCreditOnMaster: async (id: string) => { creditRefunds.push(id); return true; },
     PLAYER_SUSPENDED_MESSAGE: 'SUSPENDED',
     accountDisplayName, sanitizeSeatAvatar,
+    qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, QUALIFIER_BASE_STACK,
+    // R2 (C1 / C12): Quick Play reads the wallet first (affordable tables only); an invite code opens a PRIVATE table.
+    getUserChips: async (uid: number) => { if (gates.balance) await gates.balance; return wallet.get(uid) ?? 0; },
+    UNLIMITED_CHIPS_TESTING: false,
+    publicNameOf: (n: unknown) => String(n ?? ''),
+    privateTableByInviteCode: (code: string) => (code === 'cash1' ? { tableId: 'cash1', table: tables.get('cash1') } : null),
   };
 
   const h = { ...H, ...(opts.handlers || {}) };
@@ -189,6 +208,8 @@ ${BROKEN_TABLES}
 ${CASH_JOIN_REFUSAL}
 ${WAITLIST_MISMATCH}
 ${SEAT_NAME}
+${WHO_SITS}
+${QUALIFIER_HELPERS}
 function wire(socket) {
   ${Object.values(h).join('\n  ')}
 }`;

@@ -201,7 +201,11 @@ describe('the socket surface sends public names only', () => {
   it('stakingUpdated: display names, no seller / backer account ids', async () => {
     const w = world();
     const d = await w.mk('S1').call('getStakes');
-    expect(d.offers).toEqual([{ id: 'o1', tournamentId: 't1', totalPct: 20, pricePerPct: 100, playerName: 'Josh Hall', remaining: 10, backers: [{ name: 'Jane D', pct: 10 }], createdAt: 1 }]);
+    // R2 (C4, 2026-10-11): + `isMine` per socket, and the seller's id on HIS OWN offer only (S1 is the seller, 42).
+    expect(d.offers).toEqual([{ id: 'o1', tournamentId: 't1', totalPct: 20, pricePerPct: 100, playerName: 'Josh Hall', remaining: 10, backers: [{ name: 'Jane D', pct: 10 }], createdAt: 1, isMine: true, sellerUserId: 42 }]);
+    // Another account (the backer, 43) sees no seller id at all.
+    const other = await w.mk('S2').call('getStakes');
+    expect(other.offers).toEqual([{ id: 'o1', tournamentId: 't1', totalPct: 20, pricePerPct: 100, playerName: 'Josh Hall', remaining: 10, backers: [{ name: 'Jane D', pct: 10 }], createdAt: 1, isMine: false, sellerUserId: null }]);
   });
 
   it('wiring: no handler emits a login handle to another player any more', () => {

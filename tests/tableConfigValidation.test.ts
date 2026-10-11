@@ -151,8 +151,11 @@ describe('the handlers (real src/index.ts source)', () => {
     const code = `function wire(socket) {\n${handlerSrc('createPrivateTable', '\n  });\n')}\n}`;
     const { exports: m } = load(code, {
       assertPlayable: async () => null, emitPlayRefusal() {}, validateTableConfig, privateTableIds, bombPotPending: new Map(),
-      tableManager: { createVariantTable: (cfg: any, variant: string) => { created.push({ cfg, variant }); return 'abcdef12-0000'; } },
+      tableManager: { createVariantTable: (cfg: any, variant: string) => { created.push({ cfg, variant }); return 'abcdef12-0000'; }, getTable: () => undefined },
       log: { warn() {} },
+      // R2 (C12): creation rate limit + live-table cap + the invite code helper.
+      privateTableCreateLimiter: { hit: () => true }, privateTableMeta: new Map(), MAX_LIVE_PRIVATE_TABLES_PER_ACCOUNT: 2,
+      privateInviteCode: (id: string) => id.slice(0, 8).toUpperCase(),
     }, '{ wire }');
     const s = socketOf();
     m.wire(s);
