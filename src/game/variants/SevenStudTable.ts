@@ -97,11 +97,63 @@ export class SevenStudTable extends PokerTable {
         }
         return false;
       }
-      if (this.currentBetToMatch === bringIn && totalRaiseAmount < complete) {
-        return false;
+      if (this.currentBetToMatch < complete) {
+        // 2026-10-11 (R2) — facing only the (posted) bring-in, the one raise is
+        // the COMPLETION to the small bet: any larger request completes to
+        // exactly it, and the next raise is a full small bet more.
+        if (totalRaiseAmount < complete) return false;
+        const ok = super.playerRaise(seatIndex, complete);
+        if (ok) this.lastRaiseAmount = complete;
+        return ok;
       }
     }
     return super.playerRaise(seatIndex, totalRaiseAmount);
+  }
+
+  /**
+   * 2026-10-11 (.online R2, GAME P3) — the bring-in is a FORCED bet. It used to
+   * be optional: the low door card was handed the action at 0 to match and
+   * could simply check (and the engine refused a bring-in-sized bet anyway —
+   * under the one-big-blind opening minimum — so only a completion was
+   * possible). Now the bring-in seat posts it when Third Street is dealt, like a
+   * blind (all-in for less on a short stack), and the action starts on its left:
+   * fold, call the bring-in, or complete to the small bet. The bring-in seat has
+   * acted (no option of its own unless someone completes). Not a bet level for
+   * the fixed-limit cap — the completion is.
+   */
+  private postBringIn(seatIndex: number): number {
+    const seat = this.seats[seatIndex];
+    if (!seat || seat.state !== 'occupied' || seat.folded || seat.allIn) return 0;
+    const amount = Math.min(this.getBringInAmount(), seat.chipCount);
+    if (amount <= 0) return 0;
+    seat.chipCount -= amount;
+    seat.currentBet = amount;
+    seat.totalInvestedThisHand += amount;
+    if (seat.chipCount === 0) seat.allIn = true;
+    seat.hasActedSinceLastFullRaise = true;
+    this.currentBetToMatch = amount;
+    // Completing to the small bet is the minimum (and, fixed limit, the only) raise.
+    this.lastRaiseAmount = Math.max(1, this.getCompleteAmount() - amount);
+    this.actionLog.push({ seatIndex, playerName: seat.playerName, action: `posted bring-in ${amount}` });
+    this.emit('blindPosted', { seatIndex, amount, type: 'bring-in' });
+    return amount;
+  }
+
+  /**
+   * Fixed limit, with the Third Street exception: facing only the bring-in the
+   * most anyone may put in is the completion (an "all-in" there completes).
+   */
+  protected getMaxRaise(_seatIndex: number): number {
+    if (this.currentPhase === GamePhase.ThirdStreet && this.currentBetToMatch > 0 && this.currentBetToMatch < this.getCompleteAmount()) {
+      return this.getCompleteAmount();
+    }
+    const isLateRound = [
+      GamePhase.FifthStreet,
+      GamePhase.SixthStreet,
+      GamePhase.SeventhStreet,
+    ].includes(this.currentPhase);
+    const betSize = isLateRound ? this.config.bigBlind * 2 : this.config.bigBlind;
+    return this.currentBetToMatch + betSize;
   }
 
   /**
@@ -229,9 +281,10 @@ export class SevenStudTable extends PokerTable {
     // This is functionally equivalent to a true 50/50 split when the low
     // qualifies, and a scoop when no low qualifies.
 
+    // GAME-10 (R2) — a seat with no cards never contests the pot (as the base award).
     const seatInfos = this.seats
       .filter(s => s.state === 'occupied' && !s.eliminated && s.totalInvestedThisHand > 0)
-      .map(s => ({ seatIndex: s.seatIndex, invested: s.totalInvestedThisHand, folded: s.folded, holeCards: [...s.holeCards] }));
+      .map(s => ({ seatIndex: s.seatIndex, invested: s.totalInvestedThisHand, folded: s.folded || s.holeCards.length === 0, holeCards: [...s.holeCards] }));
 
     // Evaluate every non-folded player's high and low hands
     const evaluations = seatInfos
@@ -262,7 +315,7 @@ export class SevenStudTable extends PokerTable {
         seatIndex: s.seatIndex,
         chipCount: s.chipCount,
         totalInvestedThisHand: s.totalInvestedThisHand,
-        folded: s.folded,
+        folded: s.folded || s.holeCards.length === 0,
         allIn: s.allIn,
         holeCards: s.holeCards,
         state: s.state,
@@ -452,9 +505,11 @@ export class SevenStudTable extends PokerTable {
    */
   protected dealHoleCardsImpl(): void {
     // In stud, the initial deal is 2 down + 1 up (ThirdStreet)
-    // We'll deal them here and then the game starts on ThirdStreet betting
+    // We'll deal them here and then the game starts on ThirdStreet betting.
+    // 2026-10-11 (R2, GAME P3) — never to a SITTING-OUT seat (startNewHand
+    // starts it folded; the base deal skips it — this override dealt it cards).
     const activePlayers = this.seats.filter(
-      s => s.state === 'occupied' && !s.eliminated && s.chipCount >= 0
+      s => s.state === 'occupied' && !s.eliminated && s.chipCount >= 0 && !s.folded
     );
 
     for (const seat of activePlayers) {
@@ -493,16 +548,28 @@ export class SevenStudTable extends PokerTable {
     this.studStreetIndex = 0;
 
     const result = super.startNewHand();
-    if (result) {
+    // (R2) only a hand still waiting on its first round — an all-in-on-the-antes
+    // deal the base start already ran out must not be put back on Third Street.
+    if (result && this.currentPhase === GamePhase.PreFlop) {
       // Override the phase to ThirdStreet since stud starts there
       this.currentPhase = GamePhase.ThirdStreet;
       this.emit('phaseChanged', { phase: this.currentPhase });
 
-      // Set first actor based on showing cards
-      const firstActor = this.getStudFirstActor();
-      if (firstActor >= 0) {
-        this.activeSeatIndex = firstActor;
-        this.emit('turnChanged', { seatIndex: this.activeSeatIndex });
+      // The low (Razz: high) door card brings it in — a forced bet (R2) — and
+      // the action starts on its left.
+      const bringInSeat = this.getStudFirstActor();
+      if (bringInSeat >= 0) {
+        this.postBringIn(bringInSeat);
+        const next = this.nextActor(bringInSeat);
+        if (next >= 0) {
+          this.activeSeatIndex = next;
+          this.emit('turnChanged', { seatIndex: this.activeSeatIndex });
+        } else {
+          // Nobody else can act (all-in on the antes): the round is over.
+          this.activeSeatIndex = -1;
+          this.accumulateInvestments();
+          this.advanceToNextStreet();
+        }
       }
     }
     return result;
@@ -513,8 +580,10 @@ export class SevenStudTable extends PokerTable {
    */
   private dealStudCards(phase: VariantPhase): void {
     this.currentStudPhase = phase;
+    // GAME-10 (R2) — only seats dealt into this hand get the later streets (a
+    // mid-hand joiner — no ante, no Third Street cards — used to be dealt 4th-7th).
     const activePlayers = this.seats.filter(
-      s => s.state === 'occupied' && !s.folded && !s.eliminated
+      s => s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0
     );
 
     if (phase === 'ThirdStreet') {
@@ -595,19 +664,6 @@ export class SevenStudTable extends PokerTable {
   }
 
   /**
-   * Override: enforce fixed-limit betting.
-   */
-  protected getMaxRaise(_seatIndex: number): number {
-    const isLateRound = [
-      GamePhase.FifthStreet,
-      GamePhase.SixthStreet,
-      GamePhase.SeventhStreet,
-    ].includes(this.currentPhase);
-    const betSize = isLateRound ? this.config.bigBlind * 2 : this.config.bigBlind;
-    return this.currentBetToMatch + betSize;
-  }
-
-  /**
    * Get the face-up cards for a given seat (visible to all players).
    */
   getFaceUpCards(seatIndex: number): Card[] {
@@ -677,8 +733,9 @@ export class SevenStudTable extends PokerTable {
   };
 
   getStudFirstActor(): number {
+    // GAME-10 (R2) — a seat with no cards (a mid-hand joiner) is never handed the action.
     const activePlayers = this.seats.filter(
-      s => s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated
+      s => s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated && s.holeCards.length > 0
     );
 
     if (activePlayers.length === 0) return -1;

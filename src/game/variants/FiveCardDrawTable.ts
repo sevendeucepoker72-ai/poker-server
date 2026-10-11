@@ -191,9 +191,9 @@ export class FiveCardDrawTable extends PokerTable {
       return;
     }
 
-    // Check if only one player remains
+    // Check if only one player remains (GAME-10: a cardless seat is not in the hand)
     const playingSeats = this.seats.filter(
-      s => s.state === 'occupied' && !s.folded && !s.eliminated
+      s => s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0
     );
     if (playingSeats.length <= 1) {
       this.accumulateInvestments();
@@ -210,7 +210,7 @@ export class FiveCardDrawTable extends PokerTable {
 
       // Check if all active players are all-in (auto-complete draw)
       const activePlayers = this.seats.filter(
-        s => s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated
+        s => s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated && s.holeCards.length > 0
       );
       if (activePlayers.length === 0) {
         // Everyone is all-in, skip draw and go to next phase
@@ -265,14 +265,22 @@ export class FiveCardDrawTable extends PokerTable {
    */
   playerDraw(seatIndex: number, discardIndices: number[]): boolean {
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
+    // 2026-10-11 (.online R2, GAME-6) — a draw exists ONLY in a draw round. With
+    // no phase check a player could swap cards during any BETTING round too
+    // (repeatedly, one per round — drawsCompleted is cleared at each draw
+    // round): extra draws, a cheat.
+    if (!FiveCardDrawTable.DRAW_PHASES.includes(this.currentPhase)) return false;
 
     const seat = this.seats[seatIndex];
     if (seat.state !== 'occupied' || seat.folded || seat.eliminated) return false;
+    // GAME-6 / GAME-10 — and only by a seat DEALT INTO this hand.
+    if (seat.holeCards.length === 0) return false;
 
-    // Validate indices
+    // Validate indices (whole numbers only — a socket payload is untyped)
+    if (!Array.isArray(discardIndices)) return false;
     if (discardIndices.length > 5) return false;
     for (const idx of discardIndices) {
-      if (idx < 0 || idx >= seat.holeCards.length) return false;
+      if (!Number.isInteger(idx) || idx < 0 || idx >= seat.holeCards.length) return false;
     }
 
     // Check for duplicates
@@ -311,9 +319,27 @@ export class FiveCardDrawTable extends PokerTable {
       discardCount: discardIndices.length,
     });
 
+    this.completeDrawRoundIfDone();
+    return true;
+  }
+
+  /** The draw rounds (playerDraw is refused in any other phase). */
+  static readonly DRAW_PHASES: readonly GamePhase[] = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
+
+  /**
+   * End the current draw round when every seat that still has to draw has
+   * drawn, and move on to the next betting round (or award the pot when one
+   * player is left). Called after each draw, and by index.ts after a seat was
+   * folded OUTSIDE its turn during a draw round (a leaver — forceFoldSeat
+   * never advances anything; before R2 the round then waited for a draw that
+   * could never come). Only dealt-in seats are waited for (GAME-10: a mid-hand
+   * joiner holds no cards). Returns true when the round was completed.
+   */
+  completeDrawRoundIfDone(): boolean {
+    if (!FiveCardDrawTable.DRAW_PHASES.includes(this.currentPhase)) return false;
     // Check if all active players have drawn
     const activePlayers = this.seats.filter(
-      s => s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated
+      s => s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated && s.holeCards.length > 0
     );
     const allInPlayers = this.seats.filter(
       s => s.state === 'occupied' && !s.folded && s.allIn && !s.eliminated
@@ -325,17 +351,15 @@ export class FiveCardDrawTable extends PokerTable {
     }
 
     const allDrawn = activePlayers.every(s => this.drawsCompleted.has(s.seatIndex));
+    if (!allDrawn) return false;
 
-    if (allDrawn) {
-      // Move to next betting phase
-      this.drawsCompleted.clear();
-      this.currentDrawPhase = null;
-      this.emit('drawPhaseComplete', { phase: this.currentDrawPhase });
+    // Move to next betting phase
+    this.drawsCompleted.clear();
+    this.currentDrawPhase = null;
+    this.emit('drawPhaseComplete', { phase: this.currentDrawPhase });
 
-      // Advance to next phase (betting)
-      this.advanceToNextStreet();
-    }
-
+    // Advance to next phase (betting)
+    this.advanceToNextStreet();
     return true;
   }
 

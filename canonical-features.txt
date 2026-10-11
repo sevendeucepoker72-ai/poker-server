@@ -847,3 +847,30 @@ insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
 
 # 2026-10-11 R1 review (R1REV-2 / GAME-13): the waitlist deep link finds Hold'em tables by the table LIST variant
 waitlistHoldemByListVariant
+
+# 2026-10-11 (.online R2, S2 engine) — GAME-10 a seat taken mid-hand sits folded
+# until the next deal; a cardless seat never contests a pot (base, Omaha hi-lo,
+# Stud hi-lo). GAME-9 fixed limit is capped at a bet and three raises; the
+# table counts its own raises per street. C11 canStraddle (isFirstActor).
+# GAME-12 the engine deals a bomb pot itself. GAME-15/16 awardIfUncontested +
+# completeDrawRoundIfDone. GAME-6 draws only in a draw round by a dealt-in seat.
+# GAME-14 Omaha hi-lo all-fold refund. GAME P3: odd chip left of the button,
+# handResult names its player, Stud bring-in mandatory, Short Deck commitment +
+# rabbit hunt from its own deck.
+seat.folded = this.isHandInProgress();
+folded: s.folded || s.holeCards.length === 0,
+FIXED_LIMIT_MAX_BET_LEVELS = 4
+isRaiseCapped()
+this.raisesThisStreet++;
+canStraddle(seatIndex)
+applyBombPot(ante)
+awardIfUncontested()
+chipsWon: r.amount
+leftOfButton(
+FiveCardDrawTable.DRAW_PHASES.includes(this.currentPhase)
+completeDrawRoundIfDone()
+this.postBringIn(bringInSeat)
+posted bring-in
+(.online R2, GAME-14) — degenerate ALL-FOLD
+this.emit('deckCommitment', { hash: commitment.hash, handNumber: commitment.handNumber });
+this._shortDeckIndex = savedIndex;

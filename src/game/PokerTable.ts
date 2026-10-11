@@ -6,6 +6,14 @@ import { SidePotManager, SeatInfo, Pot, PotWinResult } from './SidePotManager';
 
 export const MAX_SEATS = 9;
 
+/**
+ * 2026-10-11 (.online R2, GAME-9) — fixed-limit betting is capped at a bet and
+ * three raises per betting round (4 bet levels; the big blind is the pre-flop
+ * bet, a Stud bring-in is not a bet — its completion is). Without a cap two
+ * bots with strong hands re-raised each other 122-154 times in one round.
+ */
+export const FIXED_LIMIT_MAX_BET_LEVELS = 4;
+
 export enum GamePhase {
   WaitingForPlayers = 'WaitingForPlayers',
   PreFlop = 'PreFlop',
@@ -82,6 +90,11 @@ export interface HandWinResult {
   amount: number;
   handResult?: HandResult;
   potName: string;
+  /** R2 — stamped on every 'handResult' entry by emitHandCompletion (the seat's player, for the chip-velocity monitor). */
+  playerId?: string;
+  isAI?: boolean;
+  /** R2 — = amount (this pot's win). */
+  chipsWon?: number;
 }
 
 /** Data for a single player's hand at showdown */
@@ -174,6 +187,22 @@ export class PokerTable extends EventEmitter {
   public activeSeatIndex: number = -1;
   public handNumber: number = 0;
   public lastRaiseAmount: number = 0;
+
+  /**
+   * 2026-10-11 (.online R2, GAME-9) — this betting round's VOLUNTARY bets and
+   * raises (an opening bet, a raise, a straddle, a Stud completion, an all-in
+   * that raises; never a blind, an ante or a bring-in). Reset every street.
+   * The bots read it (a 3-bet is "2 raises this street") instead of guessing
+   * from each opponent's last action, which saw one raise per opponent and
+   * re-raised forever.
+   */
+  public raisesThisStreet: number = 0;
+  /**
+   * GAME-9 — bet LEVELS this betting round for the fixed-limit cap
+   * (FIXED_LIMIT_MAX_BET_LEVELS): the pre-flop big blind is level 1, then each
+   * full bet / raise adds one (a short all-in that is not a full raise does not).
+   */
+  public betLevelsThisStreet: number = 0;
 
   /**
    * Monotonic decision-point version (2026-07-05). Bumped by the emit()
@@ -357,8 +386,18 @@ export class PokerTable extends EventEmitter {
     seat.playerId = playerId;
     seat.isAI = isAI;
     seat.eliminated = false;
-    seat.folded = false;
+    // 2026-10-11 (.online R2, GAME-10) — a seat taken while a hand is IN
+    // PROGRESS is not in that hand: it paid no blind or ante and holds no cards.
+    // It used to count as a live player — an uncontested winner's cards were
+    // revealed ("showdown" against the cardless joiner), Stud dealt him the
+    // later streets and gave him the action, a draw round waited for his draw.
+    // He sits folded until the next startNewHand deals him in.
+    seat.folded = this.isHandInProgress();
     seat.allIn = false;
+    seat.holeCards = [];
+    seat.currentBet = 0;
+    seat.totalInvestedThisHand = 0;
+    seat.lastAction = PlayerAction.None;
     // A brand-new player at this seat must not inherit any missed-blind
     // state from the previous occupant. Without this reset, a seat
     // vacated by a sitting-out player would charge the next occupant
@@ -734,6 +773,10 @@ export class PokerTable extends EventEmitter {
 
     // Post blinds
     this.postBlinds();
+    // GAME-9 — this round's counters: the posted big blind is the pre-flop bet
+    // (a blind-less Stud deal starts at 0 — its bring-in is not a bet).
+    this.raisesThisStreet = 0;
+    this.betLevelsThisStreet = this.currentBetToMatch > 0 ? 1 : 0;
 
     // Deal hole cards
     this.dealHoleCards();
@@ -1259,6 +1302,26 @@ export class PokerTable extends EventEmitter {
     return true;
   }
 
+  /**
+   * 2026-10-11 (.online R2, GAME-15 / GAME-16) — after a seat was folded OUT OF
+   * TURN (forceFoldSeat: its player left), award the hand at once when at most
+   * one player is left in it — the same rule advanceTurn applies after a fold
+   * on the clock. Before, the last player had to act first: a human facing the
+   * leaver's bet had to CALL to collect (folding refunded everyone), and an
+   * all-in hand waited out the insurance window. Clears a held runout (the
+   * window has nothing left to decide). False — nothing done — while two or
+   * more players are still in the hand.
+   */
+  awardIfUncontested(): boolean {
+    if (!this.isHandInProgress() || this.currentPhase === GamePhase.Showdown) return false;
+    if (this.playersInHand().length > 1) return false;
+    this._runoutHeld = false;
+    this.activeSeatIndex = -1;
+    this.accumulateInvestments();
+    this.determineWinners();
+    return true;
+  }
+
   playerCheck(seatIndex: number): boolean {
     if (!this.isValidAction(seatIndex)) return false;
 
@@ -1355,6 +1418,10 @@ export class PokerTable extends EventEmitter {
       return false;
     }
 
+    // GAME-9 — fixed limit: once the round holds a bet and three raises the
+    // only options left are call or fold (executeAIAction falls back to a call).
+    if (this.isRaiseCapped()) return false;
+
     const minRaise = this.getMinRaise();
 
     // TDA: Opening bet must be at least one big blind
@@ -1403,6 +1470,7 @@ export class PokerTable extends EventEmitter {
           s.hasActedSinceLastFullRaise = false;
         }
       }
+      this.betLevelsThisStreet++;   // GAME-9
     }
 
     seat.chipCount -= additionalChips;
@@ -1411,6 +1479,7 @@ export class PokerTable extends EventEmitter {
     seat.lastAction = PlayerAction.Raise;
     seat.hasActedSinceLastFullRaise = true;
     this.currentBetToMatch = totalRaiseAmount;
+    this.raisesThisStreet++;        // GAME-9
 
     // TDA Rule 16: Track last aggressor for showdown order
     this.lastAggressorSeat = seatIndex;
@@ -1442,19 +1511,36 @@ export class PokerTable extends EventEmitter {
    * not a mid-street 2xBB open. Reuses playerRaise for all the pot / all-in /
    * turn-advance bookkeeping, then flips the option flag back on.
    */
-  straddle(seatIndex: number): boolean {
+  /**
+   * 2026-10-11 (.online R2, TABLEUI-19 / contract C11) — may this seat straddle
+   * RIGHT NOW? Every precondition straddle() enforces, readable without acting:
+   * index.ts stamps it into the seat's own game state as `isFirstActor` (the
+   * client's Straddle button was gated on that key, which was never sent).
+   * Pre-flop, this seat on the clock, nothing above the big blind, nobody has
+   * acted yet, a real UTG (three or more players dealt in — heads-up there is
+   * none), and the seat can post 2 BB without going all-in.
+   */
+  canStraddle(seatIndex: number): boolean {
     if (this.currentPhase !== GamePhase.PreFlop) return false;
     if (this.activeSeatIndex !== seatIndex) return false;
     if (this.currentBetToMatch !== this.config.bigBlind) return false;
-    // Straddle must be the FIRST voluntary action of the hand (blinds are not
-    // logged to actionLog, so an empty preflop log == nobody has acted yet).
+    // Straddle must be the FIRST voluntary action of the hand (blinds are
+    // logged without a street, so no pre-flop entry == nobody has acted yet).
     if (this.actionLog.some(a => a.street === this.currentPhase)) return false;
+    if (this.isRaiseCapped()) return false;
     const seat = this.seats[seatIndex];
-    if (!seat || seat.state !== 'occupied' || seat.folded || seat.allIn) return false;
-    const straddleAmount = 2 * this.config.bigBlind;
-    const additional = straddleAmount - seat.currentBet;
+    if (!seat || seat.state !== 'occupied' || seat.folded || seat.allIn || seat.holeCards.length === 0) return false;
+    const dealtIn = this.seats.filter(s => s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0).length;
+    if (dealtIn < 3) return false;
+    const additional = 2 * this.config.bigBlind - seat.currentBet;
     // Require the full straddle without going all-in (keep reopening semantics simple).
-    if (additional <= 0 || additional >= seat.chipCount) return false;
+    return additional > 0 && additional < seat.chipCount;
+  }
+
+  straddle(seatIndex: number): boolean {
+    if (!this.canStraddle(seatIndex)) return false;
+    const seat = this.seats[seatIndex];
+    const straddleAmount = 2 * this.config.bigBlind;
 
     const ok = this.playerRaise(seatIndex, straddleAmount);
     if (!ok) return false;
@@ -1464,6 +1550,52 @@ export class PokerTable extends EventEmitter {
     seat.hasActedSinceLastFullRaise = false;
     const last = this.actionLog[this.actionLog.length - 1];
     if (last && last.seatIndex === seatIndex) last.action = 'straddle';
+    return true;
+  }
+
+  /**
+   * 2026-10-11 (.online R2, GAME-12) — turn the hand that was JUST dealt into a
+   * BOMB POT: every dealt-in seat puts the same `ante` in (the blinds / antes
+   * it posted are returned first — a bomb pot is an equal wager), there is no
+   * pre-flop betting, and the flop comes off THIS table's own deck through its
+   * own dealCommunityCards (burn rule, Short Deck's 36 cards, variant hooks).
+   * index.ts (activateBombPotIfPending) used to pull three cards off the base
+   * 52-card deck itself and flip the phase by hand: Short Deck flopped cards it
+   * does not contain, Stud and Draw tables got a community flop. index.ts only
+   * asks this of Hold'em / Omaha cash tables (bombPotAllowedAt).
+   * Returns false — and changes nothing — unless the hand is pre-flop with no
+   * board and nobody has acted yet.
+   */
+  applyBombPot(ante: number): boolean {
+    if (this.currentPhase !== GamePhase.PreFlop || this.communityCards.length > 0) return false;
+    if (this.actionLog.some(a => a.street === GamePhase.PreFlop)) return false;
+    if (!Number.isFinite(ante) || ante <= 0) return false;
+    for (const seat of this.seats) {
+      if (seat.state !== 'occupied' || seat.eliminated) continue;
+      // Return what was posted this hand (blinds, antes, a dead blind).
+      seat.chipCount += seat.totalInvestedThisHand;
+      seat.totalInvestedThisHand = 0;
+      seat.currentBet = 0;
+      seat.allIn = false;
+      if (seat.folded || seat.holeCards.length === 0) continue;   // sitting out: not in the bomb pot
+      const posted = Math.min(ante, seat.chipCount);
+      seat.chipCount -= posted;
+      seat.totalInvestedThisHand = posted;
+      // A stack the ante takes whole is all-in (never auto-folded out of a pot it paid into).
+      if (seat.chipCount === 0) seat.allIn = true;
+    }
+    // Straight to the flop: a fresh betting round, dealt by this table.
+    this.currentPhase = GamePhase.Flop;
+    this.resetBettingRound();
+    this.dealCommunityCardsForPhase(GamePhase.Flop);
+    this.emit('phaseChanged', { phase: this.currentPhase });
+    this.setFirstActivePlayer();
+    // Nobody (or a single player) left who can bet: run the board out, as
+    // advanceToNextStreet does — never leave a table without an actor.
+    if (this.actingPlayers().length <= 1) {
+      this.accumulateInvestments();
+      this.runOutBoard();
+    }
     return true;
   }
 
@@ -1488,6 +1620,11 @@ export class PokerTable extends EventEmitter {
     // that opponents had to match or fold to. No-limit getMaxRaise is Infinity
     // so this is a no-op there. Only caps a RAISE (stack exceeds the call).
     const callAmount = Math.max(0, this.currentBetToMatch - seat.currentBet);
+    // GAME-9 — fixed limit capped (a bet and three raises): an "all-in" that
+    // would raise is only a call now (a covered player keeps the rest).
+    if (stack > callAmount && this.isRaiseCapped()) {
+      return callAmount > 0 ? this.playerCall(seatIndex) : this.playerCheck(seatIndex);
+    }
     if (stack > callAmount) {
       const maxRaiseTotal = this.getMaxRaise(seatIndex);
       if (maxRaiseTotal !== Infinity) {
@@ -1515,11 +1652,13 @@ export class PokerTable extends EventEmitter {
             s.hasActedSinceLastFullRaise = false;
           }
         }
+        this.betLevelsThisStreet++;   // GAME-9 — only a FULL raise is a bet level
       }
       // TDA Rule 16: track last aggressor BEFORE updating currentBetToMatch,
       // otherwise the guard below (totalBet > currentBetToMatch) is always false.
       this.lastAggressorSeat = seatIndex;
       this.currentBetToMatch = totalBet;
+      this.raisesThisStreet++;        // GAME-9
     }
 
     seat.totalInvestedThisHand += allInAmount;
@@ -1768,6 +1907,8 @@ export class PokerTable extends EventEmitter {
   protected resetBettingRound(): void {
     this.currentBetToMatch = 0;
     this.lastRaiseAmount = this.config.bigBlind;
+    this.raisesThisStreet = 0;      // GAME-9
+    this.betLevelsThisStreet = 0;
     // TDA Rule 16: reset per-street so showdown order uses final-street aggressor only
     this.lastAggressorSeat = -1;
 
@@ -1966,13 +2107,17 @@ export class PokerTable extends EventEmitter {
     // Refund any uncalled top-stack excess BEFORE calculating pots.
     this.refundUncalledBets();
 
+    // GAME-10 (R2) — a seat holding NO cards never contests the pot (a mid-hand
+    // joiner — sitDown folds him, this is the second lock): counted as folded,
+    // it can neither turn an uncontested pot into a "showdown" that reveals the
+    // winner's cards nor win a pot with the board alone.
     const seatInfos: SeatInfo[] = this.seats
       .filter(s => s.state === 'occupied' && !s.eliminated)
       .map(s => ({
         seatIndex: s.seatIndex,
         chipCount: s.chipCount,
         totalInvestedThisHand: s.totalInvestedThisHand,
-        folded: s.folded,
+        folded: s.folded || s.holeCards.length === 0,
         allIn: s.allIn,
         holeCards: s.holeCards,
         state: s.state,
@@ -2082,12 +2227,9 @@ export class PokerTable extends EventEmitter {
           showdownHands.unshift(aggressor);
         }
       } else {
-        // Sort clockwise from first active seat left of dealer
-        showdownHands.sort((a, b) => {
-          const distA = (a.seatIndex - this.dealerButtonSeat + MAX_SEATS) % MAX_SEATS;
-          const distB = (b.seatIndex - this.dealerButtonSeat + MAX_SEATS) % MAX_SEATS;
-          return distA - distB;
-        });
+        // Sort clockwise from the first seat left of the dealer (R2: the button shows last).
+        const order = SidePotManager.orderClockwiseFromDealer(showdownHands.map(h => h.seatIndex), this.dealerButtonSeat, MAX_SEATS);
+        showdownHands.sort((a, b) => order.indexOf(a.seatIndex) - order.indexOf(b.seatIndex));
       }
 
       // Award pots using side pot manager.
@@ -2278,6 +2420,14 @@ export class PokerTable extends EventEmitter {
    */
   protected emitHandCompletion(results: HandWinResult[], handHistory: HandHistoryRecord | null): void {
     const commitment = this.deck.revealSeed();
+    // 2026-10-11 (.online R2, GAME P3) — every result entry names WHO won it:
+    // `playerId`, `isAI` and `chipsWon` (= amount, per pot). The anti-cheat
+    // chip-velocity monitor (index.ts handResult listener) reads those three
+    // and never ran — no entry carried them. Additive; nothing else changes.
+    results = results.map((r) => {
+      const seat = this.seats[r.seatIndex];
+      return { ...r, playerId: seat?.playerId || '', isAI: !!seat?.isAI, chipsWon: r.amount };
+    });
     this.whileCompletingHand(() => {
       this.emit('handResult', { results, handNumber: this.handNumber });
       if (handHistory) this.emit('handHistory', handHistory);
@@ -2317,6 +2467,16 @@ export class PokerTable extends EventEmitter {
    */
   getMinRaise(): number {
     return this.currentBetToMatch + this.lastRaiseAmount;
+  }
+
+  /**
+   * GAME-9 — a FIXED-LIMIT betting round that already holds a bet and three
+   * raises (FIXED_LIMIT_MAX_BET_LEVELS): nobody may raise again this round.
+   * No-limit / pot-limit are never capped here (the bots cap their own
+   * re-raising — AIPlayer).
+   */
+  isRaiseCapped(): boolean {
+    return this.bettingStructure === 'fixed-limit' && this.betLevelsThisStreet >= FIXED_LIMIT_MAX_BET_LEVELS;
   }
 
   getTotalPot(): number {
