@@ -874,3 +874,15 @@ posted bring-in
 (.online R2, GAME-14) — degenerate ALL-FOLD
 this.emit('deckCommitment', { hash: commitment.hash, handNumber: commitment.handNumber });
 this._shortDeckIndex = savedIndex;
+
+# 2026-10-11 (.online R2, S2 bots) — GAME-8 every Stud / draw variant takes its
+# own hand-strength path; the Hold'em equity sees at most 2 hole cards and is
+# time-budgeted. GAME-9 bots stop re-raising past a per-street cap; re-raises
+# are sized off the bet faced.
+STUD_VARIANT_IDS
+DRAW_VARIANT_IDS
+limitBotRaiseWar(
+BOT_MAX_STREET_RAISES_PREFLOP = 3
+BOT_EQUITY_BUDGET_MS = 40
+keptHoldemHoleCards(
+MIN_BUDGETED_SIMULATIONS = 64

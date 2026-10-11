@@ -2,7 +2,7 @@ import { Card, Rank, Suit } from '../game/Card';
 import { evaluateHand, compareTo, HandRank, HandResult } from '../game/HandEvaluator';
 import { evaluateOmahaHand } from '../game/HandEvaluatorExtensions';
 import { PokerTable, Seat, PlayerAction, GamePhase } from '../game/PokerTable';
-import { calculateEquity } from '../training/TrainingEngine';
+import { calculateEquity, keptHoldemHoleCards } from '../training/TrainingEngine';
 import {
   getPreflopPercentile, posBucket, PosBucket,
   OPEN_THRESHOLD, THREEBET_THRESHOLD, FOURBET_THRESHOLD, CALL_VS_RAISE_THRESHOLD,
@@ -78,6 +78,81 @@ const ARCHETYPE_PARAMS: Record<Archetype, ArchetypeParams> = {
 export interface AIDecision {
   action: PlayerAction;
   raiseAmount: number;
+}
+
+// ============================================================
+// 2026-10-11 (.online R2, GAME-8 / GAME-9) — variant routing + raise-war limits
+// ============================================================
+
+/** Every Stud-family variantId the engine uses (SevenStudTable: 'seven-stud' — plain Stud — was missing). */
+export const STUD_VARIANT_IDS: ReadonlySet<string> = new Set(['seven-stud', 'seven-card-stud', 'seven-card-stud-hi-lo', 'razz']);
+/** Every draw-family variantId (FiveCardDrawTable / BadugiTable). */
+export const DRAW_VARIANT_IDS: ReadonlySet<string> = new Set(['five-card-draw', 'triple-draw', 'badugi']);
+
+/**
+ * GAME-8 — the two hole cards a HOLD'EM-style hand plays. A (Crazy) Pineapple
+ * seat holds 3 until its discard; the bot's discard is the engine's automatic
+ * one (PineappleTable.autoDiscardOne: the lowest rank, ties to the lowest
+ * suit), so these are exactly the two it keeps. calculateEquity / the preflop
+ * percentile are only ever given two cards (a 7-card Stud hand fed to the
+ * Hold'em Monte Carlo cost ~1s of blocking CPU per decision).
+ */
+export function holdemHoleCards(hole: Card[]): Card[] {
+  return keptHoldemHoleCards(hole);
+}
+
+/**
+ * GAME-8 — the most wall-clock time one bot decision may spend in its Monte
+ * Carlo equity (calculateEquity stops after at least 64 simulations once it is
+ * spent). Measured before R2: 6-card Omaha multiway ~0.7s, Stud ~1s, per
+ * decision, all on the shared event loop.
+ */
+export const BOT_EQUITY_BUDGET_MS = 40;
+
+/**
+ * GAME-9 — no endless bot raise wars. Raises allowed per betting round before
+ * a bot stops re-raising (the table's own count of voluntary bets/raises this
+ * street, PokerTable.raisesThisStreet): pre-flop an open, a 3-bet and a 4-bet;
+ * after the flop (and on every Stud / draw street) a bet and one raise. Past
+ * that, and after BOT_MAX_OWN_RAISES_PER_STREET raises of its own, a bot only
+ * calls / checks — or, at no-limit with a premium hand, moves all-in (a war
+ * then ends in one more action). Before this two bots with strong hands
+ * min-re-raised each other 122-154 times in one round (multi-minute hands,
+ * ~200 busts/hour on the 24/7 tables).
+ */
+export const BOT_MAX_STREET_RAISES_PREFLOP = 3;
+export const BOT_MAX_STREET_RAISES_POSTFLOP = 2;
+export const BOT_MAX_OWN_RAISES_PER_STREET = 2;
+const OWN_RAISE_RE = /^(raised to|straddle|went all-in)/;
+
+export function limitBotRaiseWar(
+  table: PokerTable,
+  seat: Seat,
+  decision: AIDecision,
+  firstRound: boolean,
+  strength: number,
+): AIDecision {
+  if (decision.action !== PlayerAction.Raise && decision.action !== PlayerAction.AllIn) return decision;
+  const callAmount = table.getCallAmount(seat);
+  // Calling for all of a short stack is a call, not a raise — always allowed.
+  if (decision.action === PlayerAction.AllIn && callAmount >= seat.chipCount) return decision;
+  const passive: AIDecision = callAmount > 0
+    ? { action: PlayerAction.Call, raiseAmount: 0 }
+    : { action: PlayerAction.Check, raiseAmount: 0 };
+  // Fixed limit at its cap (a bet and three raises): no raise is legal at all.
+  if (typeof (table as any).isRaiseCapped === 'function' && table.isRaiseCapped()) return passive;
+  const streetRaises = Number((table as any).raisesThisStreet) || 0;
+  const streetCap = firstRound ? BOT_MAX_STREET_RAISES_PREFLOP : BOT_MAX_STREET_RAISES_POSTFLOP;
+  let ownRaises = 0;
+  for (const e of table.actionLog) {
+    if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && OWN_RAISE_RE.test(e.action)) ownRaises++;
+  }
+  if (streetRaises < streetCap && ownRaises < BOT_MAX_OWN_RAISES_PER_STREET) return decision;
+  // Past the cap: a premium no-limit hand may still shove (one action, the war
+  // is over); everything else just calls / checks.
+  const premium = firstRound ? 0.93 : 0.85;
+  if (table.bettingStructure === 'no-limit' && strength >= premium) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+  return passive;
 }
 
 // ============================================================
@@ -386,7 +461,8 @@ function getPostFlopStrength(
       numOpponents,
       isOmaha,
       oppMinPctile,
-      shortDeck
+      shortDeck,
+      BOT_EQUITY_BUDGET_MS // GAME-8 (R2) — bounded think time
     );
     return equity / 100; // normalize to 0-1
   }
@@ -712,7 +788,18 @@ export function decideAction(
     table.currentPhase === GamePhase.Bet4;
   const variantId: string = (table as any).variantId || 'texas-holdem';
   const isLowball = variantId === 'razz' || variantId === 'triple-draw' || variantId === 'badugi';
-  const isStudFamily = variantId === 'seven-card-stud' || variantId === 'seven-card-stud-hi-lo' || variantId === 'razz';
+  // 2026-10-11 (.online R2, GAME-8) — plain Seven Card Stud's variantId is
+  // 'seven-stud' (SevenStudTable), which this list missed: its bots ran the
+  // Hold'em Monte Carlo on 4-7 hole cards (~1s of blocking CPU per decision,
+  // a fake 80-96% equity) — 295 hands in 8h on that table vs 675-3,578
+  // elsewhere. Recognised by id AND by the table's own shape (a Stud table
+  // has getStudFirstActor, a draw table playerDraw), so a renamed variant can
+  // never fall back to the Hold'em path again.
+  const isStudFamily = STUD_VARIANT_IDS.has(variantId) || typeof (table as any).getStudFirstActor === 'function';
+  // Draw games bet first in GamePhase.PreFlop (then Draw1 / Bet2 / …): every one
+  // of their betting rounds uses the draw-hand strength, never the Hold'em
+  // percentile of two of the five cards.
+  const isDrawFamily = DRAW_VARIANT_IDS.has(variantId) || typeof (table as any).playerDraw === 'function';
   const callAmount = table.getCallAmount(seat);
   const totalPot = table.getTotalPot();
   const potOdds = totalPot > 0 ? callAmount / (totalPot + callAmount) : 0;
@@ -739,7 +826,7 @@ export function decideAction(
   // sharpen it: a known nit who bets is very strong; a station is wide.
   const oppCategory = dominantOpponentCategory(table, seatIndex);
   let oppMinPctile = 0;
-  if (!isPreFlop && !isStudFamily && !isDrawBet) {
+  if (!isPreFlop && !isStudFamily && !isDrawFamily && !isDrawBet) {
     if (opponents.raiseCount >= 2) oppMinPctile = 0.80;
     else if (opponents.raiseCount === 1 || callAmount > bigBlind) oppMinPctile = 0.62;
     else if (callAmount > 0) oppMinPctile = 0.45;
@@ -753,19 +840,23 @@ export function decideAction(
 
   let handStrength: number;
 
-  if (isStudFamily || isDrawBet) {
+  const isOmahaFamily = /omaha/i.test(variantId);
+  if (isStudFamily || isDrawFamily || isDrawBet) {
     // Non-community-card variants: use a generic hand-strength heuristic based
     // on the variant's own evaluator (or a lowball-aware one for razz/badugi/2-7).
     handStrength = getVariantHandStrength(seat.holeCards, variantId, isLowball);
   } else if (isPreFlop) {
     // Omaha uses a 4-card preflop model; Hold'em uses the equity-ranked percentile.
-    handStrength = /omaha/i.test(variantId)
+    handStrength = isOmahaFamily
       ? getOmahaPreflopStrength(seat.holeCards)
-      : getPreFlopHandRank(seat.holeCards);
+      : getPreFlopHandRank(holdemHoleCards(seat.holeCards));
   } else {
+    // GAME-8 — the Hold'em equity is never fed more than 2 hole cards: a
+    // (Crazy) Pineapple seat still holding 3 is priced on the 2 it keeps.
     handStrength = getPostFlopStrength(
-      seat.holeCards, table.communityCards, numOpponents, profile.difficulty,
-      /omaha/i.test(variantId), oppMinPctile, /short|six.?plus|6.?plus/i.test(variantId)
+      isOmahaFamily ? seat.holeCards : holdemHoleCards(seat.holeCards),
+      table.communityCards, numOpponents, profile.difficulty,
+      isOmahaFamily, oppMinPctile, /short|six.?plus|6.?plus/i.test(variantId)
     );
   }
 
@@ -834,20 +925,23 @@ export function decideAction(
   // ============================================================
   // PREFLOP STRATEGY
   // ============================================================
+  // GAME-9 (R2) — every decision passes the raise-war limiter last.
   if (isPreFlop) {
-    return preFlopStrategy(
+    const pre = preFlopStrategy(
       handStrength, callAmount, totalPot, seat, table, profile,
       myPosition, totalActive, opponents, bigBlind
     );
+    return limitBotRaiseWar(table, seat, pre, true, handStrength);
   }
 
   // ============================================================
   // POST-FLOP STRATEGY
   // ============================================================
-  return postFlopStrategy(
+  const post = postFlopStrategy(
     effectiveStrength, handStrength, callAmount, totalPot, potOdds,
     seat, table, profile, board, opponents, outs, bigBlind, numOpponents, oppCategory
   );
+  return limitBotRaiseWar(table, seat, post, false, effectiveStrength);
 }
 
 // ============================================================
@@ -880,7 +974,14 @@ function preFlopStrategy(
   const stackMult = getStackDepthMultiplier(effBB);
   const huFactor = totalActive <= 2 ? 0.55 : 1.0; // heads-up plays FAR wider
   const facingRaise = callAmount > bigBlind;
-  const facingThreeBet = opponents.raiseCount >= 2;
+  // GAME-9 (R2) — the table's own count of this round's raises: with each
+  // opponent's LAST action only, two bots re-raising each other each saw "one
+  // raise" forever and never reached the 4-bet / fold logic.
+  const streetRaises = Number((table as any).raisesThisStreet) || 0;
+  const facingThreeBet = Math.max(opponents.raiseCount, streetRaises) >= 2;
+  // A re-raise is sized off the bet it faces (currentBetToMatch), not off the
+  // increment still to call: "3x the call" made every 3-bet a near min-raise.
+  const betToMatch = table.currentBetToMatch;
   const minRaise = table.getMinRaise();
 
   // Model-derived, archetype/stack/heads-up-adjusted thresholds (percentile scale).
@@ -935,7 +1036,7 @@ function preFlopStrategy(
     if (wantRaise) {
       const target = callAmount === 0
         ? Math.round(bigBlind * (2.5 + Math.random() * 2.5))
-        : Math.round(callAmount * (2.5 + Math.random() * 1.5));
+        : Math.round(betToMatch * (2.5 + Math.random() * 1.5));
       if (Math.max(minRaise, target) >= seat.chipCount * 0.7) return { action: PlayerAction.AllIn, raiseAmount: 0 };
       return raiseOrAllIn(target);
     }
@@ -990,11 +1091,12 @@ function preFlopStrategy(
   }
 
   // Facing a 3-bet+: 4-bet premiums, flat strong, occasional 4-bet-bluff (expert).
+  // GAME-9: a 4-bet is ~2.3x the 3-bet it faces (was 2.2x the whole pot).
   if (facingThreeBet) {
-    if (pctile >= fourBetTh) return raiseOrAllIn(Math.round(totalPot * 2.2));
+    if (pctile >= fourBetTh) return raiseOrAllIn(roundToBB(Math.round(betToMatch * 2.3), bigBlind));
     if (pctile >= threeBetTh) return { action: PlayerAction.Call, raiseAmount: 0 };
     if (profile.difficulty === 'expert' && Math.random() < profile.bluffFrequency * 0.3) {
-      const target = Math.round(totalPot * 2.0);
+      const target = roundToBB(Math.round(betToMatch * 2.2), bigBlind);
       if (Math.max(minRaise, target) <= seat.chipCount * 0.35) return raiseOrAllIn(target);
     }
     return { action: PlayerAction.Fold, raiseAmount: 0 };
@@ -1003,7 +1105,8 @@ function preFlopStrategy(
   // Facing a single raise: 3-bet, flat, or fold.
   if (facingRaise) {
     if (pctile >= threeBetTh) {
-      const target = roundToBB(Math.round(callAmount * 3), bigBlind);
+      // GAME-9: 3x the open it faces (was 3x the increment still to call).
+      const target = roundToBB(Math.round(betToMatch * 3), bigBlind);
       return raiseOrAllIn(target);
     }
     if (pctile >= callVsRaiseTh) return { action: PlayerAction.Call, raiseAmount: 0 };
@@ -1046,6 +1149,16 @@ function postFlopStrategy(
   const isRiver = table.currentPhase === GamePhase.River;
   const params = ARCHETYPE_PARAMS[profile.archetype];
   const oppNames = getActiveOpponentNames(table, seat.seatIndex);
+  // GAME-9 (R2) — a RAISE facing a bet is sized off that bet: call it, then add
+  // `fraction` of the pot after the call ("raise to"). The old totals (a pot
+  // fraction alone) fell under the minimum re-raise as soon as the bets grew,
+  // so every re-raise became a min-raise and two strong bots traded them
+  // forever. With nothing to call this is the plain pot-fraction bet.
+  const potAfterCall = totalPot + callAmount;
+  const raiseTo = (fraction: number): number =>
+    Math.max(table.getMinRaise(), table.currentBetToMatch + Math.round(potAfterCall * fraction));
+  /** Chips a raise TO `total` takes from the stack (what it has already put in this round stays). */
+  const chipsFor = (total: number): number => total - seat.currentBet;
 
   // 2026-07-07 AI overhaul — CROSS-STREET + EXPLOITATIVE reads:
   //  • streetCaution: later-street bets mean a stronger (multi-barrel) range, so
@@ -1097,11 +1210,11 @@ function postFlopStrategy(
     }
     // Facing a bet: raise or fold (almost never just call)
     if (effectiveStrength > 0.55 || (Math.random() < 0.45 && !isRiver)) {
-      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 1.0 * params.betSizingMultiplier));
-      if (raiseSize + callAmount >= seat.chipCount * 0.8) {
+      const raiseSize = raiseTo(0.8 * params.betSizingMultiplier);
+      if (chipsFor(raiseSize) >= seat.chipCount * 0.8) {
         return { action: PlayerAction.AllIn, raiseAmount: 0 };
       }
-      if (raiseSize + callAmount <= seat.chipCount) {
+      if (chipsFor(raiseSize) <= seat.chipCount) {
         return { action: PlayerAction.Raise, raiseAmount: raiseSize };
       }
     }
@@ -1121,8 +1234,8 @@ function postFlopStrategy(
     // Folds anything below top pair to a bet
     if (effectiveStrength < 0.55) return { action: PlayerAction.Fold, raiseAmount: 0 };
     if (effectiveStrength > 0.85) {
-      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.7));
-      if (raiseSize + callAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      const raiseSize = raiseTo(0.7);
+      if (chipsFor(raiseSize) <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
     return { action: PlayerAction.Call, raiseAmount: 0 };
   }
@@ -1139,8 +1252,8 @@ function postFlopStrategy(
     if (effectiveStrength < 0.30) return { action: PlayerAction.Fold, raiseAmount: 0 };
     if (effectiveStrength > 0.92) {
       // Only raise with monsters
-      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.5));
-      if (raiseSize + callAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      const raiseSize = raiseTo(0.5);
+      if (chipsFor(raiseSize) <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
     if (callAmount >= seat.chipCount * 0.6 && effectiveStrength < 0.7) {
       return { action: PlayerAction.Fold, raiseAmount: 0 };
@@ -1161,8 +1274,8 @@ function postFlopStrategy(
     if (outs >= 4 && callAmount <= totalPot * 0.6) return { action: PlayerAction.Call, raiseAmount: 0 };
     if (effectiveStrength < 0.20 && callAmount > totalPot * 0.4) return { action: PlayerAction.Fold, raiseAmount: 0 };
     if (effectiveStrength > 0.88) {
-      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.6));
-      if (raiseSize + callAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      const raiseSize = raiseTo(0.6);
+      if (chipsFor(raiseSize) <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
     return { action: PlayerAction.Call, raiseAmount: 0 };
   }
@@ -1179,15 +1292,15 @@ function postFlopStrategy(
       return { action: PlayerAction.Check, raiseAmount: 0 };
     }
     if (effectiveStrength > 0.70) {
-      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.85 * params.betSizingMultiplier));
-      if (raiseSize + callAmount >= seat.chipCount * 0.8) return { action: PlayerAction.AllIn, raiseAmount: 0 };
-      if (raiseSize + callAmount <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      const raiseSize = raiseTo(0.75 * params.betSizingMultiplier);
+      if (chipsFor(raiseSize) >= seat.chipCount * 0.8) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+      if (chipsFor(raiseSize) <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
     if (effectiveStrength > potOdds + 0.05) return { action: PlayerAction.Call, raiseAmount: 0 };
     // Bluff-raise occasionally
     if (Math.random() < params.bluffFreq && !isRiver) {
-      const raiseSize = Math.max(table.getMinRaise(), Math.round(totalPot * 0.7));
-      if (raiseSize + callAmount <= seat.chipCount * 0.4) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      const raiseSize = raiseTo(0.6);
+      if (chipsFor(raiseSize) <= seat.chipCount * 0.4) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
@@ -1249,11 +1362,13 @@ function postFlopStrategy(
   }
 
   // Strong hand: value-raise (thinner vs sticky pools that pay off light).
+  // GAME-9 (R2): the GTO-sized amount is added ON TOP of the bet being raised.
   const valueRaiseTh = stickyPool ? 0.70 : 0.75;
   if (effectiveStrength > valueRaiseTh) {
-    const raiseSize = getGTOBetSize(rawStrength, totalPot, bigBlind, seat.chipCount, board, table.currentPhase, profile);
-    if (raiseSize >= minRaise && raiseSize + callAmount <= seat.chipCount) {
-      return { action: PlayerAction.Raise, raiseAmount: Math.max(raiseSize, minRaise) };
+    const raiseSize = Math.max(minRaise, table.currentBetToMatch +
+      getGTOBetSize(rawStrength, potAfterCall, bigBlind, seat.chipCount, board, table.currentPhase, profile));
+    if (chipsFor(raiseSize) <= seat.chipCount) {
+      return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
     return { action: PlayerAction.Call, raiseAmount: 0 };
   }
@@ -1262,8 +1377,8 @@ function postFlopStrategy(
   if (effectiveStrength > potOdds || effectiveStrength > contTh) {
     // Occasional merge/balanced raise with the top of the calling range.
     if (effectiveStrength > 0.6 && Math.random() < 0.3 * profile.aggressionFactor / 3) {
-      const raiseSize = roundToBB(Math.max(minRaise, Math.round(totalPot * 0.6)), bigBlind);
-      if (raiseSize <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      const raiseSize = roundToBB(raiseTo(0.6), bigBlind);
+      if (chipsFor(raiseSize) <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
     return { action: PlayerAction.Call, raiseAmount: 0 };
   }
@@ -1272,8 +1387,8 @@ function postFlopStrategy(
   if (outs >= 8 && !isRiver) {
     if (callAmount <= totalPot * 0.35) return { action: PlayerAction.Call, raiseAmount: 0 };
     if (outs >= 12 && Math.random() < profile.aggressionFactor * 0.2) {
-      const raiseSize = Math.max(minRaise, Math.round(totalPot * 0.7));
-      if (raiseSize + callAmount <= seat.chipCount * 0.4) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      const raiseSize = raiseTo(0.7);
+      if (chipsFor(raiseSize) <= seat.chipCount * 0.4) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
     if (callAmount <= seat.chipCount * 0.1) return { action: PlayerAction.Call, raiseAmount: 0 };
   }
@@ -1283,8 +1398,8 @@ function postFlopStrategy(
   // pools, more vs foldy ones. Not on the river (no fold-equity draws left).
   if (!isRiver && shouldBluffBalanced(rawStrength, board, table.currentPhase, profile, oppNames)) {
     if (board.hasHighCards || board.isPaired || board.isDry) {
-      const raiseSize = Math.max(minRaise, Math.round(totalPot * 0.65));
-      if (raiseSize + callAmount <= seat.chipCount * 0.30) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
+      const raiseSize = raiseTo(0.6);
+      if (chipsFor(raiseSize) <= seat.chipCount * 0.30) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
   }
 
