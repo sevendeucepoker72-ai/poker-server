@@ -28,6 +28,8 @@
 import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { FiveCardDrawTable } from '../src/game/variants/FiveCardDrawTable';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
+// R2 (C3, 2026-10-11): startQualifierTournament runs the qualifier structure (qualifierBlindLevels).
+import { qualifierBlindLevels } from '../src/game/qualifierSchedule';
 import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE_MAX_STATUS_AGE_MS } from '../src/auth/playGate';
 import { SRC, slice, fnSrc, load, flush } from './helpers/indexSource';
 
@@ -160,7 +162,7 @@ function world(opts: {
         return id;
       },
     },
-    DEFAULT_BLIND_LEVELS, GamePhase,
+    DEFAULT_BLIND_LEVELS, GamePhase, qualifierBlindLevels,
     pendingAutoStartTimers: new Map(), scheduleAutoStart: (id: string) => { scheduled.push(id); },
     reservedSeats, playerSessions, authSessions, multiTableSessions: new Map(), spectators: new Map(), aiProfiles: new Map(),
     tableProgressListeners: new Set(), sitOutTracker: new Map(), pendingSeatRemovalAfterHand: new Map(),

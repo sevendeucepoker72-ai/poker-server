@@ -16,6 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK } from './game/qualifierSchedule';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
 import { EscrowOffer, normalizeBackers, planEscrowRefund, planCashedSettlement, validateStakeOffer } from './game/stakingEscrow';
 import {
@@ -2474,6 +2475,24 @@ app.get('/api/health', async (_req, res) => {
       // (a forfeit, another hand, a seat that changed hands); open = windows
       // waiting right now (each lasts at most INSURANCE_DECISION_MS).
       insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
+      // 2026-10-11 (.online R2, S1) — tournaments, qualifiers, quick games,
+      // home games, staking, the prize ledger. Counts only, no ids.
+      // prizeLedger.pending > 0 = settlements waiting for their retry (a DB
+      // blip); qualifiers.resultPosts.failed > 0 = a results POST the master
+      // never took (audited QUALIFIER_RESULTS_POST_FAILED — seats NOT awarded).
+      r2Play: {
+        prizeLedger: { ...prizeLedgerStats },
+        tournamentPrizes: { ...tournamentPrizeStats },
+        tournamentCancelledNotices: { ...tournamentCancelledNotices },
+        tournamentStartsKeptAbsent: tournamentStartsKeptAbsent.seats,
+        staking: { ...stakingStats, openOffers: stakingOffers.size },
+        qualifiers: {
+          sync: { ...qualifierSyncStats }, registry: qualifierTournaments.size, cancellations: { ...qualifierCancellations },
+          lateEntries: { ...qualifierLateEntries }, resultPosts: { ...qualifierResultPosts },
+        },
+        quickGames: { ...quickGameStats, live: quickGames.size },
+        privateTables: { ...privateTableStats },
+      },
     });
   } catch (e: any) {
     res.status(503).json({ status: 'unhealthy', error: e?.message || String(e) });
@@ -2647,10 +2666,36 @@ interface QualifierTournamentReg {
   buyIn?: number;
   maxReEntries?: number;
   requiresQualifierCredit?: boolean;
-  players: { playerId: string; masterPlayerId?: string; playerName: string; phone: string; socketId: string; reEntries?: number; consumedCreditId?: string }[];
+  players: QualifierRegistrant[];
   status: 'registering' | 'starting' | 'running' | 'finished';
   tournamentId: string | null; // linked TournamentManager ID once started
   blindStructure: any[];
+  // ── R2 (2026-10-11, C3 / TOURNEY-2 / TOURNEY-3) — ONE registry entry per
+  // MASTER qualifier (keyed by its master id), only for events the master
+  // schedule lists, with a real lifecycle (registering → running → finished).
+  /** The lobby catalog key the master maps this type to ('weekly-qualifier'). */
+  clientQualifierId?: string;
+  /** When the master schedule last listed it (an event dropped from it before its start is cancelled + refunded). */
+  lastSeenInSchedule?: number;
+  finishedAt?: number | null;
+  /** Ended without being played (too few players / taken off the schedule) — every consumed credit refunded. */
+  cancelled?: boolean;
+  /** The final standings (C3): each finisher's own place + whether that place wins a championship seat. */
+  results?: Array<{ masterUserId: string | null; playerName: string; place: number; wonSeat: boolean }> | null;
+}
+
+/** R2 (TOURNEY-3 / AUTH-9) — a registration is the MASTER account's (masterPlayerId), never a login handle / phone / name. */
+interface QualifierRegistrant {
+  playerId: string;
+  masterPlayerId?: string;
+  localUserId?: number;
+  playerName: string;
+  phone: string;
+  socketId: string;
+  ip?: string;
+  reEntries?: number;
+  consumedCreditId?: string;
+  registeredAt?: number;
 }
 
 const qualifierTournaments = new Map<string, QualifierTournamentReg>();
@@ -2747,6 +2792,14 @@ async function issueQualifierCreditOnMaster(masterId: string, tier: string, note
 // Sync qualifier schedule from master API so qualifierTournaments has real
 // scheduledAt values (instead of client-side guessed dates) and masterQualifierId
 // for registration persistence and result reporting.
+// R2 (2026-10-11, TOURNEY-2 / C3) — the master answers `{ success, data:
+// { schedule } }`: this read `body.schedule`, found nothing, and the registry
+// stayed EMPTY (so registerQualifierTournament invented a qualifier 7 days
+// out). Now (parseMasterSchedule): one registry entry PER MASTER QUALIFIER,
+// keyed by its master id; its time / name / type follow the master until it
+// starts; an event that disappears from the schedule before it starts is
+// cancelled (every consumed credit refunded). Nothing is ever invented.
+const qualifierSyncStats = { syncs: 0, failures: 0, lastSyncAt: null as string | null, listed: 0, cancelledOffSchedule: 0 };
 async function syncQualifierSchedule(): Promise<void> {
   const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
   if (!tok) return; // no token configured — skip
@@ -2755,41 +2808,341 @@ async function syncQualifierSchedule(): Promise<void> {
     const resp = await fetch(`${base}/qualifiers/schedule`, {
       headers: { 'X-Internal-Token': tok },
     });
-    if (!resp.ok) { console.warn('[QualifierSync] schedule fetch failed:', resp.status); return; }
-    const body = await resp.json() as { schedule?: Array<{ id: number; clientQualifierId: string; type: string; name: string; scheduledAt: string | null }> };
-    const list = body?.schedule;
-    if (!Array.isArray(list)) return;
-    for (const q of list) {
-      const mapKey = q.clientQualifierId; // e.g. 'weekly-qualifier'
-      const existing = qualifierTournaments.get(mapKey);
-      if (existing) {
-        if (q.scheduledAt) existing.scheduledAt = q.scheduledAt;
-        existing.masterQualifierId = String(q.id);
-      } else {
-        qualifierTournaments.set(mapKey, {
-          qualifierId: mapKey,
-          qualifierType: q.type,
-          qualifierName: q.name,
-          scheduledAt: q.scheduledAt || new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString(),
-          masterQualifierId: String(q.id),
-          startingStack: 50000,
-          maxPlayers: 999,
-          requiresQualifierCredit: true,
-          players: [],
-          status: 'registering',
-          tournamentId: null,
-          blindStructure: [],
-        });
-      }
-    }
-    console.log(`[QualifierSync] synced ${list.length} qualifiers`);
+    if (!resp.ok) { qualifierSyncStats.failures++; console.warn('[QualifierSync] schedule fetch failed:', resp.status); return; }
+    applyQualifierSchedule(parseMasterSchedule(await resp.json()), Date.now());
   } catch (err: any) {
+    qualifierSyncStats.failures++;
     console.warn('[QualifierSync] error:', err?.message);
   }
 }
-// Run 5 s after startup (lets secrets load) then every 30 min
+
+/** R2 — fold the master schedule into the registry (see syncQualifierSchedule). */
+function applyQualifierSchedule(list: MasterScheduleEntry[], now: number): void {
+  const listed = new Set<string>();
+  for (const q of list) {
+    if (q.status !== 'open') continue;
+    listed.add(q.id);
+    const existing = qualifierTournaments.get(q.id);
+    if (existing) {
+      existing.lastSeenInSchedule = now;
+      // The master owns the time / name until the event STARTS.
+      if (existing.status === 'registering' && !existing.tournamentId) {
+        existing.scheduledAt = new Date(q.scheduledAt).toISOString();
+        existing.qualifierName = q.name;
+        existing.qualifierType = q.type;
+        existing.clientQualifierId = q.clientQualifierId;
+      }
+      continue;
+    }
+    // A brand-new event whose late registration already ended is not opened.
+    if (now > qualifierWindows(q.scheduledAt).lateRegUntil) continue;
+    qualifierTournaments.set(q.id, {
+      qualifierId: q.id,
+      masterQualifierId: q.id,
+      clientQualifierId: q.clientQualifierId,
+      qualifierType: q.type,
+      qualifierName: q.name,
+      scheduledAt: new Date(q.scheduledAt).toISOString(),
+      startingStack: QUALIFIER_BASE_STACK,
+      maxPlayers: 999,
+      requiresQualifierCredit: true,
+      players: [],
+      status: 'registering',
+      tournamentId: null,
+      blindStructure: qualifierStructure(QUALIFIER_BASE_STACK).levels,
+      lastSeenInSchedule: now,
+      finishedAt: null,
+      results: null,
+    });
+  }
+  // Taken off the schedule before it started (the master closed / moved it):
+  // cancelled — every consumed credit refunded, registrants told.
+  for (const [id, qt] of [...qualifierTournaments]) {
+    if (listed.has(id) || qt.status !== 'registering' || qt.tournamentId) continue;
+    cancelQualifierEvent(id, qt, 'removed_from_schedule');
+    qualifierSyncStats.cancelledOffSchedule++;
+  }
+  qualifierSyncStats.syncs++;
+  qualifierSyncStats.listed = listed.size;
+  qualifierSyncStats.lastSyncAt = new Date(now).toISOString();
+  console.log(`[QualifierSync] synced ${list.length} qualifiers (${listed.size} open)`);
+}
+// Run 5 s after startup (lets secrets load) then every 30 min — R2: every 10
+// minutes (a moved start time / a new week's event shows up within minutes).
 setTimeout(() => syncQualifierSchedule(), 5000);
-setInterval(() => syncQualifierSchedule(), 30 * 60 * 1000);
+setInterval(() => syncQualifierSchedule(), 10 * 60 * 1000);
+
+/**
+ * R2 (C3) — the registry entry a client's `qualifierId` names: the MASTER id;
+ * else the lobby catalog key ('weekly-qualifier') → the current event of that
+ * kind (not finished; the soonest). Never an invented one.
+ */
+function qualifierEventFor(qualifierId: unknown): [string, QualifierTournamentReg] | null {
+  if (typeof qualifierId !== 'string' || !qualifierId) return null;
+  const direct = qualifierTournaments.get(qualifierId);
+  if (direct) return [qualifierId, direct];
+  let best: [string, QualifierTournamentReg] | null = null;
+  for (const [id, qt] of qualifierTournaments) {
+    if (qt.clientQualifierId !== qualifierId || qt.status === 'finished') continue;
+    if (!best || new Date(qt.scheduledAt).getTime() < new Date(best[1].scheduledAt).getTime()) best = [id, qt];
+  }
+  return best;
+}
+
+/** R2 (C3) — one qualifier as the lobby shows it, for an asking master account (or none). */
+function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, viewerMasterId: string | null): Record<string, unknown> {
+  const at = new Date(qt.scheduledAt).getTime();
+  const w = qualifierWindows(at);
+  const phase = qt.status === 'finished' ? 'finished' : (qt.status === 'running' || qt.status === 'starting') ? 'running' : 'pending';
+  const status = qualifierStatusOf(phase, at, now);
+  const mine = viewerMasterId ? qt.players.find((p) => p.masterPlayerId === viewerMasterId) : undefined;
+  const myResult = viewerMasterId && qt.results ? qt.results.find((r) => r.masterUserId === viewerMasterId) : undefined;
+  const seatsForTop = seatsForTopOf(qt.qualifierType);
+  return {
+    qualifierId: id,
+    masterQualifierId: qt.masterQualifierId ?? id,
+    clientQualifierId: qt.clientQualifierId ?? null,
+    type: qt.qualifierType,
+    name: qt.qualifierName,
+    scheduledAt: new Date(at).toISOString(),
+    signupOpensAt: new Date(w.signupOpensAt).toISOString(),
+    signupClosesAt: new Date(w.signupClosesAt).toISOString(),
+    lateRegUntil: new Date(w.lateRegUntil).toISOString(),
+    status,
+    registered: !!mine,
+    players: qt.players.length,
+    structure: qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK),
+    seatsForTop,
+    tournamentId: qt.tournamentId,
+    ...(qt.cancelled ? { cancelled: true } : {}),
+    // The asking account's own result (C3): `myResult {place, wonSeat}` (+ the same two at the top level).
+    myResult: myResult ? { place: myResult.place, wonSeat: myResult.wonSeat } : null,
+    ...(myResult ? { place: myResult.place, wonSeat: myResult.wonSeat } : {}),
+    // Pre-R2 names (older lobbies): the same values.
+    qualifierType: qt.qualifierType,
+    qualifierName: qt.qualifierName,
+    registeredCount: qt.players.length,
+    signupOpen: status === 'registering' || (status === 'running' && now <= w.lateRegUntil),
+  };
+}
+
+/** C3 — every listed qualifier (finished ones for a day, for their results), soonest first. */
+function qualifierList(viewerMasterId: string | null, now: number = Date.now()): Array<Record<string, unknown>> {
+  return [...qualifierTournaments.entries()]
+    .sort((a, b) => new Date(a[1].scheduledAt).getTime() - new Date(b[1].scheduledAt).getTime())
+    .map(([id, qt]) => qualifierListItem(id, qt, now, viewerMasterId));
+}
+
+/**
+ * R2 — refund a registrant's consumed qualifier credit on the master and
+ * drop his master registration row. Never throws; audited.
+ */
+function releaseQualifierRegistration(qualId: string, qt: QualifierTournamentReg, p: QualifierRegistrant, reason: string): Promise<unknown> {
+  const tasks: Promise<unknown>[] = [];
+  if (p.consumedCreditId) {
+    const cid = p.consumedCreditId;
+    p.consumedCreditId = undefined;
+    tasks.push(refundQualifierCreditOnMaster(cid)
+      .then((refunded) => auditLog(p.playerId, refunded ? 'QUALIFIER_CREDIT_REFUND' : 'QUALIFIER_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: cid, reason }))
+      .catch(() => { /* audited on the false branch */ }));
+  }
+  if (qt.masterQualifierId && p.masterPlayerId) {
+    const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+    const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+    tasks.push(fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+      body: JSON.stringify({ userId: p.masterPlayerId }),
+    }).catch((e: any) => console.warn('[Qualifier] unregister persist failed:', e?.message)));
+  }
+  return Promise.all(tasks);
+}
+
+/** R2 — every live socket signed in as this master account. */
+function socketsOfMaster(masterId: string | undefined): Socket[] {
+  if (!masterId) return [];
+  const out: Socket[] = [];
+  for (const [sid, a] of authSessions) {
+    if (String(a.masterUserId || a.statsMasterUserId || '') !== String(masterId)) continue;
+    const s = io.sockets.sockets.get(sid);
+    if (s && s.connected) out.push(s);
+  }
+  return out;
+}
+
+/** R2 (TOURNEY-9) — the answer when a qualifier seat would take over a socket that plays a live seat elsewhere. */
+const QUALIFIER_LEAVE_TABLE_FIRST = 'Leave your current table first, then enter the qualifier.';
+const qualifierLateEntries = { seated: 0, refundedNoSeat: 0 };
+
+/** R2 — the master's registration row for this event (so the master knows who entered). Fire-and-forget. */
+function persistQualifierRegistration(qt: QualifierTournamentReg, masterId: string): void {
+  if (!qt.masterQualifierId || !masterId) return;
+  const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
+  const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+    body: JSON.stringify({ userId: masterId }),
+  }).catch((e: any) => console.warn('[QualifierReg] persist failed:', e?.message));
+}
+
+/** R2 (C3) — the registration count to every lobby: a NUMBER (`players` / `registeredCount`), never names. */
+function broadcastQualifierUpdate(qualId: string, qt: QualifierTournamentReg): void {
+  const item = qualifierListItem(qualId, qt, Date.now(), null);
+  io.emit('qualifierTournamentUpdate', {
+    qualifierId: qualId, status: item.status, registeredCount: qt.players.length, players: qt.players.length, tournamentId: qt.tournamentId,
+  });
+}
+
+/** R2 — give back a FIRST entry's consumed credit (the entry did not happen). Audited; never throws. */
+async function refundQualifierEntryCredit(actor: string, qualId: string, creditId: string, reason: string): Promise<boolean> {
+  let refunded = false;
+  try { refunded = await refundQualifierCreditOnMaster(creditId); } catch { refunded = false; }
+  if (reason === 'no_seat') qualifierLateEntries.refundedNoSeat++;
+  auditLog(actor, refunded ? 'QUALIFIER_ENTRY_CREDIT_REFUND' : 'QUALIFIER_ENTRY_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId, reason });
+  return refunded;
+}
+
+/** R2 — give back a RE-ENTRY's chip buy-in (additive, once) and its consumed credit. Audited; never throws. */
+async function refundQualifierReentryCharges(
+  userId: number, username: string, qualId: string, buyIn: number, creditId: string | null, reason: string,
+): Promise<void> {
+  if (buyIn > 0) {
+    let ok = false;
+    try { ok = !!(await addChipsToUser(userId, buyIn)); } catch { ok = false; }
+    auditLog(username, ok ? 'QUALIFIER_REENTRY_BUYIN_REFUND' : 'QUALIFIER_REENTRY_BUYIN_REFUND_FAILED', { qualifierId: qualId, buyIn, reason });
+  }
+  if (creditId) {
+    let refunded = false;
+    try { refunded = await refundQualifierCreditOnMaster(creditId); } catch { refunded = false; }
+    auditLog(username, refunded ? 'QUALIFIER_REENTRY_CREDIT_REFUND' : 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId, reason });
+  }
+}
+
+/**
+ * R2 (TOURNEY-3) — a LATE first entry into a RUNNING qualifier: a NEW entrant
+ * (TournamentManager.addLateEntrant) seated at once with the starting stack on
+ * an empty seat of the least-full table, this socket's session bound to it
+ * (P-g detach first). null = no seat (none free, the tournament is over): the
+ * caller refunds the credit — never a consumed credit without a seat. The
+ * caller has checked the socket plays no live seat elsewhere (TOURNEY-9).
+ */
+function seatQualifierLateEntrant(socket: Socket, qt: QualifierTournamentReg, reg: QualifierRegistrant): { tableId: string; seatIndex: number } | null {
+  const tournamentId = qt.tournamentId;
+  const tournament = tournamentId ? tournamentManager.getTournament(tournamentId) : undefined;
+  if (!tournamentId || !tournament || tournament.status !== 'running') return null;
+  const stack = qt.startingStack || QUALIFIER_BASE_STACK;
+  const tables = tournament.tableIds
+    .map((tid) => ({ tid, table: tableManager.getTable(tid) }))
+    .filter((x): x is { tid: string; table: PokerTable } => !!x.table)
+    .sort((a, b) => a.table.getOccupiedSeatCount() - b.table.getOccupiedSeatCount());
+  for (const { tid, table } of tables) {
+    for (let s = 0; s < table.seats.length; s++) {
+      if (table.seats[s].state !== 'empty') continue;
+      if (!tournamentManager.addLateEntrant(tournamentId, reg.playerId, reg.playerName, socket.id, stack, { masterUserId: reg.masterPlayerId })) return null;
+      if (!table.sitDown(s, reg.playerName, stack, reg.playerId, false)) {
+        tournamentManager.removeLateEntrant(tournamentId, reg.playerId);
+        continue;
+      }
+      tournamentManager.setPlayerTable(tournamentId, reg.playerId, tid);
+      // P-g — one table view per socket: no other table's spectating / rooms.
+      detachSocketFromOtherTables(socket, tid, 'seat', 'qualifierLateEntry');
+      playerSessions.set(socket.id, {
+        socketId: socket.id, tableId: tid, seatIndex: s, playerName: reg.playerName, playerId: reg.playerId,
+        trainingEnabled: false, sittingOut: false,
+      });
+      for (const ttid of tournament.tableIds) spectators.get(ttid)?.delete(socket.id);
+      socket.join(`table:${tid}`);
+      console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_late_entry_seated', tournamentId, tableId: tid, seatIndex: s })}`);
+      return { tableId: tid, seatIndex: s };
+    }
+  }
+  return null;
+}
+
+/**
+ * R2 (TOURNEY-3) — a qualifier that will not be played (too few players by the
+ * end of late registration, or taken off the schedule): 'finished' +
+ * `cancelled`, every consumed credit refunded, every registrant told
+ * (`qualifierCancelled {qualifierId, reason, creditRefunded}`).
+ */
+const qualifierCancellations = { cancelled: 0, creditsRefunded: 0 };
+function cancelQualifierEvent(qualId: string, qt: QualifierTournamentReg, reason: string): Promise<unknown> {
+  qt.status = 'finished';
+  qt.cancelled = true;
+  qt.finishedAt = Date.now();
+  qualifierCancellations.cancelled++;
+  const players = qt.players.slice();
+  const tasks = players.map((p) => {
+    const hadCredit = !!p.consumedCreditId;
+    if (hadCredit) qualifierCancellations.creditsRefunded++;
+    for (const s of socketsOfMaster(p.masterPlayerId)) s.emit('qualifierCancelled', { qualifierId: qualId, reason, creditRefunded: hadCredit });
+    return releaseQualifierRegistration(qualId, qt, p, reason);
+  });
+  io.emit('qualifierTournamentUpdate', { qualifierId: qualId, status: 'finished', cancelled: true, registeredCount: 0, players: 0 });
+  console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_cancelled', qualifierId: qualId, reason, registrants: players.length })}`);
+  return Promise.all(tasks);
+}
+
+/**
+ * R2 (C3 / TOURNEY-3 / TOURNEY-13) — the qualifier's tournament FINISHED:
+ * 'finished', and its standings kept — each finisher's place and whether
+ * that place wins a championship seat (seatsForTop: the master's seat places —
+ * weekly top 3, monthly top 6, TOC winner; the master's per-player seat cap
+ * can still pass a capped player's seat down, and its own seat notice is
+ * authoritative) — then every registrant's live sockets get `qualifierResults
+ * {qualifierId, myResult: {place, wonSeat} | null, place, wonSeat, seatsForTop,
+ * results}` (his own; null / false when he did not finish). The table rooms'
+ * `tournamentFinished` carries the same per socket (emitTournamentFinishedToEntrants).
+ */
+function markQualifierFinished(tournamentId: string, data: { results?: Array<{ playerId: string; playerName: string; position: number; disqualified?: boolean }> }): void {
+  for (const [qualId, qt] of qualifierTournaments) {
+    if (qt.tournamentId !== tournamentId || qt.status === 'finished') continue;
+    const seats = seatsForTopOf(qt.qualifierType);
+    const results = (data?.results || [])
+      .filter((r) => r.position > 0 && !r.disqualified)
+      .map((r) => {
+        const reg = qt.players.find((p) => p.playerId === r.playerId);
+        return { masterUserId: reg?.masterPlayerId ?? null, playerName: publicNameOf(r.playerName), place: r.position, wonSeat: r.position <= seats };
+      })
+      .sort((a, b) => a.place - b.place);
+    qt.status = 'finished';
+    qt.finishedAt = Date.now();
+    qt.results = results;
+    const publicResults = results.map((r) => ({ place: r.place, playerName: r.playerName, wonSeat: r.wonSeat }));
+    for (const p of qt.players) {
+      const mine = results.find((r) => r.masterUserId && r.masterUserId === p.masterPlayerId);
+      for (const s of socketsOfMaster(p.masterPlayerId)) {
+        s.emit('qualifierResults', {
+          qualifierId: qualId, myResult: mine ? { place: mine.place, wonSeat: mine.wonSeat } : null,
+          place: mine?.place ?? null, wonSeat: !!mine?.wonSeat, seatsForTop: seats, results: publicResults,
+        });
+      }
+    }
+    io.emit('qualifierTournamentUpdate', { qualifierId: qualId, status: 'finished', tournamentId, registeredCount: qt.players.length, players: qt.players.length });
+  }
+}
+
+/** R2 (C3) — the qualifier event a tournament plays, if any. */
+function qualifierOfTournament(tournamentId: string): { qualId: string; qt: QualifierTournamentReg } | null {
+  for (const [qualId, qt] of qualifierTournaments) if (qt.tournamentId === tournamentId) return { qualId, qt };
+  return null;
+}
+
+/** R2 (C3) — one socket's account's own qualifier result (`myResult`), or null (not a finisher / not signed in). */
+function qualifierResultOf(qt: QualifierTournamentReg, auth: SocketAuthSession | undefined): { place: number; wonSeat: boolean } | null {
+  const master = auth ? String(auth.masterUserId || auth.statsMasterUserId || '') : '';
+  if (!master || !qt.results) return null;
+  const r = qt.results.find((x) => !!x.masterUserId && x.masterUserId === master);
+  return r ? { place: r.place, wonSeat: r.wonSeat } : null;
+}
+
+/** R2 — finished qualifiers stay listed a day (their results), then leave the registry. */
+function pruneFinishedQualifiers(now: number = Date.now()): void {
+  for (const [id, qt] of [...qualifierTournaments]) {
+    if (qt.status === 'finished' && (qt.finishedAt ?? 0) > 0 && now - (qt.finishedAt as number) > 24 * 3600_000) qualifierTournaments.delete(id);
+  }
+}
 
 // 2026-07-07 gap-fill [10] — shared table-creation from a scheduled-table config.
 // Used by BOTH the manual Activate handler and the auto-fire sweep so the two
@@ -2868,48 +3221,37 @@ setTimeout(() => sweepScheduledClubTables(), 15000);
 setInterval(() => sweepScheduledClubTables(), 60 * 1000);
 
 // REST endpoint: get qualifier tournament registrations
+// R2 (C3) — ONLY the qualifiers the master schedule lists (the registry), in
+// the C3 shape; no player names or phones (the socket list adds the asking
+// account's own `registered`).
 app.get('/api/qualifier-tournaments', (_req, res) => {
-  const list: any[] = [];
-  for (const [id, qt] of qualifierTournaments) {
-    list.push({
-      qualifierId: id,
-      qualifierType: qt.qualifierType,
-      qualifierName: qt.qualifierName,
-      scheduledAt: qt.scheduledAt,
-      registeredCount: qt.players.length,
-      maxPlayers: qt.maxPlayers,
-      status: qt.status,
-      tournamentId: qt.tournamentId,
-      players: qt.players.map(p => ({ name: p.playerName })),
-    });
-  }
-  res.json({ success: true, tournaments: list });
+  res.json({ success: true, tournaments: qualifierList(null) });
 });
 
-// REST endpoint: get specific qualifier tournament
+// REST endpoint: get specific qualifier tournament (by master id or catalog key)
 app.get('/api/qualifier-tournaments/:qualifierId', (req, res) => {
-  const qt = qualifierTournaments.get(req.params.qualifierId);
-  if (!qt) return res.json({ success: false, error: 'Not found' });
-  res.json({
-    success: true,
-    tournament: {
-      ...qt,
-      players: qt.players.map(p => ({ name: p.playerName, phone: p.phone.slice(-4) })),
-    },
-  });
+  const found = qualifierEventFor(req.params.qualifierId);
+  if (!found) return res.json({ success: false, error: 'Not found' });
+  res.json({ success: true, tournament: qualifierListItem(found[0], found[1], Date.now(), null) });
 });
 
 /**
  * Auto-start qualifier tournaments when scheduled time arrives.
  * Runs every 30 seconds.
+ * R2 (TOURNEY-3) — a qualifier still without two players when its late
+ * registration ends is CANCELLED (every consumed credit refunded) — it used to
+ * wait forever with the credits gone; finished ones leave after a day.
  */
-setInterval(() => {
-  const now = Date.now();
+function tickQualifierAutoStart(now: number = Date.now()): void {
+  pruneFinishedQualifiers(now);
   for (const [qualId, qt] of qualifierTournaments) {
     if (qt.status !== 'registering') continue;
     const scheduledTime = new Date(qt.scheduledAt).getTime();
     if (now < scheduledTime) continue;
-    if (qt.players.length < 2) continue;
+    if (qt.players.length < 2) {
+      if (now > qualifierWindows(scheduledTime).lateRegUntil) void cancelQualifierEvent(qualId, qt, 'too_few_players');
+      continue;
+    }
 
     // Time to start!
     qt.status = 'starting';
@@ -2959,13 +3301,16 @@ setInterval(() => {
         tournamentId: result.tournamentId,
         playerCount: playerCount,
         tableCount: result.tableCount,
+        registeredCount: playerCount,   // R2 (C3) — numbers
+        players: playerCount,
       });
     } else {
       qt.status = 'registering'; // revert on failure
       console.error(`[QualifierTournament] Failed to start ${qt.qualifierName}`);
     }
   }
-}, 30000);
+}
+setInterval(() => tickQualifierAutoStart(), 30000);
 
 /**
  * 2026-10-07 — qualifier PRE-START SUSPENSION SCREEN.
@@ -3015,12 +3360,8 @@ async function screenQualifierRegistrants(qualId: string, qt: QualifierTournamen
       }).catch((e) => console.warn('[play-gate] qualifier unregister persist failed:', e?.message));
     }
   }
-  io.emit('qualifierTournamentUpdate', {
-    qualifierId: qualId,
-    status: qt.status,
-    registeredCount: qt.players.length,
-    players: qt.players.map((p) => ({ name: p.playerName })),
-  });
+  // R2 (C3) — the count as a NUMBER (it listed every registrant's name to every lobby).
+  broadcastQualifierUpdate(qualId, qt);
 }
 setInterval(() => {
   const now = Date.now();
@@ -7015,6 +7356,19 @@ async function publicStakingOffers(offers: any[]): Promise<any[]> {
 }
 
 /**
+ * R2 (C4) — the marketplace as ONE viewer sees it (`pub` = publicStakingOffers
+ * of `raw`, same order): `isMine` — his own offer, by ACCOUNT (the client hid
+ * the Buy button on another seller's offer whose NAME matched) — and, on his
+ * own offers only, `sellerUserId` (no other account's id: R1).
+ */
+function stakingOffersForViewer(raw: any[], pub: any[], viewerUserId: number | undefined): any[] {
+  return pub.map((o, i) => {
+    const mine = viewerUserId !== undefined && Number(raw[i]?.sellerId) === viewerUserId;
+    return { ...o, isMine: mine, sellerUserId: mine ? viewerUserId : null };
+  });
+}
+
+/**
  * Tournament standings as other players see them: names through the public
  * rules (a qualifier entrant's registration name could be his login handle),
  * and the entrant ids — a qualifier entrant's id WAS his login handle — as
@@ -7641,58 +7995,49 @@ io.on('connection', (socket: Socket) => {
       return;
     }
 
-    const qualId = data.qualifierId;
-    let qt = qualifierTournaments.get(qualId);
-
-    // Create registration if it doesn't exist yet
-    if (!qt) {
-      // Default config — frontend should send these but fallback to defaults
-      qt = {
-        qualifierId: qualId,
-        qualifierType: qualId.includes('monthly') ? 'monthly' : 'weekly',
-        qualifierName: qualId.includes('monthly') ? 'Monthly Major Qualifier' : 'Weekly Qualifier',
-        scheduledAt: new Date(Date.now() + 7 * 86400000).toISOString(), // default: 7 days from now
-        startingStack: 50000,
-        maxPlayers: 999,
-        players: [],
-        status: 'registering',
-        tournamentId: null,
-        blindStructure: [],
-        requiresQualifierCredit: true,
-      };
-      qualifierTournaments.set(qualId, qt);
+    // R2 (2026-10-11, C3 / TOURNEY-2 / TOURNEY-3) — ONLY an event the master
+    // schedule lists: its master id, or the lobby catalog key
+    // ('weekly-qualifier') → the current event of that kind
+    // (qualifierEventFor). This used to CREATE one when the registry had none
+    // — 7 days out, one per TYPE, never finished — so the lobby said "Signup
+    // opens in 165h" and nobody ever played a qualifier.
+    const found = qualifierEventFor(data?.qualifierId);
+    if (!found) {
+      socket.emit('qualifierRegistrationResult', { success: false, code: 'qualifier_not_found', error: 'This qualifier is not on the schedule right now.', qualifierId: data?.qualifierId });
+      return;
     }
+    const [qualId, qt] = found;
+    const refuseQualifier = (code: string, error: string, extra: Record<string, unknown> = {}) =>
+      socket.emit('qualifierRegistrationResult', { success: false, code, error, qualifierId: qualId, ...extra });
 
-    const LATE_REG_WINDOW_MS = 1.5 * 60 * 60 * 1000; // 1.5 hours after start
-    const SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000; // 3 hours before start
-    const phone = (data.phone || '').trim();
-
-    // Signup window: opens 3 hours before scheduledAt, closes 1.5 hours after scheduledAt
+    // Signup window (qualifierWindows): opens 3 hours before the start; closes
+    // — late registration included — 90 minutes after it.
     const scheduledTime = new Date(qt.scheduledAt).getTime();
     const now = Date.now();
-    const signupOpensAt = scheduledTime - SIGNUP_OPENS_BEFORE_MS;
-    const signupClosesAt = scheduledTime + LATE_REG_WINDOW_MS;
-
-    if (now < signupOpensAt) {
-      const opensIn = Math.ceil((signupOpensAt - now) / 60000);
+    const windows = qualifierWindows(scheduledTime);
+    if (qt.status === 'finished') {
+      refuseQualifier('registration_closed', qt.cancelled ? 'This qualifier was cancelled.' : 'This qualifier has finished.');
+      return;
+    }
+    if (now < windows.signupOpensAt) {
+      const opensIn = Math.ceil((windows.signupOpensAt - now) / 60000);
       const h = Math.floor(opensIn / 60);
       const m = opensIn % 60;
       const timeStr = h > 0 ? `${h}h ${m}m` : `${m}m`;
-      socket.emit('qualifierRegistrationResult', { success: false, error: `Signup opens in ${timeStr}` });
+      refuseQualifier('signup_not_open', `Signup opens in ${timeStr}`, { signupOpensAt: new Date(windows.signupOpensAt).toISOString() });
       return;
     }
 
-    if (now > signupClosesAt) {
-      socket.emit('qualifierRegistrationResult', { success: false, error: 'Signup window has closed' });
+    if (now > windows.signupClosesAt) {
+      refuseQualifier('signup_closed', 'Signup window has closed');
       return;
     }
 
-    // Check if tournament is in late-registration window (running but within 1.5 hours)
-    const isLateReg = qt.status === 'running' && qt.tournamentId &&
-      (now - scheduledTime) < LATE_REG_WINDOW_MS;
+    // Late registration: the event is RUNNING and its late window is still open.
+    const isLateReg = qt.status === 'running' && !!qt.tournamentId && now <= windows.lateRegUntil;
 
     if (qt.status !== 'registering' && !isLateReg) {
-      socket.emit('qualifierRegistrationResult', { success: false, error: 'Tournament is no longer accepting registrations' });
+      refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
       return;
     }
 
@@ -7704,19 +8049,22 @@ io.on('connection', (socket: Socket) => {
     // Placed before BOTH the re-entry and first-entry branches so it covers all
     // entry paths.
     if (!(await isPlayerQualified(masterId, qt.qualifierType))) {
-      socket.emit('qualifierRegistrationResult', { success: false, error: `You need a ${qt.qualifierType} qualifier credit to enter. Earn one by finishing top-5 in a live game (weekly) or finishing top-20% of your league standings (monthly).` });
+      refuseQualifier('not_qualified', `You need a ${qt.qualifierType} qualifier credit to enter. Earn one by finishing top-5 in a live game (weekly) or finishing top-20% of your league standings (monthly).`);
       return;
     }
 
-    // Check if player is already registered and NOT eliminated (can't double-enter)
-    const existingEntry = qt.players.find(p => p.playerId === (auth.username || phone) || (phone && p.phone === phone));
+    // Check if player is already registered and NOT eliminated (can't double-enter).
+    // R2 (TOURNEY-3 / AUTH-9) — the entry is the MASTER ACCOUNT's: it used to be
+    // matched by the login handle or a CLIENT-SENT phone (anyone could type
+    // another player's number — and unregister him).
+    const existingEntry = qt.players.find((p) => !!p.masterPlayerId && p.masterPlayerId === masterId);
     if (existingEntry) {
       // Check if they were eliminated — if so, allow re-entry (costs another credit)
       const tournament = qt.tournamentId ? tournamentManager.getTournament(qt.tournamentId) : null;
       const wasEliminated = tournament?.players.find(p => p.playerId === existingEntry.playerId)?.eliminated;
 
       if (!wasEliminated) {
-        socket.emit('qualifierRegistrationResult', { success: false, error: 'Already registered and still playing' });
+        refuseQualifier('already_registered', tournament ? 'Already registered and still playing' : 'You are already registered for this qualifier.', { registered: true });
         return;
       }
 
@@ -7734,7 +8082,16 @@ io.on('connection', (socket: Socket) => {
         const maxReEntries = qt.maxReEntries ?? MAX_RE_ENTRIES_DEFAULT;
         const priorReEntries = (existingEntry as any).reEntries || 0;
         if (priorReEntries >= maxReEntries) {
-          socket.emit('qualifierRegistrationResult', { success: false, error: `Re-entry limit reached (${maxReEntries})` });
+          refuseQualifier('reentry_limit', `Re-entry limit reached (${maxReEntries})`);
+          return;
+        }
+        // R2 (TOURNEY-9) — the re-entry binds THIS socket to its new seat; a
+        // socket that plays a live seat elsewhere (a cash game, another
+        // tournament, an extra table) is refused before anything is charged —
+        // its session used to be MOVED off that seat, which then played on
+        // with nobody behind it.
+        if (socketPlaysLiveSeatElsewhere(socket.id, '')) {
+          refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
           return;
         }
 
@@ -7825,6 +8182,14 @@ io.on('connection', (socket: Socket) => {
           }
         }
 
+        // R2 (TOURNEY-9) — re-checked after the awaits: a socket that sat down
+        // elsewhere meanwhile is never moved off that seat (both charges back).
+        if (socketPlaysLiveSeatElsewhere(socket.id, '')) {
+          await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'seated_elsewhere');
+          refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
+          return;
+        }
+
         // (d) NOW re-seat. Find a table with empty seats.
         const startingStack = qt.startingStack || 50000;
         let seated = false;
@@ -7896,20 +8261,32 @@ io.on('connection', (socket: Socket) => {
         // Bump in-memory re-entry counter — survives until the qt is
         // garbage-collected on tournament finish.
         (existingEntry as any).reEntries = priorReEntries + 1;
-        socket.emit('qualifierRegistrationResult', { success: true, qualifierId: qualId, reentry: true });
-        broadcastGameState(tournament.tableIds[0]);
+        // R2 — the table he now sits at (it used to broadcast the FIRST table, wherever he was seated).
+        const reentryTableId = playerSessions.get(socket.id)?.tableId || tournament.tableIds[0];
+        socket.emit('qualifierRegistrationResult', {
+          success: true, qualifierId: qualId, reentry: true, registered: true,
+          tournamentId: qt.tournamentId, tableId: reentryTableId, registeredCount: qt.players.length,
+        });
+        broadcastGameState(reentryTableId);
         return;
       }
 
-      socket.emit('qualifierRegistrationResult', { success: false, error: 'Re-entry not available at this time' });
+      refuseQualifier('reentry_unavailable', 'Re-entry not available at this time');
       return;
     }
     // IP duplicate check — prevent multi-accounting from same device. R2 (OPS-6):
     // the REAL client address (realClientIp), never the Railway proxy hop.
     const regIp = realClientIp(socket);
-    const sameIpCount = qt.players.filter(p => (p as any).ip === regIp).length;
+    const sameIpCount = qt.players.filter((p) => p.ip === regIp).length;
     if (sameIpCount >= 2) {
-      socket.emit('qualifierRegistrationResult', { success: false, error: 'Too many registrations from this device' });
+      refuseQualifier('too_many_from_device', 'Too many registrations from this device');
+      return;
+    }
+    // R2 (TOURNEY-3 + TOURNEY-9) — a LATE first entry is SEATED at once
+    // (seat-or-refund), so it never takes over a socket that plays a live seat
+    // elsewhere: refused before a credit is consumed.
+    if (isLateReg && socketPlaysLiveSeatElsewhere(socket.id, '')) {
+      refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
       return;
     }
 
@@ -7925,14 +8302,14 @@ io.on('connection', (socket: Socket) => {
       if (!consumeRes.consumed) {
         if (consumeRes.error === 'http_423') {
           // Master refused: player suspended ("86'd") — see the re-entry branch.
-          socket.emit('qualifierRegistrationResult', { success: false, error: PLAYER_SUSPENDED_MESSAGE, code: 'player_suspended' });
+          socket.emit('qualifierRegistrationResult', { success: false, error: PLAYER_SUSPENDED_MESSAGE, code: 'player_suspended', qualifierId: qualId });
           return;
         }
         if (consumeRes.error) console.error('[QualifierEntry] credit consume failed:', consumeRes.error);
-        socket.emit('qualifierRegistrationResult', {
-          success: false,
-          error: consumeRes.error ? 'Server error consuming qualifier credit — please try again.' : 'No qualifier credits available — your credit may have already been used.',
-        });
+        refuseQualifier(
+          consumeRes.error ? 'credit_error' : 'no_credit',
+          consumeRes.error ? 'Server error consuming qualifier credit — please try again.' : 'No qualifier credits available — your credit may have already been used.',
+        );
         return;
       }
       entryCreditId = consumeRes.creditId || null;
@@ -7942,121 +8319,139 @@ io.on('connection', (socket: Socket) => {
       lastQualifierFetch = 0;
     }
 
-    qt.players.push({
-      playerId: auth.username || phone,
+    // R2 — re-read after the consume (it awaited the master): the same account
+    // may have registered meanwhile (another tab), or the event moved on. The
+    // credit just consumed goes back — never a credit without an entry.
+    const dupe = qt.players.find((p) => p.masterPlayerId === masterId);
+    const lateNow = qt.status === 'running' && !!qt.tournamentId && Date.now() <= windows.lateRegUntil;
+    if (qualifierTournaments.get(qualId) !== qt || dupe || (qt.status !== 'registering' && !lateNow)) {
+      if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, dupe ? 'already_registered' : 'registration_closed');
+      if (dupe) refuseQualifier('already_registered', 'You are already registered for this qualifier.', { registered: true });
+      else refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
+      return;
+    }
+
+    // R2 (TOURNEY-3 / AUTH-9 / TOURNEY-10) — the registration is the MASTER
+    // account's; its tournament entrant id is the account's stable one (it was
+    // the LOGIN HANDLE — shown to every player in the results).
+    const registrant: QualifierRegistrant = {
+      playerId: tournamentEntrantPlayerId(auth.userId),
       masterPlayerId: masterId,
+      localUserId: auth.userId,
       playerName: seatNameForSocket(socket, data.playerName),   // R1 contract #3
-      phone: phone,
+      phone: '',
       socketId: socket.id,
       ip: regIp,
-      // Remember the consumed credit so unregister can refund it (NEW-3 fix).
+      // Remember the consumed credit so unregister / a cancellation can refund it (NEW-3 fix).
       consumedCreditId: entryCreditId || undefined,
-    } as any);
+      registeredAt: Date.now(),
+    };
 
-    // Persist to master DB so registrations survive server restarts
-    if (qt.masterQualifierId && masterId) { // masterId declared above (OIDC sub)
-      const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
-      const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
-      fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
-        body: JSON.stringify({ userId: masterId }),
-      }).catch(e => console.warn('[QualifierReg] persist failed:', e?.message));
+    if (qt.status !== 'registering') {
+      // R2 (TOURNEY-3) — a LATE first entry into the RUNNING qualifier: seated
+      // NOW or the credit goes back. It used to be pushed into a field that
+      // had already been dealt — the credit consumed, no seat, ever.
+      const lateState: BuyInExpectation = {
+        userId: auth.userId,
+        answer: () => refuseQualifier('buy_in_cancelled', BUY_IN_CANCELLED_MESSAGE),
+      };
+      if (await buyInSocketGone(socket, 'registerQualifierTournament_late', 'credit_consume', undefined, lateState)) {
+        if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, socket.connected ? 'user_changed' : 'socket_gone');
+        return;
+      }
+      if (socketPlaysLiveSeatElsewhere(socket.id, '')) {
+        if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, 'seated_elsewhere');
+        refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
+        return;
+      }
+      const seat = seatQualifierLateEntrant(socket, qt, registrant);
+      if (!seat) {
+        if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, 'no_seat');
+        refuseQualifier('no_seat', 'No seat is free in this qualifier right now — your qualifier credit was returned.');
+        return;
+      }
+      qt.players.push(registrant);
+      persistQualifierRegistration(qt, masterId);
+      progressionManager.getOrCreateProgress(registrant.playerId, registrant.playerName, auth.userId);
+      qualifierLateEntries.seated++;
+      auditLog(auth.username, 'QUALIFIER_LATE_ENTRY_SEATED', { qualifierId: qualId, tournamentId: qt.tournamentId, tableId: seat.tableId, seatIndex: seat.seatIndex });
+      socket.emit('qualifierRegistrationResult', {
+        success: true, qualifierId: qualId, registered: true, lateEntry: true,
+        tournamentId: qt.tournamentId, tableId: seat.tableId, registeredCount: qt.players.length,
+      });
+      const lateT = qt.tournamentId ? tournamentManager.getTournament(qt.tournamentId) : undefined;
+      socket.emit('qualifierTournamentStarted', {
+        qualifierId: qualId, tournamentId: qt.tournamentId, tableId: seat.tableId,
+        tableCount: lateT?.tableIds.length ?? 1, playerCount: qt.players.length, lateEntry: true,
+      });
+      broadcastGameState(seat.tableId);
+      broadcastQualifierUpdate(qualId, qt);
+      return;
     }
+
+    qt.players.push(registrant);
+    // Persist to master DB (the master's registration row for this event).
+    persistQualifierRegistration(qt, masterId);
+    // TOURNEY-10 — his progression entry exists before his first qualifier hand.
+    progressionManager.getOrCreateProgress(registrant.playerId, registrant.playerName, auth.userId);
 
     socket.emit('qualifierRegistrationResult', {
       success: true,
       qualifierId: qualId,
+      registered: true,
       registeredCount: qt.players.length,
     });
 
-    // Broadcast updated count to all clients
-    io.emit('qualifierTournamentUpdate', {
-      qualifierId: qualId,
-      status: qt.status,
-      registeredCount: qt.players.length,
-      players: qt.players.map(p => ({ name: p.playerName })),
-    });
+    // Broadcast the updated count to all clients (a NUMBER — C3; never names).
+    broadcastQualifierUpdate(qualId, qt);
   });
 
-  // Unregister from a qualifier tournament
+  // Unregister from a qualifier tournament.
+  // R2 (TOURNEY-3 / AUTH-9) — by the MASTER account (it matched the login
+  // handle, which setDisplayName could change — one player unregistered
+  // another), answered every time, and through releaseQualifierRegistration:
+  // the consumed credit refunded, the master's registration row dropped.
   socket.on('unregisterQualifierTournament', async (data: { qualifierId: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth) return;
-
-    const qt = qualifierTournaments.get(data.qualifierId);
-    if (!qt || qt.status !== 'registering') return;
-
-    const removedPlayer = qt.players.find(p => p.playerId === auth.username);
-    qt.players = qt.players.filter(p => p.playerId !== auth.username);
-
-    // Refund the qualifier credit that registration consumed (NEW-3 fix,
-    // 2026-07-01). Previously register→unregister permanently burned the
-    // credit, leaving the player unqualified with nothing to show for it.
-    if (removedPlayer?.consumedCreditId) {
-      const cid = removedPlayer.consumedCreditId;
-      refundQualifierCreditOnMaster(cid)
-        .then(refunded => auditLog(
-          auth.username,
-          refunded ? 'QUALIFIER_UNREG_CREDIT_REFUND' : 'QUALIFIER_UNREG_CREDIT_REFUND_FAILED',
-          { qualifierId: data.qualifierId, creditId: cid }
-        ))
-        .catch(() => { /* audited above on the false branch */ });
+    const masterId = auth.masterUserId ? String(auth.masterUserId) : '';
+    const found = qualifierEventFor(data?.qualifierId);
+    if (!found) {
+      socket.emit('qualifierRegistrationResult', { success: false, code: 'qualifier_not_found', error: 'This qualifier is not on the schedule right now.', qualifierId: data?.qualifierId });
+      return;
     }
-
-    // Persist unregistration to master DB
-    if (qt.masterQualifierId && removedPlayer?.masterPlayerId) {
-      const _tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
-      const _base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
-      fetch(`${_base}/qualifiers/${qt.masterQualifierId}/register/internal`, {
-        method: 'DELETE',
-        headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
-        body: JSON.stringify({ userId: removedPlayer.masterPlayerId }),
-      }).catch(e => console.warn('[QualifierUnreg] persist failed:', e?.message));
+    const [qualId, qt] = found;
+    const removedPlayer = masterId ? qt.players.find((p) => p.masterPlayerId === masterId) : undefined;
+    if (!removedPlayer) {
+      // Not registered (any more): the answer a client needs is "not registered".
+      socket.emit('qualifierRegistrationResult', { success: true, qualifierId: qualId, registeredCount: qt.players.length, unregistered: true, registered: false });
+      return;
     }
+    if (qt.status !== 'registering') {
+      socket.emit('qualifierRegistrationResult', { success: false, code: 'registration_closed', error: 'This qualifier has already started.', qualifierId: qualId, registered: true });
+      return;
+    }
+    qt.players = qt.players.filter((p) => p !== removedPlayer);
+    void releaseQualifierRegistration(qualId, qt, removedPlayer, 'unregistered');
 
     socket.emit('qualifierRegistrationResult', {
       success: true,
-      qualifierId: data.qualifierId,
+      qualifierId: qualId,
       registeredCount: qt.players.length,
       unregistered: true,
+      registered: false,
     });
-
-    io.emit('qualifierTournamentUpdate', {
-      qualifierId: data.qualifierId,
-      status: qt.status,
-      registeredCount: qt.players.length,
-      players: qt.players.map(p => ({ name: p.playerName })),
-    });
+    broadcastQualifierUpdate(qualId, qt);
   });
 
-  // Get qualifier tournament registrations
+  // Get qualifier tournament registrations.
+  // R2 (C3) — ONLY the events the master schedule lists, in the C3 shape, with
+  // `registered` for the ASKING account (the lobby recognises its own
+  // registration after a reload) — never other players' names.
   socket.on('getQualifierTournaments', async () => {
-    const SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000;
-    const SIGNUP_CLOSES_AFTER_MS = 1.5 * 60 * 60 * 1000;
-    const now = Date.now();
-    const list: any[] = [];
-    for (const [id, qt] of qualifierTournaments) {
-      const scheduledTime = new Date(qt.scheduledAt).getTime();
-      const signupOpensAt = new Date(scheduledTime - SIGNUP_OPENS_BEFORE_MS).toISOString();
-      const signupClosesAt = new Date(scheduledTime + SIGNUP_CLOSES_AFTER_MS).toISOString();
-      const signupOpen = now >= (scheduledTime - SIGNUP_OPENS_BEFORE_MS) && now <= (scheduledTime + SIGNUP_CLOSES_AFTER_MS);
-      list.push({
-        qualifierId: id,
-        qualifierType: qt.qualifierType,
-        qualifierName: qt.qualifierName,
-        scheduledAt: qt.scheduledAt,
-        signupOpensAt,
-        signupClosesAt,
-        signupOpen,
-        registeredCount: qt.players.length,
-        maxPlayers: qt.maxPlayers,
-        status: qt.status,
-        tournamentId: qt.tournamentId,
-        players: qt.players.map(p => ({ name: p.playerName })),
-      });
-    }
-    socket.emit('qualifierTournamentList', list);
+    const auth = authSessions.get(socket.id);
+    const viewerMasterId = auth ? (String(auth.masterUserId || auth.statsMasterUserId || '') || null) : null;
+    socket.emit('qualifierTournamentList', qualifierList(viewerMasterId));
   });
 
   // ========== Tournament Spectator Mode ==========
@@ -8473,7 +8868,9 @@ Give feedback in this JSON format:
   });
 
   socket.on('getStakes', async () => {
-    socket.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
+    // R1 — display names, no other account's ids; R2 (C4) — `isMine` for THIS socket's account.
+    const rawOffers = Array.from(stakingOffers.values());
+    socket.emit('stakingUpdated', { offers: stakingOffersForViewer(rawOffers, await publicStakingOffers(rawOffers), authSessions.get(socket.id)?.userId) });
   });
 
   // OAuth2 login: validate access token from auth server.
@@ -17450,9 +17847,26 @@ function finishedEntrantIsAccount(e: FinishedTournamentEntrant, auth: SocketAuth
  */
 function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: string[], data: any): void {
   const rooms = [...new Set(roomTableIds.filter(Boolean).map((tid) => `table:${tid}`))];
-  for (const room of rooms) io.to(room).emit('tournamentFinished', data);
-  tournamentFinishedNotices.roomBroadcasts += rooms.length;
   const id = data?.tournamentId || tournamentId;
+  // R2 (C3 / TOURNEY-13) — a QUALIFIER pays seats, not chips: its room frame
+  // is the same `data` plus, PER SOCKET, that socket's own result —
+  // `myResult {place, wonSeat} | null` (and `place` / `wonSeat`), with
+  // `isQualifier`, `qualifierId`, `seatsForTop` — so the Game Over screen says
+  // "you finished 3rd — you won a seat" instead of "<winner> wins 0 chips".
+  // Each socket in the rooms gets ONE frame. Every other tournament: the
+  // rooms' broadcast exactly as before.
+  const q = qualifierOfTournament(id);
+  if (!q) {
+    for (const room of rooms) io.to(room).emit('tournamentFinished', data);
+  } else {
+    const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop: seatsForTopOf(q.qt.qualifierType) };
+    for (const [sid, sock] of io.sockets.sockets) {
+      if (!sock || !rooms.some((r) => sock.rooms?.has(r))) continue;
+      const mine = qualifierResultOf(q.qt, authSessions.get(sid));
+      sock.emit('tournamentFinished', { ...data, ...common, myResult: mine, ...(mine ? { place: mine.place, wonSeat: mine.wonSeat } : {}) });
+    }
+  }
+  tournamentFinishedNotices.roomBroadcasts += rooms.length;
   const rec = noteFinishedTournament(id, data);
   const tournamentName = tournamentManager.getTournament(id)?.config.name || 'Tournament';
   let told = 0;
@@ -17462,8 +17876,11 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
     const sock = io.sockets.sockets.get(sid);
     if (!sock || !sock.connected) continue;
     if (rooms.some((r) => sock.rooms?.has(r))) continue;   // the room's frame reached it
+    const qMine = q ? qualifierResultOf(q.qt, a) : null;
     sock.emit('tournamentFinishedForEntrant', {
       tournamentId: id, position: e.position, ...(e.prize ? { prize: e.prize } : {}), tournamentName,
+      // R2 (C3) — a qualifier entrant: his own seat result too.
+      ...(q ? { isQualifier: true, qualifierId: q.qualId, myResult: qMine, wonSeat: !!qMine?.wonSeat } : {}),
     });
     told++;
   }
@@ -18478,7 +18895,11 @@ function startQualifierTournament(
     prizePool: 0,
     maxPlayers: players.length,
     startInterval: 0,
-    blindLevels: DEFAULT_BLIND_LEVELS,
+    // R2 (TOURNEY-13 / C3) — the structure the lobby is shown (qualifierStructure):
+    // the advertised 20-minute levels scaled to the real stack, continued until
+    // it must end. It ran 10/20 blinds on a 50,000 stack — a qualifier that never ended.
+    blindLevels: qualifierBlindLevels(startingStack),
+    startingChips: startingStack,
   });
 
   const tournament = tournamentManager.getTournament(tournamentId);
@@ -18634,6 +19055,8 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): vo
     if (event === 'tournamentFinished') {
       void payTournamentPrizes(data).catch(() => {}); // funded prize payouts + staking settlement (mint-free, idempotent)
       postQualifierResults(data?.tournamentId || tournamentId, data); // auto-award qualifier prizes
+      // R2 (C3) — the qualifier is FINISHED, its standings kept and told (place + wonSeat per registrant).
+      markQualifierFinished(data?.tournamentId || tournamentId, data);
       // P-h (round 5) — every table room as before, AND every entrant's other
       // live sockets (an away entrant in the lobby / at cash / on another tab).
       emitTournamentFinishedToEntrants(tournamentId, tournamentManager.getTournament(tournamentId)?.tableIds || [], data);
@@ -18822,6 +19245,8 @@ function startMultiTableTournament(
 // monthly credits). Fire-and-forget; safe to call for non-qualifier tournaments
 // (the master API matches by tournamentId against qualifierTournaments Map).
 const postedQualifierResults = new Set<string>();
+/** R2 (TOURNEY-3) — the results POST to the master (it awards the championship seats): posted / retried / failed for good. */
+const qualifierResultPosts = { posted: 0, retried: 0, failed: 0 };
 function postQualifierResults(tournamentId: string, data: { results?: Array<{ playerId: string; playerName: string; position: number; payout: number; userId?: number; disqualified?: boolean }> }): void {
   if (!tournamentId || postedQualifierResults.has(tournamentId)) return;
   // Find the qualifier that owns this tournament
@@ -18856,11 +19281,32 @@ function postQualifierResults(tournamentId: string, data: { results?: Array<{ pl
     })
     .filter(r => r.playerId); // only players we can map to master DB
   if (mappedResults.length === 0) return;
-  fetch(`${_base}/qualifiers/${masterQualifierId}/results/internal`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
-    body: JSON.stringify({ results: mappedResults }),
-  }).catch(e => console.warn('[QualifierResults] post failed:', e?.message));
+  // R2 (TOURNEY-3) — this POST is what awards the championship seats: a
+  // failure (or a non-2xx answer) is RETRIED with backoff (the master upserts
+  // results, so a retry is safe) and audited when it finally fails — it used
+  // to be fired once with the error only logged.
+  const url = `${_base}/qualifiers/${masterQualifierId}/results/internal`;
+  const post = (attempt: number): void => {
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Token': _tok },
+      body: JSON.stringify({ results: mappedResults }),
+    }).then((res: any) => {
+      if (res && res.ok === false) throw new Error(`http_${res.status}`);
+      qualifierResultPosts.posted++;
+    }).catch((e: any) => {
+      if (attempt < 4) {
+        qualifierResultPosts.retried++;
+        const t = setTimeout(() => post(attempt + 1), 5000 * 2 ** attempt);
+        (t as any)?.unref?.();
+        return;
+      }
+      qualifierResultPosts.failed++;
+      console.error('[QualifierResults] post failed for good:', e?.message);
+      auditLog('SYSTEM', 'QUALIFIER_RESULTS_POST_FAILED', { tournamentId, masterQualifierId, results: mappedResults.length, error: String(e?.message || e) });
+    });
+  };
+  post(0);
 }
 
 // results that carry a userId (paying humans). Idempotent per tournamentId so
@@ -18918,7 +19364,7 @@ const STAKE_GUARD_REFUND = `UPDATE staking_offers SET refunded_at = NOW() WHERE 
 const STAKE_GUARD_PAID = `UPDATE staking_offers SET paid_out_at = NOW(), settled_at = COALESCE(settled_at, NOW()) WHERE id = ANY($1::uuid[]) AND paid_out_at IS NULL AND refunded_at IS NULL RETURNING id`;
 
 /** Tell a backer (every live socket of his) about a payout / refund — after the commit. */
-function tellStakingCredit(userId: number, event: 'stakingPayout' | 'stakingRefund', payload: Record<string, unknown>): void {
+function tellStakingCredit(userId: number, event: 'stakingPayout' | 'stakeRefunded', payload: Record<string, unknown>): void {
   for (const [sid, a] of authSessions) {
     if (a.userId !== userId) continue;
     io.sockets.sockets.get(sid)?.emit(event, payload);
@@ -18944,7 +19390,7 @@ async function refundEscrowOffers(offers: EscrowOffer[], reason: string, tournam
     stakingStats.refundedOffers++;
     for (const c of r.paid) {
       auditLog(String(c.userId), 'STAKING_REFUND', { offerId: offer.id, tournamentId, amount: c.amount, reason });
-      tellStakingCredit(c.userId, 'stakingRefund', { offerId: offer.id, tournamentId, amount: c.amount, reason });
+      tellStakingCredit(c.userId, 'stakeRefunded', { offerId: offer.id, tournamentId, amount: c.amount, reason });
     }
   }
   if (refunded > 0) broadcastStakingOffers();
@@ -18962,10 +19408,19 @@ async function refundStakesOf(tournamentId: string, reason: string, sellerId?: n
   }
 }
 
-/** The marketplace as other players see it (public names, no ids). */
+/**
+ * The marketplace to every socket: public names, no other account's ids —
+ * R2 (C4): per socket, with ITS `isMine` flags (stakingOffersForViewer).
+ */
 function broadcastStakingOffers(): void {
-  publicStakingOffers(Array.from(stakingOffers.values()))
-    .then((offers) => io.emit('stakingUpdated', { offers }))
+  const raw = Array.from(stakingOffers.values());
+  publicStakingOffers(raw)
+    .then((pub) => {
+      for (const [sid, sock] of io.sockets.sockets) {
+        if (!sock || !sock.connected) continue;
+        sock.emit('stakingUpdated', { offers: stakingOffersForViewer(raw, pub, authSessions.get(sid)?.userId) });
+      }
+    })
     .catch(() => { /* a failed name lookup only delays the next refresh */ });
 }
 
@@ -19120,7 +19575,7 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
         if (c.kind === 'STAKING_PAYOUT' && (c.details as any)?.offerId) {
           tellStakingCredit(c.userId, 'stakingPayout', { amount: c.amount, sellerName: nameOf(Number((c.details as any).sellerId)), tournamentId: tid });
         } else if (c.kind === 'STAKING_REFUND') {
-          tellStakingCredit(c.userId, 'stakingRefund', { amount: c.amount, tournamentId: tid, reason: 'not_in_the_money' });
+          tellStakingCredit(c.userId, 'stakeRefunded', { offerId: (c.details as any)?.offerId ?? null, tournamentId: tid, amount: c.amount, reason: 'not_in_the_money' });
         }
       }
       for (const c of res.noUser) auditLog(String(c.userId), 'TOURNAMENT_PRIZE_NO_USER_ROW', { ...c.details, amount: c.amount });

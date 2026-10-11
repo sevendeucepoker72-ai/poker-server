@@ -204,6 +204,8 @@ const START = SRC.slice(
   SRC.indexOf('\n/**\n * Refund the registrants TournamentManager.cancelTournament returned'),
 );
 const BINDINGS = slice('const registrantBindings = {', 'return bound;\n}\n');
+// R2 (C4): the per-socket marketplace view (isMine / own sellerUserId).
+const VIEWER = fnSrc('function stakingOffersForViewer(');
 const H = {
   registerTournament: handlerSrc('registerTournament', '\n  });\n'),
   getTournaments: handlerSrc('getTournaments', '\n  });\n'),
@@ -253,7 +255,7 @@ function world(opts: { wallets?: Record<number, number> } = {}) {
     normalizeBackers, planEscrowRefund, planCashedSettlement, validateStakeOffer,
     console: { log() {}, warn() {}, error() {} },
   };
-  const code = `${BINDINGS}\n${REG}\n${REFUND_CANCELLED}\n${PRIZES}\n${START}\nfunction wire(socket) {\n  ${Object.values(H).join('\n  ')}\n}`;
+  const code = `${BINDINGS}\n${VIEWER}\n${REG}\n${REFUND_CANCELLED}\n${PRIZES}\n${START}\nfunction wire(socket) {\n  ${Object.values(H).join('\n  ')}\n}`;
   const { exports: m } = load(code, scope, `{ wire, broadcastTournamentList, tournamentViewerOf, refundCancelledTournamentEntrants, payTournamentPrizes,
     stakingOffers, sweepStakingOffers, bootSweepUnsettledStakes, refundStakesOf, startTournamentGame, tournamentStartsKeptAbsent, stakingStats }`);
   const emitted: Array<[string, string, any]> = [];
@@ -450,7 +452,18 @@ describe('C4 — staking: a registered tournament, escrow, settlement or refund 
       expect(w.db.wallets.get(BOB)).toBe(100_000);                 // escrow back
       expect(w.db.wallets.get(ALICE)).toBe(100_000 - 1000);
       expect(w.db.offers.get(offerId)).toMatchObject({ refunded_at: expect.any(String), paid_out_at: null });
+      // C4 (K3) — the backer is TOLD: stakeRefunded {offerId, tournamentId, amount, reason}.
+      expect(w.of('SB', 'stakeRefunded')).toEqual([{ offerId, tournamentId: tid, amount: 300, reason: 'not_in_the_money' }]);
     } finally { jest.useRealTimers(); }
+  });
+
+  it('the marketplace goes to EVERY socket with ITS isMine (by account) — the seller id only on his own offer', async () => {
+    const { w, tid, a } = await setup();
+    await a.handlers.createStake({ tournamentId: tid, percent: 10, pricePerPercent: 100 });
+    await flush();
+    const last = (sid: string) => { const l = w.of(sid, 'stakingUpdated'); return l[l.length - 1].offers; };
+    expect(last('SA')).toEqual([expect.objectContaining({ tournamentId: tid, isMine: true, sellerUserId: ALICE })]);
+    expect(last('SB')).toEqual([expect.objectContaining({ tournamentId: tid, isMine: false, sellerUserId: null })]);
   });
 
   it('the seller UNREGISTERS → his backers refunded once; a buy after the start is refused', async () => {
@@ -462,6 +475,7 @@ describe('C4 — staking: a registered tournament, escrow, settlement or refund 
     await flush(); await flush();
     expect(w.db.wallets.get(BOB)).toBe(100_000);
     expect(w.db.offers.get(offerId)!.refunded_at).toEqual(expect.any(String));
+    expect(w.of('SB', 'stakeRefunded')).toEqual([{ offerId, tournamentId: tid, amount: 500, reason: 'seller_unregistered' }]);
     await b.handlers.buyStake({ offerId, pct: 5 });
     expect(w.of('SB', 'buyStakeResult')[1]).toEqual({ success: false, error: 'Offer unavailable', offerId });
   });

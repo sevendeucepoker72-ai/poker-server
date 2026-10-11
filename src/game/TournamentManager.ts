@@ -917,7 +917,8 @@ export class TournamentManager {
         // nothing; his position's share stays unpaid (no redistribution, no mint).
         payout: p.disqualified ? 0 : base,
         userId: p.userId,
-        ...(p.masterUserId ? { masterUserId: p.masterUserId } : {}),
+        // (No master id here: these results go to every socket in the table
+        // rooms — index.ts finds a master id on the entrant record.)
         ...(p.entryId ? { entryId: p.entryId } : {}),
         ...(tied ? { tied: true } : {}),
         ...(p.disqualified ? { disqualified: true } : {}),

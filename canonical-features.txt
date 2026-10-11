@@ -947,3 +947,32 @@ bootSweepUnsettledStakes().catch(
 keepStartSeatAbsentForLiveSeatElsewhere(tournamentId, tp, boundSid, tableId, i, result.startingChips)
 event: 'start_seat_kept_absent_live_seat_elsewhere'
 startRegisteredTournamentTables(tournamentId, result.startingChips, result.blinds);
+#
+# 2026-10-11 (R2, S1) — C3 qualifiers (TOURNEY-2 / TOURNEY-3 / TOURNEY-13 /
+# AUTH-9 / APPUI-44): the registry is the master schedule (data.schedule), one
+# entry per master qualifier id, never an invented event; registrations keyed on
+# the master account; a late entry is seated at once or its credit refunded; a
+# qualifier seat never takes over a live seat elsewhere (TOURNEY-9); a qualifier
+# with too few players is cancelled and refunded; results carry each socket's
+# own place + wonSeat (myResult); the results POST is retried.
+QUALIFIER_SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000
+code: 'qualifier_not_found'
+refuseQualifier('signup_not_open'
+refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
+const existingEntry = qt.players.find((p) => !!p.masterPlayerId && p.masterPlayerId === masterId);
+'QUALIFIER_LATE_ENTRY_SEATED'
+event: 'qualifier_late_entry_seated'
+void cancelQualifierEvent(qualId, qt, 'too_few_players');
+setInterval(() => tickQualifierAutoStart(), 30000);
+registeredCount: qt.players.length, players: qt.players.length, tournamentId: qt.tournamentId,
+qualifierId: qualId, myResult: mine ? { place: mine.place, wonSeat: mine.wonSeat } : null,
+const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop:
+'QUALIFIER_RESULTS_POST_FAILED'
+r2Play: {
+#
+# 2026-10-11 (R2, S1) — C4 as K3 reads it: the marketplace per socket with its
+# own isMine (and the seller id on his own offers only); every refunded backer
+# is told stakeRefunded {offerId, tournamentId, amount, reason}.
+return { ...o, isMine: mine, sellerUserId: mine ? viewerUserId : null };
+sock.emit('stakingUpdated', { offers: stakingOffersForViewer(raw, pub, authSessions.get(sid)?.userId) });
+tellStakingCredit(c.userId, 'stakeRefunded', { offerId: offer.id, tournamentId, amount: c.amount, reason });
