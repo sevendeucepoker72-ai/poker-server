@@ -11,6 +11,7 @@
  */
 import {
   withEconomyTx, purchaseCosmetic, purchaseBattlePassPremium, settleDailyLogin, settleAchievementReward, creditOnceWithRetry, settleMissionClaim,
+  settleScratchCard,
   type TxPool,
 } from '../src/economy/economyDb';
 
@@ -145,6 +146,21 @@ describe('claims: ledger row THEN credit, one transaction', () => {
     });
     expect(await settleMissionClaim(7, '2026-10-11', 'win_3', { chips: 1000, stars: 0 }, {}, pool)).toMatchObject({ ok: true, chips: 1000 });
     expect(log.map(kind)).toEqual(['BEGIN', 'lock', 'ledger', 'credit', 'COMMIT']);
+  });
+
+  it('a scratch card that rolls a FREE wheel emote (fire) pays the duplicate stars — nothing is inserted into the inventory', async () => {
+    const { log, pool } = scripted((h) => {
+      if (h.startsWith('SELECT id, chips, stars')) return { rows: [userRow({ scratch_cards_available: 1 })] };
+      if (h.startsWith('UPDATE users SET scratch_cards_available')) return { rows: [{ scratch_cards_available: 0 }], rowCount: 1 };
+      if (h.startsWith('UPDATE users SET chips = chips +')) return { rows: [{ chips: 1000, stars: 2025, scratch_cards_available: 0 }] };
+      return {};
+    });
+    // rng: 0.25 -> the emote branch; 0.6 -> index 2 of [nice_hand, good_game, fire, crown] = fire
+    const seq = [0.25, 0.6];
+    const r: any = await settleScratchCard(7, { rng: () => seq.shift() ?? 0 }, pool);
+    expect(r).toMatchObject({ ok: true, stars: 25, reward: { kind: 'stars', amount: 25, reason: 'duplicate_refund', itemType: 'emote', itemId: 'fire' } });
+    expect(log.map(kind)).not.toContain('grant');
+    expect(log.map(kind)).toEqual(['BEGIN', 'lock', 'UPDATE', 'credit', 'COMMIT']);
   });
 
   it('withEconomyTx: an error rolls back and is re-thrown', async () => {

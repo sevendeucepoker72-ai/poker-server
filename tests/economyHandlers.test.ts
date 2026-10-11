@@ -223,6 +223,10 @@ describe('C7 / ECON-6 — the shop and equips only ever touch real catalog items
       expect(t.last('purchaseResult')).toMatchObject({ success: false, code: 'unknown_item' });
     }
     for (const f of ['purchaseCosmetic', 'purchaseBundle', 'purchaseChipPack', 'purchaseMysteryBox', 'purchaseBooster', 'purchaseVipPass']) expect(w.fakes[f]).not.toHaveBeenCalled();
+    // A free wheel emote the shop also lists: refused already_owned, nothing settled (never a charge for nothing).
+    await t.call('purchaseShopItem', { itemType: 'emote', itemId: 'fire' });
+    expect(t.last('purchaseResult')).toMatchObject({ success: false, code: 'already_owned', itemType: 'emote', itemId: 'fire' });
+    expect(w.fakes.purchaseCosmetic).not.toHaveBeenCalled();
     await t.call('purchaseShopItem', { itemType: 'mystery_box', itemId: 'premium' });
     expect(t.last('purchaseResult')).toMatchObject({ success: true, mysteryReward: { kind: 'item', itemType: 'frame', itemId: 'silver' } });
     await t.call('purchaseShopItem', { itemType: 'booster', itemId: 'chip_1p5x_1h' });

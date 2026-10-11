@@ -9,7 +9,7 @@ import {
   SHOP_PRICES, BUNDLE_CONTENTS, CAREER_REWARDS, MYSTERY_BOX_TIERS, SCRATCH_EMOTE_POOL, SEASON_REWARDS, SEASON_BADGES,
   VIP_EMOTES, FREE_EMOTES, EQUIPPABLE_TYPES, BOOSTER_DURATION, VIP_PASS_DURATION, SPIN_WHEEL_SEGMENTS,
   LOGIN_CHIPS_BY_DAY, LOGIN_STARS_BY_DAY, CHIP_GRANT_ALERT_THRESHOLD,
-  isOwnableItem, shopPrice, isFreeItem, normalizeItemType, rollMysteryBox, rollSpinWheel, rollScratchCard, loginCycleDay,
+  isOwnableItem, shopPrice, isFreeItem, isFreeForEveryone, normalizeItemType, rollMysteryBox, rollSpinWheel, rollScratchCard, loginCycleDay,
   vipTierForSeasonXp, catalogForClient,
 } from '../src/economy/catalog';
 import {
@@ -192,5 +192,19 @@ describe('progress stats merge (ECON-10): never last-writer-wins', () => {
     expect(isProgressRuleKey('handsPlayed')).toBe(true);
     expect(isProgressRuleKey('clientData')).toBe(false);
     expect(isProgressRuleKey('masterUserId')).toBe(false);
+  });
+});
+
+describe('free wheel emotes the shop also lists (fire, dead) are never sold or won', () => {
+  it('isFreeForEveryone: the free wheel emotes and price-0 items; a priced shop-only emote is not', () => {
+    const overlap = Object.keys(SHOP_PRICES.emote).filter((id) => FREE_EMOTES.includes(id));
+    expect(overlap.sort()).toEqual(['dead', 'fire']);           // the owner call: rename or drop these two
+    for (const id of overlap) expect(isFreeForEveryone('emote', id)).toBe(true);
+    expect(isFreeForEveryone('emote', 'nice_hand')).toBe(false);
+    expect(isFreeForEveryone('card_back', 'classic_red')).toBe(true);   // price 0
+    expect(isFreeForEveryone('card_back', 'mythic')).toBe(false);
+    // The scratch pool and the basic box still roll `fire` — settled as a duplicate (stars), see economySettlements.
+    expect(SCRATCH_EMOTE_POOL).toContain('fire');
+    expect(MYSTERY_BOX_TIERS.basic.itemPool).toContainEqual(['emote', 'fire']);
   });
 });

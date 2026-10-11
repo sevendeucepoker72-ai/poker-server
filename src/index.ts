@@ -11347,6 +11347,8 @@ Give feedback in this JSON format:
       const itemId = String(data?.itemId ?? '');
       const cost = shopPrice(itemType, itemId);
       if (cost === null) { reply({ success: false, error: economyMessage('unknown_item'), code: 'unknown_item', itemType, itemId }); return; }
+      // A free wheel emote the shop also lists (`fire`, `dead`): everyone already has it — never charged.
+      if (itemType === 'emote' && FREE_EMOTES.includes(itemId)) { reply({ success: false, error: economyMessage('already_owned'), code: 'already_owned', itemType, itemId }); return; }
 
       let res: Settled<any>;
       let extra: Record<string, unknown> = {};

@@ -260,6 +260,17 @@ export function isFreeItem(type: unknown, id: unknown): boolean {
   return isOwnableItem(type, id) && shopPrice(normalizeItemType(type), id) === 0;
 }
 
+/**
+ * An item EVERY account can already use: a free (price 0) catalog item, or one
+ * of the emote wheel's free emotes (FREE_EMOTES). The shop also lists `fire` /
+ * `dead` at a price (an owner call to rename or drop) — buying one is refused
+ * `already_owned` (never a charge for nothing), and a scratch / mystery-box
+ * roll that lands on one pays the duplicate stars instead.
+ */
+export function isFreeForEveryone(type: unknown, id: unknown): boolean {
+  return isFreeItem(type, id) || (normalizeItemType(type) === 'emote' && FREE_EMOTES.includes(String(id ?? '')));
+}
+
 export const itemKey = (type: string, id: string): string => `${normalizeItemType(type)}:${id}`;
 
 // ───────────────────────────── Random rewards ─────────────────────────────

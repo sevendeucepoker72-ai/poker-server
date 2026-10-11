@@ -30,7 +30,7 @@ import { PUBLIC_ID_SQL } from './schema';
 import {
   BUNDLE_CONTENTS, CHIP_PACK_PAYOUT, LOGIN_CHIPS_BY_DAY, LOGIN_DAY7_MYSTERY_BOX, LOGIN_STARS_BY_DAY,
   MYSTERY_BOX_TIERS, MYSTERY_DUPLICATE_REFUND_SHARE, SCRATCH_DUPLICATE_STARS, SEASON_REWARDS, SHOP_PRICES,
-  VIP_LOGIN_MULTIPLIER, loginCycleDay, normalizeItemType, rollMysteryBox, rollScratchCard, rollSpinWheel,
+  VIP_LOGIN_MULTIPLIER, isFreeForEveryone, loginCycleDay, normalizeItemType, rollMysteryBox, rollScratchCard, rollSpinWheel,
   type ItemType, type RewardRoll, type Rng,
 } from './catalog';
 import { monthDateRange } from './denverTime';
@@ -190,7 +190,8 @@ async function applyRoll(
 ): Promise<{ chips: number; stars: number; result: MysteryResult }> {
   if (roll.kind === 'chips') return { chips: roll.amount, stars: 0, result: { kind: 'chips', amount: roll.amount } };
   if (roll.kind === 'stars') return { chips: 0, stars: roll.amount, result: { kind: 'stars', amount: roll.amount } };
-  const fresh = await grantItemTx(tx, userId, roll.itemType, roll.itemId);
+  // An item everyone can already use (a free wheel emote) is never 'won': it pays the duplicate stars.
+  const fresh = !isFreeForEveryone(roll.itemType, roll.itemId) && await grantItemTx(tx, userId, roll.itemType, roll.itemId);
   if (fresh) return { chips: 0, stars: 0, result: { kind: 'item', itemType: roll.itemType, itemId: roll.itemId } };
   return {
     chips: 0, stars: dupStars,

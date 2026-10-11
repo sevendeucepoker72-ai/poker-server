@@ -897,3 +897,5 @@ progressRecords: progressionManager.size
 [economy] users.chips is BIGINT now (trigger re-created)
 # K3 contract: the closed social-bracket panel leaves that bracket's room.
 leaveSocialBracket
+# R2 (S3): a free wheel emote the shop also lists (fire, dead) is never charged for, nor won from a roll.
+function isFreeForEveryone(
