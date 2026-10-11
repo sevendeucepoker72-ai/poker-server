@@ -896,3 +896,5 @@ spinWheelConfig
 recordClubHand(tableId, clubHandEntries)
 progressRecords: progressionManager.size
 [economy] users.chips is BIGINT now (trigger re-created)
+# K3 contract: the closed social-bracket panel leaves that bracket's room.
+leaveSocialBracket

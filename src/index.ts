@@ -3181,7 +3181,7 @@ function getGameStateForPlayer(
 
     // C7 / C8 — ALWAYS present (all null / false for an empty, AI or
     // account-less seat) so a delta clears a look that went away.
-    const seatUid = seat.state === 'occupied' && !seat.isAI ? seatAccounts?.get(seat.seatIndex) : undefined;
+    const seatUid = seat.state !== 'empty' && !seat.isAI ? seatAccounts?.get(seat.seatIndex) : undefined;   // a sitting-out seat keeps its look
     const cos = seatUid !== undefined ? progressionManager.seatCosmetics(seatUid) : null;
     seatData.cosmetics = {
       frame: cos?.frame ?? null, title: cos?.title ?? null, cardBack: cos?.cardBack ?? null,
@@ -5328,14 +5328,23 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     broadcastGameState(tableId);
   }
 
-  // Decrement sit-out hand counter for reserved (disconnected) seats on this table
-  tickReservedSeatHands(tableId);
+  // 2026-10-11 (R2, GAME-11 / ECON-13) — the seats DEALT INTO this hand (they
+  // still hold its cards — read before the first await, a new hand deals 1.5s
+  // later). Only they played it: hands played, XP, wins / losses, position and
+  // ELO results, missions and the scratch-card tick are theirs alone. A seat
+  // sitting out, AFK or seated mid-hand used to be credited every hand (~16-22
+  // scratch cards per idle hour at the 24/7 bot tables, and every sat-out hand
+  // was an ELO loss).
+  const dealtInSeats = new Set<number>();
+  for (const s of table.seats) if (s.state === 'occupied' && s.holeCards.length > 0) dealtInSeats.add(s.seatIndex);
 
-  // Collect all human players at the table
+  // Collect the human players dealt into this hand
   const humanSessions: PlayerSession[] = [];
-  for (const [_socketId, session] of playerSessions) {
-    if (session.tableId === tableId) {
+  const dealtInSockets = new Set<string>();
+  for (const [socketId, session] of playerSessions) {
+    if (session.tableId === tableId && dealtInSeats.has(session.seatIndex)) {
       humanSessions.push(session);
+      dealtInSockets.add(socketId);
     }
   }
 
@@ -5356,24 +5365,25 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // this hand's records, never a seat that changed hands or forfeited).
   settleInsuranceForHand(tableId, table, totalWonPerSeat);
 
+  // Decrement sit-out hand counter for reserved (disconnected) seats on this
+  // table. Addendum (R2): AFTER the insurance settlement — a reserved seat at
+  // its hand limit is cashed out and stood up here, and it used to be cashed
+  // out with its PRE-settlement stack (the insured cashout then voided as
+  // "seat changed").
+  tickReservedSeatHands(tableId);
+
   // S1 (2026-10-10) — capture this hand's tournament bust check NOW, before
   // the first await below: until it runs, this table does not deal again
   // (tournamentDealWaitsForBustCheck), and what it needs (pot winners, pre-hand
   // stacks, the 0-chip seats) is read before anything can change the table.
   const tournamentBustCheck = captureTournamentBustCheck(tableId, table, results);
 
-  // 2026-10-11 (R2, ECON-13 / C6) — progress, XP, missions, achievements,
-  // scratch cards and chips won are credited ONLY to a seat that was DEALT
-  // INTO this hand (it held cards and was seated when the hand started): a
-  // sitting-out / AFK seat or a mid-hand joiner at a 24/7 bot table used to earn
-  // hands, XP and ~16-22 scratch cards an idle hour. Read now, before any await.
+  // 2026-10-11 (R2, C6 / C9 / C10) — this hand's ref (the per-hand HUD and
+  // mission flags are keyed by table + hand: an account can be in two hands
+  // at once) and its chips-won bucket. humanSessions holds ONLY the seats
+  // dealt into the hand (the GAME-11 / ECON-13 gate above): progress, XP,
+  // missions, achievements, chips won and the scratch tick are theirs alone.
   const handRef = { tableId, handNumber: table.handNumber };
-  const dealtIn = new Set<number>();
-  for (const session of humanSessions) {
-    const s = table.seats[session.seatIndex];
-    if (s && s.state === 'occupied' && !s.isAI && s.playerId === session.playerId
-      && s.holeCards.length > 0 && table.startChips.has(session.seatIndex)) dealtIn.add(session.seatIndex);
-  }
   const countsForChipsWon = tableCountsForChipsWon(tableId);
   const chipsWonDay = denverDateKey();
   const clubHandEntries: Array<{ userId: number; net: number; pot: number }> = [];
@@ -5381,12 +5391,9 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   for (const session of humanSessions) {
     // Everyone who played gets recordHandPlayed + 5 XP. Pass variantId
     // so lifetime "all_variants" + daily/weekly variety achievements
-    // can track it. A seat NOT dealt in is told so (recordHandPlayed records
-    // nothing for it) and gets nothing else below.
+    // can track it.
     const variantId: string | undefined = (table as any).config?.variantId || (table as any).variantId;
-    const wasDealtIn = dealtIn.has(session.seatIndex);
-    progressionManager.recordHandPlayed(session.playerId, variantId, handRef, wasDealtIn);
-    if (!wasDealtIn) continue;
+    progressionManager.recordHandPlayed(session.playerId, variantId, handRef);
     progressionManager.addXP(session.playerId, 5);
 
     const seat = table.seats[session.seatIndex];
@@ -5404,11 +5411,16 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     }
 
     // C9 / APPUI-50 — the hand's NET result (stack now − stack at hand start,
-    // insurance settled) into the account's Denver-day chips-won bucket.
-    // Wallet-chip tables only; additive SQL (never last-writer-wins).
-    if (countsForChipsWon && seat) {
+    // insurance settled: the same measure as the chip-velocity monitor) into
+    // the account's Denver-day chips-won bucket. Humans only (a session), a
+    // dealt-in seat with a hand-start stack, wallet-chip tables only; additive
+    // SQL (never last-writer-wins). NET, not the gross pot (`chipsWon` on the
+    // result entries): a gross count grows by shoving back and forth with a
+    // friend at no cost, a net one only by taking chips from someone.
+    const startStack = table.startChips.get(session.seatIndex);
+    if (countsForChipsWon && seat && !seat.isAI && seat.playerId === session.playerId && startStack !== undefined) {
       const auth = authSessions.get(session.socketId);
-      const net = (seat.chipCount || 0) - (table.startChips.get(session.seatIndex) || 0);
+      const net = (seat.chipCount || 0) - startStack;
       if (auth?.userId) {
         recordChipWins(auth.userId, chipsWonDay, net, 1)
           .then(() => { economyStats.chipsWonWrites++; })
@@ -5474,13 +5486,12 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // CLUBS P3 (R2) — a club table's hand feeds its club_stats + club XP (fire-and-forget).
   if (clubHandEntries.length > 0) recordClubHand(tableId, clubHandEntries);
 
-  // ELO updates: pair each winner against each loser (human vs human only,
-  // dealt-in seats only — R2: a sitting-out seat neither won nor lost).
+  // ELO updates: pair each winner against each loser (human vs human only)
   const humanWinnerIds = humanSessions
-    .filter((s) => dealtIn.has(s.seatIndex) && winnerSeatIndices.has(s.seatIndex))
+    .filter((s) => winnerSeatIndices.has(s.seatIndex))
     .map((s) => s.playerId);
   const humanLoserIds = humanSessions
-    .filter((s) => dealtIn.has(s.seatIndex) && !winnerSeatIndices.has(s.seatIndex))
+    .filter((s) => !winnerSeatIndices.has(s.seatIndex))
     .map((s) => s.playerId);
   if (humanWinnerIds.length > 0 && humanLoserIds.length > 0) {
     for (const winnerId of humanWinnerIds) {
@@ -5506,7 +5517,9 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       // R2 (C5) — the progress push follows this player's writes (below): the
       // wallet the scratch tick returned is the DB's, so the payload is DB-fresh.
       let walletRefreshed = false;
-      const authSession = authSessions.get(socketId);
+      // R2 (GAME-11 / ECON-13) — a seat not dealt into this hand earned nothing
+      // in it: no save, no scratch-card tick.
+      const authSession = dealtInSockets.has(socketId) ? authSessions.get(socketId) : undefined;
       if (authSession) {
         const clientProgress = progressionManager.getClientProgress(session.playerId) as any;
         if (clientProgress) {
@@ -5547,21 +5560,19 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
           // only has access to the minimal result data, which the replay
           // viewer couldn't render).
 
-          // A scratch-card tick for a DEALT-IN hand only (ECON-13). The same
-          // UPDATE returns the wallet: the progress record mirrors the DB
+          // The scratch-card tick (a dealt-in seat only — the gate above). The
+          // same UPDATE returns the wallet: the progress record mirrors the DB
           // (C5 — e.g. a buy-in or cash-out at another table since the last push).
-          if (dealtIn.has(session.seatIndex)) {
-            const tick: any = await tickScratchProgress(authSession.userId).catch(() => false);
-            if (tick && typeof tick === 'object') {
-              try { progressionManager.applyWallet(authSession.userId, tick); walletRefreshed = true; } catch { /* best-effort */ }
-            }
-            if (tick === true || (tick && tick.awarded === true)) {
-              const s = io.sockets.sockets.get(socketId);
-              s?.emit('scratchCardEarned', {
-                message: 'You earned a scratch card!',
-                scratchCardsAvailable: typeof tick?.scratchCardsAvailable === 'number' ? tick.scratchCardsAvailable : undefined,
-              });
-            }
+          const tick: any = await tickScratchProgress(authSession.userId).catch(() => false);
+          if (tick && typeof tick === 'object') {
+            try { progressionManager.applyWallet(authSession.userId, tick); walletRefreshed = true; } catch { /* best-effort */ }
+          }
+          if (tick === true || (tick && tick.awarded === true)) {
+            const s = io.sockets.sockets.get(socketId);
+            s?.emit('scratchCardEarned', {
+              message: 'You earned a scratch card!',
+              scratchCardsAvailable: typeof tick?.scratchCardsAvailable === 'number' ? tick.scratchCardsAvailable : undefined,
+            });
           }
         }
       }
@@ -7134,7 +7145,7 @@ function predictionWindowClosed(tableId: string, handNumber: number, kind: 'mark
     return { code: 'prediction_hand_closed', message: 'That hand is not in progress any more' };
   }
   if (kind === 'market') {
-    const anyAllIn = t.seats.some((s) => s.state === 'occupied' && !s.folded && s.allIn);
+    const anyAllIn = t.seats.some((s) => s.state !== 'empty' && !s.folded && s.allIn);
     if (t.currentPhase !== GamePhase.PreFlop || t.communityCards.length > 0 || anyAllIn) {
       return { code: 'prediction_street_closed', message: 'Predictions on this hand closed before the flop' };
     }
@@ -13824,6 +13835,14 @@ Give feedback in this JSON format:
       socket.emit('socialBracketRole', { bracketId: id, isOrganizer: !!auth?.userId && auth.userId === state.createdBy });
       socket.emit('socialBracketState', state);
     } catch { socket.emit('socialBracketError', { message: 'Failed to load bracket' }); }
+  });
+  // R2 (K3 contract) — the bracket panel closed: stop receiving that bracket's
+  // live state. Leaves ONLY that `bracket:<ID>` room (a no-op when the socket
+  // is not in it); no reply.
+  socket.on('leaveSocialBracket', (data: { bracketId?: string }) => {
+    const id = String(data?.bracketId || '').trim().toUpperCase().slice(0, 64);
+    if (!id) return;
+    try { Promise.resolve(socket.leave(bracketRoom(id))).catch(() => {}); } catch { /* not in it */ }
   });
   socket.on('socialBracketEliminate', async (data: { bracketId?: string; playerName?: string }) => {
     const auth = authSessions.get(socket.id);

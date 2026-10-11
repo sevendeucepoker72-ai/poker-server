@@ -285,6 +285,11 @@ function world(opts: {
     const s = mkSocket(sid);
     authSessions.set(sid, { userId: uid, username: `u${uid}`, masterUserId: master });
     const seat = tables.get(tableId)!.seats[seatIndex];
+    // R2 (2026-10-11, GAME-11): handleHandComplete persists / credits only the
+    // seats DEALT INTO the hand (they hold its cards). These scenarios fake a
+    // finished hand (phase HandComplete, nothing dealt), so a live player's seat
+    // is given the two cards it would hold; a real startNewHand replaces them.
+    if (seat.state === 'occupied' && seat.holeCards.length === 0) seat.holeCards = [{ rank: 2, suit: 0 }, { rank: 7, suit: 1 }] as any;
     playerSessions.set(sid, { socketId: sid, tableId, seatIndex, playerName: seat.playerName, playerId: seat.playerId, sittingOut: false });
     s.join(`table:${tableId}`);
     return s;

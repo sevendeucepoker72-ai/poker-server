@@ -490,6 +490,11 @@ describe('APPUI-45 — prediction markets only for the hand in progress, pre-flo
     (t as any).currentPhase = GamePhase.PreFlop;
     t.seats[1].allIn = true;
     expect(w.m.predictionWindowClosed('PT', hn, 'market')).toMatchObject({ code: 'prediction_street_closed' });
+    // An all-in seat that has since been marked sitting out still closes it.
+    t.seats[1].state = 'sitting_out';
+    expect(w.m.predictionWindowClosed('PT', hn, 'market')).toMatchObject({ code: 'prediction_street_closed' });
+    t.seats[1].allIn = false;
+    expect(w.m.predictionWindowClosed('PT', hn, 'market')).toBeNull();
   });
 
   it('placeSocialSideBet: a refusal (organizer / player / closed) is answered BEFORE any escrow', async () => {
@@ -499,6 +504,26 @@ describe('APPUI-45 — prediction markets only for the hand in progress, pre-flo
     expect(t.last('socialBracketError')).toMatchObject({ code: 'organizer_cannot_bet' });
     expect(w.fakes.sideBetRefusal).toHaveBeenCalledWith('ABCD', 64, ['Player 64']);
     expect(w.fakes.deductChips).not.toHaveBeenCalled();
+  });
+});
+
+describe('leaveSocialBracket (K3 contract) — the closed bracket panel leaves that bracket room only', () => {
+  it('leaves bracket:<ID> (upper-cased, like every bracket room); nothing for a missing id; a failing leave never throws', async () => {
+    const BRACKET_ROOM = between('  const bracketRoom = ', "  socket.on('createSocialBracket'");
+    const LEAVE = between("  socket.on('leaveSocialBracket'", "  socket.on('socialBracketEliminate'");
+    const { exports: m, stubbed } = load(`function wire(socket) {\n${BRACKET_ROOM}\n${LEAVE}\n}`, {}, '{ wire }');
+    const handlers: Record<string, (d?: any) => void> = {};
+    const left: string[] = [];
+    m.wire({ on: (ev: string, fn: any) => { handlers[ev] = fn; }, leave: (room: string) => { left.push(room); } });
+    handlers.leaveSocialBracket({ bracketId: 'abcd' });
+    handlers.leaveSocialBracket({});
+    handlers.leaveSocialBracket(undefined);
+    handlers.leaveSocialBracket({ bracketId: '   ' });
+    expect(left).toEqual(['bracket:ABCD']);
+    m.wire({ on: (ev: string, fn: any) => { handlers[ev] = fn; }, leave: () => Promise.reject(new Error('adapter down')) });
+    expect(() => handlers.leaveSocialBracket({ bracketId: 'x1' })).not.toThrow();
+    await flush();
+    expect([...stubbed]).toEqual([]);
   });
 });
 
@@ -549,6 +574,9 @@ describe('seat cosmetics in the table state (C7 / C8)', () => {
     expect(s.myTheme).toBe('royal_gold');
     expect(g.getGameStateForPlayer(t, 1).myTheme).toBeNull();
     expect(g.getGameStateForPlayer(t, -1).myTheme).toBeNull();
+    // A SITTING-OUT seat is still his seat: it keeps its look.
+    t.seats[0].state = 'sitting_out';
+    expect(g.getGameStateForPlayer(t, 1).seats[0].cosmetics).toEqual({ frame: 'gold', title: 'royal', cardBack: null, badge: null, vip: true });
   });
 });
 
