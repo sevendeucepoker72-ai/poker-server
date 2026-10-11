@@ -1136,6 +1136,14 @@ export async function deductStars(userId: number, stars: number): Promise<boolea
 }
 
 /** Load the durable progression fields from DB (seed values for ProgressionManager.getOrCreateProgress). */
+/** stats.clientData of a users.stats value (TEXT or JSONB), or null — never throws on a bad row. */
+function clientDataOf(stats: unknown): Record<string, unknown> | null {
+  let o: any = stats;
+  if (typeof o === 'string') { try { o = JSON.parse(o || '{}'); } catch { return null; } }
+  const cd = o && typeof o === 'object' ? o.clientData : null;
+  return cd && typeof cd === 'object' && !Array.isArray(cd) ? cd : null;
+}
+
 export async function loadDurableProgress(userId: number): Promise<{
   stars: number;
   loginStreak: number;
@@ -1144,10 +1152,12 @@ export async function loadDurableProgress(userId: number): Promise<{
   handsSinceLastScratch: number;
   customization: any;
   preferences: any;
+  /** R2 — the client-owned saved blob (stats.clientData: settings / career / missions UI state), or null. */
+  clientData: Record<string, unknown> | null;
 } | null> {
   try {
     const { rows } = await pool.query(
-      `SELECT stars, login_streak, last_login_claim_date, scratch_cards_available, hands_since_last_scratch, customization, preferences
+      `SELECT stars, login_streak, last_login_claim_date, scratch_cards_available, hands_since_last_scratch, customization, preferences, stats
          FROM users WHERE id = $1`,
       [userId]
     );
@@ -1161,6 +1171,7 @@ export async function loadDurableProgress(userId: number): Promise<{
       handsSinceLastScratch: r.hands_since_last_scratch || 0,
       customization: r.customization || {},
       preferences: r.preferences || {},
+      clientData: clientDataOf(r.stats),
     };
   } catch (e: any) {
     console.warn(`[loadDurableProgress ${userId}]`, e.message);

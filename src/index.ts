@@ -3369,14 +3369,14 @@ function getGameStateForPlayer(
   stateObj.rebuyAllowed = rebuyAllowedAt(table.config.tableId);
   stateObj.minBuyIn = table.config.minBuyIn;
   stateObj.maxBuyIn = table.config.minBuyIn * 10;
-  // R1 contract #1 — ALWAYS present: null, or THIS seat's own all-in
-  // insurance quote { handNumber, cashout, equityPct, pot, expiresAt } while
-  // the runout is held for its decision. Spectators always get null.
-  stateObj.insuranceQuote = insuranceQuoteForSeat(table.config.tableId, table, playerSeatIndex);
   // R2 (C7) — ALWAYS present: this seat's EQUIPPED table theme id, else null
   // (spectators, AI, an account-less or not-yet-loaded seat).
   const myUid = playerSeatIndex >= 0 ? seatAccounts?.get(playerSeatIndex) : undefined;
   stateObj.myTheme = myUid !== undefined ? (progressionManager.equippedTheme(myUid) ?? null) : null;
+  // R1 contract #1 — ALWAYS present: null, or THIS seat's own all-in
+  // insurance quote { handNumber, cashout, equityPct, pot, expiresAt } while
+  // the runout is held for its decision. Spectators always get null.
+  stateObj.insuranceQuote = insuranceQuoteForSeat(table.config.tableId, table, playerSeatIndex);
 
   // Add missed-blind info for this player. Now sourced directly from the
   // seat object (seat.deadBlindOwedChips + seat.missedBlind) — single
@@ -9315,7 +9315,7 @@ Give feedback in this JSON format:
       // profile BY ID — never the account id, the login handle or a name lookup).
       let pids = new Map<number, string>();
       try { pids = (await publicIdsFor(rows.map((r) => r.id))) || new Map(); } catch { /* ids are optional */ }
-      socket.emit('playerSearchResults', { results: rows.map((r, i) => ({ id: `r${i}`, username: r.displayName, displayName: r.displayName, level: r.level, publicId: pids.get(r.id) ?? undefined })) });
+      socket.emit('playerSearchResults', { results: rows.map((r, i) => ({ id: `r${i}`, username: r.displayName, displayName: r.displayName, level: r.level, publicId: pids.get(r.id) ?? undefined, ...(r.id === auth.userId ? { isYou: true } : {}) })) });
     } catch {
       socket.emit('playerSearchResults', { results: [] });
     }
@@ -11850,6 +11850,8 @@ Give feedback in this JSON format:
         loginStreak: durable?.loginStreak || 0,
         lastLoginClaimDate: durable?.lastLoginClaimDate || null,
         scratchCardsAvailable: durable?.scratchCardsAvailable || 0,
+        // R2 — the client's own saved blob (what saveProgress { stats: { clientData } } stored), or null.
+        clientData: durable?.clientData ?? null,
         handHistory,
       });
     } catch (err: any) {

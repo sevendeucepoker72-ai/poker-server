@@ -435,4 +435,17 @@ d('economy on a real Postgres', () => {
       expect(await brackets.addSideBet(id, 'Stranger', 'Alice', 100, stranger, ['Stranger'])).toMatchObject({ ok: false, code: 'betting_closed' });
     });
   });
+
+  describe('durable state (K2 contract)', () => {
+    it('loadDurableProgress returns the saved clientData from the TEXT stats column; an unparsable stats row still loads (clientData null)', async () => {
+      const id = await mkUser({ stats: JSON.stringify({ handsPlayed: 3, clientData: { settings: { sound: false } } }) });
+      expect((await am.loadDurableProgress(id))!.clientData).toEqual({ settings: { sound: false } });
+      const none = await mkUser();
+      expect((await am.loadDurableProgress(none))!.clientData).toBeNull();
+      const bad = await mkUser({ stats: '{not json' });
+      const d = await am.loadDurableProgress(bad);
+      expect(d).not.toBeNull();
+      expect(d!.clientData).toBeNull();
+    });
+  });
 });

@@ -507,6 +507,54 @@ describe('APPUI-45 — prediction markets only for the hand in progress, pre-flo
   });
 });
 
+describe('K2 contract — names the economy screens are built against', () => {
+  it('getDurableState answers durableState with the account\'s own saved clientData (or null)', async () => {
+    const saved = { settings: { sound: false, fourColor: true } };
+    const w = world({
+      loadDurableProgress: async () => ({ stars: 5, loginStreak: 2, lastLoginClaimDate: '2026-10-10', scratchCardsAvailable: 1, handsSinceLastScratch: 0, customization: {}, preferences: {}, clientData: saved }),
+    });
+    w.users.set(90, {});
+    const t = w.connect('S90', 90);
+    await t.call('getDurableState', {});
+    expect(t.last('durableState')).toMatchObject({ clientData: saved, battlePassPremium: false, loginStreak: 2, scratchCardsAvailable: 1 });
+    const w2 = world();
+    w2.users.set(91, {});
+    const t2 = w2.connect('S91', 91);
+    await t2.call('getDurableState', {});
+    expect(t2.last('durableState').clientData).toBeNull();
+  });
+
+  it('player search rows: publicId, isYou:true on the searcher\'s own row (absent on others), never an account id or chips', async () => {
+    const w = world({
+      searchUsers: async () => [{ id: 92, displayName: 'Josh', level: 4 }, { id: 93, displayName: 'Joshua', level: 9 }],
+      playerSearchLimiter: createWindowRateLimiter(30, 30_000),
+    });
+    w.users.set(92, {});
+    const t = w.connect('S92', 92);
+    await t.call('searchPlayers', { query: 'jo' });
+    const rows = t.last('playerSearchResults').results;
+    expect(rows).toEqual([
+      { id: 'r0', username: 'Josh', displayName: 'Josh', level: 4, publicId: 'p000000000000092', isYou: true },
+      { id: 'r1', username: 'Joshua', displayName: 'Joshua', level: 9, publicId: 'p000000000000093' },
+    ]);
+    expect('isYou' in rows[1]).toBe(false);
+  });
+
+  it('leaderboard rows (all-time and the chips-won windows): publicId + isYou, no userId', async () => {
+    const w = world();
+    w.users.set(1, {});
+    const t = w.connect('S1', 1);
+    for (const period of ['alltime', 'season']) {
+      await t.call('getLeaderboard', { period });
+      const d = t.last('leaderboardData');
+      expect(d.period).toBe(period);
+      expect(d.entries[0]).toMatchObject({ publicId: 'p000000000000001', isYou: true });
+      for (const e of d.entries) expect(e).not.toHaveProperty('userId');
+      if (period === 'season') expect(d).toEqual(expect.objectContaining({ seasonEndsAt: expect.any(Number), windowEndsAt: expect.any(Number) }));
+    }
+  });
+});
+
 describe('leaveSocialBracket (K3 contract) — the closed bracket panel leaves that bracket room only', () => {
   it('leaves bracket:<ID> (upper-cased, like every bracket room); nothing for a missing id; a failing leave never throws', async () => {
     const BRACKET_ROOM = between('  const bracketRoom = ', "  socket.on('createSocialBracket'");
