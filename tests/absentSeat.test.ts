@@ -76,7 +76,8 @@ const P = {
   entrantIsAccount: fnSrc('function tournamentEntrantIsAccount('),
   liveSeatIndex: fnSrc('function tournamentLiveSeatIndex('),
   handlePlayerLeave: fnSrc('function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKind'),
-  clearGhost: fnSrc('function clearGhostSeatsForUser('),
+  // AUTH-3 (2026-10-11): ghost seats by account only — the helper it uses comes along.
+  clearGhost: fnSrc('function clearGhostSeatsForUser(') + fnSrc('function seatPlayedByAnotherAccount('),
   standUpRefusedSeat: fnSrc('function standUpRefusedSeat('),
   refuseSeatRestore: fnSrc('async function refuseSeatRestoreIfBarred('),
   cashOutGuest: fnSrc('async function cashOutSeatsBeforeGuestClaim('),
@@ -1251,7 +1252,9 @@ describe('minor (2026-10-10) — the post-restart orphan-seat scans never claim 
     expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
     w.m.handlePlayerLeave(s2);
     await flush();
-    expect(w.credits).toEqual([{ uid: 102, amount: 7000 }]);
+    // AUTH-3 (2026-10-11): clearGhostSeatsForUser now also clears Bob's OWN
+    // session-less seat 1 (stamped user_102) to Bob — the theft is the 7,000.
+    expect(w.credits).toContainEqual({ uid: 102, amount: 7000 });
   });
 });
 

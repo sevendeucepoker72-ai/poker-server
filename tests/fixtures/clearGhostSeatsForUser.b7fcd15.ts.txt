@@ -1,0 +1,109 @@
+function clearGhostSeatsForUser(
+  userId: number, tableId: string, excludeSocketId?: string, excludeSeatIndex?: number,
+  opts: { nameScan?: boolean } = {},
+): number {
+  let cleared = 0;
+  const table = tableManager.getTable(tableId);
+  if (!table) return 0;
+
+  // Resolve the user's display name and phone/username so we can match
+  // seats even when no session record remains (e.g. orphaned seats
+  // left behind after a crash or a non-joinTable seat path).
+  let userDisplayName: string | null = null;
+  let userUsername: string | null = null;
+  try {
+    // Best effort — find via any existing auth session, then via DB if needed.
+    for (const [, auth] of authSessions) {
+      if (auth.userId === userId) { userUsername = auth.username; break; }
+    }
+  } catch {}
+
+  // 1. Scan active sessions — any prior socket of the same user on this table
+  for (const [otherSocketId, otherSession] of playerSessions) {
+    if (otherSocketId === excludeSocketId) continue;
+    if (otherSession.tableId !== tableId) continue;
+    if (excludeSeatIndex !== undefined && otherSession.seatIndex === excludeSeatIndex) continue;
+    const otherAuth = authSessions.get(otherSocketId);
+    if (!otherAuth || otherAuth.userId !== userId) continue;
+
+    const seat = table.seats[otherSession.seatIndex];
+    if (seat && seat.state === 'occupied' && !seat.isAI) {
+      if (table.isHandInProgress() && table.activeSeatIndex === otherSession.seatIndex) {
+        try { table.playerFold(otherSession.seatIndex); } catch {}
+      }
+      // Remember the name for step 3 (in case OTHER dead seats also match)
+      userDisplayName = userDisplayName || seat.playerName;
+      // C8: return the stack to the wallet before destroying the seat.
+      creditSeatStackToWallet(otherAuth.userId, otherAuth.username, tableId, seat, 'ghost_seat_session_scan');
+      table.standUp(otherSession.seatIndex);
+      cleared++;
+    }
+    playerSessions.delete(otherSocketId);
+    const ghostSocket = io.sockets.sockets.get(otherSocketId);
+    if (ghostSocket) {
+      ghostSocket.leave(`table:${tableId}`);
+      ghostSocket.emit('seatVacated', { tableId, seatIndex: otherSession.seatIndex, reason: 'joined_new_seat' });
+    }
+  }
+
+  // 2. Clear any reserved seat on this table
+  const reserved = reservedSeats.get(userId);
+  if (reserved && reserved.tableId === tableId
+      && (excludeSeatIndex === undefined || reserved.seatIndex !== excludeSeatIndex)) {
+    clearTimeout(reserved.cleanupTimer);
+    reservedSeats.delete(userId);
+    const rSeat = table.seats[reserved.seatIndex];
+    if (rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
+      userDisplayName = userDisplayName || rSeat.playerName;
+      // C8: return the reserved seat's stack to the wallet before teardown.
+      // U3: never for a TOURNAMENT reservation — decided by its snapshot
+      // (isTournamentReservation): a table break drops the id from
+      // tournamentTables while the stack is already on the new table, and
+      // creditSeatStackToWallet alone would then mint it. Same audit row
+      // creditSeatStackToWallet writes for a tournament stack.
+      if (isTournamentReservation(reserved)) {
+        if ((rSeat.chipCount || 0) > 0) {
+          auditLog(userUsername || rSeat.playerName || '', 'TOURNAMENT_STACK_NOT_CASHED', {
+            userId, tableId, reason: 'ghost_seat_reserved', chips: rSeat.chipCount,
+          });
+        }
+      } else {
+        creditSeatStackToWallet(userId, userUsername || rSeat.playerName || '', tableId, rSeat, 'ghost_seat_reserved');
+      }
+      table.standUp(reserved.seatIndex);
+      cleared++;
+    }
+  }
+
+  // 3. NAME-based scan — catch seats where the playerName matches our
+  // user but NO session/reservation points at them (true orphans from
+  // crashes, forced disconnects, or code paths that bypass cleanup).
+  // Stronger than the session scan because it doesn't require any
+  // lookup map to still hold the stale entry.
+  const namesToMatch = new Set<string>();
+  if (userDisplayName) namesToMatch.add(userDisplayName);
+  if (userUsername) namesToMatch.add(userUsername);
+  if (namesToMatch.size > 0 && opts.nameScan !== false) {
+    for (let i = 0; i < table.seats.length; i++) {
+      if (i === excludeSeatIndex) continue;
+      const s = table.seats[i];
+      if (s.state !== 'occupied' || s.isAI) continue;
+      if (!namesToMatch.has(s.playerName)) continue;
+      if (table.isHandInProgress() && table.activeSeatIndex === i) {
+        try { table.playerFold(i); } catch {}
+      }
+      // C8: return the orphaned seat's stack to the wallet before teardown.
+      // All name-matched seats belong to this userId (that's the match
+      // criterion), so crediting userId is correct.
+      creditSeatStackToWallet(userId, userUsername || s.playerName || '', tableId, s, 'ghost_seat_name_scan');
+      table.standUp(i);
+      cleared++;
+    }
+  }
+
+  if (cleared > 0) {
+    console.log(`[clearGhostSeatsForUser] userId=${userId} tableId=${tableId} cleared=${cleared} (name-match=${userDisplayName || userUsername || 'n/a'})`);
+    broadcastGameState(tableId);
+  }
+  return cleared;
+}

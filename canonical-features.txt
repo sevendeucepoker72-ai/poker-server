@@ -734,3 +734,13 @@ crashSafety
 # ADMIN_PASSWORD (a set value only logs this reminder); ADMIN_PHONE has no
 # hardcoded default. Pinned by tests/playGate.test.ts (AUTH-8 test).
 ADMIN_PASSWORD is set but no longer used
+#
+# 2026-10-11 (.online R1, AUTH-3 — P0 chip theft) — clearGhostSeatsForUser finds
+# ghost seats by ACCOUNT only: this account's other sessions, its own
+# reservation (only while the seat is still its own: same seat name, no live
+# session / reservation of another account), and on cash tables seats stamped
+# user_<id> that nobody plays. The display-name scan that credited a same-named
+# victim's stack to the caller is gone. Pinned by tests/ghostSeats.test.ts.
+seatPlayedByAnotherAccount
+ghost_seat_account_stamp
+ghost_reservation_not_his

@@ -1033,10 +1033,10 @@ describe('index.ts — every play-entry handler is gated before its first side e
     expect(body).toContain('const reserved = reservedSeats.get(userId);');
     expect(body).toContain('...(claims.phone ? { phone: claims.phone } : {}),');
     expect(body).toContain('isAdmin: !!row.is_admin, origIat: claims.orig_iat, phone: claims.phone,');
-    // The ghost clearing around the restore is userId-only too (its display-name
-    // step would stand up a same-named player and credit HIS stack to this user).
-    expect(body).toContain('clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex, { nameScan: false });');
-    expect(fnBody('function clearGhostSeatsForUser(')).toContain('if (namesToMatch.size > 0 && opts.nameScan !== false) {');
+    // The ghost clearing around the restore is account-only — and since AUTH-3
+    // (2026-10-11) for EVERY caller: the display-name step is gone.
+    expect(body).toContain('clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex);');
+    expect(fnBody('function clearGhostSeatsForUser(')).not.toContain('namesToMatch');
   });
 
   it('(B) resumeSession builds userData BEFORE setting the session (no half-signed-in socket on a parse error)', () => {

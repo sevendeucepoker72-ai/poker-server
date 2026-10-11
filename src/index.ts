@@ -5401,41 +5401,43 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
 
 // ========== Ghost-seat cleanup ==========
 /**
- * Stand up any seat on `tableId` currently occupied by `userId` through a
- * different socket than `excludeSocketId` (or any socket, if no exclude).
- * Also clears any reservedSeats entry the user has on this table.
+ * Stand up any seat on `tableId` that THIS ACCOUNT (`userId`) still holds
+ * through something other than the caller's socket (`excludeSocketId`), and
+ * clear this account's reservation on the table. Runs before every sitDown so
+ * the invariant "one userId → at most one seat per table" holds regardless of
+ * prior disconnects / tab reloads / multi-tab logins ("3-of-me" ghost seats).
  *
- * This runs before every sitDown attempt so the invariant
- *   "one userId → at most one seat per table"
- * holds regardless of prior disconnects / tab reloads / multi-tab logins.
- * Fixes the "3-of-me" ghost-seat bug.
- *
- * `opts.nameScan:false` (2026-10-09, D1 — used by `resumeSession`) skips
- * step 3, the display-name match: ticket display names are 'First L.' and
- * collide, and step 3 credits a matched seat's stack to `userId` — a resume
- * acts on the LOCAL userId only (steps 1-2), never on a name.
+ * 🚨 2026-10-11 (AUTH-3, P0 chip theft) — ghost seats are found by ACCOUNT
+ * only. A former step 3 scanned the table for seats whose `playerName` equalled
+ * this user's display name / username and credited each one's stack to THIS
+ * user, standing its player up. Seat names were client-sent (and display names
+ * collide — 'First L.'), so a player who sat down under a victim's name and
+ * then joined from a second tab was paid the victim's whole stack and the
+ * victim was stood up (reproduced). Now a seat is this account's only when:
+ *   1. a live session SIGNED IN AS THIS ACCOUNT (another socket) sits there;
+ *   2. it is this account's own reservation on this table — and only while the
+ *      reserved seat is still the reserved player's (same seat name) with no
+ *      live session and no reservation of ANOTHER account on it; otherwise the
+ *      stale reservation is dropped and nothing is credited or stood up;
+ *   3. on a CASH table, its seat is stamped with this account's playerId
+ *      (`user_<userId>`) and no live session (any account's) plays it.
+ * A seat another account's live session plays is never credited and never
+ * stood up. (The `nameScan` option is gone with the name scan.)
  */
 function clearGhostSeatsForUser(
   userId: number, tableId: string, excludeSocketId?: string, excludeSeatIndex?: number,
-  opts: { nameScan?: boolean } = {},
 ): number {
   let cleared = 0;
   const table = tableManager.getTable(tableId);
   if (!table) return 0;
 
-  // Resolve the user's display name and phone/username so we can match
-  // seats even when no session record remains (e.g. orphaned seats
-  // left behind after a crash or a non-joinTable seat path).
-  let userDisplayName: string | null = null;
+  // For audit rows only (never to MATCH a seat): the account's session username.
   let userUsername: string | null = null;
-  try {
-    // Best effort — find via any existing auth session, then via DB if needed.
-    for (const [, auth] of authSessions) {
-      if (auth.userId === userId) { userUsername = auth.username; break; }
-    }
-  } catch {}
+  for (const [, auth] of authSessions) {
+    if (auth.userId === userId) { userUsername = auth.username; break; }
+  }
 
-  // 1. Scan active sessions — any prior socket of the same user on this table
+  // 1. Sessions signed in as THIS account (another socket) on this table.
   for (const [otherSocketId, otherSession] of playerSessions) {
     if (otherSocketId === excludeSocketId) continue;
     if (otherSession.tableId !== tableId) continue;
@@ -5448,8 +5450,6 @@ function clearGhostSeatsForUser(
       if (table.isHandInProgress() && table.activeSeatIndex === otherSession.seatIndex) {
         try { table.playerFold(otherSession.seatIndex); } catch {}
       }
-      // Remember the name for step 3 (in case OTHER dead seats also match)
-      userDisplayName = userDisplayName || seat.playerName;
       // C8: return the stack to the wallet before destroying the seat.
       creditSeatStackToWallet(otherAuth.userId, otherAuth.username, tableId, seat, 'ghost_seat_session_scan');
       table.standUp(otherSession.seatIndex);
@@ -5463,15 +5463,18 @@ function clearGhostSeatsForUser(
     }
   }
 
-  // 2. Clear any reserved seat on this table
+  // 2. This account's reservation on this table — still its seat?
   const reserved = reservedSeats.get(userId);
   if (reserved && reserved.tableId === tableId
       && (excludeSeatIndex === undefined || reserved.seatIndex !== excludeSeatIndex)) {
     clearTimeout(reserved.cleanupTimer);
     reservedSeats.delete(userId);
     const rSeat = table.seats[reserved.seatIndex];
-    if (rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
-      userDisplayName = userDisplayName || rSeat.playerName;
+    const stillHis = !!rSeat && rSeat.state === 'occupied' && !rSeat.isAI
+      && rSeat.playerName === reserved.playerName
+      && !seatPlayedByAnotherAccount(userId, tableId, reserved.seatIndex)
+      && !seatReservedByOtherAccount(userId, tableId, reserved.seatIndex);
+    if (stillHis) {
       // C8: return the reserved seat's stack to the wallet before teardown.
       // U3: never for a TOURNAMENT reservation — decided by its snapshot
       // (isTournamentReservation): a table break drops the id from
@@ -5489,40 +5492,52 @@ function clearGhostSeatsForUser(
       }
       table.standUp(reserved.seatIndex);
       cleared++;
+    } else if (rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
+      // AUTH-3 — the reservation is stale: someone else sits there now.
+      console.warn(`[clearGhostSeatsForUser] ${JSON.stringify({
+        event: 'ghost_reservation_not_his', userId, tableId, seatIndex: reserved.seatIndex,
+      })}`);
     }
   }
 
-  // 3. NAME-based scan — catch seats where the playerName matches our
-  // user but NO session/reservation points at them (true orphans from
-  // crashes, forced disconnects, or code paths that bypass cleanup).
-  // Stronger than the session scan because it doesn't require any
-  // lookup map to still hold the stale entry.
-  const namesToMatch = new Set<string>();
-  if (userDisplayName) namesToMatch.add(userDisplayName);
-  if (userUsername) namesToMatch.add(userUsername);
-  if (namesToMatch.size > 0 && opts.nameScan !== false) {
-    for (let i = 0; i < table.seats.length; i++) {
-      if (i === excludeSeatIndex) continue;
-      const s = table.seats[i];
-      if (s.state !== 'occupied' || s.isAI) continue;
-      if (!namesToMatch.has(s.playerName)) continue;
-      if (table.isHandInProgress() && table.activeSeatIndex === i) {
-        try { table.playerFold(i); } catch {}
-      }
-      // C8: return the orphaned seat's stack to the wallet before teardown.
-      // All name-matched seats belong to this userId (that's the match
-      // criterion), so crediting userId is correct.
-      creditSeatStackToWallet(userId, userUsername || s.playerName || '', tableId, s, 'ghost_seat_name_scan');
-      table.standUp(i);
-      cleared++;
+  // 3. Seats stamped with this account's playerId that no live session plays —
+  // CASH tables only: a tournament seat is never stood up bare (T1 — the
+  // tournament could not finish); it comes back by account or is blinded out.
+  const accountPlayerId = `user_${userId}`;
+  for (let i = 0; i < table.seats.length && !isTournamentTable(tableId); i++) {
+    if (i === excludeSeatIndex) continue;
+    const s = table.seats[i];
+    if (s.state !== 'occupied' || s.isAI || s.playerId !== accountPlayerId) continue;
+    if (otherSessionHoldsSeat('', tableId, i)) continue;   // '': ANY live session — the caller's too
+    if (table.isHandInProgress() && table.activeSeatIndex === i) {
+      try { table.playerFold(i); } catch {}
     }
+    creditSeatStackToWallet(userId, userUsername || s.playerName || '', tableId, s, 'ghost_seat_account_stamp');
+    table.standUp(i);
+    cleared++;
   }
 
   if (cleared > 0) {
-    console.log(`[clearGhostSeatsForUser] userId=${userId} tableId=${tableId} cleared=${cleared} (name-match=${userDisplayName || userUsername || 'n/a'})`);
+    console.log(`[clearGhostSeatsForUser] userId=${userId} tableId=${tableId} cleared=${cleared}`);
     broadcastGameState(tableId);
   }
   return cleared;
+}
+
+/**
+ * AUTH-3 — is (tableId, seatIndex) played by a live session (main or extra
+ * table) of an account OTHER than `userId` (or of a socket with no account)?
+ */
+function seatPlayedByAnotherAccount(userId: number, tableId: string, seatIndex: number): boolean {
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId === tableId && s.seatIndex === seatIndex && authSessions.get(sid)?.userId !== userId) return true;
+  }
+  for (const [sid, list] of multiTableSessions) {
+    if (!Array.isArray(list)) continue;
+    if (list.some((s) => s && s.tableId === tableId && s.seatIndex === seatIndex)
+        && authSessions.get(sid)?.userId !== userId) return true;
+  }
+  return false;
 }
 
 // ========== Seat-restore play gate (2026-10-07 review fix) ==========
@@ -11650,7 +11665,7 @@ Give feedback in this JSON format:
               if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
               reservedSeats.delete(userId);
               // userId-only ghost clearing (no display-name match — D1).
-              clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex, { nameScan: false });
+              clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex);
               detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'resumeSession');   // P-g (round 5)
               playerSessions.set(socket.id, {
                 socketId: socket.id, tableId: reserved.tableId, seatIndex: reserved.seatIndex,
