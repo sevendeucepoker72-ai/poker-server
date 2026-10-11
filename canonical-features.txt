@@ -1100,3 +1100,55 @@ reason = 'server_restarting';
 code: 'server_restarting'
 'CASH_OUT_LEFT_TO_SHUTDOWN_FLUSH'
 'SHUTDOWN_FLUSH'
+#
+# 2026-10-11 (R2, S3) — C5 / ECON-9 / APPUI-4: ONE progress record per account
+# (re-hydrated on every login); the C5 payload carries the Denver login-claim
+# date and the scratch-card count; season badges render from owned items.
+lastLoginClaimDate: progress.lastLoginClaimDate ?? null
+scratchCardsAvailable: progress.scratchCardsAvailable ?? 0
+badges: owned.filter((k) => k.startsWith('badge:'))
+# ECON-10 / APPUI-11: an achievement pays only when ITS ledger row is inserted.
+INSERT INTO user_achievements (user_id, ach_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1
+# ECON-12: a record is hydrated only after the DB reads succeed; claims refuse meanwhile.
+progress_loading
+# ECON-4 / APPUI-36: the login streak is computed in SQL on the Denver calendar.
+(NOW() AT TIME ZONE 'America/Denver')::date
+CASE WHEN last_login_claim_date = ${DENVER_TODAY} - 1 THEN COALESCE(login_streak, 0) + 1 ELSE 1 END AS next_login_streak
+# C6 / ECON-5 / APPUI-3: missions per account per Denver day; claimMission needs no seat.
+mission:${dateKey}:${templateId}
+missionClaimed
+daily_bonus_retired
+# C10 / APPUI-10: HUD + mission actions are recorded on the engine's playerAction
+# event (the street the action was made on, before the turn advances).
+progressionManager.recordAction(s.playerId, progressAction, {
+# C7 / ECON-6 / APPUI-5: owned cosmetics only (deduct THEN grant); emotes gated; seat cosmetics + myTheme.
+emote_locked
+myTheme
+# C8 / ECON-7: the VIP monthly bonus, once per Denver month.
+claimVipMonthly
+vip_monthly:${
+# ECON-16 / APPUI-6: Battle Pass premium remembered; never charged twice.
+user_battle_pass_premium
+# C9 / ECON-11 / APPUI-17 / APPUI-50: the automated monthly season award, ranked by chips WON.
+user_chip_wins
+season_award_runs
+seasonRewardAwarded
+meta.seasonEndsAt = endsAt;
+# ECON-17 / ECON-18: one-transaction settlements; large credits audited (the Spin & Go prize is S1's prize ledger).
+ECON_LARGE_CREDIT
+# ECON-14 / APPUI-43 / APPUI-45: social bracket + prediction betting rules.
+organizer_cannot_bet
+player_cannot_bet
+prediction_street_closed
+# Addendum: friends / profiles by opaque public id; the ticker shows public names only.
+^p[0-9a-f]{15}$
+const winnerName = winnerPublic !==
+# P3s: spin wheel table exposed; club stats from hand complete; idle-record eviction metric; BIGINT chips.
+spinWheelConfig
+recordClubHand(tableId, clubHandEntries)
+progressRecords: progressionManager.size
+[economy] users.chips is BIGINT now (trigger re-created)
+# K3 contract: the closed social-bracket panel leaves that bracket's room.
+leaveSocialBracket
+# R2 (S3): a free wheel emote the shop also lists (fire, dead) is never charged for, nor won from a roll.
+function isFreeForEveryone(

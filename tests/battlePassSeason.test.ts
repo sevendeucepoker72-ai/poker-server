@@ -38,6 +38,8 @@ function world(handler = HANDLER) {
     addChipsToUser: async (uid: number, n: number) => { chips.push([uid, n]); return true; },
     addStarsToUser: async (uid: number, n: number) => { stars.push([uid, n]); return true; },
     dbGrantItem: async () => true, loadInventory: async () => [], auditLog() {}, sendProgressToPlayer() {},
+    // R2 (ECON-17): the claim row + reward settle in ONE transaction; here the fakes run on a pass-through client.
+    withEconomyTx: async (fn: (tx: unknown) => Promise<unknown>) => fn(undefined),
   };
   const code = `${SEASON}\nconst battlePassClaimLimiter = createWindowRateLimiter(110, 60_000);\nfunction wire(socket) {\n${BP_REWARD}\n${handler}\n}`;
   const { exports: m } = load(code, scope, '{ wire, CURRENT_BATTLE_PASS_SEASON }');

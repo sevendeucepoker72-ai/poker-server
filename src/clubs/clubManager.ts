@@ -2743,3 +2743,15 @@ export async function getClubOfWeek(): Promise<{ success: boolean; club?: ClubIn
     },
   };
 }
+
+/**
+ * 2026-10-11 (.online R2, CLUBS P3) — the club a RUNTIME table belongs to (the
+ * club_tables row createClubTable stamped with it), else null. Used by the
+ * hand-complete path to feed club_stats / club XP (updateClubStats and
+ * addClubXp were never called, so every club leaderboard stayed empty).
+ */
+export async function getClubIdForRuntimeTable(runtimeTableId: string): Promise<number | null> {
+  const { rows } = await getPool().query('SELECT clubId FROM club_tables WHERE tableId = $1 LIMIT 1', [runtimeTableId]);
+  const id = rows[0] ? Number((rows[0] as any).clubid ?? (rows[0] as any).clubId) : NaN;
+  return Number.isInteger(id) && id > 0 ? id : null;
+}

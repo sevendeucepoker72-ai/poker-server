@@ -1,22 +1,26 @@
 import {
   PlayerProgress, Mission, MissionType,
-  DailyStats, WeeklyStats, emptyDailyStats, emptyWeeklyStats,
+  emptyDailyStats, emptyWeeklyStats,
 } from './PlayerProgress';
 import {
-  persistStars as dbPersistStars,
-  deductStars as dbDeductStars,
   addChipsToUser as dbAddChipsToUser,
   addStarsToUser as dbAddStarsToUser,
-  saveProgress as dbSaveProgress,
-  commitLevelUpReward as dbCommitLevelUpReward,
-  loadDurableProgress,
-  loadInventory,
-  loadProgress as dbLoadProgress,
-  recordDailyAchievement,
-  recordWeeklyAchievement,
-  loadTodayDailyAchievements,
-  loadThisWeekWeeklyAchievements,
+  mergeUserStats as dbMergeUserStats,
 } from '../auth/authManager';
+import {
+  loadProgressBundle, settleAchievementReward, settleLevelUps,
+  type ProgressBundle, type AchievementCategory, type Balances,
+} from '../economy/economyDb';
+import {
+  missionTemplateIdsFor, applyMissionProgress, missionRows, emptyMissionDay, missionTemplate, parseMissionId,
+  type MissionDayState,
+} from './missions';
+import { mergeProgressStats } from './progressMerge';
+import { denverDateKey, nextDenverMidnightMs, denverMonthKey } from '../economy/denverTime';
+import {
+  vipTierForSeasonXp, VIP_EMOTES, FREE_EMOTES, VIP_PASS_PERKS, VIP_MONTHLY_BONUS_CHIPS, VIP_LOGIN_MULTIPLIER,
+  SHOP_PRICES, itemKey, normalizeItemType, CHIP_BOOSTED_REWARDS,
+} from '../economy/catalog';
 
 // ── Level / XP system (1000 levels) ─────────────────────────────────────────
 // Unified curve — MUST match poker-3d/src/store/progressStore.js
@@ -80,7 +84,6 @@ function calcEloChange(playerElo: number, opponentElo: number, won: boolean): nu
   const k = playerElo >= 1500 ? ELO_K_HIGH : ELO_K_LOW;
   return Math.round(k * ((won ? 1 : 0) - expected));
 }
-import { v4 as uuidv4 } from 'uuid';
 
 interface AchievementDef {
   id: string;
@@ -266,6 +269,18 @@ export function maxXpAtLevel(level: number): number {
   return Math.max(0, xpRequiredForLevel(Math.max(1, l)) - 1);
 }
 
+/** Cumulative ("season") XP of (level, xp in level) — the Battle Pass / VIP-tier XP. */
+export function seasonXpOf(level: number, xp: number): number {
+  let total = Math.max(0, Number(xp) || 0);
+  const lv = Math.min(MAX_LEVEL, Math.max(1, Math.floor(Number(level) || 1)));
+  for (let l = 1; l < lv; l++) {
+    const req = xpRequiredForLevel(l);
+    if (!Number.isFinite(req)) break;
+    total += req;
+  }
+  return total;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 //   DAILY ACHIEVEMENTS — reset every UTC 00:00. (user, ach, date) PK
 //   in DB prevents double-claim. Check functions read `p.dailyStats`.
@@ -340,7 +355,7 @@ const WEEKLY_ACHIEVEMENTS: WindowedAchievementDef[] = [
     check: (p) => p.weeklyStats.winStreakThisWeek >= 8, reward: { xp: 2500, chips: 25000, stars: 120 } },
 ];
 
-// Utility — UTC date and week-start in YYYY-MM-DD.
+// Utility — UTC date and week-start in YYYY-MM-DD (the achievement windows).
 function utcDateKey(d: Date = new Date()): string {
   return d.toISOString().slice(0, 10);
 }
@@ -350,111 +365,138 @@ function utcWeekStartKey(d: Date = new Date()): string {
   return sunday.toISOString().slice(0, 10);
 }
 
-const DAILY_BONUS_AMOUNTS = [500, 1000, 1500, 2500, 4000, 6000, 10000];
-const MISSIONS_REFRESH_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
+// ── 2026-10-11 (.online R2) — the per-USER record ────────────────────────────
 
-interface MissionTemplate {
-  type: MissionType;
-  description: string;
-  target: number;
-  reward: { chips: number; xp: number; stars?: number };
+/** The canonical progress key of an account. Every seat's playerId of that account is an ALIAS of it. */
+export const userProgressKey = (userId: number): string => `user-${userId}`;
+const validUserId = (v: unknown): number | null => {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : null;
+};
+
+/** stats key ↔ PlayerProgress field, for counters that grow by events. */
+const ADDITIVE_COUNTERS: ReadonlyArray<[string, keyof PlayerProgress]> = [
+  ['handsPlayed', 'totalHandsPlayed'], ['handsWon', 'handsWon'], ['bluffWins', 'bluffWins'], ['allInWins', 'allInWins'],
+  ['chatMessagesSent', 'chatMessagesSent'], ['straightFlushHits', 'straightFlushHits'], ['fullHouseHits', 'fullHouseHits'],
+  ['quadsHits', 'quadsHits'], ['royalFlushHits', 'royalFlushHits'], ['tournamentsWon', 'tournamentsWon'],
+  ['tournamentsPlayed', 'tournamentsPlayed'], ['vpipHands', 'vpipHands'], ['pfrHands', 'pfrHands'],
+  ['flopsSeenHands', 'flopsSeenHands'], ['showdownHands', 'showdownHands'], ['showdownWins', 'showdownWins'],
+  ['threeBetOpps', 'threeBetOpps'], ['threeBets', 'threeBets'], ['rankedWins', 'rankedWins'], ['rankedLosses', 'rankedLosses'],
+];
+/** Counters that are a running MAXIMUM. */
+const MAX_COUNTERS: ReadonlyArray<[string, keyof PlayerProgress]> = [
+  ['biggestPot', 'biggestPot'], ['bestStreak', 'bestStreak'], ['peakElo', 'peakElo'],
+];
+
+const num = (v: unknown, d = 0): number => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
+
+/** Per-hand facts of one table's hand, keyed `${tableId}#${handNumber}` (a player can be in two hands at once). */
+interface HandFlags { vpip: boolean; pfr: boolean; faced3bet: boolean; did3bet: boolean; foldedPreflop: boolean; allIns: number }
+export interface HandRef { tableId?: string; handNumber?: number }
+const handKeyOf = (ref?: HandRef): string =>
+  ref && ref.tableId != null && ref.handNumber != null ? `${ref.tableId}#${ref.handNumber}` : '';
+const emptyFlags = (): HandFlags => ({ vpip: false, pfr: false, faced3bet: false, did3bet: false, foldedPreflop: false, allIns: 0 });
+
+/** Internal per-record state that never leaves the server. */
+interface RecordInternals {
+  handFlags: Map<string, HandFlags>;
+  committedHands: string[];
+  /** `${category}:${id}:${window}` payouts in flight (never re-triggered meanwhile). */
+  pendingAch: Set<string>;
+  /** achievement payout retry back-off after a DB error (id → epoch ms). */
+  achRetryAfter: Map<string, number>;
+  /**
+   * Chips / stars the record SHOWS that no transaction has confirmed yet
+   * (optimistic achievement / level-up rewards in flight). A DB wallet snapshot
+   * is applied as `DB + pending`, so a hand-complete or sign-in refresh never
+   * makes a reward that is still settling disappear from the display.
+   */
+  pendChips: number;
+  pendStars: number;
 }
 
-const MISSION_TEMPLATES: MissionTemplate[] = [
-  {
-    type: MissionType.PlayHands,
-    description: 'Play 10 hands',
-    target: 10,
-    reward: { chips: 500, xp: 50 },
-  },
-  {
-    type: MissionType.WinHands,
-    description: 'Win 3 hands',
-    target: 3,
-    reward: { chips: 1000, xp: 100 },
-  },
-  {
-    type: MissionType.WinPotOver,
-    description: 'Win a pot over 5,000',
-    target: 5000,
-    reward: { chips: 2000, xp: 200 },
-  },
-  {
-    type: MissionType.PlayAllIn,
-    description: 'Go All-In 3 times',
-    target: 3,
-    reward: { chips: 750, xp: 75 },
-  },
-  {
-    type: MissionType.GetHandRank,
-    description: 'Get a Flush or better',
-    target: 5, // HandRank.Flush = 5
-    reward: { chips: 1500, xp: 150 },
-  },
-  {
-    type: MissionType.WinStreak,
-    description: 'Win 3 hands in a row',
-    target: 3,
-    reward: { chips: 3000, xp: 300, stars: 10 },
-  },
-  {
-    type: MissionType.PlayHands,
-    description: 'Play 20 hands',
-    target: 20,
-    reward: { chips: 1000, xp: 100 },
-  },
-  {
-    type: MissionType.WinHands,
-    description: 'Win 5 hands',
-    target: 5,
-    reward: { chips: 2000, xp: 200 },
-  },
-  {
-    type: MissionType.FoldPreFlop,
-    description: 'Fold pre-flop 5 times',
-    target: 5,
-    reward: { chips: 500, xp: 50 },
-  },
-  {
-    type: MissionType.WinWithBluff,
-    description: 'Win with less than a pair',
-    target: 1,
-    reward: { chips: 1500, xp: 150 },
-  },
-  {
-    type: MissionType.PlayAllIn,
-    description: 'Go All-In 5 times',
-    target: 5,
-    reward: { chips: 1200, xp: 120 },
-  },
-  {
-    type: MissionType.WinPotOver,
-    description: 'Win a pot over 10,000',
-    target: 10000,
-    reward: { chips: 3000, xp: 300, stars: 5 },
-  },
-];
+export interface EconomyAuditEvent {
+  userId: number;
+  kind: 'achievement' | 'level_up';
+  chips: number;
+  stars: number;
+  detail: Record<string, unknown>;
+}
 
 export class ProgressionManager {
   private progressMap: Map<string, PlayerProgress> = new Map();
+  /** seat playerId (player-<uuid>, user_<id>, …) → the account's canonical key. */
+  private aliases: Map<string, string> = new Map();
   private pendingEvents: Map<string, ProgressEvent[]> = new Map();
+  private internals: WeakMap<PlayerProgress, RecordInternals> = new WeakMap();
+  private hydrations: Map<string, Promise<boolean>> = new Map();
+  private retryTimers: Map<string, { attempts: number; timer: ReturnType<typeof setTimeout> | null }> = new Map();
+  private inflight: Set<Promise<unknown>> = new Set();
+  private changeListener: ((userId: number) => void) | null = null;
+  private auditHook: ((e: EconomyAuditEvent) => void) | null = null;
 
-  getOrCreateProgress(playerId: string, playerName: string, userId?: number): PlayerProgress {
-    let progress = this.progressMap.get(playerId);
-    if (progress) {
-      progress.playerName = playerName;
-      // If we now have a userId and the entry hasn't been hydrated yet, do it.
-      // This ensures xp/level/achievements reflect DB state even for
-      // entries that were created pre-auth.
-      if (userId && !progress.userId) {
-        this.hydrateFromDB(playerId, userId).catch((e) =>
-          console.warn(`[ProgressionManager.getOrCreateProgress hydrate ${userId}]`, e?.message)
-        );
-      }
-      return progress;
+  /** The Battle Pass season whose premium the record carries (index.ts sets it). */
+  battlePassSeason = 'season_1_the_river';
+  /** Back-off between hydrate attempts (ms); tests set [0, 0, 0]. */
+  hydrateBackoffMs: number[] = [0, 250, 1000];
+  /** Background re-hydrate schedule after every attempt failed (ms). */
+  hydrateRetryDelaysMs: number[] = [5_000, 15_000, 60_000, 180_000];
+  /** Clock seam for tests. */
+  now: () => number = () => Date.now();
+
+  // ───────────────────────── identity / lifecycle ─────────────────────────
+
+  private keyOf(playerId: string): string {
+    return this.aliases.get(playerId) ?? playerId;
+  }
+
+  private rec(playerId: string): PlayerProgress | undefined {
+    const p = this.progressMap.get(this.keyOf(playerId));
+    if (p) p.lastTouchedAt = this.now();
+    return p;
+  }
+
+  private inner(p: PlayerProgress): RecordInternals {
+    let i = this.internals.get(p);
+    if (!i) {
+      i = { handFlags: new Map(), committedHands: [], pendingAch: new Set(), achRetryAfter: new Map(), pendChips: 0, pendStars: 0 };
+      this.internals.set(p, i);
     }
+    return i;
+  }
 
-    progress = {
+  /** Called whenever an asynchronous settlement changed a user's progress (index.ts pushes C5). */
+  setChangeListener(fn: ((userId: number) => void) | null): void { this.changeListener = fn; }
+  /** Every economy credit the engine pays is reported here (index.ts: auditLog + large-grant alert). */
+  setAuditHook(fn: ((e: EconomyAuditEvent) => void) | null): void { this.auditHook = fn; }
+
+  private notify(p: PlayerProgress): void {
+    if (!p.userId || !this.changeListener) return;
+    try { this.changeListener(p.userId); } catch (e: any) { console.warn('[ProgressionManager] change listener threw:', e?.message); }
+  }
+  private audit(e: EconomyAuditEvent): void {
+    if (!this.auditHook) return;
+    try { this.auditHook(e); } catch (err: any) { console.warn('[ProgressionManager] audit hook threw:', err?.message); }
+  }
+  private track<T>(p: Promise<T>): Promise<T> {
+    this.inflight.add(p);
+    const done = () => { this.inflight.delete(p); };
+    p.then(done, done);
+    return p;
+  }
+  /** Resolve once every settlement in flight has finished (tests, graceful shutdown). */
+  async flushPending(): Promise<void> {
+    for (let i = 0; i < 10 && this.inflight.size > 0; i++) {
+      await Promise.allSettled([...this.inflight]);
+    }
+  }
+
+  private newRecord(playerId: string, playerName: string): PlayerProgress {
+    const now = this.now();
+    return {
       playerId,
       playerName,
       level: 1,
@@ -468,7 +510,7 @@ export class ProgressionManager {
       achievements: [],
       dailyMissions: [],
       dailyMissionsRefreshAt: 0,
-      chips: 10000,
+      chips: 0,
       stars: 0,
       dailyLoginStreak: 0,
       lastLoginDate: '',
@@ -502,14 +544,12 @@ export class ProgressionManager {
       bluffWins: 0,
       allInWins: 0,
       chatMessagesSent: 0,
-      // Daily/weekly achievement window stats — reset lazily.
       dailyStats: emptyDailyStats(),
-      dailyStatsDate: utcDateKey(),
+      dailyStatsDate: utcDateKey(new Date(now)),
       weeklyStats: emptyWeeklyStats(),
-      weeklyStatsWeekStart: utcWeekStartKey(),
+      weeklyStatsWeekStart: utcWeekStartKey(new Date(now)),
       dailyAchievementsToday: [],
       weeklyAchievementsThisWeek: [],
-      // Rare-hand + tournament counters
       straightFlushHits: 0,
       fullHouseHits: 0,
       quadsHits: 0,
@@ -518,34 +558,93 @@ export class ProgressionManager {
       tournamentsPlayed: 0,
       variantsPlayed: [],
       // Gate for save paths — flipped to true only after hydrateFromDB
-      // completes successfully. Until then, no write should touch the
-      // users row (could clobber real values with fresh-init defaults).
+      // completes successfully. Until then, no write may touch the users row.
       hydrated: false,
+      everHydrated: false,
+      scratchCardsAvailable: 0,
+      lastLoginClaimDate: null,
+      vipExpiresAt: 0,
+      activeBoosters: {},
+      battlePassPremium: false,
+      owned: new Set<string>(),
+      equipped: {},
+      missionDay: emptyMissionDay(denverDateKey(now)),
+      vipMonthlyClaimedMonth: null,
+      spinClaimedDate: null,
+      lastTouchedAt: now,
     };
+  }
 
-    this.progressMap.set(playerId, progress);
-    this.generateDailyMissions(playerId);
-
-    // Hydrate new entry from DB if userId known — this is the normal path
-    // for authenticated players joining their first table in a session.
-    if (userId) {
-      this.hydrateFromDB(playerId, userId).catch((e) =>
-        console.warn(`[ProgressionManager.getOrCreateProgress hydrate-new ${userId}]`, e?.message)
-      );
+  /**
+   * The progress record for a seat / lobby id. With an account (`userId`) there
+   * is exactly ONE record per account — `user-<id>` — and every seat playerId
+   * of that account becomes an alias of it (2026-10-11 R2, ECON-9 / ECON-10:
+   * one entry per SEAT used to double-pay achievements across two seats, let
+   * counters last-writer-win, and leave the lobby entry stale). Without an
+   * account the id is its own record (unauthenticated sockets, tests).
+   */
+  getOrCreateProgress(playerId: string, playerName: string, userId?: number): PlayerProgress {
+    const uid = validUserId(userId);
+    const now = this.now();
+    if (uid) {
+      const ukey = userProgressKey(uid);
+      let entry = this.progressMap.get(ukey);
+      if (playerId !== ukey) {
+        // A record created under this playerId before the account was known —
+        // adopt it as the account's record (or drop it if the account already has one).
+        const own = this.progressMap.get(playerId);
+        if (own && own !== entry && (!own.userId || own.userId === uid)) {
+          this.progressMap.delete(playerId);
+          if (!entry) {
+            own.playerId = ukey;
+            own.userId = uid;
+            this.progressMap.set(ukey, own);
+            entry = own;
+            const ev = this.pendingEvents.get(playerId);
+            if (ev) { this.pendingEvents.delete(playerId); this.pendingEvents.set(ukey, [...(this.pendingEvents.get(ukey) || []), ...ev]); }
+          }
+        }
+        this.aliases.set(playerId, ukey);
+      }
+      if (!entry) {
+        entry = this.newRecord(ukey, playerName);
+        entry.userId = uid;
+        this.progressMap.set(ukey, entry);
+      }
+      if (playerName) entry.playerName = playerName;
+      entry.lastTouchedAt = now;
+      if (!entry.hydrated && !this.hydrations.has(ukey)) {
+        this.hydrateFromDB(ukey, uid).catch((e) =>
+          console.warn(`[ProgressionManager.getOrCreateProgress hydrate ${uid}]`, e?.message));
+      }
+      return entry;
     }
-    return progress;
+    const key = this.keyOf(playerId);
+    const existing = this.progressMap.get(key);
+    if (existing) {
+      existing.playerName = playerName;
+      existing.lastTouchedAt = now;
+      return existing;
+    }
+    const fresh = this.newRecord(playerId, playerName);
+    this.progressMap.set(playerId, fresh);
+    return fresh;
   }
 
   getProgress(playerId: string): PlayerProgress | undefined {
-    return this.progressMap.get(playerId);
+    return this.rec(playerId);
+  }
+
+  /** The account's record, if loaded. */
+  userRecord(userId: number): PlayerProgress | undefined {
+    const uid = validUserId(userId);
+    return uid ? this.progressMap.get(userProgressKey(uid)) : undefined;
   }
 
   /**
    * 2026-10-09 (D2) — merge a guest carry-over into the CALLER's live
    * in-memory progress, WITHOUT reloading it from Postgres. A full reload
-   * would throw away progress that is ahead of the DB (on prod the
-   * end-of-hand save fails on the TEXT stats column, so in-memory xp / hand
-   * counters / achievements routinely lead the row) and, while `hydrated` is
+   * would throw away progress that is ahead of the DB and, while `hydrated` is
    * false, persistChipReward / persistStarReward skip — a reward earned in
    * that window would be lost for good. So only the carried fields move:
    *   chips / stars    += what the claim added (the DB got the same, additively);
@@ -593,12 +692,10 @@ export class ProgressionManager {
   /**
    * 2026-10-09 — force every in-memory entry belonging to `userId` to re-read
    * Postgres, after an out-of-band DB change to that user's progress. Used for
-   * the RETIRED guest row after a carry-over (its stars/chips just left it:
-   * persistStars is a GREATEST write, so a stale in-memory entry would re-mint
-   * the moved stars). NOT for the caller — see applyCarriedProgress. Clearing
-   * `hydrated` first engages the existing write gate for the duration of the
-   * reload, so nothing is written from the stale values meanwhile. Returns the
-   * ids reloaded.
+   * the RETIRED guest row after a carry-over (its stars/chips just left it).
+   * NOT for the caller — see applyCarriedProgress. Clearing `hydrated` first
+   * engages the write gate for the duration of the reload, so nothing is
+   * written from the stale values meanwhile. Returns the ids reloaded.
    */
   async rehydrateUser(userId: number): Promise<string[]> {
     const ids: string[] = [];
@@ -608,161 +705,277 @@ export class ProgressionManager {
         ids.push(playerId);
       }
     }
-    await Promise.all(ids.map((playerId) => this.hydrateFromDB(playerId, userId).catch((e: any) =>
+    await Promise.all(ids.map((playerId) => this.hydrateFromDB(playerId, userId, { refresh: true }).catch((e: any) =>
       console.warn(`[ProgressionManager.rehydrateUser ${userId}]`, e?.message))));
     return ids;
   }
 
   /**
-   * Hydrate a player's progress entry from Postgres. Call once after auth
-   * (authWithTicket, oauthLogin, etc.) so stars + durable fields reflect DB.
-   * Idempotent — safe to call multiple times.
+   * Load a record from Postgres. 2026-10-11 (R2):
+   *  - ECON-12: `hydrated` becomes true ONLY when every read succeeded
+   *    (loadProgressBundle throws instead of returning [] / null); failed
+   *    attempts are retried (hydrateBackoffMs), then re-tried in the background
+   *    (hydrateRetryDelaysMs) — a record never fresh-inits counters over real data.
+   *  - C5: `refresh` re-reads an ALREADY hydrated record (every sign-in does):
+   *    the DB-owned fields (wallet, inventory, entitlements, claims) are taken
+   *    from the DB, counters / level / achievements are merged (never lowered).
+   * Concurrent calls share one load. Returns whether the record is hydrated.
    */
-  async hydrateFromDB(playerId: string, userId: number): Promise<void> {
-    const progress = this.progressMap.get(playerId);
-    if (!progress) return;
-    // Idempotent: short-circuit if already hydrated for this userId.
-    // Prevents a late re-hydrate from clobbering mid-session gains.
-    if (progress.hydrated && progress.userId === userId) return;
+  async hydrateFromDB(playerId: string, userId: number, opts: { refresh?: boolean } = {}): Promise<boolean | undefined> {
+    const key = this.keyOf(playerId);
+    const progress = this.progressMap.get(key);
+    if (!progress) return false;
+    if (!opts.refresh && progress.hydrated && progress.userId === userId) return true;
+    const running = this.hydrations.get(key);
+    if (running) {
+      const ok = await running;
+      if (!opts.refresh) return ok && !!progress.hydrated;
+    }
     progress.userId = userId;
-
-    // ─── Hydrate xp / level / achievements / chips from users table ────────
-    // Without this, every login seeds level=1 xp=0 achievements=[] in-memory
-    // even though the DB already has the real values. Then the first XP gain
-    // overwrites the DB with fresh-start numbers. This is the root cause of
-    // "exp and achievements don't persist".
-    try {
-      const res = await dbLoadProgress(userId);
-      if (res.success && res.userData) {
-        const u = res.userData;
-        if (typeof u.level === 'number' && u.level > 0) progress.level = Math.min(u.level, MAX_LEVEL);
-        if (typeof u.xp === 'number' && u.xp >= 0) progress.xp = u.xp;
-        progress.xpToNextLevel = xpRequiredForLevel(progress.level);
-        if (Array.isArray(u.achievements)) {
-          progress.achievements = Array.from(new Set([...(progress.achievements || []), ...u.achievements]));
-        }
-        if (typeof u.chips === 'number') progress.chips = u.chips;
-        if (u.stats && typeof u.stats === 'object') {
-          // Re-seed stat counters that live in PlayerProgress.
-          const s: any = u.stats;
-          if (typeof s.handsPlayed === 'number') progress.totalHandsPlayed = s.handsPlayed;
-          if (typeof s.handsWon === 'number')    progress.handsWon = s.handsWon;
-          if (typeof s.biggestPot === 'number')  progress.biggestPot = s.biggestPot;
-          if (typeof s.bestStreak === 'number')  progress.bestStreak = s.bestStreak;
-          if (typeof s.bluffWins === 'number')   progress.bluffWins = s.bluffWins;
-          if (typeof s.allInWins === 'number')   progress.allInWins = s.allInWins;
-          if (typeof s.chatMessagesSent === 'number') progress.chatMessagesSent = s.chatMessagesSent;
-          // Rare-hand / tournament counters
-          if (typeof s.straightFlushHits === 'number') progress.straightFlushHits = s.straightFlushHits;
-          if (typeof s.fullHouseHits === 'number')     progress.fullHouseHits     = s.fullHouseHits;
-          if (typeof s.quadsHits === 'number')         progress.quadsHits         = s.quadsHits;
-          if (typeof s.royalFlushHits === 'number')    progress.royalFlushHits    = s.royalFlushHits;
-          if (typeof s.tournamentsWon === 'number')    progress.tournamentsWon    = s.tournamentsWon;
-          if (typeof s.tournamentsPlayed === 'number') progress.tournamentsPlayed = s.tournamentsPlayed;
-          if (Array.isArray(s.variantsPlayed))         progress.variantsPlayed    = s.variantsPlayed;
-          if (typeof s.vpipHands === 'number')         progress.vpipHands         = s.vpipHands;
-          if (typeof s.pfrHands === 'number')          progress.pfrHands          = s.pfrHands;
-          if (typeof s.flopsSeenHands === 'number')    progress.flopsSeenHands    = s.flopsSeenHands;
-          if (typeof s.showdownHands === 'number')     progress.showdownHands     = s.showdownHands;
-          if (typeof s.showdownWins === 'number')      progress.showdownWins      = s.showdownWins;
-          if (typeof s.threeBetOpps === 'number')      progress.threeBetOpps      = s.threeBetOpps;
-          if (typeof s.threeBets === 'number')         progress.threeBets         = s.threeBets;
-          // Restore shop boosters + VIP so they survive a restart (drop already-
-          // expired boosters so a stale one doesn't linger past its window).
-          if (s.activeBoosters && typeof s.activeBoosters === 'object') {
-            const now = Date.now();
-            const live: any = {};
-            for (const [k, v] of Object.entries(s.activeBoosters as any)) {
-              if (v && (v as any).expiresAt > now) live[k] = v;
-            }
-            (progress as any).activeBoosters = live;
-          }
-          if (typeof s.vipExpiresAt === 'number') (progress as any).vipExpiresAt = s.vipExpiresAt;
-        }
-      }
-    } catch (e: any) {
-      console.warn(`[ProgressionManager.hydrateFromDB progress ${userId}]`, e?.message);
-    }
-
-    // Hydrate already-earned daily/weekly achievement IDs for the current
-    // windows so the user doesn't re-earn them on reconnect inside the same
-    // day/week. rollAchievementWindows handles future rollover naturally.
-    try {
-      const [todayIds, weekIds] = await Promise.all([
-        loadTodayDailyAchievements(userId),
-        loadThisWeekWeeklyAchievements(userId),
-      ]);
-      progress.dailyAchievementsToday = todayIds;
-      progress.weeklyAchievementsThisWeek = weekIds;
-      progress.dailyStatsDate = utcDateKey();
-      progress.weeklyStatsWeekStart = utcWeekStartKey();
-    } catch (e: any) {
-      console.warn(`[ProgressionManager.hydrateFromDB ach-windows ${userId}]`, e?.message);
-    }
-
-    const durable = await loadDurableProgress(userId);
-    if (durable) {
-      progress.stars = durable.stars;
-      progress.dailyLoginStreak = durable.loginStreak;
-      // 2026-07-05 audit P2 fix: seed lastLoginDate from the durable claim date.
-      // This was the ONLY progress field hydrateFromDB never reloaded, so after
-      // every server restart the next claimDailyBonus saw lastLoginDate='' and hit
-      // its "!== today -> reset streak to 1" branch, overwriting the correctly-
-      // hydrated dailyLoginStreak and paying the day-1 bonus instead of the earned
-      // amount. lastDailyBonusClaimed is deliberately left unseeded — the real
-      // once-per-day lock is the atomic user_daily_claims row in the socket handler,
-      // and seeding it from the login-claim date could wrongly block a same-day claim.
-      if (durable.lastLoginClaimDate) {
-        progress.lastLoginDate = durable.lastLoginClaimDate;
-      }
-      // Don't clobber equippedCardBack / equippedTableTheme here — those are
-      // sourced from user_inventory via loadInventory below.
-    }
-    const inv = await loadInventory(userId);
-    if (inv.length > 0) {
-      const cardBacks = inv.filter((r) => r.item_type === 'card_back').map((r) => r.item_id);
-      const themes    = inv.filter((r) => r.item_type === 'theme').map((r) => r.item_id);
-      const equippedCB = inv.find((r) => r.item_type === 'card_back' && r.equipped)?.item_id;
-      const equippedTheme = inv.find((r) => r.item_type === 'theme' && r.equipped)?.item_id;
-      if (cardBacks.length > 0) progress.ownedCardBacks = Array.from(new Set([...progress.ownedCardBacks, ...cardBacks]));
-      if (themes.length > 0) progress.ownedThemes = Array.from(new Set([...progress.ownedThemes, ...themes]));
-      if (equippedCB) progress.equippedCardBack = equippedCB;
-      if (equippedTheme) progress.equippedTableTheme = equippedTheme;
-    }
-    // Flip hydrated LAST — all DB reads complete, safe to save now.
-    progress.hydrated = true;
+    const p = this.runHydrate(key, progress, userId).finally(() => {
+      if (this.hydrations.get(key) === p) this.hydrations.delete(key);
+    });
+    this.hydrations.set(key, p);
+    return p;
   }
 
-  /** Push the current stars balance to Postgres. Fire-and-forget.
-   *  HARD GATE on progress.hydrated — writing the fresh-init value 0
-   *  (plus any mid-race bonus) would overwrite the user's real DB
-   *  balance. This was the cause of "my stars keep disappearing" and
-   *  is the same class of bug as the earlier chips wipeout. If an
-   *  achievement / level-up fires before hydration finishes, we simply
-   *  skip the persist — the in-memory value will be corrected on the
-   *  next hydrate call which reads from DB. */
-  private persistStars(progress: PlayerProgress): void {
-    if (!progress.userId) return;
-    if (!progress.hydrated) {
-      console.warn(`[persistStars ${progress.userId}] SKIPPED — progress not hydrated yet (would have clobbered DB stars)`);
-      return;
+  private async runHydrate(key: string, progress: PlayerProgress, userId: number): Promise<boolean> {
+    const now = this.now();
+    let lastErr = '';
+    const delays = this.hydrateBackoffMs.length ? this.hydrateBackoffMs : [0];
+    for (let attempt = 0; attempt < delays.length; attempt++) {
+      if (delays[attempt] > 0) await new Promise((r) => setTimeout(r, delays[attempt]));
+      try {
+        const bundle = await loadProgressBundle(userId, {
+          utcToday: utcDateKey(new Date(now)), utcWeekStart: utcWeekStartKey(new Date(now)), battlePassSeason: this.battlePassSeason,
+        });
+        if (!bundle) {
+          console.warn(`[ProgressionManager.hydrateFromDB ${userId}] no users row — record stays un-hydrated`);
+          return false;
+        }
+        if (this.progressMap.get(key) !== progress) return false; // evicted / replaced meanwhile
+        this.applyBundle(progress, bundle);
+        const rt = this.retryTimers.get(key);
+        if (rt?.timer) clearTimeout(rt.timer);
+        this.retryTimers.delete(key);
+        return true;
+      } catch (e: any) {
+        lastErr = e?.message || String(e);
+      }
     }
-    dbPersistStars(progress.userId, progress.stars).catch((e) =>
-      console.warn(`[ProgressionManager.persistStars ${progress.userId}]`, e?.message)
-    );
+    console.warn(`[ProgressionManager.hydrateFromDB ${userId}] every read attempt failed — hydrated stays ${progress.hydrated}: ${lastErr}`);
+    if (!progress.hydrated) this.scheduleRehydrate(key, userId);
+    return !!progress.hydrated;
+  }
+
+  private scheduleRehydrate(key: string, userId: number): void {
+    const state = this.retryTimers.get(key) || { attempts: 0, timer: null };
+    if (state.timer || state.attempts >= this.hydrateRetryDelaysMs.length) return;
+    const delay = this.hydrateRetryDelaysMs[state.attempts];
+    state.attempts++;
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      const p = this.progressMap.get(key);
+      if (!p || p.hydrated) return;
+      this.hydrateFromDB(key, userId).then((ok) => { if (ok) this.notify(p); }).catch(() => { /* logged inside */ });
+    }, delay);
+    if (typeof (state.timer as any)?.unref === 'function') (state.timer as any).unref();
+    this.retryTimers.set(key, state);
   }
 
   /**
-   * Persist a chip REWARD durably to users.chips via the atomic-additive
-   * addChipsToUser. The reward paths (level-up, achievements, daily bonus,
-   * royal flush) previously only did `progress.chips += X` IN MEMORY — never
-   * written to the DB, so hydrateFromDB / a Railway redeploy overwrote it and
-   * the reward vanished (F1, 2026-07-01 .online audit — the "user data MUST
-   * persist" P0 class). Fire-and-forget + hydrated gate mirror persistStars.
-   * Atomic additive, so it needs no ratchet and never double-counts (each
-   * caller is idempotent by achievement/level/daily-claim; missions are gated
-   * on the daily-claim ledger in the handler — see claimMission).
+   * Fold a DB bundle into a record. FIRST load: the DB's values, plus whatever
+   * the record counted before the load landed (it started from zero, so its
+   * counters ARE deltas). LATER loads (sign-in refresh): DB-owned fields from
+   * the DB, counters max(memory, DB), level ratchet, achievement union.
    */
+  private applyBundle(p: PlayerProgress, b: ProgressBundle): void {
+    const fresh = !p.everHydrated;
+    const s = b.stats || {};
+    const now = this.now();
+
+    // DB-owned: every write path of these writes the DB (additive SQL / a
+    // transaction). Rewards still settling stay on top (`DB + pending`).
+    const inner = this.inner(p);
+    p.chips = b.chips + inner.pendChips;
+    p.stars = b.stars + inner.pendStars;
+    p.scratchCardsAvailable = b.scratchCardsAvailable;
+    p.dailyLoginStreak = b.loginStreak;
+    p.lastLoginClaimDate = b.lastLoginClaimDate;
+    p.lastLoginDate = b.lastLoginClaimDate || '';
+    p.vipExpiresAt = num(s.vipExpiresAt);
+    p.activeBoosters = liveBoosters(s.activeBoosters, now);
+    p.battlePassPremium = !!b.battlePassPremium;
+    p.vipMonthlyClaimedMonth = b.vipMonthlyClaimed ? b.denverMonth : null;
+    p.spinClaimedDate = b.spinClaimedToday ? b.denverToday : null;
+    const owned = new Set<string>();
+    const equipped: Record<string, string> = {};
+    for (const row of b.inventory) {
+      owned.add(itemKey(row.itemType, row.itemId));
+      if (row.equipped) equipped[normalizeItemType(row.itemType)] = row.itemId;
+    }
+    p.owned = owned;
+    p.equipped = equipped;
+    this.syncLegacyCosmetics(p);
+
+    // Level / xp.
+    const dbLevel = Math.min(MAX_LEVEL, Math.max(1, b.level));
+    if (fresh || dbLevel > p.level) {
+      p.level = dbLevel;
+      p.xp = b.xp;
+    } else if (dbLevel === p.level) {
+      p.xp = Math.max(p.xp, b.xp);
+    }
+    p.xpToNextLevel = xpRequiredForLevel(p.level);
+    if (p.level >= MAX_LEVEL) { p.xp = 0; p.xpToNextLevel = Infinity; }
+
+    // Lifetime achievements: users.achievements ∪ the ledger ∪ confirmed memory.
+    p.achievements = Array.from(new Set([...(p.achievements || []), ...b.achievements, ...b.lifetimeLedger]));
+
+    // Counters.
+    const rec = p as unknown as Record<string, number>;
+    for (const [sk, field] of ADDITIVE_COUNTERS) {
+      const dbv = num(s[sk]);
+      const mem = num(rec[field as string]);
+      rec[field as string] = fresh ? dbv + mem : Math.max(dbv, mem);
+    }
+    for (const [sk, field] of MAX_COUNTERS) {
+      if (typeof s[sk] === 'number') rec[field as string] = Math.max(num(s[sk]), num(rec[field as string]));
+    }
+    if (Array.isArray(s.variantsPlayed)) {
+      p.variantsPlayed = Array.from(new Set([...(s.variantsPlayed as string[]), ...(p.variantsPlayed || [])]));
+    }
+    p.actionCounts = mergeCounterMaps(s.actionCounts, p.actionCounts, fresh);
+    p.handsPerRank = mergeCounterMaps(s.handsPerRank, p.handsPerRank, fresh);
+    p.positionWins = mergePositionWins(s.positionWins, p.positionWins, fresh);
+    if (typeof s.lastHandAt === 'number') p.lastHandAt = Math.max(s.lastHandAt, p.lastHandAt || 0);
+
+    // ELO: the stored rating on the first load; a live record keeps its own (single writer).
+    if (fresh) {
+      if (typeof s.elo === 'number' && Number.isFinite(s.elo)) p.elo = Math.max(0, s.elo + (p.elo - ELO_START));
+      if (Array.isArray(s.eloHistory)) {
+        p.eloHistory = [...(s.eloHistory as Array<{ t: number; elo: number }>), ...(p.eloHistory || [])]
+          .filter((x) => x && typeof x.t === 'number' && typeof x.elo === 'number').slice(-30);
+      }
+    }
+    if (p.elo > p.peakElo) p.peakElo = p.elo;
+    p.rank = eloToRank(p.elo);
+
+    // HUD / achievement windows (persisted with their date since R2).
+    this.rollAchievementWindows(p);
+    if (s.dailyStatsDate === p.dailyStatsDate && s.dailyStats && typeof s.dailyStats === 'object') {
+      p.dailyStats = { ...emptyDailyStats(), ...mergeProgressStats({ dailyStats: s.dailyStats, dailyStatsDate: p.dailyStatsDate }, { dailyStats: p.dailyStats, dailyStatsDate: p.dailyStatsDate }).dailyStats };
+    }
+    if (s.weeklyStatsWeekStart === p.weeklyStatsWeekStart && s.weeklyStats && typeof s.weeklyStats === 'object') {
+      p.weeklyStats = { ...emptyWeeklyStats(), ...mergeProgressStats({ weeklyStats: s.weeklyStats, weeklyStatsWeekStart: p.weeklyStatsWeekStart }, { weeklyStats: p.weeklyStats, weeklyStatsWeekStart: p.weeklyStatsWeekStart }).weeklyStats };
+    }
+    p.dailyAchievementsToday = Array.from(new Set([...(p.dailyAchievementsToday || []), ...b.dailyAchievementIds]));
+    p.weeklyAchievementsThisWeek = Array.from(new Set([...(p.weeklyAchievementsThisWeek || []), ...b.weeklyAchievementIds]));
+
+    // Missions (Denver day).
+    const day = this.missionDayOf(p);
+    if (b.denverToday === day.date) {
+      const stored = s.missions;
+      if (stored && typeof stored === 'object' && stored.date === day.date && stored.progress && typeof stored.progress === 'object') {
+        for (const [tid, v] of Object.entries(stored.progress as Record<string, unknown>)) {
+          day.progress[tid] = Math.max(num(v), num(day.progress[tid]));
+        }
+      }
+      day.claimed = Array.from(new Set([...day.claimed, ...b.missionClaims]));
+    }
+
+    if (b.displayName && !p.playerName) p.playerName = b.displayName;
+    if (b.publicId) p.publicId = b.publicId;
+    p.hydrated = true;
+    p.everHydrated = true;
+  }
+
+  /** The legacy cosmetic mirrors older clients read (ownedThemes, equippedTableTheme, …). */
+  private syncLegacyCosmetics(p: PlayerProgress): void {
+    const owned = p.owned || new Set<string>();
+    const ofType = (t: string) => [...owned].filter((k) => k.startsWith(`${t}:`)).map((k) => k.slice(t.length + 1));
+    p.ownedThemes = Array.from(new Set(['classic_blue', ...ofType('theme')]));
+    p.ownedTableThemes = Array.from(new Set(['default', ...ofType('theme')]));
+    p.ownedCardBacks = Array.from(new Set(['default', ...ofType('card_back')]));
+    p.equippedTableTheme = p.equipped?.theme || 'default';
+    p.equippedCardBack = p.equipped?.card_back || 'default';
+  }
+
+  /**
+   * Sign-in refresh (C5: "login always re-hydrates from the DB"): the account's
+   * record is created if needed and re-read from Postgres — a fresh load the
+   * first time, a merge afterwards. Returns the record (hydrated or not).
+   */
+  async refreshUser(userId: number, displayName: string): Promise<PlayerProgress | undefined> {
+    const uid = validUserId(userId);
+    if (!uid) return undefined;
+    const ukey = userProgressKey(uid);
+    const p = this.getOrCreateProgress(ukey, displayName, uid);
+    await this.hydrateFromDB(ukey, uid, { refresh: true });
+    return p;
+  }
+
+  /** Overwrite the DB-owned wallet fields of a loaded record (a transaction's RETURNING / a fresh read). */
+  applyWallet(userId: number, w: Partial<Balances> & { loginStreak?: number; lastLoginClaimDate?: string | null }): void {
+    const p = this.userRecord(userId);
+    if (!p) return;
+    const inner = this.inner(p);
+    if (typeof w.chips === 'number' && Number.isFinite(w.chips)) p.chips = w.chips + inner.pendChips;
+    if (typeof w.stars === 'number' && Number.isFinite(w.stars)) p.stars = w.stars + inner.pendStars;
+    if (typeof w.scratchCardsAvailable === 'number') p.scratchCardsAvailable = w.scratchCardsAvailable;
+    if (typeof w.loginStreak === 'number') p.dailyLoginStreak = w.loginStreak;
+    if (w.lastLoginClaimDate !== undefined) { p.lastLoginClaimDate = w.lastLoginClaimDate; p.lastLoginDate = w.lastLoginClaimDate || ''; }
+  }
+
+  /** Apply a change to a loaded record (economy handlers mirror their committed transaction). */
+  updateUser(userId: number, fn: (p: PlayerProgress) => void): PlayerProgress | undefined {
+    const p = this.userRecord(userId);
+    if (!p) return undefined;
+    fn(p);
+    if (!p.owned) p.owned = new Set();
+    if (!p.equipped) p.equipped = {};
+    this.syncLegacyCosmetics(p);
+    return p;
+  }
+
+  /**
+   * Drop records nobody uses (P3: progressMap was never evicted). A record of an
+   * account with a live socket / seat (`isLive`) is kept; so is one with a
+   * settlement in flight. Aliases pointing at a dropped record go with it.
+   */
+  evictIdle(isLive: (userId: number) => boolean, idleMs = 30 * 60_000): string[] {
+    const now = this.now();
+    const dropped: string[] = [];
+    for (const [key, p] of this.progressMap) {
+      if (now - (p.lastTouchedAt || 0) < idleMs) continue;
+      if (p.userId && isLive(p.userId)) continue;
+      const i = this.internals.get(p);
+      if (i && i.pendingAch.size > 0) continue;
+      if (this.hydrations.has(key)) continue;
+      this.progressMap.delete(key);
+      this.pendingEvents.delete(key);
+      const rt = this.retryTimers.get(key);
+      if (rt?.timer) clearTimeout(rt.timer);
+      this.retryTimers.delete(key);
+      dropped.push(key);
+    }
+    if (dropped.length) {
+      const gone = new Set(dropped);
+      for (const [alias, key] of this.aliases) if (gone.has(key)) this.aliases.delete(alias);
+    }
+    return dropped;
+  }
+
+  /** Forget a seat playerId alias (the seat is gone). The account's record stays. */
+  dropAlias(playerId: string): void {
+    this.aliases.delete(playerId);
+  }
+
+  get size(): number { return this.progressMap.size; }
+  get aliasCount(): number { return this.aliases.size; }
+
+  // ───────────────────────── rewards ─────────────────────────
+
   /**
    * Credit REAL reward chips to an ONLINE player (referral reward, etc.):
    * additive in-memory so their live client sees it immediately, AND additive to
@@ -771,7 +984,7 @@ export class ProgressionManager {
    * players are credited DB-only by the caller via addChipsToUser.
    */
   creditChips(playerId: string, amount: number): boolean {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress || amount <= 0) return false;
     progress.chips += amount;
     if (progress.userId) {
@@ -782,7 +995,15 @@ export class ProgressionManager {
     return true;
   }
 
-  private persistChipReward(progress: PlayerProgress, amount: number): void {
+  /**
+   * Persist a chip reward. 2026-10-11 (R2, ECON-10): an ACHIEVEMENT reward
+   * (`ledger` given) is paid through its durable ledger — chips AND stars in
+   * one transaction that pays only when the ledger INSERT returns a row
+   * (settleRewardLedger). Without a ledger: the atomic additive credit
+   * (hydrated gate, as before).
+   */
+  private persistChipReward(progress: PlayerProgress, amount: number, ledger?: AchievementLedgerRef): void {
+    if (ledger) { this.settleRewardLedger(progress, ledger); return; }
     if (!progress.userId || amount <= 0) return;
     if (!progress.hydrated) {
       console.warn(`[persistChipReward ${progress.userId}] SKIPPED — not hydrated`);
@@ -793,12 +1014,7 @@ export class ProgressionManager {
     );
   }
 
-  /**
-   * Persist a star REWARD durably via atomic-additive addStarsToUser. Replaces
-   * the incremental persistStars(GREATEST-snapshot) calls in reward paths,
-   * which could silently drop a concurrent additive star grant (F4). GREATEST
-   * is right for a full-balance resync, wrong for an incremental grant.
-   */
+  /** Atomic additive star credit (no ledger); hydrated gate. */
   private persistStarReward(progress: PlayerProgress, amount: number): void {
     if (!progress.userId || amount <= 0) return;
     if (!progress.hydrated) {
@@ -810,83 +1026,144 @@ export class ProgressionManager {
     );
   }
 
+  /**
+   * The achievement payout: the record already shows the reward (optimistic —
+   * the toast-free part), the DB pays it only if the ledger says it is new.
+   *   paid    → confirmed: lifetime id stored, XP granted, event + audit, push.
+   *   already → paid elsewhere (another process / an earlier session): the
+   *             optimistic chips/stars are taken back, the id kept as earned.
+   *   error   → taken back, un-marked, retried after a minute.
+   */
+  private settleRewardLedger(p: PlayerProgress, l: AchievementLedgerRef): void {
+    const inner = this.inner(p);
+    const unmark = () => {
+      inner.pendingAch.delete(l.pendingKey);
+      if (l.category === 'daily') p.dailyAchievementsToday = p.dailyAchievementsToday.filter((x) => x !== l.def.id);
+      if (l.category === 'weekly') p.weeklyAchievementsThisWeek = p.weeklyAchievementsThisWeek.filter((x) => x !== l.def.id);
+    };
+    const settled = () => {
+      inner.pendChips = Math.max(0, inner.pendChips - l.optimisticChips);
+      inner.pendStars = Math.max(0, inner.pendStars - l.optimisticStars);
+    };
+    const takeBack = () => {
+      p.chips = Math.max(0, p.chips - l.optimisticChips);
+      p.stars = Math.max(0, p.stars - l.optimisticStars);
+    };
+    if (!p.userId || !p.hydrated) {
+      settled();
+      takeBack();
+      unmark();
+      return;
+    }
+    const userId = p.userId;
+    const job = settleAchievementReward(userId, l.category, l.def.id, l.windowKey, { chips: l.def.reward.chips, stars: l.def.reward.stars || 0 }, { now: this.now() })
+      .then((res) => {
+        inner.pendingAch.delete(l.pendingKey);
+        settled();
+        if (res.status === 'paid') {
+          p.chips += res.chips - l.optimisticChips;
+          p.stars += res.stars - l.optimisticStars;
+          if (l.category === 'lifetime' && !p.achievements.includes(l.def.id)) p.achievements.push(l.def.id);
+          if (l.def.reward.xp > 0) this.addXP(p.playerId, l.def.reward.xp);
+          this.pushEvent(p.playerId, {
+            type: 'achievementUnlocked',
+            data: { category: l.category, id: l.def.id, name: l.def.name, description: l.def.description, reward: l.def.reward, chipsPaid: res.chips },
+          });
+          this.audit({ userId, kind: 'achievement', chips: res.chips, stars: res.stars, detail: { category: l.category, achId: l.def.id, window: l.windowKey } });
+        } else {
+          takeBack();
+          if (l.category === 'lifetime' && !p.achievements.includes(l.def.id)) p.achievements.push(l.def.id);
+        }
+        this.notify(p);
+      })
+      .catch((e: any) => {
+        settled();
+        takeBack();
+        unmark();
+        inner.achRetryAfter.set(l.pendingKey, this.now() + 60_000);
+        console.warn(`[ProgressionManager.achievement ${userId} ${l.category}/${l.def.id}] settlement failed — will retry:`, e?.message || e);
+        this.notify(p);
+      });
+    this.track(job);
+  }
+
   // Consume pending events (levelUp, achievements, missionComplete)
   consumeEvents(playerId: string): ProgressEvent[] {
-    const events = this.pendingEvents.get(playerId) || [];
-    this.pendingEvents.delete(playerId);
+    const key = this.keyOf(playerId);
+    const events = this.pendingEvents.get(key) || [];
+    this.pendingEvents.delete(key);
     return events;
   }
 
   private pushEvent(playerId: string, event: ProgressEvent): void {
-    if (!this.pendingEvents.has(playerId)) {
-      this.pendingEvents.set(playerId, []);
+    const key = this.keyOf(playerId);
+    if (!this.pendingEvents.has(key)) {
+      this.pendingEvents.set(key, []);
     }
-    this.pendingEvents.get(playerId)!.push(event);
+    const list = this.pendingEvents.get(key)!;
+    list.push(event);
+    if (list.length > 50) list.splice(0, list.length - 50);
+  }
+
+  /** The live chip-booster multiplier (1 when none). */
+  private chipBoost(progress: PlayerProgress): number {
+    const b = progress.activeBoosters?.chip;
+    return b && b.expiresAt > this.now() && b.mult > 0 ? b.mult : 1;
   }
 
   /**
    * Active chip-booster multiplier, applied to chip REWARD grants only
-   * (daily bonus, missions, achievements, level-up). NEVER applied to pot
-   * winnings — that would mint chips and break table conservation. Rewards are
-   * already grants (mints), so boosting them is conservation-safe. The shop
-   * stores the booster on progress.activeBoosters.chip { mult, expiresAt }.
+   * (level-up, achievements, missions, daily login, spin, scratch — see
+   * CHIP_BOOSTED_REWARDS). NEVER applied to pot winnings — that would mint
+   * chips and break table conservation.
    */
   private boostChipReward(progress: PlayerProgress, amount: number): number {
-    const b = (progress as any).activeBoosters?.chip;
-    if (b && b.expiresAt > Date.now() && b.mult > 0) return Math.round(amount * b.mult);
-    return amount;
+    return Math.round(amount * this.chipBoost(progress));
   }
 
   addXP(playerId: string, amount: number): void {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return;
     if (progress.level >= MAX_LEVEL) {
-      // At cap — just accumulate for stats, no further level-ups.
       progress.xp = 0;
       progress.xpToNextLevel = Infinity;
       return;
     }
 
     // Apply XP booster if active (consumable from shop).
-    const xpBooster = (progress as any).activeBoosters?.xp;
-    if (xpBooster && xpBooster.expiresAt > Date.now()) {
+    const xpBooster = progress.activeBoosters?.xp;
+    if (xpBooster && xpBooster.expiresAt > this.now()) {
       amount = Math.round(amount * (xpBooster.mult || 1));
     }
-    // Apply the VIP loyalty tier XP-rate perk (Silver 1.5x / Gold 2x / Platinum
-    // 3x), computed from the player's cumulative season XP BEFORE this gain so it
-    // matches the tier the client's VIPPanel displays. This was an advertised
-    // perk that did nothing. Stacks with the consumable XP booster above.
+    // The loyalty XP-rate perk (Silver 1.5x / Gold 2x / Platinum 3x by
+    // cumulative season XP BEFORE this gain — the tier VIPPanel shows).
     const vipRate = this.vipXpRate(progress);
     if (vipRate > 1) amount = Math.round(amount * vipRate);
     progress.xp += amount;
 
-    // Accumulate the level-up reward across all levels crossed in this call,
-    // then persist ONCE (atomic-additive) plus the level bump. Persisting the
-    // reward chips/stars is the F1 fix; persisting the level immediately is
-    // what keeps it exactly-once — otherwise a redeploy before the next
-    // saveProgress would rehydrate the OLD level, let the player re-cross the
-    // same threshold, and re-collect the same level's chips (a mint).
-    let leveledChips = 0;
-    let leveledStars = 0;
+    // Accumulate the level-up rewards across every level crossed, show them at
+    // once (optimistic), and settle them through the per-LEVEL ledger
+    // (economyDb.settleLevelUps): each level pays exactly once, whatever order
+    // the hand-complete save and this commit land in.
+    const levels: Array<{ level: number; chips: number; stars: number }> = [];
     while (progress.level < MAX_LEVEL && progress.xp >= progress.xpToNextLevel) {
       progress.xp -= progress.xpToNextLevel;
       progress.level++;
       progress.xpToNextLevel = xpRequiredForLevel(progress.level);
 
-      // Reward schedule: base per-level stars + milestone bonuses.
-      const baseChips = this.boostChipReward(progress, progress.level * 500);
+      const baseChips = progress.level * 500;
+      const shownChips = this.boostChipReward(progress, baseChips);
       const baseStars = progress.level * 5;
       const bonusStars = milestoneStarsBonus(progress.level);
-      progress.chips += baseChips;
+      progress.chips += shownChips;
       progress.stars += baseStars + bonusStars;
-      leveledChips += baseChips;
-      leveledStars += baseStars + bonusStars;
+      levels.push({ level: progress.level, chips: baseChips, stars: baseStars + bonusStars });
 
       this.pushEvent(playerId, {
         type: 'levelUp',
         data: {
           newLevel: progress.level,
-          bonusChips: baseChips,
+          bonusChips: shownChips,
           bonusStars: baseStars + bonusStars,
           milestoneStars: bonusStars,
           isMilestone: bonusStars > 0,
@@ -899,39 +1176,114 @@ export class ProgressionManager {
       progress.xpToNextLevel = Infinity;
     }
 
-    if (leveledChips > 0 || leveledStars > 0) {
-      // 2026-07-05 audit P3 fix: credit the level-up chips/stars AND ratchet the
-      // level in ONE atomic UPDATE (gated on the level advancing) instead of three
-      // independent fire-and-forget writes. Previously a crash between the chip
-      // credit and the level ratchet let a rehydrate reload the OLD level, re-cross
-      // the threshold, and re-mint the reward. dbCommitLevelUpReward is exactly-once.
-      if (progress.userId && progress.hydrated) {
-        dbCommitLevelUpReward(progress.userId, leveledChips, leveledStars, progress.level, progress.xp).catch((e) =>
-          console.warn(`[ProgressionManager.levelUp commit ${progress.userId}]`, e?.message)
-        );
-      }
+    if (levels.length > 0 && progress.userId && progress.hydrated) {
+      const shownChips = levels.reduce((s, l) => s + this.boostChipReward(progress, l.chips), 0);
+      const shownStars = levels.reduce((s, l) => s + l.stars, 0);
+      const inner = this.inner(progress);
+      inner.pendChips += shownChips;
+      inner.pendStars += shownStars;
+      this.settleLevels(progress, levels, progress.level, progress.xp, shownChips, shownStars, 0);
     }
   }
 
-  recordHandPlayed(playerId: string, variantId?: string): void {
-    const progress = this.progressMap.get(playerId);
+  private settleLevels(
+    progress: PlayerProgress, levels: Array<{ level: number; chips: number; stars: number }>, newLevel: number, xp: number,
+    shownChips: number, shownStars: number, attempt: number,
+  ): void {
+    const userId = progress.userId!;
+    const inner = this.inner(progress);
+    const settled = () => {
+      inner.pendChips = Math.max(0, inner.pendChips - shownChips);
+      inner.pendStars = Math.max(0, inner.pendStars - shownStars);
+    };
+    const job = settleLevelUps(userId, levels, newLevel, xp, { now: this.now() })
+      .then((res) => {
+        settled();
+        // Levels the ledger had already paid (another process / a stale record) are taken back.
+        progress.chips = Math.max(0, progress.chips + res.chips - shownChips);
+        progress.stars = Math.max(0, progress.stars + res.stars - shownStars);
+        if (res.chips > 0 || res.stars > 0) {
+          this.audit({ userId, kind: 'level_up', chips: res.chips, stars: res.stars, detail: { levels: res.paidLevels } });
+        }
+        this.notify(progress);
+      })
+      .catch((e: any) => {
+        if (attempt < 2) {
+          const retry = new Promise<void>((resolve) => setTimeout(() => {
+            this.settleLevels(progress, levels, newLevel, xp, shownChips, shownStars, attempt + 1);
+            resolve();
+          }, 500 * (attempt + 1)));
+          this.track(retry);
+          return;
+        }
+        settled();
+        progress.chips = Math.max(0, progress.chips - shownChips);
+        progress.stars = Math.max(0, progress.stars - shownStars);
+        console.error(`[ProgressionManager.levelUp ${userId}] reward settlement failed after retries (levels ${levels.map((l) => l.level).join(',')}):`, e?.message || e);
+        this.notify(progress);
+      });
+    this.track(job);
+  }
+
+  // ───────────────────────── per-hand recording ─────────────────────────
+
+  private flagsFor(p: PlayerProgress, ref?: HandRef): HandFlags {
+    const inner = this.inner(p);
+    const key = handKeyOf(ref);
+    let f = inner.handFlags.get(key);
+    if (!f) {
+      f = emptyFlags();
+      inner.handFlags.set(key, f);
+      if (inner.handFlags.size > 20) {
+        const first = inner.handFlags.keys().next().value;
+        if (first !== undefined) inner.handFlags.delete(first);
+      }
+    }
+    return f;
+  }
+
+  /** The hand's flags, removed (the hand is being committed). A late action of a committed hand applies directly. */
+  private takeFlags(p: PlayerProgress, ref?: HandRef): HandFlags {
+    const inner = this.inner(p);
+    const key = handKeyOf(ref);
+    const f = inner.handFlags.get(key) || emptyFlags();
+    inner.handFlags.delete(key);
+    if (key) {
+      inner.committedHands.push(key);
+      if (inner.committedHands.length > 20) inner.committedHands.shift();
+    }
+    return f;
+  }
+
+  private handCommitted(p: PlayerProgress, ref?: HandRef): boolean {
+    const key = handKeyOf(ref);
+    return !!key && this.inner(p).committedHands.includes(key);
+  }
+
+  /**
+   * A hand the player was DEALT INTO completed (handleHandComplete calls this
+   * only for dealt-in seats — ECON-13). `ref` = { tableId, handNumber }.
+   */
+  recordHandPlayed(playerId: string, variantId?: string, ref?: HandRef, dealtIn = true): void {
+    const progress = this.rec(playerId);
     if (!progress) return;
+    if (!dealtIn) {
+      // ECON-13 — a seat sitting out / joining mid-hand: no hand, no XP, no
+      // mission, no scratch progress. Its per-hand flags are dropped.
+      this.takeFlags(progress, ref);
+      return;
+    }
 
     progress.totalHandsPlayed++;
-    (progress as any).lastHandAt = Date.now();
+    progress.lastHandAt = this.now();
 
-    // Commit the per-hand VPIP/PFR flags set in recordAction, then reset them
-    // for the next hand. Denominator = totalHandsPlayed (just incremented).
-    if ((progress as any)._vpipThisHand) progress.vpipHands = (progress.vpipHands || 0) + 1;
-    if ((progress as any)._pfrThisHand) progress.pfrHands = (progress.pfrHands || 0) + 1;
-    (progress as any)._vpipThisHand = false;
-    (progress as any)._pfrThisHand = false;
-
-    // Commit per-hand 3-bet flags (set by recordPreflopRaiseContext).
-    if ((progress as any)._faced3betThisHand) progress.threeBetOpps = (progress.threeBetOpps || 0) + 1;
-    if ((progress as any)._did3betThisHand) progress.threeBets = (progress.threeBets || 0) + 1;
-    (progress as any)._faced3betThisHand = false;
-    (progress as any)._did3betThisHand = false;
+    const f = this.takeFlags(progress, ref);
+    if (f.vpip) progress.vpipHands = (progress.vpipHands || 0) + 1;
+    if (f.pfr) progress.pfrHands = (progress.pfrHands || 0) + 1;
+    if (f.faced3bet) progress.threeBetOpps = (progress.threeBetOpps || 0) + 1;
+    if (f.did3bet) progress.threeBets = (progress.threeBets || 0) + 1;
+    // Remembered for recordShowdownResult of the same hand (called right after).
+    this.inner(progress).handFlags.set(`sd|${handKeyOf(ref)}`, { ...emptyFlags(), foldedPreflop: f.foldedPreflop });
 
     // Track variant breadth for lifetime "all_variants" + daily/weekly buckets.
     if (variantId && !progress.variantsPlayed.includes(variantId)) {
@@ -939,83 +1291,72 @@ export class ProgressionManager {
     }
     this.tickWindows(progress, 'played', { variantId });
 
-    // Update missions
-    for (const mission of progress.dailyMissions) {
-      if (mission.completed || mission.claimed) continue;
-      if (mission.type === MissionType.PlayHands) {
-        mission.progress = Math.min(mission.progress + 1, mission.target);
-        if (mission.progress >= mission.target) {
-          mission.completed = true;
-          this.pushEvent(playerId, {
-            type: 'missionComplete',
-            data: { missionId: mission.id, description: mission.description, reward: mission.reward },
-          });
-        }
-      }
-    }
+    this.advanceMissions(progress, { played: true, allIns: f.allIns });
 
     this.checkAchievements(playerId);
   }
 
   /**
-   * Record the showdown outcome of a hand for the WTSD / W$SD HUD stats. Called
-   * once per seated human at hand-complete. `sawFlop` is derived from the
-   * per-hand _foldedPreflop flag set in recordAction (folded preflop = never saw
-   * the flop). The flag is reset here for the next hand.
-   */
-  /**
    * Preflop 3-bet context for the HUD 3-Bet%. `facingRaise` = the player is
    * acting with a prior preflop raise already in front of them (a 3-bet spot);
-   * `isReraise` = they raised in that spot (a 3-bet+). Sets per-hand flags
-   * committed in recordHandPlayed. Fed by the per-table playerAction listener.
+   * `isReraise` = they raised in that spot (a 3-bet+). Fed by the per-table
+   * playerAction listener, keyed by the hand.
    */
-  recordPreflopRaiseContext(playerId: string, facingRaise: boolean, isReraise: boolean): void {
-    const progress = this.progressMap.get(playerId);
+  recordPreflopRaiseContext(playerId: string, facingRaise: boolean, isReraise: boolean, ref?: HandRef): void {
+    const progress = this.rec(playerId);
     if (!progress) return;
-    if (facingRaise) (progress as any)._faced3betThisHand = true;
-    if (isReraise) (progress as any)._did3betThisHand = true;
+    if (this.handCommitted(progress, ref)) {
+      if (facingRaise) progress.threeBetOpps = (progress.threeBetOpps || 0) + 1;
+      if (isReraise) progress.threeBets = (progress.threeBets || 0) + 1;
+      return;
+    }
+    const f = this.flagsFor(progress, ref);
+    if (facingRaise) f.faced3bet = true;
+    if (isReraise) f.did3bet = true;
   }
 
-  recordShowdownResult(playerId: string, flopDealt: boolean, reachedShowdown: boolean, wonAtShowdown: boolean): void {
-    const progress = this.progressMap.get(playerId);
+  /**
+   * Record the showdown outcome of a hand for the WTSD / W$SD HUD stats. Called
+   * once per dealt-in human at hand-complete, after recordHandPlayed. `sawFlop`
+   * is derived from the hand's foldedPreflop flag.
+   */
+  recordShowdownResult(playerId: string, flopDealt: boolean, reachedShowdown: boolean, wonAtShowdown: boolean, ref?: HandRef): void {
+    const progress = this.rec(playerId);
     if (!progress) return;
-    const sawFlop = flopDealt && !(progress as any)._foldedPreflop;
+    const inner = this.inner(progress);
+    const sdKey = `sd|${handKeyOf(ref)}`;
+    const folded = inner.handFlags.get(sdKey)?.foldedPreflop || false;
+    inner.handFlags.delete(sdKey);
+    const sawFlop = flopDealt && !folded;
     if (sawFlop) progress.flopsSeenHands = (progress.flopsSeenHands || 0) + 1;
     if (reachedShowdown) progress.showdownHands = (progress.showdownHands || 0) + 1;
     if (wonAtShowdown) progress.showdownWins = (progress.showdownWins || 0) + 1;
-    (progress as any)._foldedPreflop = false;
   }
 
   /**
    * Record a finished tournament for a participant. position 1 === winner.
    * Called once per participant from payTournamentPrizes (rides its
    * paidOutTournaments idempotency guard). AI players have no progress entry,
-   * so this no-ops for them. These counters feed the tournament achievements
-   * (first win / 10 wins / 50 played / weekly win) that were previously
-   * unreachable because nothing ever incremented them.
+   * so this no-ops for them.
    */
   recordTournamentResult(playerId: string, position: number): void {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return;
 
     progress.tournamentsPlayed = (progress.tournamentsPlayed || 0) + 1;
     if (position === 1) {
       progress.tournamentsWon = (progress.tournamentsWon || 0) + 1;
-      // Ensure the weekly window is current before ticking its counter.
       this.rollAchievementWindows(progress);
       progress.weeklyStats.tournamentsWonThisWeek = (progress.weeklyStats.tournamentsWonThisWeek || 0) + 1;
     }
 
-    // Persist the lifetime counters durably — a win/finish must survive an
-    // immediate quit, when no further hand-complete save fires for this user.
-    // JSONB-merges; hydrated gate prevents clobbering real DB values.
+    // Persist the lifetime counters durably (a win must survive an immediate
+    // quit) — merged under the row lock, never lowered (R2: max-merge).
     if (progress.userId && progress.hydrated) {
-      dbSaveProgress(progress.userId, {
-        stats: {
-          tournamentsWon: progress.tournamentsWon,
-          tournamentsPlayed: progress.tournamentsPlayed,
-        },
-      }).catch((e: any) => console.warn(`[recordTournamentResult ${progress.userId}]`, e?.message));
+      dbMergeUserStats(progress.userId, {
+        tournamentsWon: progress.tournamentsWon,
+        tournamentsPlayed: progress.tournamentsPlayed,
+      }, { monotonic: true }).catch((e: any) => console.warn(`[recordTournamentResult ${progress.userId}]`, e?.message));
     }
 
     this.checkAchievements(playerId);
@@ -1027,7 +1368,7 @@ export class ProgressionManager {
     handRank?: number,
     wasAllIn?: boolean
   ): void {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return;
 
     progress.handsWon++;
@@ -1082,48 +1423,13 @@ export class ProgressionManager {
     else if (potSize >= 1000) xpGain += 5;
     this.addXP(playerId, xpGain);
 
-    // Update missions
-    for (const mission of progress.dailyMissions) {
-      if (mission.completed || mission.claimed) continue;
-
-      switch (mission.type) {
-        case MissionType.WinHands:
-          mission.progress = Math.min(mission.progress + 1, mission.target);
-          break;
-        case MissionType.WinPotOver:
-          if (potSize >= mission.target) {
-            mission.progress = mission.target;
-          }
-          break;
-        case MissionType.WinStreak:
-          mission.progress = Math.min(progress.currentStreak, mission.target);
-          break;
-        case MissionType.GetHandRank:
-          if (handRank !== undefined && handRank >= mission.target) {
-            mission.progress = mission.target;
-          }
-          break;
-        case MissionType.WinWithBluff:
-          if (handRank !== undefined && handRank < 1) {
-            mission.progress = Math.min(mission.progress + 1, mission.target);
-          }
-          break;
-      }
-
-      if (mission.progress >= mission.target && !mission.completed) {
-        mission.completed = true;
-        this.pushEvent(playerId, {
-          type: 'missionComplete',
-          data: { missionId: mission.id, description: mission.description, reward: mission.reward },
-        });
-      }
-    }
+    this.advanceMissions(progress, { win: { potWon: potSize, handRank, currentStreak: progress.currentStreak } });
 
     this.checkAchievements(playerId);
   }
 
   recordHandLost(playerId: string): void {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return;
     progress.currentStreak = 0;
     // Also break the within-today streak so daily streak achievements
@@ -1133,7 +1439,7 @@ export class ProgressionManager {
   }
 
   recordChipHistory(playerId: string, chipCount: number): void {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return;
     progress.chipHistory.push(chipCount);
     if (progress.chipHistory.length > 20) {
@@ -1142,7 +1448,7 @@ export class ProgressionManager {
   }
 
   recordPositionResult(playerId: string, position: string, won: boolean): void {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return;
     if (!progress.positionWins[position]) {
       progress.positionWins[position] = { wins: 0, total: 0 };
@@ -1153,81 +1459,14 @@ export class ProgressionManager {
     }
   }
 
-  purchaseTheme(playerId: string, themeId: string, cost: number): { success: boolean; error?: string } {
-    const progress = this.progressMap.get(playerId);
-    if (!progress) return { success: false, error: 'Player not found' };
-    if (progress.ownedThemes.includes(themeId)) return { success: false, error: 'Already owned' };
-    if (progress.stars < cost) return { success: false, error: 'Not enough stars' };
-
-    // 2026-05-12 audit fix: this used to call `this.persistStars(progress)`
-    // after `progress.stars -= cost`. After the round-1 GREATEST ratchet
-    // change in persistStars (`SET stars = GREATEST(stars, $1)`) the DB
-    // refused to lower the value — user kept their stars AND got the theme.
-    // Use the atomic deduct path instead, which uses
-    // `UPDATE ... SET stars = stars - $1 WHERE stars >= $1`. Returns false
-    // on insufficient DB-side balance (defense-in-depth against in-memory
-    // drift from the live DB row).
-    const dbUid = progress.userId;
-    if (typeof dbUid === 'number' && dbUid > 0) {
-      dbDeductStars(dbUid, cost).then((ok) => {
-        if (!ok) {
-          // DB had less than the in-memory snapshot — roll back in-memory.
-          progress.stars += cost;
-          const idx = progress.ownedThemes.indexOf(themeId);
-          if (idx >= 0) progress.ownedThemes.splice(idx, 1);
-          console.warn(`[purchaseTheme ${progress.userId}] DB deduct rejected for ${cost} stars on ${themeId}; rolled back in-memory`);
-        }
-      }).catch((e) => {
-        console.warn(`[purchaseTheme ${progress.userId}] deductStars threw:`, e?.message);
-      });
-    }
-    progress.stars -= cost;
-    progress.ownedThemes.push(themeId);
-    return { success: true };
-  }
-
-  /**
-   * Authoritative variant of purchaseTheme (2026-07-05 audit P2 fix). purchaseTheme
-   * returns success from the IN-MEMORY snapshot and fires the DB star deduction
-   * fire-and-forget, rolling back in-memory only if it later fails — so a caller
-   * that grants an entitlement on the back of the charge (purchaseBattlePass) could
-   * hand out the entitlement for free when the DB row had fewer stars than the
-   * in-memory value (drift, e.g. right after a redeploy). This variant AWAITS the DB
-   * deduct and only commits the in-memory spend + returns success if it succeeded.
-   */
-  async purchaseThemeAtomic(playerId: string, themeId: string, cost: number): Promise<{ success: boolean; error?: string }> {
-    const progress = this.progressMap.get(playerId);
-    if (!progress) return { success: false, error: 'Player not found' };
-    if (progress.ownedThemes.includes(themeId)) return { success: false, error: 'Already owned' };
-    if (progress.stars < cost) return { success: false, error: 'Not enough stars' };
-    const dbUid = progress.userId;
-    if (typeof dbUid === 'number' && dbUid > 0) {
-      let ok = false;
-      try { ok = await dbDeductStars(dbUid, cost); } catch { ok = false; }
-      if (!ok) return { success: false, error: 'Not enough stars' };
-    }
-    progress.stars -= cost;
-    progress.ownedThemes.push(themeId);
-    return { success: true };
-  }
-
-  equipTheme(playerId: string, themeId: string): { success: boolean; error?: string } {
-    const progress = this.progressMap.get(playerId);
-    if (!progress) return { success: false, error: 'Player not found' };
-    if (!progress.ownedThemes.includes(themeId)) return { success: false, error: 'Theme not owned' };
-
-    progress.equippedTableTheme = themeId;
-    return { success: true };
-  }
-
   /**
    * Update ELO for a head-to-head result. Call once per winner-loser pair per hand.
    * For multi-player games pass the average ELO of all other players as opponentElo.
    */
   updateElo(winnerId: string, loserId: string): void {
-    const winner = this.progressMap.get(winnerId);
-    const loser = this.progressMap.get(loserId);
-    if (!winner || !loser) return;
+    const winner = this.rec(winnerId);
+    const loser = this.rec(loserId);
+    if (!winner || !loser || winner === loser) return;
 
     const winnerChange = calcEloChange(winner.elo, loser.elo, true);
     const loserChange = calcEloChange(loser.elo, winner.elo, false);
@@ -1237,9 +1476,8 @@ export class ProgressionManager {
 
     if (winner.elo > winner.peakElo) winner.peakElo = winner.elo;
 
-    // 2026-07-07 gap-fill — record a bounded ELO sample for the rank sparkline
-    // so it shows a REAL trend (was a fake flat line). Capped to the last 30.
-    const now = Date.now();
+    // Bounded ELO samples for the rank sparkline (persisted since R2).
+    const now = this.now();
     const pushElo = (p: PlayerProgress) => {
       if (!Array.isArray(p.eloHistory)) p.eloHistory = [];
       p.eloHistory.push({ t: now, elo: p.elo });
@@ -1255,11 +1493,15 @@ export class ProgressionManager {
     loser.rankedLosses++;
   }
 
+  /**
+   * The HUD (C10): computed from the record's PERSISTED counters (since R2 the
+   * action / position counters are stored too), so an unseated socket gets the
+   * same numbers as a seated one. Null stats = no sample yet (client shows N/A).
+   */
   getDetailedStats(playerId: string): object | null {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return null;
 
-    // Derive HUD stats from the real tracked counters.
     const th = progress.totalHandsPlayed || 0;
     const ac = progress.actionCounts || {};
     const passive = ac.call || 0;
@@ -1269,15 +1511,16 @@ export class ProgressionManager {
       : (aggressive > 0 ? 99 : 0);
     const vpip = th > 0 ? Number((((progress.vpipHands || 0) / th) * 100).toFixed(1)) : 0;
     const pfr = th > 0 ? Number((((progress.pfrHands || 0) / th) * 100).toFixed(1)) : 0;
-    // Showdown stats. WTSD = went to showdown / saw a flop; W$SD = won at
-    // showdown / went to showdown. Null when there's no sample yet so the client
-    // shows N/A rather than a misleading 0.
     const fs = progress.flopsSeenHands || 0;
     const sd = progress.showdownHands || 0;
     const wtsd = fs > 0 ? Number(((sd / fs) * 100).toFixed(1)) : null;
     const wsd = sd > 0 ? Number((((progress.showdownWins || 0) / sd) * 100).toFixed(1)) : null;
     const tbo = progress.threeBetOpps || 0;
     const threeBet = tbo > 0 ? Number((((progress.threeBets || 0) / tbo) * 100).toFixed(1)) : null;
+    const positionStats: Record<string, { wins: number; total: number; winRate: number | null }> = {};
+    for (const [pos, v] of Object.entries(progress.positionWins || {})) {
+      positionStats[pos] = { wins: v.wins, total: v.total, winRate: v.total > 0 ? Number(((v.wins / v.total) * 100).toFixed(1)) : null };
+    }
 
     return {
       ...this.getClientProgress(playerId),
@@ -1285,13 +1528,12 @@ export class ProgressionManager {
       actionCounts: progress.actionCounts,
       chipHistory: progress.chipHistory,
       positionWins: progress.positionWins,
-      winRate: progress.totalHandsPlayed > 0
-        ? ((progress.handsWon / progress.totalHandsPlayed) * 100).toFixed(1)
-        : '0.0',
+      positionStats,
+      handsTracked: th,
+      winRate: winRateOf(progress),
       ownedThemes: progress.ownedThemes,
       bluffWins: progress.bluffWins,
       allInWins: progress.allInWins,
-      // Real HUD stats (VPIP/PFR as %, AF as ratio) computed from tracked data.
       vpip,
       pfr,
       af,
@@ -1300,70 +1542,48 @@ export class ProgressionManager {
       threeBet,
       vpipHands: progress.vpipHands || 0,
       pfrHands: progress.pfrHands || 0,
+      hydrated: progress.hydrated,
     };
   }
 
+  /**
+   * An action of a hand. 2026-10-11 (R2, C10/APPUI-10): fed from the table's
+   * 'playerAction' event, which fires with the phase the action was MADE in
+   * and before the hand can complete (it used to be recorded after the
+   * action was applied, reading the ALREADY ADVANCED phase: the preflop call
+   * that closed the round never counted for VPIP, and a flag set after the
+   * hand-complete commit leaked into the next hand). `ref` keys the per-hand
+   * flags by table + hand; a late action of a committed hand applies directly.
+   */
   recordAction(
     playerId: string,
     action: string,
-    context?: { phase?: string; handRank?: number }
+    context?: { phase?: string; handRank?: number; tableId?: string; handNumber?: number }
   ): void {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return;
 
-    // Track action counts for stats
     if (action === 'fold' || action === 'check' || action === 'call' || action === 'raise' || action === 'allIn') {
       const key = action === 'allIn' ? 'allin' : action;
       progress.actionCounts[key] = (progress.actionCounts[key] || 0) + 1;
     }
 
-    // Real VPIP/PFR tracking — flag this hand as voluntary/raised preflop. The
-    // per-hand transient flags are committed to the persisted counters in
-    // recordHandPlayed (once per dealt hand), so a limp+call in the same hand
-    // counts once. A preflop check (BB option) or fold is NOT voluntary.
-    if (context?.phase === 'PreFlop') {
-      if (action === 'call' || action === 'raise' || action === 'allIn') {
-        (progress as any)._vpipThisHand = true;
-      }
-      if (action === 'raise' || action === 'allIn') {
-        (progress as any)._pfrThisHand = true;
-      }
-      if (action === 'fold') {
-        // Folded preflop = never saw the flop (WTSD denominator excludes these).
-        (progress as any)._foldedPreflop = true;
-      }
-    }
-
-    if (action === 'allIn') {
-      for (const mission of progress.dailyMissions) {
-        if (mission.completed || mission.claimed) continue;
-        if (mission.type === MissionType.PlayAllIn) {
-          mission.progress = Math.min(mission.progress + 1, mission.target);
-          if (mission.progress >= mission.target && !mission.completed) {
-            mission.completed = true;
-            this.pushEvent(playerId, {
-              type: 'missionComplete',
-              data: { missionId: mission.id, description: mission.description, reward: mission.reward },
-            });
-          }
-        }
-      }
-    }
-
-    if (action === 'fold' && context?.phase === 'PreFlop') {
-      for (const mission of progress.dailyMissions) {
-        if (mission.completed || mission.claimed) continue;
-        if (mission.type === MissionType.FoldPreFlop) {
-          mission.progress = Math.min(mission.progress + 1, mission.target);
-          if (mission.progress >= mission.target && !mission.completed) {
-            mission.completed = true;
-            this.pushEvent(playerId, {
-              type: 'missionComplete',
-              data: { missionId: mission.id, description: mission.description, reward: mission.reward },
-            });
-          }
-        }
-      }
+    const ref: HandRef | undefined = context?.tableId != null && context?.handNumber != null
+      ? { tableId: context.tableId, handNumber: context.handNumber } : undefined;
+    const late = this.handCommitted(progress, ref);
+    const preflop = context?.phase === 'PreFlop';
+    const voluntary = action === 'call' || action === 'raise' || action === 'allIn';
+    const raised = action === 'raise' || action === 'allIn';
+    if (late) {
+      if (preflop && voluntary) progress.vpipHands = (progress.vpipHands || 0) + 1;
+      if (preflop && raised) progress.pfrHands = (progress.pfrHands || 0) + 1;
+      if (action === 'allIn') this.advanceMissions(progress, { allIns: 1 });
+    } else if (action !== 'chat') {
+      const f = this.flagsFor(progress, ref);
+      if (preflop && voluntary) f.vpip = true;
+      if (preflop && raised) f.pfr = true;
+      if (preflop && action === 'fold') f.foldedPreflop = true;
+      if (action === 'allIn') f.allIns++;
     }
 
     if (action === 'chat') {
@@ -1373,240 +1593,158 @@ export class ProgressionManager {
   }
 
   recordRoyalFlush(playerId: string): void {
-    const progress = this.progressMap.get(playerId);
-    if (!progress) return;
+    // royal_flush is a regular lifetime achievement since R2 (royalFlushHits,
+    // counted in recordHandWon, pays it through the ledger): a second path that
+    // paid it here could race the ledger. Just make sure the check has run.
+    this.checkAchievements(playerId);
+  }
 
-    if (!progress.achievements.includes('royal_flush')) {
-      const achDef = ACHIEVEMENTS.find((a) => a.id === 'royal_flush');
-      if (achDef) {
-        progress.achievements.push('royal_flush');
-        progress.chips += achDef.reward.chips;
-        progress.stars += (achDef.reward.stars || 0);
-        this.persistChipReward(progress, achDef.reward.chips);
-        this.persistStarReward(progress, achDef.reward.stars || 0);
-        this.addXP(playerId, achDef.reward.xp);
+  // ───────────────────────── missions (C6) ─────────────────────────
 
-        this.pushEvent(playerId, {
-          type: 'achievementUnlocked',
-          data: {
-            id: achDef.id,
-            name: achDef.name,
-            description: achDef.description,
-            reward: achDef.reward,
-          },
-        });
-      }
+  /** Today's (Denver) mission day of a record, rolled over at Denver midnight. */
+  private missionDayOf(p: PlayerProgress): MissionDayState {
+    const today = denverDateKey(this.now());
+    if (!p.missionDay || p.missionDay.date !== today) p.missionDay = emptyMissionDay(today);
+    return p.missionDay as MissionDayState;
+  }
+
+  private missionTemplatesOf(p: PlayerProgress): string[] {
+    if (!p.userId) return [];
+    return missionTemplateIdsFor(p.userId, this.missionDayOf(p).date);
+  }
+
+  private advanceMissions(p: PlayerProgress, event: Parameters<typeof applyMissionProgress>[2]): void {
+    const ids = this.missionTemplatesOf(p);
+    if (ids.length === 0) return;
+    const day = this.missionDayOf(p);
+    const done = applyMissionProgress(day, ids, event);
+    for (const tid of done) {
+      const t = missionTemplate(tid);
+      if (!t) continue;
+      this.pushEvent(p.playerId, {
+        type: 'missionComplete',
+        data: { missionId: `${day.date}:${tid}`, templateId: tid, description: t.description, reward: { ...t.reward } },
+      });
     }
   }
 
-  generateDailyMissions(playerId: string): Mission[] {
-    const progress = this.progressMap.get(playerId);
-    if (!progress) return [];
-
-    // Shuffle and pick 3 unique mission types
-    const shuffled = [...MISSION_TEMPLATES].sort(() => Math.random() - 0.5);
-    const selected: MissionTemplate[] = [];
-    const usedTypes = new Set<string>();
-
-    for (const template of shuffled) {
-      const key = `${template.type}_${template.target}`;
-      if (!usedTypes.has(key) && selected.length < 3) {
-        usedTypes.add(key);
-        selected.push(template);
-      }
-    }
-
-    progress.dailyMissions = selected.map((t) => ({
-      id: uuidv4(),
-      type: t.type,
-      description: t.description,
-      target: t.target,
-      progress: 0,
-      completed: false,
-      claimed: false,
-      reward: { ...t.reward },
-    }));
-
-    progress.dailyMissionsRefreshAt = Date.now() + MISSIONS_REFRESH_INTERVAL;
-
-    return progress.dailyMissions;
+  /** The C5 / C6 mission rows of a record. */
+  missionsOf(playerId: string): ReturnType<typeof missionRows> {
+    const p = this.rec(playerId);
+    if (!p) return [];
+    return missionRows(this.missionDayOf(p), this.missionTemplatesOf(p));
   }
 
-  getDailyMissions(playerId: string): Mission[] {
-    const progress = this.progressMap.get(playerId);
-    if (!progress) return [];
-
-    // Check if missions need refreshing
-    if (Date.now() >= progress.dailyMissionsRefreshAt || progress.dailyMissions.length === 0) {
-      return this.generateDailyMissions(playerId);
-    }
-
-    return progress.dailyMissions;
+  /**
+   * Can this mission be claimed now? (C6) It must be one of TODAY's (Denver)
+   * three missions of this account, complete, and not claimed yet. The claim
+   * itself is the ledger transaction (economyDb.settleMissionClaim).
+   */
+  missionClaimCheck(userId: number, missionIdRaw: unknown):
+    | { ok: true; dateKey: string; templateId: string; reward: { chips: number; xp: number; stars: number } }
+    | { ok: false; code: 'progress_loading' | 'mission_not_found' | 'mission_expired' | 'mission_incomplete' | 'already_claimed' } {
+    const p = this.userRecord(userId);
+    if (!p || !p.hydrated) return { ok: false, code: 'progress_loading' };
+    const parsed = parseMissionId(missionIdRaw);
+    if (!parsed) return { ok: false, code: 'mission_not_found' };
+    const day = this.missionDayOf(p);
+    if (parsed.dateKey !== day.date) return { ok: false, code: 'mission_expired' };
+    if (!this.missionTemplatesOf(p).includes(parsed.templateId)) return { ok: false, code: 'mission_not_found' };
+    const t = missionTemplate(parsed.templateId);
+    if (!t) return { ok: false, code: 'mission_not_found' };
+    if (day.claimed.includes(t.id)) return { ok: false, code: 'already_claimed' };
+    if ((day.progress[t.id] || 0) < t.target) return { ok: false, code: 'mission_incomplete' };
+    return { ok: true, dateKey: day.date, templateId: t.id, reward: { ...t.reward } };
   }
 
-  claimMissionReward(playerId: string, missionId: string): { success: boolean; reward?: { chips: number; xp: number; stars?: number } } {
-    const progress = this.progressMap.get(playerId);
-    if (!progress) return { success: false };
-
-    const mission = progress.dailyMissions.find((m) => m.id === missionId);
-    if (!mission) return { success: false };
-    if (!mission.completed || mission.claimed) return { success: false };
-
-    mission.claimed = true;
-    progress.chips += mission.reward.chips;
-    if (mission.reward.stars) {
-      progress.stars += mission.reward.stars;
-    }
-    this.addXP(playerId, mission.reward.xp);
-
-    // NOTE: chips/stars are persisted to the DB by the claimMission socket
-    // handler, gated on recordDailyClaim('mission:'+id). Mission.claimed is
-    // in-memory only and resets on a Railway redeploy, so persisting here
-    // would let a redeploy + re-claim re-mint the reward (M8). The daily-claim
-    // ledger is the durable exactly-once gate. Do NOT persist chips here.
-    return { success: true, reward: mission.reward };
+  /** Mirror a committed mission claim: mark it claimed, grant its XP. */
+  markMissionClaimed(userId: number, dateKey: string, templateId: string, xp: number): void {
+    const p = this.userRecord(userId);
+    if (!p) return;
+    const day = this.missionDayOf(p);
+    if (day.date === dateKey && !day.claimed.includes(templateId)) day.claimed.push(templateId);
+    if (xp > 0) this.addXP(p.playerId, xp);
   }
 
-  claimDailyBonus(playerId: string): { success: boolean; chips?: number; stars?: number; streak?: number } {
-    const progress = this.progressMap.get(playerId);
-    if (!progress) return { success: false };
-
-    const today = new Date().toISOString().split('T')[0];
-
-    if (progress.lastDailyBonusClaimed === today) {
-      return { success: false };
-    }
-
-    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
-
-    if (progress.lastLoginDate === yesterday) {
-      progress.dailyLoginStreak = Math.min(progress.dailyLoginStreak + 1, 7);
-    } else if (progress.lastLoginDate !== today) {
-      progress.dailyLoginStreak = 1;
-    }
-
-    progress.lastLoginDate = today;
-    progress.lastDailyBonusClaimed = today;
-
-    const streakIndex = Math.min(progress.dailyLoginStreak - 1, DAILY_BONUS_AMOUNTS.length - 1);
-    const bonusChips = this.boostChipReward(progress, DAILY_BONUS_AMOUNTS[streakIndex]);
-    const bonusStars = progress.dailyLoginStreak * 5;
-
-    progress.chips += bonusChips;
-    progress.stars += bonusStars;
-    // Durable persistence (F1/F4). The handler already gated this on
-    // recordDailyClaim('daily_bonus') so it runs at most once/day — safe to
-    // persist chips+stars additively.
-    this.persistChipReward(progress, bonusChips);
-    this.persistStarReward(progress, bonusStars);
-
-    return {
-      success: true,
-      chips: bonusChips,
-      stars: bonusStars,
-      streak: progress.dailyLoginStreak,
-    };
-  }
+  // ───────────────────────── achievements ─────────────────────────
 
   checkAchievements(playerId: string): void {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return;
-    // Roll daily/weekly windows lazily so checks always run against the
-    // current window — an idle user whose server process stayed up across
-    // midnight UTC still gets a fresh day.
+    // Roll daily/weekly windows lazily so checks always run against the current window.
     this.rollAchievementWindows(progress);
+    const inner = this.inner(progress);
+    const now = this.now();
+    const blocked = (pk: string) => {
+      const until = inner.achRetryAfter.get(pk);
+      if (until === undefined) return false;
+      if (until <= now) { inner.achRetryAfter.delete(pk); return false; }
+      return true;
+    };
 
     // Lifetime achievements
     for (const achDef of ACHIEVEMENTS) {
       if (progress.achievements.includes(achDef.id)) continue;
-      if (achDef.check(progress)) {
-        progress.achievements.push(achDef.id);
-        progress.chips += achDef.reward.chips;
-        this.persistChipReward(progress, achDef.reward.chips);
-        if (achDef.reward.stars) {
-          progress.stars += achDef.reward.stars;
-          this.persistStarReward(progress, achDef.reward.stars);
-        }
-        this.addXP(playerId, achDef.reward.xp);
-        this.pushEvent(playerId, {
-          type: 'achievementUnlocked',
-          data: {
-            category: 'lifetime',
-            id: achDef.id,
-            name: achDef.name,
-            description: achDef.description,
-            reward: achDef.reward,
-          },
-        });
-      }
+      const pk = `lifetime:${achDef.id}:`;
+      if (inner.pendingAch.has(pk) || blocked(pk)) continue;
+      if (!achDef.check(progress)) continue;
+      this.payAchievement(progress, 'lifetime', achDef, '', pk);
     }
 
     // Daily achievements
     for (const achDef of DAILY_ACHIEVEMENTS) {
       if (progress.dailyAchievementsToday.includes(achDef.id)) continue;
-      if (achDef.check(progress)) {
-        progress.dailyAchievementsToday.push(achDef.id);
-        progress.chips += achDef.reward.chips;
-        this.persistChipReward(progress, achDef.reward.chips);
-        if (achDef.reward.stars) {
-          progress.stars += achDef.reward.stars;
-          this.persistStarReward(progress, achDef.reward.stars);
-        }
-        this.addXP(playerId, achDef.reward.xp);
-        if (progress.userId) {
-          recordDailyAchievement(progress.userId, achDef.id).catch(() => {});
-        }
-        this.pushEvent(playerId, {
-          type: 'achievementUnlocked',
-          data: {
-            category: 'daily',
-            id: achDef.id,
-            name: achDef.name,
-            description: achDef.description,
-            reward: achDef.reward,
-          },
-        });
-      }
+      const pk = `daily:${achDef.id}:${progress.dailyStatsDate}`;
+      if (inner.pendingAch.has(pk) || blocked(pk)) continue;
+      if (!achDef.check(progress)) continue;
+      progress.dailyAchievementsToday.push(achDef.id);
+      this.payAchievement(progress, 'daily', achDef, progress.dailyStatsDate, pk);
     }
 
     // Weekly achievements
     for (const achDef of WEEKLY_ACHIEVEMENTS) {
       if (progress.weeklyAchievementsThisWeek.includes(achDef.id)) continue;
-      if (achDef.check(progress)) {
-        progress.weeklyAchievementsThisWeek.push(achDef.id);
-        progress.chips += achDef.reward.chips;
-        this.persistChipReward(progress, achDef.reward.chips);
-        if (achDef.reward.stars) {
-          progress.stars += achDef.reward.stars;
-          this.persistStarReward(progress, achDef.reward.stars);
-        }
-        this.addXP(playerId, achDef.reward.xp);
-        if (progress.userId) {
-          recordWeeklyAchievement(progress.userId, achDef.id).catch(() => {});
-        }
-        this.pushEvent(playerId, {
-          type: 'achievementUnlocked',
-          data: {
-            category: 'weekly',
-            id: achDef.id,
-            name: achDef.name,
-            description: achDef.description,
-            reward: achDef.reward,
-          },
-        });
-      }
+      const pk = `weekly:${achDef.id}:${progress.weeklyStatsWeekStart}`;
+      if (inner.pendingAch.has(pk) || blocked(pk)) continue;
+      if (!achDef.check(progress)) continue;
+      progress.weeklyAchievementsThisWeek.push(achDef.id);
+      this.payAchievement(progress, 'weekly', achDef, progress.weeklyStatsWeekStart, pk);
     }
+  }
+
+  /**
+   * Show the reward now (optimistic) and settle it through its ledger
+   * (persistChipReward → settleRewardLedger). A LIFETIME id is not added to
+   * `achievements` until the ledger confirms — the hand-complete save writes
+   * `achievements`, and an id stored before the ledger row would read as
+   * "already paid" and lose the reward.
+   */
+  private payAchievement(
+    progress: PlayerProgress, category: AchievementCategory, def: AchievementDef | WindowedAchievementDef, windowKey: string, pendingKey: string,
+  ): void {
+    const inner = this.inner(progress);
+    inner.pendingAch.add(pendingKey);
+    const optimisticChips = this.boostChipReward(progress, def.reward.chips);
+    const optimisticStars = def.reward.stars || 0;
+    progress.chips += optimisticChips;
+    progress.stars += optimisticStars;
+    inner.pendChips += optimisticChips;
+    inner.pendStars += optimisticStars;
+    this.persistChipReward(progress, def.reward.chips, {
+      category, def: def as AchievementDef, windowKey, pendingKey, optimisticChips, optimisticStars,
+    });
   }
 
   /** Reset dailyStats / weeklyStats lazily if the window has rolled over. */
   private rollAchievementWindows(progress: PlayerProgress): void {
-    const today = utcDateKey();
+    const nowD = new Date(this.now());
+    const today = utcDateKey(nowD);
     if (progress.dailyStatsDate !== today) {
       progress.dailyStats = emptyDailyStats();
       progress.dailyStatsDate = today;
       progress.dailyAchievementsToday = [];
     }
-    const weekStart = utcWeekStartKey();
+    const weekStart = utcWeekStartKey(nowD);
     if (progress.weeklyStatsWeekStart !== weekStart) {
       progress.weeklyStats = emptyWeeklyStats();
       progress.weeklyStatsWeekStart = weekStart;
@@ -1658,7 +1796,6 @@ export class ProgressionManager {
       if (rank.includes('flush')) d.flushesHit++;
       if (rank.includes('straight')) d.straightsHit++;
       if (rank.includes('fullhouse') || rank.includes('full')) d.fullHousesHit++;
-      // Best streak-this-week tracked from currentStreak.
       if (progress.currentStreak > w.winStreakThisWeek) w.winStreakThisWeek = progress.currentStreak;
     }
   }
@@ -1670,11 +1807,11 @@ export class ProgressionManager {
     daily: any[]; weekly: any[]; lifetime: any[];
     windowEndsAt: { daily: number; weekly: number };
   } | null {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return null;
     this.rollAchievementWindows(progress);
 
-    const now = new Date();
+    const now = new Date(this.now());
     const dailyEnd = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
     const weekEnd = dailyEnd + (6 - now.getUTCDay()) * 24 * 60 * 60 * 1000;
 
@@ -1687,7 +1824,6 @@ export class ProgressionManager {
       description: def.description,
       reward: def.reward,
       unlocked: earnedIds.includes(def.id),
-      // Running check lets the panel show a ✓ even before the sync tick.
       progressMet: (def as any).check ? (def as any).check(progress) : false,
     }));
 
@@ -1699,17 +1835,42 @@ export class ProgressionManager {
     };
   }
 
-  // Returns a sanitized version for sending to client (no internal tracking fields)
+  // ───────────────────────── persistence snapshots ─────────────────────────
+
+  /**
+   * The stats patch the hand-complete save MERGES (mergeUserStats monotonic,
+   * progressMerge rules): every counter, the HUD maps, the dated achievement
+   * windows, today's mission progress and the rating. Never the wallet or the
+   * entitlements (their own transactions write those).
+   */
+  persistStatsPatch(playerId: string): Record<string, unknown> {
+    const p = this.rec(playerId);
+    if (!p) return {};
+    const out: Record<string, unknown> = {};
+    for (const [sk, field] of ADDITIVE_COUNTERS) out[sk] = num((p as any)[field]);
+    for (const [sk, field] of MAX_COUNTERS) out[sk] = num((p as any)[field]);
+    out.variantsPlayed = [...(p.variantsPlayed || [])];
+    out.actionCounts = { ...(p.actionCounts || {}) };
+    out.handsPerRank = { ...(p.handsPerRank || {}) };
+    out.positionWins = JSON.parse(JSON.stringify(p.positionWins || {}));
+    out.dailyStats = { ...p.dailyStats };
+    out.dailyStatsDate = p.dailyStatsDate;
+    out.weeklyStats = { ...p.weeklyStats };
+    out.weeklyStatsWeekStart = p.weeklyStatsWeekStart;
+    const day = this.missionDayOf(p);
+    out.missions = { date: day.date, progress: { ...day.progress } };
+    out.elo = p.elo;
+    out.rank = p.rank;
+    out.eloHistory = (p.eloHistory || []).slice(-30);
+    return out;
+  }
+
+  // ───────────────────────── VIP / cosmetics views (C7 / C8) ─────────────────────────
+
   /**
    * Cumulative ("season") XP: total XP earned to reach the current level plus
-   * progress into it. The server keeps no separate season-XP counter, so we
-   * reconstruct it from the SAME level curve the client uses. Battle-pass
-   * tiers unlock at 500 XP each; getClientProgress emits this as `totalXp`
-   * (which the client's BattlePass UI reads) and claimBattlePassTier gates on
-   * it so a tier can only be claimed once its XP is actually earned.
-   * Earned 2026-07-01 .online audit — the claim handler previously had no
-   * unlock check at all (crafted tierId minted chips), and the server never
-   * sent totalXp so the legit UI always showed tier 0.
+   * progress into it. Battle-pass tiers unlock at 500 XP each; getClientProgress
+   * emits this as `totalXp` and claimBattlePassTier gates on it.
    */
   private seasonXpFor(progress: { level: number; xp: number }): number {
     let total = Math.max(0, progress.xp || 0);
@@ -1721,28 +1882,97 @@ export class ProgressionManager {
     return total;
   }
 
-  /**
-   * VIP loyalty tier XP-rate multiplier by cumulative season XP. Thresholds
-   * MIRROR the client VIPPanel (Bronze <1k = 1x, Silver 1k = 1.5x, Gold 5k = 2x,
-   * Platinum 20k = 3x) so the perk matches the tier the player is shown.
-   */
+  /** The loyalty XP-rate multiplier by cumulative season XP (Bronze 1x … Platinum 3x). */
   private vipXpRate(progress: PlayerProgress): number {
-    const total = this.seasonXpFor(progress);
-    if (total >= 20000) return 3;
-    if (total >= 5000) return 2;
-    if (total >= 1000) return 1.5;
-    return 1;
+    return vipTierForSeasonXp(this.seasonXpFor(progress)).rate;
   }
 
   getSeasonXp(playerId: string): number {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return 0;
     return this.seasonXpFor(progress);
   }
 
+  /** Is the account's VIP pass active? */
+  vipActive(p: PlayerProgress | undefined): boolean {
+    return !!p && num(p.vipExpiresAt) > this.now();
+  }
+
+  /** C8 — the VIP block of the C5 payload. */
+  vipView(p: PlayerProgress): {
+    active: boolean; tier: string; xpRate: number; expiresAt: number | null; perks: string[];
+    loginMultiplier: number; monthlyBonus: number; monthlyClaimed: boolean; monthKey: string;
+  } {
+    const tier = vipTierForSeasonXp(this.seasonXpFor(p));
+    const active = this.vipActive(p);
+    const monthKey = denverMonthKey(this.now());
+    const perks: string[] = active ? [...VIP_PASS_PERKS] : [];
+    if (tier.rate > 1) perks.push('xp_rate');
+    return {
+      active,
+      tier: tier.name,
+      xpRate: tier.rate,
+      expiresAt: active ? num(p.vipExpiresAt) : null,
+      perks,
+      loginMultiplier: active ? VIP_LOGIN_MULTIPLIER : 1,
+      monthlyBonus: VIP_MONTHLY_BONUS_CHIPS,
+      monthlyClaimed: p.vipMonthlyClaimedMonth === monthKey,
+      monthKey,
+    };
+  }
+
+  /** Emotes the account can use on the wheel: the free ones, owned shop emotes, VIP emotes while VIP. */
+  usableEmotes(p: PlayerProgress): string[] {
+    const owned = [...(p.owned || [])].filter((k) => k.startsWith('emote:')).map((k) => k.slice('emote:'.length));
+    const vip = this.vipActive(p) ? VIP_EMOTES : [];
+    return Array.from(new Set([...FREE_EMOTES, ...owned, ...vip]));
+  }
+
+  canUseEmote(userId: number, emoteId: string): boolean {
+    const p = this.userRecord(userId);
+    if (!p) return FREE_EMOTES.includes(emoteId);
+    return this.usableEmotes(p).includes(emoteId);
+  }
+
+  /** C7 — what other players see at this account's seat (null slots = default look). */
+  seatCosmetics(userId: number): { frame: string | null; title: string | null; cardBack: string | null; badge: string | null; vip: boolean } | null {
+    const p = this.userRecord(userId);
+    if (!p || !p.hydrated) return null;
+    const eq = p.equipped || {};
+    return {
+      frame: eq.frame ?? null,
+      title: eq.title ?? null,
+      cardBack: eq.card_back ?? null,
+      badge: eq.badge ?? null,
+      vip: this.vipActive(p),
+    };
+  }
+
+  /** C7 — the equipped table theme (per-player `myTheme`). */
+  equippedTheme(userId: number): string | null {
+    const p = this.userRecord(userId);
+    return p?.hydrated ? (p.equipped?.theme ?? null) : null;
+  }
+
+  // ───────────────────────── client payload (C5) ─────────────────────────
+
+  /**
+   * The `playerProgress` payload (C5). Keys of the pre-R2 payload are kept
+   * (older clients); the C5 keys are added. Never anything another player may
+   * not see — this goes only to the account's own sockets.
+   */
   getClientProgress(playerId: string): object | null {
-    const progress = this.progressMap.get(playerId);
+    const progress = this.rec(playerId);
     if (!progress) return null;
+    const now = this.now();
+    const missions = this.missionsOf(playerId);
+    const day = this.missionDayOf(progress);
+    const owned = [...(progress.owned || [])].sort();
+    const eq = progress.equipped || {};
+    const boostersArr = Object.entries(progress.activeBoosters || {})
+      .filter(([, b]) => b && b.expiresAt > now)
+      .map(([type, b]) => ({ type, multiplier: b.mult, expiresAt: b.expiresAt }));
+    const dailyMissions = missions.map((m) => ({ ...m }));
 
     return {
       playerId: progress.playerId,
@@ -1755,27 +1985,45 @@ export class ProgressionManager {
       totalXp: this.seasonXpFor(progress),
       totalHandsPlayed: progress.totalHandsPlayed,
       handsWon: progress.handsWon,
+      winRate: winRateOf(progress),
       biggestPot: progress.biggestPot,
       currentStreak: progress.currentStreak,
       bestStreak: progress.bestStreak,
       achievements: progress.achievements,
-      dailyMissions: progress.dailyMissions,
-      dailyMissionsRefreshAt: progress.dailyMissionsRefreshAt,
+      // C6 — today's (Denver) missions; `dailyMissions` is the same list under the pre-R2 key.
+      missions,
+      dailyMissions,
+      dailyMissionsDate: day.date,
+      dailyMissionsRefreshAt: nextDenverMidnightMs(now),
       chips: progress.chips,
       stars: progress.stars,
+      scratchCardsAvailable: progress.scratchCardsAvailable ?? 0,
       dailyLoginStreak: progress.dailyLoginStreak,
       lastLoginDate: progress.lastLoginDate,
-      // 2026-05-19 audit — also emit under the client-side field names.
-      // Client `progressStore.setDurableState` + LoginRewards.jsx read
-      // `progress.loginStreak` / `progress.lastLoginClaimDate`. The
-      // initial /durableState event uses those (matches), but every
-      // subsequent /playerProgress event was sending only the server
-      // field names — so re-opening the daily-rewards modal after a
-      // claim re-read stale loginStreak=0. Sending both names keeps
-      // the durable + per-hand progress paths consistent.
       loginStreak: progress.dailyLoginStreak,
-      lastLoginClaimDate: progress.lastLoginDate,
-      lastDailyBonusClaimed: progress.lastDailyBonusClaimed,
+      lastLoginClaimDate: progress.lastLoginClaimDate ?? null,
+      dailySpinClaimed: progress.spinClaimedDate === denverDateKey(now),
+      battlePassPremium: !!progress.battlePassPremium,
+      vip: this.vipView(progress),
+      vipExpiresAt: num(progress.vipExpiresAt),
+      activeBoosters: boostersArr,
+      chipBoostedRewards: CHIP_BOOSTED_REWARDS,
+      equipped: {
+        theme: eq.theme ?? null,
+        cardBack: eq.card_back ?? null,
+        frame: eq.frame ?? null,
+        title: eq.title ?? null,
+        badge: eq.badge ?? null,
+        chipSkin: eq.chip_skin ?? null,
+        cardFront: eq.card_front ?? null,
+        dealerVoice: eq.dealer_voice ?? null,
+        profileBg: eq.profile_bg ?? null,
+        soundPack: eq.sound_pack ?? null,
+        celebration: eq.celebration ?? null,
+        emotes: this.usableEmotes(progress),
+      },
+      owned,
+      badges: owned.filter((k) => k.startsWith('badge:')).map((k) => k.slice('badge:'.length)),
       equippedCardBack: progress.equippedCardBack,
       equippedTableTheme: progress.equippedTableTheme,
       ownedCardBacks: progress.ownedCardBacks,
@@ -1792,11 +2040,76 @@ export class ProgressionManager {
       rankedWins: progress.rankedWins,
       rankedLosses: progress.rankedLosses,
       peakElo: progress.peakElo,
-      eloHistory: progress.eloHistory || [],   // 2026-07-07 gap-fill — real rank trend
-      // Shop entitlements so the client can show real VIP status + active
-      // boosters (previously in-memory only and never sent to the client).
-      vipExpiresAt: (progress as any).vipExpiresAt || 0,
-      activeBoosters: (progress as any).activeBoosters || {},
+      eloHistory: progress.eloHistory || [],
     };
   }
+
+  /** Every loaded record's account id (for sweeps). */
+  loadedUserIds(): number[] {
+    const out: number[] = [];
+    for (const p of this.progressMap.values()) if (p.userId) out.push(p.userId);
+    return out;
+  }
+
+  /** Price of a sellable item — re-exported for handlers that only hold the manager. */
+  static shopPrice(itemType: string, itemId: string): number | null {
+    const prices = SHOP_PRICES[itemType];
+    return prices && Object.prototype.hasOwnProperty.call(prices, itemId) ? prices[itemId] : null;
+  }
 }
+
+interface AchievementLedgerRef {
+  category: AchievementCategory;
+  def: AchievementDef;
+  windowKey: string;
+  pendingKey: string;
+  optimisticChips: number;
+  optimisticStars: number;
+}
+
+/** Win % (0-100, one decimal) from the lifetime counters. */
+function winRateOf(p: PlayerProgress): number {
+  const th = p.totalHandsPlayed || 0;
+  return th > 0 ? Math.round(((p.handsWon || 0) / th) * 1000) / 10 : 0;
+}
+
+function liveBoosters(raw: unknown, now: number): Record<string, { mult: number; expiresAt: number }> {
+  const out: Record<string, { mult: number; expiresAt: number }> = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [k, v] of Object.entries(raw as Record<string, any>)) {
+    if (v && Number(v.expiresAt) > now && Number(v.mult) > 0) out[k] = { mult: Number(v.mult), expiresAt: Number(v.expiresAt) };
+  }
+  return out;
+}
+
+function mergeCounterMaps(db: unknown, mem: Record<string, number> | undefined, add: boolean): Record<string, number> {
+  const out: Record<string, number> = { ...(mem || {}) };
+  if (db && typeof db === 'object') {
+    for (const [k, v] of Object.entries(db as Record<string, unknown>)) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) continue;
+      out[k] = add ? n + (out[k] || 0) : Math.max(n, out[k] || 0);
+    }
+  }
+  return out;
+}
+
+function mergePositionWins(
+  db: unknown, mem: Record<string, { wins: number; total: number }> | undefined, add: boolean,
+): Record<string, { wins: number; total: number }> {
+  const out: Record<string, { wins: number; total: number }> = {};
+  for (const [k, v] of Object.entries(mem || {})) out[k] = { wins: v.wins, total: v.total };
+  if (db && typeof db === 'object') {
+    for (const [k, v] of Object.entries(db as Record<string, any>)) {
+      if (!v || typeof v !== 'object') continue;
+      const cur = out[k] || { wins: 0, total: 0 };
+      out[k] = add
+        ? { wins: num(v.wins) + cur.wins, total: num(v.total) + cur.total }
+        : { wins: Math.max(num(v.wins), cur.wins), total: Math.max(num(v.total), cur.total) };
+    }
+  }
+  return out;
+}
+
+// Re-exported for tests / handlers that type mission rows.
+export type { Mission, MissionType };

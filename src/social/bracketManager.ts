@@ -160,13 +160,41 @@ export async function eliminatePlayer(
 // clamped `amt` returned lets the caller escrow the exact amount stored. Rejects
 // bets on an already-eliminated player or a completed bracket (can't escrow into
 // a decided outcome).
+/**
+ * 2026-10-11 (.online R2, ECON-14 / APPUI-43) — who may bet on a bracket and
+ * when: never its ORGANIZER (he decides every elimination, so he decides the
+ * outcome), never a player IN it (a roster name equal to one of the bettor's
+ * names, case-insensitive), and only until the FIRST elimination (after that
+ * the field is no longer unknown). A refusal carries a stable `code`.
+ */
+export async function sideBetRefusal(
+  bracketId: string, bettorUserId: number | undefined, bettorNames: string[],
+): Promise<{ code: string; error: string } | null> {
+  const pool = getPool();
+  const b = await pool.query('SELECT status, sidebets_settled, created_by FROM social_brackets WHERE bracket_id=$1', [bracketId]);
+  if (!b.rows.length) return { code: 'bracket_not_found', error: 'Bracket not found' };
+  if (b.rows[0].status === 'complete' || b.rows[0].sidebets_settled) return { code: 'bracket_finished', error: 'Tournament already finished' };
+  if (bettorUserId !== undefined && Number(b.rows[0].created_by) === bettorUserId) {
+    return { code: 'organizer_cannot_bet', error: 'The organizer cannot bet on their own bracket' };
+  }
+  const names = bettorNames.map((n) => String(n || '').trim().toLowerCase()).filter(Boolean);
+  if (names.length) {
+    const inIt = await pool.query('SELECT 1 FROM social_bracket_players WHERE bracket_id=$1 AND LOWER(name) = ANY($2::text[]) LIMIT 1', [bracketId, names]);
+    if (inIt.rowCount) return { code: 'player_cannot_bet', error: 'Players in this bracket cannot bet on it' };
+  }
+  const out = await pool.query('SELECT 1 FROM social_bracket_players WHERE bracket_id=$1 AND is_out=TRUE LIMIT 1', [bracketId]);
+  if (out.rowCount) return { code: 'betting_closed', error: 'Betting closed at the first elimination' };
+  return null;
+}
+
 export async function addSideBet(
   bracketId: string,
   bettorName: string,
   targetName: string,
   amount: number,
-  bettorUserId?: number
-): Promise<{ ok: boolean; error?: string; state?: BracketState; amount?: number }> {
+  bettorUserId?: number,
+  bettorNames: string[] = [],
+): Promise<{ ok: boolean; error?: string; code?: string; state?: BracketState; amount?: number }> {
   const pool = getPool();
   const b = await pool.query('SELECT status, sidebets_settled FROM social_brackets WHERE bracket_id=$1', [bracketId]);
   if (!b.rows.length) return { ok: false, error: 'Bracket not found' };
@@ -182,14 +210,20 @@ export async function addSideBet(
   // conditional on the bracket still being active+unsettled AND the target still
   // in AT WRITE TIME — a single atomic statement. If the race lost, rowCount is
   // 0 and the caller refunds the escrow.
+  // R2 (ECON-14) — the same statement also holds the who/when rules at write
+  // time: not the organizer, not a player in the bracket, no one eliminated yet.
+  const names = bettorNames.map((n) => String(n || '').trim().toLowerCase()).filter(Boolean);
   const ins = await pool.query(
     `INSERT INTO social_bracket_sidebets (bracket_id, bettor_name, target_name, amount, bettor_user_id)
      SELECT $1,$2,$3,$4,$5
-     WHERE EXISTS (SELECT 1 FROM social_brackets WHERE bracket_id=$1 AND status='active' AND sidebets_settled=FALSE)
-       AND EXISTS (SELECT 1 FROM social_bracket_players WHERE bracket_id=$1 AND name=$3 AND is_out=FALSE)`,
-    [bracketId, String(bettorName || 'Guest').slice(0, 40), String(targetName).slice(0, 40), amt, bettorUserId ?? null]
+     WHERE EXISTS (SELECT 1 FROM social_brackets WHERE bracket_id=$1 AND status='active' AND sidebets_settled=FALSE
+                     AND ($5::int IS NULL OR created_by <> $5::int))
+       AND EXISTS (SELECT 1 FROM social_bracket_players WHERE bracket_id=$1 AND name=$3 AND is_out=FALSE)
+       AND NOT EXISTS (SELECT 1 FROM social_bracket_players WHERE bracket_id=$1 AND is_out=TRUE)
+       AND NOT EXISTS (SELECT 1 FROM social_bracket_players WHERE bracket_id=$1 AND LOWER(name) = ANY($6::text[]))`,
+    [bracketId, String(bettorName || 'Guest').slice(0, 40), String(targetName).slice(0, 40), amt, bettorUserId ?? null, names]
   );
-  if (!ins.rowCount) return { ok: false, error: 'Bracket just closed — bet not placed' };
+  if (!ins.rowCount) return { ok: false, error: 'Betting on this bracket is closed — bet not placed', code: 'betting_closed' };
   // 2026-07-07 review fix — the bet is now DURABLY recorded. The follow-up state
   // read is BEST-EFFORT: if it throws, addSideBet must NOT throw, because the
   // caller (placeSocialSideBet) would then treat it as "never recorded" and
