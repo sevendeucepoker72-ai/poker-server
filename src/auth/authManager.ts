@@ -9,6 +9,8 @@ import crypto from 'crypto';
 import { parseStatsColumn } from './loginIdentity';
 // 2026-10-11 (R1, ECON-3) — what other players may see of an account.
 import { publicDisplayName, isPublicDisplayName, escapeLikePattern, LISTABLE_USER_SQL } from '../social/publicIdentity';
+// 2026-10-11 (R2, ECON-10) — counters merge, never last-writer-wins.
+import { mergeProgressStats, isProgressRuleKey } from '../progression/progressMerge';
 
 // JWT secret. H1 (2026-07-01 audit): the old guard keyed the fatal check on
 // NODE_ENV==='production' ONLY, but Railway uses nixpacks and does NOT set
@@ -648,7 +650,9 @@ export async function saveProgress(userId: number, data: { level?: number; xp?: 
     // the `hydrated` gate in the hand-complete handler and the in-memory
     // hydration step. Belt + suspenders for the "level keeps resetting"
     // bug users reported.
+    let levelIdx = 0;
     if (data.level !== undefined) {
+      levelIdx = idx;
       sets.push(`level = GREATEST(level, $${idx++})`);
       vals.push(data.level);
     }
@@ -658,8 +662,13 @@ export async function saveProgress(userId: number, data: { level?: number; xp?: 
     // Use a subquery-driven ternary via CASE to handle both cases.
     if (data.xp !== undefined) {
       if (data.level !== undefined) {
-        // Paired with a level write: accept xp unconditionally (new level means xp can reset).
-        sets.push(`xp = $${idx++}`);
+        // 2026-10-11 (R2, ECON-10) — paired with a level write, the xp belongs
+        // to THAT level: taken as-is when the level advances, ratcheted at the
+        // same level, and IGNORED when the row is already at a higher level (a
+        // stale entry's xp used to land under the row's higher level). The
+        // CASE reads the row's OLD level (every SET expression does).
+        sets.push(`xp = CASE WHEN $${levelIdx} > level THEN $${idx} WHEN $${levelIdx} = level THEN GREATEST(xp, $${idx}) ELSE xp END`);
+        idx++;
         vals.push(data.xp);
       } else {
         // Lone xp write: ratchet — only accept if >= current.
@@ -673,7 +682,20 @@ export async function saveProgress(userId: number, data: { level?: number; xp?: 
     // `stats = $N` write would clobber those — exactly the failure mode
     // CLAUDE.md describes for stats-shaped fields. The `||` operator
     // concatenates JSONB objects with right-hand precedence.
-    if (data.stats !== undefined) {
+    // 2026-10-11 (R2, ECON-10) — progress COUNTERS in a stats patch (the
+    // SIGTERM flush passes handsPlayed / handsWon / …) are MERGED under the row
+    // lock (mergeUserStats monotonic: never lowered); only the other keys
+    // (clientData, …) are written by the `||` below.
+    let monotonicStats: Record<string, any> | null = null;
+    let plainStats: Record<string, any> | undefined;
+    if (data.stats !== undefined && data.stats && typeof data.stats === 'object') {
+      for (const [k, v] of Object.entries(data.stats)) {
+        // (a caller-supplied client `db` keeps the plain write: the merge takes its own pooled lock)
+        if (!db && isProgressRuleKey(k)) (monotonicStats ||= {})[k] = v;
+        else (plainStats ||= {})[k] = v;
+      }
+    }
+    if (plainStats !== undefined) {
       // 2026-10-10 hotfix — prod users.stats is TEXT (index.ts
       // probeStatsColumnType); COALESCE(text, jsonb) failed the WHOLE UPDATE
       // (42804) — level / xp / achievements included — on every hand-complete
@@ -681,7 +703,7 @@ export async function saveProgress(userId: number, data: { level?: number; xp?: 
       // masterIdGuardSql pattern): no trailing ::text — the assignment casts
       // jsonb->text for a TEXT column and is a no-op for a jsonb one.
       sets.push(`stats = COALESCE(NULLIF(stats::text, '')::jsonb, '{}'::jsonb) || $${idx++}::jsonb`);
-      vals.push(JSON.stringify(data.stats));
+      vals.push(JSON.stringify(plainStats));
     }
     // Achievements list should only grow — use a JSONB union via SQL so a
     // stale (empty) write doesn't erase unlocked achievements. We merge
@@ -698,9 +720,11 @@ export async function saveProgress(userId: number, data: { level?: number; xp?: 
       vals.push(JSON.stringify(data.achievements));
       idx++;
     }
-    if (sets.length === 0) return true;
-    vals.push(userId);
-    await (db || pool).query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${idx}`, vals);
+    if (sets.length > 0) {
+      vals.push(userId);
+      await (db || pool).query(`UPDATE users SET ${sets.join(', ')} WHERE id = $${idx}`, vals);
+    }
+    if (monotonicStats) await mergeUserStats(userId, monotonicStats, { monotonic: true });
     return true;
   } catch (err) {
     console.error(`[Auth] Failed to save progress userId=${userId} keys=${Object.keys(data).join(',')}:`, err);
@@ -763,9 +787,26 @@ export async function isUserBanned(userId: number): Promise<boolean> {
   return rows[0]?.banned === true;
 }
 
-export async function getAllUsers(): Promise<Array<{ id: number; username: string; chips: number; level: number; isAdmin: boolean; banned: boolean }>> {
-  const { rows } = await pool.query('SELECT id, username, chips, level, is_admin, banned FROM users');
-  return rows.map(u => ({ id: u.id, username: u.username, chips: u.chips, level: u.level, isAdmin: u.is_admin, banned: u.banned }));
+/**
+ * Every user for the ADMIN dashboard (admin-gated caller). 2026-10-11 (R2,
+ * APPUI-34): also xp / handsPlayed / handsWon / winRate (0-100, 1 decimal) /
+ * displayName — the user drawer showed zeros for XP, Hands and Win.
+ */
+export async function getAllUsers(): Promise<Array<{
+  id: number; username: string; displayName: string | null; chips: number; level: number; xp: number;
+  handsPlayed: number; handsWon: number; winRate: number; isAdmin: boolean; banned: boolean;
+}>> {
+  const { rows } = await pool.query('SELECT id, username, display_name, chips, level, xp, stats::text AS stats, is_admin, banned FROM users');
+  return rows.map((u: any) => {
+    const s = parseStatsColumn(u.stats);
+    const handsPlayed = Number(s.handsPlayed || s.totalHandsPlayed) || 0;
+    const handsWon = Number(s.handsWon) || 0;
+    return {
+      id: u.id, username: u.username, displayName: u.display_name ?? null, chips: Number(u.chips) || 0, level: u.level,
+      xp: Number(u.xp) || 0, handsPlayed, handsWon, winRate: handsPlayed > 0 ? Math.round((handsWon / handsPlayed) * 1000) / 10 : 0,
+      isAdmin: u.is_admin, banned: u.banned,
+    };
+  });
 }
 
 export async function banUser(userId: number): Promise<boolean> {
@@ -883,7 +924,15 @@ export async function getTotalUsers(): Promise<number> {
   return parseInt(rows[0].count);
 }
 
-export async function mergeUserStats(userId: number, patch: Record<string, any>): Promise<void> {
+/**
+ * Merge `patch` into users.stats under a row lock. `opts.monotonic` (2026-10-11,
+ * R2 — ECON-10) merges by the progress rules (progression/progressMerge): the
+ * counters only ever go up (max), sets union, dated windows keep the newest —
+ * the hand-complete save of the per-user progress record uses it, so no save
+ * (a stale entry, a second process) can ever lower a counter. Without it the
+ * patch's keys overwrite (identity stamps, one-time flags).
+ */
+export async function mergeUserStats(userId: number, patch: Record<string, any>, opts: { monotonic?: boolean } = {}): Promise<void> {
   // Earned 2026-05-02 audit: pre-fix, this was a plain read-modify-write.
   // Two concurrent calls both read {handsWon: 5}, both write back, second
   // wins → first's increment lost. Now wrap SELECT + UPDATE in a transaction
@@ -911,11 +960,12 @@ export async function mergeUserStats(userId: number, patch: Record<string, any>)
     // no-op under TEXT. See index.ts probeStatsColumnType for which one prod
     // actually has — /api/health reports it.
     const existing = parseStatsColumn(rows[0]?.stats);
-    const merged = { ...existing, ...patch };
+    const merged = opts.monotonic ? mergeProgressStats(existing, patch) : { ...existing, ...patch };
     await client.query('UPDATE users SET stats = $1 WHERE id = $2', [JSON.stringify(merged), userId]);
     await client.query('COMMIT');
-  } catch (e) {
+  } catch (e: any) {
     try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    console.warn(`[mergeUserStats ${userId}] failed (nothing written):`, e?.message || e);
   } finally {
     client.release();
   }
@@ -1053,14 +1103,15 @@ export async function persistStars(userId: number, stars: number): Promise<void>
  *  Postgres serializes `stars = stars + $1` correctly across concurrent
  *  writes, so grants can't clobber each other. Use for daily rewards,
  *  battle pass, scratch cards, shop refunds — anywhere a delta is added. */
-export async function addStarsToUser(userId: number, stars: number): Promise<boolean> {
+export async function addStarsToUser(userId: number, stars: number, db?: ChipQueryable): Promise<boolean> {
   // R1 (AUTH-4) — a negative, fractional or non-numeric grant is refused (it
   // used to be floored / clamped silently); 0 stays a no-op success.
+  // R2 — `db`: run on a caller's transaction client (economy settlements).
   if (stars === 0) return true;
   if (!isPositiveWholeAmount(stars)) return refuseAmount('addStarsToUser', userId, stars);
   try {
     const amount = stars;
-    await pool.query('UPDATE users SET stars = stars + $1 WHERE id = $2', [amount, userId]);
+    await (db || pool).query('UPDATE users SET stars = stars + $1 WHERE id = $2', [amount, userId]);
     return true;
   } catch (e: any) {
     console.error(`[addStarsToUser ${userId}] amount=${stars}`, e.message);
@@ -1131,10 +1182,10 @@ export async function loadInventory(userId: number): Promise<Array<{ item_type: 
   }
 }
 
-/** Grant a cosmetic item. Returns true if newly granted, false if already owned. */
-export async function grantItem(userId: number, itemType: string, itemId: string): Promise<boolean> {
+/** Grant a cosmetic item. Returns true if newly granted, false if already owned. `db` = a transaction client (R2). */
+export async function grantItem(userId: number, itemType: string, itemId: string, db?: ChipQueryable): Promise<boolean> {
   try {
-    const { rowCount } = await pool.query(
+    const { rowCount } = await (db || pool).query(
       `INSERT INTO user_inventory (user_id, item_type, item_id) VALUES ($1, $2, $3)
          ON CONFLICT (user_id, item_type, item_id) DO NOTHING`,
       [userId, itemType, itemId]
@@ -1265,8 +1316,16 @@ export async function updateLoginStreak(userId: number, streak: number): Promise
   }
 }
 
-/** Increment hands_since_last_scratch; if it crosses 20, bank a card and reset the counter. Returns whether a card was awarded. */
-export async function tickScratchProgress(userId: number): Promise<boolean> {
+/** One dealt-in hand's scratch-card tick + the row's wallet after it (C5: the hand-complete push is DB-fresh). */
+export interface ScratchTick { awarded: boolean; chips: number; stars: number; scratchCardsAvailable: number }
+
+/**
+ * Increment hands_since_last_scratch; if it crosses 20, bank a card and reset
+ * the counter. Returns the tick (awarded + the wallet columns the same UPDATE
+ * returns — R2: the hand-complete progress push reads the wallet from here, no
+ * extra round trip), or false on a missing row / DB error.
+ */
+export async function tickScratchProgress(userId: number): Promise<ScratchTick | false> {
   try {
     // 2026-06-19 fix: do the increment + cross-threshold reset/award in ONE
     // atomic UPDATE. The previous two-statement version (increment, read, then a
@@ -1279,11 +1338,16 @@ export async function tickScratchProgress(userId: number): Promise<boolean> {
          hands_since_last_scratch = CASE WHEN hands_since_last_scratch + 1 >= 20 THEN 0 ELSE hands_since_last_scratch + 1 END,
          scratch_cards_available = scratch_cards_available + CASE WHEN hands_since_last_scratch + 1 >= 20 THEN 1 ELSE 0 END
        WHERE id = $1
-       RETURNING hands_since_last_scratch`,
+       RETURNING hands_since_last_scratch, chips, stars, scratch_cards_available`,
       [userId]
     );
     if (rows.length === 0) return false;
-    return rows[0].hands_since_last_scratch === 0;
+    return {
+      awarded: Number(rows[0].hands_since_last_scratch) === 0,
+      chips: Number(rows[0].chips) || 0,
+      stars: Number(rows[0].stars) || 0,
+      scratchCardsAvailable: Number(rows[0].scratch_cards_available) || 0,
+    };
   } catch (e: any) {
     console.warn(`[tickScratchProgress ${userId}]`, e.message);
     return false;
@@ -1307,9 +1371,9 @@ export async function consumeScratchCard(userId: number): Promise<boolean> {
 
 /** Try to claim a battle pass tier on a given track. Returns true if newly claimed.
  *  2026-07-07 gap-fill — now track-aware (free|premium), one claim per (tier,track). */
-export async function claimBattlePassTier(userId: number, seasonId: string, tierId: number, track: 'free' | 'premium' = 'free'): Promise<boolean> {
+export async function claimBattlePassTier(userId: number, seasonId: string, tierId: number, track: 'free' | 'premium' = 'free', db?: ChipQueryable): Promise<boolean> {
   try {
-    const { rowCount } = await pool.query(
+    const { rowCount } = await (db || pool).query(
       `INSERT INTO user_battle_pass_claims (user_id, season_id, tier_id, track) VALUES ($1, $2, $3, $4)
          ON CONFLICT (user_id, season_id, tier_id, track) DO NOTHING`,
       [userId, seasonId, tierId, track]

@@ -94,8 +94,38 @@ export interface PlayerProgress {
    * defaults (level 1, xp 0). This was the root cause of "level resets
    * every login" reports: first hand after join kept bulldozing the
    * previous session's progress.
+   * 2026-10-11 (R2, ECON-12): set ONLY after every DB read succeeded.
    */
   hydrated: boolean;
+
+  // ── 2026-10-11 (.online R2) — the per-USER record (one per account, C5) ──
+  /** True once ANY hydrate succeeded: later loads MERGE (never re-seed) — see ProgressionManager.applyBundle. */
+  everHydrated?: boolean;
+  /** Banked scratch cards (users.scratch_cards_available). */
+  scratchCardsAvailable?: number;
+  /** Denver YYYY-MM-DD of the last daily-login claim (users.last_login_claim_date). */
+  lastLoginClaimDate?: string | null;
+  /** VIP pass expiry (epoch ms; 0 = none) — users.stats.vipExpiresAt. */
+  vipExpiresAt?: number;
+  /** Live boosters by kind — users.stats.activeBoosters. */
+  activeBoosters?: Record<string, { mult: number; expiresAt: number }>;
+  /** Battle Pass premium owned for the current season. */
+  battlePassPremium?: boolean;
+  /** Owned cosmetics as "type:id" (user_inventory). */
+  owned?: Set<string>;
+  /** Equipped item per slot type (user_inventory.equipped). */
+  equipped?: Record<string, string>;
+  /** Today's (Denver) missions: progress per template + claimed templates. */
+  missionDay?: { date: string; progress: Record<string, number>; claimed: string[] };
+  /** Denver 'YYYY-MM' the VIP monthly bonus was claimed for. */
+  vipMonthlyClaimedMonth?: string | null;
+  /** Denver date of today's daily spin, if claimed. */
+  spinClaimedDate?: string | null;
+  lastHandAt?: number;
+  /** Eviction clock (ms). */
+  lastTouchedAt?: number;
+  /** users.public_id — the opaque id other players may see (seats, leaderboards, profiles). */
+  publicId?: string | null;
 }
 
 export interface Mission {

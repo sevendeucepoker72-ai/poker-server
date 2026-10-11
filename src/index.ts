@@ -166,6 +166,8 @@ import {
   getFeaturedClubs,
   getClubOfWeek,
   getMemberRole,
+  getClubIdForRuntimeTable,
+  updateClubStats,
   CLUB_LEVEL_THRESHOLDS,
   CLUB_LEVEL_PERKS,
 } from './clubs/clubManager';
@@ -177,8 +179,32 @@ import {
 } from './social/predictionManager';
 import {
   initBracketTables, getBracket, createBracket, eliminatePlayer as eliminateBracketPlayer,
-  addSideBet as addBracketSideBet, settleBracketSideBets, refundBracketSideBets,
+  addSideBet as addBracketSideBet, settleBracketSideBets, refundBracketSideBets, sideBetRefusal,
 } from './social/bracketManager';
+// 2026-10-11 (.online R2, S3) — the economy: every claim / purchase settles its
+// ledger row and its balance change in ONE transaction (economy/economyDb), the
+// one catalog (economy/catalog), the Denver calendar (economy/denverTime), the
+// economy tables + users.chips BIGINT (economy/schema).
+import {
+  withEconomyTx, readWallet, settleDailyLogin, settleDailySpin, settleScratchCard, settleMissionClaim, settleVipMonthly,
+  settleCareerReward, creditOnceWithRetry, purchaseCosmetic, purchaseBundle, purchaseChipPack, purchaseMysteryBox,
+  purchaseBooster, purchaseVipPass, purchaseBattlePassPremium, hasBattlePassPremium, equipItemTx, recordChipWins,
+  chipsWonStandings, awardSeason, publicIdsFor, userIdForPublicId,
+  type Settled, type SeasonAwardResult,
+} from './economy/economyDb';
+import {
+  shopPrice, isOwnableItem, isFreeItem, normalizeItemType, itemKey, EQUIPPABLE_TYPES, BOOSTER_DURATION, VIP_PASS_DURATION,
+  SPIN_WHEEL_SEGMENTS, SEASON_REWARDS, CAREER_REWARDS, CHIP_GRANT_ALERT_THRESHOLD, VIP_MONTHLY_BONUS_CHIPS,
+  BATTLE_PASS_XP_PER_TIER, BATTLE_PASS_TOTAL_TIERS, BATTLE_PASS_PREMIUM_COST, BATTLE_PASS_SEASON_NAME,
+  LOGIN_CHIPS_BY_DAY, LOGIN_STARS_BY_DAY, LOGIN_DAY7_MYSTERY_BOX, VIP_LOGIN_MULTIPLIER, FREE_REACTIONS, FREE_EMOTES,
+  catalogForClient, vipTierForSeasonXp,
+} from './economy/catalog';
+import {
+  denverDateKey, denverMonthKey, previousDenverMonthKey, nextDenverMidnightMs, nextDenverMonthStartMs,
+  monthDateRange, denverWeekRange, addDaysToDateKey, denverWallTimeToMs,
+} from './economy/denverTime';
+import { initEconomyTables, migrateUsersChipsToBigint } from './economy/schema';
+import { userProgressKey, seasonXpOf } from './progression/ProgressionManager';
 
 // ========== Sentry (optional, prod-only crash reporting) ==========
 // Initialized BEFORE the express app + socket.io server so any synchronous
@@ -1081,6 +1107,9 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // master account's split local rows into one, and the goodwill grant pays
   // 50,000 chips per person: both are chip + identity mutations.
   'ACCOUNT_MERGE', 'GOODWILL_CHIP_GRANT', 'ACHIEVEMENT_BACKFILL',
+  // 2026-10-11 (.online R2, ECON-18) — an economy credit at / above
+  // CHIP_GRANT_ALERT_THRESHOLD, and every monthly season award (rare, durable trail).
+  'ECON_LARGE_CREDIT', 'SEASON_LEADERBOARD_AWARD',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -2816,6 +2845,7 @@ async function createTableFromScheduledConfig(clubId: number, cfg: any): Promise
     ? tableManager.createTable(tableConfig)
     : tableManager.createVariantTable(tableConfig, variant);
   clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
+  clubIdByTable.set(tableId, clubId);   // R2 (CLUBS P3) — club stats from its hands
   return tableId;
 }
 
@@ -3113,6 +3143,12 @@ function getGameStateForPlayer(
       if (session.avatar) nameToAvatar.set(session.playerName, session.avatar);
     }
   }
+  // 2026-10-11 (R2, C7 / C8) — the account behind each human seat, for the
+  // seat's EQUIPPED cosmetics (server-validated ids from the account's record)
+  // and its opaque public id (profile / friend request by id, never the
+  // account id). Never throws into the state build.
+  let seatAccounts: Map<number, number> | undefined;
+  try { seatAccounts = seatAccountsOfTable(table); } catch { seatAccounts = undefined; }
 
   const seats = table.seats.map((seat) => {
     const seatData: any = {
@@ -3142,6 +3178,16 @@ function getGameStateForPlayer(
       const av = nameToAvatar.get(seat.playerName);
       if (av) seatData.avatar = av;
     }
+
+    // C7 / C8 — ALWAYS present (all null / false for an empty, AI or
+    // account-less seat) so a delta clears a look that went away.
+    const seatUid = seat.state === 'occupied' && !seat.isAI ? seatAccounts?.get(seat.seatIndex) : undefined;
+    const cos = seatUid !== undefined ? progressionManager.seatCosmetics(seatUid) : null;
+    seatData.cosmetics = {
+      frame: cos?.frame ?? null, title: cos?.title ?? null, cardBack: cos?.cardBack ?? null,
+      badge: cos?.badge ?? null, vip: !!cos?.vip,
+    };
+    seatData.publicId = seatUid !== undefined ? (progressionManager.userRecord(seatUid)?.publicId ?? null) : null;
 
     // For Stud games: show face-up cards to everyone
     if (table instanceof SevenStudTable && seat.holeCards.length > 0 && !seat.folded) {
@@ -3327,6 +3373,10 @@ function getGameStateForPlayer(
   // insurance quote { handNumber, cashout, equityPct, pot, expiresAt } while
   // the runout is held for its decision. Spectators always get null.
   stateObj.insuranceQuote = insuranceQuoteForSeat(table.config.tableId, table, playerSeatIndex);
+  // R2 (C7) — ALWAYS present: this seat's EQUIPPED table theme id, else null
+  // (spectators, AI, an account-less or not-yet-loaded seat).
+  const myUid = playerSeatIndex >= 0 ? seatAccounts?.get(playerSeatIndex) : undefined;
+  stateObj.myTheme = myUid !== undefined ? (progressionManager.equippedTheme(myUid) ?? null) : null;
 
   // Add missed-blind info for this player. Now sourced directly from the
   // seat object (seat.deadBlindOwedChips + seat.missedBlind) — single
@@ -3914,6 +3964,22 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     recordOpponentObservation(s.playerName, 'hand_start', { handNumber: hn });
     const a = d.action;
     const aggressive = a === PlayerAction.Raise || a === PlayerAction.AllIn;
+    // 2026-10-11 (R2, C10 / APPUI-10) — the player's HUD counters + missions
+    // are recorded HERE: this event fires with the street the action was made
+    // on and before the turn advances (the action handler recorded it AFTER the
+    // engine moved on — a preflop call that closed the round read as a Flop
+    // action and never counted for VPIP; a hand-ending action's flag landed after
+    // the hand was committed). Keyed by table + hand (an account can be in two
+    // hands at once). AI seats have no progress record (no-op).
+    if (s.playerId && !s.isAI) {
+      const progressAction = a === PlayerAction.Fold ? 'fold' : a === PlayerAction.Check ? 'check'
+        : a === PlayerAction.Call ? 'call' : a === PlayerAction.Raise ? 'raise' : a === PlayerAction.AllIn ? 'allIn' : '';
+      if (progressAction) {
+        progressionManager.recordAction(s.playerId, progressAction, {
+          phase: table.currentPhase === GamePhase.PreFlop ? 'PreFlop' : undefined, tableId, handNumber: hn,
+        });
+      }
+    }
 
     if (table.currentPhase === GamePhase.PreFlop) {
       const voluntary = a === PlayerAction.Call || aggressive;
@@ -3934,7 +4000,7 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         const facingRaise = preflopRaiseCount >= 1;
         const isReraise = aggressive && preflopRaiseCount >= 1;
         if (facingRaise || isReraise) {
-          progressionManager.recordPreflopRaiseContext(s.playerId, facingRaise, isReraise);
+          progressionManager.recordPreflopRaiseContext(s.playerId, facingRaise, isReraise, { tableId, handNumber: hn });
         }
       }
       if (aggressive) { preflopRaiseCount++; preflopAggressorSeat = d.seatIndex; }
@@ -5134,33 +5200,64 @@ setInterval(() => {
  */
 async function hydrateAndPushProgress(socket: Socket, userId: number, username: string): Promise<void> {
   try {
-    const playerId = playerSessions.get(socket.id)?.playerId || `user-${userId}`;
-    progressionManager.getOrCreateProgress(playerId, username);
-    await progressionManager.hydrateFromDB(playerId, userId);
-    const clientProgress = progressionManager.getClientProgress(playerId);
+    // 2026-10-11 (R2, C5 / ECON-9) — EVERY sign-in re-reads the account's ONE
+    // record from Postgres (a fresh load the first time, a merge afterwards —
+    // the old lobby entry was hydrated once per process and then went stale),
+    // and the seat this socket already holds becomes an alias of it.
+    const auth = authSessions.get(socket.id);
+    const name = accountDisplayName(auth?.userId === userId ? auth.displayName : null);
+    const seatPid = playerSessions.get(socket.id)?.playerId;
+    if (seatPid) progressionManager.getOrCreateProgress(seatPid, name, userId);
+    const p = await progressionManager.refreshUser(userId, name);
+    if (!p || !p.hydrated) {
+      console.warn(`[hydrateAndPushProgress ${userId}] progress not loaded yet (no payload sent; a background re-load follows)`);
+      return;
+    }
+    const clientProgress = progressionManager.getClientProgress(p.playerId);
     if (clientProgress) socket.emit('playerProgress', clientProgress);
   } catch (err: any) {
     console.warn(`[hydrateAndPushProgress ${userId}]`, err?.message);
   }
 }
 
-function sendProgressToPlayer(socketId: string): void {
-  const session = playerSessions.get(socketId);
-  if (!session) return;
-
+/**
+ * Push this socket's progress (+ pending events). 2026-10-11 (R2, C5 /
+ * APPUI-4): a SIGNED-IN socket gets its ACCOUNT's record whether or not it is
+ * seated — this used to return for an unseated socket, so a lobby purchase /
+ * claim / refill never refreshed the client. Never a not-yet-hydrated record.
+ */
+function sendProgressToPlayer(socketId: string, opts: { fresh?: boolean } = {}): void {
   const socket = io.sockets.sockets.get(socketId);
   if (!socket) return;
-
-  const clientProgress = progressionManager.getClientProgress(session.playerId);
-  if (clientProgress) {
-    socket.emit('playerProgress', clientProgress);
+  const auth = authSessions.get(socketId);
+  const playerId = auth?.userId ? userProgressKey(auth.userId) : playerSessions.get(socketId)?.playerId;
+  if (!playerId) return;
+  const emit = (): void => {
+    const s = io.sockets.sockets.get(socketId);
+    const prog = progressionManager.getProgress(playerId);
+    if (!s || !prog || (auth?.userId && !prog.hydrated)) return;
+    const clientProgress = progressionManager.getClientProgress(playerId);
+    if (clientProgress) {
+      s.emit('playerProgress', clientProgress);
+    }
+    // Flush any pending events (levelUp, achievements, missionComplete)
+    const events = progressionManager.consumeEvents(playerId);
+    for (const event of events) {
+      s.emit(event.type, event.data);
+    }
+  };
+  // C5 — DB-fresh: a signed-in socket's wallet is re-read first (a buy-in,
+  // cash-out, refund or credit elsewhere changed users.chips without touching
+  // the record), unless the caller just refreshed it (`fresh: false`).
+  if (auth?.userId && opts.fresh !== false) {
+    const userId = auth.userId;
+    readWallet(userId)
+      .then((w) => { if (w) progressionManager.applyWallet(userId, w); })
+      .catch((e: any) => console.warn(`[progress-push ${userId}] wallet read failed:`, e?.message || e))
+      .finally(emit);
+    return;
   }
-
-  // Flush any pending events (levelUp, achievements, missionComplete)
-  const events = progressionManager.consumeEvents(session.playerId);
-  for (const event of events) {
-    socket.emit(event.type, event.data);
-  }
+  emit();
 }
 
 /**
@@ -5265,26 +5362,59 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // stacks, the 0-chip seats) is read before anything can change the table.
   const tournamentBustCheck = captureTournamentBustCheck(tableId, table, results);
 
+  // 2026-10-11 (R2, ECON-13 / C6) — progress, XP, missions, achievements,
+  // scratch cards and chips won are credited ONLY to a seat that was DEALT
+  // INTO this hand (it held cards and was seated when the hand started): a
+  // sitting-out / AFK seat or a mid-hand joiner at a 24/7 bot table used to earn
+  // hands, XP and ~16-22 scratch cards an idle hour. Read now, before any await.
+  const handRef = { tableId, handNumber: table.handNumber };
+  const dealtIn = new Set<number>();
+  for (const session of humanSessions) {
+    const s = table.seats[session.seatIndex];
+    if (s && s.state === 'occupied' && !s.isAI && s.playerId === session.playerId
+      && s.holeCards.length > 0 && table.startChips.has(session.seatIndex)) dealtIn.add(session.seatIndex);
+  }
+  const countsForChipsWon = tableCountsForChipsWon(tableId);
+  const chipsWonDay = denverDateKey();
+  const clubHandEntries: Array<{ userId: number; net: number; pot: number }> = [];
+
   for (const session of humanSessions) {
     // Everyone who played gets recordHandPlayed + 5 XP. Pass variantId
     // so lifetime "all_variants" + daily/weekly variety achievements
-    // can track it.
+    // can track it. A seat NOT dealt in is told so (recordHandPlayed records
+    // nothing for it) and gets nothing else below.
     const variantId: string | undefined = (table as any).config?.variantId || (table as any).variantId;
-    progressionManager.recordHandPlayed(session.playerId, variantId);
+    const wasDealtIn = dealtIn.has(session.seatIndex);
+    progressionManager.recordHandPlayed(session.playerId, variantId, handRef, wasDealtIn);
+    if (!wasDealtIn) continue;
     progressionManager.addXP(session.playerId, 5);
 
     const seat = table.seats[session.seatIndex];
     const isWinner = winnerSeatIndices.has(session.seatIndex);
 
     // Showdown HUD stats (WTSD / W$SD). saw-flop is derived inside from the
-    // per-hand _foldedPreflop flag; here we pass whether the board reached a
+    // hand's foldedPreflop flag; here we pass whether the board reached a
     // flop, whether this player was still in at a contested showdown, and
     // whether they won at that showdown.
     {
       const flopDealt = table.communityCards.length >= 3;
       const reachedShowdown = !!(table as any).wentToShowdown && !seat?.folded;
       const wonAtShowdown = reachedShowdown && (totalWonPerSeat.get(session.seatIndex) || 0) > 0;
-      progressionManager.recordShowdownResult(session.playerId, flopDealt, reachedShowdown, wonAtShowdown);
+      progressionManager.recordShowdownResult(session.playerId, flopDealt, reachedShowdown, wonAtShowdown, handRef);
+    }
+
+    // C9 / APPUI-50 — the hand's NET result (stack now − stack at hand start,
+    // insurance settled) into the account's Denver-day chips-won bucket.
+    // Wallet-chip tables only; additive SQL (never last-writer-wins).
+    if (countsForChipsWon && seat) {
+      const auth = authSessions.get(session.socketId);
+      const net = (seat.chipCount || 0) - (table.startChips.get(session.seatIndex) || 0);
+      if (auth?.userId) {
+        recordChipWins(auth.userId, chipsWonDay, net, 1)
+          .then(() => { economyStats.chipsWonWrites++; })
+          .catch((e: any) => { economyStats.chipsWonWriteFailures++; console.warn(`[chips-won ${auth.userId}]`, e?.message || e); });
+        clubHandEntries.push({ userId: auth.userId, net, pot: totalWonPerSeat.get(session.seatIndex) || 0 });
+      }
     }
 
     // Determine position category
@@ -5306,7 +5436,10 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       progressionManager.recordPositionResult(session.playerId, posCategory, true);
 
       // Live activity ticker: surface notable real wins (big pots, rare hands).
-      const winnerName = seat?.playerName || session.playerName;
+      // R2 (Addendum) — the PUBLIC name only (never a phone-like name or a
+      // login handle); a player without one is not announced.
+      const winnerPublic = publicNameOf(seat?.playerName || session.playerName);
+      const winnerName = winnerPublic !== PUBLIC_NAME_FALLBACK ? winnerPublic : '';
       if (winnerName && potSize >= 10000) {
         pushActivity(`🏆 ${winnerName} won ${potSize.toLocaleString()} chips`);
       } else if (winnerName && handRank === HandRank.RoyalFlush) {
@@ -5338,12 +5471,16 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     }
   }
 
-  // ELO updates: pair each winner against each loser (human vs human only)
+  // CLUBS P3 (R2) — a club table's hand feeds its club_stats + club XP (fire-and-forget).
+  if (clubHandEntries.length > 0) recordClubHand(tableId, clubHandEntries);
+
+  // ELO updates: pair each winner against each loser (human vs human only,
+  // dealt-in seats only — R2: a sitting-out seat neither won nor lost).
   const humanWinnerIds = humanSessions
-    .filter((s) => winnerSeatIndices.has(s.seatIndex))
+    .filter((s) => dealtIn.has(s.seatIndex) && winnerSeatIndices.has(s.seatIndex))
     .map((s) => s.playerId);
   const humanLoserIds = humanSessions
-    .filter((s) => !winnerSeatIndices.has(s.seatIndex))
+    .filter((s) => dealtIn.has(s.seatIndex) && !winnerSeatIndices.has(s.seatIndex))
     .map((s) => s.playerId);
   if (humanWinnerIds.length > 0 && humanLoserIds.length > 0) {
     for (const winnerId of humanWinnerIds) {
@@ -5366,7 +5503,9 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // still runs only after every player's writes.
   for (const [socketId, session] of playerSessions) {
     if (session.tableId === tableId) try {
-      sendProgressToPlayer(socketId);
+      // R2 (C5) — the progress push follows this player's writes (below): the
+      // wallet the scratch tick returned is the DB's, so the payload is DB-fresh.
+      let walletRefreshed = false;
       const authSession = authSessions.get(socketId);
       if (authSession) {
         const clientProgress = progressionManager.getClientProgress(session.playerId) as any;
@@ -5378,52 +5517,26 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
           // and clobbers the user's real DB state. Repeated over sessions
           // this caused the "my level keeps resetting" bug.
           if (clientProgress.hydrated) {
+            // 2026-10-11 (R2, ECON-10) — every counter of the account's ONE
+            // record, the HUD maps (actions / positions / hand ranks), the dated
+            // achievement windows, today's missions and the rating are MERGED
+            // under the row lock (mergeUserStats monotonic: max / union / newest
+            // window) — a counter can no longer be lowered by a stale or second
+            // writer, and ELO / ranked W-L / the windows are finally persisted
+            // (0 users had stats.elo). Boosters / VIP / BP premium are written
+            // only by their purchase transactions (never re-written from memory).
             await mergeUserStats(authSession.userId, {
-              handsPlayed: clientProgress.totalHandsPlayed || 0,
-              handsWon: clientProgress.handsWon || 0,
-              biggestPot: clientProgress.biggestPot || 0,
+              ...progressionManager.persistStatsPatch(session.playerId),
               lastHandAt: Date.now(),
-            });
+            }, { monotonic: true });
 
-            // 2026-06-19 fix: also persist the COUNTER stats that feed
-            // counter-based achievements. mergeUserStats above only covers
-            // hands/biggestPot; without these, progress toward bluff/all-in/
-            // rare-hand/tournament/variant/streak achievements was held only in
-            // memory and reset to the last-saved value on every reconnect
-            // (hydrateFromDB reads exactly these keys, ProgressionManager.ts:502-513).
-            // saveProgress JSONB-merges, so other stats keys are preserved; the
-            // hydrated gate + only-go-up nature means no regression.
-            const raw = progressionManager.getProgress(session.playerId) as any;
-            const counterStats = raw ? {
-              bestStreak: raw.bestStreak,
-              bluffWins: raw.bluffWins,
-              allInWins: raw.allInWins,
-              chatMessagesSent: raw.chatMessagesSent,
-              straightFlushHits: raw.straightFlushHits,
-              fullHouseHits: raw.fullHouseHits,
-              quadsHits: raw.quadsHits,
-              royalFlushHits: raw.royalFlushHits,
-              tournamentsWon: raw.tournamentsWon,
-              tournamentsPlayed: raw.tournamentsPlayed,
-              variantsPlayed: raw.variantsPlayed,
-              vpipHands: raw.vpipHands,
-              pfrHands: raw.pfrHands,
-              flopsSeenHands: raw.flopsSeenHands,
-              showdownHands: raw.showdownHands,
-              showdownWins: raw.showdownWins,
-              threeBetOpps: raw.threeBetOpps,
-              threeBets: raw.threeBets,
-              // Shop boosters + VIP pass — persist so they survive a restart
-              // instead of evaporating (they were in-memory only).
-              activeBoosters: raw.activeBoosters,
-              vipExpiresAt: raw.vipExpiresAt,
-            } : undefined;
-
+            // level ratchets, xp belongs to that level, achievements union
+            // (only CONFIRMED ids — an achievement still settling is added by
+            // its own ledger transaction).
             await saveProgress(authSession.userId, {
               xp: clientProgress.xp,
               level: clientProgress.level,
               achievements: clientProgress.achievements || [],
-              ...(counterStats ? { stats: counterStats } : {}),
             }).catch((e) => console.warn(`[saveProgress hand-complete ${authSession.userId}]`, e?.message));
           } else {
             console.warn(`[hand-complete] SKIPPED save for userId=${authSession.userId} — progress not hydrated yet (would have overwritten real values with fresh-init)`);
@@ -5434,13 +5547,25 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
           // only has access to the minimal result data, which the replay
           // viewer couldn't render).
 
-          const awarded = await tickScratchProgress(authSession.userId).catch(() => false);
-          if (awarded) {
-            const s = io.sockets.sockets.get(socketId);
-            s?.emit('scratchCardEarned', { message: 'You earned a scratch card!' });
+          // A scratch-card tick for a DEALT-IN hand only (ECON-13). The same
+          // UPDATE returns the wallet: the progress record mirrors the DB
+          // (C5 — e.g. a buy-in or cash-out at another table since the last push).
+          if (dealtIn.has(session.seatIndex)) {
+            const tick: any = await tickScratchProgress(authSession.userId).catch(() => false);
+            if (tick && typeof tick === 'object') {
+              try { progressionManager.applyWallet(authSession.userId, tick); walletRefreshed = true; } catch { /* best-effort */ }
+            }
+            if (tick === true || (tick && tick.awarded === true)) {
+              const s = io.sockets.sockets.get(socketId);
+              s?.emit('scratchCardEarned', {
+                message: 'You earned a scratch card!',
+                scratchCardsAvailable: typeof tick?.scratchCardsAvailable === 'number' ? tick.scratchCardsAvailable : undefined,
+              });
+            }
           }
         }
       }
+      sendProgressToPlayer(socketId, { fresh: !walletRefreshed });
     } catch (e: any) {
       console.warn(`[hand-complete] progress persistence failed for socket ${socketId} (table ${tableId}) — continuing:`, e?.message || e);
     }
@@ -6696,6 +6821,328 @@ function settleInsuranceForHand(tableId: string, table: PokerTable, totalWonPerS
 const CURRENT_BATTLE_PASS_SEASON = 'season_1_the_river';
 // A full "Claim all" is <= 100 emits (50 tiers x 2 tracks): 110 per minute per account.
 const battlePassClaimLimiter = createWindowRateLimiter(110, 60_000);
+
+// ========== Economy (.online R2 — S3, 2026-10-11) ==========
+// One progress record per ACCOUNT (`user-<id>`; every seat id is an alias) —
+// C5 pushes it to every socket of the account, seated or not; achievements and
+// level-ups pay through durable ledgers (ProgressionManager); every claim /
+// purchase settles in one transaction (economy/economyDb). Contracts C5-C10.
+progressionManager.battlePassSeason = CURRENT_BATTLE_PASS_SEASON;
+// Purchases / claims per account per minute (a Claim-all of missions is 3; the shop is a tap at a time).
+const economyActionLimiter = createWindowRateLimiter(60, 60_000);
+const economyStats = {
+  pushes: 0, freshReads: 0, freshReadFailures: 0, credits: 0, largeCredits: 0,
+  seasonSweeps: 0, seasonAwards: 0, seasonSweepErrors: 0, lastSeasonSweep: null as null | { at: string; seasonKey: string; status: string },
+  evicted: 0, chipsWonWrites: 0, chipsWonWriteFailures: 0, bigintMigration: 'pending' as string,
+};
+
+/** Every live socket signed in as `userId`. */
+function socketIdsOfUser(userId: number): string[] {
+  const out: string[] = [];
+  for (const [sid, a] of authSessions) if (a?.userId === userId) out.push(sid);
+  return out;
+}
+
+/**
+ * C5 — push the account's `playerProgress` (+ its pending levelUp /
+ * achievementUnlocked / missionComplete events) to EVERY live socket of the
+ * account, seated or not. Built from the per-account record; `fresh` re-reads
+ * the wallet columns (chips, stars, scratch cards, login streak) from Postgres
+ * first — after a lobby economy action, or a settlement that finished in the
+ * background. Nothing is pushed for a record that is not hydrated (never a
+ * fresh-init level 1 / 0 chips payload).
+ */
+async function pushProgressToUser(userId: number, opts: { fresh?: boolean } = {}): Promise<void> {
+  if (!Number.isInteger(userId) || userId <= 0) return;
+  if (opts.fresh) {
+    try {
+      const w = await readWallet(userId);
+      economyStats.freshReads++;
+      if (w) progressionManager.applyWallet(userId, w);
+    } catch (e: any) {
+      economyStats.freshReadFailures++;
+      console.warn(`[progress-push ${userId}] wallet read failed (pushing the record as is):`, e?.message || e);
+    }
+  }
+  const p = progressionManager.userRecord(userId);
+  if (!p || !p.hydrated) return;
+  const payload = progressionManager.getClientProgress(p.playerId);
+  const events = progressionManager.consumeEvents(p.playerId);
+  for (const sid of socketIdsOfUser(userId)) {
+    const s = io.sockets.sockets.get(sid);
+    if (!s) continue;
+    s.emit('playerProgress', payload);
+    for (const ev of events) s.emit(ev.type, ev.data);
+  }
+  economyStats.pushes++;
+}
+
+/**
+ * Every economy CREDIT (chips / stars a player receives from a reward, claim,
+ * prize or purchase) is audited, and one at or above CHIP_GRANT_ALERT_THRESHOLD
+ * also raises the LARGE CHIP GRANT ALERT and gets the durable audit row
+ * (ECON-18 — the daily / spin / scratch / BP / mystery-box / chip-pack credits
+ * used to be unaudited, with no threshold).
+ */
+function auditEconomyCredit(userId: number, action: string, chips: number, stars: number, detail: Record<string, unknown> = {}): void {
+  const c = Math.max(0, Math.floor(Number(chips) || 0));
+  const s = Math.max(0, Math.floor(Number(stars) || 0));
+  if (c === 0 && s === 0) return;
+  economyStats.credits++;
+  auditLog(`user:${userId}`, action, { userId, chips: c, stars: s, ...detail });
+  if (c >= CHIP_GRANT_ALERT_THRESHOLD) {
+    economyStats.largeCredits++;
+    console.warn(`[AntiCheat] LARGE CHIP GRANT ALERT: ${action} credited ${c} chips to userId=${userId}`);
+    auditLog('SYSTEM', 'ECON_LARGE_CREDIT', { userId, action, chips: c, stars: s, ...detail });
+  }
+}
+
+progressionManager.setAuditHook((e) => {
+  auditEconomyCredit(e.userId, e.kind === 'achievement' ? 'ACHIEVEMENT_REWARD' : 'LEVEL_UP_REWARD', e.chips, e.stars, e.detail);
+});
+// A settlement that finished in the background (achievement / level-up ledger)
+// pushes the account's DB-fresh progress (and its unlock toasts).
+progressionManager.setChangeListener((userId) => {
+  pushProgressToUser(userId, { fresh: true }).catch((e: any) => console.warn(`[progress-push ${userId}]`, e?.message || e));
+});
+
+/**
+ * ECON-9 — persist the record's level / xp NOW, after an XP grant outside a
+ * hand (a Battle Pass XP tier, a mission): an unseated player's XP was only
+ * saved by a later hand-complete / seated disconnect, i.e. usually never.
+ * saveProgress ratchets (level GREATEST, xp of that level).
+ */
+async function persistLevelXp(userId: number): Promise<void> {
+  const p = progressionManager.userRecord(userId);
+  if (!p || !p.hydrated) return;
+  await saveProgress(userId, { level: p.level, xp: p.xp });
+}
+
+/** The message shown for an economy refusal code. */
+function economyMessage(code: string): string {
+  switch (code) {
+    case 'not_enough_stars': return 'Not enough stars';
+    case 'already_owned': return 'You already own that';
+    case 'already_claimed': return 'Already claimed';
+    case 'unknown_item': return 'Unknown item';
+    case 'not_owned': return "You don't own that item";
+    case 'not_equippable': return 'That item cannot be equipped';
+    case 'no_cards_available': return 'No scratch cards available';
+    case 'vip_required': return 'An active VIP pass is required';
+    case 'progress_loading': return 'Your progress is still loading — try again in a moment.';
+    case 'mission_not_found': return 'That mission is not one of your missions today';
+    case 'mission_expired': return 'That mission has expired';
+    case 'mission_incomplete': return 'That mission is not complete yet';
+    case 'rate_limited': return 'Slow down a little — try again in a moment.';
+    case 'login_required': return 'Sign in first';
+    case 'no_account': return 'Account not found';
+    default: return 'Something went wrong — try again';
+  }
+}
+
+/**
+ * C7 — the account behind each occupied human seat of a table: live main
+ * sessions, extra-table seats, then reservations (an absent player keeps his
+ * look). Built per state for the seat cosmetics; never throws.
+ */
+function seatAccountsOfTable(table: PokerTable): Map<number, number> {
+  const tableId = table.config.tableId;
+  const out = new Map<number, number>();
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId !== tableId) continue;
+    const a = authSessions.get(sid);
+    if (a?.userId) out.set(s.seatIndex, a.userId);
+  }
+  for (const [sid, list] of multiTableSessions) {
+    if (!Array.isArray(list)) continue;
+    for (const s of list) {
+      if (!s || s.tableId !== tableId || out.has(s.seatIndex)) continue;
+      const a = authSessions.get(sid);
+      if (a?.userId) out.set(s.seatIndex, a.userId);
+    }
+  }
+  for (const [uid, r] of reservedSeats) {
+    if (r.tableId === tableId && !out.has(r.seatIndex)) out.set(r.seatIndex, uid);
+  }
+  return out;
+}
+
+/** Re-send the table state of every table the account sits at (its seat cosmetics changed). */
+function rebroadcastTablesOfUser(userId: number): void {
+  const tables = new Set<string>();
+  for (const sid of socketIdsOfUser(userId)) {
+    const main = playerSessions.get(sid);
+    if (main) tables.add(main.tableId);
+    for (const extra of multiTableSessions.get(sid) || []) if (extra) tables.add(extra.tableId);
+  }
+  for (const t of tables) { try { broadcastGameState(t); } catch { /* best-effort */ } }
+}
+
+/**
+ * Leaderboard windows (APPUI-50): 'daily' / 'weekly' / 'season' rank by the
+ * NET chips WON at cash tables in the Denver day / week (Sunday start) / month
+ * (user_chip_wins) — 'season' is exactly the C9 award ranking. Cached 30s.
+ */
+const periodBoardCache = new Map<string, { at: number; value: { entries: any[]; meta: Record<string, unknown> } }>();
+async function periodLeaderboard(period: 'daily' | 'weekly' | 'season'): Promise<{ entries: any[]; meta: Record<string, unknown> }> {
+  const now = Date.now();
+  const hit = periodBoardCache.get(period);
+  if (hit && now - hit.at < 30_000) return hit.value;
+  let first: string; let last: string; let endsAt: number;
+  const meta: Record<string, unknown> = {};
+  if (period === 'daily') {
+    first = last = denverDateKey(now);
+    endsAt = nextDenverMidnightMs(now);
+  } else if (period === 'weekly') {
+    ({ first, last } = denverWeekRange(now));
+    const [y, m, d] = addDaysToDateKey(last, 1).split('-').map(Number);
+    endsAt = denverWallTimeToMs(y, m, d);
+  } else {
+    const seasonKey = denverMonthKey(now);
+    ({ first, last } = monthDateRange(seasonKey)!);
+    endsAt = nextDenverMonthStartMs(now);
+    meta.seasonKey = seasonKey;
+    meta.seasonEndsAt = endsAt;
+    meta.rewards = SEASON_REWARDS.map((r) => ({ place: r.place, chips: r.chips, badge: r.badge }));
+  }
+  const rows = await chipsWonStandings(first, last, 50);
+  let pids = new Map<number, string>();
+  try { pids = (await publicIdsFor(rows.map((r) => r.userId))) || new Map(); } catch { /* ids are optional */ }
+  const entries = rows.map((r, i) => {
+    const handsPlayed = Number(r.stats.handsPlayed) || 0;
+    const handsWon = Number(r.stats.handsWon) || 0;
+    return {
+      rank: i + 1, username: r.displayName, displayName: r.displayName,
+      chips: r.won, chipsWon: r.won, handsInWindow: r.hands, level: r.level,
+      handsPlayed, handsWon, winRate: handsPlayed > 0 ? Math.round((handsWon / handsPlayed) * 1000) / 10 : 0,
+      biggestPot: Number(r.stats.biggestPot) || 0, publicId: pids.get(r.userId) ?? null, userId: r.userId,
+    };
+  });
+  const value = { entries, meta: { ...meta, windowStart: first, windowEnd: last, windowEndsAt: endsAt } };
+  periodBoardCache.set(period, { at: now, value });
+  return value;
+}
+
+/** C9 — the public view of a season award (display names through publicNameOf). */
+function seasonAwardPublicResults(res: SeasonAwardResult): Array<{ userId: number; displayName: string; place: number; chips: number; badge: string; won: number }> {
+  const results: Array<{ userId: number; displayName: string; place: number; chips: number; badge: string; won: number }> = [];
+  for (const u of res.winners) {
+    const rw = SEASON_REWARDS.find((x) => x.place === u.place) || { place: u.place, chips: u.chips, badge: u.badge };
+    results.push({ userId: u.id, displayName: publicNameOf(u.display_name), place: rw.place, chips: rw.chips, badge: rw.badge, won: u.won });
+  }
+  return results;
+}
+
+/** After a season award committed: audit, push each winner's DB-fresh progress, tell their sockets. */
+function announceSeasonAward(res: SeasonAwardResult, actor: string): void {
+  for (const r of seasonAwardPublicResults(res)) {
+    auditLog(actor, 'SEASON_LEADERBOARD_AWARD', { seasonKey: res.seasonKey, ...r });
+    auditEconomyCredit(r.userId, 'SEASON_REWARD', r.chips, 0, { seasonKey: res.seasonKey, place: r.place, badge: r.badge });
+    progressionManager.updateUser(r.userId, (p) => { p.owned!.add(itemKey('badge', r.badge)); });
+    for (const sid of socketIdsOfUser(r.userId)) {
+      io.sockets.sockets.get(sid)?.emit('seasonRewardAwarded', { seasonKey: res.seasonKey, place: r.place, chips: r.chips, badge: r.badge, chipsWon: r.won });
+    }
+    pushProgressToUser(r.userId, { fresh: true }).catch(() => { /* best-effort */ });
+  }
+}
+
+/**
+ * C9 — the automatic month-end award: the FIRST sweep after the Denver month
+ * rolls over awards the previous month (awardSeason is idempotent per season —
+ * advisory lock + season_award_runs — so every later sweep, and a second
+ * process during a deploy overlap, is a no-op). Runs at boot and every 10 min.
+ */
+async function sweepSeasonAwards(trigger: string): Promise<void> {
+  const seasonKey = previousDenverMonthKey(Date.now());
+  economyStats.seasonSweeps++;
+  try {
+    const res = await awardSeason(seasonKey, trigger);
+    economyStats.lastSeasonSweep = { at: new Date().toISOString(), seasonKey, status: res.status };
+    if (res.status === 'awarded') {
+      economyStats.seasonAwards++;
+      console.log(`[season-award] ${seasonKey} awarded (${trigger}): ${res.winners.length} winner(s)`);
+      announceSeasonAward(res, 'SYSTEM');
+    }
+  } catch (e: any) {
+    economyStats.seasonSweepErrors++;
+    economyStats.lastSeasonSweep = { at: new Date().toISOString(), seasonKey, status: 'error' };
+    console.warn(`[season-award] sweep for ${seasonKey} failed (retried next sweep):`, e?.message || e);
+  }
+}
+
+/** P3 — drop progress records of accounts with no live socket / seat / reservation for 30 min. */
+function evictIdleProgress(): void {
+  const live = new Set<number>();
+  for (const a of authSessions.values()) if (a?.userId) live.add(a.userId);
+  for (const uid of reservedSeats.keys()) live.add(uid);
+  const dropped = progressionManager.evictIdle((uid) => live.has(uid));
+  economyStats.evicted += dropped.length;
+}
+
+/**
+ * Is (tableId) a table whose hands move WALLET chips between players — the
+ * only hands that count as "chips won" for the leaderboard windows and the
+ * season (C9)? Cash, private and club tables. Never a tournament (tournament
+ * chips are not wallet chips) or a quick game against bots (Spin & Go, career,
+ * heads-up / all-in-or-fold snaps — their bot stacks are refilled).
+ */
+function tableCountsForChipsWon(tableId: string): boolean {
+  if (isTournamentTable(tableId)) return false;
+  const kind = tableKindOf(tableId);
+  return kind === 'cash' || kind === 'private' || kind === 'club';
+}
+
+/**
+ * CLUBS P3 (R2) — club tables feed club_stats + club XP from every completed
+ * hand (updateClubStats / addClubXp existed but nothing called them: every club
+ * leaderboard was empty). runtime table id → club id (set when a club table is
+ * created; else looked up once in club_tables; null = not a club's table).
+ */
+const clubIdByTable = new Map<string, number | null>();
+async function clubIdOfTable(tableId: string): Promise<number | null> {
+  if (clubIdByTable.has(tableId)) return clubIdByTable.get(tableId) ?? null;
+  if (!clubTableIds.has(tableId)) return null;
+  try {
+    const id = await getClubIdForRuntimeTable(tableId);
+    clubIdByTable.set(tableId, id);
+    return id;
+  } catch { return null; }
+}
+function recordClubHand(tableId: string, entries: Array<{ userId: number; net: number; pot: number }>): void {
+  if (entries.length === 0 || !clubTableIds.has(tableId)) return;
+  void (async () => {
+    const clubId = await clubIdOfTable(tableId);
+    if (!clubId) return;
+    for (const e of entries) {
+      await updateClubStats(clubId, e.userId, {
+        handsPlayed: 1, chipsWon: e.net > 0 ? e.net : 0, chipsLost: e.net < 0 ? -e.net : 0, biggestPot: e.pot,
+      }).catch((err: any) => console.warn(`[club-stats ${clubId}/${e.userId}]`, err?.message || err));
+    }
+    await addClubXp(clubId, entries.length).catch((err: any) => console.warn(`[club-xp ${clubId}]`, err?.message || err));
+  })();
+}
+
+/**
+ * APPUI-45 — is the prediction window of (table, hand) closed? null = open.
+ *   'market' (a prediction-wallet bet): the hand IN PROGRESS, pre-flop, no board
+ *            card, nobody all-in — before anything a market asks about shows.
+ *   'pick'   (the free winner pick): the hand in progress, before the river.
+ */
+function predictionWindowClosed(tableId: string, handNumber: number, kind: 'market' | 'pick'): { code: string; message: string } | null {
+  const t = tableManager.getTable(tableId);
+  if (!t || !t.isHandInProgress() || t.handNumber !== handNumber) {
+    return { code: 'prediction_hand_closed', message: 'That hand is not in progress any more' };
+  }
+  if (kind === 'market') {
+    const anyAllIn = t.seats.some((s) => s.state === 'occupied' && !s.folded && s.allIn);
+    if (t.currentPhase !== GamePhase.PreFlop || t.communityCards.length > 0 || anyAllIn) {
+      return { code: 'prediction_street_closed', message: 'Predictions on this hand closed before the flop' };
+    }
+  } else if (![GamePhase.PreFlop, GamePhase.Flop, GamePhase.Turn].includes(t.currentPhase)) {
+    return { code: 'prediction_street_closed', message: 'Picks on this hand closed at the river' };
+  }
+  return null;
+}
 
 // R1 contract #4 — showMuckedHand: one reveal per (table, hand, seat).
 const shownMuckedHands = new Set<string>();
@@ -8815,14 +9262,27 @@ Give feedback in this JSON format:
   socket.on('getLeaderboard', async (data: { period?: string }) => { // async
     try {
       const period = data?.period || 'alltime';
-      const entries = await getLeaderboard(50, period);
       // R1 (ECON-3) — public display names only (no admin / banned /
       // tombstone rows), and the viewer's own row flagged by the server
       // (`isYou`) instead of shipping account ids.
       const viewer = authSessions.get(socket.id)?.userId;
+      // R2 (APPUI-50 / C9) — 'daily' / 'weekly' / 'season' rank by the chips
+      // WON in that Denver window (they ranked the all-time wallet); 'season'
+      // is the monthly award's own ranking, with `seasonEndsAt` + its rewards.
+      if (period === 'daily' || period === 'weekly' || period === 'season') {
+        const board = await periodLeaderboard(period);
+        socket.emit('leaderboardData', {
+          period, ...board.meta,
+          entries: board.entries.map(({ userId, ...e }: any) => ({ ...e, isYou: viewer !== undefined && userId === viewer })),
+        });
+        return;
+      }
+      const entries = await getLeaderboard(50, period);
+      let pids = new Map<number, string>();
+      try { pids = (await publicIdsFor(entries.map((e) => e.userId))) || new Map(); } catch { /* ids are optional */ }
       socket.emit('leaderboardData', {
         period,
-        entries: entries.map(({ userId, ...e }) => ({ ...e, isYou: viewer !== undefined && userId === viewer })),
+        entries: entries.map(({ userId, ...e }) => ({ ...e, publicId: pids.get(userId) ?? null, isYou: viewer !== undefined && userId === viewer })),
       });
     } catch {
       socket.emit('leaderboardData', { period: data?.period || 'alltime', entries: [] });
@@ -8840,7 +9300,11 @@ Give feedback in this JSON format:
       const q = (typeof data?.query === 'string' ? data.query : '').trim().slice(0, 20);
       if (q.length < 2) { socket.emit('playerSearchResults', { results: [] }); return; }
       const rows = await searchUsers(q, 10);
-      socket.emit('playerSearchResults', { results: rows.map((r, i) => ({ id: `r${i}`, username: r.displayName, displayName: r.displayName, level: r.level })) });
+      // R2 (Addendum) — each result's opaque `publicId` (friend request /
+      // profile BY ID — never the account id, the login handle or a name lookup).
+      let pids = new Map<number, string>();
+      try { pids = (await publicIdsFor(rows.map((r) => r.id))) || new Map(); } catch { /* ids are optional */ }
+      socket.emit('playerSearchResults', { results: rows.map((r, i) => ({ id: `r${i}`, username: r.displayName, displayName: r.displayName, level: r.level, publicId: pids.get(r.id) ?? undefined })) });
     } catch {
       socket.emit('playerSearchResults', { results: [] });
     }
@@ -8877,13 +9341,20 @@ Give feedback in this JSON format:
         name: t.tableName,
         players: t.playerCount,
         blinds: `${t.smallBlind}/${t.bigBlind}`,
+        // R2 (APPUI-34) — the dashboard reads `stakes` (it showed N/A).
+        stakes: `${t.smallBlind}/${t.bigBlind}`,
         variant: t.variantName,
         isTournament: isTournamentTable(t.tableId),
       })),
       handsPlayedToday,
       uptime: `${hours}h ${mins}m`,
       memoryUsage: `${memMB} MB`,
+      // R2 (APPUI-34) — the server's maintenance flag, so the toggle shows the
+      // real state (it started OFF on every dashboard load).
+      maintenanceMode,
+      // R2 (APPUI-34) — users carry xp / handsPlayed / handsWon / winRate.
       users: await getAllUsers(),
+      economy: { ...economyStats, progressRecords: progressionManager.size },
     });
   });
 
@@ -9431,65 +9902,36 @@ Give feedback in this JSON format:
   });
 
   // 2026-07-07 gap-fill — season leaderboard awards. The Leaderboard UI advertises
-  // real season prizes (1st 50k+Gold, 2nd 25k+Silver, 3rd 10k+Bronze) but nothing
-  // ever paid them out. Admin-triggered (NOT auto), idempotent per season+user via
-  // season_leaderboard_awards, play-money chips on the audited additive path +
-  // badge cosmetics via grantItem. Ranks the top-3 by chips (what the leaderboard
-  // shows). Amounts are SERVER constants — never from the client.
+  // real season prizes (1st 50k+Gold, 2nd 25k+Silver, 3rd 10k+Bronze).
+  // 2026-10-11 (R2, C9 / ECON-11 / APPUI-17) — the award now runs AUTOMATICALLY
+  // (sweepSeasonAwards: the first sweep after the Denver month rolls over) and
+  // ranks by chips WON during the month (user_chip_wins — it ranked the all-time
+  // WALLET, which a season does not measure), excluding admins / banned /
+  // tombstones / guests. Ledger + chips + badge + the season's run marker in
+  // ONE transaction (economyDb.awardSeason), idempotent per season. This admin
+  // request runs the same award for a COMPLETED month only (a missed sweep / a
+  // re-check); a season already awarded answers `already_awarded`.
   socket.on('runSeasonLeaderboardAward', async (data: { seasonKey?: string } = {}) => {
     const auth = authSessions.get(socket.id);
     if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
-    const seasonKey = (data?.seasonKey && /^\d{4}-\d{2}$/.test(data.seasonKey)) ? data.seasonKey : new Date().toISOString().slice(0, 7);
-    const REWARDS = [
-      { place: 1, chips: 50000, badge: 'season_gold' },
-      { place: 2, chips: 25000, badge: 'season_silver' },
-      { place: 3, chips: 10000, badge: 'season_bronze' },
-    ];
-    // 2026-07-07 review fix — run the WHOLE award in ONE transaction (ledger +
-    // chip credit + badge, all atomic) so a transient credit failure rolls back
-    // the ledger row too (previously the ledger committed first, then a failed
-    // addChipsToUser stranded the award permanently unpaid). Plus a PER-SEASON
-    // guard: if this season already has ANY award rows, refuse — otherwise a
-    // re-run after the top-3-by-chips ranking shifts would pay additional users
-    // beyond the intended three. An advisory lock serializes concurrent runs.
-    const client = await getPool().connect();
+    const current = denverMonthKey();
+    const seasonKey = (data?.seasonKey && /^\d{4}-\d{2}$/.test(data.seasonKey)) ? data.seasonKey : previousDenverMonthKey();
+    if (seasonKey >= current) {
+      socket.emit('seasonLeaderboardAwarded', { success: false, error: 'season_not_finished', seasonKey, current });
+      return;
+    }
     try {
-      await client.query('BEGIN');
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [`season_award:${seasonKey}`]);
-      const existing = await client.query('SELECT 1 FROM season_leaderboard_awards WHERE season_key=$1 LIMIT 1', [seasonKey]);
-      if (existing.rowCount) {
-        await client.query('ROLLBACK');
+      const res = await awardSeason(seasonKey, `admin:${auth.userId}`);
+      if (res.status === 'already_awarded') {
         socket.emit('seasonLeaderboardAwarded', { success: false, error: 'already_awarded', seasonKey });
         return;
       }
-      // R1 (ECON-3 / ECON-11) — ranked like the leaderboard it advertises:
-      // never an admin, banned, tombstone or retired guest row.
-      const { rows } = await client.query(`SELECT id, display_name, chips FROM users WHERE ${LISTABLE_USER_SQL} ORDER BY chips DESC LIMIT 3`);
-      const results: any[] = [];
-      for (let i = 0; i < rows.length && i < REWARDS.length; i++) {
-        const u = rows[i];
-        const rw = REWARDS[i];
-        await client.query(
-          `INSERT INTO season_leaderboard_awards (season_key, user_id, place, chips, badge_id) VALUES ($1,$2,$3,$4,$5)`,
-          [seasonKey, u.id, rw.place, rw.chips, rw.badge]
-        );
-        await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [rw.chips, u.id]);
-        await client.query(
-          `INSERT INTO user_inventory (user_id, item_type, item_id) VALUES ($1,'badge',$2) ON CONFLICT (user_id, item_type, item_id) DO NOTHING`,
-          [u.id, rw.badge]
-        );
-        results.push({ userId: u.id, displayName: publicNameOf(u.display_name), place: rw.place, chips: rw.chips, badge: rw.badge });
-      }
-      await client.query('COMMIT');
       // Audit AFTER commit — the movements are now durable.
-      for (const r of results) auditLog(auth.username, 'SEASON_LEADERBOARD_AWARD', { seasonKey, ...r });
-      socket.emit('seasonLeaderboardAwarded', { success: true, seasonKey, results });
+      announceSeasonAward(res, auth.username);
+      socket.emit('seasonLeaderboardAwarded', { success: true, seasonKey, results: seasonAwardPublicResults(res) });
     } catch (err: any) {
-      try { await client.query('ROLLBACK'); } catch { /* ignore */ }
       console.error('[runSeasonLeaderboardAward]', err);
       socket.emit('seasonLeaderboardAwarded', { success: false, error: 'server_error' });
-    } finally {
-      client.release();
     }
   });
 
@@ -9732,6 +10174,7 @@ Give feedback in this JSON format:
         : tableManager.createVariantTable(tableConfig, variant);
       if (tableId) {
         clubTableIds.add(tableId);   // R1 contract #2 — tableKind 'club'
+        clubIdByTable.set(tableId, Number(data.clubId) || null);   // R2 (CLUBS P3)
         await updateClubTableId(result.table.id, tableId);
         result.table.tableId = tableId;
       }
@@ -10317,19 +10760,15 @@ Give feedback in this JSON format:
       if (amount > 0) {
         const creditReferral = (uid?: number) => {
           if (!uid) return;
-          // Online → in-memory + DB + live client refresh; offline → DB only.
-          let live = false;
-          for (const [sid, a] of authSessions) {
-            if (a.userId === uid) {
-              const pid = playerSessions.get(sid)?.playerId;
-              if (pid && progressionManager.creditChips(pid, amount)) {
-                sendProgressToPlayer(sid);
-                live = true;
-              }
-              break;
-            }
-          }
-          if (!live) addChipsToUser(uid, amount).catch((e) => console.warn(`[referral reward ${uid}]`, e?.message));
+          // R2 (C5) — DB credit (additive), then the account's DB-fresh
+          // progress to every socket of it (it only reached a SEATED socket).
+          addChipsToUser(uid, amount)
+            .then((ok) => {
+              if (!ok) { console.warn(`[referral reward ${uid}] credit failed`); return; }
+              auditEconomyCredit(uid, 'CLUB_REFERRAL_REWARD', amount, 0, {});
+              return pushProgressToUser(uid, { fresh: true });
+            })
+            .catch((e) => console.warn(`[referral reward ${uid}]`, e?.message));
           auditLog(String(uid), 'CLUB_REFERRAL_CHIP_GRANT', { amount });
         };
         creditReferral(result.referrerUserId);
@@ -10853,464 +11292,155 @@ Give feedback in this JSON format:
    */
 
   // ───── Persistence sweep: socket handlers ──────────────────────────────────
-  // Server-authoritative shop prices. Client cannot influence cost.
-  const SHOP_PRICES: Record<string, Record<string, number>> = {
-    // Card backs
-    card_back: {
-      classic_red: 0, royal_blue: 0,
-      gold_premium: 500, neon_green: 500, silver_foil: 400,
-      holographic: 800, dragon: 1200, phoenix: 1500,
-      diamond_pattern: 2000, mythic: 5000,
-    },
-    // Table themes — moved off the broken "Browse Table Themes" modal
-    // flow and into the main shop grid.
-    theme: {
-      classic_blue: 0, green_felt: 0,
-      midnight_purple: 300, ocean_breeze: 400, casino_royale: 500,
-      neon_vegas: 600, carbon_black: 700, royal_gold: 800,
-      cherry_wood: 900, cosmic_nebula: 1500,
-    },
-    // Avatar frames
-    frame: {
-      bronze: 500, silver: 1000, gold: 2000, diamond: 5000,
-      flame: 6000, ice: 6000, crown: 10000, platinum: 8000, mythic: 15000,
-    },
-    // Emotes
-    emote: {
-      nice_hand: 150, good_game: 150, well_played: 150,
-      thumbs_up: 150, clap: 200, love: 250,
-      big_brain: 200, money: 200, fire: 250,
-      tears: 250, rocket: 300, crown: 400,
-      sunglasses: 200, laughing: 200, surprised: 200,
-      dead: 300, think: 300, poker_face: 400,
-      mic_drop: 500, trophy: 600,
-    },
-    // Celebrations
-    celebration: {
-      confetti: 400, chip_rain: 800, fireworks: 1200, lightning: 1500,
-      golden_shower: 2000, dragon_breath: 3000, cosmic_burst: 4000, supernova: 6000,
-    },
-    // Sound packs
-    sound_pack: {
-      silent_mode: 100, classic_casino: 300, vegas_casino: 300,
-      old_school: 500, cyberpunk: 750, fantasy: 1000,
-    },
-    // Player titles
-    title: {
-      nitwit: 300, calling_station: 400, grinder: 500,
-      river_rat: 600, chip_leader: 700, degenerate: 700,
-      the_shark: 800, bad_beat_survivor: 800, final_table: 1000,
-      bluff_master: 1200, all_in_legend: 1500, phantom: 1500,
-      tournament_champ: 2000, royal: 3000, godmode: 8000,
-    },
-    // Chip packs — stars → chips conversion
-    chip_pack: {
-      refill: 50, small: 100, medium: 300, big: 600,
-      pro: 1500, whale: 3000, kingpin: 6000, emperor: 12000,
-    },
-    // Mystery boxes — random reward
-    mystery_box: {
-      basic: 500, premium: 2000, legendary: 8000,
-    },
-    // Chip skins — how your chips look in your seat stack visual
-    chip_skin: {
-      classic: 0, crimson: 400, cobalt: 500, emerald: 600,
-      amethyst: 800, gold_rimmed: 1200, neon: 1800, holographic: 2500, mythic: 4000,
-    },
-    // Card front designs — alt faces for your cards (hero only; others see default)
-    card_front: {
-      standard: 0, minimal: 400, retro: 600, modern: 800,
-      futuristic: 1200, luxury: 1800, hanafuda: 2200, artistic: 2800,
-    },
-    // Dealer voice packs — audio pack for dealer callouts
-    dealer_voice: {
-      standard: 0, vegas_vet: 600, british_butler: 800,
-      pirate: 900, robot: 1100, sportscaster: 1400, celebrity: 2200, mythic_sage: 4000,
-    },
-    // Profile backgrounds — the backdrop behind your avatar in the lobby
-    profile_bg: {
-      default: 0, sunset: 200, city_lights: 350, deep_space: 500,
-      aurora: 700, volcano: 900, underwater: 1100, cherry_blossom: 1400, diamond_rain: 2500,
-    },
-    // XP & chip boosters (consumable — expiry handled server-side)
-    booster: {
-      xp_2x_15m: 200, xp_2x_1h: 600, xp_2x_1d: 2500,
-      chip_1p5x_1h: 400, chip_1p5x_1d: 2000,
-    },
-    // VIP passes — future-use flag, gates premium-only perks
-    vip_pass: {
-      daily: 300, weekly: 1500, monthly: 5000, lifetime: 50000,
-    },
-    // Bundles — single-purchase multi-item grants. See BUNDLE_CONTENTS below.
-    bundle: {
-      starter:       800,    // 3 items
-      collector:     2500,   // 5 items
-      tournament:    4000,   // 6 items + chip pack
-      whale_bundle:  10000,  // 8 items + chip pack
-      mythic_bundle: 25000,  // everything mythic-tier
-    },
-  };
-  const CHIP_PACK_PAYOUT: Record<string, number> = {
-    refill: 10000, small: 25000, medium: 100000, big: 250000,
-    pro: 750000, whale: 2000000, kingpin: 5000000, emperor: 15000000,
-  };
+  // 2026-10-11 (.online R2, S3) — prices, bundles, boosters, VIP passes and every
+  // reward table live in economy/catalog.ts (server-authoritative; the client
+  // can never influence a cost). Every purchase and claim below settles in ONE
+  // transaction (economy/economyDb.ts) and then pushes the account's DB-fresh
+  // progress to all of its sockets (C5 — seated or not).
 
-  // Bundle contents: what items a single purchase grants.
-  // Each entry is an array of [itemType, itemId] tuples. If the user
-  // already owns any item, a 25% pro-rata stars refund is credited for
-  // each duplicate.
-  const BUNDLE_CONTENTS: Record<string, Array<[string, string]>> = {
-    starter: [
-      ['card_back', 'silver_foil'],
-      ['emote', 'nice_hand'],
-      ['frame', 'bronze'],
-    ],
-    collector: [
-      ['card_back', 'gold_premium'],
-      ['theme', 'casino_royale'],
-      ['frame', 'silver'],
-      ['emote', 'crown'],
-      ['celebration', 'chip_rain'],
-    ],
-    tournament: [
-      ['title', 'tournament_champ'],
-      ['theme', 'royal_gold'],
-      ['frame', 'gold'],
-      ['card_back', 'holographic'],
-      ['celebration', 'fireworks'],
-      ['emote', 'trophy'],
-    ],
-    whale_bundle: [
-      ['theme', 'cosmic_nebula'],
-      ['card_back', 'diamond_pattern'],
-      ['frame', 'diamond'],
-      ['celebration', 'golden_shower'],
-      ['emote', 'mic_drop'],
-      ['title', 'royal'],
-      ['sound_pack', 'fantasy'],
-      ['dealer_voice', 'celebrity'],
-    ],
-    mythic_bundle: [
-      ['card_back', 'mythic'],
-      ['frame', 'mythic'],
-      ['title', 'godmode'],
-      ['celebration', 'supernova'],
-      ['chip_skin', 'mythic'],
-      ['card_front', 'artistic'],
-      ['dealer_voice', 'mythic_sage'],
-      ['profile_bg', 'diamond_rain'],
-      ['theme', 'cosmic_nebula'],
-    ],
-  };
-
-  // Booster durations in ms (for consumable activation record)
-  const BOOSTER_DURATION: Record<string, { kind: 'xp' | 'chip'; mult: number; ms: number }> = {
-    xp_2x_15m:    { kind: 'xp',   mult: 2,   ms: 15 * 60 * 1000 },
-    xp_2x_1h:     { kind: 'xp',   mult: 2,   ms: 60 * 60 * 1000 },
-    xp_2x_1d:     { kind: 'xp',   mult: 2,   ms: 24 * 60 * 60 * 1000 },
-    chip_1p5x_1h: { kind: 'chip', mult: 1.5, ms: 60 * 60 * 1000 },
-    chip_1p5x_1d: { kind: 'chip', mult: 1.5, ms: 24 * 60 * 60 * 1000 },
-  };
-
-  // VIP pass durations
-  const VIP_PASS_DURATION: Record<string, number> = {
-    daily:    24 * 60 * 60 * 1000,
-    weekly:   7  * 24 * 60 * 60 * 1000,
-    monthly:  30 * 24 * 60 * 60 * 1000,
-    lifetime: 100 * 365 * 24 * 60 * 60 * 1000,
-  };
-
-  // Lazy hydration — first socket call after auth hydrates player progress from DB.
-  async function ensureHydrated(s: Socket): Promise<{ userId: number; playerId: string; username: string } | null> {
+  // Lazy hydration — the ACCOUNT's record (`user-<id>`), loaded from Postgres.
+  // R2: `hydrated` is false only when every read attempt failed (ECON-12) —
+  // economy handlers then refuse `progress_loading` instead of acting on a
+  // fresh-init record.
+  async function ensureHydrated(s: Socket): Promise<{ userId: number; playerId: string; username: string; hydrated: boolean } | null> {
     const auth = authSessions.get(s.id);
     if (!auth) return null;
-    const playerId = playerSessions.get(s.id)?.playerId || `user-${auth.userId}`;
-    const progress = progressionManager.getOrCreateProgress(playerId, auth.username);
-    // Await hydration fully. Previously we only checked `!progress.userId`
-    // which returns false the instant hydrateFromDB sets userId at the top
-    // of its function, but `hydrated=true` isn't set until the very end
-    // after all DB reads complete. That race window was enough for a
-    // caller to mutate in-memory values (stars/xp/etc.) and then write
-    // them to DB via a non-gated path, clobbering real data. Now we
-    // always await hydrateFromDB — it's idempotent (early-returns if
-    // already hydrated for this userId) so this is cheap.
-    if (!progress.hydrated || progress.userId !== auth.userId) {
-      await progressionManager.hydrateFromDB(playerId, auth.userId);
-    }
-    return { userId: auth.userId, playerId, username: auth.username };
+    const playerId = userProgressKey(auth.userId);
+    const progress = progressionManager.getOrCreateProgress(playerId, accountDisplayName(auth.displayName), auth.userId);
+    let hydrated = !!progress.hydrated && progress.userId === auth.userId;
+    if (!hydrated) hydrated = !!(await progressionManager.hydrateFromDB(playerId, auth.userId));
+    return { userId: auth.userId, playerId, username: auth.username, hydrated };
   }
 
-  // Shop: purchase an item. Deducts stars (or chips for chip_pack), inventory-inserts, emits update.
+  /** Refuse an economy action on an un-loaded record / a burst (true = refused, the reply is sent). */
+  const economyGate = (ctx: { userId: number; hydrated?: boolean } | null, reply: (r: Record<string, unknown>) => void): boolean => {
+    if (!ctx) { reply({ success: false, error: economyMessage('login_required'), code: 'login_required' }); return true; }
+    if (ctx.hydrated === false) { reply({ success: false, error: economyMessage('progress_loading'), code: 'progress_loading' }); return true; }
+    if (!economyActionLimiter.hit(String(ctx.userId))) { reply({ success: false, error: economyMessage('rate_limited'), code: 'rate_limited' }); return true; }
+    return false;
+  };
+
+  // Shop: purchase an item (C7 / C8 / ECON-6). Stars are DEDUCTED FIRST, then
+  // the grant, in one transaction — a refusal (already owned, not enough
+  // stars) or any error rolls the whole purchase back. Replies `purchaseResult`
+  // { success, itemType, itemId, cost, [payout | mysteryReward | bundleGranted,
+  // bundleDuplicates, refund | booster | vipExpiresAt] } or { success:false,
+  // error, code }.
   socket.on('purchaseShopItem', async (data: { itemType: string; itemId: string }) => {
+    const reply = (r: Record<string, unknown>) => socket.emit('purchaseResult', r);
     try {
       const ctx = await ensureHydrated(socket);
-      if (!ctx) { socket.emit('purchaseResult', { success: false, error: 'Not authenticated' }); return; }
-      const { itemType, itemId } = data || {};
-      const prices = SHOP_PRICES[itemType];
-      if (!prices || prices[itemId] == null) {
-        socket.emit('purchaseResult', { success: false, error: 'Unknown item' });
-        return;
-      }
-      const cost = prices[itemId];
-      const progress = progressionManager.getProgress(ctx.playerId)!;
-      if (progress.stars < cost) {
-        socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
-        return;
-      }
+      if (economyGate(ctx, reply)) return;
+      const userId = ctx!.userId;
+      const itemType = normalizeItemType(data?.itemType);
+      const itemId = String(data?.itemId ?? '');
+      const cost = shopPrice(itemType, itemId);
+      if (cost === null) { reply({ success: false, error: economyMessage('unknown_item'), code: 'unknown_item', itemType, itemId }); return; }
 
-      // Chip pack: spend stars → credit chips. No inventory row.
+      let res: Settled<any>;
+      let extra: Record<string, unknown> = {};
+      let inventoryChanged = false;
       if (itemType === 'chip_pack') {
-        const payout = CHIP_PACK_PAYOUT[itemId] || 0;
-        const ok = await deductStars(ctx.userId, cost);
-        if (!ok) {
-          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_chip_pack' });
-          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
-          return;
+        res = await purchaseChipPack(userId, itemId, cost);
+        if (res.ok) {
+          extra = { payout: res.payout };
+          auditEconomyCredit(userId, 'SHOP_CHIP_PACK', res.payout, 0, { itemId, cost });
         }
-        // 2026-06-19 fix: the two DB ops aren't a single transaction, so if the
-        // chip credit fails AFTER stars are already deducted, refund the stars
-        // (otherwise: stars lost, no chips). Update the in-memory mirror only
-        // after BOTH DB ops succeed.
-        const credited = await addChipsToUser(ctx.userId, payout).catch(() => false);
-        if (!credited) {
-          try { await addStarsToUser(ctx.userId, cost); } catch { /* logged below */ }
-          auditLog('SYSTEM', 'CHIP_PACK_CREDIT_FAILED_REFUND', { userId: ctx.userId, cost, payout });
-          socket.emit('purchaseResult', { success: false, error: 'Purchase failed — stars refunded' });
-          sendProgressToPlayer(socket.id);
-          return;
-        }
-        progress.stars -= cost;
-        progress.chips += payout;
-        socket.emit('purchaseResult', { success: true, itemType, itemId, cost, payout });
-        sendProgressToPlayer(socket.id);
-        return;
-      }
-
-      // Mystery box: spend stars → roll a random reward (chips / stars
-      // refund / cosmetic). Tier determines loot quality.
-      if (itemType === 'mystery_box') {
-        const ok = await deductStars(ctx.userId, cost);
-        if (!ok) {
-          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_mystery_box' });
-          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
-          return;
-        }
-        progress.stars -= cost;
-
-        const tierTable: Record<string, { chips: [number, number]; stars: [number, number]; itemPool?: Array<{ type: string; id: string }> }> = {
-          basic: {
-            chips: [5000, 25000], stars: [50, 150],
-            itemPool: [
-              { type: 'emote', id: 'nice_hand' }, { type: 'emote', id: 'fire' },
-              { type: 'sound_pack', id: 'classic_casino' },
-            ],
-          },
-          premium: {
-            chips: [25000, 150000], stars: [200, 600],
-            itemPool: [
-              { type: 'frame', id: 'silver' }, { type: 'celebration', id: 'chip_rain' },
-              { type: 'title', id: 'the_shark' }, { type: 'card_back', id: 'holographic' },
-            ],
-          },
-          legendary: {
-            chips: [150000, 1000000], stars: [800, 2500],
-            itemPool: [
-              { type: 'frame', id: 'diamond' }, { type: 'celebration', id: 'supernova' },
-              { type: 'title', id: 'royal' }, { type: 'card_back', id: 'mythic' },
-            ],
-          },
-        };
-        const tier = tierTable[itemId] || tierTable.basic;
-        const roll = Math.random();
-        let payload: any = {};
-        if (roll < 0.5) {
-          // 50% chips
-          const amt = Math.floor(tier.chips[0] + Math.random() * (tier.chips[1] - tier.chips[0]));
-          progress.chips += amt;
-          await addChipsToUser(ctx.userId, amt);
-          payload = { kind: 'chips', amount: amt };
-        } else if (roll < 0.8) {
-          // 30% stars refund
-          const amt = Math.floor(tier.stars[0] + Math.random() * (tier.stars[1] - tier.stars[0]));
-          const ok = await addStarsToUser(ctx.userId, amt);
-          if (!ok) {
-            auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: amt, path: 'shop_mystery_box_refund' });
+      } else if (itemType === 'mystery_box') {
+        res = await purchaseMysteryBox(userId, itemId, cost);
+        if (res.ok) {
+          // P3 — the result is {kind, amount} or {kind:'item', itemType, itemId} (never an object in a string).
+          extra = { mysteryReward: res.mysteryReward };
+          const m = res.mysteryReward;
+          if (m.kind === 'item') {
+            inventoryChanged = true;
+            progressionManager.updateUser(userId, (p) => { p.owned!.add(itemKey(m.itemType, m.itemId)); });
           }
-          progress.stars += amt;
-          payload = { kind: 'stars', amount: amt };
-        } else if (tier.itemPool && tier.itemPool.length > 0) {
-          // 20% cosmetic item
-          const pick = tier.itemPool[Math.floor(Math.random() * tier.itemPool.length)];
-          const granted = await dbGrantItem(ctx.userId, pick.type, pick.id);
-          if (granted) {
-            payload = { kind: 'item', itemType: pick.type, itemId: pick.id };
-            const inv = await loadInventory(ctx.userId);
-            socket.emit('inventoryUpdated', { inventory: inv });
-          } else {
-            // Duplicate — refund equivalent stars.
-            const refund = Math.floor(cost * 0.4);
-            const ok = await addStarsToUser(ctx.userId, refund);
-            if (!ok) {
-              auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: refund, path: 'shop_mystery_box_dup_refund' });
-            }
-            progress.stars += refund;
-            payload = { kind: 'stars', amount: refund, reason: 'duplicate_refund' };
-          }
-        } else {
-          payload = { kind: 'chips', amount: 0 };
+          auditEconomyCredit(userId, 'SHOP_MYSTERY_BOX', m.kind === 'chips' ? m.amount : 0, m.kind === 'stars' ? m.amount : 0, { itemId, cost, result: m });
         }
-
-        socket.emit('purchaseResult', { success: true, itemType, itemId, cost, mysteryReward: payload });
-        sendProgressToPlayer(socket.id);
-        return;
-      }
-
-      // Bundle: multi-item grant in a single purchase. Duplicates refund
-      // pro-rata stars so the user isn't penalized for partial overlap.
-      if (itemType === 'bundle') {
-        const contents = BUNDLE_CONTENTS[itemId] || [];
-        if (contents.length === 0) {
-          socket.emit('purchaseResult', { success: false, error: 'Unknown bundle' });
-          return;
+      } else if (itemType === 'bundle') {
+        res = await purchaseBundle(userId, itemId, cost);
+        if (res.ok) {
+          inventoryChanged = true;
+          extra = { bundleGranted: res.granted, bundleDuplicates: res.duplicates, refund: res.refund };
+          progressionManager.updateUser(userId, (p) => { for (const [t, id] of res.granted as Array<[string, string]>) p.owned!.add(itemKey(t, id)); });
+          if (res.refund > 0) auditEconomyCredit(userId, 'SHOP_BUNDLE_DUP_REFUND', 0, res.refund, { itemId });
         }
-        const deducted = await deductStars(ctx.userId, cost);
-        if (!deducted) {
-          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_bundle' });
-          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
-          return;
-        }
-        progress.stars -= cost;
-        const grantedItems: Array<[string, string]> = [];
-        let duplicates = 0;
-        for (const [t, id] of contents) {
-          const ok = await dbGrantItem(ctx.userId, t, id);
-          if (ok) grantedItems.push([t, id]);
-          else duplicates++;
-        }
-        // Refund 25% of bundle cost per duplicate, averaged over item count.
-        if (duplicates > 0) {
-          const refund = Math.floor((cost * 0.25 * duplicates) / contents.length);
-          if (refund > 0) {
-            const refunded = await addStarsToUser(ctx.userId, refund);
-            if (!refunded) {
-              auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: refund, path: 'shop_bundle_dup_refund' });
-            }
-          }
-          progress.stars += refund;
-        }
-        socket.emit('purchaseResult', {
-          success: true, itemType, itemId, cost,
-          bundleGranted: grantedItems, bundleDuplicates: duplicates,
-        });
-        const inv = await loadInventory(ctx.userId);
-        socket.emit('inventoryUpdated', { inventory: inv });
-        sendProgressToPlayer(socket.id);
-        return;
-      }
-
-      // Booster (XP / chip multiplier): consumable with expiry. Applied
-      // to the in-memory progress; future hands respect the multiplier.
-      // Persistence is best-effort — a server restart clears boosters
-      // (acceptable trade-off given short durations).
-      if (itemType === 'booster') {
+      } else if (itemType === 'booster') {
         const b = BOOSTER_DURATION[itemId];
-        if (!b) {
-          socket.emit('purchaseResult', { success: false, error: 'Unknown booster' });
-          return;
+        res = b ? await purchaseBooster(userId, cost, b.kind, b.mult, b.ms) : { ok: false, code: 'unknown_item' };
+        if (res.ok) {
+          extra = { booster: res.booster };
+          progressionManager.updateUser(userId, (p) => { p.activeBoosters = { ...res.activeBoosters }; });
         }
-        const ok = await deductStars(ctx.userId, cost);
-        if (!ok) {
-          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_booster' });
-          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
-          return;
-        }
-        progress.stars -= cost;
-        const expiresAt = Date.now() + b.ms;
-        (progress as any).activeBoosters = (progress as any).activeBoosters || {};
-        (progress as any).activeBoosters[b.kind] = { mult: b.mult, expiresAt };
-        // Persist immediately so the booster survives a restart even if the
-        // player never plays a hand after buying it (JSONB-merge, gated).
-        if ((progress as any).hydrated) {
-          saveProgress(ctx.userId, { stats: { activeBoosters: (progress as any).activeBoosters } })
-            .catch((e) => console.warn(`[shop booster persist ${ctx.userId}]`, e?.message));
-        }
-        socket.emit('purchaseResult', {
-          success: true, itemType, itemId, cost,
-          booster: { kind: b.kind, mult: b.mult, expiresAt },
-        });
-        sendProgressToPlayer(socket.id);
-        return;
-      }
-
-      // VIP pass: timed premium flag; gates future premium-only perks.
-      if (itemType === 'vip_pass') {
+      } else if (itemType === 'vip_pass') {
         const ms = VIP_PASS_DURATION[itemId];
-        if (!ms) {
-          socket.emit('purchaseResult', { success: false, error: 'Unknown VIP pass' });
-          return;
+        res = ms ? await purchaseVipPass(userId, cost, ms) : { ok: false, code: 'unknown_item' };
+        if (res.ok) {
+          extra = { vipExpiresAt: res.vipExpiresAt };
+          progressionManager.updateUser(userId, (p) => { p.vipExpiresAt = res.vipExpiresAt; });
         }
-        const ok = await deductStars(ctx.userId, cost);
-        if (!ok) {
-          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_vip_pass' });
-          socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
-          return;
+      } else if (isOwnableItem(itemType, itemId)) {
+        res = await purchaseCosmetic(userId, itemType, itemId, cost);
+        if (res.ok) {
+          inventoryChanged = true;
+          progressionManager.updateUser(userId, (p) => { p.owned!.add(itemKey(itemType, itemId)); });
         }
-        progress.stars -= cost;
-        const current = (progress as any).vipExpiresAt || 0;
-        const base = Math.max(Date.now(), current);
-        (progress as any).vipExpiresAt = base + ms;
-        // Persist immediately so the VIP pass survives a restart (was in-memory
-        // only, so it evaporated on every redeploy).
-        if ((progress as any).hydrated) {
-          saveProgress(ctx.userId, { stats: { vipExpiresAt: (progress as any).vipExpiresAt } })
-            .catch((e) => console.warn(`[shop vip persist ${ctx.userId}]`, e?.message));
-        }
-        socket.emit('purchaseResult', {
-          success: true, itemType, itemId, cost,
-          vipExpiresAt: (progress as any).vipExpiresAt,
-        });
-        sendProgressToPlayer(socket.id);
-        return;
+      } else {
+        res = { ok: false, code: 'unknown_item' };
       }
 
-      // Cosmetic: deduct stars + insert into inventory.
-      const granted = await dbGrantItem(ctx.userId, itemType, itemId);
-      if (!granted) {
-        socket.emit('purchaseResult', { success: false, error: 'Already owned' });
+      if (!res.ok) {
+        reply({ success: false, error: economyMessage(res.code), code: res.code, itemType, itemId });
+        try { await pushProgressToUser(userId, { fresh: true }); } catch { /* best-effort */ }
         return;
       }
-      const ok = await deductStars(ctx.userId, cost);
-      if (!ok) {
-        auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: -cost, path: 'shop_cosmetic' });
-        socket.emit('purchaseResult', { success: false, error: 'Not enough stars' });
-        return;
-      }
-      progress.stars -= cost;
-      socket.emit('purchaseResult', { success: true, itemType, itemId, cost });
-      // Push updated inventory snapshot too
-      const inv = await loadInventory(ctx.userId);
-      socket.emit('inventoryUpdated', { inventory: inv });
-      sendProgressToPlayer(socket.id);
+      progressionManager.applyWallet(userId, res.balances);
+      auditLog(`user:${userId}`, 'SHOP_PURCHASE', { itemType, itemId, cost });
+      reply({ success: true, itemType, itemId, cost, ...extra });
+      if (inventoryChanged) socket.emit('inventoryUpdated', { inventory: await loadInventory(userId) });
+      await pushProgressToUser(userId);
+      if (itemType === 'vip_pass') rebroadcastTablesOfUser(userId);   // C8 — the VIP frame at his seats
     } catch (err: any) {
       console.error('purchaseShopItem error:', err);
-      socket.emit('purchaseResult', { success: false, error: 'Server error' });
+      reply({ success: false, error: 'Server error', code: 'server_error' });
     }
   });
 
-  // Shop: equip an owned item (unequips siblings of same type).
-  socket.on('equipItem', async (data: { itemType: string; itemId: string }) => {
+  // C7 — the catalog the client renders (every sellable item + reward-only
+  // items + free / VIP emotes + bundles / boosters / passes).
+  socket.on('getShopCatalog', () => {
+    socket.emit('shopCatalog', catalogForClient());
+  });
+
+  // Shop: equip an owned item (C7). `itemId: null` UNEQUIPS the slot. Only a
+  // real catalog item of an equippable type; a FREE (price 0) item is owned by
+  // everyone. Replies `equipResult` { success, itemType, itemId, error?, code? };
+  // the seats he holds are re-broadcast with his new look.
+  socket.on('equipItem', async (data: { itemType: string; itemId: string | null }) => {
+    const reply = (r: Record<string, unknown>) => socket.emit('equipResult', r);
     try {
       const ctx = await ensureHydrated(socket);
-      if (!ctx) return;
-      const { itemType, itemId } = data || {};
-      const ok = await dbEquipItem(ctx.userId, itemType, itemId);
-      socket.emit('equipResult', { success: ok, itemType, itemId, error: ok ? undefined : 'not_owned' });
-      if (ok) {
-        const inv = await loadInventory(ctx.userId);
-        socket.emit('inventoryUpdated', { inventory: inv });
-      }
+      if (economyGate(ctx, reply)) return;
+      const userId = ctx!.userId;
+      const itemType = normalizeItemType(data?.itemType);
+      const itemId = data?.itemId === null || data?.itemId === undefined || data?.itemId === '' ? null : String(data.itemId);
+      if (!EQUIPPABLE_TYPES.has(itemType)) { reply({ success: false, itemType, itemId, error: 'not_equippable', code: 'not_equippable' }); return; }
+      if (itemId !== null && !isOwnableItem(itemType, itemId)) { reply({ success: false, itemType, itemId, error: 'unknown_item', code: 'unknown_item' }); return; }
+      const res = await equipItemTx(userId, itemType, itemId, itemId !== null && isFreeItem(itemType, itemId));
+      if (!res.ok) { reply({ success: false, itemType, itemId, error: res.code, code: res.code }); return; }
+      progressionManager.updateUser(userId, (p) => {
+        if (itemId === null) { delete p.equipped![itemType]; return; }
+        p.owned!.add(itemKey(itemType, itemId));
+        p.equipped![itemType] = itemId;
+      });
+      reply({ success: true, itemType, itemId });
+      socket.emit('inventoryUpdated', { inventory: await loadInventory(userId) });
+      await pushProgressToUser(userId);
+      rebroadcastTablesOfUser(userId);
     } catch (err: any) {
       console.error('equipItem error:', err);
+      reply({ success: false, error: 'server_error', code: 'server_error' });
     }
   });
 
@@ -11326,65 +11456,55 @@ Give feedback in this JSON format:
     }
   });
 
-  // Daily login reward — real server-validated claim, awards actual stars+chips.
+  // Daily login reward (ECON-4 / C8 / APPUI-36). Once per DENVER day; the
+  // streak continues only from the Denver yesterday (computed in SQL); +50%
+  // chips and stars with an active VIP pass; the chip booster on the chips;
+  // Day 7 also opens a real basic Mystery Box (what the UI advertises). Ledger
+  // row + credit + streak in one transaction. Replies `dailyLoginClaimed`
+  // { success, day, streak, chips, stars, baseChips, baseStars, vipBonus,
+  // chipBoost, mysteryBox, lastLoginClaimDate } or { success:false, error, code,
+  // lastLoginClaimDate, streak }.
   socket.on('claimDailyLogin', async () => {
+    const reply = (r: Record<string, unknown>) => socket.emit('dailyLoginClaimed', r);
     try {
       const ctx = await ensureHydrated(socket);
-      if (!ctx) { socket.emit('dailyLoginClaimed', { success: false, error: 'Not authenticated' }); return; }
-
-      if (await hasClaimedToday(ctx.userId, 'login')) {
-        socket.emit('dailyLoginClaimed', { success: false, error: 'already_claimed' });
+      if (economyGate(ctx, reply)) return;
+      const userId = ctx!.userId;
+      const res = await settleDailyLogin(userId);
+      if (!res.ok) {
+        const p = progressionManager.userRecord(userId);
+        reply({ success: false, error: res.code, code: res.code, lastLoginClaimDate: p?.lastLoginClaimDate ?? null, streak: p?.dailyLoginStreak ?? 0 });
+        try { await pushProgressToUser(userId, { fresh: true }); } catch { /* best-effort */ }
         return;
       }
-
-      const durable = await loadDurableProgress(ctx.userId);
-      const today = new Date().toISOString().slice(0, 10);
-      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-      const prev = durable?.lastLoginClaimDate;
-      let newStreak: number;
-      if (prev === yesterday) newStreak = (durable!.loginStreak || 0) + 1;
-      else                    newStreak = 1;
-      // Cap the streak display cycle at 7
-      const day = ((newStreak - 1) % 7) + 1;
-
-      // Reward table: Days 1-3 chips only; 4→+5⭐; 5→+10⭐; 6→+20⭐; 7→+50⭐
-      const CHIPS_BY_DAY = [0, 1000, 2000, 3000, 5000, 7500, 10000, 20000];
-      const STARS_BY_DAY = [0,    0,    0,    0,    5,   10,    20,    50];
-      const chips = CHIPS_BY_DAY[day] || 0;
-      const stars = STARS_BY_DAY[day] || 0;
-
-      // H6 fix (2026-07-01 audit): record the claim FIRST. recordDailyClaim is
-      // an atomic INSERT ... ON CONFLICT DO NOTHING and returns true ONLY for
-      // the first claim today. A concurrent second tab gets false and bails
-      // BEFORE any grant. Previously the grant ran before this INSERT, so two
-      // simultaneous emits both passed the read-only hasClaimedToday check and
-      // double-credited chips + stars.
-      const firstLoginClaim = await recordDailyClaim(ctx.userId, 'login', { day, chips, stars });
-      if (!firstLoginClaim) {
-        socket.emit('dailyLoginClaimed', { success: false, error: 'already_claimed' });
-        return;
-      }
-
-      const progress = progressionManager.getProgress(ctx.playerId)!;
-      progress.chips += chips;
-      progress.stars += stars;
-      progress.dailyLoginStreak = newStreak;
-
-      if (chips > 0) await addChipsToUser(ctx.userId, chips);
-      if (stars > 0) {
-        const ok = await addStarsToUser(ctx.userId, stars);
-        if (!ok) {
-          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: stars, path: 'daily_login' });
-        }
-      }
-      await updateLoginStreak(ctx.userId, newStreak);
-
-      socket.emit('dailyLoginClaimed', { success: true, day, streak: newStreak, chips, stars });
-      sendProgressToPlayer(socket.id);
+      progressionManager.applyWallet(userId, { ...res.balances, loginStreak: res.streak, lastLoginClaimDate: res.lastLoginClaimDate });
+      const box = res.mysteryBox;
+      if (box && box.kind === 'item') progressionManager.updateUser(userId, (p) => { p.owned!.add(itemKey(box.itemType, box.itemId)); });
+      auditEconomyCredit(userId, 'DAILY_LOGIN_REWARD', res.chips, res.stars, { day: res.day, streak: res.streak, vip: res.vip, chipBoost: res.chipBoost, mysteryBox: box });
+      reply({
+        success: true, day: res.day, streak: res.streak, chips: res.chips, stars: res.stars,
+        baseChips: res.baseChips, baseStars: res.baseStars, vipBonus: res.vip, chipBoost: res.chipBoost,
+        mysteryBox: box, lastLoginClaimDate: res.lastLoginClaimDate,
+      });
+      if (box && box.kind === 'item') socket.emit('inventoryUpdated', { inventory: await loadInventory(userId) });
+      await pushProgressToUser(userId);
     } catch (err: any) {
       console.error('claimDailyLogin error:', err);
-      socket.emit('dailyLoginClaimed', { success: false, error: 'server_error' });
+      reply({ success: false, error: 'server_error', code: 'server_error' });
     }
+  });
+
+  // The daily login reward table (C8 — VIP multiplier included), for the panel.
+  socket.on('getLoginRewards', () => {
+    socket.emit('loginRewards', {
+      days: [1, 2, 3, 4, 5, 6, 7].map((day) => ({
+        day, chips: LOGIN_CHIPS_BY_DAY[day], stars: LOGIN_STARS_BY_DAY[day],
+        mysteryBox: day === 7 ? LOGIN_DAY7_MYSTERY_BOX : null,
+      })),
+      vipMultiplier: VIP_LOGIN_MULTIPLIER,
+      resetsAt: nextDenverMidnightMs(),
+      timeZone: 'America/Denver',
+    });
   });
 
   // 2026-06-12 — Unlimited "broke refill". A player who has lost their bankroll
@@ -11423,127 +11543,96 @@ Give feedback in this JSON format:
         socket.emit('refillResult', { success: false, error: 'not_broke', chips: current });
         return;
       }
-      try { const p = progressionManager.getProgress(ctx.playerId); if (p) p.chips = newBalance; } catch {}
+      // R2 (C5) — the record mirrors the DB balance; the push reaches every socket of the account.
+      try { progressionManager.applyWallet(ctx.userId, { chips: newBalance }); } catch {}
       const uname = authSessions.get(socket.id)?.username || String(ctx.userId);
       auditLog(uname, 'BROKE_REFILL', { added: REFILL_AMOUNT, newBalance, onTable });
       socket.emit('refillResult', { success: true, added: REFILL_AMOUNT, chips: newBalance });
-      sendProgressToPlayer(socket.id);
+      try { await pushProgressToUser(ctx.userId); } catch { /* best-effort */ }
     } catch (err: any) {
       console.error('claimRefill error:', err);
       socket.emit('refillResult', { success: false, error: 'server_error' });
     }
   });
 
-  // Daily spin — server-validated one-per-day with stars included in reward table.
+  // APPUI-37 — the daily spin's REAL prize table (the wheel draws exactly these).
+  socket.on('getSpinWheel', async () => {
+    const auth = authSessions.get(socket.id);
+    const p = auth ? progressionManager.userRecord(auth.userId) : undefined;
+    socket.emit('spinWheelConfig', {
+      segments: SPIN_WHEEL_SEGMENTS.map((s) => ({ id: s.id, label: s.label, chips: s.chips, stars: s.stars, weight: s.weight })),
+      claimedToday: !!p && p.spinClaimedDate === denverDateKey(),
+      resetsAt: nextDenverMidnightMs(),
+    });
+  });
+
+  // Daily spin — once per Denver day; ledger row + credit in one transaction.
+  // Replies `dailySpinClaimed` { success, reward:{chips, stars, label},
+  // segmentId, chipBoost } or { success:false, error, code }.
   socket.on('claimDailySpinServer', async () => {
+    const reply = (r: Record<string, unknown>) => socket.emit('dailySpinClaimed', r);
     try {
       const ctx = await ensureHydrated(socket);
-      if (!ctx) { socket.emit('dailySpinClaimed', { success: false, error: 'Not authenticated' }); return; }
-
-      if (await hasClaimedToday(ctx.userId, 'spin')) {
-        socket.emit('dailySpinClaimed', { success: false, error: 'already_claimed' });
-        return;
-      }
-
-      // Reward roll: 5% big stars, 20% small stars, 50% chips, 25% big chips.
-      const roll = Math.random();
-      let reward: { chips: number; stars: number; label: string };
-      if (roll < 0.05) reward = { chips: 0, stars: 100, label: '💰 100 stars!' };
-      else if (roll < 0.25) reward = { chips: 0, stars: 25, label: '⭐ 25 stars' };
-      else if (roll < 0.75) reward = { chips: 2500, stars: 0, label: '2,500 chips' };
-      else                  reward = { chips: 10000, stars: 0, label: '🎰 10,000 chips' };
-
-      // 2026-07-05 audit P2 fix: record the claim FIRST (atomic INSERT ... ON
-      // CONFLICT DO NOTHING) and bail if it loses, exactly like the claimDailyLogin
-      // H6 fix. The read-only hasClaimedToday above is only a fast-path — two
-      // concurrent emits both passed it and double-credited the spin because the
-      // grant used to run BEFORE this atomic INSERT.
-      const firstSpinClaim = await recordDailyClaim(ctx.userId, 'spin', reward);
-      if (!firstSpinClaim) {
-        socket.emit('dailySpinClaimed', { success: false, error: 'already_claimed' });
-        return;
-      }
-
-      const progress = progressionManager.getProgress(ctx.playerId)!;
-      progress.chips += reward.chips;
-      progress.stars += reward.stars;
-      if (reward.chips > 0) await addChipsToUser(ctx.userId, reward.chips);
-      if (reward.stars > 0) {
-        const ok = await addStarsToUser(ctx.userId, reward.stars);
-        if (!ok) {
-          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: reward.stars, path: 'daily_spin' });
-        }
-      }
-
-      socket.emit('dailySpinClaimed', { success: true, reward });
-      sendProgressToPlayer(socket.id);
+      if (economyGate(ctx, reply)) return;
+      const userId = ctx!.userId;
+      const res = await settleDailySpin(userId);
+      if (!res.ok) { reply({ success: false, error: res.code, code: res.code }); return; }
+      progressionManager.applyWallet(userId, res.balances);
+      progressionManager.updateUser(userId, (p) => { p.spinClaimedDate = denverDateKey(); });
+      auditEconomyCredit(userId, 'DAILY_SPIN_REWARD', res.chips, res.stars, { segmentId: res.segmentId, chipBoost: res.chipBoost });
+      reply({ success: true, reward: { chips: res.chips, stars: res.stars, label: res.label }, segmentId: res.segmentId, chipBoost: res.chipBoost });
+      await pushProgressToUser(userId);
     } catch (err: any) {
       console.error('claimDailySpinServer error:', err);
-      socket.emit('dailySpinClaimed', { success: false, error: 'server_error' });
+      reply({ success: false, error: 'server_error', code: 'server_error' });
     }
   });
 
-  // Scratch card — consume from user's banked inventory, reveal reward.
+  // Scratch card (APPUI-38) — consume one banked card AND pay it in one
+  // transaction (a duplicate emote pays stars, never "Won 0 item"). Replies
+  // `scratchCardRevealed` { success, reward:{kind, amount} | {kind:'item',
+  // itemType, itemId} (+ chips / stars / item / label for older clients),
+  // scratchCardsAvailable } or { success:false, error, code }.
   socket.on('claimScratchCard', async () => {
+    const reply = (r: Record<string, unknown>) => socket.emit('scratchCardRevealed', r);
     try {
       const ctx = await ensureHydrated(socket);
-      if (!ctx) { socket.emit('scratchCardRevealed', { success: false, error: 'Not authenticated' }); return; }
-
-      const consumed = await consumeScratchCard(ctx.userId);
-      if (!consumed) {
-        socket.emit('scratchCardRevealed', { success: false, error: 'no_cards_available' });
-        return;
-      }
-
-      // Reward roll: 20% stars, 10% cosmetic surprise, 70% chips.
-      const roll = Math.random();
-      let reward: { chips?: number; stars?: number; item?: { type: string; id: string }; label: string };
-      if (roll < 0.20) {
-        const amt = 10 + Math.floor(Math.random() * 40);
-        reward = { stars: amt, label: `⭐ ${amt} stars` };
-      } else if (roll < 0.30) {
-        // Grant a cheap surprise emote
-        const pool = ['nice_hand', 'good_game', 'fire', 'crown'];
-        const id = pool[Math.floor(Math.random() * pool.length)];
-        await dbGrantItem(ctx.userId, 'emote', id);
-        reward = { item: { type: 'emote', id }, label: `🎁 Emote: ${id}` };
-      } else {
-        const amt = 1000 + Math.floor(Math.random() * 9000);
-        reward = { chips: amt, label: `🪙 ${amt.toLocaleString()} chips` };
-      }
-
-      const progress = progressionManager.getProgress(ctx.playerId)!;
-      if (reward.chips) {
-        progress.chips += reward.chips;
-        await addChipsToUser(ctx.userId, reward.chips);
-      }
-      if (reward.stars) {
-        const ok = await addStarsToUser(ctx.userId, reward.stars);
-        if (!ok) {
-          auditLog('SYSTEM', 'STARS_WRITE_FAIL', { userId: ctx.userId, delta: reward.stars, path: 'scratch_card' });
-        }
-        progress.stars += reward.stars;
-      }
-
-      socket.emit('scratchCardRevealed', { success: true, reward });
-      if (reward.item) {
-        const inv = await loadInventory(ctx.userId);
-        socket.emit('inventoryUpdated', { inventory: inv });
-      }
-      sendProgressToPlayer(socket.id);
+      if (economyGate(ctx, reply)) return;
+      const userId = ctx!.userId;
+      const res = await settleScratchCard(userId);
+      if (!res.ok) { reply({ success: false, error: res.code, code: res.code }); return; }
+      progressionManager.applyWallet(userId, res.balances);
+      const r = res.reward;
+      if (r.kind === 'item') progressionManager.updateUser(userId, (p) => { p.owned!.add(itemKey(r.itemType, r.itemId)); });
+      auditEconomyCredit(userId, 'SCRATCH_CARD_REWARD', res.chips, res.stars, { result: r });
+      reply({
+        success: true,
+        reward: {
+          ...r,
+          ...(r.kind === 'chips' ? { chips: r.amount } : {}),
+          ...(r.kind === 'stars' ? { stars: r.amount } : {}),
+          ...(r.kind === 'item' ? { item: { type: r.itemType, id: r.itemId } } : {}),
+          label: res.label,
+        },
+        scratchCardsAvailable: res.balances.scratchCardsAvailable,
+      });
+      if (r.kind === 'item') socket.emit('inventoryUpdated', { inventory: await loadInventory(userId) });
+      await pushProgressToUser(userId);
     } catch (err: any) {
       console.error('claimScratchCard error:', err);
-      socket.emit('scratchCardRevealed', { success: false, error: 'server_error' });
+      reply({ success: false, error: 'server_error', code: 'server_error' });
     }
   });
 
   // Battle pass tier claim — idempotent via unique constraint.
   // 2026-07-07 gap-fill — canonical server reward table, mirrors BattlePass.jsx
-  // buildTiers() EXACTLY. NEVER trust the client's `reward` payload; the server
+  // buildTiers(). NEVER trust the client's `reward` payload; the server
   // is authoritative. FREE: tier%10→chips tier*200, else tier%5→500 chips, else
-  // +100 season XP. PREMIUM milestones grant real cosmetics (item_type/item_id
-  // that exist in the client catalogs); non-milestone premium: tier%3→1000 chips
-  // else 10 stars.
+  // +100 season XP. PREMIUM milestones grant real cosmetics; non-milestone
+  // premium: tier%3→1000 chips else 10 stars.
+  // 2026-10-11 (R2, ECON-16 / C7) — every premium item is a REAL catalog item:
+  // tier 20 emote 'trophy' (was 'legendary_pack'), tier 40 frame 'diamond' (was
+  // item type 'avatar_frame'), tier 50 title 'royal' (was 'season_champion').
   const bpReward = (tierId: number, track: 'free' | 'premium'):
     | { kind: 'chips'; amount: number }
     | { kind: 'stars'; amount: number }
@@ -11556,10 +11645,10 @@ Give feedback in this JSON format:
     }
     // premium
     if (tierId === 10) return { kind: 'item', itemType: 'card_back', itemId: 'dragon' };
-    if (tierId === 20) return { kind: 'item', itemType: 'emote', itemId: 'legendary_pack' };
+    if (tierId === 20) return { kind: 'item', itemType: 'emote', itemId: 'trophy' };
     if (tierId === 30) return { kind: 'item', itemType: 'theme', itemId: 'neon_vegas' };
-    if (tierId === 40) return { kind: 'item', itemType: 'avatar_frame', itemId: 'diamond' };
-    if (tierId === 50) return { kind: 'item', itemType: 'title', itemId: 'season_champion' };
+    if (tierId === 40) return { kind: 'item', itemType: 'frame', itemId: 'diamond' };
+    if (tierId === 50) return { kind: 'item', itemType: 'title', itemId: 'royal' };
     if (tierId % 3 === 0) return { kind: 'chips', amount: 1000 };
     return { kind: 'stars', amount: 10 };
   };
@@ -11583,24 +11672,16 @@ Give feedback in this JSON format:
       }
 
       const progress = progressionManager.getProgress(ctx.playerId)!;
-      // 2026-05-11 stats audit — hydrated gate. A claim firing during the
-      // async hydrate window would modify in-memory stars that get clobbered
-      // when hydrate finishes and overwrites with DB state — reward lost until
-      // next login. Checked BEFORE the idempotency insert (moved 2026-07-01)
-      // so a rejected claim never marks the tier claimed-but-ungranted.
-      if (!progress.hydrated) {
+      // 2026-05-11 stats audit — hydrated gate (checked BEFORE the claim row).
+      if (!progress || !progress.hydrated) {
         socket.emit('battlePassTierClaimed', { success: false, error: 'NOT_HYDRATED' });
         return;
       }
 
       // 🚨 Server-authoritative tier-unlock gate (earned 2026-07-01 .online
       // audit). Tiers unlock at 500 season XP each — this MUST match the
-      // client's BattlePass.jsx XP_PER_TIER. Previously the handler validated
-      // only that tierId was an integer 1–50 and hadn't been claimed, with NO
-      // earned-XP check: a crafted socket.emit('claimBattlePassTier',{tierId:50})
-      // paid ~11,000 chips via addChipsToUser (permanent DB write), and looping
-      // tiers 1–50 harvested the whole season's chips+stars from a level-1
-      // account. The only "unlock" was client-side UI. Gate the payout here.
+      // client's BattlePass.jsx XP_PER_TIER. A crafted claim of tier 50 used to
+      // pay from a level-1 account; the only "unlock" was client-side UI.
       const BP_XP_PER_TIER = 500;
       const seasonXp = progressionManager.getSeasonXp(ctx.playerId);
       const unlockedTier = Math.floor(seasonXp / BP_XP_PER_TIER);
@@ -11609,56 +11690,78 @@ Give feedback in this JSON format:
         return;
       }
 
-      // 2026-07-07 gap-fill — resolve the track and gate the premium track on
-      // the battlePassPremium entitlement (bought via purchaseBattlePass, stored
-      // in users.stats). Fail-closed if the stats read fails.
+      // The premium track needs Battle Pass premium for THIS season (R2: the
+      // user_battle_pass_premium row bought by purchaseBattlePass; fail-closed).
       const track: 'free' | 'premium' = data.track === 'premium' ? 'premium' : 'free';
       if (track === 'premium') {
         let hasPremium = false;
-        try {
-          const { rows } = await getPool().query('SELECT stats FROM users WHERE id = $1', [ctx.userId]);
-          const raw = rows[0]?.stats;
-          const s = typeof raw === 'string' ? JSON.parse(raw || '{}') : (raw || {});
-          hasPremium = s?.battlePassPremium === true;
-        } catch { /* fail-closed */ }
+        try { hasPremium = !!(await hasBattlePassPremium(ctx.userId, seasonId)); } catch { /* fail-closed */ }
         if (!hasPremium) {
           socket.emit('battlePassTierClaimed', { success: false, error: 'premium_required', tierId });
           return;
         }
       }
 
-      const ok = await dbClaimBattlePassTier(ctx.userId, seasonId, tierId, track);
-      if (!ok) {
+      // R2 (ECON-17) — the claim row and the reward settle in ONE transaction:
+      // a failed credit rolls the claim back (it used to leave the tier
+      // claimed-but-unpaid). Currency on the audited additive paths (on the
+      // transaction client); a cosmetic into user_inventory; the +100 XP of a
+      // free tier is granted after the commit.
+      const r = bpReward(tierId, track);
+      let claimed = false;
+      let itemGranted = false;
+      await withEconomyTx(async (tx: any) => {
+        if (!(await dbClaimBattlePassTier(ctx.userId, seasonId, tierId, track, tx))) return;
+        if (r.kind === 'chips') {
+          if (!(await addChipsToUser(ctx.userId, r.amount, tx))) throw new Error('battle_pass_chip_credit_failed');
+        } else if (r.kind === 'stars') {
+          if (!(await addStarsToUser(ctx.userId, r.amount, tx))) throw new Error('battle_pass_star_credit_failed');
+        } else if (r.kind === 'item') {
+          itemGranted = await dbGrantItem(ctx.userId, r.itemType, r.itemId, tx);
+        }
+        claimed = true;
+      });
+      if (!claimed) {
         socket.emit('battlePassTierClaimed', { success: false, error: 'already_claimed', tierId, track });
         return;
       }
-
-      // Grant the CANONICAL reward for (tier, track) — was hardcoded chips/stars,
-      // so premium cosmetic tiers paid chips instead of the Dragon Card Back /
-      // Neon Vegas Theme / etc. the UI advertised. DB-first: currency/item lands
-      // durably before the in-memory bump + client ack. All currency stays on the
-      // audited additive paths; cosmetics go to user_inventory via grantItem.
-      const r = bpReward(tierId, track);
-      if (r.kind === 'chips') {
-        const okc = await addChipsToUser(ctx.userId, r.amount);
-        if (!okc) { auditLog('SYSTEM', 'BATTLEPASS_CHIPS_DB_FAIL', { userId: ctx.userId, seasonId, tierId, track, amount: r.amount }); socket.emit('battlePassTierClaimed', { success: false, error: 'db_failed' }); return; }
-        progress.chips += r.amount;
-      } else if (r.kind === 'stars') {
-        const oks = await addStarsToUser(ctx.userId, r.amount);
-        if (!oks) { auditLog('SYSTEM', 'BATTLEPASS_STARS_DB_FAIL', { userId: ctx.userId, seasonId, tierId, track, amount: r.amount }); socket.emit('battlePassTierClaimed', { success: false, error: 'db_failed' }); return; }
-        progress.stars += r.amount;
-      } else if (r.kind === 'xp') {
+      if (r.kind === 'chips') { progress.chips += r.amount; auditEconomyCredit(ctx.userId, 'BATTLE_PASS_REWARD', r.amount, 0, { seasonId, tierId, track }); }
+      else if (r.kind === 'stars') { progress.stars += r.amount; auditEconomyCredit(ctx.userId, 'BATTLE_PASS_REWARD', 0, r.amount, { seasonId, tierId, track }); }
+      else if (r.kind === 'xp') {
         progressionManager.addXP(ctx.playerId, r.amount);
-      } else if (r.kind === 'item') {
-        const granted = await dbGrantItem(ctx.userId, r.itemType, r.itemId);
-        if (granted) { const inv = await loadInventory(ctx.userId); socket.emit('inventoryUpdated', { inventory: inv }); }
+        try { await persistLevelXp(ctx.userId); } catch { /* the next save ratchets it */ }
+      }
+      else if (r.kind === 'item' && itemGranted) {
+        progress.owned?.add(itemKey(r.itemType, r.itemId));
+        const inv = await loadInventory(ctx.userId);
+        socket.emit('inventoryUpdated', { inventory: inv });
       }
 
       socket.emit('battlePassTierClaimed', { success: true, tierId, track, reward: r });
-      sendProgressToPlayer(socket.id);
+      try { await pushProgressToUser(ctx.userId); } catch { /* best-effort */ }
     } catch (err: any) {
       console.error('claimBattlePassTier error:', err);
       socket.emit('battlePassTierClaimed', { success: false, error: 'server_error' });
+    }
+  });
+
+  // ECON-16 / C5 — the Battle Pass the client renders: the server's season,
+  // its XP per tier and every tier's FREE and PREMIUM reward (catalog items),
+  // the premium price and whether this account owns premium + its claims.
+  socket.on('getBattlePass', async () => {
+    try {
+      const auth = authSessions.get(socket.id);
+      const claims = auth ? await loadBattlePassClaims(auth.userId, CURRENT_BATTLE_PASS_SEASON) : [];
+      const p = auth ? progressionManager.userRecord(auth.userId) : undefined;
+      const tiers = [];
+      for (let t = 1; t <= BATTLE_PASS_TOTAL_TIERS; t++) tiers.push({ tier: t, free: bpReward(t, 'free'), premium: bpReward(t, 'premium') });
+      socket.emit('battlePassInfo', {
+        seasonId: CURRENT_BATTLE_PASS_SEASON, seasonName: BATTLE_PASS_SEASON_NAME, xpPerTier: BATTLE_PASS_XP_PER_TIER,
+        totalTiers: BATTLE_PASS_TOTAL_TIERS, premiumCost: BATTLE_PASS_PREMIUM_COST, premium: !!p?.battlePassPremium,
+        totalXp: p ? progressionManager.getSeasonXp(p.playerId) : 0, claims, tiers,
+      });
+    } catch (err: any) {
+      console.error('getBattlePass error:', err);
     }
   });
 
@@ -11696,14 +11799,15 @@ Give feedback in this JSON format:
 
   // Achievements panel — 3-bucket summary (daily / weekly / lifetime) with
   // per-entry unlock status + reward + window end timestamps for countdown.
+  // R2 — the ACCOUNT's record (seated or not).
   socket.on('getAchievements', async () => {
     const empty = { daily: [], weekly: [], lifetime: [], windowEndsAt: { daily: 0, weekly: 0 } };
-    // Resolve playerId from the table seat if present, else from the auth
-    // session (so the lobby Achievement Badges / panel work when not seated).
-    let playerId = playerSessions.get(socket.id)?.playerId;
-    if (!playerId) {
+    let playerId: string | undefined;
+    if (authSessions.get(socket.id)) {
       const ctx = await ensureHydrated(socket);
       playerId = ctx?.playerId;
+    } else {
+      playerId = playerSessions.get(socket.id)?.playerId;
     }
     if (!playerId) { socket.emit('achievementsList', empty); return; }
     const summary = progressionManager.getAchievementsSummary(playerId);
@@ -11723,9 +11827,11 @@ Give feedback in this JSON format:
         loadHandHistory(ctx.userId, 100),
         loadCareerProgress(ctx.userId),
       ]);
+      const rec = progressionManager.userRecord(ctx.userId);
       socket.emit('durableState', {
         inventory,
         battlePassClaims: bpClaims,
+        battlePassPremium: !!rec?.battlePassPremium,
         careerProgress,
         customization: durable?.customization || {},
         preferences: durable?.preferences || {},
@@ -13381,10 +13487,9 @@ Give feedback in this JSON format:
         return;
       }
 
-      // Track action for progression (all actions tracked for stats)
-      progressionManager.recordAction(session.playerId, data.type, {
-        phase: table.currentPhase === GamePhase.PreFlop ? 'PreFlop' : undefined,
-      });
+      // R2 (C10) — the action is recorded for progression by the table's
+      // 'playerAction' listener (ensureTableProgressListener), with the street
+      // it was made on; recording it here read the already-advanced phase.
 
       broadcastGameState(session.tableId);
 
@@ -13461,83 +13566,96 @@ Give feedback in this JSON format:
 
   // ========== Progression Events ==========
 
+  // C5 — the account's progress (seated or not). R2: an unseated socket used to get nothing.
   socket.on('getProgress', async () => {
+    const auth = authSessions.get(socket.id);
+    if (auth) {
+      const ctx = await ensureHydrated(socket);
+      if (ctx?.hydrated) await pushProgressToUser(ctx.userId, { fresh: true });
+      return;
+    }
     sendProgressToPlayer(socket.id);
   });
 
+  // C6 / ECON-5 / APPUI-3 — claim one of TODAY's (Denver) missions, from the
+  // lobby or a table. The mission must be one of this account's three, complete
+  // and unclaimed; the claim row (`mission:<date>:<templateId>`) and the chips /
+  // stars settle in one transaction, the XP follows. Replies `missionClaimed`
+  // { missionId, templateId, reward:{chips, xp, stars} } or `missionClaimError`
+  // { missionId, code, error } (code: progress_loading | mission_not_found |
+  // mission_expired | mission_incomplete | already_claimed | rate_limited | …).
   socket.on('claimMission', async (data: { missionId: string }) => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
-
-    const ctx = await ensureHydrated(socket);
-    if (!ctx) { socket.emit('error', { message: 'Not authenticated' }); return; }
-
-    const result = progressionManager.claimMissionReward(session.playerId, data.missionId);
-    if (result.success && result.reward) {
-      // Durable, exactly-once reward persistence (M8 + F1, 2026-07-01 audit).
-      // The manager grants in-memory for instant UI but does NOT touch the DB;
-      // mission.claimed is in-memory and resets on a Railway redeploy. Gate the
-      // DB write on the daily-claim ledger so a redeploy + re-claim can't
-      // re-mint. Mirrors claimDailyBonus. On the dup path (redeploy re-claim)
-      // the in-memory grant is transient and corrected on the next hydrate.
-      const firstToday = await recordDailyClaim(ctx.userId, `mission:${data.missionId}`, null);
-      if (firstToday) {
-        if (result.reward.chips > 0) await addChipsToUser(ctx.userId, result.reward.chips);
-        if (result.reward.stars) await addStarsToUser(ctx.userId, result.reward.stars);
+    const missionId = String(data?.missionId ?? '');
+    const fail = (code: string) => socket.emit('missionClaimError', { missionId, code, error: economyMessage(code) });
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (economyGate(ctx, (r) => fail(String(r.code)))) return;
+      const userId = ctx!.userId;
+      const check = progressionManager.missionClaimCheck(userId, missionId);
+      if (!check.ok) { fail(check.code); return; }
+      const res = await settleMissionClaim(userId, check.dateKey, check.templateId, { chips: check.reward.chips, stars: check.reward.stars });
+      if (!res.ok) {
+        if (res.code === 'already_claimed') progressionManager.markMissionClaimed(userId, check.dateKey, check.templateId, 0);
+        fail(res.code);
+        try { await pushProgressToUser(userId); } catch { /* best-effort */ }
+        return;
       }
-      socket.emit('missionClaimed', { missionId: data.missionId, reward: result.reward });
-    }
-    sendProgressToPlayer(socket.id);
-  });
-
-  socket.on('claimDailyBonus', async () => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
-
-    // 2026-05-11 stats audit — claimDailyBonus used to be in-memory only,
-    // letting a Railway redeploy + rehydrate desync state and double-credit
-    // within seconds. user_daily_claims is now the source of truth.
-    const ctx = await ensureHydrated(socket);
-    if (!ctx) {
-      socket.emit('error', { message: 'Not authenticated' });
-      return;
-    }
-    const progress = progressionManager.getProgress(ctx.playerId);
-    if (!progress || !progress.hydrated) {
-      socket.emit('error', { code: 'NOT_HYDRATED', message: 'Progress is still loading; try again' });
-      return;
-    }
-
-    // DB write is the source of truth. If the row was already there for
-    // today (INSERT ... ON CONFLICT DO NOTHING returned 0 rows), refuse.
-    const newlyClaimed = await recordDailyClaim(ctx.userId, 'daily_bonus', null);
-    if (!newlyClaimed) {
-      socket.emit('error', { message: 'Daily bonus already claimed today' });
-      return;
-    }
-
-    const result = progressionManager.claimDailyBonus(session.playerId);
-    if (result.success) {
-      socket.emit('dailyBonusClaimed', {
-        chips: result.chips,
-        stars: result.stars,
-        streak: result.streak,
+      progressionManager.applyWallet(userId, res.balances);
+      progressionManager.markMissionClaimed(userId, check.dateKey, check.templateId, check.reward.xp);
+      try { await persistLevelXp(userId); } catch { /* the next save ratchets it */ }
+      auditEconomyCredit(userId, 'MISSION_REWARD', res.chips, res.stars, { missionId, chipBoost: res.chipBoost });
+      socket.emit('missionClaimed', {
+        missionId, templateId: check.templateId,
+        reward: { chips: res.chips, xp: check.reward.xp, stars: res.stars },
       });
-    } else {
-      // DB-write succeeded but in-memory claim refused (e.g. lastDailyBonusClaimed
-      // matched today after rehydrate). The DB row is the lock; keep it.
-      socket.emit('error', { message: 'Daily bonus already claimed today' });
+      await pushProgressToUser(userId);
+    } catch (err: any) {
+      console.error('claimMission error:', err);
+      fail('server_error');
     }
-    sendProgressToPlayer(socket.id);
   });
 
-  socket.on('getDailyMissions', async () => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
+  // RETIRED (R2, C6): claimDailyLogin is the daily reward. This used to pay a
+  // second, unrelated daily bonus from a seat-only progress entry. It pays
+  // nothing now and says so (stable code).
+  socket.on('claimDailyBonus', async () => {
+    socket.emit('error', { code: 'daily_bonus_retired', message: 'The daily reward is now claimed from Daily Rewards.' });
+  });
 
-    const missions = progressionManager.getDailyMissions(session.playerId);
-    socket.emit('dailyMissions', missions);
-    sendProgressToPlayer(socket.id);
+  // C6 — today's missions (seated or not). Also in every playerProgress (`missions`).
+  socket.on('getDailyMissions', async () => {
+    const ctx = await ensureHydrated(socket);
+    if (!ctx) return;
+    socket.emit('dailyMissions', progressionManager.missionsOf(ctx.playerId));
+    if (ctx.hydrated) await pushProgressToUser(ctx.userId);
+  });
+
+  // C8 — the monthly VIP chip bonus: once per Denver month while a VIP pass is
+  // active (ledger `vip_monthly:<YYYY-MM>` + chips in one transaction). Replies
+  // `vipMonthlyClaimed` { success, chips, monthKey } or { success:false, code, error }.
+  socket.on('claimVipMonthly', async () => {
+    const reply = (r: Record<string, unknown>) => socket.emit('vipMonthlyClaimed', r);
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (economyGate(ctx, reply)) return;
+      const userId = ctx!.userId;
+      const monthKey = denverMonthKey();
+      const res = await settleVipMonthly(userId, monthKey, VIP_MONTHLY_BONUS_CHIPS);
+      if (!res.ok) {
+        if (res.code === 'already_claimed') progressionManager.updateUser(userId, (p) => { p.vipMonthlyClaimedMonth = monthKey; });
+        reply({ success: false, code: res.code, error: economyMessage(res.code), monthKey });
+        try { await pushProgressToUser(userId); } catch { /* best-effort */ }
+        return;
+      }
+      progressionManager.applyWallet(userId, res.balances);
+      progressionManager.updateUser(userId, (p) => { p.vipMonthlyClaimedMonth = monthKey; });
+      auditEconomyCredit(userId, 'VIP_MONTHLY_BONUS', res.chips, 0, { monthKey });
+      reply({ success: true, chips: res.chips, monthKey });
+      await pushProgressToUser(userId);
+    } catch (err: any) {
+      console.error('claimVipMonthly error:', err);
+      reply({ success: false, code: 'server_error', error: economyMessage('server_error') });
+    }
   });
 
   // ========== Friends (durable, Postgres) — Phase 3a 2026-06-18 ==========
@@ -13553,8 +13671,14 @@ Give feedback in this JSON format:
       for (const [sid, a] of authSessions) {
         if (a?.userId) { online.add(a.userId); if (playerSessions.has(sid)) inGame.add(a.userId); }
       }
+      // R2 (Addendum) — every row also carries the friend's opaque `publicId`
+      // (profile / invite by id); `username` is the PUBLIC display name.
+      let pids = new Map<number, string>();
+      try { pids = (await publicIdsFor(friends.map((f) => f.userId))) || new Map(); } catch { /* ids are optional */ }
       const withPresence = friends.map(f => ({
         ...f,
+        displayName: f.username,
+        publicId: pids.get(f.userId) ?? null,
         presence: f.status !== 'accepted' ? 'offline'
           : inGame.has(f.userId) ? 'in-game'
           : online.has(f.userId) ? 'online' : 'offline',
@@ -13562,7 +13686,7 @@ Give feedback in this JSON format:
       socket.emit('friendsList', { friends: withPresence });
     } catch (e) { socket.emit('friendError', { message: 'Failed to load friends' }); }
   });
-  socket.on('sendFriendRequest', async (data: { name?: string; userId?: number }) => {
+  socket.on('sendFriendRequest', async (data: { name?: string; userId?: number; publicId?: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth?.userId) return;
     try {
@@ -13571,8 +13695,12 @@ Give feedback in this JSON format:
       // LIKE match of a login handle (which friended a stranger). FriendSystem
       // sends {name} (what the player typed); {userId} (a friends-list row) is
       // checked to be a real, listable account.
+      // R2 (Addendum) — {publicId} (a seat / leaderboard / search / profile
+      // row) is the exact, unambiguous way: resolved to a listable account.
       let targetId: number | undefined;
-      if (data?.userId !== undefined && data?.userId !== null) {
+      if (typeof data?.publicId === 'string' && data.publicId) {
+        targetId = (await userIdForPublicId(data.publicId)) ?? undefined;
+      } else if (data?.userId !== undefined && data?.userId !== null) {
         const n = Number(data.userId);
         if (Number.isInteger(n) && n > 0 && (await getPublicNames([n])).has(n)) targetId = n;
       } else if (typeof data?.name === 'string' && data.name.trim()) {
@@ -13588,7 +13716,9 @@ Give feedback in this JSON format:
       if (!res.ok) { socket.emit('friendError', { message: res.error || 'Failed' }); return; }
       socket.emit('friendRequestSent', { status: res.status });
       const fromName = await publicNameForUser(auth.userId);   // R1 — never the login handle
-      for (const [sid, a] of authSessions) if (a?.userId === targetId) io.to(sid).emit('friendRequestReceived', { from: fromName });
+      let fromPublicId: string | undefined;
+      try { fromPublicId = ((await publicIdsFor([auth.userId])) || new Map()).get(auth.userId); } catch { /* optional */ }
+      for (const [sid, a] of authSessions) if (a?.userId === targetId) io.to(sid).emit('friendRequestReceived', { from: fromName, fromPublicId });
     } catch (e) { socket.emit('friendError', { message: 'Failed to send request' }); }
   });
   socket.on('acceptFriendRequest', async (data: { userId: number }) => {
@@ -13633,6 +13763,12 @@ Give feedback in this JSON format:
     const tableId = data?.tableId || playerSessions.get(socket.id)?.tableId;
     const handNumber = Number(data?.handId);
     if (!tableId || !Number.isFinite(handNumber)) { socket.emit('predictionError', { message: 'No active hand' }); return; }
+    // R2 (APPUI-45) — a market is open only for the hand IN PROGRESS on this
+    // table and only before anything it asks about can be seen: pre-flop, no
+    // board card dealt, nobody all-in yet. Bets used to be accepted on any hand
+    // number at any phase — after the flop / an all-in / the showdown was visible.
+    const closed = predictionWindowClosed(tableId, handNumber, 'market');
+    if (closed) { socket.emit('predictionError', { message: closed.message, code: closed.code }); return; }
     try {
       const res = await placeMarketBet(auth.userId, tableId, handNumber, String(data?.marketId), String(data?.outcome), Number(data?.amount));
       if (!res.ok) { socket.emit('predictionError', { message: res.error || 'Bet rejected' }); return; }
@@ -13654,6 +13790,9 @@ Give feedback in this JSON format:
     const handNumber = Number(data?.handId);
     const seat = Number(data?.predictedSeat);
     if (!tableId || !Number.isFinite(handNumber) || !Number.isFinite(seat)) { socket.emit('predictionError', { message: 'No active hand' }); return; }
+    // R2 (APPUI-45) — a winner pick only for the hand IN PROGRESS, before the river.
+    const closed = predictionWindowClosed(tableId, handNumber, 'pick');
+    if (closed) { socket.emit('predictionError', { message: closed.message, code: closed.code }); return; }
     try {
       const res = await placePick(auth.userId, tableId, handNumber, seat);
       if (!res.ok) { socket.emit('predictionError', { message: res.error || 'Pick rejected' }); return; }
@@ -13701,6 +13840,7 @@ Give feedback in this JSON format:
           const movements = await settleBracketSideBets(res.state.bracketId);
           for (const m of movements) {
             auditLog('SYSTEM', m.reason === 'sidebet_win' ? 'BRACKET_SIDEBET_PAYOUT' : 'BRACKET_SIDEBET_REFUND', { bracketId: res.state.bracketId, userId: m.userId, amount: m.amount, target: m.target });
+            if (m.reason === 'sidebet_win') auditEconomyCredit(m.userId, 'BRACKET_SIDEBET_WIN', m.amount, 0, { bracketId: res.state.bracketId });   // R2 (ECON-18) — large-grant alert
             // Push the new balance + a toast to every live tab of the winner/refundee.
             const newChips = await getUserChips(m.userId);
             for (const [sid, a] of authSessions) {
@@ -13733,20 +13873,29 @@ Give feedback in this JSON format:
     // the deduction is server-atomic and the payout server-computed.
     if (!auth?.userId) { socket.emit('socialBracketError', { message: 'Sign in to place a chip side bet' }); return; }
     const amt = Math.max(1, Math.min(1_000_000, Math.floor(Number(data?.amount) || 0)));
+    const bracketIdIn = String(data?.bracketId || '').toUpperCase();
     let deducted = false;
     try {
+      // R2 (ECON-14 / APPUI-43) — the organizer and the players in the bracket
+      // never bet on it, and betting closes at the first elimination: refused
+      // BEFORE the escrow (and again, atomically, by the recording INSERT). The
+      // bettor is shown by his PUBLIC name (it was his login handle).
+      const bettorName = await publicNameForUser(auth.userId);
+      const bettorNames = [bettorName, auth.displayName || ''].filter((n) => n && n !== PUBLIC_NAME_FALLBACK);
+      const refusal = await sideBetRefusal(bracketIdIn, auth.userId, bettorNames);
+      if (refusal) { socket.emit('socialBracketError', { message: refusal.error, code: refusal.code }); return; }
       const chips = await getUserChips(auth.userId);
       if (amt > chips) { socket.emit('socialBracketError', { message: `Not enough chips (need ${amt.toLocaleString()})` }); return; }
       // Escrow FIRST (atomic check-and-subtract), then record the bet.
       if (!(await deductChips(auth.userId, amt))) { socket.emit('socialBracketError', { message: 'Could not place bet' }); return; }
       deducted = true;
-      const res = await addBracketSideBet(String(data?.bracketId || ''), auth.username, String(data?.target || ''), amt, auth.userId);
+      const res = await addBracketSideBet(bracketIdIn, bettorName, String(data?.target || ''), amt, auth.userId, bettorNames);
       if (!res.ok) {
         // Recording failed (bad bracket / player out / completed / lost the
         // just-closed race) — the bet was NOT persisted, so refund the escrow.
         await addChipsToUser(auth.userId, amt);
         deducted = false;
-        socket.emit('socialBracketError', { message: res.error || 'Could not place bet' });
+        socket.emit('socialBracketError', { message: res.error || 'Could not place bet', ...(res.code ? { code: res.code } : {}) });
         return;
       }
       // ok:true means the bet is DURABLY recorded — the escrow legitimately
@@ -14335,8 +14484,18 @@ Give feedback in this JSON format:
         if (winnerUid) {
           winner.chipCount = 0;
           winner.totalInvestedThisHand = 0;
-          addChipsToUser(winnerUid, prize)
-            .then((ok) => auditLog(winner.playerName, ok ? 'SPINGO_PRIZE' : 'SPINGO_PRIZE_FAILED', { userId: winnerUid, tableId, multiplier, prize }))
+          // R2 (ECON-17 / ECON-18) — the prize is ONE keyed credit
+          // (economy_credits `spingo:<table>`: ledger + chips in one
+          // transaction, retried on a transient error, never paid twice) — the
+          // seat was zeroed first and a failed addChipsToUser lost the prize.
+          creditOnceWithRetry(`spingo:${tableId}`, winnerUid, prize, 0, 'spingo_prize', { tableId, multiplier })
+            .then((r) => {
+              auditLog(`user:${winnerUid}`, r.status === 'failed' ? 'SPINGO_PRIZE_FAILED' : 'SPINGO_PRIZE', { userId: winnerUid, tableId, multiplier, prize, status: r.status });
+              if (r.status === 'credited') {
+                auditEconomyCredit(winnerUid, 'SPINGO_PRIZE_CREDIT', prize, 0, { tableId, multiplier });
+                pushProgressToUser(winnerUid, { fresh: true }).catch(() => { /* best-effort */ });
+              }
+            })
             .catch((e) => console.warn(`[spinGo prize ${winnerUid}]`, e?.message));
         }
 
@@ -14602,26 +14761,26 @@ Give feedback in this JSON format:
             if (won) {
               upsertCareerProgress(uid, venue, stage, stars).catch(() => {});
               if (stage === 2) {
-                // SERVER copy of the VENUES reward table (never trust the client).
-                const CAREER_REWARDS: Array<{ chips: number; item?: { type: string; id: string } }> = [
-                  { chips: 1000 },
-                  { chips: 5000, item: { type: 'card_back', id: 'career_local_casino' } },
-                  { chips: 15000, item: { type: 'theme', id: 'career_vegas_strip' } },
-                  { chips: 50000, item: { type: 'avatar_frame', id: 'career_monte_carlo' } },
-                  { chips: 100000, item: { type: 'theme', id: 'career_macau' } },
-                  { chips: 500000, item: { type: 'card_back', id: 'career_wsop_legend' } },
-                ];
+                // SERVER copy of the VENUES reward table (economy/catalog
+                // CAREER_REWARDS — never the client's). R2 (ECON-17 / C7): the
+                // venue claim row, the chips and the cosmetic (a REAL catalog
+                // item now — the career_* ids rendered nothing) settle in ONE
+                // transaction, once per venue (a failed credit used to leave the
+                // venue claimed-but-unpaid); audited + large-grant alert.
                 const rw = CAREER_REWARDS[venue];
                 if (rw) {
                   (async () => {
-                    const firstTime = await claimCareerReward(uid, venue);
-                    if (!firstTime) return; // already paid for this venue
-                    const okc = await addChipsToUser(uid, rw.chips);
-                    if (!okc) { auditLog('SYSTEM', 'CAREER_CHIPS_DB_FAIL', { userId: uid, venue, amount: rw.chips }); }
-                    if (rw.item) await dbGrantItem(uid, rw.item.type, rw.item.id);
-                    auditLog(String(uid), 'CAREER_REWARD_GRANT', { venue, chips: rw.chips, extra: rw.item || null });
+                    const res = await settleCareerReward(uid, venue, rw.chips, rw.item);
+                    if (!res.ok) return; // already paid for this venue
+                    auditEconomyCredit(uid, 'CAREER_REWARD', res.chips, 0, { venue, item: rw.item || null });
+                    if (res.itemGranted && rw.item) {
+                      const [it, iid] = rw.item;
+                      progressionManager.updateUser(uid, (p) => { p.owned!.add(itemKey(it, iid)); });
+                    }
+                    progressionManager.applyWallet(uid, res.balances);
+                    socket.emit('careerRewardGranted', { venue, chips: res.chips, item: rw.item ? { itemType: rw.item[0], itemId: rw.item[1] } : null, itemGranted: res.itemGranted });
                     try { const inv = await loadInventory(uid); socket.emit('inventoryUpdated', { inventory: inv }); } catch {}
-                    sendProgressToPlayer(socket.id);
+                    await pushProgressToUser(uid);
                   })().catch((e) => console.warn('[career reward]', e?.message));
                 }
               }
@@ -14646,6 +14805,18 @@ Give feedback in this JSON format:
   socket.on('emote', async (data: { emoteId: string }) => {
     const session = playerSessions.get(socket.id);
     if (!session) return;
+    const emoteId = String(data?.emoteId ?? '').slice(0, 40);
+    if (!emoteId) return;
+    // 2026-10-11 (R2, C7 / C8) — only an emote this account may use: the
+    // wheel's free emotes, the shop emotes it OWNS, the VIP emotes while its
+    // VIP pass is active. Anything else is refused (`emoteRefused`), never
+    // relayed. (An account-less socket: the free emotes only.)
+    const auth = authSessions.get(socket.id);
+    const allowed = auth?.userId ? progressionManager.canUseEmote(auth.userId, emoteId) : FREE_EMOTES.includes(emoteId);
+    if (!allowed) {
+      socket.emit('emoteRefused', { emoteId, code: 'emote_locked' });
+      return;
+    }
 
     // Rate limit: 1 emote per 3 seconds
     const now = Date.now();
@@ -14655,7 +14826,7 @@ Give feedback in this JSON format:
 
     io.to(`table:${session.tableId}`).emit('emote', {
       seatIndex: session.seatIndex,
-      emoteId: data.emoteId,
+      emoteId,
       playerName: seatNameForSocket(socket, session.playerName),
     });
   });
@@ -14728,93 +14899,106 @@ Give feedback in this JSON format:
 
   // ========== Theme Shop ==========
 
+  // Legacy ThemeShop modal (R2, ECON P3): the price is the CATALOG price of a
+  // real theme (no `?? 400` default any more — an unknown theme is refused),
+  // stars deducted then the theme granted, in one transaction (the same path as
+  // purchaseShopItem). Replies `themePurchased` { themeId } or `error` { message, code }.
   socket.on('purchaseTheme', async (data: { themeId: string }) => {
-    // 2026-06-19 fix: ThemeShop is opened from the LOBBY (not seated), so gate
-    // on the auth session, not playerSessions (a table seat) — previously every
-    // lobby purchase silently no-op'd. And the cost table now keys off the REAL
-    // client theme ids; the old keys (gold/neon/classic/…) matched NONE of the
-    // client's (classic_blue/casino_royale/…), so every buy fell through to the
-    // flat `?? 400` regardless of the price shown.
-    const ctx = await ensureHydrated(socket);
-    if (!ctx) { socket.emit('error', { message: 'Not authenticated' }); return; }
+    const themeId = String(data?.themeId ?? '');
+    const refuse = (code: string) => socket.emit('error', { message: economyMessage(code), code, themeId });
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (economyGate(ctx, (r) => refuse(String(r.code)))) return;
+      const userId = ctx!.userId;
+      const cost = shopPrice('theme', themeId);
+      if (cost === null) { refuse('unknown_item'); return; }
+      const res = await purchaseCosmetic(userId, 'theme', themeId, cost);
+      if (!res.ok) { refuse(res.code); return; }
+      progressionManager.applyWallet(userId, res.balances);
+      progressionManager.updateUser(userId, (p) => { p.owned!.add(itemKey('theme', themeId)); });
+      auditLog(`user:${userId}`, 'SHOP_PURCHASE', { itemType: 'theme', itemId: themeId, cost, via: 'purchaseTheme' });
+      socket.emit('themePurchased', { themeId, cost });
+      socket.emit('inventoryUpdated', { inventory: await loadInventory(userId) });
+      await pushProgressToUser(userId);
+    } catch (err: any) {
+      console.error('purchaseTheme error:', err);
+      refuse('server_error');
+    }
+  });
 
-    // Cost is looked up server-side — never trust cost from the client.
-    const THEME_COSTS: Record<string, number> = {
-      classic_blue: 0, casino_royale: 500, midnight_purple: 300,
-      ocean_breeze: 400, royal_gold: 800, neon_vegas: 600,
+  // ECON-16 / APPUI-6 — Battle Pass premium, bought from the LOBBY (no seat —
+  // it answered 'Not in a session' before), ONCE per season (the
+  // user_battle_pass_premium row: a second purchase is `already_owned`, never a
+  // second charge), stars deducted then the row granted in one transaction, and
+  // remembered (C5 `battlePassPremium`). Ack + `battlePassPurchased`:
+  // { success:true, seasonId, cost } or { success:false, error, code }.
+  socket.on('purchaseBattlePass', async (_data: unknown, callback?: (ack: { success: boolean; error?: string; code?: string; seasonId?: string; cost?: number }) => void) => {
+    const respond = (ack: { success: boolean; error?: string; code?: string; seasonId?: string; cost?: number }) => {
+      if (typeof callback === 'function') callback(ack);
+      socket.emit('battlePassPurchased', ack);
     };
-    const cost = THEME_COSTS[data.themeId] ?? 400;
-
-    const result = progressionManager.purchaseTheme(ctx.playerId, data.themeId, cost);
-    if (result.success) {
-      // 2026-07-07 gap-fill — PERSIST the purchase to user_inventory. Previously
-      // purchaseTheme only pushed the theme into the in-memory progressMap and
-      // charged stars in the DB, so on the next Railway restart/rehydrate
-      // (loadInventory reads item_type='theme') the paid-for theme vanished —
-      // stars gone, theme gone. grantItem is INSERT-ON-CONFLICT idempotent.
-      await dbGrantItem(ctx.userId, 'theme', data.themeId);
-      socket.emit('themePurchased', { themeId: data.themeId });
-    } else {
-      socket.emit('error', { message: result.error || 'Purchase failed' });
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (economyGate(ctx, (r) => respond({ success: false, error: String(r.error), code: String(r.code) }))) return;
+      const userId = ctx!.userId;
+      const res = await purchaseBattlePassPremium(userId, CURRENT_BATTLE_PASS_SEASON, BATTLE_PASS_PREMIUM_COST);
+      if (!res.ok) {
+        if (res.code === 'already_owned') progressionManager.updateUser(userId, (p) => { p.battlePassPremium = true; });
+        respond({ success: false, error: economyMessage(res.code), code: res.code, seasonId: CURRENT_BATTLE_PASS_SEASON });
+        try { await pushProgressToUser(userId); } catch { /* best-effort */ }
+        return;
+      }
+      progressionManager.applyWallet(userId, res.balances);
+      progressionManager.updateUser(userId, (p) => { p.battlePassPremium = true; });
+      auditLog(`user:${userId}`, 'BATTLE_PASS_PREMIUM_PURCHASE', { seasonId: CURRENT_BATTLE_PASS_SEASON, cost: BATTLE_PASS_PREMIUM_COST });
+      respond({ success: true, seasonId: CURRENT_BATTLE_PASS_SEASON, cost: BATTLE_PASS_PREMIUM_COST });
+      await pushProgressToUser(userId);
+    } catch (err: any) {
+      console.error('purchaseBattlePass error:', err);
+      respond({ success: false, error: economyMessage('server_error'), code: 'server_error' });
     }
-    const cp = progressionManager.getClientProgress(ctx.playerId);
-    if (cp) socket.emit('playerProgress', cp);
   });
 
-  socket.on('purchaseBattlePass', async (_data: unknown, callback?: (ack: { success: boolean; error?: string }) => void) => {
-    const auth = authSessions.get(socket.id);
-    const session = playerSessions.get(socket.id);
-    const respond = (ack: { success: boolean; error?: string }) => { if (typeof callback === 'function') callback(ack); };
-    if (!auth) { respond({ success: false, error: 'Not authenticated' }); return; }
-    const playerId = session?.playerId;
-    if (!playerId) { respond({ success: false, error: 'Not in a session' }); return; }
-    const BATTLE_PASS_COST = 950;
-    // 2026-07-05 audit P2 fix: use the AUTHORITATIVE atomic charge. purchaseTheme
-    // returned success from the in-memory snapshot and deducted stars fire-and-
-    // forget, so the premium entitlement (mergeUserStats below) could be granted
-    // even when the real DB star charge failed. purchaseThemeAtomic awaits the DB
-    // deduct and only reports success when the charge actually landed.
-    const result = await progressionManager.purchaseThemeAtomic(playerId, '__battlepass_premium__', BATTLE_PASS_COST);
-    if (!result.success) { respond({ success: false, error: result.error }); return; }
-    await mergeUserStats(auth.userId, { battlePassPremium: true });
-    sendProgressToPlayer(socket.id);
-    respond({ success: true });
-  });
-
+  // Legacy ThemeShop equip — the same validated equip as equipItem.
   socket.on('equipTheme', async (data: { themeId: string }) => {
-    // 2026-06-19 fix: same as purchaseTheme — equip is invoked from the lobby,
-    // so gate on the auth session and push progress directly (sendProgressToPlayer
-    // no-ops without a table seat).
-    const ctx = await ensureHydrated(socket);
-    if (!ctx) { socket.emit('error', { message: 'Not authenticated' }); return; }
-
-    const result = progressionManager.equipTheme(ctx.playerId, data.themeId);
-    if (result.success) {
-      // 2026-07-07 gap-fill — PERSIST the equip to user_inventory (UPDATE
-      // equipped). equipTheme mutated only in-memory, so the equipped theme
-      // reverted on restart. grantItem first is a self-heal: a user who bought
-      // a theme BEFORE the purchase-persist fix has it in-memory but has no
-      // inventory row, so equipItem (which requires ownership) would no-op —
-      // granting first (idempotent) writes the row so their equip sticks.
-      // progressionManager.equipTheme already verified ownedThemes, so this
-      // can't equip an unowned theme.
-      await dbGrantItem(ctx.userId, 'theme', data.themeId);
-      await dbEquipItem(ctx.userId, 'theme', data.themeId);
-      socket.emit('themeEquipped', { themeId: data.themeId });
-    } else {
-      socket.emit('error', { message: result.error || 'Equip failed' });
+    const themeId = String(data?.themeId ?? '');
+    const refuse = (code: string) => socket.emit('error', { message: economyMessage(code), code, themeId });
+    try {
+      const ctx = await ensureHydrated(socket);
+      if (economyGate(ctx, (r) => refuse(String(r.code)))) return;
+      const userId = ctx!.userId;
+      if (!isOwnableItem('theme', themeId)) { refuse('unknown_item'); return; }
+      const res = await equipItemTx(userId, 'theme', themeId, isFreeItem('theme', themeId));
+      if (!res.ok) { refuse(res.code); return; }
+      progressionManager.updateUser(userId, (p) => { p.owned!.add(itemKey('theme', themeId)); p.equipped!.theme = themeId; });
+      socket.emit('themeEquipped', { themeId });
+      socket.emit('inventoryUpdated', { inventory: await loadInventory(userId) });
+      await pushProgressToUser(userId);
+      rebroadcastTablesOfUser(userId);   // C7 — myTheme at his seats
+    } catch (err: any) {
+      console.error('equipTheme error:', err);
+      refuse('server_error');
     }
-    const cp = progressionManager.getClientProgress(ctx.playerId);
-    if (cp) socket.emit('playerProgress', cp);
   });
 
   // ========== Detailed Stats ==========
 
+  // C10 / APPUI-10 — the HUD stats of the ACCOUNT, seated or not (it answered
+  // only seated sockets, so the lobby StatsPanel / LeakFinder showed zeros as a
+  // "PFR 0.0%" leak). From the record loaded from Postgres (the action /
+  // position counters are persisted since R2). Replies `detailedStats` { vpip,
+  // pfr, af, threeBet, wtsd, wsd, handsTracked, winRate, positionStats, … }.
   socket.on('getDetailedStats', async () => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
-
-    const stats = progressionManager.getDetailedStats(session.playerId);
+    let playerId: string | undefined;
+    if (authSessions.get(socket.id)) {
+      const ctx = await ensureHydrated(socket);
+      if (!ctx || ctx.hydrated === false) { socket.emit('detailedStats', { hydrated: false, error: 'progress_loading' }); return; }
+      playerId = ctx.playerId;
+    } else {
+      playerId = playerSessions.get(socket.id)?.playerId;
+    }
+    if (!playerId) return;
+    const stats = progressionManager.getDetailedStats(playerId);
     socket.emit('detailedStats', stats);
   });
 
@@ -14931,23 +15115,39 @@ Give feedback in this JSON format:
   // profile hung on "Loading…" (or showed a fabricated buildMockProfile).
   // Returns the player's REAL public stats. Auth-gated (viewers must be signed
   // in) and returns only non-PII profile fields (no chips/email/phone).
-  socket.on('requestProfile', async (data: { username: string }) => {
-    if (!authSessions.get(socket.id)) return; // signed-in viewers only
-    // R1 (APPUI-14 / AUTH-7) — `username` is the NAME the viewer clicked (a
-    // seat / leaderboard name): it is looked up as an exact DISPLAY NAME
-    // (case-insensitive, listable rows), echoed back as `username` (the
-    // client matches on it) — never a login handle.
+  socket.on('requestProfile', async (data: { username?: string; publicId?: string; userId?: number }) => {
+    const viewer = authSessions.get(socket.id);
+    if (!viewer) return; // signed-in viewers only
+    // R2 (APPUI-14 / Addendum) — a profile opens BY ID: `publicId` (the opaque
+    // id seats / leaderboards / search / friends carry) or `userId` (a
+    // friends-list row) — exact, no display-name ambiguity. The R1 name lookup
+    // (`username` = an exact DISPLAY NAME, echoed back) stays for older clients.
+    // Never a login handle. `isYou` = the viewer's own profile.
+    const byPublicId = typeof data?.publicId === 'string' && data.publicId ? String(data.publicId).slice(0, 32) : '';
+    const byUserId = data?.userId !== undefined && data?.userId !== null ? Number(data.userId) : NaN;
     const uname = String(data?.username || '').trim().slice(0, 40);
-    if (!uname) return;
+    if (!byPublicId && !Number.isInteger(byUserId) && !uname) return;
+    const echo = { username: uname, ...(byPublicId ? { publicId: byPublicId } : {}), ...(Number.isInteger(byUserId) ? { userId: byUserId } : {}) };
     const emptyProfile = {
-      username: uname, level: 1, elo: 500, wins: 0, losses: 0, totalHands: 0,
+      ...echo, level: 1, elo: 500, wins: 0, losses: 0, totalHands: 0,
       winRate: '0.0', netChips: 0, vpip: 0, pfr: 0, vipTier: 'Bronze', vipXp: 0,
       unlockedAchievements: [] as string[], sessionHistory: null, handHistory: [] as any[],
     };
     try {
-      const match = isPublicDisplayName(uname) ? (await findUsersByDisplayName(uname, 1))[0] : undefined;
-      const { rows } = match
-        ? await getPool().query(`SELECT level, stats, achievements FROM users WHERE id = $1`, [match.id])
+      let targetId: number | undefined;
+      let displayName: string | undefined;
+      if (byPublicId) {
+        const id = await userIdForPublicId(byPublicId);
+        if (id) { targetId = id; displayName = await publicNameForUser(id); }
+      } else if (Number.isInteger(byUserId) && byUserId > 0) {
+        const names = await getPublicNames([byUserId]);
+        if (names.has(byUserId)) { targetId = byUserId; displayName = names.get(byUserId); }
+      } else {
+        const match = isPublicDisplayName(uname) ? (await findUsersByDisplayName(uname, 1))[0] : undefined;
+        if (match) { targetId = match.id; displayName = match.displayName; }
+      }
+      const { rows } = targetId
+        ? await getPool().query(`SELECT level, xp, stats, achievements FROM users WHERE id = $1`, [targetId])
         : { rows: [] as any[] };
       if (rows.length === 0) { socket.emit('profileData', { ...emptyProfile, notFound: true }); return; }
       const u = rows[0];
@@ -14955,22 +15155,41 @@ Give feedback in this JSON format:
       try { stats = typeof u.stats === 'string' ? JSON.parse(u.stats || '{}') : (u.stats || {}); } catch { /* keep {} */ }
       let achievements: string[] = [];
       try { achievements = Array.isArray(u.achievements) ? u.achievements : JSON.parse(u.achievements || '[]'); } catch { /* keep [] */ }
-      const totalHands = stats.handsPlayed || stats.totalHandsPlayed || 0;
-      const wins = stats.handsWon || 0;
+      // A live record is fresher than the row (counters persist per hand).
+      const live = progressionManager.userRecord(targetId!);
+      const totalHands = Math.max(Number(stats.handsPlayed || stats.totalHandsPlayed) || 0, live?.totalHandsPlayed || 0);
+      const wins = Math.max(Number(stats.handsWon) || 0, live?.handsWon || 0);
+      const vpipHands = Math.max(Number(stats.vpipHands) || 0, live?.vpipHands || 0);
+      const pfrHands = Math.max(Number(stats.pfrHands) || 0, live?.pfrHands || 0);
+      const level = Math.max(Number(u.level) || 1, live?.level || 0);
+      const seasonXp = live ? progressionManager.getSeasonXp(live.playerId) : seasonXpOf(level, Number(u.xp) || 0);
+      let publicId: string | null = byPublicId || null;
+      let badges: string[] = [];
+      try {
+        if (!publicId) publicId = ((await publicIdsFor([targetId!])) || new Map()).get(targetId!) ?? null;
+        const inv = await loadInventory(targetId!);
+        badges = (Array.isArray(inv) ? inv : []).filter((r: any) => r?.item_type === 'badge' && typeof r.item_id === 'string').map((r: any) => r.item_id);
+      } catch { /* optional extras */ }
       socket.emit('profileData', {
-        username: uname,
-        displayName: match!.displayName,
-        level: u.level || 1,
-        elo: stats.elo || 500,
+        ...echo,
+        displayName,
+        publicId,
+        isYou: targetId === viewer.userId,
+        level,
+        elo: typeof live?.elo === 'number' ? live.elo : (Number(stats.elo) || 500),
+        peakElo: Math.max(Number(stats.peakElo) || 0, live?.peakElo || 0) || 500,
+        rankedWins: Math.max(Number(stats.rankedWins) || 0, live?.rankedWins || 0),
+        rankedLosses: Math.max(Number(stats.rankedLosses) || 0, live?.rankedLosses || 0),
         wins,
         losses: Math.max(0, totalHands - wins),
         totalHands,
         winRate: totalHands > 0 ? ((wins / totalHands) * 100).toFixed(1) : '0.0',
         netChips: stats.netChips || 0,
-        vpip: stats.vpip || 0,
-        pfr: stats.pfr || 0,
-        vipTier: stats.vipTier || 'Bronze',
-        vipXp: stats.vipXp || 0,
+        vpip: totalHands > 0 ? Number(((vpipHands / totalHands) * 100).toFixed(1)) : 0,
+        pfr: totalHands > 0 ? Number(((pfrHands / totalHands) * 100).toFixed(1)) : 0,
+        vipTier: vipTierForSeasonXp(seasonXp)?.name || 'Bronze',
+        vipXp: seasonXp,
+        badges,
         unlockedAchievements: achievements,
         sessionHistory: null,
         handHistory: [],
@@ -18058,7 +18277,9 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
   // Live activity ticker: announce the tournament winner (real human only;
   // never a disqualified survivor).
   const champ = (data?.results || []).find((r) => r.position === 1 && r.userId !== undefined && !r.disqualified);
-  if (champ?.playerName) pushActivity(`♠ ${champ.playerName} won a tournament!`);
+  // R2 (Addendum) — the public name only (a registration name is never shown raw).
+  const champName = champ?.playerName ? publicNameOf(champ.playerName) : PUBLIC_NAME_FALLBACK;
+  if (champName !== PUBLIC_NAME_FALLBACK) pushActivity(`♠ ${champName} won a tournament!`);
 
   for (const r of data?.results || []) {
     // A disqualified entrant's payout is already 0 (finishTournament); the
@@ -19233,6 +19454,24 @@ initDB().then(async () => {
   try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }
   try { await initPredictionTables(); } catch (e) { console.error('[prediction] initPredictionTables failed', e); }
   try { await initBracketTables(); } catch (e) { console.error('[bracket] initBracketTables failed', e); }
+  // 2026-10-11 (.online R2, S3) — the economy tables (achievement / credit /
+  // chips-won / Battle Pass premium / season-run ledgers, users.public_id),
+  // then users.chips → BIGINT (retried while a deploy overlap holds the lock),
+  // the month-end season award sweep (C9) and the progress-record eviction.
+  try {
+    await initEconomyTables(getPool());
+    console.log('[economy] tables ready');
+  } catch (e: any) { console.error('[economy] initEconomyTables failed (claims that need the new ledgers refuse until a boot succeeds):', e?.message || e); }
+  const runBigintMigration = async (attempt: number): Promise<void> => {
+    const r = await migrateUsersChipsToBigint(getPool() as any).catch((e: any) => { console.warn('[economy] BIGINT migration:', e?.message || e); return 'failed' as const; });
+    economyStats.bigintMigration = r;
+    if (r === 'migrated') console.log('[economy] users.chips is BIGINT now (trigger re-created)');
+    if (r === 'lock_timeout' && attempt < 10) setTimeout(() => { void runBigintMigration(attempt + 1); }, 60_000).unref?.();
+  };
+  void runBigintMigration(1);
+  void sweepSeasonAwards('boot');
+  setInterval(() => { void sweepSeasonAwards('sweep'); }, 10 * 60_000).unref?.();
+  setInterval(() => { try { evictIdleProgress(); } catch (e: any) { console.warn('[progress-evict]', e?.message || e); } }, 10 * 60_000).unref?.();
 
   // 2026-10-10 — one-time account merge (one person, one local row) and the
   // 50,000-chip goodwill grant (auth/accountMerge.ts). They start
