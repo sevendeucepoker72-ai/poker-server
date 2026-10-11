@@ -43,8 +43,8 @@ import {
 import { ProgressionManager, lifetimeAchievementsUnlockedByLevel, maxXpAtLevel } from './progression/ProgressionManager';
 import { sanitizeClientProgressSave, PAYOUT_KEYS_FROM_CLIENT } from './progression/clientProgressSave';
 import { HandRank } from './game/HandEvaluator';
-import { getFullTrainingData, calculateEquity } from './training/TrainingEngine';
-import { insuranceCashoutAmount, insuranceSettlementDelta } from './game/insurance';
+import { getFullTrainingData } from './training/TrainingEngine';
+import { insuranceSettlementDelta, priceInsuranceQuote, InsuranceQuote } from './game/insurance';
 import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
@@ -3390,6 +3390,19 @@ function getGameStateForPlayer(
   stateObj.isTournament = !!stateTournamentId;
   stateObj.tournamentId = stateTournamentId;
 
+  // 2026-10-11 (R1 contract #2) — what kind of table this is and whether a
+  // rebuy is allowed here, ALWAYS present (the `rebuy` handler refuses with
+  // `rebuy_not_allowed` where it is false), plus the buy-in bounds the
+  // rebuy / top-up controls use (rebuy clamps to [minBuyIn, 10 x minBuyIn]).
+  stateObj.tableKind = tableKindOf(table.config.tableId);
+  stateObj.rebuyAllowed = rebuyAllowedAt(table.config.tableId);
+  stateObj.minBuyIn = table.config.minBuyIn;
+  stateObj.maxBuyIn = table.config.minBuyIn * 10;
+  // R1 contract #1 — ALWAYS present: null, or THIS seat's own all-in
+  // insurance quote { handNumber, cashout, equityPct, pot, expiresAt } while
+  // the runout is held for its decision. Spectators always get null.
+  stateObj.insuranceQuote = insuranceQuoteForSeat(table.config.tableId, table, playerSeatIndex);
+
   // Add missed-blind info for this player. Now sourced directly from the
   // seat object (seat.deadBlindOwedChips + seat.missedBlind) — single
   // source of truth after the audit refactor.
@@ -3698,6 +3711,7 @@ function broadcastGameState(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
   ensureTurnTimerWired(tableId);
+  ensureInsuranceHoldWired(tableId, table); // R1 — the insurance decision window (cash Hold'em only)
 
   // Send personalized state to each player at the table
   for (const [socketId, session] of playerSessions) {
@@ -5315,30 +5329,10 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
 
   // All-in insurance settlement — BEFORE bust removal, so an insured player who
   // was outdrawn keeps their locked-in cashout instead of busting. The engine
-  // already credited the pot to seat.chipCount; we adjust it so the insured
-  // seat ends with exactly `cashout` (delta>0 = house pays, delta<0 = house
-  // collects the margin). Adjusts the LIVE stack — the wallet syncs on cashout,
-  // so no double-count. Heads-up only, so no side-pot eligibility to reconcile.
-  const insCashouts = insuranceCashouts.get(tableId);
-  if (insCashouts && insCashouts.length) {
-    for (const co of insCashouts) {
-      const iseat = table.seats[co.seatIndex];
-      if (!iseat || iseat.state !== 'occupied') continue;
-      const actualWon = totalWonPerSeat.get(co.seatIndex) || 0;
-      const delta = insuranceSettlementDelta(co.cashout, actualWon);
-      iseat.chipCount = Math.max(0, iseat.chipCount + delta);
-      auditLog(co.playerId, delta >= 0 ? 'INSURANCE_PAYOUT' : 'INSURANCE_COLLECT',
-        { tableId, seatIndex: co.seatIndex, cashout: co.cashout, actualWon, delta, newStack: iseat.chipCount });
-      for (const [sid, s] of playerSessions) {
-        if (s.tableId === tableId && s.seatIndex === co.seatIndex) {
-          io.sockets.sockets.get(sid)?.emit('insuranceSettled', { cashout: co.cashout, delta, stack: iseat.chipCount });
-          break;
-        }
-      }
-    }
-    insuranceCashouts.delete(tableId);
-    broadcastGameState(tableId); // reflect the adjusted stack to all clients
-  }
+  // already credited the pot to seat.chipCount; settleInsuranceForHand adjusts
+  // it so the insured seat ends with exactly `cashout` (R1 2026-10-11: only
+  // this hand's records, never a seat that changed hands or forfeited).
+  settleInsuranceForHand(tableId, table, totalWonPerSeat);
 
   // S1 (2026-10-10) — capture this hand's tournament bust check NOW, before
   // the first await below: until it runs, this table does not deal again
@@ -6469,11 +6463,269 @@ const careerTables = new Map<string, { venue: number; stage: number }>();
 // All-in insurance cashouts locked in for the CURRENT hand, per table. Settled
 // at hand-complete (before bust removal) and cleared. Server-computed amount —
 // the client's suggested figure is never trusted.
-const insuranceCashouts = new Map<string, Array<{ seatIndex: number; playerId: string; userId?: number; cashout: number }>>();
+const insuranceCashouts = new Map<string, Array<{ seatIndex: number; playerId: string; userId?: number; cashout: number; handNumber: number; equityPct: number; pot: number }>>();
 
 // Club-challenge heads-up tables: tableId -> the challenge being played on it.
 // The stakes are the buy-in, so chips flow through the normal join/cleanup paths.
 const challengeTables = new Map<string, { challengeId: number; challengerId: number; challengedId: number }>();
+
+// ========== Table kind (R1 contract #2, 2026-10-11) ==========
+// Private home games and club tables are ordinary cash tables to the engine;
+// these record which they are (created by createPrivateTable / createClubTable
+// / a scheduled club table) so every per-player game state can say so.
+const privateTableIds = new Set<string>();
+const clubTableIds = new Set<string>();
+
+type TableKind = 'cash' | 'private' | 'club' | 'tournament' | 'spingo' | 'career' | 'headsup' | 'aof';
+
+/**
+ * R1 contract #2 — what kind of table this is (per-player game state key
+ * `tableKind`, always present). Quick tables are told apart by the registry
+ * each create path fills before the table's first broadcast; a quick table in
+ * none of the per-mode registries is the heads-up snap.
+ */
+function tableKindOf(tableId: string): TableKind {
+  if (isTournamentTable(tableId)) return 'tournament';
+  if (spinGoMultipliers.has(tableId)) return 'spingo';
+  if (careerTables.has(tableId)) return 'career';
+  if (allInOrFoldTables.has(tableId)) return 'aof';
+  if (quickTables.has(tableId)) return 'headsup';
+  if (challengeTables.has(tableId) || clubTableIds.has(tableId)) return 'club';
+  if (privateTableIds.has(tableId)) return 'private';
+  return 'cash';
+}
+
+/**
+ * R1 contract #2 / TOURNEY-1 — may a seated player top up (`rebuy`) here?
+ * Never at a tournament table nor at any quick table (Spin & Go / career /
+ * heads-up / all-in-or-fold: fixed-buy-in games whose settlement pays a prize,
+ * so a rebuy was destroyed on a win — users 1541 + 4481 lost 5,000 each), and
+ * never in a club CHALLENGE (a freezeout whose winner is the last one with
+ * chips). Per-player game state key `rebuyAllowed`, always present.
+ */
+function rebuyAllowedAt(tableId: string): boolean {
+  const kind = tableKindOf(tableId);
+  return (kind === 'cash' || kind === 'private' || kind === 'club') && !challengeTables.has(tableId);
+}
+
+/** The `rebuy` handler's refusal (stable code `rebuy_not_allowed`) where rebuyAllowedAt is false, else null. */
+function rebuyRefusalAt(tableId: string): { message: string; code: 'rebuy_not_allowed' } | null {
+  if (rebuyAllowedAt(tableId)) return null;
+  return {
+    message: isTournamentTable(tableId) ? 'Rebuys are disabled in tournaments' : 'Rebuys are not available at this table',
+    code: 'rebuy_not_allowed',
+  };
+}
+
+// ========== All-in insurance (R1 contract #1, 2026-10-11 — ECON-1 / TABLEUI-1) ==========
+// The house buys an all-in player's equity at 90%. Before R1 the price came
+// from the training engine's PERCENT equity against a random hand, read as a
+// 0..1 fraction (every quote clamped to 90% of the pot: 1.47M chips minted
+// 09-12..10-07), was offered before the opponent had even called, and at any
+// table. Now:
+//   - ELIGIBLE (insuranceCandidates): a cash Hold'em table (cash / private /
+//     club — never tournament, qualifier, quick or club-challenge tables), a
+//     hand in progress with board cards to come, EXACTLY two players in it, the
+//     seat all-in, human, with a live session, the betting closed (the runout
+//     is HELD — PokerTable.runoutHoldDecider), not accepted / declined yet.
+//   - PRICE (priceInsuranceQuote): round(0.9 * equity * contested pot), the
+//     equity against the opponent's ACTUAL cards — exact with <= 2 board cards
+//     to come, a deterministic Monte Carlo pre-flop.
+//   - WINDOW: the engine deals the whole board in the tick the betting closes,
+//     so a hand with an eligible seat holds its runout INSURANCE_DECISION_MS
+//     (or until every quoted seat accepted / declined), then runs out normally.
+//   - ACCEPT re-validates all of it and records EXACTLY the quoted cashout;
+//     settlement (settleInsuranceForHand) makes the insured stack end the hand
+//     with that cashout. A seat that forfeits (leaves -> folded) voids it.
+const INSURANCE_DECISION_MS = 7000;
+interface InsuranceOffer {
+  handNumber: number;
+  boardKey: string;
+  expiresAt: number;
+  timer: ReturnType<typeof setTimeout> | null;
+  /** seatIndex -> its quote (only the seats that were quoted). */
+  quotes: Map<number, InsuranceQuote>;
+  /** Seats that accepted or declined (their quote is gone). */
+  decided: Set<number>;
+}
+const insuranceOffers = new Map<string, InsuranceOffer>();
+const insuranceStats = { windows: 0, quotes: 0, accepted: 0, declined: 0, refused: 0, releasedTimeout: 0, releasedDecided: 0, settled: 0, voided: 0 };
+
+const insuranceBoardKey = (table: PokerTable): string => table.communityCards.map((c) => `${c.rank}.${c.suit}`).join(',');
+
+/** Texas Hold'em proper: the base engine itself (every variant subclasses PokerTable). Dealer's Choice only relabels. */
+function isPlainHoldemTable(table: PokerTable): boolean {
+  return Object.getPrototypeOf(table) === PokerTable.prototype && table.variantId === 'holdem';
+}
+
+/** A live session (main or extra-table) plays this seat. */
+function seatHasAnySession(tableId: string, seatIndex: number): boolean {
+  if (seatHasLiveSession(tableId, seatIndex)) return true;
+  for (const list of multiTableSessions.values()) {
+    if (Array.isArray(list) && list.some((s) => s && s.tableId === tableId && s.seatIndex === seatIndex)) return true;
+  }
+  return false;
+}
+
+/**
+ * R1 contract #1 — the seats that may insure this hand, each with its one
+ * opponent: everything except "the betting is closed", which the caller adds
+ * (runOutBoard asking the decider, or the runout hold being in place).
+ */
+function insuranceCandidates(tableId: string, table: PokerTable): Array<{ seatIndex: number; opponent: number }> {
+  const kind = tableKindOf(tableId);
+  if (!(kind === 'cash' || kind === 'private' || kind === 'club') || challengeTables.has(tableId)) return [];
+  if (!isPlainHoldemTable(table)) return [];
+  if (!table.isHandInProgress() || table.communityCards.length >= 5) return [];
+  const inHand = table.seats.filter((s) => s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0);
+  if (inHand.length !== 2 || inHand.some((s) => s.holeCards.length !== 2)) return [];
+  const out: Array<{ seatIndex: number; opponent: number }> = [];
+  for (const s of inHand) {
+    if (!s.allIn || s.isAI || !seatHasAnySession(tableId, s.seatIndex)) continue;
+    out.push({ seatIndex: s.seatIndex, opponent: inHand.find((o) => o.seatIndex !== s.seatIndex)!.seatIndex });
+  }
+  return out;
+}
+
+/** The pots BOTH remaining players can win — what an insured seat stands to win or lose. */
+function insuranceContestedPot(table: PokerTable, a: number, b: number): number {
+  let pot = 0;
+  for (const p of table.getCurrentPots()) {
+    if (p.eligibleSeatIndices.includes(a) && p.eligibleSeatIndices.includes(b)) pot += p.amount;
+  }
+  return pot;
+}
+
+/**
+ * PokerTable.runoutHoldDecider — the betting just closed with board cards to
+ * come. Quote every eligible seat; hold the runout when at least one quote
+ * exists (a hand nobody can insure runs out at once, exactly as before).
+ */
+function decideInsuranceHold(tableId: string, table: PokerTable): boolean {
+  const candidates = insuranceCandidates(tableId, table);
+  if (candidates.length === 0) return false;
+  const expiresAt = Date.now() + INSURANCE_DECISION_MS;
+  const quotes = new Map<number, InsuranceQuote>();
+  for (const c of candidates) {
+    const q = priceInsuranceQuote({
+      tableId,
+      handNumber: table.handNumber,
+      hero: table.seats[c.seatIndex].holeCards,
+      villain: table.seats[c.opponent].holeCards,
+      board: table.communityCards,
+      contestedPot: insuranceContestedPot(table, c.seatIndex, c.opponent),
+      expiresAt,
+    });
+    if (q) quotes.set(c.seatIndex, q);
+  }
+  if (quotes.size === 0) return false;
+  clearInsuranceOffer(tableId);
+  const handNumber = table.handNumber;
+  const offer: InsuranceOffer = { handNumber, boardKey: insuranceBoardKey(table), expiresAt, timer: null, quotes, decided: new Set() };
+  offer.timer = setTimeout(() => releaseInsuranceHold(tableId, handNumber, 'timeout'), INSURANCE_DECISION_MS);
+  (offer.timer as any)?.unref?.();
+  insuranceOffers.set(tableId, offer);
+  insuranceStats.windows++;
+  insuranceStats.quotes += quotes.size;
+  log.info(`[insurance] ${JSON.stringify({ event: 'insurance_window_open', tableId, handNumber, seats: [...quotes.keys()], boardCards: table.communityCards.length })}`);
+  return true;
+}
+
+const wiredInsuranceHold = new WeakSet<object>();
+function ensureInsuranceHoldWired(tableId: string, table: PokerTable): void {
+  if (wiredInsuranceHold.has(table)) return;
+  wiredInsuranceHold.add(table);
+  table.runoutHoldDecider = (t: PokerTable) => decideInsuranceHold(tableId, t);
+}
+
+function clearInsuranceOffer(tableId: string): void {
+  const offer = insuranceOffers.get(tableId);
+  if (!offer) return;
+  if (offer.timer) clearTimeout(offer.timer);
+  insuranceOffers.delete(tableId);
+}
+
+/**
+ * End the decision window of `handNumber`: the board runs out and the hand is
+ * settled (settleInsuranceForHand, inside the handResult listener), then the
+ * next hand is scheduled exactly as after a player's hand-ending action.
+ */
+function releaseInsuranceHold(tableId: string, handNumber: number, reason: 'timeout' | 'decided'): void {
+  const offer = insuranceOffers.get(tableId);
+  if (offer && offer.handNumber === handNumber) clearInsuranceOffer(tableId);
+  const table = tableManager.getTable(tableId);
+  if (!table || table.handNumber !== handNumber || !table.isRunoutHeld()) return;
+  if (reason === 'timeout') insuranceStats.releasedTimeout++;
+  else insuranceStats.releasedDecided++;
+  table.releaseRunoutHold();
+  broadcastGameState(tableId);
+  if (table.currentPhase === GamePhase.HandComplete) scheduleAutoStart(tableId, 3000);
+  else scheduleAIAction(tableId);
+}
+
+/** Every quoted seat accepted or declined → no reason to keep the table waiting. */
+function releaseInsuranceHoldIfDecided(tableId: string, handNumber: number): void {
+  const offer = insuranceOffers.get(tableId);
+  if (!offer || offer.handNumber !== handNumber) return;
+  for (const seatIndex of offer.quotes.keys()) if (!offer.decided.has(seatIndex)) return;
+  releaseInsuranceHold(tableId, handNumber, 'decided');
+}
+
+/**
+ * R1 contract #1 — this seat's `insuranceQuote` (per-player game state, always
+ * present): its quote while the runout is held for it and it is still
+ * eligible, else null. Spectators (-1) and everyone else always get null.
+ */
+function insuranceQuoteForSeat(tableId: string, table: PokerTable, seatIndex: number): InsuranceQuote | null {
+  if (seatIndex < 0) return null;
+  const offer = insuranceOffers.get(tableId);
+  if (!offer || offer.handNumber !== table.handNumber || !table.isRunoutHeld()) return null;
+  if (offer.decided.has(seatIndex)) return null;
+  const quote = offer.quotes.get(seatIndex);
+  if (!quote || offer.boardKey !== insuranceBoardKey(table)) return null;
+  if (!insuranceCandidates(tableId, table).some((c) => c.seatIndex === seatIndex)) return null;
+  return quote;
+}
+
+/**
+ * At hand complete (handleHandComplete, BEFORE bust removal): every insured
+ * seat ends the hand with EXACTLY its cashout — the engine already credited
+ * its pot winnings, the delta is (cashout - won): > 0 the house pays an
+ * outdrawn player, < 0 it keeps the margin of a winner. Adjusts the LIVE stack
+ * (the wallet syncs at cash-out). VOID when the record is not this hand's, the
+ * seat changed hands, or the seat folded (a leave forfeits the hand — and the
+ * insurance with it: otherwise insure-then-leave paid the cashout while the
+ * opponent took the whole pot).
+ */
+function settleInsuranceForHand(tableId: string, table: PokerTable, totalWonPerSeat: Map<number, number>): void {
+  const insCashouts = insuranceCashouts.get(tableId);
+  if (!insCashouts || insCashouts.length === 0) return;
+  insuranceCashouts.delete(tableId);
+  for (const co of insCashouts) {
+    const iseat = table.seats[co.seatIndex];
+    const voidReason = co.handNumber !== table.handNumber ? 'other_hand'
+      : (!iseat || iseat.state !== 'occupied' || iseat.playerId !== co.playerId) ? 'seat_changed'
+      : iseat.folded ? 'forfeited' : null;
+    if (voidReason) {
+      insuranceStats.voided++;
+      auditLog(co.playerId, 'INSURANCE_VOID', { tableId, seatIndex: co.seatIndex, handNumber: co.handNumber, cashout: co.cashout, reason: voidReason });
+      continue;
+    }
+    const actualWon = totalWonPerSeat.get(co.seatIndex) || 0;
+    const delta = insuranceSettlementDelta(co.cashout, actualWon);
+    iseat!.chipCount = Math.max(0, iseat!.chipCount + delta);
+    insuranceStats.settled++;
+    auditLog(co.playerId, delta >= 0 ? 'INSURANCE_PAYOUT' : 'INSURANCE_COLLECT',
+      { tableId, seatIndex: co.seatIndex, handNumber: co.handNumber, cashout: co.cashout, equityPct: co.equityPct, pot: co.pot, actualWon, delta, newStack: iseat!.chipCount });
+    for (const [sid, s] of playerSessions) {
+      if (s.tableId === tableId && s.seatIndex === co.seatIndex) {
+        io.sockets.sockets.get(sid)?.emit('insuranceSettled', { cashout: co.cashout, delta, stack: iseat!.chipCount, tableId, handNumber: co.handNumber });
+        break;
+      }
+    }
+  }
+  broadcastGameState(tableId); // reflect the adjusted stack to all clients
+}
 
 function cleanupQuickTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
@@ -6530,6 +6782,7 @@ function cleanupQuickTable(tableId: string): void {
   allInOrFoldTables.delete(tableId);
   careerTables.delete(tableId);
   insuranceCashouts.delete(tableId);
+  clearInsuranceOffer(tableId);
   challengeTables.delete(tableId);
 
   const timeoutKey = tableId;
@@ -12551,8 +12804,14 @@ Give feedback in this JSON format:
     // owned by TournamentManager; a self-serve rebuy would let them
     // un-eliminate with a client-chosen stack and corrupt standings +
     // payouts. Mirror the moveSeat tournament gate.
-    if (isTournamentTable(session.tableId)) {
-      socket.emit('error', { message: 'Rebuys are disabled in tournaments' });
+    // 2026-10-11 (R1 contract #2, TOURNEY-1) — and never at a QUICK table
+    // (Spin & Go / career / heads-up / all-in-or-fold) or a club challenge:
+    // their settlement pays a fixed prize, so a top-up (poker-3d's auto-rebuy
+    // sent minBuyIn || 5000) was destroyed on a win. Same rule as the
+    // `rebuyAllowed` game-state key; refused before anything is deducted.
+    const rebuyRefusal = rebuyRefusalAt(session.tableId);
+    if (rebuyRefusal) {
+      socket.emit('error', rebuyRefusal);
       return;
     }
     // Don't allow rebuys in the middle of a hand while the player is
@@ -14384,46 +14643,78 @@ Give feedback in this JSON format:
     });
   });
 
-  // ========== All-In Insurance (cashout) ==========
-  // A player all-in with cards to come can lock in a guaranteed cashout instead
-  // of gambling the runout. The house is the counterparty (buys their equity at
-  // a 10% discount). v1 is scoped to HEADS-UP all-ins so the total pot equals
-  // the eligible pot (no side-pot mis-pricing). The amount is computed
-  // server-side from real Monte-Carlo equity — the client's figure is ignored.
-  socket.on('acceptInsurance', () => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
+  // ========== All-In Insurance (cashout) — R1 contract #1 (2026-10-11) ==========
+  // The quote is SERVER state: the eligible seat's game state carries
+  // `insuranceQuote` while the runout is held for it (decideInsuranceHold). The
+  // client names the hand it saw the quote in — `acceptInsurance { tableId,
+  // handNumber }` — and sends NO numbers; any it sends are ignored. Everything
+  // is re-validated here and the cashout recorded is EXACTLY the quote's.
+  // Answers: `insuranceAccepted { cashout, equityPct, tableId, handNumber }`, or
+  // `error { message, code }` with a stable code: insurance_not_seated /
+  // insurance_stale_hand (no / another handNumber — an old client) /
+  // insurance_already_accepted / insurance_unavailable.
+  const insuranceSessionFor = (tableId: unknown): PlayerSession | undefined => {
+    const main = playerSessions.get(socket.id);
+    if (typeof tableId !== 'string' || !tableId || main?.tableId === tableId) return main;
+    return (multiTableSessions.get(socket.id) || []).find((s) => s && s.tableId === tableId);
+  };
+  socket.on('acceptInsurance', (data: { tableId?: string; handNumber?: number } = {}) => {
+    const refuse = (code: string, message: string): void => {
+      insuranceStats.refused++;
+      socket.emit('error', { message, code });
+    };
+    const session = insuranceSessionFor(data?.tableId);
+    if (!session) { refuse('insurance_not_seated', 'You are not seated at that table.'); return; }
     const table = tableManager.getTable(session.tableId);
-    if (!table) return;
+    if (!table) { refuse('insurance_not_seated', 'You are not seated at that table.'); return; }
+    const handNumber = Number(data?.handNumber);
+    if (!Number.isInteger(handNumber) || handNumber !== table.handNumber) {
+      refuse('insurance_stale_hand', 'That insurance offer is no longer available.');
+      return;
+    }
+    const already = (insuranceCashouts.get(session.tableId) || []).some((c) => c.seatIndex === session.seatIndex && c.handNumber === handNumber);
+    if (already) { refuse('insurance_already_accepted', 'Insurance is already locked in for this hand.'); return; }
+    const quote = insuranceQuoteForSeat(session.tableId, table, session.seatIndex);
+    const offer = insuranceOffers.get(session.tableId);
     const seat = table.seats[session.seatIndex];
-    if (!seat || seat.state !== 'occupied' || !seat.allIn || seat.folded) return;
-    // Community-card game with cards still to come.
-    const vId = String((table as any).config?.variantId || (table as any).variantId || '').toLowerCase();
-    const isCommunity = /holdem|omaha|short|royal/.test(vId) || seat.holeCards.length <= 4;
-    if (!isCommunity || table.communityCards.length >= 5) return;
-    // Exactly one live opponent (heads-up all-in) → total pot === eligible pot.
-    const liveOpponents = table.seats.filter(
-      (s, i) => i !== session.seatIndex && s.state === 'occupied' && !s.folded && !s.eliminated
-    );
-    if (liveOpponents.length !== 1) return;
-    // One cashout per seat per hand.
+    if (!quote || !offer || !seat) { refuse('insurance_unavailable', 'Insurance is not available for this hand.'); return; }
+
     const list = insuranceCashouts.get(session.tableId) || [];
-    if (list.some((c) => c.seatIndex === session.seatIndex)) return;
-
-    const isOmaha = vId.includes('omaha');
-    const equity = calculateEquity(seat.holeCards, table.communityCards, 1, isOmaha); // 0..1
-    const pot = table.getTotalPot();
-    const cashout = insuranceCashoutAmount(pot, equity);
-    if (cashout <= 0) return;
-
     list.push({
       seatIndex: session.seatIndex,
-      playerId: session.playerId,
+      playerId: seat.playerId,
       userId: authSessions.get(socket.id)?.userId,
-      cashout,
+      cashout: quote.cashout,
+      handNumber,
+      equityPct: quote.equityPct,
+      pot: quote.pot,
     });
     insuranceCashouts.set(session.tableId, list);
-    socket.emit('insuranceAccepted', { cashout, equityPct: Math.round(equity * 100) });
+    offer.decided.add(session.seatIndex);
+    insuranceStats.accepted++;
+    auditLog(authSessions.get(socket.id)?.username || seat.playerId, 'INSURANCE_ACCEPTED', {
+      tableId: session.tableId, handNumber, seatIndex: session.seatIndex, cashout: quote.cashout, equityPct: quote.equityPct, pot: quote.pot,
+    });
+    socket.emit('insuranceAccepted', { cashout: quote.cashout, equityPct: quote.equityPct, tableId: session.tableId, handNumber });
+    broadcastGameState(session.tableId); // the quote leaves this seat's state
+    releaseInsuranceHoldIfDecided(session.tableId, handNumber);
+  });
+
+  // Optional (additive to contract #1): the player waved the offer away — his
+  // quote goes, and once every quoted seat has decided the board runs out at
+  // once instead of waiting out the window. Silent on anything invalid.
+  socket.on('declineInsurance', (data: { tableId?: string; handNumber?: number } = {}) => {
+    const session = insuranceSessionFor(data?.tableId);
+    if (!session) return;
+    const table = tableManager.getTable(session.tableId);
+    const handNumber = Number(data?.handNumber);
+    if (!table || !Number.isInteger(handNumber) || handNumber !== table.handNumber) return;
+    const offer = insuranceOffers.get(session.tableId);
+    if (!offer || offer.handNumber !== handNumber || !offer.quotes.has(session.seatIndex) || offer.decided.has(session.seatIndex)) return;
+    offer.decided.add(session.seatIndex);
+    insuranceStats.declined++;
+    broadcastGameState(session.tableId);
+    releaseInsuranceHoldIfDecided(session.tableId, handNumber);
   });
 
   // ========== Straddle ==========

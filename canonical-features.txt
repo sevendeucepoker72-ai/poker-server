@@ -701,3 +701,25 @@ if (!(owed <= 0 && table.playerCheck(session.seatIndex)))
 # round-7 review: one seat, one session (a stale disconnect never acts for a seat another socket plays; tokenLogin's orphan scan skips it).
 otherSessionHoldsSeat
 disconnect_seat_not_his_after_save
+#
+# 2026-10-11 (.online fix round 1, H2) — ECON-1 / TABLEUI-1: all-in insurance
+# is priced against the opponent's ACTUAL cards as a 0..1 fraction (exact with
+# <= 2 board cards to come, seeded Monte Carlo pre-flop), only on cash Hold'em
+# tables, heads-up, betting closed (the runout is HELD for the decision), once
+# per seat per hand; the quote is the per-player `insuranceQuote` key; accept
+# re-validates and settles at exactly the quote; a forfeited seat is void.
+runoutHoldDecider
+insurance_window_open
+insurance_stale_hand
+insurance_already_accepted
+INSURANCE_VOID
+INSURANCE_PREFLOP_SAMPLES
+fastHandScore
+stateObj.insuranceQuote = 
+settleInsuranceForHand(tableId, table, totalWonPerSeat);
+# R1 contract #2 / TOURNEY-1: per-player tableKind + rebuyAllowed (+ minBuyIn);
+# rebuy refused at tournament / quick / challenge tables with a stable code.
+rebuy_not_allowed
+stateObj.tableKind = 
+stateObj.rebuyAllowed = 
+stateObj.minBuyIn = 
