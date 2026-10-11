@@ -961,7 +961,7 @@ describe('index.ts — every play-entry handler is gated before its first side e
     const wl = handlerBody('joinWithWaitlistContext');
     expect(wl).toContain('...(wlBootstrapSession && seatedAuth === wlBootstrapSession');
     expect(wl).toContain('? resumeFieldsFor(lu.id, wlBootstrapSession.masterUserId, lu.token_version, { isAdmin: !!lu.is_admin })');
-    expect(wl).toContain('wlBootstrapSession = { userId: urows[0].id, username: urows[0].username, masterUserId: String(remoteUserId) };');
+    expect(wl).toContain('wlBootstrapSession = { userId: wlRow.id, username: wlRow.username, masterUserId: String(remoteUserId) };');
     // OIDC logins and the password login issue NONE.
     for (const ev of ['oauthLogin', 'tokenLogin', 'login']) expect(handlerBody(ev)).not.toContain('resumeFieldsFor(');
     // The only call sites in the file: the two issuers + the resume refresh

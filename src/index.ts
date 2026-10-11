@@ -55,10 +55,13 @@ import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUs
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus } from './auth/oauthValidator';
 import {
   resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
-  masterIdGuardSql, isRowOwnedByOtherMaster, parseStatsColumn, mergeMasterIdentityStats,
-  resolveIdentityGuardMode, clearMasterIdentityStamp,
-  type LoginFailureCode, type IdentityGuardMode,
+  parseStatsColumn, clearMasterIdentityStamp,
+  type LoginFailureCode,
 } from './auth/loginIdentity';
+// 2026-10-11 (AUTH-1 / AUTH-11) — a master with no local row: a new `m:<sub>`
+// row, or an unowned row only with an attested phone (never by a name).
+import { createOrAdoptMasterRow, masterRowStats } from './auth/masterRow';
+import { accountDisplayName } from './auth/displayName';
 import {
   findLocalUserByMasterId, awaitIdentityGate, releaseIdentityGate, scheduleBootAccountOps, isMergedTombstone,
   withMasterLock, identityStampPatch, MasterLookupError,
@@ -574,66 +577,40 @@ function failLogin(
 }
 
 // ---------------------------------------------------------------------------
-// 2026-08-17 P0 — INTERIM account-takeover / admin-escalation guard
+// 2026-10-11 — AUTH-1 (P0): a sign-in finds its local row by MASTER ID only
 // ---------------------------------------------------------------------------
-// Both OIDC socket-login handlers (`oauthLogin`, `tokenLogin`) resolved the
-// local poker-server row by upserting `ON CONFLICT (LOWER(username))` on a key
-// that, in production, is auth-server's `username` claim — which is
-// `[firstName, lastName].join(' ')`, a NON-UNIQUE human display name the user
-// can freely set on themselves via the master API's `updateUser` (it validates
-// firstName/lastName only as "string, <= 50 chars"; the NAME_BAD_CHARS
-// whitelist runs in signup ONLY). Any player could therefore rename themselves
-// to an admin's display name, sign in to .online, and be bound to that admin's
-// row — inheriting its id, chips, progression and `is_admin=true`, which is
-// exactly what `isUserAdmin()` reads to gate adminGrantChips / adminRestoreBalance
-// / banUser. The benign form of the same bug already happens: two real players
-// named "John Smith" silently share one account.
+// Until 2026-10-11 a sign-in for a master account with no local row UPSERTED
+// `ON CONFLICT (LOWER(username))` on a key taken from the sign-in itself — for
+// oauthLogin / tokenLogin the token's `username` claim, i.e. the display name
+// the player edits freely on americanpub.poker — and got back WHATEVER row
+// already had that username: an UNOWNED row (row 1, the is_admin ADMIN_PHONE
+// seed holding ~2.0B chips, included) was adopted in both guard modes, and in
+// the default WARN mode a row OWNED by another master was bound as well.
 //
-// This helper detects a login that would bind to a conflicting row: one that is
-// neither unowned (legacy) nor already owned by the SAME attested `sub`.
+// The interim warn / enforce guard of 2026-08-17 (ONLINE_IDENTITY_GUARD_ENFORCE)
+// is retired with that statement: nothing is bound by a name any more, so
+// nothing has to be refused for a name either — two people called "John Smith",
+// or one person with two master accounts, simply get two rows.
 //
-// 🚨 IT SHIPS IN WARN MODE (ONLINE_IDENTITY_GUARD_ENFORCE unset ⇒ 'warn').
-// In warn mode the check runs, the conflict is logged in full — both master
-// ids, the local row id, its is_admin — and the login then BINDS AND PROCEEDS
-// exactly as the pre-guard code did. Zero behaviour change for users.
-// In enforce mode the same conflict is refused with `identity_conflict`.
-//
-// Why warn and not enforce, and the exact sequence for flipping it, are
-// documented on `resolveIdentityGuardMode` in src/auth/loginIdentity.ts. The
-// short version: measured exposure today is ZERO admin display-name collisions
-// across all 2,268 live master accounts, while enforcing would permanently lock
-// out 4 known real people who legitimately hold two master accounts each and
-// share a display name between them. Warn mode buys the full colliding-pair
-// list from production logs at no user cost; that list is what makes enforcing
-// safe later.
-//
-// THIS IS NOT THE REAL FIX EITHER WAY. The real fix is a `master_user_id`
-// column on poker-server's `users` table with a UNIQUE index, populated from the
-// attested `sub` and used as the conflict target — so identity never depends on
-// a mutable display string at all. That needs a Railway Postgres schema change
-// plus a backfill of every existing row, which requires Railway access this
-// change did not have. See src/auth/loginIdentity.ts for the ownership
-// predicates and the users.stats TEXT-vs-JSONB note.
-const IDENTITY_GUARD_MODE: IdentityGuardMode =
-  resolveIdentityGuardMode(process.env.ONLINE_IDENTITY_GUARD_ENFORCE);
-/** Conflicts observed since boot — surfaced on /api/health so warn mode is never silent. */
-const identityGuardStats = { conflictsSeen: 0, conflictsRefused: 0, conflictsAllowed: 0 };
+// The rule (auth/masterRow.ts): master-first (accountMerge
+// findLocalUserByMasterId, under withMasterLock); a master with no row gets an
+// existing UNOWNED row only with real proof — a phone the master side attested
+// (here: a phone claim in the signed token) equal to the row's phone-number
+// username, and never an is_admin, GuestNNNN or tombstone row — else a NEW row
+// under the collision-proof key `m:<master id>`. authWithTicket and the waitlist
+// deep link use the same function.
+/** /api/health → identityGuard.mode. */
+const IDENTITY_RESOLUTION_MODE = 'master_id_only';
 
 interface LocalUserUpsertOk {
   ok: true;
   user: any;
-  /**
-   * Whether this login STAMPED the row as its own. False in warn mode when the
-   * row demonstrably belongs to another master account: the login is allowed
-   * through (that is what warn mode means) but must NOT overwrite the existing
-   * owner, or it destroys the very ownership evidence being collected and
-   * starts a stamp ping-pong between the two accounts.
-   */
-  adopted: boolean;
+  /** The master's own row, one created for him now (or by a parallel process), or a phone-proven adoption. */
+  how: 'master' | 'created' | 'found_after_race' | 'adopted_phone';
 }
 interface LocalUserUpsertErr {
   ok: false;
-  code: Extract<LoginFailureCode, 'identity_conflict' | 'user_row_missing' | 'user_upsert_failed'>;
+  code: Extract<LoginFailureCode, 'user_upsert_failed'>;
   /** Exportable — codes and opaque ids only (POSTed to auth_events). */
   detail: Record<string, any>;
   /** stdout-only free text (may quote user-controlled values). */
@@ -641,12 +618,11 @@ interface LocalUserUpsertErr {
 }
 
 type OidcUpsertArgs = {
-  key: string;            // local users.username key (phone claim, else username claim)
   displayName: string;
   sub: string;            // cryptographically-attested master user id
   /** Human display name from the `username` claim. NOT the master's slug. */
   masterDisplayName?: string;
-  /** Real phone number, or undefined. Set only when the phone claim was used. */
+  /** Real phone number from a signed PHONE claim, or undefined. The only adoption proof. */
   masterPhone?: string;
   isAdmin: boolean;
   via: string;            // 'oauthLogin' | 'tokenLogin' — for logs
@@ -662,33 +638,22 @@ async function upsertOidcLocalUser(args: OidcUpsertArgs): Promise<LocalUserUpser
 }
 
 async function upsertOidcLocalUserLocked(args: OidcUpsertArgs): Promise<LocalUserUpsertOk | LocalUserUpsertErr> {
-  const { key, displayName, sub, masterDisplayName, masterPhone, isAdmin, via } = args;
+  const { displayName, sub, masterDisplayName, masterPhone, isAdmin, via } = args;
   // 2026-08-17 P3 — field semantics. `masterUsername` is the master API's unique
   // SLUG and this path never receives it (auth-server's `username` claim is a
-  // display name), so it is NOT written here; writing the display name into it
-  // is what made authWithTicket rewrite the row on every single login. Likewise
-  // `masterPhone` is written only when a real phone claim produced the key.
-  // See MasterIdentityStamp in auth/loginIdentity.ts.
-  const statsJson = JSON.stringify({
-    masterUserId: sub,
-    ...(masterDisplayName ? { masterDisplayName } : {}),
-    ...(masterPhone ? { masterPhone } : {}),
-  });
-  const enforcing = IDENTITY_GUARD_MODE === 'enforce';
+  // display name), so it is NOT written here. `masterPhone` is written only when
+  // a real phone claim was present. See MasterIdentityStamp in auth/loginIdentity.ts.
 
   // 2026-10-10 — ONE PERSON, ONE ROW (auth/accountMerge.ts). A master account
-  // that already has a local row signs in to THAT row. The key below is the
-  // `username` claim — a display name that changes with the master's name and
-  // differs from the ticket path's slug — so keying on it alone gave one
-  // person two or three rows (114 masters / 240 rows on 2026-10-10). Same
-  // grant-only is_admin and COALESCE display_name as the upsert below.
+  // that already has a local row signs in to THAT row. Grant-only is_admin and
+  // a display_name only where there is none.
   let byMaster: any = null;
   try {
     byMaster = await findLocalUserByMasterId(getPool(), String(sub));
   } catch (e: any) {
-    // A lookup that could not be ANSWERED is never "no row": falling through to
-    // the key INSERT below created a second row for an existing person (review
-    // 2026-10-10). Refuse — the client retries.
+    // A lookup that could not be ANSWERED is never "no row": that would create
+    // a second row for an existing person (review 2026-10-10). Refuse — the
+    // client retries.
     return {
       ok: false,
       code: 'user_upsert_failed',
@@ -703,8 +668,9 @@ async function upsertOidcLocalUserLocked(args: OidcUpsertArgs): Promise<LocalUse
         byMaster.is_admin = true;
       }
       if (!byMaster.display_name && displayName) {
-        await getPool().query('UPDATE users SET display_name = $2 WHERE id = $1 AND display_name IS NULL', [byMaster.id, displayName]);
-        byMaster.display_name = displayName;
+        const safeName = accountDisplayName(displayName);
+        await getPool().query('UPDATE users SET display_name = $2 WHERE id = $1 AND display_name IS NULL', [byMaster.id, safeName]);
+        byMaster.display_name = safeName;
       }
       // Atomic merge of ONLY the changed identity keys (mergeUserStats locks the
       // row) — never a whole-stats rewrite from this earlier read.
@@ -721,159 +687,30 @@ async function upsertOidcLocalUserLocked(args: OidcUpsertArgs): Promise<LocalUse
       // Non-fatal: the row is this master's; only the descriptive refresh failed.
       console.warn(`[OAuth] ${via} master-row refresh failed (login continues):`, e?.message);
     }
-    return { ok: true, user: byMaster, adopted: true };
+    return { ok: true, user: byMaster, how: 'master' };
   }
 
-  // Only a master with no row yet reaches the INSERT, so only it pays for the
-  // ~90ms synchronous bcrypt (it ran on EVERY sign-in before 2026-10-10 — the
-  // CPU burst behind the pool timeouts when the identity gate opened).
-  const bcrypt = require('bcryptjs');
-  const placeholderHash = bcrypt.hashSync(`oauth-placeholder-${sub}-${Date.now()}`, 10);
-
-  let rows: any[];
-  try {
-    // 2026-07-05 audit P3 fix: persist is_admin from the master OAuth result so
-    // admins signing in via the primary OIDC flow can actually use admin socket
-    // handlers (isUserAdmin reads users.is_admin). Grant-only (`$5 OR
-    // users.is_admin`) — never revokes an existing admin from this path.
-    //
-    // 2026-08-17 — the `WHERE` on DO UPDATE is the P0 guard, and it is applied
-    // ONLY in enforce mode. When present and unsatisfied, Postgres updates
-    // NOTHING for that row and `RETURNING` yields NO ROW, so we land in the
-    // zero-row branch below and refuse: fail closed, never bind to someone
-    // else's account.
-    //
-    // In WARN mode the clause is omitted, which is byte-for-byte the
-    // pre-guard statement — the ownership check then runs on the RETURNED row
-    // instead (see below). That is sound because `DO UPDATE` here only touches
-    // display_name and is_admin, so `RETURNING *`.stats is the row's
-    // pre-existing stats: exactly the value the SQL guard would have tested.
-    const guard = enforcing ? `WHERE ${masterIdGuardSql('$6')}` : '';
-    // 2026-10-06 P0 — `$6` (sub) is referenced ONLY by the enforce-mode guard.
-    // Postgres refuses a bind that supplies more values than the statement
-    // uses ("bind message supplies 6 parameters, but prepared statement \"\"
-    // requires 5"), so in WARN mode — the live default — EVERY oauthLogin and
-    // OIDC tokenLogin failed with user_upsert_failed from the 2026-08-18 deploy
-    // on (Railway: 0 `oauthLogin ok` vs 654 upsert failures, 09-07..10-07).
-    // The bind list must track the placeholders actually in the statement.
-    const upsertParams: any[] = [String(key), displayName, placeholderHash, statsJson, isAdmin];
-    if (enforcing) upsertParams.push(String(sub));
-    const res = await getPool().query(
-      `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats, is_admin)
-         VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4, $5)
-         ON CONFLICT (LOWER(username)) DO UPDATE
-           SET display_name = COALESCE(users.display_name, $2),
-               is_admin = ($5 OR users.is_admin)
-         ${guard}
-       RETURNING *`,
-      upsertParams
-    );
-    rows = res.rows;
-  } catch (dbErr: any) {
-    console.error(`[OAuth] ${via} user-upsert failed:`, dbErr?.message);
-    if (Sentry) Sentry.captureException(dbErr, { tags: { area: `auth.${via}.upsert` } });
-    return {
-      ok: false,
-      code: 'user_upsert_failed',
-      // Postgres text can quote the offending value ("Key (username)=(Josh
-      // Hall) already exists"), so it is diagnostics, not exportable detail.
-      detail: {},
-      diag: { db_error: String(dbErr?.message || 'unknown').slice(0, 160) },
-    };
+  // AUTH-1 (2026-10-11) — no row for this master yet. The sign-in's name is
+  // NEVER looked up as a username; only a signed phone claim can prove that an
+  // existing unowned row is his (auth/masterRow.ts). Otherwise: a NEW row under
+  // `m:<sub>` (no ~90ms bcrypt any more — the row gets an unusable hash).
+  const created = await createOrAdoptMasterRow({ pool: getPool() }, {
+    masterUserId: String(sub),
+    displayName,
+    stamp: {
+      ...(masterDisplayName ? { masterDisplayName } : {}),
+      ...(masterPhone ? { masterPhone } : {}),
+    },
+    verifiedPhone: masterPhone ?? null,
+    isAdmin,
+    via,
+    defaults: { chips: DEFAULT_CHIPS, level: DEFAULT_LEVEL, xp: DEFAULT_XP },
+  });
+  if (!created.ok) {
+    console.error(`[OAuth] ${via} local row could not be created (sign-in refused, retryable): ${created.diag}`);
+    return { ok: false, code: 'user_upsert_failed', detail: {}, diag: { db_error: created.diag } };
   }
-
-  const user = rows[0];
-  if (user?.id) {
-    // WARN MODE ownership check. The row is already bound at this point — this
-    // decides only whether to (a) record the collision and (b) skip stamping.
-    if (!enforcing && isRowOwnedByOtherMaster(user.stats, sub)) {
-      const ownerId = String(parseStatsColumn(user.stats).masterUserId);
-      identityGuardStats.conflictsSeen++;
-      identityGuardStats.conflictsAllowed++;
-      // Same record enforce mode would log, so the colliding-pair list builds up
-      // identically either way. `key` is a real person's name — stdout only,
-      // never into the exported auth_events detail (see failLogin's PII rule).
-      console.error(
-        `[identity-guard] WARN ${via} IDENTITY CONFLICT (allowed — guard not enforcing). ` +
-          `key=${JSON.stringify(String(key))} localUserId=${user.id} localIsAdmin=${!!user.is_admin} ` +
-          `rowOwnerMasterId=${ownerId} callerMasterId=${sub}`
-      );
-      // Do NOT stamp: the row already belongs to someone else and overwriting
-      // their masterUserId would (a) destroy the ownership evidence this mode
-      // exists to collect and (b) start a stamp ping-pong between the two
-      // accounts, one write per login each.
-      return { ok: true, user, adopted: false };
-    }
-
-    // Adoption stamp. A legacy row with no masterUserId passes the guard
-    // (correctly — it must keep working for existing players), but stays
-    // UNPROTECTED until it is owned. Stamp it so that once enforcement is on,
-    // the next login of anyone else with the same display name is refused.
-    // Merge, never replace: users.stats carries unrelated keys from other
-    // subsystems.
-    try {
-      // 2026-10-10 — atomic patch of the changed identity keys only
-      // (mergeUserStats locks the row), not a whole-stats rewrite.
-      const patch = identityStampPatch(user.stats, {
-        masterUserId: String(sub),
-        ...(masterDisplayName ? { masterDisplayName } : {}),
-        ...(masterPhone ? { masterPhone } : {}),
-      });
-      if (patch) {
-        await mergeUserStats(user.id, patch);
-        user.stats = { ...parseStatsColumn(user.stats), ...patch };
-      }
-    } catch (stampErr: any) {
-      // Non-fatal: the login itself already succeeded and the guard still
-      // protects every ALREADY-owned row. Loud, because an un-stamped row is a
-      // row this defense does not cover yet.
-      console.warn(`[OAuth] ${via} masterUserId stamp failed (row stays unowned):`, stampErr?.message);
-    }
-    return { ok: true, user, adopted: true };
-  }
-
-  // Zero rows. In enforce mode that normally means the guard refused (the
-  // conflicting row belongs to another master account); in warn mode there is
-  // no guard clause, so zero rows means something genuinely strange. Diagnose
-  // so the two codes are never conflated, and log BOTH master ids so the owner
-  // can merge the real duplicates.
-  try {
-    const { rows: existing } = await getPool().query(
-      'SELECT id, username, stats, is_admin FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1',
-      [String(key)]
-    );
-    const row = existing[0];
-    if (row && isRowOwnedByOtherMaster(row.stats, sub)) {
-      const ownerId = String(parseStatsColumn(row.stats).masterUserId);
-      identityGuardStats.conflictsSeen++;
-      identityGuardStats.conflictsRefused++;
-      console.error(
-        `[identity-guard] ENFORCE ${via} IDENTITY CONFLICT — refusing to bind login to another account. ` +
-          `key=${JSON.stringify(String(key))} localUserId=${row.id} localIsAdmin=${!!row.is_admin} ` +
-          `rowOwnerMasterId=${ownerId} callerMasterId=${sub}`
-      );
-      return {
-        ok: false,
-        code: 'identity_conflict',
-        // 2026-08-17 P3 — `conflict_key` (the colliding DISPLAY NAME, i.e. a
-        // real person's name straight from the `username` claim) used to sit
-        // here, in the object that is POSTed to the auth_events table. It is
-        // now stdout-only, above and in `diag`. The opaque ids stay: they are
-        // the whole point of the record and are not personal data.
-        detail: {
-          local_user_id: row.id,
-          row_owner_master_id: ownerId,
-          caller_master_id: String(sub),
-          row_is_admin: !!row.is_admin,
-        },
-        diag: { conflict_key: String(key).slice(0, 120) },
-      };
-    }
-    console.error(`[OAuth] ${via} upsert returned no row and no conflicting owner found. key=${JSON.stringify(String(key))}`);
-  } catch (diagErr: any) {
-    console.warn(`[OAuth] ${via} conflict diagnosis query failed:`, diagErr?.message);
-  }
-  return { ok: false, code: 'user_row_missing', detail: { caller_master_id: String(sub) } };
+  return { ok: true, user: created.user, how: created.how };
 }
 
 // ---------------------------------------------------------------------------
@@ -2431,26 +2268,24 @@ app.get('/api/health', async (_req, res) => {
     // fire at all. `configured:false` (or delivered:0 with failed>0) means the
     // Auth Health dashboard is blind and every number on it is a floor, not a
     // count. Informational only — never 503s this endpoint.
-    // 2026-08-17 P1 — `identityGuard` sits next to authTelemetry so the guard's
-    // mode is never a silent property of the environment. `mode:'warn'` means
-    // conflicts are being COUNTED and ALLOWED, not refused; `conflictsSeen > 0`
-    // in warn mode is the operator's cue that real colliding pairs exist and
-    // must be merged before enforcement can be turned on. `statsColumnType` is
-    // the answer to the TEXT-vs-JSONB question the guard's durability rests on
-    // (see probeStatsColumnType) — anything other than `jsonb` means the
-    // adoption stamp is not trustworthy and enforce must stay off.
+    // `identityGuard` (2026-08-17 P1; 2026-10-11 AUTH-1 retired the warn /
+    // enforce modes): how sign-ins resolve local rows, plus `statsColumnType`,
+    // the answer to the TEXT-vs-JSONB question (see probeStatsColumnType).
     pruneBrokenTournamentTables(); // P8 — brokenTablesRetained counts only entries still retained
     res.json({
       status: 'ok',
       tables: tableManager.getTableList().length,
       authClient: getPreflightStatus(),
       authTelemetry: getAuthTelemetryStatus(),
+      // 2026-10-11 (AUTH-1) — mode 'master_id_only': rows are found by master
+      // id; a master with no row gets a new `m:<sub>` row (created) or, with an
+      // attested phone, an unowned phone row (adoptedByPhone). adoptionRefused
+      // counts phone matches refused (admin / guest / owned / tombstone).
       identityGuard: {
-        mode: IDENTITY_GUARD_MODE,
-        enforcing: IDENTITY_GUARD_MODE === 'enforce',
+        mode: IDENTITY_RESOLUTION_MODE,
         statsColumnType: _statsColumnType,
         stampDurable: _statsColumnType === 'jsonb',
-        ...identityGuardStats,
+        masterRows: { ...masterRowStats, adoptionRefused: { ...masterRowStats.adoptionRefused } },
       },
       // 2026-10-11 (R1 contract #6) — crash safety. Counts only. A climbing
       // socketListeners.handlerErrors / process.unhandledRejections is a bug to
@@ -7704,10 +7539,9 @@ Give feedback in this JSON format:
       // "Authentication failed" — indistinguishable from a genuinely bad token
       // even though the token had already been proven valid three lines
       // earlier. A Railway Postgres blip therefore looked exactly like a
-      // rejected credential, to users AND to triage. It also now carries the P0
-      // identity guard; see upsertOidcLocalUser.
+      // rejected credential, to users AND to triage. AUTH-1 (2026-10-11): the
+      // row is found by MASTER ID only — see upsertOidcLocalUser.
       const upsert = await upsertOidcLocalUser({
-        key: String(phone),
         displayName,
         sub: String(oauthResult.sub),
         // `oauthResult.username` is auth-server's DISPLAY-name claim, not the
@@ -7721,12 +7555,7 @@ Give feedback in this JSON format:
       if (!upsert.ok) {
         failLogin(socket, {
           code: upsert.code,
-          message: upsert.code === 'identity_conflict'
-            // Deliberately vague to the client: naming the other account would
-            // confirm to an attacker that a given display name maps to a real
-            // (possibly admin) row. The server log carries the full detail.
-            ? 'This account could not be matched securely. Please contact support.'
-            : 'We could not load your account just now — please try again.',
+          message: 'We could not load your account just now — please try again.',
           via: 'oauthLogin',
           requestId,
           detail: upsert.detail,
@@ -8028,7 +7857,6 @@ Give feedback in this JSON format:
         // PROCESS EXIT — every seated table on the server dropped. It also read
         // `_tlRows[0].id` with no null guard.
         const _tlUpsert = await upsertOidcLocalUser({
-          key: String(_tlPhone),
           displayName: _tlDisplayName,
           sub: String(oauthResult.sub),
           masterDisplayName: oauthResult.username,
@@ -8040,9 +7868,7 @@ Give feedback in this JSON format:
           socket.emit('tokenLoginResult', { success: false, message: 'Could not load your account' });
           failLogin(socket, {
             code: _tlUpsert.code,
-            message: _tlUpsert.code === 'identity_conflict'
-              ? 'This account could not be matched securely. Please contact support.'
-              : 'We could not load your account just now — please try again.',
+            message: 'We could not load your account just now — please try again.',
             via: 'tokenLogin',
             requestId: tlRequestId,
             detail: _tlUpsert.detail,
@@ -11559,6 +11385,7 @@ Give feedback in this JSON format:
         // created a fresh 50,000-chip row for an existing person).
         let localUser: any = null;
         let masterLookupFailed = false as boolean;
+        let rowCreateFailed = '';
         await withMasterLock(String(remoteUserId), async () => {
           // 3a. Prefer matching by masterUserId — works regardless of whether
           // the row was originally keyed by phone, by username or by display
@@ -11591,8 +11418,9 @@ Give feedback in this JSON format:
               }
               if (!localUser.display_name && displayName) {
                 try {
-                  await getPool().query('UPDATE users SET display_name = COALESCE(display_name, $2) WHERE id = $1', [localUser.id, displayName]);
-                  localUser.display_name = displayName;
+                  const safeName = accountDisplayName(displayName);
+                  await getPool().query('UPDATE users SET display_name = COALESCE(display_name, $2) WHERE id = $1', [localUser.id, safeName]);
+                  localUser.display_name = safeName;
                 } catch { /* non-fatal */ }
               }
             }
@@ -11602,65 +11430,40 @@ Give feedback in this JSON format:
             return;
           }
 
-          // 3b. Fall back to UPSERT by username if no masterUserId match.
-          //
-          // 2026-08-17 P2 — DELIBERATELY LEFT UNGUARDED. Assessed, decided, not
-          // an oversight. The P0 ownership guard covers 2 of the 4 upsert sites
-          // (`oauthLogin` + `tokenLogin`, via upsertOidcLocalUser); this one and
-          // `authManager.syncMasterUser` are the other two, and both stay as-is:
-          //
-          //   • They key on `phone` = `phoneNumber || phone_number || username`
-          //     where `username` is the master API's UNIQUE SLUG (`josh.hall2`),
-          //     not the freely-settable display name. A user cannot rename
-          //     themselves onto another account's slug, so the escalation path
-          //     that motivated the guard does not exist here.
-          //   • The value comes from the master API's /me response for a
-          //     server-verified ticket, not from a client-supplied claim.
-          //   • Adding a fail-closed guard here during a live sign-in outage
-          //     would put a NEW refusal on the deep-link path, which is the
-          //     path a first-time visitor from an SMS lands on. That is a worse
-          //     trade than the (currently unexploitable) hole it would close.
-          //
-          // 2026-10-10 — the "my chips changed when I used the Play Online link"
-          // effect this comment used to accept is fixed: 3a now resolves the
-          // master's ONE row, and the boot merge folded the old split rows
-          // together (auth/accountMerge.ts). Only a master with no row reaches
-          // this INSERT — and only it pays the ~90ms synchronous bcrypt.
+          // 3b. AUTH-1 (2026-10-11) — no row for this master yet. NEVER an
+          // upsert on the slug / phone any more: `ON CONFLICT (LOWER(username))
+          // DO UPDATE … RETURNING *` handed back whatever row had that username,
+          // owned by another master or not (a slug or an unattested phone is no
+          // proof — a master slug is whatever the master API allows). Now: a NEW
+          // `m:<master id>` row, or an existing unowned phone row only when the
+          // master's own record (/me) carries that phone — never an admin, guest
+          // or tombstone row (auth/masterRow.ts). Same lock as 3a; same rule as
+          // oauthLogin / tokenLogin and the waitlist deep link.
           if (!localUser) {
-            const bcrypt = require('bcryptjs');
-            const placeholderHash = bcrypt.hashSync(
-              `ticket-placeholder-${remoteUserId}-${Date.now()}`,
-              10
-            );
-            const { rows } = await getPool().query(
-              `INSERT INTO users (username, display_name, password_hash, chips, level, xp, stats)
-                 VALUES ($1, $2, $3, ${DEFAULT_CHIPS}, ${DEFAULT_LEVEL}, ${DEFAULT_XP}, $4)
-                 ON CONFLICT (LOWER(username)) DO UPDATE
-                   SET display_name = COALESCE(users.display_name, $2)
-               RETURNING *`,
-              [phone, displayName, placeholderHash, JSON.stringify({ masterPhone: phone, masterUsername: masterUser.username, masterUserId: remoteUserId })]
-            );
-            localUser = rows[0];
-            // An EXISTING slug row (ON CONFLICT: the INSERT's stats were not
-            // written) that nobody owns yet is stamped as this master's, so the
-            // next sign-in on either path finds it by master id instead of
-            // creating a second row. A row another master owns is left alone.
-            if (localUser && !isRowOwnedByOtherMaster(localUser.stats, String(remoteUserId))) {
-              const patch = identityStampPatch(localUser.stats, {
-                masterUserId: String(remoteUserId),
+            const attestedPhone = masterUser.phoneNumber || masterUser.phone_number || null;
+            const made = await createOrAdoptMasterRow({ pool: getPool() }, {
+              masterUserId: String(remoteUserId),
+              displayName,
+              stamp: {
                 masterUsername: masterUser.username,
-              });
-              if (patch) {
-                try {
-                  await mergeUserStats(localUser.id, patch);
-                  localUser.stats = { ...parseStatsColumn(localUser.stats), ...patch };
-                } catch { /* non-fatal: the next sign-in retries the stamp */ }
-              }
-            }
+                ...(attestedPhone ? { masterPhone: String(attestedPhone) } : {}),
+              },
+              verifiedPhone: attestedPhone,
+              isAdmin: false,
+              via: 'authWithTicket',
+              defaults: { chips: DEFAULT_CHIPS, level: DEFAULT_LEVEL, xp: DEFAULT_XP },
+            });
+            if (made.ok) localUser = made.user;
+            else rowCreateFailed = made.diag;
           }
         });
         if (masterLookupFailed) {
           failTicket('handler_exception', 'The server is busy right now — please tap Play Online again.');
+          return;
+        }
+        if (!localUser) {
+          console.error(`[authWithTicket] local row could not be created (sign-in refused, retryable): ${rowCreateFailed}`);
+          failTicket('user_upsert_failed', 'We could not load your account just now — please tap Play Online again.', undefined, { db_error: rowCreateFailed });
           return;
         }
 
@@ -12226,43 +12029,61 @@ Give feedback in this JSON format:
             try {
               // 2026-10-10 — master-first (auth/accountMerge.ts): the verified
               // ticket's master account resolves to ITS one local row, exactly as
-              // oauthLogin / authWithTicket do. The phone lookup below is the old
-              // fallback (the public /me no longer returns a phone, so it rarely
-              // matches) for a master that has no stamped row yet.
-              const byMaster = await findLocalUserByMasterId(getPool(), String(remoteUserId));
-              if (byMaster && !authSessions.has(socket.id)) {
-                wlBootstrapSession = { userId: byMaster.id, username: byMaster.username, masterUserId: String(remoteUserId) };
-                releaseSocketForAccountSwitch(socket, byMaster.id, 'joinWithWaitlistContext');
-                authSessions.set(socket.id, wlBootstrapSession);
-              }
-              const meRes = byMaster ? null : await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`, meBypassInit);
-              if (!meRes) {
-                // resolved by master id above
-              } else if (meRes.ok) {
-                const meJson: any = await meRes.json();
-                const masterUser = meJson?.data || meJson;
-                const phone = masterUser.phoneNumber || masterUser.phone_number;
-                if (phone) {
-                  const { rows: urows } = await getPool().query(
-                    'SELECT id, username, stats FROM users WHERE username = $1 LIMIT 1',
-                    [phone]
-                  );
-                  if (urows[0] && isMergedTombstone(urows[0].stats)) urows.length = 0;
-                  if (urows[0] && !authSessions.has(socket.id)) {
-                    // 2026-10-07 — masterUserId = the VERIFIED ticket's user id
-                    // (the same attestation authWithTicket stamps on its session);
-                    // this row was found via that account's own /me.
-                    // P4 (2026-10-10) — only if no sign-in landed on this socket
-                    // during the awaits above (that session is then judged by the
-                    // account check below, never overwritten), and never under a
-                    // seat this account did not buy (releaseSocketForAccountSwitch).
-                    wlBootstrapSession = { userId: urows[0].id, username: urows[0].username, masterUserId: String(remoteUserId) };
-                    releaseSocketForAccountSwitch(socket, urows[0].id, 'joinWithWaitlistContext');
-                    authSessions.set(socket.id, wlBootstrapSession);
-                  }
+              // oauthLogin / authWithTicket do.
+              // 2026-10-11 (AUTH-11) — a FIRST-TIME master (no local row yet) was
+              // refused here ("Authentication could not be established"): the old
+              // fallback only looked a row up by a phone the public /me never
+              // returns, and never created one — and when it did match, it bound
+              // ANY row with that username, another master's included. He now gets
+              // his row the same safe way as authWithTicket (auth/masterRow.ts: a
+              // new `m:<id>` row, or an unowned row only with a /me-attested phone;
+              // never an admin / guest / tombstone row), under the same per-master
+              // lock (the lookup is repeated inside it).
+              let wlRow: any = await findLocalUserByMasterId(getPool(), String(remoteUserId));
+              if (!wlRow) {
+                const meRes = await fetchWithTimeout(`${MASTER_API_BASE}/users/${remoteUserId}/me`, meBypassInit);
+                if (!meRes.ok) {
+                  reportAuthEvent('waitlist_auth_failed', { reason: `me_fetch_http_${meRes.status}` });
+                } else {
+                  const meJson: any = await meRes.json();
+                  const masterUser = meJson?.data || meJson || {};
+                  const attestedPhone = masterUser.phoneNumber || masterUser.phone_number || null;
+                  const wlDisplayName = masterUser.firstName
+                    ? `${masterUser.firstName} ${(masterUser.lastName || '')[0] || ''}.`.trim()
+                    : String(masterUser.username || '');
+                  await withMasterLock(String(remoteUserId), async () => {
+                    wlRow = await findLocalUserByMasterId(getPool(), String(remoteUserId));
+                    if (wlRow) return;
+                    const made = await createOrAdoptMasterRow({ pool: getPool() }, {
+                      masterUserId: String(remoteUserId),
+                      displayName: wlDisplayName,
+                      stamp: {
+                        ...(masterUser.username ? { masterUsername: String(masterUser.username) } : {}),
+                        ...(attestedPhone ? { masterPhone: String(attestedPhone) } : {}),
+                      },
+                      verifiedPhone: attestedPhone,
+                      isAdmin: false,
+                      via: 'joinWithWaitlistContext',
+                      defaults: { chips: DEFAULT_CHIPS, level: DEFAULT_LEVEL, xp: DEFAULT_XP },
+                    });
+                    if (made.ok) wlRow = made.user;
+                    else {
+                      reportAuthEvent('waitlist_auth_failed', { reason: 'row_create_failed' });
+                      console.warn(`[joinWithWaitlistContext] local row could not be created: ${made.diag}`);
+                    }
+                  });
                 }
-              } else {
-                reportAuthEvent('waitlist_auth_failed', { reason: `me_fetch_http_${meRes.status}` });
+              }
+              if (wlRow && !authSessions.has(socket.id)) {
+                // 2026-10-07 — masterUserId = the VERIFIED ticket's user id (the
+                // same attestation authWithTicket stamps on its session).
+                // P4 (2026-10-10) — only if no sign-in landed on this socket
+                // during the awaits above (that session is then judged by the
+                // account check below, never overwritten), and never under a
+                // seat this account did not buy (releaseSocketForAccountSwitch).
+                wlBootstrapSession = { userId: wlRow.id, username: wlRow.username, masterUserId: String(remoteUserId) };
+                releaseSocketForAccountSwitch(socket, wlRow.id, 'joinWithWaitlistContext');
+                authSessions.set(socket.id, wlBootstrapSession);
               }
             } catch (e) {
               reportAuthEvent('waitlist_auth_failed', { reason: 'me_fetch_error' });
@@ -18753,14 +18574,12 @@ initDB().then(async () => {
   // 2026-08-17 — resolve users.stats' real column type once, loudly, and put it
   // on /api/health. Read-only; never throws. See probeStatsColumnType.
   await probeStatsColumnType();
+  // 2026-10-11 (AUTH-1) — the warn / enforce guard is retired: sign-ins resolve
+  // rows by master id only (auth/masterRow.ts). The old env var does nothing.
   console.log(
-    `[identity-guard] mode=${IDENTITY_GUARD_MODE}` +
-      (IDENTITY_GUARD_MODE === 'warn'
-        ? ' (WARN — conflicts are logged and ALLOWED; no login is refused. ' +
-          'Collect `[identity-guard] WARN` lines, merge the real duplicate accounts, ' +
-          'then set ONLINE_IDENTITY_GUARD_ENFORCE=1.)'
-        : ' (ENFORCE — a login that would bind to another master account\'s row is REFUSED ' +
-          'with identity_conflict. Recovery: adminClearIdentityStamp.)')
+    `[identity-guard] mode=${IDENTITY_RESOLUTION_MODE} (rows by master id; a new master gets an m:<id> row; ` +
+      'an unowned row only with a master-attested phone, never an admin / guest / tombstone row)' +
+      (process.env.ONLINE_IDENTITY_GUARD_ENFORCE ? ' — ONLINE_IDENTITY_GUARD_ENFORCE is set and IGNORED' : '')
   );
   try { await initClubTables(); } catch (e) { console.error('[Clubs] initClubTables failed', e); }
   try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }

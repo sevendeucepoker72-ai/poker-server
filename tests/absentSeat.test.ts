@@ -1067,10 +1067,9 @@ describe('P4 — a login that switches a socket to ANOTHER account never inherit
       ["socket.on('tokenLogin'", "releaseSocketForAccountSwitch(socket, userId, 'tokenLogin_legacy');"],
       ["'authWithTicket',", "releaseSocketForAccountSwitch(socket, localUser.id, 'authWithTicket');"],
       ["'resumeSession',", "releaseSocketForAccountSwitch(socket, userId, 'resumeSession');"],
-      // 2026-10-10 — the waitlist bootstrap resolves master-first (one person,
-      // one row: auth/accountMerge.ts), then falls back to the phone lookup.
-      ["'joinWithWaitlistContext',", "releaseSocketForAccountSwitch(socket, byMaster.id, 'joinWithWaitlistContext');"],
-      ["'joinWithWaitlistContext',", "releaseSocketForAccountSwitch(socket, urows[0].id, 'joinWithWaitlistContext');"],
+      // 2026-10-11 (AUTH-11) — the waitlist bootstrap resolves master-first and,
+      // for a first-time master, creates his row (auth/masterRow.ts): ONE bind site.
+      ["'joinWithWaitlistContext',", "releaseSocketForAccountSwitch(socket, wlRow.id, 'joinWithWaitlistContext');"],
     ];
     for (const [handler, call] of sites) {
       const at = SRC.indexOf(handler);

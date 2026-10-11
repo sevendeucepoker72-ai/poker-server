@@ -163,16 +163,26 @@ requestId
 identity_conflict
 masterUserId
 #
-# 🚨 THE GUARD SHIPS IN WARN MODE and the mode switch is itself load-bearing.
-# Enforcing today would permanently lock out 4 KNOWN real humans (production has
-# 4 confirmed duplicate master-account pairs sharing a display name) in order to
-# close a hole with ZERO measured exposure (no admin display-name collision
-# exists across all 2,268 live master accounts). Warn mode runs the identical
-# check and logs the identical record, then binds the row exactly as before.
-# Losing the mode switch — i.e. hard-coding the refusal back in — is a
-# regression, not a hardening. See resolveIdentityGuardMode in
-# src/auth/loginIdentity.ts for the sequence that makes enforcement safe.
-ONLINE_IDENTITY_GUARD_ENFORCE
+# 2026-10-11 (.online R1, AUTH-1) — the warn / enforce mode switch above is
+# RETIRED (ONLINE_IDENTITY_GUARD_ENFORCE removed from this manifest): in WARN
+# mode the upsert bound a renamed attacker to ANOTHER master's row, and in BOTH
+# modes it adopted any UNOWNED row by name — row 1, the is_admin ADMIN_PHONE
+# seed with ~2.0B chips, included. Sign-ins now find rows by MASTER ID only; a
+# master with no row gets a NEW row under the collision-proof key `m:<master
+# id>`, or an existing unowned row only with REAL proof (a master-attested
+# phone equal to its phone-number username; never an is_admin, GuestNNNN or
+# tombstone row). Nothing is bound by a name, so nothing has to be refused for
+# one — the 4 duplicate-master people simply get a second row. Same rule on
+# oauthLogin / tokenLogin, authWithTicket and the waitlist deep link (which
+# also creates the row for a first-time master now, AUTH-11). Pinned by
+# tests/masterRow.test.ts (real upsertOidcLocalUser on a prod-like table + a
+# CONTROL of the old statement). Restore the code, never these lines.
+master_id_only
+createOrAdoptMasterRow
+master_row_created
+phone_adoption_refused
+verifiedPhone: masterPhone ?? null,
+!no-password:
 identity-guard
 # Admin recovery. Its ABSENCE is the main reason enforcement is not safe yet:
 # no other admin handler can clear a stamp, rename a local row, or delete a
@@ -215,10 +225,9 @@ probeStatsColumnType
 # ============================================================
 waitlist_auth_failed
 
-# 2026-10-06 P0 — upsertOidcLocalUser bind values must match the statement's
-# placeholders ($6 exists only in ENFORCE mode). A fixed 6-value array broke
-# every WARN-mode OIDC socket login for 7 weeks (user_upsert_failed).
-upsertParams
+# 2026-10-06 P0 — upsertOidcLocalUser bind values had to match the statement's
+# placeholders ($6 existed only in ENFORCE mode). Token `upsertParams` RETIRED
+# 2026-10-11 with that statement (AUTH-1: sign-ins no longer upsert by name).
 
 # ============================================================
 # 2026-10-07 — PLAY GATE: game suspensions + guest play OFF (src/auth/playGate.ts).
