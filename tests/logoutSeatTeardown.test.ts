@@ -80,6 +80,12 @@ const DISCONNECT_HANDLER = slice('function otherSessionHoldsSeat(', '\n}\n') // 
 const fnSrc = (signature: string): string => slice(signature, '\n}\n');
 const BUST_CHECK = [
   slice('const tournamentBustChecksPending = new Map', ';\n'),
+  // OPS-3 (2026-10-11): runTournamentBustCheck ASSIGNS this module-level `let`
+  // (round 6, one elimination notice). Without its declaration the transpiled
+  // slice assigns an undeclared name — a ReferenceError in the strict-mode
+  // CommonJS that the lockfile's TypeScript 6 emits ("use strict"), so CI failed
+  // here on every push since 2026-10-10 while a stale local TS 5.x passed.
+  slice('let eliminationDirectNotice', ';\n'),
   fnSrc('function captureTournamentBustCheck('),
   fnSrc('function runTournamentBustCheck('),
   fnSrc('function tournamentEntrantHasLiveSeat('),

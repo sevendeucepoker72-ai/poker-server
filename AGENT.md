@@ -32,8 +32,14 @@ railway up --service poker-server
 ```
 
 CI on push/PR runs `npm run lint` (tsc --noEmit) + `npm test` (Jest) +
-`npm run build`. `ship.sh poker-server` adds the cross-service contract
-check on top.
+`npm run build` + the canonical-features.txt grep of `dist/`. There is NO
+`poker-server` target in the workspace `ship.sh` (2026-10-11, OPS-3: this file
+used to claim one) and Railway builds the pushed commit without waiting for CI,
+so a red CI run does not block a deploy — check CI before `railway up`.
+Run `npm ci` before testing locally: CI uses the LOCKFILE's TypeScript (6.x,
+strict "use strict" emit); a stale local node_modules (TS 5.x) hid a red suite
+for four deploys (tests that slice index.ts must declare every module-level
+binding the slice assigns).
 
 ## Hard rules (earned)
 
