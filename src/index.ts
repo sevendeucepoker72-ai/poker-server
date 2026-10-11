@@ -9718,7 +9718,8 @@ Give feedback in this JSON format:
 
   socket.on('getClubInfo', async (data: { clubId: number }) => {
     const auth = authSessions.get(socket.id);
-    const result = await getClubInfo(data.clubId, auth?.userId);
+    // R1 (CLUBS-2) — the join code is in the answer only for an active member (clubManager.getClubInfo).
+    const result = await getClubInfo(Number(data?.clubId), auth?.userId);
     socket.emit('clubInfo', result);
   });
 

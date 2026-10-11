@@ -778,3 +778,7 @@ if (prevVal !== null && prevVal !== undefined)
 # (non-tournament) tables; refused chips_on_table otherwise.
 chips_on_table
 const onTable = chipsOnTablesOfUser(ctx.userId);
+#
+# 2026-10-11 (R1, H2) — CLUBS-2: getClubInfo includes the join code only for an
+# active member (walking SERIAL ids no longer reveals private clubs' codes).
+...(myRole ? { clubCode: club.clubCode } : {}),

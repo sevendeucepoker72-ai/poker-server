@@ -47,7 +47,8 @@ export interface ClubTable {
 
 export interface ClubInfo {
   id: number;
-  clubCode: string;
+  /** The join code. getClubInfo includes it ONLY for an active member (R1, CLUBS-2). */
+  clubCode?: string;
   name: string;
   description: string;
   ownerId: number;
@@ -676,7 +677,12 @@ export async function getClubInfo(
     success: true,
     club: {
       id: club.id,
-      clubCode: club.clubCode,
+      // 2026-10-11 (.online R1, CLUBS-2) — the join code only for an ACTIVE
+      // member (getMemberRole reads active rows only). getClubInfo answers any
+      // signed-in socket for any SERIAL id, so returning it to everyone let
+      // anyone walk the ids and join every PRIVATE club. Public clubs' codes
+      // still come from searchClubs / getFeaturedClubs (isPrivate = false).
+      ...(myRole ? { clubCode: club.clubCode } : {}),
       name: club.name,
       description: club.description,
       ownerId: club.ownerId,
