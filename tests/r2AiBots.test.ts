@@ -128,19 +128,27 @@ describe('GAME-8 — every Stud variant takes the Stud path; the Hold\'em equity
     expect(holdemHoleCards([card(9, 3), card(9, 0), card(4, 2)] as any)).toEqual([card(9, 3), card(9, 0)]);
   });
 
-  it('calculateEquity itself never runs a 7-card Hold\'em hand (CPU) and honours its time budget', () => {
+  it('calculateEquity itself never runs a 7-card Hold\'em hand: it plays the two best cards (same answer, same WORK as that 2-card hand)', () => {
+    // Deterministic (seeded draws, counted) — a wall-clock bound flaked on a loaded box;
+    // the budget itself is pinned by the work-count test below.
     const seven = [card(14, 0), card(13, 0), card(12, 1), card(5, 2), card(4, 3), card(3, 1), card(2, 2)] as any;
-    const t0 = Date.now();
-    for (let i = 0; i < 5; i++) {
-      const eq = TE.calculateEquity(seven, [], 2, false);
-      expect(eq).toBeGreaterThanOrEqual(0);
-      expect(eq).toBeLessThanOrEqual(100);
-    }
-    expect(Date.now() - t0).toBeLessThan(1500);              // 5 x 500 sims of a 2-card hand (was ~1s EACH)
-    const hole = [card(14, 0), card(13, 0), card(12, 1), card(11, 2), card(10, 3), card(9, 1)] as any;
-    const t1 = Date.now();
-    TE.calculateEquity(hole, [card(2, 0), card(7, 1), card(9, 2)] as any, 7, true, 0, false, 5);
-    expect(Date.now() - t1).toBeLessThan(250);                // stops soon after its 5ms budget (>= 64 sims)
+    const kept = TE.keptHoldemHoleCards(seven);
+    expect(kept.map((c: any) => c.rank)).toEqual([14, 13]);
+    const run = (hole: any) => {
+      const restore = seedRandom(21);
+      const seeded = Math.random;
+      let draws = 0;
+      Math.random = () => { draws++; return seeded(); };
+      try {
+        const eq = TE.calculateEquity(hole, [], 2, false);
+        return { eq, draws };
+      } finally { Math.random = seeded; restore(); }
+    };
+    const fromSeven = run(seven);
+    expect(fromSeven).toEqual(run(kept));                     // the 7-card call IS the 2-card call
+    expect(fromSeven.eq).toBeGreaterThanOrEqual(0);
+    expect(fromSeven.eq).toBeLessThanOrEqual(100);
+    expect(fromSeven.draws).toBeGreaterThan(0);
   });
 
   it('bot think time is bounded: a Stud decision is a cheap heuristic (no Monte Carlo — was ~1s of CPU); generous bound for a loaded CI box', () => {

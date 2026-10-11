@@ -1242,13 +1242,16 @@ function processPendingSeatRemovals(tableId: string): void {
  * leaver was deferred), on every extra-table seat, on ghost cleanup — and none
  * of them handed the turn on, so the next bot sat ~30s until its turn clock.
  *
- *   - In a hand IN PROGRESS a seat still holding cards is taken out of it: on
- *     the clock (outside a draw round) by playerFold, else by forceFoldSeat
- *     (a draw round then completes if it was only waiting for him; a hand left
- *     with one player is awarded at once). An ALL-IN seat is never folded: he
- *     has no decision left and keeps his equity — and an accepted all-in
- *     insurance (the runout hold) its settlement (Addendum: a leave during the
- *     insurance window used to forfeit the pot AND void the insurance).
+ *   - In a hand IN PROGRESS a seat still holding cards is taken out of it
+ *     (foldSeatOutOfHand): on the clock (outside a draw round) by playerFold,
+ *     else by forceFoldSeat (a draw round then completes if it was only
+ *     waiting for him; a hand left with one player is awarded at once). An
+ *     ALL-IN seat at a RING table (leaverKeepsAllInHand — his stack is wallet
+ *     chips) is never folded: he has no decision left and keeps his equity —
+ *     and an accepted all-in insurance (the runout hold) its settlement
+ *     (Addendum: a leave during the insurance window used to forfeit the pot
+ *     AND void the insurance). At a tournament / fixed-roster quick table the
+ *     seat torn down is out of the game: its hand is dead even all-in.
  *   - Chips IN THE POT of a live hand (folded or not) → the stand-up waits for
  *     the hand's end (pendingSeatRemovalAfterHand, registered BEFORE any fold —
  *     audit #7: a fold can end the hand synchronously): the pot keeps every
@@ -1262,6 +1265,40 @@ function processPendingSeatRemovals(tableId: string): void {
  */
 type SeatTeardownOutcome = 'deferred' | 'stood_up' | 'none';
 const seatTeardownStats = { deferred: 0, stoodUp: 0, allInKept: 0, foldedOnClock: 0, foldedOutOfTurn: 0, awardedUncontested: 0 };
+
+/**
+ * R2 — does a seat torn down while ALL-IN keep its hand? Only where its stack
+ * is the player's own WALLET chips — a ring game (not a tournament, not a
+ * fixed-roster quick game or club challenge): he is paid what he wins at the
+ * hand's end. Elsewhere the seat torn down is out of the game (a disqualified
+ * or eliminated entrant, a quick-game leaver who concedes): its hand is dead
+ * (TDA), its chips in the pot stay with the players still in it — a pot it
+ * "won" would only leave play with the seat (a tournament stack is never
+ * cashed).
+ */
+function leaverKeepsAllInHand(tableId: string): boolean {
+  return !isTournamentTable(tableId) && !isFixedRosterQuickTable(tableId);
+}
+
+/**
+ * R2 (GAME-15 / GAME-16) — take a seat that still holds cards out of the live
+ * hand: on the clock (outside a draw round) by playerFold (the turn moves on),
+ * else by forceFoldSeat — then a draw round completes if it was only waiting
+ * for him, and a hand left with one player is awarded at once. The caller
+ * schedules the next actor.
+ */
+function foldSeatOutOfHand(table: PokerTable, seatIndex: number): void {
+  if (!DrawPhases.includes(table.currentPhase) && table.activeSeatIndex === seatIndex) {
+    table.playerFold(seatIndex);
+    seatTeardownStats.foldedOnClock++;
+    return;
+  }
+  table.forceFoldSeat(seatIndex);
+  seatTeardownStats.foldedOutOfTurn++;
+  if (table instanceof FiveCardDrawTable) table.completeDrawRoundIfDone();
+  if (table.awardIfUncontested()) seatTeardownStats.awardedUncontested++;
+}
+
 function teardownSeat(
   tableId: string, table: PokerTable, seatIndex: number,
   who: { userId: number; username: string } | null, reason: string,
@@ -1281,16 +1318,10 @@ function teardownSeat(
       : { userId: 0, username: '', noCredit: true, playerId: seat.playerId });
   }
   if (stillInHand) {
-    if (seat.allIn) {
+    if (seat.allIn && leaverKeepsAllInHand(tableId)) {
       seatTeardownStats.allInKept++;
-    } else if (!DrawPhases.includes(table.currentPhase) && table.activeSeatIndex === seatIndex) {
-      table.playerFold(seatIndex);
-      seatTeardownStats.foldedOnClock++;
     } else {
-      table.forceFoldSeat(seatIndex);
-      seatTeardownStats.foldedOutOfTurn++;
-      if (table instanceof FiveCardDrawTable) table.completeDrawRoundIfDone();
-      if (table.awardIfUncontested()) seatTeardownStats.awardedUncontested++;
+      foldSeatOutOfHand(table, seatIndex);
     }
   }
   scheduleAIAction(tableId);
@@ -17379,27 +17410,17 @@ function standUpAdminDisqualifiedAbsentSeat(
   sitOutTracker.get(tableId)?.delete(seatIndex);
   seat.deadBlindOwedChips = 0;
   seat.missedBlind = 'none';
-  // His chips in a LIVE pot stay there until the hand ends (C7): folded now,
-  // stood up by processPendingSeatRemovals — whose creditSeatStackToWallet
-  // never credits a tournament table. Registered BEFORE the fold (#7).
-  const inPot = table.isHandInProgress() && !seat.folded && (seat.totalInvestedThisHand || 0) > 0;
-  if (inPot) {
-    let m = pendingSeatRemovalAfterHand.get(tableId);
-    if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(tableId, m); }
-    m.set(seatIndex, { userId: account.userId, username: account.username || String(account.userId) });
-  }
-  if (table.isHandInProgress()) {
-    if (table.activeSeatIndex === seatIndex) table.playerFold(seatIndex);
-    else if (inPot) table.forceFoldSeat(seatIndex);
-  }
-  if (!inPot && seat.state === 'occupied') {
-    if (seat.chipCount > 0) {
-      auditLog(account.username || String(account.userId), 'TOURNAMENT_STACK_NOT_CASHED', {
-        userId: account.userId, tableId, amount: seat.chipCount, reason: `${via}_away_disqualified`,
-      });
-    }
-    table.standUp(seatIndex);
-  }
+  // R2 (2026-10-11, GAME-15 / GAME-16) — the ONE teardown (teardownSeat, the
+  // same one handlePlayerLeave gives a seated player): his chips in a LIVE pot
+  // — FOLDED or not (a folded seat's chips used to leave the pot with the
+  // immediate stand-up) — stay there until the hand ends (C7; registered
+  // BEFORE any fold — #7); a hand he still holds is dead, all-in included
+  // (leaverKeepsAllInHand: a tournament seat); the next actor goes now (it sat
+  // until its turn clock). His tournament chips are never credited:
+  // creditSeatStackToWallet only audits them (TOURNAMENT_STACK_NOT_CASHED —
+  // reason `<via>_away_disqualified` now, `leave_after_hand` at the hand's end).
+  teardownSeat(tableId, table, seatIndex,
+    { userId: account.userId, username: account.username || String(account.userId) }, `${via}_away_disqualified`);
   syncSitOutToTable(tableId);
   broadcastGameState(tableId);
 }

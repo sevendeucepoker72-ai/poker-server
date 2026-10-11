@@ -27,7 +27,7 @@ const quiet = { log() {}, warn() {}, error() {} };
 const DRAWS = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
 
 /** The teardown helpers + processPendingSeatRemovals + settleInsuranceForHand on one real table. */
-function teardownWorld(mk: () => PokerTable = () => new PokerTable({ tableId: T, tableName: T, smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 } as any)) {
+function teardownWorld(mk: () => PokerTable = () => new PokerTable({ tableId: T, tableName: T, smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 } as any), extraScope: Record<string, unknown> = {}) {
   const table = mk();
   const credits: Array<{ userId: number; chips: number; reason: string }> = [];
   const scheduled: string[] = [];
@@ -46,6 +46,7 @@ function teardownWorld(mk: () => PokerTable = () => new PokerTable({ tableId: T,
     insuranceStats: { settled: 0, voided: 0 }, insuranceSettlementDelta,
     io: { sockets: { sockets: new Map() } },
     DrawPhases: DRAWS, FiveCardDrawTable, GamePhase, MAX_SEATS, console: quiet,
+    ...extraScope,
   };
   const code = fnSrc('function processPendingSeatRemovals(') + SEAT_TEARDOWN_SRC + fnSrc('function settleInsuranceForHand(')
     + fnSrc('function seatPlayedByAnotherAccount(');
@@ -559,5 +560,180 @@ describe('GAME-15 / GAME-16 — the guest-claim pre-step tears seats down throug
     playOut(w.table);
     expect(w.table.currentPhase).toBe(GamePhase.HandComplete);
     expect(w.conserved()).toBe(20000);
+  });
+});
+
+describe('R2 — a seat torn down while ALL-IN keeps its hand only at a ring table (wallet chips)', () => {
+  /** 3-handed, 5000 each; the first actor shoves and is torn down while the other two still have to act. */
+  function shoveThenTeardown(w: ReturnType<typeof teardownWorld>) {
+    for (let i = 0; i < 3; i++) w.table.sitDown(i, `P${i}`, 5000, `p${i}`, false);
+    w.table.startNewHand();
+    const shover = w.table.activeSeatIndex;
+    expect(w.table.playerAllIn(shover)).toBe(true);
+    expect(w.table.seats[shover].allIn).toBe(true);
+    expect(w.m.teardownSeat(T, w.table, shover, { userId: 7, username: 'u7' }, 'admin_kick')).toBe('deferred');
+    return shover;
+  }
+
+  it('a TOURNAMENT seat: its hand is dead (folded) — its 5000 stays in the pot for the players still in it, nothing leaves play with the seat', () => {
+    const w = teardownWorld(undefined, { isTournamentTable: () => true });
+    const shover = shoveThenTeardown(w);
+    expect(w.table.seats[shover].folded).toBe(true);
+    expect(w.m.seatTeardownStats.allInKept).toBe(0);
+    playOut(w.table);
+    expect(w.table.currentPhase).toBe(GamePhase.HandComplete);
+    expect(w.table.seats[shover].state).toBe('empty');
+    expect(w.credited()).toBe(0);
+    expect(w.table.seats.reduce((s, x) => s + (x.state === 'occupied' ? x.chipCount : 0), 0)).toBe(15000);
+  });
+
+  it('a fixed-roster QUICK table seat (the leaver concedes): folded the same way', () => {
+    const w = teardownWorld(undefined, { isFixedRosterQuickTable: () => true });
+    const shover = shoveThenTeardown(w);
+    expect(w.table.seats[shover].folded).toBe(true);
+  });
+
+  it('a RING (cash) seat keeps its all-in hand (Addendum): it is paid what it wins at the hand\'s end', () => {
+    const w = teardownWorld(undefined, { isTournamentTable: () => false, isFixedRosterQuickTable: () => false });
+    const shover = shoveThenTeardown(w);
+    expect(w.table.seats[shover].folded).toBe(false);
+    expect(w.m.seatTeardownStats.allInKept).toBe(1);
+    playOut(w.table);
+    expect(w.table.seats[shover].state).toBe('empty');
+    expect(w.chipsOnTable() + w.credited()).toBe(15000);
+  });
+
+  it('CONTROL — every all-in kept (the first R2 cut): a disqualified tournament seat stayed IN the pot; anything it won would leave play with it', () => {
+    const w = teardownWorld(undefined, { isTournamentTable: () => true });
+    const code = SEAT_TEARDOWN_SRC.replace('if (seat.allIn && leaverKeepsAllInHand(tableId)) {', 'if (seat.allIn) {');
+    expect(code).not.toBe(SEAT_TEARDOWN_SRC);
+    const scope: Record<string, unknown> = {
+      pendingSeatRemovalAfterHand: new Map(), sitOutTracker: new Map(), scheduleAIAction() {}, syncSitOutToTable() {},
+      creditSeatStackToWallet() {}, isTournamentTable: () => true, DrawPhases: DRAWS, FiveCardDrawTable, GamePhase, MAX_SEATS, console: quiet,
+    };
+    const { exports: old } = load(code, scope, '{ teardownSeat }');
+    for (let i = 0; i < 3; i++) w.table.sitDown(i, `P${i}`, 5000, `p${i}`, false);
+    w.table.startNewHand();
+    const shover = w.table.activeSeatIndex;
+    w.table.playerAllIn(shover);
+    expect(old.teardownSeat(T, w.table, shover, { userId: 7, username: 'u7' }, 'admin_kick')).toBe('deferred');
+    expect(w.table.seats[shover].folded).toBe(false);
+  });
+});
+
+describe('GAME-15 / GAME-16 — an admin-disqualified ABSENT tournament seat goes through the ONE teardown', () => {
+  const DQ_CALL = 'teardownSeat(tableId, table, seatIndex,\n    { userId: account.userId, username: account.username || String(account.userId) }, `${via}_away_disqualified`);';
+  const PRE_R2 = [
+    'const inPot = table.isHandInProgress() && !seat.folded && (seat.totalInvestedThisHand || 0) > 0;',
+    'if (inPot) {',
+    '  let m = pendingSeatRemovalAfterHand.get(tableId);',
+    '  if (!m) { m = new Map(); pendingSeatRemovalAfterHand.set(tableId, m); }',
+    '  m.set(seatIndex, { userId: account.userId, username: account.username || String(account.userId) });',
+    '}',
+    'if (table.isHandInProgress()) {',
+    '  if (table.activeSeatIndex === seatIndex) table.playerFold(seatIndex);',
+    '  else if (inPot) table.forceFoldSeat(seatIndex);',
+    '}',
+    "if (!inPot && seat.state === 'occupied') {",
+    '  if (seat.chipCount > 0) {',
+    "    auditLog(account.username || String(account.userId), 'TOURNAMENT_STACK_NOT_CASHED', {",
+    '      userId: account.userId, tableId, amount: seat.chipCount, reason: `${via}_away_disqualified`,',
+    '    });',
+    '  }',
+    '  table.standUp(seatIndex);',
+    '}',
+  ].join('\n');
+  const DQ_SRC = [
+    fnSrc('function standUpAdminDisqualifiedAbsentSeat('),
+    fnSrc('function processPendingSeatRemovals('),
+    fnSrc('function creditSeatStackToWallet('),
+    SEAT_TEARDOWN_SRC,
+  ].join('\n');
+
+  function dqWorld(players: number, code = DQ_SRC) {
+    const table = new PokerTable({ tableId: T, tableName: T, smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 } as any);
+    for (let i = 0; i < players; i++) table.sitDown(i, `P${i}`, 5000, `p${i}`, false);
+    const audits: Array<{ action: string; d: any }> = [];
+    const walletCredits: number[] = [];
+    const scheduled: string[] = [];
+    const scope: Record<string, unknown> = {
+      tableManager: { getTable: (id: string) => (id === T ? table : undefined) },
+      pendingSeatRemovalAfterHand: new Map(), sitOutTracker: new Map(), reservedSeats: new Map(), playerSessions: new Map(),
+      aiProfiles: new Map(), aiTimeouts: new Map(), pendingAutoStartTimers: new Map(),
+      isTournamentTable: () => true, Sentry: null,
+      addChipsToUser: async (_u: number, amount: number) => { walletCredits.push(amount); return true; },
+      auditLog: (_a: string, action: string, d: any) => audits.push({ action, d }),
+      scheduleAIAction: (id: string) => scheduled.push(id), syncSitOutToTable() {}, broadcastGameState() {},
+      DrawPhases: DRAWS, FiveCardDrawTable, GamePhase, MAX_SEATS, console: quiet,
+    };
+    const { exports: m } = load(code, scope, '{ standUpAdminDisqualifiedAbsentSeat, processPendingSeatRemovals }');
+    table.on('handResult', () => m.processPendingSeatRemovals(T));
+    const dq = (seatIndex: number) => m.standUpAdminDisqualifiedAbsentSeat(table, T, seatIndex, { userId: 202, username: 'u202' }, 'admin_ip_ban');
+    const onTable = () => table.seats.reduce((s, x) => s + (x.state === 'occupied' ? x.chipCount + (table.isHandInProgress() ? x.totalInvestedThisHand : 0) : 0), 0);
+    return { table, dq, audits, walletCredits, scheduled, onTable };
+  }
+
+  function foldedSmallBlind(w: ReturnType<typeof dqWorld>) {
+    w.table.startNewHand();
+    const sb = w.table.seats.findIndex((s) => s.currentBet === 25);
+    let g = 0;
+    while (w.table.activeSeatIndex !== sb && g++ < 5) w.table.playerCall(w.table.activeSeatIndex);
+    expect(w.table.playerFold(sb)).toBe(true);
+    return sb;
+  }
+
+  it('a FOLDED seat with chips in the live pot: left for the hand\'s end (the pot keeps its 25); never credited, audited at the end', () => {
+    const w = dqWorld(3);
+    const sb = foldedSmallBlind(w);
+    w.dq(sb);
+    expect(w.table.seats[sb].state).toBe('occupied');
+    playOut(w.table);
+    expect(w.table.seats[sb].state).toBe('empty');
+    expect(w.walletCredits).toEqual([]);
+    expect(w.audits).toEqual([expect.objectContaining({ action: 'TOURNAMENT_STACK_NOT_CASHED', d: expect.objectContaining({ amount: 4975, reason: 'leave_after_hand' }) })]);
+    expect(w.onTable()).toBe(15000 - 4975);                          // only HIS stack left play
+  });
+
+  it('CONTROL — pre-R2 (only a NON-folded seat deferred): the folded seat was stood up at once and its 25 left the pot too', () => {
+    const code = DQ_SRC.replace(DQ_CALL, PRE_R2);
+    expect(code).not.toBe(DQ_SRC);
+    const w = dqWorld(3, code);
+    const sb = foldedSmallBlind(w);
+    w.dq(sb);
+    expect(w.table.seats[sb].state).toBe('empty');
+    playOut(w.table);
+    expect(w.onTable()).toBe(15000 - 4975 - 25);
+  });
+
+  it('a seat ON THE CLOCK: folded, the next actor is scheduled now, stood up at once; audited <via>_away_disqualified, never credited', () => {
+    const w = dqWorld(4);
+    w.table.startNewHand();
+    const utg = w.table.activeSeatIndex;
+    w.dq(utg);
+    expect(w.table.seats[utg].state).toBe('empty');
+    expect(w.table.activeSeatIndex).not.toBe(utg);
+    expect(w.scheduled).toContain(T);
+    expect(w.walletCredits).toEqual([]);
+    expect(w.audits).toEqual([expect.objectContaining({ action: 'TOURNAMENT_STACK_NOT_CASHED', d: expect.objectContaining({ amount: 5000, reason: 'admin_ip_ban_away_disqualified' }) })]);
+  });
+
+  it('CONTROL — pre-R2: the on-the-clock fold never scheduled the next actor (it sat until its turn clock)', () => {
+    const w = dqWorld(4, DQ_SRC.replace(DQ_CALL, PRE_R2));
+    w.table.startNewHand();
+    w.dq(w.table.activeSeatIndex);
+    expect(w.scheduled).toEqual([]);
+  });
+
+  it('an ALL-IN seat: its hand is dead; the 5000 it shoved stays with the players still in the hand (nothing leaves play)', () => {
+    const w = dqWorld(3);
+    w.table.startNewHand();
+    const shover = w.table.activeSeatIndex;
+    expect(w.table.playerAllIn(shover)).toBe(true);
+    w.dq(shover);
+    expect(w.table.seats[shover].folded).toBe(true);
+    playOut(w.table);
+    expect(w.table.seats[shover].state).toBe('empty');
+    expect(w.walletCredits).toEqual([]);
+    expect(w.onTable()).toBe(15000);
   });
 });

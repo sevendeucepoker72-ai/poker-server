@@ -1919,7 +1919,9 @@ describe('Z6 — a leave / disconnect on his own turn CHECKS when a check is fre
     // R2 (2026-10-11): the cash leave tears the seat down through teardownSeat,
     // which folds the seat on its own turn (outside a draw round) — as before.
     expect(P.handlePlayerLeave).toContain('teardownSeat(session.tableId, table, session.seatIndex,');
-    expect(SEAT_TEARDOWN_SRC).toContain('} else if (!DrawPhases.includes(table.currentPhase) && table.activeSeatIndex === seatIndex) {\n      table.playerFold(seatIndex);');
+    // (foldSeatOutOfHand — teardownSeat's fold step, shared with the admin-DQ absent stand-up.)
+    expect(SEAT_TEARDOWN_SRC).toContain('  if (!DrawPhases.includes(table.currentPhase) && table.activeSeatIndex === seatIndex) {\n    table.playerFold(seatIndex);');
+    expect(SEAT_TEARDOWN_SRC).toContain('      foldSeatOutOfHand(table, seatIndex);');
   });
 });
 

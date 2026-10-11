@@ -921,3 +921,11 @@ endCashReservation(
 recordChipVelocity(tableId, table, data.results);
 chip_velocity_alert
 invalid_draw
+
+# 2026-10-11 (.online R2, S2 follow-up) — an all-in seat torn down keeps its
+# hand only at a ring table (wallet chips; a tournament / fixed-roster quick
+# seat's hand is dead); the guest-claim seat cash-out and the admin-DQ absent
+# tournament seat go through the one teardown.
+seat.allIn && leaverKeepsAllInHand(tableId)
+foldSeatOutOfHand(table, seatIndex)
+teardownSeat(tableId, table, seatIndex, null, reason)
