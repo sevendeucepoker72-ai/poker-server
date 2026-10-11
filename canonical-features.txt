@@ -741,3 +741,18 @@ if (!allowBelowMin && (buyIn <= 0 || !Number.isInteger(buyIn)))
 const seasonId = CURRENT_BATTLE_PASS_SEASON;
 .loadBattlePassClaims)(ctx.userId, CURRENT_BATTLE_PASS_SEASON)
 battlePassClaimLimiter.hit(String(ctx.userId))
+#
+# 2026-10-11 (R1, H2) — ECON-3 / AUTH-7 / APPUI-1 / APPUI-14 (P0 PII):
+# users.username (login handles: phone numbers, first.last slugs) is never sent
+# to another player — leaderboard / search / staking / standings / profiles /
+# friends / voice / coach / club views use the public display name (else
+# 'Player'); admin / banned / tombstone rows are never listed; search and the
+# name check need a session and are rate-limited; friend requests by name
+# resolve only an exact, unique display-name match.
+LISTABLE_USER_SQL
+isYou: viewer !== undefined && userId === viewer
+playerSearchLimiter.hit(
+usernameCheckLimiter.hit(
+publicStakingOffers(
+publicTournamentStandings(
+friend_name_ambiguous

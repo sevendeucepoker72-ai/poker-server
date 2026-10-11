@@ -1,4 +1,6 @@
 import { getPool } from '../auth/authManager';
+// 2026-10-11 (R1, ECON-3 / AUTH-7) — club views show the public display name, never users.username.
+import { publicDisplayName } from '../social/publicIdentity';
 
 // ========== Types ==========
 
@@ -468,10 +470,10 @@ async function generateClubCode(): Promise<string> {
 async function getUsername(userId: number): Promise<string> {
   const pool = getPool();
   const user = (await pool.query(
-    'SELECT COALESCE(display_name, username) AS username FROM users WHERE id = $1',
+    'SELECT display_name FROM users WHERE id = $1',
     [userId]
-  )).rows[0] as { username: string } | undefined;
-  return user?.username || 'Unknown';
+  )).rows[0] as { display_name: string | null } | undefined;
+  return user ? publicDisplayName(user.display_name) : 'Unknown';
 }
 
 export async function getMemberRole(clubId: number, userId: number): Promise<string | null> {
@@ -698,7 +700,7 @@ export async function getClubMembers(
 
   const pool = getPool();
   const rows = (await pool.query(
-    `SELECT cm.*, COALESCE(u.display_name, u.username) AS username FROM club_members cm
+    `SELECT cm.*, u.display_name AS display_name FROM club_members cm
      LEFT JOIN users u ON cm.userId = u.id
      WHERE cm.clubId = $1
      ORDER BY
@@ -711,7 +713,7 @@ export async function getClubMembers(
     id: r.id,
     clubId: r.clubid,
     userId: r.userid,
-    username: r.username,
+    username: publicDisplayName(r.display_name),
     role: r.role,
     joinedAt: r.joinedat,
     status: r.status,
@@ -2237,7 +2239,7 @@ export async function getMemberProfile(
 ): Promise<{ success: boolean; error?: string; profile?: MemberProfile }> {
   const pool = getPool();
   const member = (await pool.query(
-    'SELECT cm.role, cm.joinedAt, COALESCE(u.display_name, u.username) AS username FROM club_members cm LEFT JOIN users u ON cm.userId = u.id WHERE cm.clubId = $1 AND cm.userId = $2 AND cm.status = $3',
+    'SELECT cm.role, cm.joinedAt, u.display_name AS display_name FROM club_members cm LEFT JOIN users u ON cm.userId = u.id WHERE cm.clubId = $1 AND cm.userId = $2 AND cm.status = $3',
     [clubId, targetUserId, 'active']
   )).rows[0] as any;
   if (!member) return { success: false, error: 'Member not found' };
@@ -2255,7 +2257,7 @@ export async function getMemberProfile(
   return {
     success: true,
     profile: {
-      username: member.username || 'Unknown',
+      username: publicDisplayName(member.display_name),
       role: member.role,
       joinedAt: member.joinedat,
       handsPlayed,

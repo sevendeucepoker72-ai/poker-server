@@ -47,13 +47,15 @@ import { getFullTrainingData } from './training/TrainingEngine';
 import { insuranceSettlementDelta, priceInsuranceQuote, InsuranceQuote } from './game/insurance';
 import { validateTableConfig, validateChallengeStakes } from './game/tableConfigValidation';
 import { createWindowRateLimiter } from './auth/rateLimit';
+import { publicNameOf, PUBLIC_NAME_FALLBACK, isPublicDisplayName, LISTABLE_USER_SQL } from './social/publicIdentity';
+import { createHash } from 'crypto';
 import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims } from './auth/authManager';
+import { initDB, loginUser, loginUserAsync, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus } from './auth/oauthValidator';
 import {
   resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
@@ -6755,6 +6757,73 @@ const CURRENT_BATTLE_PASS_SEASON = 'season_1_the_river';
 // A full "Claim all" is <= 100 emits (50 tiers x 2 tracks): 110 per minute per account.
 const battlePassClaimLimiter = createWindowRateLimiter(110, 60_000);
 
+// ========== Public names (R1 2026-10-11 — ECON-3 / AUTH-7 / APPUI-1, P0 PII) ==========
+// users.username is a LOGIN handle (phone numbers, first.last slugs) and is
+// never sent to another player: they see the public display name
+// (social/publicIdentity — whitelist-valid, not phone-like, else 'Player').
+const playerSearchLimiter = createWindowRateLimiter(30, 30_000);
+const usernameCheckLimiter = createWindowRateLimiter(20, 60_000);
+const publicNameCache = new Map<number, { name: string; at: number }>();
+const PUBLIC_NAME_CACHE_MS = 60_000;
+/** The public name of a local account (cached 60s; 'Player' when unknown or on a DB error). */
+async function publicNameForUser(userId: number | undefined | null): Promise<string> {
+  if (!userId) return PUBLIC_NAME_FALLBACK;
+  const hit = publicNameCache.get(userId);
+  if (hit && Date.now() - hit.at < PUBLIC_NAME_CACHE_MS) return hit.name;
+  try {
+    const name = (await getPublicNames([userId])).get(userId) ?? PUBLIC_NAME_FALLBACK;
+    if (publicNameCache.size >= 5_000) publicNameCache.clear();
+    publicNameCache.set(userId, { name, at: Date.now() });
+    return name;
+  } catch {
+    return PUBLIC_NAME_FALLBACK;
+  }
+}
+
+/** A staking offer as other players see it: display names, no account ids. */
+async function publicStakingOffers(offers: any[]): Promise<any[]> {
+  const ids: number[] = [];
+  for (const o of offers) {
+    ids.push(Number(o.sellerId));
+    for (const b of Array.isArray(o.backers) ? o.backers : []) ids.push(Number(b?.userId));
+  }
+  let names = new Map<number, string>();
+  try { names = await getPublicNames(ids); } catch { /* every name falls back to 'Player' */ }
+  const nameOf = (id: unknown) => names.get(Number(id)) ?? PUBLIC_NAME_FALLBACK;
+  return offers.map((o) => ({
+    id: o.id,
+    tournamentId: o.tournamentId,
+    totalPct: o.totalPct,
+    pricePerPct: o.pricePerPct,
+    playerName: nameOf(o.sellerId),
+    remaining: o.remaining,
+    backers: (Array.isArray(o.backers) ? o.backers : []).map((b: any) => ({ name: nameOf(b?.userId), pct: Number(b?.pct) || 0 })),
+    createdAt: o.createdAt,
+  }));
+}
+
+/**
+ * Tournament standings as other players see them: names through the public
+ * rules (a qualifier entrant's registration name could be his login handle),
+ * and the entrant ids — a qualifier entrant's id WAS his login handle — as
+ * opaque per-tournament tokens (stable across polls, so the bracket's
+ * elimination diff still works).
+ */
+function publicTournamentStandings(standings: any): any {
+  if (!standings) return standings;
+  const token = (playerId: unknown) => 'e' + createHash('sha256').update(String(standings.tournamentId) + '|' + String(playerId)).digest('hex').slice(0, 12);
+  return {
+    ...standings,
+    eliminationOrder: (Array.isArray(standings.eliminationOrder) ? standings.eliminationOrder : []).map(token),
+    players: (Array.isArray(standings.players) ? standings.players : []).map((p: any) => ({
+      playerId: token(p.playerId),
+      playerName: publicNameOf(p.playerName),
+      chipCount: p.chipCount,
+      finishPosition: p.finishPosition,
+    })),
+  };
+}
+
 function cleanupQuickTable(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (table) {
@@ -7578,10 +7647,22 @@ io.on('connection', (socket: Socket) => {
   });
 
   socket.on('checkUsername', async (data: { username: string }) => {
-    const name = (data.username || '').trim();
-    if (name.length < 2) { socket.emit('checkUsernameResult', { available: null, username: name }); return; }
-    const taken = await isUsernameTaken(name);
-    socket.emit('checkUsernameResult', { available: !taken, username: name });
+    // R1 (AUTH-7) — this answered "is this LOGIN HANDLE taken?" for anyone:
+    // an oracle for which phone numbers have accounts. Now: signed-in players
+    // only, rate-limited, and it answers what a name picker needs — is this
+    // DISPLAY NAME free (the same case-insensitive rule setDisplayName
+    // enforces; the caller's own name counts as free). No client called it.
+    const auth = authSessions.get(socket.id);
+    const name = (typeof data?.username === 'string' ? data.username : '').trim().slice(0, 40);
+    if (!auth?.userId) { socket.emit('checkUsernameResult', { available: null, username: name, error: 'login_required' }); return; }
+    if (!usernameCheckLimiter.hit(String(auth.userId))) { socket.emit('checkUsernameResult', { available: null, username: name, error: 'rate_limited' }); return; }
+    if (!isPublicDisplayName(name)) { socket.emit('checkUsernameResult', { available: null, username: name }); return; }
+    try {
+      const holders = await findUsersByDisplayName(name, 2);
+      socket.emit('checkUsernameResult', { available: holders.every((h) => h.id === auth.userId), username: name });
+    } catch {
+      socket.emit('checkUsernameResult', { available: null, username: name });
+    }
   });
 
   // ========== LLM Post-Hand Coach ==========
@@ -7665,8 +7746,9 @@ Give feedback in this JSON format:
     if (!data?.tableId || !isSeatedAt(data.tableId)) { socket.emit('error', { message: 'Not seated at table' }); return; }
     const room = `voice_${data.tableId}`;
     socket.join(room);
-    // Use the authenticated username, not the one the client sent.
-    socket.to(room).emit('voicePeerJoined', { socketId: socket.id, username: auth.username });
+    // The authenticated account's PUBLIC name (R1 — never the login handle,
+    // never the one the client sent).
+    socket.to(room).emit('voicePeerJoined', { socketId: socket.id, username: await publicNameForUser(auth.userId) });
   });
   socket.on('voiceLeave', async (data: { tableId: string }) => {
     if (!authSessions.get(socket.id)) return;
@@ -7677,7 +7759,7 @@ Give feedback in this JSON format:
   socket.on('voiceOffer', async (data: { to: string; offer: any; username: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth || !data?.to) return;
-    io.to(data.to).emit('voiceOffer', { from: socket.id, offer: data.offer, username: auth.username });
+    io.to(data.to).emit('voiceOffer', { from: socket.id, offer: data.offer, username: await publicNameForUser(auth.userId) });
   });
   socket.on('voiceAnswer', async (data: { to: string; answer: any }) => {
     if (!authSessions.get(socket.id) || !data?.to) return;
@@ -7752,7 +7834,7 @@ Give feedback in this JSON format:
       );
       stakingOffers.set(id, offer);
       auditLog(auth.username, 'STAKING_OFFER_CREATED', { offerId: id, tournamentId: offer.tournamentId, totalPct: offer.totalPct, pricePerPct: offer.pricePerPct });
-      io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
+      io.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
       socket.emit('stakeCreated', { id });
     } catch (e: any) {
       console.error('[Staking] createStake DB error:', e.message);
@@ -7841,7 +7923,7 @@ Give feedback in this JSON format:
       if (settled) stakingOffers.delete(data.offerId);
 
       auditLog(auth.username, 'STAKING_BUY', { offerId: data.offerId, pct: data.pct, totalCost, sellerId: offer.sellerId });
-      io.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
+      io.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
       replyBuyStake({ success: true });
     } catch (e: any) {
       await client.query('ROLLBACK').catch(() => {});
@@ -7853,7 +7935,7 @@ Give feedback in this JSON format:
   });
 
   socket.on('getStakes', async () => {
-    socket.emit('stakingUpdated', { offers: Array.from(stakingOffers.values()) });
+    socket.emit('stakingUpdated', { offers: await publicStakingOffers(Array.from(stakingOffers.values())) });   // R1 — display names, no ids
   });
 
   // OAuth2 login: validate access token from auth server.
@@ -8760,7 +8842,14 @@ Give feedback in this JSON format:
     try {
       const period = data?.period || 'alltime';
       const entries = await getLeaderboard(50, period);
-      socket.emit('leaderboardData', { period, entries });
+      // R1 (ECON-3) — public display names only (no admin / banned /
+      // tombstone rows), and the viewer's own row flagged by the server
+      // (`isYou`) instead of shipping account ids.
+      const viewer = authSessions.get(socket.id)?.userId;
+      socket.emit('leaderboardData', {
+        period,
+        entries: entries.map(({ userId, ...e }) => ({ ...e, isYou: viewer !== undefined && userId === viewer })),
+      });
     } catch {
       socket.emit('leaderboardData', { period: data?.period || 'alltime', entries: [] });
     }
@@ -8768,9 +8857,16 @@ Give feedback in this JSON format:
 
   socket.on('searchPlayers', async (data: { query: string }) => {
     try {
-      const q = (data?.query || '').trim();
+      // R1 (ECON-3 / APPUI-1) — signed-in players only, rate-limited per
+      // account, on the DISPLAY NAME; results carry a name and a level only
+      // (no username, no chips, no account id — `id` is a list key).
+      const auth = authSessions.get(socket.id);
+      if (!auth?.userId) { socket.emit('playerSearchResults', { results: [], error: 'login_required' }); return; }
+      if (!playerSearchLimiter.hit(String(auth.userId))) { socket.emit('playerSearchResults', { results: [], error: 'rate_limited' }); return; }
+      const q = (typeof data?.query === 'string' ? data.query : '').trim().slice(0, 20);
       if (q.length < 2) { socket.emit('playerSearchResults', { results: [] }); return; }
-      socket.emit('playerSearchResults', { results: await searchUsers(q) });
+      const rows = await searchUsers(q, 10);
+      socket.emit('playerSearchResults', { results: rows.map((r, i) => ({ id: `r${i}`, username: r.displayName, displayName: r.displayName, level: r.level })) });
     } catch {
       socket.emit('playerSearchResults', { results: [] });
     }
@@ -9392,7 +9488,9 @@ Give feedback in this JSON format:
         socket.emit('seasonLeaderboardAwarded', { success: false, error: 'already_awarded', seasonKey });
         return;
       }
-      const { rows } = await client.query('SELECT id, username, chips FROM users WHERE banned = FALSE ORDER BY chips DESC LIMIT 3');
+      // R1 (ECON-3 / ECON-11) — ranked like the leaderboard it advertises:
+      // never an admin, banned, tombstone or retired guest row.
+      const { rows } = await client.query(`SELECT id, display_name, chips FROM users WHERE ${LISTABLE_USER_SQL} ORDER BY chips DESC LIMIT 3`);
       const results: any[] = [];
       for (let i = 0; i < rows.length && i < REWARDS.length; i++) {
         const u = rows[i];
@@ -9406,7 +9504,7 @@ Give feedback in this JSON format:
           `INSERT INTO user_inventory (user_id, item_type, item_id) VALUES ($1,'badge',$2) ON CONFLICT (user_id, item_type, item_id) DO NOTHING`,
           [u.id, rw.badge]
         );
-        results.push({ username: u.username, place: rw.place, chips: rw.chips, badge: rw.badge });
+        results.push({ userId: u.id, displayName: publicNameOf(u.display_name), place: rw.place, chips: rw.chips, badge: rw.badge });
       }
       await client.query('COMMIT');
       // Audit AFTER commit — the movements are now durable.
@@ -9539,8 +9637,9 @@ Give feedback in this JSON format:
     if (result.success) {
       socket.emit('clubJoined', result);
       if (result.club && result.status === 'active') {
-        await addActivity(result.club.id, 'member_join', { username: auth.username });
-        await sendClubMessage(result.club.id, auth.userId, auth.username, `${auth.username} joined the club`, 'system');
+        const joinerName = await publicNameForUser(auth.userId);   // R1 — never the login handle
+        await addActivity(result.club.id, 'member_join', { username: joinerName });
+        await sendClubMessage(result.club.id, auth.userId, joinerName, `${joinerName} joined the club`, 'system');
       }
     } else {
       socket.emit('error', { message: result.error });
@@ -9553,8 +9652,9 @@ Give feedback in this JSON format:
     const result = await leaveClub(auth.userId, data.clubId);
     if (result.success) {
       socket.emit('clubLeft', { clubId: data.clubId });
-      await addActivity(data.clubId, 'member_leave', { username: auth.username });
-      await sendClubMessage(data.clubId, auth.userId, auth.username, `${auth.username} left the club`, 'system');
+      const leaverName = await publicNameForUser(auth.userId);   // R1 — never the login handle
+      await addActivity(data.clubId, 'member_leave', { username: leaverName });
+      await sendClubMessage(data.clubId, auth.userId, leaverName, `${leaverName} left the club`, 'system');
     } else {
       socket.emit('error', { message: result.error });
     }
@@ -9761,11 +9861,12 @@ Give feedback in this JSON format:
     if (!msgText) { socket.emit('error', { message: 'Empty message' }); return; }
 
     const msgType = data.type || 'chat';
-    const result = await sendClubMessage(data.clubId, auth.userId, auth.username, msgText, msgType);
+    const senderName = await publicNameForUser(auth.userId);   // R1 — never the login handle
+    const result = await sendClubMessage(data.clubId, auth.userId, senderName, msgText, msgType);
     if (result.success && result.message) {
       io.to(`club:${data.clubId}`).emit('clubMessage', result.message);
       if (msgType === 'announcement') {
-        await addActivity(data.clubId, 'announcement', { username: auth.username, message: data.message });
+        await addActivity(data.clubId, 'announcement', { username: senderName, message: data.message });
       }
     } else {
       socket.emit('error', { message: result.error });
@@ -13463,18 +13564,29 @@ Give feedback in this JSON format:
     const auth = authSessions.get(socket.id);
     if (!auth?.userId) return;
     try {
-      let targetId = data?.userId;
-      if (!targetId && data?.name) {
-        const q = String(data.name).trim();
-        const matches = await searchUsers(q, 5);
-        const exact = matches.find(m => m.username.toLowerCase() === q.toLowerCase()) || matches[0];
-        targetId = exact?.id;
+      // R1 (APPUI-14) — a name resolves only to an EXACT (case-insensitive)
+      // display-name match of ONE listable account: never the first partial
+      // LIKE match of a login handle (which friended a stranger). FriendSystem
+      // sends {name} (what the player typed); {userId} (a friends-list row) is
+      // checked to be a real, listable account.
+      let targetId: number | undefined;
+      if (data?.userId !== undefined && data?.userId !== null) {
+        const n = Number(data.userId);
+        if (Number.isInteger(n) && n > 0 && (await getPublicNames([n])).has(n)) targetId = n;
+      } else if (typeof data?.name === 'string' && data.name.trim()) {
+        const matches = await findUsersByDisplayName(data.name.trim(), 2);
+        if (matches.length > 1) {
+          socket.emit('friendError', { message: 'More than one player uses that name — add them from their profile or a table instead.', code: 'friend_name_ambiguous' });
+          return;
+        }
+        targetId = matches[0]?.id;
       }
-      if (!targetId) { socket.emit('friendError', { message: 'Player not found' }); return; }
+      if (!targetId) { socket.emit('friendError', { message: 'Player not found', code: 'friend_not_found' }); return; }
       const res = await sendFriendRequest(auth.userId, targetId);
       if (!res.ok) { socket.emit('friendError', { message: res.error || 'Failed' }); return; }
       socket.emit('friendRequestSent', { status: res.status });
-      for (const [sid, a] of authSessions) if (a?.userId === targetId) io.to(sid).emit('friendRequestReceived', { from: auth.username });
+      const fromName = await publicNameForUser(auth.userId);   // R1 — never the login handle
+      for (const [sid, a] of authSessions) if (a?.userId === targetId) io.to(sid).emit('friendRequestReceived', { from: fromName });
     } catch (e) { socket.emit('friendError', { message: 'Failed to send request' }); }
   });
   socket.on('acceptFriendRequest', async (data: { userId: number }) => {
@@ -13493,7 +13605,8 @@ Give feedback in this JSON format:
   socket.on('inviteFriendToTable', async (data: { userId: number; tableId?: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth?.userId || !data?.userId) return;
-    for (const [sid, a] of authSessions) if (a?.userId === data.userId) io.to(sid).emit('tableInvite', { from: auth.username, tableId: data.tableId || null });
+    const inviterName = await publicNameForUser(auth.userId);   // R1 — never the login handle
+    for (const [sid, a] of authSessions) if (a?.userId === data.userId) io.to(sid).emit('tableInvite', { from: inviterName, tableId: data.tableId || null });
     socket.emit('friendInviteSent', { userId: data.userId });
   });
 
@@ -14800,7 +14913,11 @@ Give feedback in this JSON format:
   // in) and returns only non-PII profile fields (no chips/email/phone).
   socket.on('requestProfile', async (data: { username: string }) => {
     if (!authSessions.get(socket.id)) return; // signed-in viewers only
-    const uname = String(data?.username || '').trim();
+    // R1 (APPUI-14 / AUTH-7) — `username` is the NAME the viewer clicked (a
+    // seat / leaderboard name): it is looked up as an exact DISPLAY NAME
+    // (case-insensitive, listable rows), echoed back as `username` (the
+    // client matches on it) — never a login handle.
+    const uname = String(data?.username || '').trim().slice(0, 40);
     if (!uname) return;
     const emptyProfile = {
       username: uname, level: 1, elo: 500, wins: 0, losses: 0, totalHands: 0,
@@ -14808,10 +14925,10 @@ Give feedback in this JSON format:
       unlockedAchievements: [] as string[], sessionHistory: null, handHistory: [] as any[],
     };
     try {
-      const { rows } = await getPool().query(
-        `SELECT username, level, stats, achievements FROM users WHERE LOWER(username) = LOWER($1) LIMIT 1`,
-        [uname]
-      );
+      const match = isPublicDisplayName(uname) ? (await findUsersByDisplayName(uname, 1))[0] : undefined;
+      const { rows } = match
+        ? await getPool().query(`SELECT level, stats, achievements FROM users WHERE id = $1`, [match.id])
+        : { rows: [] as any[] };
       if (rows.length === 0) { socket.emit('profileData', { ...emptyProfile, notFound: true }); return; }
       const u = rows[0];
       let stats: any = {};
@@ -14821,7 +14938,8 @@ Give feedback in this JSON format:
       const totalHands = stats.handsPlayed || stats.totalHandsPlayed || 0;
       const wins = stats.handsWon || 0;
       socket.emit('profileData', {
-        username: u.username,
+        username: uname,
+        displayName: match!.displayName,
         level: u.level || 1,
         elo: stats.elo || 500,
         wins,
@@ -14859,7 +14977,7 @@ Give feedback in this JSON format:
       const running = (tournamentManager.getTournamentList() as any[]).find((t) => t.status === 'running');
       tid = running?.tournamentId;
     }
-    socket.emit('tournamentStandings', tid ? tournamentManager.getTournamentStandings(tid, tableManager) : null);
+    socket.emit('tournamentStandings', tid ? publicTournamentStandings(tournamentManager.getTournamentStandings(tid, tableManager)) : null);   // R1 — public names, opaque ids
   });
 
   socket.on('registerTournament', async (data: { tournamentId: string; playerName: string }) => {
@@ -15573,7 +15691,9 @@ Give feedback in this JSON format:
     if (data.targetSocketId === socket.id) return;
     io.to(data.targetSocketId).emit('coachWhisper', {
       message: data.message,
-      coachName: data.coachName || auth.username,
+      // R1 — the coach's public name (the client's coachName was spoofable,
+      // the fallback was the login handle).
+      coachName: await publicNameForUser(auth.userId),
     });
   });
 

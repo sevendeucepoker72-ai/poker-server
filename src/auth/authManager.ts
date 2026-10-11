@@ -7,6 +7,8 @@ import crypto from 'crypto';
 // in index.ts — /api/health reports the answer). Using it instead of a bare
 // JSON.parse is what stops mergeUserStats from silently wiping the column.
 import { parseStatsColumn, masterIdGuardSql } from './loginIdentity';
+// 2026-10-11 (R1, ECON-3) — what other players may see of an account.
+import { publicDisplayName, isPublicDisplayName, escapeLikePattern, LISTABLE_USER_SQL } from '../social/publicIdentity';
 
 // JWT secret. H1 (2026-07-01 audit): the old guard keyed the fatal check on
 // NODE_ENV==='production' ONLY, but Railway uses nixpacks and does NOT set
@@ -1132,11 +1134,23 @@ export async function mergeUserStats(userId: number, patch: Record<string, any>)
 }
 
 export interface LeaderboardEntry {
-  rank: number; username: string; chips: number; level: number;
+  /**
+   * 2026-10-11 (R1, ECON-3) — the PUBLIC display name (social/publicIdentity),
+   * never users.username (phone numbers / first.last slugs). Kept under the
+   * key `username` because that is what poker-3d's leaderboards render.
+   */
+  rank: number; username: string; displayName: string; chips: number; level: number;
   handsPlayed: number; handsWon: number; winRate: number; biggestPot: number;
+  /** INTERNAL — the socket handler turns it into the viewer's `isYou` and drops it. */
+  userId: number;
 }
 
-export async function getLeaderboard(limit = 50, period = 'alltime'): Promise<LeaderboardEntry[]> {
+/** Read-only query surface (R1: lets the public-name readers run against a test double). */
+export interface RowQueryable {
+  query(text: string, params?: unknown[]): Promise<{ rows: any[] }>;
+}
+
+export async function getLeaderboard(limit = 50, period = 'alltime', db?: RowQueryable): Promise<LeaderboardEntry[]> {
   const now = Date.now();
   let cutoff = 0;
   if (period === 'daily') cutoff = now - 86400000;
@@ -1147,21 +1161,24 @@ export async function getLeaderboard(limit = 50, period = 'alltime'): Promise<Le
   // window and re-rank within it. Capping at top-N by chips before filtering would silently
   // exclude active players who happen to sit outside the chip-count top-N.
   const fetchLimit = cutoff > 0 ? 5000 : limit;
-  const { rows } = await pool.query(
-    'SELECT username, chips, level, stats FROM users WHERE banned = FALSE ORDER BY chips DESC LIMIT $1',
+  // R1 (ECON-3) — never an admin row (the seed admin sat at #1 with ~2B
+  // chips), a banned row, an account-merge tombstone or a retired guest row;
+  // the display name only (else 'Player').
+  const { rows } = await (db || pool).query(
+    `SELECT id, display_name, chips, level, stats FROM users WHERE ${LISTABLE_USER_SQL} ORDER BY chips DESC LIMIT $1`,
     [fetchLimit]
   );
 
   const candidates: LeaderboardEntry[] = [];
   for (const row of rows) {
-    let stats: Record<string, any> = {};
-    try { stats = JSON.parse(row.stats || '{}'); } catch { /* ignore */ }
+    const stats: Record<string, any> = parseStatsColumn(row.stats);
     if (cutoff > 0 && (stats.lastHandAt || 0) < cutoff) continue;
     const handsPlayed = stats.handsPlayed || stats.totalHandsPlayed || 0;
     const handsWon = stats.handsWon || 0;
-    candidates.push({ rank: 0, username: row.username, chips: row.chips, level: row.level,
+    const name = publicDisplayName(row.display_name);
+    candidates.push({ rank: 0, username: name, displayName: name, chips: row.chips, level: row.level,
       handsPlayed, handsWon, winRate: handsPlayed > 0 ? Math.round((handsWon / handsPlayed) * 1000) / 10 : 0,
-      biggestPot: stats.biggestPot || 0 });
+      biggestPot: stats.biggestPot || 0, userId: Number(row.id) });
   }
 
   // Re-sort by chips within the filtered window, then assign ranks
@@ -1169,9 +1186,50 @@ export async function getLeaderboard(limit = 50, period = 'alltime'): Promise<Le
   return candidates.slice(0, limit).map((e, i) => ({ ...e, rank: i + 1 }));
 }
 
-export async function searchUsers(query: string, limit = 10): Promise<Array<{ id: number; username: string; chips: number; level: number }>> {
-  const { rows } = await pool.query('SELECT id, username, chips, level FROM users WHERE banned = FALSE AND LOWER(username) LIKE $1 LIMIT $2', [`%${query.toLowerCase()}%`, limit]);
-  return rows;
+/**
+ * 2026-10-11 (R1, ECON-3 / APPUI-1) — player search on the DISPLAY NAME (it
+ * used to LIKE-match users.username and return id, username — phone numbers
+ * — and the wallet balance). Only listable rows whose display name is shown
+ * as itself; LIKE wildcards in the query are escaped. No chips, no username.
+ */
+export async function searchUsers(query: string, limit = 10, db?: RowQueryable): Promise<Array<{ id: number; displayName: string; level: number }>> {
+  const q = String(query || '').trim().toLowerCase();
+  if (q.length < 2) return [];
+  const { rows } = await (db || pool).query(
+    `SELECT id, display_name, level FROM users
+      WHERE ${LISTABLE_USER_SQL} AND display_name IS NOT NULL AND LOWER(display_name) LIKE $1 ESCAPE '\\'
+      ORDER BY LOWER(display_name) LIMIT $2`,
+    [`%${escapeLikePattern(q)}%`, Math.max(1, Math.min(25, limit * 2))]
+  );
+  return rows
+    .filter((r: any) => isPublicDisplayName(r.display_name))
+    .slice(0, limit)
+    .map((r: any) => ({ id: Number(r.id), displayName: String(r.display_name).trim(), level: Number(r.level) || 1 }));
+}
+
+/**
+ * 2026-10-11 (R1, APPUI-14) — the accounts whose display name is EXACTLY
+ * `name` (case-insensitive, listable rows only; at most `limit`). A friend
+ * request by name resolves only when this returns exactly one.
+ */
+export async function findUsersByDisplayName(name: string, limit = 2, db?: RowQueryable): Promise<Array<{ id: number; displayName: string }>> {
+  const n = String(name || '').trim();
+  if (!isPublicDisplayName(n)) return [];
+  const { rows } = await (db || pool).query(
+    `SELECT id, display_name FROM users WHERE ${LISTABLE_USER_SQL} AND LOWER(TRIM(display_name)) = LOWER($1) ORDER BY id LIMIT $2`,
+    [n, Math.max(1, limit)]
+  );
+  return rows.map((r: any) => ({ id: Number(r.id), displayName: String(r.display_name).trim() }));
+}
+
+/** 2026-10-11 (R1) — public names (publicDisplayName) of local user ids; unknown ids are absent. */
+export async function getPublicNames(userIds: number[], db?: RowQueryable): Promise<Map<number, string>> {
+  const ids = [...new Set(userIds.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  const out = new Map<number, string>();
+  if (ids.length === 0) return out;
+  const { rows } = await (db || pool).query('SELECT id, display_name FROM users WHERE id = ANY($1::int[])', [ids]);
+  for (const r of rows) out.set(Number(r.id), publicDisplayName(r.display_name));
+  return out;
 }
 
 // =============================================================================
