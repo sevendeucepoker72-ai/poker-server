@@ -1235,3 +1235,7 @@ function seatBoughtInBy(
 stale_session_ended_at_removed_seat
 bigint_migration_waiting_for_previous_instance
 economy: {
+
+# 2026-10-12 owner "loosen for pubs": 25 connections per address; same network at one table = admin alert, not a refusal; no per-network qualifier cap.
+same_network_same_table
+sameNetworkSeats

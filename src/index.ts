@@ -1072,9 +1072,28 @@ const lastChatTime = new Map<string, number>();
 const tokenLoginAttempts = new Map<string, { attempts: number; firstAt: number }>();
 // Per-IP connection tracking: ip -> Set of socketIds
 const ipConnections = new Map<string, Set<string>>();
-const MAX_CONNECTIONS_PER_IP = 5;
-// Per-IP seated players: ip -> Set of tableId:seatIndex strings (collusion detection)
+// 2026-10-12 (owner: "loosen for pubs") — 25, a flood guard only: since R2 the
+// key is the REAL client address, and a pub's Wi-Fi (or a carrier's shared
+// IP) puts many real players behind one address; 5 refused the 6th device.
+const MAX_CONNECTIONS_PER_IP = 25;
+// Per-IP seated players: ip -> Set of socketId:tableId strings. 2026-10-12
+// (owner): two players from one network at one table is an ADMIN ALERT
+// (sameNetworkSeats, adminStats + /api/health), never a refusal — friends at
+// the same pub sit together.
 const ipSeatedSlots = new Map<string, Set<string>>();
+const SAME_NETWORK_LOG_MAX = 25;
+const sameNetworkSeats: Array<{ at: string; tableId: string; tableName: string; seatedFromNetwork: number; names: string[] }> = [];
+const networkStats = { sameNetworkSameTable: 0 };
+/** 2026-10-12 — record (and log, counts only) two+ accounts from one network seated at one table. */
+function noteSameNetworkSeat(tableId: string, table: { config?: { tableName?: string } } | undefined, joinerName: string, otherSocketIds: string[], joinerUserId?: number): void {
+  networkStats.sameNetworkSameTable++;
+  const names = [...otherSocketIds.map((sid) => playerSessions.get(sid)?.playerName).filter(Boolean) as string[], joinerName].slice(0, 9);
+  const userIds = [...otherSocketIds.map((sid) => authSessions.get(sid)?.userId).filter((u) => Number(u) > 0), ...(Number(joinerUserId) > 0 ? [joinerUserId] : [])];
+  sameNetworkSeats.push({ at: new Date().toISOString(), tableId, tableName: String(table?.config?.tableName || ''), seatedFromNetwork: otherSocketIds.length + 1, names });
+  if (sameNetworkSeats.length > SAME_NETWORK_LOG_MAX) sameNetworkSeats.splice(0, sameNetworkSeats.length - SAME_NETWORK_LOG_MAX);
+  console.warn(`[AntiCheat] ${JSON.stringify({ event: 'same_network_same_table', tableId, seatedFromNetwork: otherSocketIds.length + 1 })}`);
+  auditLog('SYSTEM', 'SAME_NETWORK_SAME_TABLE', { tableId, userIds });
+}
 // Chip velocity tracking: userId -> { chipsAtSessionStart, sessionStartAt }
 // R2 (2026-10-11): chipsAtStart = the session's first hand-start STACK; netWon =
 // table winnings since; alerted = this session already alerted (once each).
@@ -2856,6 +2875,8 @@ app.get('/api/health', async (_req, res) => {
       // (a forfeit, another hand, a seat that changed hands); open = windows
       // waiting right now (each lasts at most INSURANCE_DECISION_MS).
       insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
+      // 2026-10-12 — the per-network rules (owner: "loosen for pubs").
+      network: { maxConnectionsPerIp: MAX_CONNECTIONS_PER_IP, sameNetworkSameTable: networkStats.sameNetworkSameTable },
       // R3 review (SF-B-3) — the economy's boot work and sweeps, visible to a
       // plain curl after a deploy (counts / status only, no ids): the users.chips
       // BIGINT migration (waiting_for_previous_instance -> migrated /
@@ -9654,14 +9675,11 @@ io.on('connection', (socket: Socket) => {
       refuseQualifier('reentry_unavailable', 'Re-entry not available at this time');
       return;
     }
-    // IP duplicate check — prevent multi-accounting from same device. R2 (OPS-6):
-    // the REAL client address (realClientIp), never the Railway proxy hop.
+    // 2026-10-12 (owner: "loosen for pubs") — no per-network cap: a qualifier
+    // entry already needs a phone-verified master account holding a credit
+    // (one person, one entry), and a "2 per IP" rule only refused friends
+    // registering from the same venue's Wi-Fi. The address is still recorded.
     const regIp = realClientIp(socket);
-    const sameIpCount = qt.players.filter((p) => p.ip === regIp).length;
-    if (sameIpCount >= 2) {
-      refuseQualifier('too_many_from_device', 'Too many registrations from this device');
-      return;
-    }
     // R2 (TOURNEY-3 + TOURNEY-9) — a LATE first entry is SEATED at once
     // (seat-or-refund), so it never takes over a socket that plays a live seat
     // elsewhere: refused before a credit is consumed.
@@ -11291,6 +11309,8 @@ Give feedback in this JSON format:
       // R2 (APPUI-34) — users carry xp / handsPlayed / handsWon / winRate.
       users: await getAllUsers(),
       economy: { ...economyStats, progressRecords: progressionManager.size },
+      // 2026-10-12 — same-network seats at one table (newest first; public seat names).
+      sameNetworkSeats: [...sameNetworkSeats].reverse(),
     });
   });
 
@@ -12965,16 +12985,15 @@ Give feedback in this JSON format:
       // viewer). Always a whitelist-valid, non-empty string.
       playerName = seatNameForSocket(socket, data.playerName);
 
-      // Block same-IP multi-seating at the same table (collusion prevention)
+      // Same-network seats at one table — 2026-10-12 (owner: "loosen for
+      // pubs"): an ADMIN ALERT (recorded below, once seated), never a refusal.
       const tableSlotKey = `${tableId}`;
       if (!ipSeatedSlots.has(clientIp)) ipSeatedSlots.set(clientIp, new Set());
       const mySlots = ipSeatedSlots.get(clientIp)!;
-      for (const slot of mySlots) {
-        if (slot.endsWith(`:${tableSlotKey}`)) {
-          socket.emit('error', { message: 'Another connection from your network is already seated at this table' });
-          return;
-        }
-      }
+      const sameNetworkSockets = [...mySlots]
+        .filter((slot) => slot.endsWith(`:${tableSlotKey}`))
+        .map((slot) => slot.slice(0, slot.length - tableSlotKey.length - 1))
+        .filter((sid) => sid !== socket.id);
 
       // 2026-06-11 audit C6: clamp the CLIENT-supplied buy-in. PokerTable.sitDown
       // only enforced the minimum, so a crafted joinTable payload could seat an
@@ -13017,6 +13036,7 @@ Give feedback in this JSON format:
       }
 
       mySlots.add(`${socket.id}:${tableSlotKey}`);
+      if (sameNetworkSockets.length > 0) noteSameNetworkSeat(tableId, table, playerName, sameNetworkSockets, authForJoin?.userId);
 
       const playerId = `player-${uuidv4()}`;
       const success = table.sitDown(
