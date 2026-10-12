@@ -43,6 +43,7 @@ import {
   getThinkingDelay,
   Difficulty,
   recordOpponentObservation,
+  opponentModelKey,
 } from './ai/AIPlayer';
 import { ProgressionManager, lifetimeAchievementsUnlockedByLevel, maxXpAtLevel } from './progression/ProgressionManager';
 import { sanitizeClientProgressSave, PAYOUT_KEYS_FROM_CLIENT } from './progression/clientProgressSave';
@@ -51,6 +52,7 @@ import { getFullTrainingData } from './training/TrainingEngine';
 import { insuranceSettlementDelta, priceInsuranceQuote, InsuranceQuote } from './game/insurance';
 import { validateTableConfig, validateChallengeStakes } from './game/tableConfigValidation';
 import { createWindowRateLimiter } from './auth/rateLimit';
+import { createTicketReplayGuard, initUsedPlayTicketsTable, ticketReplayStats } from './auth/ticketReplay';
 import { publicNameOf, PUBLIC_NAME_FALLBACK, isPublicDisplayName, LISTABLE_USER_SQL } from './social/publicIdentity';
 import { createHash } from 'crypto';
 import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
@@ -805,6 +807,20 @@ async function probeStatsColumnType(): Promise<void> {
   }
 }
 
+/**
+ * R3 (AUTH-P3-2) — /api/health identityGuard.stampDurable: is the master-id
+ * stamp in users.stats durable? Yes on a jsonb AND on a TEXT column — every
+ * stamp write (masterRow's `SET stats = $2` JSON text, saveProgress's
+ * `NULLIF(stats::text,'')::jsonb || …` merge) and every master-id read
+ * (findLocalUserByMasterId) is TEXT-safe since 2026-10-10. It was
+ * `=== 'jsonb'`: false on prod's TEXT column although the stamp was durable.
+ * null = not probed yet; false = the column is missing or the probe failed.
+ */
+function statsStampDurable(columnType: string | null): boolean | null {
+  if (columnType === null) return null;
+  return columnType === 'jsonb' || columnType === 'text';
+}
+
 const tableManager = new TableManager();
 const progressionManager = new ProgressionManager();
 const tournamentManager = new TournamentManager();
@@ -1156,8 +1172,24 @@ async function _ensureAuditTable(): Promise<void> {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log (action, ts DESC)`);
   _auditTableReady = true;
 }
+/**
+ * R3 (OPS-P3-2) — the actor as PRINTED on an [AUDIT] line. Most callers pass
+ * the login handle (auth.username), and legacy rows' handles are PHONE NUMBERS:
+ * every buy-in / cash-out / admin line put a phone number in the logs. A
+ * phone-number handle now prints as `user:<local id>` (the live session signed
+ * in with it) or `phone-handle`; everything else (SYSTEM, user:<id>, ids,
+ * public names, slugs) prints as before. The durable audit_log row keeps the
+ * raw actor (Postgres already holds the handle; forensics join on it).
+ */
+const PHONE_HANDLE_RE = /^\+?[\d\s().-]{7,}$/;
+function auditActorLabel(actor: unknown): string {
+  const a = String(actor ?? '');
+  if (!PHONE_HANDLE_RE.test(a) || a.replace(/\D/g, '').length < 7) return a;
+  for (const s of authSessions.values()) if (s && s.username === a) return `user:${s.userId}`;
+  return 'phone-handle';
+}
 function auditLog(actorUsername: string, action: string, details: Record<string, unknown> = {}) {
-  const entry = `[AUDIT] ${new Date().toISOString()} | ${actorUsername} | ${action} | ${JSON.stringify(details)}`;
+  const entry = `[AUDIT] ${new Date().toISOString()} | ${auditActorLabel(actorUsername)} | ${action} | ${JSON.stringify(details)}`;
   console.log(entry);
   // Only forensic-critical, low-frequency actions get the durable DB row (see
   // the DURABLE_AUDIT_ACTIONS note above re: the db-f1-micro connection ceiling).
@@ -1295,7 +1327,9 @@ function processPendingSeatRemovals(tableId: string): void {
  *     else by forceFoldSeat (a draw round then completes if it was only
  *     waiting for him; a hand left with one player is awarded at once). An
  *     ALL-IN seat at a RING table (leaverKeepsAllInHand — his stack is wallet
- *     chips) is never folded: he has no decision left and keeps his equity —
+ *     chips) — or, R3 (S2-1), ANY seat in the hand while the runout is held
+ *     (the covering caller too) — is never folded: he has no decision left
+ *     and keeps his equity —
  *     and an accepted all-in insurance (the runout hold) its settlement
  *     (Addendum: a leave during the insurance window used to forfeit the pot
  *     AND void the insurance). At a tournament / fixed-roster quick table the
@@ -1366,7 +1400,12 @@ function teardownSeat(
       : { userId: 0, username: '', noCredit: true, playerId: seat.playerId });
   }
   if (stillInHand) {
-    if (seat.allIn && leaverKeepsAllInHand(tableId)) {
+    // R3 (S2-1) — a seat with NO decision left keeps its hand at a ring table:
+    // all-in, OR the runout is HELD (the insurance window — the betting is
+    // closed, so the COVERING seat can never be asked to act again either). It
+    // used to be folded there and its called chips handed to the all-in seat
+    // ('Won by fold') — or, with the shover insured, to the house.
+    if ((seat.allIn || table.isRunoutHeld()) && leaverKeepsAllInHand(tableId)) {
       seatTeardownStats.allInKept++;
     } else {
       foldSeatOutOfHand(table, seatIndex);
@@ -1515,6 +1554,25 @@ const authSessions = new Map<string, { userId: number; username: string; masterU
 function seatNameForSocket(socket: Socket, clientName?: unknown): string {
   const auth = authSessions.get(socket.id);
   return accountDisplayName(auth ? auth.displayName : clientName);
+}
+
+/**
+ * R3 (AUTH-P3-1) — the socket a peer-to-peer relay (voiceOffer / voiceAnswer /
+ * voiceIce, coachWhisper) may reach: a LIVE socket other than the sender that
+ * shares a room with this prefix with it (`voice_<tableId>` — both joined that
+ * table's voice chat; `table:<tableId>` — both at that table, seated or
+ * watching). The relays used to `io.to(<client string>)`: any socket id
+ * anywhere — or any ROOM name, e.g. a whole `table:<id>` — got the payload.
+ * Null = not relayed (silently, as before for a missing target).
+ */
+function relayPeerSharingRoom(from: Socket, toId: unknown, roomPrefix: 'voice_' | 'table:'): Socket | null {
+  if (typeof toId !== 'string' || !toId || toId === from.id) return null;
+  const peer = io.sockets.sockets.get(toId);
+  if (!peer) return null;
+  for (const room of from.rooms) {
+    if (room.startsWith(roomPrefix) && peer.rooms.has(room)) return peer;
+  }
+  return null;
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -2309,6 +2367,11 @@ interface ReservedSeat {
    * Absent on a synthetic reservation (sign-in orphan scan) — the seat name is used.
    */
   playerId?: string;
+  /**
+   * R3 (K1-6) — the departed session's fast-mode choice (PlayerSession.fastMode),
+   * given back to the restored session (restoreFastModeOnSeatRestore). Absent = off.
+   */
+  fastMode?: boolean;
 }
 const reservedSeats = new Map<number, ReservedSeat>();
 
@@ -2482,34 +2545,16 @@ function noteTournamentReservationNotCashed(
 
 // Deep-link ticket replay guard. The master API verifies tickets but does not
 // currently mark them as consumed, so a leaked URL from marketing/player app
-// could be replayed from multiple sockets to claim multiple seats. We hash the
-// raw token string and remember the hash locally; a second attempt within the
-// TTL window is rejected. Hashes expire after 2 hours (longer than any token
-// lifetime we issue, so legitimate retries within the token window still work
-// because the socket re-emit from the same tab doesn't create a new ticket).
-const usedTicketHashes = new Map<string, number>(); // hash -> expiresAt (ms)
-const TICKET_HASH_TTL_MS = 2 * 60 * 60 * 1000;
-function hashTicketToken(token: string): string {
-  // Tiny deterministic hash — we don't need cryptographic strength, just
-  // enough to distinguish tokens without storing the token itself in memory.
-  let h1 = 0x811c9dc5, h2 = 0;
-  for (let i = 0; i < token.length; i++) {
-    const c = token.charCodeAt(i);
-    h1 = Math.imul(h1 ^ c, 16777619) >>> 0;
-    h2 = Math.imul(h2 ^ c, 2246822519) >>> 0;
-  }
-  return h1.toString(16) + '_' + h2.toString(16) + '_' + token.length.toString(16);
-}
-function markTicketUsed(token: string): boolean {
-  const now = Date.now();
-  // Opportunistic GC — drop entries older than TTL on every touch.
-  for (const [k, exp] of usedTicketHashes) {
-    if (exp <= now) usedTicketHashes.delete(k);
-  }
-  const hash = hashTicketToken(token);
-  if (usedTicketHashes.has(hash)) return false;
-  usedTicketHashes.set(hash, now + TICKET_HASH_TTL_MS);
-  return true;
+// could be replayed from multiple sockets to claim multiple seats. A second
+// use within the TTL window (2h — longer than any token lifetime we issue) is
+// rejected. R3 (AUTH-P3-3): the burn is DURABLE now (auth/ticketReplay.ts — the
+// used_play_tickets ledger, one atomic INSERT … ON CONFLICT DO NOTHING per
+// claim, the in-memory map as the fast path): it used to be memory only, so a
+// restart forgot every used ticket and a deploy overlap accepted one twice.
+const playTicketGuard = createTicketReplayGuard(() => getPool());
+/** true = the ticket's first use (go on); false = replayed (refuse ticket_replayed). */
+function markTicketUsed(token: string): Promise<boolean> {
+  return playTicketGuard.claim(token);
 }
 
 // Keep seats reserved for 6 hours of wall-clock time (was 30 minutes).
@@ -2594,7 +2639,7 @@ app.get('/api/health', async (_req, res) => {
       identityGuard: {
         mode: IDENTITY_RESOLUTION_MODE,
         statsColumnType: _statsColumnType,
-        stampDurable: _statsColumnType === 'jsonb',
+        stampDurable: statsStampDurable(_statsColumnType),   // R3 (AUTH-P3-2) — TEXT is durable too
         masterRows: { ...masterRowStats, adoptionRefused: { ...masterRowStats.adoptionRefused } },
       },
       // 2026-10-11 (R1 contract #6) — crash safety. Counts only. A climbing
@@ -2726,6 +2771,10 @@ app.get('/api/health', async (_req, res) => {
       // 2026-10-09 — R1 resumable ticket sessions. enabled:false = JWT_SECRET
       // missing in prod (tokens would be forgeable) — every resume refused.
       resumeSessions: { enabled: !!RESUME_SIGNING_KEY, ...resumeStats, signOut: { ...signOutStats } },
+      // R3 (AUTH-P3-3) — play-ticket burns: claimed / refused (memory, durable =
+      // used before a restart or by the other process of a deploy overlap) /
+      // durableErrors (claims the DB could not answer: in-memory guard only).
+      ticketReplayGuard: { ...ticketReplayStats },
       // 2026-10-09 — R2 guest carry-over.
       guestClaims: { ...guestClaimStats },
       // 2026-10-11 (.online R1, ECON-1) — all-in insurance: decision windows
@@ -4377,6 +4426,9 @@ function broadcastGameState(tableId: string): void {
       if (socket) {
         const state: any = getGameStateForPlayer(table, session.seatIndex, session.trainingEnabled);
         state.sittingOut = session.sittingOut || false;
+        // R3 (K1-6) — the player's own fast-mode choice, always present (the client's
+        // toggle can follow it after a page reload, when fastModeSet came before it mounted).
+        state.fastMode = session.fastMode === true;
         emitGameState(socket, state);
       }
     }
@@ -4399,6 +4451,7 @@ function broadcastGameState(tableId: string): void {
       if (!socket) continue;
       const state: any = getGameStateForPlayer(table, session.seatIndex, session.trainingEnabled);
       state.sittingOut = session.sittingOut || false;
+      state.fastMode = session.fastMode === true;   // R3 (K1-6)
       socket.emit('gameState', { full: true, state, _serverTs: Date.now() });
     }
   }
@@ -4765,13 +4818,16 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   let flopCbetterSeat = -1;      // 2026-07-07: seat that made the flop c-bet
   table.on('playerAction', (d: { seatIndex: number; action: PlayerAction; amount?: number }) => {
     const s = table.seats[d.seatIndex];
-    if (!s || !s.playerName) return;
+    // R3 (GAME-P3-10) — the model is keyed by the seat's player id, never its
+    // display name (same-named players / bots shared one read).
+    const oppKey = s ? opponentModelKey(s) : '';
+    if (!s || !oppKey) return;
     const hn = table.handNumber;
     if (hn !== obsHand) {
       obsHand = hn; obsVpip.clear(); obsPfr.clear(); obs3bet.clear(); obsCbet.clear();
       preflopRaiseCount = 0; preflopAggressorSeat = -1; flopCbetterSeat = -1;
     }
-    recordOpponentObservation(s.playerName, 'hand_start', { handNumber: hn });
+    recordOpponentObservation(oppKey, 'hand_start', { handNumber: hn });
     const a = d.action;
     const aggressive = a === PlayerAction.Raise || a === PlayerAction.AllIn;
     // 2026-10-11 (R2, C10 / APPUI-10) — the player's HUD counters + missions
@@ -4793,15 +4849,15 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
 
     if (table.currentPhase === GamePhase.PreFlop) {
       const voluntary = a === PlayerAction.Call || aggressive;
-      if (voluntary && !obsVpip.has(s.playerName)) { obsVpip.add(s.playerName); recordOpponentObservation(s.playerName, 'vpip'); }
-      if (aggressive && !obsPfr.has(s.playerName)) { obsPfr.add(s.playerName); recordOpponentObservation(s.playerName, 'pfr'); }
+      if (voluntary && !obsVpip.has(oppKey)) { obsVpip.add(oppKey); recordOpponentObservation(oppKey, 'vpip'); }
+      if (aggressive && !obsPfr.has(oppKey)) { obsPfr.add(oppKey); recordOpponentObservation(oppKey, 'pfr'); }
       // 2026-07-07: facing a 3-bet+ means ≥2 preflop raises are already in front
       // of this player (open + reraise). Record the spot and whether they fold —
       // this feeds categorizeOpponent's fold-to-3-bet read (was hardcoded 0.6).
-      if (preflopRaiseCount >= 2 && !obs3bet.has(s.playerName)) {
-        obs3bet.add(s.playerName);
-        recordOpponentObservation(s.playerName, 'face_3bet');
-        if (a === PlayerAction.Fold) recordOpponentObservation(s.playerName, 'fold_to_3bet');
+      if (preflopRaiseCount >= 2 && !obs3bet.has(oppKey)) {
+        obs3bet.add(oppKey);
+        recordOpponentObservation(oppKey, 'face_3bet');
+        if (a === PlayerAction.Fold) recordOpponentObservation(oppKey, 'fold_to_3bet');
       }
       // 3-bet%: a prior preflop raise already in front = a 3-bet spot; raising
       // in that spot is a 3-bet+. preflopRaiseCount reflects raises BEFORE this
@@ -4819,10 +4875,10 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
       // c-bet; every later flop actor is "facing the c-bet" until it's resolved.
       if (aggressive && flopCbetterSeat === -1 && d.seatIndex === preflopAggressorSeat) {
         flopCbetterSeat = d.seatIndex;
-      } else if (flopCbetterSeat !== -1 && d.seatIndex !== flopCbetterSeat && !obsCbet.has(s.playerName)) {
-        obsCbet.add(s.playerName);
-        recordOpponentObservation(s.playerName, 'face_cbet');
-        if (a === PlayerAction.Fold) recordOpponentObservation(s.playerName, 'fold_to_cbet');
+      } else if (flopCbetterSeat !== -1 && d.seatIndex !== flopCbetterSeat && !obsCbet.has(oppKey)) {
+        obsCbet.add(oppKey);
+        recordOpponentObservation(oppKey, 'face_cbet');
+        if (a === PlayerAction.Fold) recordOpponentObservation(oppKey, 'fold_to_cbet');
       }
     }
   });
@@ -4834,8 +4890,8 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // opponent model. Read from the authoritative seat state before teardown.
     if (table.wentToShowdown) {
       for (const s of table.seats) {
-        if (s.state === 'occupied' && !s.folded && !s.eliminated && s.playerName) {
-          recordOpponentObservation(s.playerName, 'showdown');
+        if (s.state === 'occupied' && !s.folded && !s.eliminated && opponentModelKey(s)) {
+          recordOpponentObservation(opponentModelKey(s), 'showdown');   // R3 (GAME-P3-10)
         }
       }
     }
@@ -5130,6 +5186,23 @@ function tableWantsFastBots(tableId: string): boolean {
     }
   }
   return humans > 0;
+}
+
+/**
+ * R3 (K1-6) — a seat restore keeps the player's fast-mode choice. The
+ * reservation carried it (reserveSeatForDeparture); the restored session gets
+ * it back and this socket is TOLD — `fastModeSet {enabled}`, the one event the
+ * client's Fast Mode toggle syncs from (it stays mounted across a reconnect).
+ * Before R3 every restore built a session without fastMode: the bots dropped to
+ * normal speed while the toggle still said ON. Called by every restore path
+ * right after its 'reconnectedToTable' (still the restore's first frame) and
+ * before its state broadcast; `from` null/undefined = off.
+ */
+function restoreFastModeOnSeatRestore(socket: { id: string; emit: (ev: string, d: unknown) => unknown }, from: { fastMode?: boolean } | null | undefined): void {
+  const session = playerSessions.get(socket.id);
+  if (!session) return;
+  session.fastMode = from?.fastMode === true;
+  socket.emit('fastModeSet', { enabled: session.fastMode });
 }
 
 function scheduleAIAction(tableId: string): void {
@@ -7532,6 +7605,31 @@ function straddleAllowedAt(tableId: string): boolean {
   return (kind === 'cash' || kind === 'private' || kind === 'club') && !challengeTables.has(tableId);
 }
 
+/**
+ * R3 (AUTH-P3-4) — may Dealer's Choice be switched on at this table? Ring games
+ * only (cash / private / club, never a club challenge): never a tournament
+ * (every entrant registered for one game) nor a quick table (fixed formats).
+ */
+function dealersChoiceAllowedAt(tableId: string): boolean {
+  const kind = tableKindOf(tableId);
+  return (kind === 'cash' || kind === 'private' || kind === 'club') && !challengeTables.has(tableId);
+}
+
+/**
+ * R3 (AUTH-P3-4) — the session of this socket that is SEATED at `tableId` (its
+ * main seat or an extra-table seat, the seat still its own and in play), else null.
+ */
+function socketSeatedAt(socketId: string, tableId: string): PlayerSession | null {
+  const table = tableManager.getTable(tableId);
+  if (!table) return null;
+  for (const s of [playerSessions.get(socketId), ...(multiTableSessions.get(socketId) || [])]) {
+    if (!s || s.tableId !== tableId) continue;
+    const seat = table.seats[s.seatIndex];
+    if (seat && seat.state === 'occupied' && !seat.isAI && !seat.eliminated && seat.playerId === s.playerId) return s;
+  }
+  return null;
+}
+
 /** The `rebuy` handler's refusal (stable code `rebuy_not_allowed`) where rebuyAllowedAt is false, else null. */
 function rebuyRefusalAt(tableId: string): { message: string; code: 'rebuy_not_allowed' } | null {
   if (rebuyAllowedAt(tableId)) return null;
@@ -9827,18 +9925,20 @@ Give feedback in this JSON format:
     socket.leave(`voice_${data.tableId}`);
     socket.to(`voice_${data.tableId}`).emit('voicePeerLeft', { socketId: socket.id });
   });
+  // R3 (AUTH-P3-1) — a signal reaches ONLY a socket in the same voice room
+  // (relayPeerSharingRoom): `data.to` used to be any socket id, or any room.
   socket.on('voiceOffer', async (data: { to: string; offer: any; username: string }) => {
     const auth = authSessions.get(socket.id);
     if (!auth || !data?.to) return;
-    io.to(data.to).emit('voiceOffer', { from: socket.id, offer: data.offer, username: seatNameForSocket(socket) });
+    relayPeerSharingRoom(socket, data.to, 'voice_')?.emit('voiceOffer', { from: socket.id, offer: data.offer, username: seatNameForSocket(socket) });
   });
   socket.on('voiceAnswer', async (data: { to: string; answer: any }) => {
     if (!authSessions.get(socket.id) || !data?.to) return;
-    io.to(data.to).emit('voiceAnswer', { from: socket.id, answer: data.answer });
+    relayPeerSharingRoom(socket, data.to, 'voice_')?.emit('voiceAnswer', { from: socket.id, answer: data.answer });
   });
   socket.on('voiceIce', async (data: { to: string; candidate: any }) => {
     if (!authSessions.get(socket.id) || !data?.to) return;
-    io.to(data.to).emit('voiceIce', { from: socket.id, candidate: data.candidate });
+    relayPeerSharingRoom(socket, data.to, 'voice_')?.emit('voiceIce', { from: socket.id, candidate: data.candidate });
   });
 
   // ========== Staking Marketplace ==========
@@ -10307,6 +10407,7 @@ Give feedback in this JSON format:
             if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
             // P-b — a tournament reservation says which tournament (+tournamentId).
             socket.emit('reconnectedToTable', { tableId: reserved.tableId, seatIndex: reserved.seatIndex, ...reconnectTournamentFields(reserved) });
+            restoreFastModeOnSeatRestore(socket, reserved);   // R3 (K1-6) — his fast mode survives the restore; the client is told
             emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
             broadcastGameState(reserved.tableId);
             console.log(`[OAuth Reserve] user ${userId} reconnected to seat ${reserved.seatIndex}`);
@@ -10649,6 +10750,7 @@ Give feedback in this JSON format:
                   seatIndex: reserved.seatIndex,
                   ...reconnectTournamentFields(reserved),   // P-b: + tournamentId for a tournament seat
                 });
+                restoreFastModeOnSeatRestore(socket, reserved);   // R3 (K1-6) — his fast mode survives the restore; the client is told
                 // Send a FORCED full state to the reconnecting socket so they
                 // get hole cards + current phase + turn info immediately, not
                 // wait for the next delta. `broadcastGameState` alone uses
@@ -10765,6 +10867,7 @@ Give feedback in this JSON format:
                 seatIndex: reserved.seatIndex,
                 ...reconnectTournamentFields(reserved),   // P-b: + tournamentId for a tournament seat
               });
+              restoreFastModeOnSeatRestore(socket, reserved);   // R3 (K1-6) — his fast mode survives the restore; the client is told
 
               // Forced full state to the reconnecting socket — see the OAuth
               // branch above for rationale.
@@ -11068,7 +11171,7 @@ Give feedback in this JSON format:
     }
     auditLog(auth.username, 'GRANT_CHIPS', { targetUserId: data.userId, amount });
     if (amount >= CHIP_GRANT_ALERT_THRESHOLD) {
-      console.warn(`[AntiCheat] LARGE CHIP GRANT ALERT: admin ${auth.username} granted ${amount} chips to userId=${data.userId}`);
+      console.warn(`[AntiCheat] LARGE CHIP GRANT ALERT: admin userId=${auth.userId} granted ${amount} chips to userId=${data.userId}`);   // R3 (OPS-P3-2) — id, not the login handle
     }
     const success = await addChipsToUser(data.userId, amount);
     socket.emit('adminGrantChipsResult', { success, userId: data.userId, amount });
@@ -11093,14 +11196,14 @@ Give feedback in this JSON format:
       // the one defined locally in adminGrantChips above (1_000_000).
       const CHIP_GRANT_ALERT_THRESHOLD = 1_000_000;
       if (CHIP_AMOUNT >= CHIP_GRANT_ALERT_THRESHOLD) {
-        console.warn(`[AntiCheat] LARGE CHIP GRANT ALERT: admin ${auth.username} restored ${CHIP_AMOUNT} chips to userId=${auth.userId}`);
+        console.warn(`[AntiCheat] LARGE CHIP GRANT ALERT: admin userId=${auth.userId} restored ${CHIP_AMOUNT} chips to userId=${auth.userId}`);   // R3 (OPS-P3-2)
       }
       await getPool().query(
         `UPDATE users SET chips = chips + $1, stars = stars + $2 WHERE id = $3`,
         [CHIP_AMOUNT, STAR_AMOUNT, auth.userId]
       );
       auditLog(auth.username, 'RESTORE_BALANCE', { chips: CHIP_AMOUNT, stars: STAR_AMOUNT });
-      console.warn(`[Restore] Admin ${auth.username} restored ${CHIP_AMOUNT.toLocaleString()} chips + ${STAR_AMOUNT.toLocaleString()} stars`);
+      console.warn(`[Restore] Admin userId=${auth.userId} restored ${CHIP_AMOUNT.toLocaleString()} chips + ${STAR_AMOUNT.toLocaleString()} stars`);   // R3 (OPS-P3-2)
       const playerId = playerSessions.get(socket.id)?.playerId || `user-${auth.userId}`;
       const progress = progressionManager.getProgress(playerId);
       if (progress) {
@@ -11200,7 +11303,7 @@ Give feedback in this JSON format:
       if (rows.length === 0) { socket.emit('adminAdjustChipsResult', { success: false, error: 'User not found' }); return; }
       const newBalance = Number(rows[0].chips);
       if (Math.abs(amount) >= 1_000_000) {
-        console.warn(`[AntiCheat] LARGE CHIP ADJUST: admin ${auth.username} adjusted userId=${targetUserId} by ${amount} → ${newBalance}`);
+        console.warn(`[AntiCheat] LARGE CHIP ADJUST: admin userId=${auth.userId} adjusted userId=${targetUserId} by ${amount} → ${newBalance}`);   // R3 (OPS-P3-2)
       }
       auditLog(auth.username, 'ADMIN_ADJUST_CHIPS', { targetUserId, amount, reason: data?.reason || '', newBalance });
       // Reflect in the target's in-memory progress if they're online.
@@ -11383,7 +11486,7 @@ Give feedback in this JSON format:
         targetUserId: row.id, clearedMasterUserId, targetIsAdmin: !!row.is_admin,
       });
       console.warn(
-        `[identity-guard] stamp cleared by admin=${auth.username} localUserId=${row.id} ` +
+        `[identity-guard] stamp cleared by adminUserId=${auth.userId} localUserId=${row.id} ` +   // R3 (OPS-P3-2) — id, not the login handle
           `previousOwnerMasterId=${clearedMasterUserId}`
       );
       socket.emit('adminClearIdentityStampResult', {
@@ -13665,8 +13768,9 @@ Give feedback in this JSON format:
           failTicket('ticket_missing', 'Missing token');
           return;
         }
-        // Ticket replay guard — reject if this exact token has been used already.
-        if (!markTicketUsed(data.token)) {
+        // Ticket replay guard — reject if this exact token has been used already
+        // (R3, AUTH-P3-3: durable across restarts and a deploy overlap).
+        if (!(await markTicketUsed(data.token))) {
           failTicket('ticket_replayed', 'Token already used — please request a new link');
           return;
         }
@@ -13788,7 +13892,8 @@ Give feedback in this JSON format:
           // public-safe shape must have changed shape on us. Surface a
           // clear error instead of letting the INSERT NPE.
           failTicket('master_user_shape', 'Master API user shape missing username — please retry');
-          console.error('[authWithTicket] master /me public-safe shape missing both phoneNumber and username:', masterUser);
+          // R3 (OPS-P3-2) — the KEYS only: the /me object is a person's record (it was dumped whole).
+          console.error('[authWithTicket] master /me public-safe shape missing both phoneNumber and username; keys:', Object.keys(masterUser || {}).slice(0, 40).join(','));
           return;
         }
 
@@ -13953,7 +14058,8 @@ Give feedback in this JSON format:
         hydrateAndPushProgress(socket, localUser.id, localUser.username).catch(() => {});
 
         console.log(
-          `[authWithTicket] logged in userId=${localUser.id} (masterId=${remoteUserId}) username=${localUser.username}`
+          // R3 (OPS-P3-2) — ids only: the login handle (a phone number on legacy rows) is never logged.
+          `[authWithTicket] logged in userId=${localUser.id} (masterId=${remoteUserId})`
         );
       } catch (err: any) {
         console.error('authWithTicket error:', err);
@@ -14123,6 +14229,7 @@ Give feedback in this JSON format:
               if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
               // P-b — + tournamentId for a tournament reservation.
               socket.emit('reconnectedToTable', { tableId: reserved.tableId, seatIndex: reserved.seatIndex, ...reconnectTournamentFields(reserved) });
+              restoreFastModeOnSeatRestore(socket, reserved);   // R3 (K1-6) — his fast mode survives the restore; the client is told
               emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
               broadcastGameState(reserved.tableId);
               console.log(`[resumeSession] user ${userId} reconnected to seat ${reserved.seatIndex}`);
@@ -14366,8 +14473,8 @@ Give feedback in this JSON format:
           failWaitlist('ticket_missing', 'Missing token');
           return;
         }
-        // Ticket replay guard for the waitlist path.
-        if (!markTicketUsed(data.token)) {
+        // Ticket replay guard for the waitlist path (R3, AUTH-P3-3: durable).
+        if (!(await markTicketUsed(data.token))) {
           failWaitlist('ticket_replayed', 'Token already used — please request a new link');
           return;
         }
@@ -15891,6 +15998,10 @@ Give feedback in this JSON format:
     // another seated player — or the client's reset on mount — flips for
     // everyone, and never the table's admin / tournament turbo (fastModeTables).
     session.fastMode = data?.enabled === true;
+    // R3 (K1-6) — the choice is the PLAYER's: his extra-table seats on this
+    // socket follow it (a toggle while viewing an extra table used to change
+    // only the main session, so that table never got fast bots).
+    for (const extra of multiTableSessions.get(socket.id) || []) if (extra) extra.fastMode = session.fastMode;
     socket.emit('fastModeSet', { enabled: session.fastMode });
   });
 
@@ -16034,16 +16145,24 @@ Give feedback in this JSON format:
   });
 
   // ========== Dealer's Choice ==========
+  // R3 (AUTH-P3-4) — only a player SEATED at the table (his main or an
+  // extra-table seat on this socket — socketSeatedAt) and only at a RING table
+  // (dealersChoiceAllowedAt: cash / private / club, never a tournament, quick or
+  // club-challenge table). It used to be any session naming its own table — a
+  // tournament or quick table included (the variant label every seat sees).
   socket.on('enableDealersChoice', async (data: { tableId?: string; enabled: boolean }) => {
     const session = playerSessions.get(socket.id);
-    if (!session) return;
-    const tableId = data?.tableId || session.tableId;
-    // Only players at this table may toggle dealer's choice
-    if (session.tableId !== tableId) return;
+    const tableId = (typeof data?.tableId === 'string' && data.tableId) || session?.tableId;
+    if (!tableId || !socketSeatedAt(socket.id, tableId)) return;
     const table = tableManager.getTable(tableId);
     if (!table) return;
+    if (!dealersChoiceAllowedAt(tableId)) {
+      socket.emit('error', { message: "Dealer's Choice is only available at cash tables.", code: 'dealers_choice_not_allowed' });
+      return;
+    }
+    const enabled = data?.enabled === true;
 
-    if (data.enabled) {
+    if (enabled) {
       dealersChoiceState.set(tableId, {
         enabled: true,
         orbitCount: 0,
@@ -16057,8 +16176,8 @@ Give feedback in this JSON format:
     // Notify all players
     io.to(`table:${tableId}`).emit('dealersChoiceToggled', {
       tableId,
-      enabled: data.enabled,
-      currentVariant: data.enabled ? DEALERS_CHOICE_VARIANTS[0] : null,
+      enabled,
+      currentVariant: enabled ? DEALERS_CHOICE_VARIANTS[0] : null,
     });
 
     broadcastGameState(tableId);
@@ -17348,6 +17467,8 @@ Give feedback in this JSON format:
       trainingEnabled: false,
       sittingOut: false,
       avatar,
+      // R3 (K1-6) — an extra seat starts with the player's fast-mode choice (his main session's).
+      ...(playerSessions.get(socket.id)?.fastMode ? { fastMode: true } : {}),
     };
 
     // P-g (round 5) — an extra seat ends any spectating (its main seat and
@@ -17742,11 +17863,17 @@ Give feedback in this JSON format:
     // Must be authenticated to send whispers
     const auth = authSessions.get(socket.id);
     if (!auth) return;
-    if (!data.targetSocketId || !data.message) return;
+    if (!data?.targetSocketId || !data.message) return;
     // Prevent whisper to self
     if (data.targetSocketId === socket.id) return;
-    io.to(data.targetSocketId).emit('coachWhisper', {
-      message: data.message,
+    // R3 (AUTH-P3-1) — only to a socket at the SAME table as the coach (both in
+    // its `table:` room, seated or watching), and only a bounded text. It used
+    // to reach any socket id — or any room — with any payload.
+    if (typeof data.message !== 'string') return;
+    const student = relayPeerSharingRoom(socket, data.targetSocketId, 'table:');
+    if (!student) return;
+    student.emit('coachWhisper', {
+      message: data.message.slice(0, 500),
       // R1 — the coach's public name (the client's coachName was spoofable,
       // the fallback was the login handle).
       coachName: await publicNameForUser(auth.userId),
@@ -18086,6 +18213,8 @@ function reserveSeatForDeparture(
     ...(opts.voluntary ? { voluntary: true } : {}),
     // R3 (S3-2) — the occupant, for the chips-won account of hands he is away for.
     ...(seat?.playerId ? { playerId: String(seat.playerId) } : {}),
+    // R3 (K1-6) — his fast-mode choice survives the restore (restoreFastModeOnSeatRestore).
+    ...(session.fastMode ? { fastMode: true } : {}),
     // T1: snapshot — a later table break drops the id from tournamentTables.
     // F2: and a disconnect IN the break window (session still on the
     // broken table, id already gone from tournamentTables) is still a
@@ -18601,13 +18730,17 @@ function restoreAbsentTournamentSeat(
   const table = tableManager.getTable(tableId);
   if (!table) return null;
   const r = reservedSeats.get(auth.userId);
+  // R3 (K1-6) — the fast-mode choice this seat was played with (its reservation, or a session taken over below).
+  let fastModeFrom: { fastMode?: boolean } | undefined;
   if (r && r.tableId === tableId && r.seatIndex === seatIndex) {
     if (r.cleanupTimer) clearTimeout(r.cleanupTimer);
     reservedSeats.delete(auth.userId);
+    fastModeFrom = r;
   }
   for (const [sid, s] of playerSessions) {
     if (s.tableId !== tableId || s.seatIndex !== seatIndex) continue;
     playerSessions.delete(sid);   // a gone socket's, or (P-c'') one of found.heldBy — told below
+    if (s.fastMode) fastModeFrom = s;
     if (!found.heldBy.includes(sid)) continue;
     const old = io.sockets.sockets.get(sid);
     releaseSeatedSlot(sid, tableId);
@@ -18639,6 +18772,7 @@ function restoreAbsentTournamentSeat(
   voluntarilyAbsentTournamentEntrants.delete(voluntaryAbsenceKey(tournamentId, tp.playerId));
   tournamentSeatKeep.returned++;
   socket.emit('reconnectedToTable', { tableId, seatIndex, tournamentId });
+  restoreFastModeOnSeatRestore(socket, fastModeFrom);   // R3 (K1-6) — his fast mode survives the restore; the client is told
   emitGameState(socket, getGameStateForPlayer(table, seatIndex), true);
   broadcastGameState(tableId);
   console.log(`[Tournament] ${JSON.stringify({
@@ -21838,6 +21972,10 @@ initDB().then(async () => {
   try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }
   try { await initPredictionTables(); } catch (e) { console.error('[prediction] initPredictionTables failed', e); }
   try { await initBracketTables(); } catch (e) { console.error('[bracket] initBracketTables failed', e); }
+  // R3 (AUTH-P3-3) — the durable play-ticket replay ledger + its hourly TTL prune.
+  try { await initUsedPlayTicketsTable(getPool()); } catch (e: any) { console.error('[ticket-replay] initUsedPlayTicketsTable failed (in-memory guard only until a boot succeeds):', e?.message || e); }
+  void playTicketGuard.prune();
+  setInterval(() => { void playTicketGuard.prune(); }, 60 * 60_000).unref?.();
   // 2026-10-11 (.online R2, S3) — the economy tables (achievement / credit /
   // chips-won / Battle Pass premium / season-run ledgers, users.public_id),
   // then users.chips → BIGINT (retried while a deploy overlap holds the lock),
@@ -21946,7 +22084,8 @@ initDB().then(async () => {
 // ========== Start Server ==========
 
 httpServer.listen(PORT, async () => {
-  console.log(`Poker server running on port ${PORT}`);
+  // R3 (OPS-4) — the runtime is named at boot (Node 22 LTS, >= 22.12: jose 6 loads through require(esm)).
+  console.log(`Poker server running on port ${PORT} (Node ${process.version})`);
   console.log(`Tables available: ${tableManager.getTableList().length}`);
   for (const table of tableManager.getTableList()) {
     console.log(

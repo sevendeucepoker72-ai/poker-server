@@ -33,6 +33,7 @@ import { HandRank } from '../src/game/HandEvaluator';
 import { ProgressionManager } from '../src/progression/ProgressionManager';
 import { denverDateKey } from '../src/economy/denverTime';
 import { publicNameOf, PUBLIC_NAME_FALLBACK } from '../src/social/publicIdentity';
+import { opponentModelKey } from '../src/ai/AIPlayer';
 
 const LISTENER = fnSrc('function ensureTableProgressListener(');
 const HAND_COMPLETE = fnSrc('async function handleHandComplete(');
@@ -68,7 +69,8 @@ function world(opts: { tableKind?: string; humanName?: string } = {}) {
   const scope: Record<string, unknown> = {
     tableManager: { getTable: () => table }, playerSessions, authSessions, progressionManager: pm,
     tableProgressListeners: new Set<string>(), bombPotActive: new Map(), GamePhase, PlayerAction, HandRank,
-    recordOpponentObservation() {}, incrementHandsPlayed() {}, settlePredictionsForHand: async () => {}, processPendingSeatRemovals() {},
+    // R3 (GAME-P3-10): the listener keys the AI read by player id (opponentModelKey).
+    recordOpponentObservation() {}, opponentModelKey, incrementHandsPlayed() {}, settlePredictionsForHand: async () => {}, processPendingSeatRemovals() {},
     scheduleAutoStart() {}, chipVelocity: new Map(), getUserChips: async () => 0, standUpSuspendedSeatsBeforeDeal() {},
     tickReservedSeatHands() {}, settleInsuranceForHand() {}, captureTournamentBustCheck: () => null,
     runTournamentBustCheck() {}, rekickTournamentDealAfterBustCheck() {}, runPendingTournamentBustChecks() {}, broadcastGameState() {},
