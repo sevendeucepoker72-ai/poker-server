@@ -16,7 +16,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { SRC, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC } from './helpers/indexSource';
+import { SRC, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_IDENTITY_SRC } from './helpers/indexSource';
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
 import { HandRank } from '../src/game/HandEvaluator';
 import { Card, cardToString } from '../src/game/Card';
@@ -415,7 +415,7 @@ describe('S3-2 — chips won is recorded per dealt-in human SEAT, by account', (
     w.playerSessions.delete('SA');
     const multi = new Map([['SX', [{ tableId: 'T1', seatIndex: 1, playerId: 'player-A' }]]]);
     w.authSessions.set('SX', { userId: 70 });
-    const m2 = load(`${fnSrc('function dealtInSeatAccount(')}\n${fnSrc('function seatPlayedByAnotherAccount(')}`, {
+    const m2 = load(`${fnSrc('function dealtInSeatAccount(')}\n${fnSrc('function seatPlayedByAnotherAccount(')}\n${SEAT_IDENTITY_SRC}`, {
       playerSessions: w.playerSessions, multiTableSessions: multi, authSessions: w.authSessions,
       pendingSeatRemovalAfterHand: w.pendingSeatRemovalAfterHand, reservedSeats: w.reservedSeats,
     }, 'dealtInSeatAccount').exports;

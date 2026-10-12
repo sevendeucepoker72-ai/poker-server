@@ -33,7 +33,8 @@ describe('R1 review fixes', () => {
     expect(body).not.toMatch(/const recoverName\s*=/);
     expect(body).not.toMatch(/seat\.playerName\s*!==\s*recoverName/);
     // the only recovery left is BY ACCOUNT, with the same guards as tokenLogin's scan
-    expect(body).toMatch(/if \(seat\.playerId !== expectedPlayerId\) continue;/);
+    // R3 (live P1): by account — its user_<id> stamp OR a seat this account bought into (server-recorded alias)
+    expect(body).toMatch(/if \(seat\.playerId !== expectedPlayerId && !seatBoughtInBy\(seat, userId\)\) continue;/);
     expect(body).toMatch(/if \(otherSessionHoldsSeat\(socket\.id, t\.tableId, i\)\) continue;/);
     expect(body).toMatch(/if \(seatReservedByOtherAccount\(userId, t\.tableId, i\)\) continue;/);
     expect(body).not.toMatch(/seat\.playerName\s*(!==|===)/);

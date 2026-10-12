@@ -27,7 +27,7 @@ jest.mock('../src/auth/authManager', () => ({
   addChipsToUser: jest.fn(async () => true), addStarsToUser: jest.fn(async () => true), mergeUserStats: jest.fn(async () => {}),
 }));
 
-import { fnSrc, load, flush } from './helpers/indexSource';
+import { fnSrc, load, flush, SEAT_IDENTITY_SRC } from './helpers/indexSource';
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
 import { HandRank } from '../src/game/HandEvaluator';
 import { ProgressionManager } from '../src/progression/ProgressionManager';
@@ -39,7 +39,7 @@ const LISTENER = fnSrc('function ensureTableProgressListener(');
 const HAND_COMPLETE = fnSrc('async function handleHandComplete(');
 // R3 (S3-2 / H1) — the per-seat chips-won resolution and the viewer fields of each handHistory copy.
 const R3_HELPERS = [
-  fnSrc('function chipsWonSeatsOfHand('), fnSrc('function dealtInSeatAccount('), fnSrc('function handHistoryViewerOf('),
+  fnSrc('function chipsWonSeatsOfHand('), fnSrc('function dealtInSeatAccount('), fnSrc('function handHistoryViewerOf('), SEAT_IDENTITY_SRC,
   fnSrc('function seatPlayedByAnotherAccount('),
 ].join('\n');
 

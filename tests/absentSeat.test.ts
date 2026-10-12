@@ -2025,3 +2025,69 @@ describe('R3 (K1-6) — the fast-mode choice survives a seat restore (and the cl
     expect(w.emitted('S2').map(([ev]) => ev)).not.toContain('fastModeSet');
   });
 });
+
+// ── R3 (live P1, 2026-10-11) ─────────────────────────────────────────────
+// Live logs 2026-10-12: users 4198 and 4492 were reserved, restored by a
+// sign-in, then dropped AGAIN — `disconnect_seat_not_his_after_save`: the
+// restored session carried `user_<id>` while the seat kept its buy-in id, so
+// the second disconnect reserved nothing and the seat was orphaned with its
+// stack (auto-folded, blinded away, never cashed out).
+describe('R3 (live P1) — a sign-in-RESTORED seat is still his on the NEXT disconnect: reserved again, never orphaned', () => {
+  const BUY_IN_ID = 'player-alice-buyin';
+  async function restoredOnce(w: ReturnType<typeof world>, login: (s: any) => Promise<unknown>) {
+    w.table.seats[0].playerId = BUY_IN_ID;                                    // a real cash buy-in id (never user_<id>)
+    const s1 = w.seatLive('S1', ALICE, 0);
+    w.playerSessions.get('S1').playerId = BUY_IN_ID;                          // the buy-in session carries the seat's own id
+    await w.drop(s1);
+    expect(w.reservedSeats.get(ALICE)).toMatchObject({ tableId: 't1', seatIndex: 0 });
+    const s2 = w.mkSocket('S2');
+    await login(s2);
+    await flush();
+    expect(w.playerSessions.get('S2')).toMatchObject({
+      tableId: 't1', seatIndex: 0, playerId: `user_${ALICE}`, seatPlayerId: BUY_IN_ID,
+    });
+    return s2;
+  }
+
+  it.each([
+    ['oauthLogin', (s: any) => s.handlers.oauthLogin({ accessToken: 'oidc-alice' })],
+    ['tokenLogin (OIDC branch)', (s: any) => s.handlers.tokenLogin({ token: 'oidc-alice' })],
+    ['tokenLogin (legacy branch)', (s: any) => s.handlers.tokenLogin({ token: 'legacy-alice' })],
+    ['resumeSession', (s: any) => s.handlers.resumeSession({ resumeToken: 'tok' })],
+  ] as const)('%s restores her; her second drop RESERVES the seat again and the expiry credits her 7,000 exactly once', async (_via, login) => {
+    const w = world();
+    const s2 = await restoredOnce(w, login);
+    await w.drop(s2);
+    expect(w.reservedSeats.get(ALICE)).toMatchObject({ tableId: 't1', seatIndex: 0 });
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);
+    await flush();
+    expect(w.credits).toEqual([{ uid: ALICE, amount: 7000 }]);
+  });
+
+  it('…and a THIRD sign-in restores it again (the seat stays hers across any number of drops)', async () => {
+    const w = world();
+    const s2 = await restoredOnce(w, (s) => s.handlers.resumeSession({ resumeToken: 'tok' }));
+    await w.drop(s2);
+    const s3 = w.mkSocket('S3');
+    await s3.handlers.resumeSession({ resumeToken: 'tok' });
+    await flush();
+    expect(w.playerSessions.get('S3')).toMatchObject({ tableId: 't1', seatIndex: 0, seatPlayerId: BUY_IN_ID });
+    expect(w.reservedSeats.has(ALICE)).toBe(false);
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);
+    await flush();
+    expect(w.credits).toEqual([]);                                             // seated again: nothing cashed out
+  });
+
+  it('CONTROL — the pre-R3 check (seat.playerId === session.playerId): the second drop reserves NOTHING and the 7,000 is orphaned, never credited', async () => {
+    const ON = 'sessionHoldsSeat(session, seat) && !brokeMeanwhile';
+    expect(P.disconnect).toContain(ON);
+    const w = world({ over: { disconnect: P.disconnect.replace(ON, 'seat.playerId === session.playerId && !brokeMeanwhile') } });
+    const s2 = await restoredOnce(w, (s) => s.handlers.resumeSession({ resumeToken: 'tok' }));
+    await w.drop(s2);
+    expect(w.reservedSeats.has(ALICE)).toBe(false);
+    expect(w.table.seats[0]).toMatchObject({ state: 'occupied', chipCount: 7000, playerId: BUY_IN_ID });
+    jest.advanceTimersByTime(SEAT_RESERVE_MS);
+    await flush();
+    expect(w.credits).toEqual([]);
+  });
+});

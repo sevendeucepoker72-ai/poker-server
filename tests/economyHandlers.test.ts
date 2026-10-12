@@ -140,7 +140,7 @@ function world(over: Record<string, unknown> = {}) {
       to: (target: string) => ({ emit: (ev: string, d: any) => { const so = sockets.get(target); if (so) so.emitted.push([ev, d]); else roomEmits.push([target, ev, d]); } }),
       emit: () => {},
     },
-    tableManager: { getTable: (id: string) => tables.get(id) },
+    tableManager: { getTable: (id: string) => tables.get(id), getTableList: () => [...tables.keys()].map((tableId) => ({ tableId })) },
     isTournamentTable: () => false,
     tableKindOf: () => 'cash',
     clubTableIds: new Set<string>(),

@@ -848,6 +848,12 @@ interface PlayerSession {
   // R2 (GAME-11) — consecutive hands this cash seat sat out without being
   // dealt in (standUpSeatsPastSitOutLimit stands it up at SIT_OUT_HANDS_LIMIT).
   sitOutHands?: number;
+  // R3 (live P1, 2026-10-11) — a sign-in-RESTORED session carries the account's
+  // `user_<id>` playerId, while the seat keeps its sit-down playerId: this is
+  // that seat's own id, so "is this still his seat" checks (sessionHoldsSeat)
+  // recognise it. Before, his NEXT disconnect found the seat "not his", reserved
+  // nothing and orphaned it with his chips (live 2026-10-12: users 4198, 4492).
+  seatPlayerId?: string;
   // Deep-link context from player app — e.g. { source: 'waitlist', gameId, venue }
   context?: {
     source: string;
@@ -1312,6 +1318,34 @@ function processPendingSeatRemovals(tableId: string): void {
 }
 
 // ========== Seat teardown — ONE helper (.online R2, 2026-10-11: GAME-15 / GAME-16 + Addendum) ==========
+/**
+ * R3 (live P1, 2026-10-11) — does this session (main or extra-table) still sit
+ * in `seat`? Its own playerId, or — for a sign-in-restored session — the seat's
+ * sit-down id it was restored onto (`seatPlayerId`). The ONE comparison every
+ * "still his seat" check uses (disconnect, shutdown claim, chips won, hand
+ * history, invites).
+ */
+function sessionHoldsSeat(
+  session: { playerId?: string; seatPlayerId?: string } | null | undefined,
+  seat: { playerId?: string | null } | null | undefined,
+): boolean {
+  if (!session || !seat || !seat.playerId) return false;
+  return seat.playerId === session.playerId || (!!session.seatPlayerId && seat.playerId === session.seatPlayerId);
+}
+
+/**
+ * R3 (live P1) — did THIS account buy into the seat? The sit-down playerId ->
+ * account link is server-recorded at the buy-in (its progression alias,
+ * getOrCreateProgress(playerId, name, userId)), never a client-sent name.
+ */
+function seatBoughtInBy(seat: { playerId?: string | null }, userId: number): boolean {
+  const pid = String(seat?.playerId || '');
+  if (!pid || !(userId > 0)) return false;
+  const pm: any = progressionManager;
+  const rec = pm && typeof pm.getProgress === 'function' ? pm.getProgress(pid) : undefined;
+  return Number(rec?.userId) === userId;
+}
+
 /**
  * THE way a HUMAN seat leaves a table at any moment (a leave, an extra-table
  * leave, a departure's extra seats, ghost cleanup, a refused seat restore, a
@@ -5041,7 +5075,7 @@ function handHistoryViewerOf(
   const row = history.players.find((p) => p.seatIndex === seatIndex);
   const seat = table.seats[seatIndex];
   if (!row || !seat || seat.state !== 'occupied' || seat.isAI) return null;
-  if (seat.playerId !== session.playerId && seat.playerName !== session.playerName) return null;
+  if (!sessionHoldsSeat(session, seat) && seat.playerName !== session.playerName) return null;
   if (row.name !== seat.playerName) return null;
   return { seatIndex, holeCards: seat.holeCards.length > 0 ? [...seat.holeCards] : null };
 }
@@ -7625,7 +7659,7 @@ function socketSeatedAt(socketId: string, tableId: string): PlayerSession | null
   for (const s of [playerSessions.get(socketId), ...(multiTableSessions.get(socketId) || [])]) {
     if (!s || s.tableId !== tableId) continue;
     const seat = table.seats[s.seatIndex];
-    if (seat && seat.state === 'occupied' && !seat.isAI && !seat.eliminated && seat.playerId === s.playerId) return s;
+    if (seat && seat.state === 'occupied' && !seat.isAI && !seat.eliminated && sessionHoldsSeat(s, seat)) return s;
   }
   return null;
 }
@@ -8365,6 +8399,18 @@ function evictIdleProgress(): void {
   const live = new Set<number>();
   for (const a of authSessions.values()) if (a?.userId) live.add(a.userId);
   for (const uid of reservedSeats.keys()) live.add(uid);
+  // R3 (live P1) — an account that still OWNS an occupied seat (its buy-in
+  // alias) keeps its record: the alias is how an orphaned seat finds its owner
+  // (sign-in recovery, the shutdown sweep).
+  for (const { tableId } of tableManager.getTableList()) {
+    const t = tableManager.getTable(tableId);
+    if (!t) continue;
+    for (const seat of t.seats) {
+      if (seat.state !== 'occupied' || seat.isAI || !seat.playerId) continue;
+      const uid = Number(progressionManager.getProgress(seat.playerId)?.userId);
+      if (uid > 0) live.add(uid);
+    }
+  }
   const dropped = progressionManager.evictIdle((uid) => live.has(uid));
   economyStats.evicted += dropped.length;
 }
@@ -8425,11 +8471,11 @@ function chipsWonSeatsOfHand(
  */
 function dealtInSeatAccount(tableId: string, seat: PokerTable['seats'][number]): number | null {
   for (const [sid, s] of playerSessions) {
-    if (s.tableId !== tableId || s.seatIndex !== seat.seatIndex || s.playerId !== seat.playerId) continue;
+    if (s.tableId !== tableId || s.seatIndex !== seat.seatIndex || !sessionHoldsSeat(s, seat)) continue;
     return authSessions.get(sid)?.userId || null;
   }
   for (const [sid, list] of multiTableSessions) {
-    if (!Array.isArray(list) || !list.some((s) => s && s.tableId === tableId && s.seatIndex === seat.seatIndex && s.playerId === seat.playerId)) continue;
+    if (!Array.isArray(list) || !list.some((s) => s && s.tableId === tableId && s.seatIndex === seat.seatIndex && sessionHoldsSeat(s, seat))) continue;
     return authSessions.get(sid)?.userId || null;
   }
   const pending = pendingSeatRemovalAfterHand.get(tableId)?.get(seat.seatIndex);
@@ -10352,7 +10398,9 @@ Give feedback in this JSON format:
             for (let i = 0; i < table.seats.length; i++) {
               const seat = table.seats[i];
               if (seat.state !== 'occupied' || seat.isAI) continue;
-              if (seat.playerId !== expectedPlayerId) continue;
+              // R3 (live P1) — or a seat THIS account bought into (server-recorded alias):
+              // a seat orphaned by the pre-R3 restore bug comes back by account.
+              if (seat.playerId !== expectedPlayerId && !seatBoughtInBy(seat, userId)) continue;
               if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;
               if (otherSessionHoldsSeat(socket.id, t.tableId, i)) continue;
               reservedSeats.set(userId, {
@@ -10397,7 +10445,7 @@ Give feedback in this JSON format:
             detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'oauthLogin');   // P-g (round 5)
             playerSessions.set(socket.id, {
               socketId: socket.id, tableId: reserved.tableId, seatIndex: reserved.seatIndex,
-              playerName: reserved.playerName, playerId: `user_${userId}`,
+              playerName: reserved.playerName, playerId: `user_${userId}`, seatPlayerId: rSeat.playerId,   // R3 (live P1)
               trainingEnabled: false, sittingOut: false, avatar: reserved.avatar,
             } as PlayerSession);
             socket.join(`table:${reserved.tableId}`);
@@ -10660,7 +10708,8 @@ Give feedback in this JSON format:
               for (let i = 0; i < table.seats.length; i++) {
                 const seat = table.seats[i];
                 if (seat.state !== 'occupied' || seat.isAI) continue;
-                if (seat.playerId !== expectedPlayerId) continue;
+                // R3 (live P1) — or a seat THIS account bought into (server-recorded alias).
+                if (seat.playerId !== expectedPlayerId && !seatBoughtInBy(seat, userId)) continue;
                 // 2026-10-10 — never a seat RESERVED for another account.
                 if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;
                 // 2026-10-10 (round-7 review, major) — never a seat a live
@@ -10717,7 +10766,7 @@ Give feedback in this JSON format:
                   tableId: reserved.tableId,
                   seatIndex: reserved.seatIndex,
                   playerName: reserved.playerName,
-                  playerId: `user_${userId}`,
+                  playerId: `user_${userId}`, seatPlayerId: seat.playerId,   // R3 (live P1)
                   trainingEnabled: false,
                   sittingOut: false,
                   avatar: reserved.avatar,
@@ -10835,7 +10884,7 @@ Give feedback in this JSON format:
                 tableId: reserved.tableId,
                 seatIndex: reserved.seatIndex,
                 playerName: reserved.playerName,
-                playerId: `user_${userId}`,
+                playerId: `user_${userId}`, seatPlayerId: seat.playerId,   // R3 (live P1)
                 trainingEnabled: false,
                 sittingOut: reserved.sittingOut,
                 avatar: reserved.avatar,
@@ -14219,7 +14268,7 @@ Give feedback in this JSON format:
               detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'resumeSession');   // P-g (round 5)
               playerSessions.set(socket.id, {
                 socketId: socket.id, tableId: reserved.tableId, seatIndex: reserved.seatIndex,
-                playerName: reserved.playerName, playerId: `user_${userId}`,
+                playerName: reserved.playerName, playerId: `user_${userId}`, seatPlayerId: rSeat.playerId,   // R3 (live P1)
                 trainingEnabled: false, sittingOut: false, avatar: reserved.avatar,
               } as PlayerSession);
               socket.join(`table:${reserved.tableId}`);
@@ -18014,7 +18063,7 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
           // removal window) is never where his seat is any more.
           const brokeMeanwhile = brokenTournamentTables.has(session.tableId) && !tournamentTables.has(session.tableId);
           const seatStillHis = tableNow === table && seatNow === seat && seat.state === 'occupied'
-            && seat.playerId === session.playerId && !brokeMeanwhile;
+            && sessionHoldsSeat(session, seat) && !brokeMeanwhile;   // R3 (live P1): a restored session's seat too
           const playedElsewhere = otherSessionHoldsSeat(socket.id, session.tableId, session.seatIndex);
           if (currentSession !== session || !seatStillHis || playedElsewhere) {
             if (currentSession === session) playerSessions.delete(socket.id);
@@ -22334,7 +22383,8 @@ function claimSeatsForShutdown(): { credits: ShutdownSeatCredit[]; progress: Arr
       const seat = table?.seats?.[session.seatIndex];
       const seatKey = `${session.tableId}:${session.seatIndex}`;
       if (seat && seat.state === 'occupied' && !creditedSeats.has(seatKey) && !isTournamentTable(session.tableId)) {
-        take(auth.userId, session.tableId, session.seatIndex, 'seated', session.playerId);
+        // R3 (live P1) — a restored session is checked against the seat's own id.
+        take(auth.userId, session.tableId, session.seatIndex, 'seated', session.seatPlayerId || session.playerId);
       }
     }
     playerSessions.delete(socketId);

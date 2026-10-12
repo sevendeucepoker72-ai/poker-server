@@ -49,6 +49,17 @@ export const SEAT_TEARDOWN_SRC: string = [
   fnSrc('function endCashReservation('),
 ].join('\n');
 
+/**
+ * R3 (live P1, 2026-10-11) — the "is this still his seat" helpers
+ * (sessionHoldsSeat: a restored session's seatPlayerId; seatBoughtInBy: the
+ * buy-in alias). They sit at the top of the seat-teardown block, so harnesses
+ * that append SEAT_TEARDOWN_SRC already have them; others append this.
+ */
+export const SEAT_IDENTITY_SRC: string = [
+  fnSrc('function sessionHoldsSeat('),
+  fnSrc('function seatBoughtInBy('),
+].join('\n');
+
 /** The `socket.on('<event>', …)` registration (either layout), through `endNeedle`. */
 export function handlerSrc(event: string, endNeedle: string): string {
   let at = SRC.indexOf(`socket.on('${event}'`);

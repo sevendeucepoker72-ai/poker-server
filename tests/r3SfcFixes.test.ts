@@ -25,7 +25,7 @@ import {
   opponentProfileCount, OPPONENT_PROFILES_CAP,
 } from '../src/ai/AIPlayer';
 import { createFakePokerDb } from './helpers/fakePokerDb';
-import { SRC, slice, fnSrc, handlerSrc, load, flush } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, SEAT_IDENTITY_SRC } from './helpers/indexSource';
 
 const ROOT = path.join(__dirname, '..');
 const quiet = { log() {}, warn() {}, error() {} };
@@ -275,7 +275,7 @@ describe('R3 (AUTH-P3-4) — Dealer\'s Choice: a seated player, a ring table onl
     const room: Array<[string, string, any]> = [];
     const set = (k: string) => (kind === k ? new Set(['T']) : new Set<string>());
     const { exports: m } = load(
-      `${fnSrc('function tableKindOf(')}\n${fnSrc('function dealersChoiceAllowedAt(')}\n${fnSrc('function socketSeatedAt(')}\nfunction wire(socket) {\n${code}\n}`,
+      `${fnSrc('function tableKindOf(')}\n${fnSrc('function dealersChoiceAllowedAt(')}\n${SEAT_IDENTITY_SRC}\n${fnSrc('function socketSeatedAt(')}\nfunction wire(socket) {\n${code}\n}`,
       {
         playerSessions, multiTableSessions, dealersChoiceState, DEALERS_CHOICE_VARIANTS: ['texas-holdem', 'omaha'],
         tableManager: { getTable: (id: string) => (id === 'T' ? t : undefined) },

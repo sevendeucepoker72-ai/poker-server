@@ -1226,3 +1226,7 @@ function opponentModelKey(
 OPPONENT_PROFILES_CAP
 # OPS-P3-2: a phone-number login handle never reaches an [AUDIT] log line.
 phone-handle
+
+# 2026-10-11 R3 (live P1): a sign-in-restored session keeps the seat's own id; the next disconnect reserves it (never orphans it).
+function sessionHoldsSeat(
+function seatBoughtInBy(
