@@ -28,7 +28,7 @@ import { LISTABLE_USER_SQL, publicDisplayName } from '../social/publicIdentity';
 // ./schema also installs the BIGINT → number result parser at import time.
 import { PUBLIC_ID_SQL } from './schema';
 import {
-  BUNDLE_CONTENTS, CHIP_PACK_PAYOUT, LOGIN_CHIPS_BY_DAY, LOGIN_DAY7_MYSTERY_BOX, LOGIN_STARS_BY_DAY,
+  BUNDLE_CONTENTS, CHIP_PACK_PAYOUT, FIRST_CHIPS_WON_SEASON, LOGIN_CHIPS_BY_DAY, LOGIN_DAY7_MYSTERY_BOX, LOGIN_STARS_BY_DAY,
   MYSTERY_BOX_TIERS, MYSTERY_DUPLICATE_REFUND_SHARE, SCRATCH_DUPLICATE_STARS, SEASON_REWARDS, SHOP_PRICES,
   VIP_LOGIN_MULTIPLIER, isFreeForEveryone, loginCycleDay, normalizeItemType, rollMysteryBox, rollScratchCard, rollSpinWheel,
   type ItemType, type RewardRoll, type Rng,
@@ -558,14 +558,22 @@ export function purchaseBattlePassPremium(userId: number, seasonId: string, cost
   }, pool);
 }
 
-/** Does the account own Battle Pass premium for the season (the R2 table, or the pre-R2 stats flag)? */
+/**
+ * Does the account own Battle Pass premium for the season (the R2 table, or the pre-R2 stats flag)?
+ * R3 (S3-1) — the pre-R2 flag is the PARSED TOP-LEVEL `stats.battlePassPremium`
+ * (as loadProgressBundle and purchaseBattlePassPremium read it), never a
+ * substring of the stats text: the client writes `stats.clientData` (D4), so a
+ * crafted saveProgress {stats:{clientData:{battlePassPremium:true}}} put
+ * `"battlePassPremium":true` into the text after the next compact stats write
+ * and unlocked every premium tier for free (15,000 chips, 300 stars, 5 cosmetics).
+ */
 export async function hasBattlePassPremium(userId: number, seasonId: string, db: Queryable = defaultPool()): Promise<boolean> {
   const { rows } = await db.query(
     `SELECT EXISTS (SELECT 1 FROM user_battle_pass_premium WHERE user_id = $1 AND season_id = $2) AS owned,
-            position('"battlePassPremium":true' in COALESCE((SELECT stats::text FROM users WHERE id = $1), '')) > 0 AS legacy`,
+            (SELECT stats::text FROM users WHERE id = $1) AS stats`,
     [userId, seasonId],
   );
-  return !!(rows[0]?.owned || rows[0]?.legacy);
+  return !!rows[0]?.owned || parseStatsColumn(rows[0]?.stats).battlePassPremium === true;
 }
 
 // ───────────────────────────── VIP monthly bonus (C8) ─────────────────────────────
@@ -837,7 +845,8 @@ export async function chipsWonStandings(firstDay: string, lastDay: string, limit
 // ───────────────────────────── Season award (C9) ─────────────────────────────
 
 export interface SeasonAwardResult {
-  status: 'awarded' | 'already_awarded';
+  /** R3 (XL-2) — 'pre_ledger': the month ended before the chips-won ledger existed (nothing paid, nothing marked). */
+  status: 'awarded' | 'already_awarded' | 'pre_ledger';
   seasonKey: string;
   /** The paid rows (`display_name` raw — callers show it through publicNameOf). */
   winners: Array<{ id: number; display_name: string | null; place: number; chips: number; badge: string; won: number }>;
@@ -852,6 +861,9 @@ export interface SeasonAwardResult {
 export async function awardSeason(seasonKey: string, trigger: string, pool?: TxPool): Promise<SeasonAwardResult> {
   const range = monthDateRange(seasonKey);
   if (!range) throw new Error(`invalid season key ${seasonKey}`);
+  // R3 (XL-2) — a month before the ledger existed was never measured: no award,
+  // and NO season_award_runs marker (it would make the month unpayable forever).
+  if (seasonKey < FIRST_CHIPS_WON_SEASON) return { status: 'pre_ledger', seasonKey, winners: [] };
   return withEconomyTx(async (tx) => {
     await tx.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [`season_award:${seasonKey}`]);
     const ran = await tx.query('SELECT 1 FROM season_award_runs WHERE season_key = $1', [seasonKey]);

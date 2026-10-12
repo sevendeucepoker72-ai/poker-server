@@ -23,6 +23,9 @@ const db = {
   levels: new Set<string>(),
   failBundle: 0,
   failSettle: 0,
+  /** R3 (S3-4) — settleLevelUps calls that throw (a DB blip), and the level lists sent. */
+  failLevels: 0,
+  levelCalls: [] as number[][],
   bundleCalls: 0,
   settleCalls: [] as string[],
   merges: [] as Array<[number, Record<string, any>, any]>,
@@ -69,6 +72,8 @@ jest.mock('../src/economy/economyDb', () => ({
     return { status: 'paid', chips: reward.chips, stars: reward.stars, balances: { chips: u.chips, stars: u.stars, scratchCardsAvailable: u.scratch } };
   }),
   settleLevelUps: jest.fn(async (userId: number, levels: Array<{ level: number; chips: number; stars: number }>, newLevel: number, xp: number) => {
+    db.levelCalls.push(levels.map((l) => l.level));
+    if (db.failLevels > 0) { db.failLevels--; throw new Error('Connection terminated unexpectedly'); }
     const u = db.users.get(userId)!;
     let chips = 0; let stars = 0; const paidLevels: number[] = [];
     for (const l of levels) {
@@ -96,6 +101,7 @@ const flush = async () => { for (let i = 0; i < 10; i++) await new Promise((r) =
 function reset() {
   db.users.clear(); db.lifetime.clear(); db.windows.clear(); db.levels.clear();
   db.failBundle = 0; db.failSettle = 0; db.bundleCalls = 0; db.settleCalls = []; db.merges = [];
+  db.failLevels = 0; db.levelCalls = [];
 }
 function freshPm(): ProgressionManager {
   const pm = new ProgressionManager();
@@ -259,6 +265,59 @@ describe('achievements + level-ups settle through ledgers', () => {
     await pm.flushPending();
     expect(db.users.get(14)!.chips).toBe(1500);             // only level 3 (3 x 500)
     expect(rec.chips).toBe(1500);                           // level 2's optimistic 1,000 taken back
+  });
+
+  it('R3 (S3-4) — a level-up whose settlement exhausts its retries stays OWED: the next level-up pays both levels, each once', async () => {
+    user(30, { level: 1, xp: 0, chips: 0, stars: 0 });
+    jest.spyOn(console, 'error').mockImplementationOnce(() => {});
+    const pm = freshPm();
+    let clock = Date.now();
+    pm.now = () => clock;
+    const rec = pm.getOrCreateProgress('p30', 'P', 30);
+    await flush();
+    db.failLevels = 3;                                       // a DB blip longer than the 3 attempts
+    pm.addXP('p30', xpRequiredForLevel(1));                  // 1 → 2 during the outage
+    await pm.flushPending();
+    expect(rec.level).toBe(2);                               // the level is kept (the hand save persists it)
+    expect(db.levelCalls).toEqual([[2], [2], [2]]);
+    expect(db.users.get(30)!.chips).toBe(0);
+    expect(rec.chips).toBe(0);                               // the unpaid reward is not shown
+    clock += 1_000;
+    pm.addXP('p30', 1);                                      // inside the back-off: not re-sent yet
+    await pm.flushPending();
+    expect(db.levelCalls).toHaveLength(3);
+    clock += 60_000;
+    pm.addXP('p30', xpRequiredForLevel(2));                  // 2 → 3, the DB is back
+    await pm.flushPending();
+    expect(db.levelCalls[db.levelCalls.length - 1]).toEqual([2, 3]);   // the owed level rides along
+    expect(db.users.get(30)!.chips).toBe(2 * 500 + 3 * 500);
+    expect(db.users.get(30)!.stars).toBe(2 * 5 + 3 * 5);
+    expect(rec.chips).toBe(2500);                             // shown once paid
+    expect(rec.stars).toBe(25);
+    clock += 120_000;
+    pm.addXP('p30', 1);                                       // nothing owed any more: nothing re-sent
+    await pm.flushPending();
+    expect(db.levelCalls).toHaveLength(4);
+  });
+
+  it('R3 (S3-4) — …or the retry timer pays it with no further XP; a record still owing a level-up is never evicted', async () => {
+    user(31, { level: 1, xp: 0, chips: 0, stars: 0 });
+    jest.spyOn(console, 'error').mockImplementationOnce(() => {});
+    const pm = freshPm();
+    pm.levelSettleRetryMs = 20;
+    const rec = pm.getOrCreateProgress('p31', 'P', 31);
+    await flush();
+    db.failLevels = 3;
+    pm.addXP('p31', xpRequiredForLevel(1));
+    await pm.flushPending();
+    expect(db.users.get(31)!.chips).toBe(0);
+    expect(pm.evictIdle(() => false, -1)).toEqual([]);       // owed: kept
+    await new Promise((r) => setTimeout(r, 120));
+    await pm.flushPending();
+    expect(db.levelCalls[db.levelCalls.length - 1]).toEqual([2]);
+    expect(db.users.get(31)!.chips).toBe(1000);
+    expect(rec.chips).toBe(1000);
+    expect(pm.evictIdle(() => false, -1)).toEqual([userProgressKey(31)]);   // paid: evictable again
   });
 
   it('the chip booster multiplies reward grants (level-up) — never anything else', async () => {

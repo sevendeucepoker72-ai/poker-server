@@ -76,6 +76,7 @@ import {
   findLocalUserByMasterId, awaitIdentityGate, releaseIdentityGate, scheduleBootAccountOps, isMergedTombstone,
   withMasterLock, identityStampPatch, MasterLookupError,
   identityGateState, identityGateStats, identityResolverStats, bootAccountOps,
+  MERGE_START_DELAY_MS, waitForPreviousInstanceGone,
 } from './auth/accountMerge';
 import {
   createPlayStatusClient, createAssertPlayable, resolveSessionMasterId, masterIdFromStats,
@@ -207,7 +208,7 @@ import {
   SPIN_WHEEL_SEGMENTS, SEASON_REWARDS, CAREER_REWARDS, CHIP_GRANT_ALERT_THRESHOLD, VIP_MONTHLY_BONUS_CHIPS,
   BATTLE_PASS_XP_PER_TIER, BATTLE_PASS_TOTAL_TIERS, BATTLE_PASS_PREMIUM_COST, BATTLE_PASS_SEASON_NAME,
   LOGIN_CHIPS_BY_DAY, LOGIN_STARS_BY_DAY, LOGIN_DAY7_MYSTERY_BOX, VIP_LOGIN_MULTIPLIER, FREE_REACTIONS, FREE_EMOTES,
-  catalogForClient, vipTierForSeasonXp,
+  catalogForClient, vipTierForSeasonXp, FIRST_CHIPS_WON_SEASON, RENDERED_ITEM_TYPES,
 } from './economy/catalog';
 import {
   denverDateKey, denverMonthKey, previousDenverMonthKey, nextDenverMidnightMs, nextDenverMonthStartMs,
@@ -2294,6 +2295,13 @@ interface ReservedSeat {
    * disconnect's reservation never carries it (today's auto-restore).
    */
   voluntary?: boolean;
+  /**
+   * R3 (S3-2) — the seat's occupant (`seat.playerId`) when the reservation was
+   * made: a hand that completes while he is away is credited to THIS account's
+   * chips-won only while that occupant still sits there (dealtInSeatAccount).
+   * Absent on a synthetic reservation (sign-in orphan scan) — the seat name is used.
+   */
+  playerId?: string;
 }
 const reservedSeats = new Map<number, ReservedSeat>();
 
@@ -4922,24 +4930,57 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
 
     for (const [socketId, session] of playerSessions) {
       if (session.tableId === tableId) {
+        // R3 (H1 — TABLEUI-6 / APPUI-16 / K2-6) — each recipient's OWN copy:
+        // the table it came from, HIS seat in that hand (viewerSeat) and HIS
+        // cards (viewerHoleCards — the shared record masks every hand that was
+        // not tabled, his own fold / uncontested pot included). Never anyone
+        // else's cards; both keys omitted when he was not seated in that hand.
+        const viewer = handHistoryViewerOf(table, history, session);
+        const forViewer: Record<string, unknown> = { ...serializedHistory, tableId };
+        if (viewer) {
+          forViewer.viewerSeat = viewer.seatIndex;
+          if (viewer.holeCards) forViewer.viewerHoleCards = viewer.holeCards.map(serializeCard);
+        }
         const socket = io.sockets.sockets.get(socketId);
         if (socket) {
-          socket.emit('handHistory', serializedHistory);
+          socket.emit('handHistory', forViewer);
         }
         // Persist the FULL serialized replay record to DB per-user so
         // the Last Hand viewer still works across logins. Previously
         // handleHandComplete wrote a minimal snapshot here (just chips +
         // holeCards + community), which the replay viewer couldn't use
         // — opening Last Hand after login threw inside buildReplaySteps
-        // because history.players was undefined.
+        // because history.players was undefined. R3 (H1): his copy, with
+        // viewerSeat / viewerHoleCards / tableId.
         const auth = authSessions.get(socketId);
         if (auth) {
           const handId = `${tableId}-${serializedHistory.handNumber}-${session.seatIndex}-${Date.now()}`;
-          recordHand(auth.userId, handId, serializedHistory).catch(() => {});
+          recordHand(auth.userId, handId, forViewer).catch(() => {});
         }
       }
     }
   });
+}
+
+/**
+ * R3 (H1) — the recipient's own seat in a finished hand and his own cards, for
+ * his copy of the `handHistory` record; null when his session's seat was not in
+ * that hand. Read in the `handHistory` emit (synchronous with the hand's end:
+ * the seat still holds that hand's cards — a fold keeps them; the next hand is
+ * refused while this one completes). The seat must still be his (same playerId,
+ * or the seat name his restored session carries) — never another player's cards.
+ */
+function handHistoryViewerOf(
+  table: PokerTable, history: HandHistoryRecord, session: PlayerSession,
+): { seatIndex: number; holeCards: Card[] | null } | null {
+  const seatIndex = session.seatIndex;
+  if (!Number.isInteger(seatIndex) || seatIndex < 0) return null;
+  const row = history.players.find((p) => p.seatIndex === seatIndex);
+  const seat = table.seats[seatIndex];
+  if (!row || !seat || seat.state !== 'occupied' || seat.isAI) return null;
+  if (seat.playerId !== session.playerId && seat.playerName !== session.playerName) return null;
+  if (row.name !== seat.playerName) return null;
+  return { seatIndex, holeCards: seat.holeCards.length > 0 ? [...seat.holeCards] : null };
 }
 
 // Target occupancy for cash tables. Keeps the game alive without hogging
@@ -6210,6 +6251,17 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // this hand's records, never a seat that changed hands or forfeited).
   settleInsuranceForHand(tableId, table, totalWonPerSeat);
 
+  // R3 (S3-2) — chips won / club stats are recorded per dealt-in HUMAN SEAT, by
+  // ACCOUNT, and read HERE: after the insurance settlement, before anything can
+  // stand a seat up (tickReservedSeatHands below; processPendingSeatRemovals
+  // runs right after this handler's synchronous part). The live-session loop
+  // used to be the only source: a player who LEFT or DROPPED mid-hand (his seat
+  // kept for the hand's end, e.g. all-in during the runout) got no row — a loss
+  // dodged by tapping Leave whenever behind, while every win stayed recorded.
+  const countsForChipsWon = tableCountsForChipsWon(tableId);
+  const feedsClubStats = tableFeedsClubStats(tableId);
+  const chipsWonSeats = (countsForChipsWon || feedsClubStats) ? chipsWonSeatsOfHand(tableId, table, dealtInSeats) : [];
+
   // Decrement sit-out hand counter for reserved (disconnected) seats on this
   // table. Addendum (R2): AFTER the insurance settlement — a reserved seat at
   // its hand limit is cashed out and stood up here, and it used to be cashed
@@ -6225,14 +6277,31 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
 
   // 2026-10-11 (R2, C6 / C9 / C10) — this hand's ref (the per-hand HUD and
   // mission flags are keyed by table + hand: an account can be in two hands
-  // at once) and its chips-won bucket. humanSessions holds ONLY the seats
-  // dealt into the hand (the GAME-11 / ECON-13 gate above): progress, XP,
-  // missions, achievements, chips won and the scratch tick are theirs alone.
+  // at once). humanSessions holds ONLY the seats dealt into the hand (the
+  // GAME-11 / ECON-13 gate above): progress, XP, missions, achievements and
+  // the scratch tick are theirs alone.
   const handRef = { tableId, handNumber: table.handNumber };
-  const countsForChipsWon = tableCountsForChipsWon(tableId);
-  const feedsClubStats = tableFeedsClubStats(tableId);
+
+  // C9 / APPUI-50 — the hand's NET result (stack now − stack at hand start,
+  // insurance settled: the same measure as the chip-velocity monitor) into the
+  // account's Denver-day chips-won bucket. Humans only, a dealt-in seat with a
+  // hand-start stack; additive SQL (never last-writer-wins). NET, not the gross
+  // pot (`chipsWon` on the result entries): a gross count grows by shoving back
+  // and forth with a friend at no cost, a net one only by taking chips from
+  // someone. R2 merge — the season / leaderboard bucket takes PUBLIC cash hands
+  // only (tableCountsForChipsWon); a club table's hands still feed its club
+  // stats. R3 (S3-2) — one entry per dealt-in SEAT by account (chipsWonSeats,
+  // above): a leaver's or a dropped player's loss is recorded too.
   const chipsWonDay = denverDateKey();
   const clubHandEntries: Array<{ userId: number; net: number; pot: number }> = [];
+  for (const cw of chipsWonSeats) {
+    if (countsForChipsWon) {
+      recordChipWins(cw.userId, chipsWonDay, cw.net, 1)
+        .then(() => { economyStats.chipsWonWrites++; })
+        .catch((e: any) => { economyStats.chipsWonWriteFailures++; console.warn(`[chips-won ${cw.userId}]`, e?.message || e); });
+    }
+    if (feedsClubStats) clubHandEntries.push({ userId: cw.userId, net: cw.net, pot: totalWonPerSeat.get(cw.seatIndex) || 0 });
+  }
 
   for (const session of humanSessions) {
     // Everyone who played gets recordHandPlayed + 5 XP. Pass variantId
@@ -6256,28 +6325,7 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       progressionManager.recordShowdownResult(session.playerId, flopDealt, reachedShowdown, wonAtShowdown, handRef);
     }
 
-    // C9 / APPUI-50 — the hand's NET result (stack now − stack at hand start,
-    // insurance settled: the same measure as the chip-velocity monitor) into
-    // the account's Denver-day chips-won bucket. Humans only (a session), a
-    // dealt-in seat with a hand-start stack, wallet-chip tables only; additive
-    // SQL (never last-writer-wins). NET, not the gross pot (`chipsWon` on the
-    // result entries): a gross count grows by shoving back and forth with a
-    // friend at no cost, a net one only by taking chips from someone.
-    // R2 merge — the season / leaderboard bucket takes PUBLIC cash hands only
-    // (tableCountsForChipsWon); a club table's hands still feed its club stats.
-    const startStack = table.startChips.get(session.seatIndex);
-    if ((countsForChipsWon || feedsClubStats) && seat && !seat.isAI && seat.playerId === session.playerId && startStack !== undefined) {
-      const auth = authSessions.get(session.socketId);
-      const net = (seat.chipCount || 0) - startStack;
-      if (auth?.userId) {
-        if (countsForChipsWon) {
-          recordChipWins(auth.userId, chipsWonDay, net, 1)
-            .then(() => { economyStats.chipsWonWrites++; })
-            .catch((e: any) => { economyStats.chipsWonWriteFailures++; console.warn(`[chips-won ${auth.userId}]`, e?.message || e); });
-        }
-        if (feedsClubStats) clubHandEntries.push({ userId: auth.userId, net, pot: totalWonPerSeat.get(session.seatIndex) || 0 });
-      }
-    }
+    // (Chips won: recorded per dealt-in seat above — R3, S3-2.)
 
     // Determine position category
     const totalOccupied = table.seats.filter((s) => s.state === 'occupied').length;
@@ -8141,6 +8189,9 @@ function announceSeasonAward(res: SeasonAwardResult, actor: string): void {
  * rolls over awards the previous month (awardSeason is idempotent per season —
  * advisory lock + season_award_runs — so every later sweep, and a second
  * process during a deploy overlap, is a no-op). Runs at boot and every 10 min.
+ * R3 (XL-2) — a month before FIRST_CHIPS_WON_SEASON answers 'pre_ledger': not
+ * awarded and not marked (the first R2 boot used to mark September 2026 as
+ * awarded with 0 winners over the empty ledger); lastSeasonSweep shows it.
  */
 async function sweepSeasonAwards(trigger: string): Promise<void> {
   const seasonKey = previousDenverMonthKey(Date.now());
@@ -8158,6 +8209,35 @@ async function sweepSeasonAwards(trigger: string): Promise<void> {
     economyStats.lastSeasonSweep = { at: new Date().toISOString(), seasonKey, status: 'error' };
     console.warn(`[season-award] sweep for ${seasonKey} failed (retried next sweep):`, e?.message || e);
   }
+}
+
+/**
+ * R3 (S3-3) — users.chips INTEGER → BIGINT (economy/schema
+ * migrateUsersChipsToBigint), run only once the PREVIOUS container is gone:
+ * MERGE_START_DELAY_MS after boot, then waitForPreviousInstanceGone — the same
+ * wait as the boot account ops (Railway starts this container ~7s BEFORE it
+ * SIGTERMs the old one). The pre-R2 build has no int8 parser: from the moment
+ * the column is BIGINT, pg hands it chips as a STRING, its hydrate drops a
+ * non-number and every account it loads shows the fresh-init 10,000 wallet.
+ * It used to run seconds after boot, while the old build was still serving.
+ * A busy table lock ('lock_timeout') is retried every minute, 10 tries.
+ * (Rolling back below R2 needs the column turned back first — AGENT.md Rollback.)
+ */
+function scheduleChipsBigintMigration(delayMs: number = MERGE_START_DELAY_MS): void {
+  const run = async (attempt: number): Promise<void> => {
+    const r = await migrateUsersChipsToBigint(getPool() as any).catch((e: any) => { console.warn('[economy] BIGINT migration:', e?.message || e); return 'failed' as const; });
+    economyStats.bigintMigration = r;
+    if (r === 'migrated') console.log('[economy] users.chips is BIGINT now (trigger re-created)');
+    if (r === 'lock_timeout' && attempt < 10) setTimeout(() => { void run(attempt + 1); }, 60_000).unref?.();
+  };
+  economyStats.bigintMigration = 'waiting_for_previous_instance';
+  setTimeout(() => {
+    void (async () => {
+      // Never throws (a failed pg_stat_activity check proceeds); bounded at 60s.
+      try { await waitForPreviousInstanceGone(getPool() as any); } catch { /* proceed */ }
+      await run(1);
+    })();
+  }, delayMs).unref?.();
 }
 
 /** P3 — drop progress records of accounts with no live socket / seat / reservation for 30 min. */
@@ -8190,6 +8270,56 @@ function tableCountsForChipsWon(tableId: string): boolean {
  */
 function tableFeedsClubStats(tableId: string): boolean {
   return !isTournamentTable(tableId) && tableKindOf(tableId) === 'club';
+}
+
+/**
+ * R3 (S3-2) — the chips-won entries of a finished hand: one per dealt-in HUMAN
+ * seat whose ACCOUNT is known, with its NET (stack now − stack at hand start).
+ * Called synchronously by handleHandComplete after the insurance settlement and
+ * before any seat is stood up. Losses can no longer be dodged by leaving: the
+ * account is resolved from the seat, not from a live session.
+ */
+function chipsWonSeatsOfHand(
+  tableId: string, table: PokerTable, dealtInSeats: Set<number>,
+): Array<{ userId: number; seatIndex: number; net: number }> {
+  const out: Array<{ userId: number; seatIndex: number; net: number }> = [];
+  for (const seatIndex of dealtInSeats) {
+    const seat = table.seats[seatIndex];
+    const startStack = table.startChips.get(seatIndex);
+    if (!seat || seat.state !== 'occupied' || seat.isAI || startStack === undefined) continue;
+    const userId = dealtInSeatAccount(tableId, seat);
+    if (userId) out.push({ userId, seatIndex, net: (seat.chipCount || 0) - startStack });
+  }
+  return out;
+}
+
+/**
+ * R3 (S3-2) — the local account behind a dealt-in human seat, in this order:
+ *   1. the live session playing it (main or extra table) — same playerId;
+ *   2. the hand-end removal registered for that occupant (he LEFT mid-hand with
+ *      chips in the pot — teardownSeat), unless it credits nobody (`noCredit`);
+ *   3. his reservation of that seat (he DROPPED: disconnect / account switch),
+ *      while the reserved occupant still sits there and no other account plays it.
+ * A live session that plays the seat decides alone (a guest's → null). null =
+ * no account. Never a name scan across seats.
+ */
+function dealtInSeatAccount(tableId: string, seat: PokerTable['seats'][number]): number | null {
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId !== tableId || s.seatIndex !== seat.seatIndex || s.playerId !== seat.playerId) continue;
+    return authSessions.get(sid)?.userId || null;
+  }
+  for (const [sid, list] of multiTableSessions) {
+    if (!Array.isArray(list) || !list.some((s) => s && s.tableId === tableId && s.seatIndex === seat.seatIndex && s.playerId === seat.playerId)) continue;
+    return authSessions.get(sid)?.userId || null;
+  }
+  const pending = pendingSeatRemovalAfterHand.get(tableId)?.get(seat.seatIndex);
+  if (pending && !pending.noCredit && pending.userId > 0 && (!pending.playerId || pending.playerId === seat.playerId)) return pending.userId;
+  for (const [uid, r] of reservedSeats) {
+    if (r.tableId !== tableId || r.seatIndex !== seat.seatIndex) continue;
+    const sameOccupant = r.playerId ? r.playerId === seat.playerId : r.playerName === seat.playerName;
+    if (sameOccupant && !seatPlayedByAnotherAccount(uid, tableId, seat.seatIndex)) return uid;
+  }
+  return null;
 }
 
 /**
@@ -11441,6 +11571,13 @@ Give feedback in this JSON format:
         socket.emit('seasonLeaderboardAwarded', { success: false, error: 'already_awarded', seasonKey });
         return;
       }
+      // R3 (XL-2) — a month that ended before the chips-won ledger existed has
+      // no ranking to pay: nothing is paid AND nothing is marked (paying it by
+      // another rule stays an owner decision).
+      if (res.status === 'pre_ledger') {
+        socket.emit('seasonLeaderboardAwarded', { success: false, error: 'pre_ledger_season', seasonKey, firstSeason: FIRST_CHIPS_WON_SEASON });
+        return;
+      }
       // Audit AFTER commit — the movements are now durable.
       announceSeasonAward(res, auth.username);
       socket.emit('seasonLeaderboardAwarded', { success: true, seasonKey, results: seasonAwardPublicResults(res) });
@@ -12898,10 +13035,12 @@ Give feedback in this JSON format:
       const userId = ctx!.userId;
       const itemType = normalizeItemType(data?.itemType);
       const itemId = String(data?.itemId ?? '');
+      // A free wheel emote (`fire`, `dead`, …): everyone already has it — never charged.
+      // R3 (E1) — checked BEFORE the price: the catalog no longer prices fire / dead,
+      // and an older client that still lists them gets "already own" (not "unknown").
+      if (itemType === 'emote' && FREE_EMOTES.includes(itemId)) { reply({ success: false, error: economyMessage('already_owned'), code: 'already_owned', itemType, itemId }); return; }
       const cost = shopPrice(itemType, itemId);
       if (cost === null) { reply({ success: false, error: economyMessage('unknown_item'), code: 'unknown_item', itemType, itemId }); return; }
-      // A free wheel emote the shop also lists (`fire`, `dead`): everyone already has it — never charged.
-      if (itemType === 'emote' && FREE_EMOTES.includes(itemId)) { reply({ success: false, error: economyMessage('already_owned'), code: 'already_owned', itemType, itemId }); return; }
 
       let res: Settled<any>;
       let extra: Record<string, unknown> = {};
@@ -12946,7 +13085,10 @@ Give feedback in this JSON format:
           extra = { vipExpiresAt: res.vipExpiresAt };
           progressionManager.updateUser(userId, (p) => { p.vipExpiresAt = res.vipExpiresAt; });
         }
-      } else if (isOwnableItem(itemType, itemId)) {
+      } else if (isOwnableItem(itemType, itemId) && RENDERED_ITEM_TYPES.has(itemType)) {
+        // R3 (E1) — only a cosmetic the client renders is sold (a celebration /
+        // sound pack / chip skin / card front / dealer voice / profile
+        // background is drawn nowhere: a crafted request bought nothing visible).
         res = await purchaseCosmetic(userId, itemType, itemId, cost);
         if (res.ok) {
           inventoryChanged = true;
@@ -17799,6 +17941,8 @@ function reserveSeatForDeparture(
     cleanupTimer,
     handsRemaining: typeof opts.handsRemaining === 'number' ? opts.handsRemaining : DISCONNECT_HANDS_LIMIT,
     ...(opts.voluntary ? { voluntary: true } : {}),
+    // R3 (S3-2) — the occupant, for the chips-won account of hands he is away for.
+    ...(seat?.playerId ? { playerId: String(seat.playerId) } : {}),
     // T1: snapshot — a later table break drops the id from tournamentTables.
     // F2: and a disconnect IN the break window (session still on the
     // broken table, id already gone from tournamentTables) is still a
@@ -21506,13 +21650,8 @@ initDB().then(async () => {
     await initEconomyTables(getPool());
     console.log('[economy] tables ready');
   } catch (e: any) { console.error('[economy] initEconomyTables failed (claims that need the new ledgers refuse until a boot succeeds):', e?.message || e); }
-  const runBigintMigration = async (attempt: number): Promise<void> => {
-    const r = await migrateUsersChipsToBigint(getPool() as any).catch((e: any) => { console.warn('[economy] BIGINT migration:', e?.message || e); return 'failed' as const; });
-    economyStats.bigintMigration = r;
-    if (r === 'migrated') console.log('[economy] users.chips is BIGINT now (trigger re-created)');
-    if (r === 'lock_timeout' && attempt < 10) setTimeout(() => { void runBigintMigration(attempt + 1); }, 60_000).unref?.();
-  };
-  void runBigintMigration(1);
+  // R3 (S3-3) — not at once: only after the previous container is gone (see scheduleChipsBigintMigration).
+  scheduleChipsBigintMigration();
   void sweepSeasonAwards('boot');
   setInterval(() => { void sweepSeasonAwards('sweep'); }, 10 * 60_000).unref?.();
   setInterval(() => { try { evictIdleProgress(); } catch (e: any) { console.warn('[progress-evict]', e?.message || e); } }, 10 * 60_000).unref?.();

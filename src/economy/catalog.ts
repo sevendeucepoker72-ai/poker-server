@@ -70,14 +70,16 @@ export const SHOP_PRICES: Record<string, Record<string, number>> = {
     bronze: 500, silver: 1000, gold: 2000, diamond: 5000,
     flame: 6000, ice: 6000, crown: 10000, platinum: 8000, mythic: 15000,
   },
-  // Emotes
+  // Emotes. R3 (E1 / K2-3) — `fire` and `dead` are not sold: they are FREE
+  // wheel emotes every account already has (FREE_EMOTES); the shop listed them
+  // at 250 / 300 stars and every purchase was refused `already_owned`.
   emote: {
     nice_hand: 150, good_game: 150, well_played: 150,
     thumbs_up: 150, clap: 200, love: 250,
-    big_brain: 200, money: 200, fire: 250,
+    big_brain: 200, money: 200,
     tears: 250, rocket: 300, crown: 400,
     sunglasses: 200, laughing: 200, surprised: 200,
-    dead: 300, think: 300, poker_face: 400,
+    think: 300, poker_face: 400,
     mic_drop: 500, trophy: 600,
   },
   // Celebrations
@@ -148,13 +150,36 @@ export const CHIP_PACK_PAYOUT: Record<string, number> = {
   pro: 750000, whale: 2000000, kingpin: 5000000, emperor: 15000000,
 };
 
-/** What a bundle grants. A duplicate refunds 25% of the bundle price pro rata in stars. */
+/**
+ * R3 (E1 — ECON-6 / APPUI-5) — the cosmetic types the client RENDERS (table
+ * theme, card back, nameplate frame, title, emote wheel). Nothing sold or
+ * granted may be inert: a bundle, a mystery-box pool and the scratch emote pool
+ * hold only these types, and the shop sells no other cosmetic type. Celebration
+ * / sound pack / chip skin / card front / dealer voice / profile background
+ * rows a player already owns stay in his inventory (collectibles).
+ */
+export const RENDERED_ITEM_TYPES: ReadonlySet<string> = new Set<ItemType>(['theme', 'card_back', 'frame', 'title', 'emote']);
+
+/**
+ * What a bundle grants. A duplicate refunds 25% of the bundle price pro rata in stars.
+ * R3 (E1) — every item is a RENDERED type; each celebration / sound pack /
+ * dealer voice / chip skin / card front / profile background a bundle used to
+ * hold was replaced 1:1 by a rendered catalog item of a similar price:
+ *   collector  chip_rain 800 → title bad_beat_survivor 800
+ *   tournament fireworks 1200 → title final_table 1000
+ *   whale      golden_shower 2000 → title tournament_champ 2000, fantasy 1000 →
+ *              theme cherry_wood 900, celebrity 2200 → frame gold 2000
+ *   mythic     supernova 6000 → frame flame 6000, chip_skin mythic 4000 → frame
+ *              diamond 5000, card_front artistic 2800 → title royal 3000,
+ *              mythic_sage 4000 → card_back diamond_pattern 2000, diamond_rain
+ *              2500 → title tournament_champ 2000
+ */
 export const BUNDLE_CONTENTS: Record<string, Array<[ItemType, string]>> = {
   starter: [['card_back', 'silver_foil'], ['emote', 'nice_hand'], ['frame', 'bronze']],
-  collector: [['card_back', 'gold_premium'], ['theme', 'casino_royale'], ['frame', 'silver'], ['emote', 'crown'], ['celebration', 'chip_rain']],
-  tournament: [['title', 'tournament_champ'], ['theme', 'royal_gold'], ['frame', 'gold'], ['card_back', 'holographic'], ['celebration', 'fireworks'], ['emote', 'trophy']],
-  whale_bundle: [['theme', 'cosmic_nebula'], ['card_back', 'diamond_pattern'], ['frame', 'diamond'], ['celebration', 'golden_shower'], ['emote', 'mic_drop'], ['title', 'royal'], ['sound_pack', 'fantasy'], ['dealer_voice', 'celebrity']],
-  mythic_bundle: [['card_back', 'mythic'], ['frame', 'mythic'], ['title', 'godmode'], ['celebration', 'supernova'], ['chip_skin', 'mythic'], ['card_front', 'artistic'], ['dealer_voice', 'mythic_sage'], ['profile_bg', 'diamond_rain'], ['theme', 'cosmic_nebula']],
+  collector: [['card_back', 'gold_premium'], ['theme', 'casino_royale'], ['frame', 'silver'], ['emote', 'crown'], ['title', 'bad_beat_survivor']],
+  tournament: [['title', 'tournament_champ'], ['theme', 'royal_gold'], ['frame', 'gold'], ['card_back', 'holographic'], ['title', 'final_table'], ['emote', 'trophy']],
+  whale_bundle: [['theme', 'cosmic_nebula'], ['card_back', 'diamond_pattern'], ['frame', 'diamond'], ['title', 'tournament_champ'], ['emote', 'mic_drop'], ['title', 'royal'], ['theme', 'cherry_wood'], ['frame', 'gold']],
+  mythic_bundle: [['card_back', 'mythic'], ['frame', 'mythic'], ['title', 'godmode'], ['frame', 'flame'], ['frame', 'diamond'], ['title', 'royal'], ['card_back', 'diamond_pattern'], ['title', 'tournament_champ'], ['theme', 'cosmic_nebula']],
 };
 
 // ───────────────────────────── Boosters ─────────────────────────────
@@ -262,10 +287,10 @@ export function isFreeItem(type: unknown, id: unknown): boolean {
 
 /**
  * An item EVERY account can already use: a free (price 0) catalog item, or one
- * of the emote wheel's free emotes (FREE_EMOTES). The shop also lists `fire` /
- * `dead` at a price (an owner call to rename or drop) — buying one is refused
- * `already_owned` (never a charge for nothing), and a scratch / mystery-box
- * roll that lands on one pays the duplicate stars instead.
+ * of the emote wheel's free emotes (FREE_EMOTES). R3 (E1): the shop no longer
+ * lists `fire` / `dead` and no pool rolls them; a purchase request for one is
+ * still refused `already_owned` (never a charge for nothing), and a roll that
+ * ever lands on a free item pays the duplicate stars instead.
  */
 export function isFreeForEveryone(type: unknown, id: unknown): boolean {
   return isFreeItem(type, id) || (normalizeItemType(type) === 'emote' && FREE_EMOTES.includes(String(id ?? '')));
@@ -283,19 +308,26 @@ export type RewardRoll =
   | { kind: 'stars'; amount: number }
   | { kind: 'item'; itemType: ItemType; itemId: string };
 
-/** Mystery box tiers (shop + the Day-7 login box, which is a 'basic' box). */
+/**
+ * Mystery box tiers (shop + the Day-7 login box, which is a 'basic' box).
+ * R3 (E1 / K2-7) — RENDERED types only, 1:1 replacements of a similar price:
+ * basic fire (free) → emote tears 250, sound_pack classic_casino 300 → emote
+ * rocket 300 (the basic item roll is now always an emote); premium celebration
+ * chip_rain 800 → title bad_beat_survivor 800; legendary celebration supernova
+ * 6000 → frame flame 6000 (premium / legendary stay "a frame, title or card back").
+ */
 export const MYSTERY_BOX_TIERS: Record<string, { chips: [number, number]; stars: [number, number]; itemPool: Array<[ItemType, string]> }> = {
   basic: {
     chips: [5000, 25000], stars: [50, 150],
-    itemPool: [['emote', 'nice_hand'], ['emote', 'fire'], ['sound_pack', 'classic_casino']],
+    itemPool: [['emote', 'nice_hand'], ['emote', 'tears'], ['emote', 'rocket']],
   },
   premium: {
     chips: [25000, 150000], stars: [200, 600],
-    itemPool: [['frame', 'silver'], ['celebration', 'chip_rain'], ['title', 'the_shark'], ['card_back', 'holographic']],
+    itemPool: [['frame', 'silver'], ['title', 'bad_beat_survivor'], ['title', 'the_shark'], ['card_back', 'holographic']],
   },
   legendary: {
     chips: [150000, 1000000], stars: [800, 2500],
-    itemPool: [['frame', 'diamond'], ['celebration', 'supernova'], ['title', 'royal'], ['card_back', 'mythic']],
+    itemPool: [['frame', 'diamond'], ['frame', 'flame'], ['title', 'royal'], ['card_back', 'mythic']],
   },
 };
 /** A duplicate mystery-box item is refunded this share of the box price, in stars. */
@@ -334,8 +366,11 @@ export function rollSpinWheel(rng: Rng = Math.random): typeof SPIN_WHEEL_SEGMENT
   return SPIN_WHEEL_SEGMENTS[SPIN_WHEEL_SEGMENTS.length - 1];
 }
 
-/** Scratch card: 20% stars (10-49), 10% an emote from the pool, 70% chips (1,000-9,999). */
-export const SCRATCH_EMOTE_POOL: readonly string[] = ['nice_hand', 'good_game', 'fire', 'crown'];
+/**
+ * Scratch card: 20% stars (10-49), 10% an emote from the pool, 70% chips (1,000-9,999).
+ * R3 (E1) — sellable emotes only: `fire` (free for everyone) → `love` (250).
+ */
+export const SCRATCH_EMOTE_POOL: readonly string[] = ['nice_hand', 'good_game', 'love', 'crown'];
 /** A scratch-card emote the player already owns pays this many stars instead. */
 export const SCRATCH_DUPLICATE_STARS = 25;
 export function rollScratchCard(rng: Rng = Math.random): RewardRoll {
@@ -387,6 +422,16 @@ export const SEASON_REWARDS: ReadonlyArray<{ place: number; chips: number; badge
   { place: 2, chips: 25000, badge: 'season_silver' },
   { place: 3, chips: 10000, badge: 'season_bronze' },
 ];
+
+/**
+ * R3 (XL-2) — the first Denver month the chips-won ledger (user_chip_wins,
+ * created at the first R2 boot) measures. An earlier season was never
+ * measured: it is never awarded and never MARKED awarded (the first R2 boot's
+ * sweep used to record September 2026 as "awarded, 0 winners" over the empty
+ * ledger, so it could never be paid). Paying a pre-ledger month is an owner
+ * decision; leaving it unmarked keeps that possible.
+ */
+export const FIRST_CHIPS_WON_SEASON = '2026-10';
 
 // ───────────────────────────── Alerts ─────────────────────────────
 

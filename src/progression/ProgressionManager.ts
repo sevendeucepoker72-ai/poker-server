@@ -416,6 +416,17 @@ interface RecordInternals {
    */
   pendChips: number;
   pendStars: number;
+  /**
+   * R3 (S3-4) — level-ups whose ledger settlement exhausted its retries (a DB
+   * blip): level → base reward. Never dropped: re-sent with the next
+   * settlement (the next addXP — every dealt-in hand adds XP) or by the retry
+   * timer, `levelSettleRetryMs` after the failure. The per-level ledger key
+   * (economy_credits `levelup:<uid>:<level>`) makes a late / repeated send pay
+   * at most once. Their reward is shown only once a settlement pays it.
+   */
+  pendingLevels: Map<number, { level: number; chips: number; stars: number }>;
+  levelRetryAfter: number;
+  levelRetryTimer: ReturnType<typeof setTimeout> | null;
 }
 
 export interface EconomyAuditEvent {
@@ -444,6 +455,8 @@ export class ProgressionManager {
   hydrateBackoffMs: number[] = [0, 250, 1000];
   /** Background re-hydrate schedule after every attempt failed (ms). */
   hydrateRetryDelaysMs: number[] = [5_000, 15_000, 60_000, 180_000];
+  /** R3 (S3-4) — wait before a level-up whose settlement failed is re-sent (ms); tests shorten it. */
+  levelSettleRetryMs = 60_000;
   /** Clock seam for tests. */
   now: () => number = () => Date.now();
 
@@ -462,7 +475,10 @@ export class ProgressionManager {
   private inner(p: PlayerProgress): RecordInternals {
     let i = this.internals.get(p);
     if (!i) {
-      i = { handFlags: new Map(), committedHands: [], pendingAch: new Set(), achRetryAfter: new Map(), pendChips: 0, pendStars: 0 };
+      i = {
+        handFlags: new Map(), committedHands: [], pendingAch: new Set(), achRetryAfter: new Map(), pendChips: 0, pendStars: 0,
+        pendingLevels: new Map(), levelRetryAfter: 0, levelRetryTimer: null,
+      };
       this.internals.set(p, i);
     }
     return i;
@@ -951,6 +967,7 @@ export class ProgressionManager {
       if (p.userId && isLive(p.userId)) continue;
       const i = this.internals.get(p);
       if (i && i.pendingAch.size > 0) continue;
+      if (i && i.pendingLevels.size > 0) continue;   // R3 (S3-4) — an unpaid level-up is still owed
       if (this.hydrations.has(key)) continue;
       this.progressMap.delete(key);
       this.pendingEvents.delete(key);
@@ -1176,14 +1193,37 @@ export class ProgressionManager {
       progress.xpToNextLevel = Infinity;
     }
 
-    if (levels.length > 0 && progress.userId && progress.hydrated) {
-      const shownChips = levels.reduce((s, l) => s + this.boostChipReward(progress, l.chips), 0);
-      const shownStars = levels.reduce((s, l) => s + l.stars, 0);
+    if (progress.userId && progress.hydrated) {
       const inner = this.inner(progress);
-      inner.pendChips += shownChips;
-      inner.pendStars += shownStars;
-      this.settleLevels(progress, levels, progress.level, progress.xp, shownChips, shownStars, 0);
+      // R3 (S3-4) — level-ups whose settlement failed earlier ride along (their
+      // reward is not shown: it appears when this settlement pays it).
+      const owed = this.takeOwedLevels(inner);
+      if (levels.length > 0 || owed.length > 0) {
+        const shownChips = levels.reduce((s, l) => s + this.boostChipReward(progress, l.chips), 0);
+        const shownStars = levels.reduce((s, l) => s + l.stars, 0);
+        inner.pendChips += shownChips;
+        inner.pendStars += shownStars;
+        this.settleLevels(progress, [...owed, ...levels], progress.level, progress.xp, shownChips, shownStars, 0);
+      }
     }
+  }
+
+  /** R3 (S3-4) — the owed (failed) level-ups due for a re-send, removed from the owed list (an in-flight send re-adds them on failure). */
+  private takeOwedLevels(inner: RecordInternals): Array<{ level: number; chips: number; stars: number }> {
+    if (inner.pendingLevels.size === 0 || this.now() < inner.levelRetryAfter) return [];
+    const owed = [...inner.pendingLevels.values()].sort((a, b) => a.level - b.level);
+    inner.pendingLevels.clear();
+    return owed;
+  }
+
+  /** R3 (S3-4) — re-send owed level-ups without waiting for the next XP (the retry timer). Not due / not hydrated: re-armed. */
+  private retryOwedLevels(progress: PlayerProgress): void {
+    const inner = this.inner(progress);
+    if (inner.pendingLevels.size === 0 || !progress.userId) return;
+    if (!progress.hydrated) inner.levelRetryAfter = Math.max(inner.levelRetryAfter, this.now() + this.levelSettleRetryMs);
+    const owed = progress.hydrated ? this.takeOwedLevels(inner) : [];
+    if (owed.length > 0) this.settleLevels(progress, owed, progress.level, progress.xp, 0, 0, 0);
+    else this.scheduleOwedLevelRetry(progress);
   }
 
   private settleLevels(
@@ -1219,10 +1259,29 @@ export class ProgressionManager {
         settled();
         progress.chips = Math.max(0, progress.chips - shownChips);
         progress.stars = Math.max(0, progress.stars - shownStars);
-        console.error(`[ProgressionManager.levelUp ${userId}] reward settlement failed after retries (levels ${levels.map((l) => l.level).join(',')}):`, e?.message || e);
+        // R3 (S3-4) — the levels are OWED, never dropped: the record keeps its
+        // raised level (the hand-complete save persists it, so the level is
+        // never crossed again) and used to lose the reward for good. Re-sent
+        // with the next settlement or by the timer; the ledger pays each once.
+        for (const l of levels) inner.pendingLevels.set(l.level, l);
+        inner.levelRetryAfter = this.now() + this.levelSettleRetryMs;
+        this.scheduleOwedLevelRetry(progress);
+        console.error(`[ProgressionManager.levelUp ${userId}] reward settlement failed after retries (levels ${levels.map((l) => l.level).join(',')}) — kept owed, retried in ${Math.round(this.levelSettleRetryMs / 1000)}s:`, e?.message || e);
         this.notify(progress);
       });
     this.track(job);
+  }
+
+  /** R3 (S3-4) — one retry timer per record (unref'd: it never holds the process open); a failed re-send arms it again. */
+  private scheduleOwedLevelRetry(progress: PlayerProgress): void {
+    const inner = this.inner(progress);
+    if (inner.levelRetryTimer) return;
+    const t = setTimeout(() => {
+      inner.levelRetryTimer = null;
+      this.retryOwedLevels(progress);
+    }, Math.max(0, inner.levelRetryAfter - this.now()));
+    (t as any).unref?.();
+    inner.levelRetryTimer = t;
   }
 
   // ───────────────────────── per-hand recording ─────────────────────────

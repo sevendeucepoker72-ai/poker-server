@@ -72,6 +72,8 @@ const P = {
   rebalance: fnSrc('function handleTableRebalance(tournamentId: string): void {'),
   autoStart: fnSrc('function autoStartNextHand(tableId: string): void {'),
   handComplete: fnSrc('async function handleHandComplete('),
+  // R3 (S3-2) — handleHandComplete's per-seat chips-won resolution (gated: never a tournament hand).
+  chipsWonSeats: fnSrc('function chipsWonSeatsOfHand(') + fnSrc('function dealtInSeatAccount('),
   events: slice('  tournamentManager.onEvent(tournamentId, (event, data) => {', '\n  });\n', SRC.indexOf('function bootstrapTournamentTables(')),
   // S1/S2/M3 (2026-10-10): the socket 'startHand' and 'returnToTournamentSeat' handlers, the seat-keep
   // region (keepTournamentSeatOnLeave / restoreAbsentTournamentSeat / detachTournamentEntrantSockets),
@@ -169,6 +171,7 @@ ${p.helpers}
 ${p.rebalance}
 ${p.autoStart}
 ${p.handComplete}
+${p.chipsWonSeats}
 function registerEvents(tournamentId) {
 ${p.events}
 }
