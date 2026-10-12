@@ -175,19 +175,61 @@ describe('XL-2 — a season before the chips-won ledger is never awarded or mark
 // ─────────────────────────────── S3-3 ───────────────────────────────
 
 describe('S3-3 — the users.chips BIGINT migration waits for the previous container', () => {
-  function migrationWorld(results: string[]) {
+  function migrationWorld(results: string[], otherServers: number[] = []) {
     const timers: Array<{ fn: () => void; ms: number }> = [];
     const wait = deferred();
     const migrate = jest.fn(async () => results.shift() ?? 'already_bigint');
     const waitForPreviousInstanceGone = jest.fn(() => wait.p);
+    // R3 review (SF-B-2) — the narrowed "another poker-server is connected" check.
+    const countOtherPokerServerSessions = jest.fn(async () => otherServers.shift() ?? 0);
     const economyStats = { bigintMigration: 'pending' };
     const schedule = load(fnSrc('function scheduleChipsBigintMigration('), {
       setTimeout: (fn: () => void, ms: number) => { timers.push({ fn, ms }); return { unref() {} }; },
       MERGE_START_DELAY_MS: 20_000, waitForPreviousInstanceGone, migrateUsersChipsToBigint: migrate,
+      countOtherPokerServerSessions, BIGINT_GATE_POLL_MS: 30_000,
       getPool: () => ({}), economyStats, console: quiet,
     }, 'scheduleChipsBigintMigration').exports;
-    return { schedule, timers, wait, migrate, waitForPreviousInstanceGone, economyStats };
+    return { schedule, timers, wait, migrate, waitForPreviousInstanceGone, countOtherPokerServerSessions, economyStats };
   }
+
+  it('R3 review (SF-B-2): the old build still connected after the 60s wait → NO ALTER; re-checked every 30s, migrated only once it is gone', async () => {
+    const w = migrationWorld(['migrated'], [2, 1, 0]);
+    w.schedule();
+    w.timers[0].fn();
+    (w.wait.resolve as (v: unknown) => void)({ olderConnections: 4, waitedMs: 60_000 });   // the wait gave up with the old container's sessions open
+    await flush();
+    expect(w.migrate).not.toHaveBeenCalled();
+    expect(w.economyStats.bigintMigration).toBe('waiting_for_previous_instance');
+    expect(w.countOtherPokerServerSessions).toHaveBeenCalledTimes(1);
+    expect(w.timers.map((t) => t.ms)).toEqual([20_000, 30_000]);
+    w.timers[1].fn();                                             // still 1 other server session
+    await flush();
+    expect(w.migrate).not.toHaveBeenCalled();
+    w.timers[2].fn();                                             // gone
+    await flush();
+    expect(w.migrate).toHaveBeenCalledTimes(1);
+    expect(w.economyStats.bigintMigration).toBe('migrated');
+  });
+
+  it('CONTROL — the pre-review scheduler (wait result discarded) ALTERs while the old build is still connected', async () => {
+    const fn = fnSrc('function scheduleChipsBigintMigration(');
+    const gate = 'if (older > 0) { await recheck(); return; }';
+    expect(fn).toContain(gate);
+    const timers: Array<{ fn: () => void; ms: number }> = [];
+    const wait = deferred();
+    const migrate = jest.fn(async () => 'migrated');
+    const schedule = load(fn.split(gate).join(''), {
+      setTimeout: (f: () => void, ms: number) => { timers.push({ fn: f, ms }); return { unref() {} }; },
+      MERGE_START_DELAY_MS: 20_000, waitForPreviousInstanceGone: () => wait.p, migrateUsersChipsToBigint: migrate,
+      countOtherPokerServerSessions: async () => 4, BIGINT_GATE_POLL_MS: 30_000,
+      getPool: () => ({}), economyStats: { bigintMigration: 'pending' }, console: quiet,
+    }, 'scheduleChipsBigintMigration').exports;
+    schedule();
+    timers[0].fn();
+    (wait.resolve as (v: unknown) => void)({ olderConnections: 4, waitedMs: 60_000 });
+    await flush();
+    expect(migrate).toHaveBeenCalledTimes(1);
+  });
 
   it('nothing at boot; MERGE_START_DELAY_MS later it waits for the old instance; only then the ALTER', async () => {
     const w = migrationWorld(['migrated']);
@@ -225,7 +267,9 @@ describe('S3-3 — the users.chips BIGINT migration waits for the previous conta
     expect(SRC.split('migrateUsersChipsToBigint(').length - 1).toBe(1);
     const fn = fnSrc('function scheduleChipsBigintMigration(');
     expect(fn.indexOf('await waitForPreviousInstanceGone(')).toBeGreaterThan(-1);
-    expect(fn.indexOf('await run(1);')).toBeGreaterThan(fn.indexOf('await waitForPreviousInstanceGone('));
+    expect(fn.lastIndexOf('await run(1);')).toBeGreaterThan(fn.indexOf('await waitForPreviousInstanceGone('));
+    // R3 review (SF-B-2): the recheck path migrates only when no other poker-server session is left
+    expect(fn).toContain('if (others === 0) { await run(1); return; }');
     expect(fn).toContain('delayMs: number = MERGE_START_DELAY_MS');
   });
 

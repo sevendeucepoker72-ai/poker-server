@@ -211,7 +211,7 @@ import {
   SPIN_WHEEL_SEGMENTS, SEASON_REWARDS, CAREER_REWARDS, CHIP_GRANT_ALERT_THRESHOLD, VIP_MONTHLY_BONUS_CHIPS,
   BATTLE_PASS_XP_PER_TIER, BATTLE_PASS_TOTAL_TIERS, BATTLE_PASS_PREMIUM_COST, BATTLE_PASS_SEASON_NAME,
   LOGIN_CHIPS_BY_DAY, LOGIN_STARS_BY_DAY, LOGIN_DAY7_MYSTERY_BOX, VIP_LOGIN_MULTIPLIER, FREE_REACTIONS, FREE_EMOTES,
-  catalogForClient, vipTierForSeasonXp, FIRST_CHIPS_WON_SEASON, RENDERED_ITEM_TYPES,
+  catalogForClient, vipTierForSeasonXp, FIRST_CHIPS_WON_SEASON, RENDERED_ITEM_TYPES, SOLD_COSMETIC_TYPES,
 } from './economy/catalog';
 import {
   denverDateKey, denverMonthKey, previousDenverMonthKey, nextDenverMidnightMs, nextDenverMonthStartMs,
@@ -1190,8 +1190,11 @@ async function _ensureAuditTable(): Promise<void> {
 const PHONE_HANDLE_RE = /^\+?[\d\s().-]{7,}$/;
 function auditActorLabel(actor: unknown): string {
   const a = String(actor ?? '');
+  // R3 review (SFC-2) — ANY actor that is a live session's login handle prints
+  // as that session's `user:<id>` (legacy OIDC rows' handles are real full
+  // names, ticket rows' are login slugs), whatever its shape.
+  if (a && a !== 'SYSTEM') for (const s of authSessions.values()) if (s && s.username === a) return `user:${s.userId}`;
   if (!PHONE_HANDLE_RE.test(a) || a.replace(/\D/g, '').length < 7) return a;
-  for (const s of authSessions.values()) if (s && s.username === a) return `user:${s.userId}`;
   return 'phone-handle';
 }
 function auditLog(actorUsername: string, action: string, details: Record<string, unknown> = {}) {
@@ -1311,10 +1314,46 @@ function processPendingSeatRemovals(tableId: string): void {
       seat.missedBlind = 'none';
       sitOutTracker.get(tableId)?.delete(seatIndex);
       table.standUp(seatIndex);
+      endStaleSessionsAtSeat(tableId, seatIndex);
     }
   }
   syncSitOutToTable(tableId);
   broadcastGameState(tableId);
+}
+
+/**
+ * R3 review (SFC-1) — a seat just stood up at the hand's end is nobody's: any
+ * session (main or extra-table) or reservation still pointing at it is STALE —
+ * never left in place, or its socket would see and act for the seat's NEXT
+ * occupant (its state is getGameStateForPlayer(table, seatIndex)).
+ */
+function endStaleSessionsAtSeat(tableId: string, seatIndex: number): void {
+  for (const [sid, s] of [...playerSessions]) {
+    if (s.tableId !== tableId || s.seatIndex !== seatIndex) continue;
+    playerSessions.delete(sid);
+    const sock = io.sockets.sockets.get(sid);
+    if (sock) {
+      sock.leave(`table:${tableId}`);
+      sock.emit('seatVacated', { tableId, seatIndex, reason: 'left_after_hand' });
+    }
+    console.warn(`[seat-teardown] ${JSON.stringify({ event: 'stale_session_ended_at_removed_seat', tableId, seatIndex })}`);
+  }
+  for (const [sid, list] of [...multiTableSessions]) {
+    if (!Array.isArray(list)) continue;
+    const keep = list.filter((s) => !(s && s.tableId === tableId && s.seatIndex === seatIndex));
+    if (keep.length === list.length) continue;
+    if (keep.length) multiTableSessions.set(sid, keep); else multiTableSessions.delete(sid);
+    const sock = io.sockets.sockets.get(sid);
+    if (sock) {
+      sock.leave(`table:${tableId}`);
+      sock.emit('seatVacated', { tableId, seatIndex, reason: 'left_after_hand' });
+    }
+  }
+  for (const [uid, r] of [...reservedSeats]) {
+    if (r.tableId !== tableId || r.seatIndex !== seatIndex) continue;
+    if (r.cleanupTimer) clearTimeout(r.cleanupTimer);
+    reservedSeats.delete(uid);
+  }
 }
 
 // ========== Seat teardown — ONE helper (.online R2, 2026-10-11: GAME-15 / GAME-16 + Addendum) ==========
@@ -2817,6 +2856,17 @@ app.get('/api/health', async (_req, res) => {
       // (a forfeit, another hand, a seat that changed hands); open = windows
       // waiting right now (each lasts at most INSURANCE_DECISION_MS).
       insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
+      // R3 review (SF-B-3) — the economy's boot work and sweeps, visible to a
+      // plain curl after a deploy (counts / status only, no ids): the users.chips
+      // BIGINT migration (waiting_for_previous_instance -> migrated /
+      // already_bigint / lock_timeout / failed) and the season sweep.
+      economy: {
+        bigintMigration: economyStats.bigintMigration,
+        lastSeasonSweep: economyStats.lastSeasonSweep ? { at: economyStats.lastSeasonSweep.at, seasonKey: economyStats.lastSeasonSweep.seasonKey, status: economyStats.lastSeasonSweep.status } : null,
+        seasonSweeps: economyStats.seasonSweeps, seasonAwards: economyStats.seasonAwards, seasonSweepErrors: economyStats.seasonSweepErrors,
+        chipsWonWrites: economyStats.chipsWonWrites, chipsWonWriteFailures: economyStats.chipsWonWriteFailures,
+        freshReadFailures: economyStats.freshReadFailures,
+      },
       // 2026-10-11 (.online R2, S2 engine lane) — table lifecycle counters:
       // seatTeardown (GAME-15/16: stand-ups deferred to the hand's end, all-in
       // leavers kept in, out-of-turn folds, hands awarded at once), botStacks
@@ -8377,6 +8427,26 @@ async function sweepSeasonAwards(trigger: string): Promise<void> {
  * A busy table lock ('lock_timeout') is retried every minute, 10 tries.
  * (Rolling back below R2 needs the column turned back first — AGENT.md Rollback.)
  */
+const BIGINT_GATE_POLL_MS = 30_000;
+const BIGINT_GATE_BOOT_ISO = new Date().toISOString();
+/**
+ * R3 review (SF-B-2) — sessions of ANOTHER poker-server process: any
+ * 'poker-server:*' application name but our own, plus unlabelled sessions
+ * opened before this process booted (an older build). A diag client opened
+ * since (psql, a script) never counts.
+ */
+async function countOtherPokerServerSessions(pool: { query: (q: string, p?: unknown[]) => Promise<{ rows: any[] }> }): Promise<number> {
+  const { rows } = await pool.query(
+    `SELECT count(*)::int AS n FROM pg_stat_activity
+      WHERE datname = current_database() AND pid <> pg_backend_pid()
+        AND backend_type = 'client backend'
+        AND application_name IS DISTINCT FROM current_setting('application_name')
+        AND (application_name LIKE 'poker-server%' OR (application_name = '' AND backend_start < $1::timestamptz))`,
+    [BIGINT_GATE_BOOT_ISO],
+  );
+  return Number(rows[0]?.n) || 0;
+}
+
 function scheduleChipsBigintMigration(delayMs: number = MERGE_START_DELAY_MS): void {
   const run = async (attempt: number): Promise<void> => {
     const r = await migrateUsersChipsToBigint(getPool() as any).catch((e: any) => { console.warn('[economy] BIGINT migration:', e?.message || e); return 'failed' as const; });
@@ -8385,10 +8455,24 @@ function scheduleChipsBigintMigration(delayMs: number = MERGE_START_DELAY_MS): v
     if (r === 'lock_timeout' && attempt < 10) setTimeout(() => { void run(attempt + 1); }, 60_000).unref?.();
   };
   economyStats.bigintMigration = 'waiting_for_previous_instance';
+  // R3 review (SF-B-2) — NEVER blind: while another poker-server process is
+  // still connected (the old build still serving — a new container Railway
+  // never made healthy, a long drain) the ALTER waits, re-checked every 30s.
+  let polls = 0;
+  const recheck = async (): Promise<void> => {
+    let others = -1;
+    try { others = await countOtherPokerServerSessions(getPool() as any); } catch (e: any) { console.warn('[economy] BIGINT gate check failed (retrying):', e?.message || e); }
+    if (others === 0) { await run(1); return; }
+    polls++;
+    if (polls === 1 || polls % 20 === 0) console.warn(`[economy] ${JSON.stringify({ event: 'bigint_migration_waiting_for_previous_instance', otherServerSessions: others, polls })}`);
+    setTimeout(() => { void recheck(); }, BIGINT_GATE_POLL_MS).unref?.();
+  };
   setTimeout(() => {
     void (async () => {
-      // Never throws (a failed pg_stat_activity check proceeds); bounded at 60s.
-      try { await waitForPreviousInstanceGone(getPool() as any); } catch { /* proceed */ }
+      // Bounded at 60s; its result is ACTED on (it used to be discarded).
+      let older = 0;
+      try { older = Number((await waitForPreviousInstanceGone(getPool() as any))?.olderConnections) || 0; } catch { older = 0; }
+      if (older > 0) { await recheck(); return; }
       await run(1);
     })();
   }, delayMs).unref?.();
@@ -10401,6 +10485,8 @@ Give feedback in this JSON format:
               // R3 (live P1) — or a seat THIS account bought into (server-recorded alias):
               // a seat orphaned by the pre-R3 restore bug comes back by account.
               if (seat.playerId !== expectedPlayerId && !seatBoughtInBy(seat, userId)) continue;
+              // R3 review (SFC-1) — never a seat he LEFT that waits for its after-hand removal.
+              if (pendingSeatRemovalAfterHand.get(t.tableId)?.has(i)) continue;
               if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;
               if (otherSessionHoldsSeat(socket.id, t.tableId, i)) continue;
               reservedSeats.set(userId, {
@@ -10710,6 +10796,8 @@ Give feedback in this JSON format:
                 if (seat.state !== 'occupied' || seat.isAI) continue;
                 // R3 (live P1) — or a seat THIS account bought into (server-recorded alias).
                 if (seat.playerId !== expectedPlayerId && !seatBoughtInBy(seat, userId)) continue;
+                // R3 review (SFC-1) — never a seat he LEFT that waits for its after-hand removal.
+                if (pendingSeatRemovalAfterHand.get(t.tableId)?.has(i)) continue;
                 // 2026-10-10 — never a seat RESERVED for another account.
                 if (seatReservedByOtherAccount(userId, t.tableId, i)) continue;
                 // 2026-10-10 (round-7 review, major) — never a seat a live
@@ -13309,10 +13397,11 @@ Give feedback in this JSON format:
           extra = { vipExpiresAt: res.vipExpiresAt };
           progressionManager.updateUser(userId, (p) => { p.vipExpiresAt = res.vipExpiresAt; });
         }
-      } else if (isOwnableItem(itemType, itemId) && RENDERED_ITEM_TYPES.has(itemType)) {
+      } else if (isOwnableItem(itemType, itemId) && SOLD_COSMETIC_TYPES.has(itemType)) {
         // R3 (E1) — only a cosmetic the client renders is sold (a celebration /
-        // sound pack / chip skin / card front / dealer voice / profile
-        // background is drawn nowhere: a crafted request bought nothing visible).
+        // sound pack / chip skin / card front / dealer voice is drawn nowhere: a
+        // crafted request bought nothing visible). R3 review (SF-B-1): profile
+        // backgrounds ARE drawn (lobby banner, profile page) and stay for sale.
         res = await purchaseCosmetic(userId, itemType, itemId, cost);
         if (res.ok) {
           inventoryChanged = true;

@@ -154,11 +154,17 @@ export const CHIP_PACK_PAYOUT: Record<string, number> = {
  * R3 (E1 — ECON-6 / APPUI-5) — the cosmetic types the client RENDERS (table
  * theme, card back, nameplate frame, title, emote wheel). Nothing sold or
  * granted may be inert: a bundle, a mystery-box pool and the scratch emote pool
- * hold only these types, and the shop sells no other cosmetic type. Celebration
- * / sound pack / chip skin / card front / dealer voice / profile background
- * rows a player already owns stay in his inventory (collectibles).
+ * hold only these types. Celebration / sound pack / chip skin / card front /
+ * dealer voice rows a player already owns stay in his inventory (collectibles).
  */
 export const RENDERED_ITEM_TYPES: ReadonlySet<string> = new Set<ItemType>(['theme', 'card_back', 'frame', 'title', 'emote']);
+
+/**
+ * R3 review (SF-B-1) — what the SHOP sells: the rendered table cosmetics plus
+ * profile backgrounds (drawn on the lobby banner and the profile page, so not
+ * inert). Bundles and the mystery / scratch pools stay on RENDERED_ITEM_TYPES.
+ */
+export const SOLD_COSMETIC_TYPES: ReadonlySet<string> = new Set<string>([...RENDERED_ITEM_TYPES, 'profile_bg']);
 
 /**
  * What a bundle grants. A duplicate refunds 25% of the bundle price pro rata in stars.

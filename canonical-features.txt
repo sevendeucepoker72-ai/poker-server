@@ -1230,3 +1230,8 @@ phone-handle
 # 2026-10-11 R3 (live P1): a sign-in-restored session keeps the seat's own id; the next disconnect reserves it (never orphans it).
 function sessionHoldsSeat(
 function seatBoughtInBy(
+
+# 2026-10-12 R3 final review: stale sessions end with their removed seat (SFC-1); the BIGINT ALTER never runs while another server is connected (SF-B-2); economy status on /api/health.
+stale_session_ended_at_removed_seat
+bigint_migration_waiting_for_previous_instance
+economy: {

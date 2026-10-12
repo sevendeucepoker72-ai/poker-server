@@ -407,6 +407,16 @@ describe('R3 (OPS-P3-2) — no login handle (legacy phone numbers) in the logs',
     for (const a of ['SYSTEM', 'user:12', '4481', 'josh.hall2', 'm:123456', 'Alice A.', 'user_1541']) expect(m.auditActorLabel(a)).toBe(a);
   });
 
+  it('R3 review (SFC-2): ANY live session\'s login handle (a legacy full-name row, a ticket slug) prints as user:<id>', () => {
+    const { m, lines } = audit([['S1', { userId: 4198, username: 'Jane Q Public' }], ['S2', { userId: 4492, username: 'jane.public' }]]);
+    m.auditLog('Jane Q Public', 'BUY_IN_DEDUCT', { tableId: 'T', buyIn: 500 });
+    m.auditLog('jane.public', 'CASH_OUT', { amount: 5 });
+    expect(lines[0]).toContain('| user:4198 | BUY_IN_DEDUCT |');
+    expect(lines[1]).toContain('| user:4492 | CASH_OUT |');
+    expect(lines.join('\n')).not.toMatch(/Jane Q Public|jane\.public/);
+    expect(m.auditActorLabel('SYSTEM')).toBe('SYSTEM');
+  });
+
   it('CONTROL — pre-R3 auditLog printed the raw handle', () => {
     const pre = fnSrc('function auditLog(').replace('${auditActorLabel(actorUsername)}', '${actorUsername}');
     const lines: string[] = [];

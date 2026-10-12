@@ -240,7 +240,7 @@ describe('C7 / ECON-6 — the shop and equips only ever touch real catalog items
     const w = world();
     w.users.set(48, { stars: 100000 });
     const t = w.connect('S1', 48);
-    for (const [itemType, itemId] of [['celebration', 'confetti'], ['sound_pack', 'fantasy'], ['chip_skin', 'mythic'], ['card_front', 'artistic'], ['dealer_voice', 'robot'], ['profile_bg', 'aurora']]) {
+    for (const [itemType, itemId] of [['celebration', 'confetti'], ['sound_pack', 'fantasy'], ['chip_skin', 'mythic'], ['card_front', 'artistic'], ['dealer_voice', 'robot']]) {
       await t.call('purchaseShopItem', { itemType, itemId });
       expect(t.last('purchaseResult')).toMatchObject({ success: false, code: 'unknown_item', itemType, itemId });
     }
@@ -252,6 +252,10 @@ describe('C7 / ECON-6 — the shop and equips only ever touch real catalog items
     // a rendered cosmetic still sells at the catalog price
     await t.call('purchaseShopItem', { itemType: 'title', itemId: 'final_table' });
     expect(w.fakes.purchaseCosmetic).toHaveBeenCalledWith(48, 'title', 'final_table', 1000);
+    // R3 review (SF-B-1) — a profile background is drawn (lobby banner, profile page): still sold
+    await t.call('purchaseShopItem', { itemType: 'profile_bg', itemId: 'aurora' });
+    expect(w.fakes.purchaseCosmetic).toHaveBeenCalledWith(48, 'profile_bg', 'aurora', catalog.shopPrice('profile_bg', 'aurora'));
+    expect(catalog.shopPrice('profile_bg', 'aurora')).toBe(700);
   });
 
   it('a whale chip pack is a LARGE CHIP GRANT (alert + durable audit); a refused purchase pushes the DB-fresh wallet', async () => {

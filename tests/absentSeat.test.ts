@@ -2091,3 +2091,40 @@ describe('R3 (live P1) — a sign-in-RESTORED seat is still his on the NEXT disc
     expect(w.credits).toEqual([]);
   });
 });
+
+// ── R3 review (SFC-1) ────────────────────────────────────────────────────
+describe('R3 review (SFC-1) — a sign-in never puts a player back on a seat he LEFT that waits for its after-hand removal', () => {
+  const LEFT_ID = 'player-alice-left';
+  /** Alice left mid-hand with chips in the pot: teardownSeat queued the seat for the hand's end and ended her session. */
+  function leftMidHand(w: ReturnType<typeof world>) {
+    w.table.seats[0].playerId = LEFT_ID;
+    (w.g.progressionManager as any).getProgress = (pid: string) => (pid === LEFT_ID ? { userId: ALICE } : undefined);
+    (w.g.pendingSeatRemovalAfterHand as Map<string, Map<number, any>>)
+      .set('t1', new Map([[0, { userId: ALICE, username: 'alice.player', playerId: LEFT_ID }]]));
+  }
+
+  it.each([
+    ['oauthLogin', (s: any) => s.handlers.oauthLogin({ accessToken: 'oidc-alice' })],
+    ['tokenLogin (OIDC branch)', (s: any) => s.handlers.tokenLogin({ token: 'oidc-alice' })],
+  ] as const)('%s on a new socket before the hand ends: NOT restored (no session, no reservation, no reconnectedToTable)', async (_via, login) => {
+    const w = world();
+    leftMidHand(w);
+    const s2 = w.mkSocket('S2');
+    await login(s2);
+    await flush();
+    expect(w.playerSessions.has('S2')).toBe(false);
+    expect(w.reservedSeats.has(ALICE)).toBe(false);
+    expect(w.emitted('S2').map(([ev]) => ev)).not.toContain('reconnectedToTable');
+  });
+
+  it('CONTROL — without the pending-removal skip, the buy-in alias scan binds her new socket to the seat she left', async () => {
+    const SKIP = 'if (pendingSeatRemovalAfterHand.get(t.tableId)?.has(i)) continue;';
+    expect(P.oauth).toContain(SKIP);
+    const w = world({ over: { oauth: P.oauth.split(SKIP).join('') } });
+    leftMidHand(w);
+    const s2 = w.mkSocket('S2');
+    await s2.handlers.oauthLogin({ accessToken: 'oidc-alice' });
+    await flush();
+    expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
+  });
+});
