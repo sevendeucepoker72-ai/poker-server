@@ -366,7 +366,7 @@ describe('S3-2 — chips won is recorded per dealt-in human SEAT, by account', (
     expect([w.table.seats[1].chipCount, w.table.seats[2].chipCount]).toEqual([4000, 0]);
     expect(w.chipsWon).toEqual([{ userId: 7, net: 2000 }, { userId: 8, net: -2000 }]);
     // only the side monitors are inert in this world — every path the assertions rely on is real
-    expect([...w.stubbed].filter((n) => !n.includes('.')).sort()).toEqual(['recordChipVelocity', 'recordRevealedCommitment', 'standUpSeatsPastSitOutLimit']);
+    expect([...w.stubbed].filter((n) => !n.includes('.')).sort()).toEqual(['opponentModelKey', 'recordChipVelocity', 'recordRevealedCommitment', 'standUpSeatsPastSitOutLimit']);   // + the AI opponent-model key (R3 GAME-P3-10, imported from AIPlayer)
   });
 
   it('Bob taps Leave during the runout hold (his seat kept for the hand): his −2,000 is STILL recorded', async () => {
