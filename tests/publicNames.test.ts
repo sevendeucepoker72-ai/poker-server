@@ -106,7 +106,15 @@ function world() {
     findUsersByDisplayName: async (n: string, limit = 2) => accounts.filter((a) => a.displayName.toLowerCase() === n.trim().toLowerCase()).slice(0, limit),
     getPublicNames: async (ids: number[]) => new Map(ids.filter((i) => names.has(i)).map((i) => [i, names.get(i)!])),
     sendFriendRequest: async (from: number, to: number) => { friendRequests.push([from, to]); return { ok: true, status: 'pending' }; },
-    io: { to: (sid: string) => ({ emit: (ev: string, d: any) => { toEmits.push([sid, ev, d]); } }) },
+    io: {
+      to: (sid: string) => ({ emit: (ev: string, d: any) => { toEmits.push([sid, ev, d]); } }),
+      // R3 (S1-5, contract I1) — a table invite goes to each live socket of the (accepted) friend.
+      sockets: { sockets: new Map([['S44', { connected: true, emit: (ev: string, d: any) => { toEmits.push(['S44', ev, d]); } }]]) },
+    },
+    // R3 (S1-5) — the inviter sits at T1 (a public cash table); 44 is his accepted friend.
+    playerSessions: new Map([['S1', { socketId: 'S1', tableId: 'T1', seatIndex: 0, playerId: 'p-1' }]]),
+    multiTableSessions: new Map(), challengeTables: new Map(),
+    tableKindOf: () => 'cash', isFixedRosterTable: () => false, areAcceptedFriends: async () => true,
     getPool: () => ({ query: async (_t: string, p: unknown[]) => ({ rows: p[0] === 44 ? [{ level: 9, stats: '{"handsPlayed":20,"handsWon":5}', achievements: '[]' }] : [] }) }),
     tournamentManager: {
       getTournamentList: () => [{ tournamentId: 'Q1', status: 'running' }],
@@ -120,7 +128,7 @@ function world() {
         ],
       }),
     },
-    tableManager: {},
+    tableManager: { getTable: (id: string) => (id === 'T1' ? { seats: [{ state: 'occupied' }] } : undefined) },
   };
   const code = `${HELPERS}\nconst stakingOffers = stakingOffersMap;\nfunction wire(socket) {\n${HANDLERS}\n}`;
   scope.stakingOffersMap = stakingOffers;
@@ -176,7 +184,8 @@ describe('the socket surface sends public names only', () => {
     expect(w.toEmits).toContainEqual(['S44', 'friendRequestReceived', { from: 'Josh Hall' }]);
     expect(await s.call('sendFriendRequest', { userId: 999 })).toMatchObject({ code: 'friend_not_found' });   // not a real account
     await s.call('inviteFriendToTable', { userId: 44, tableId: 'T1' });
-    expect(w.toEmits).toContainEqual(['S44', 'tableInvite', { from: 'Josh Hall', tableId: 'T1' }]);
+    // R3 (S1-5, contract I1) — + tableKind (the join path); still the inviter's PUBLIC name, never his login handle.
+    expect(w.toEmits).toContainEqual(['S44', 'tableInvite', { from: 'Josh Hall', tableId: 'T1', tableKind: 'cash' }]);
   });
 
   it('requestProfile: looked up by exact display name, echoes the requested name, never a login handle', async () => {

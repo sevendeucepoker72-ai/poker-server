@@ -69,6 +69,8 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
   let clubSeq = 0;
   const failures: Array<{ pattern: RegExp; times: number }> = [];
   const statements: string[] = [];
+  /** R3 (S1-3) — every pg_advisory_xact_lock key taken (in order). */
+  const locks: string[] = [];
   const now = () => new Date().toISOString();
 
   const res = (rows: any[]) => ({ rows, rowCount: rows.length });
@@ -258,6 +260,25 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
       if (o.remaining <= 0) o.settled_at = now();
       return { rows: [{ remaining: o.remaining }], rowCount: 1 };
     }
+    // R3 (S1-2) — a refund CLOSES the offer first and plans from the backers it returns.
+    if (/^UPDATE staking_offers SET remaining = 0 WHERE id = \$1 AND paid_out_at IS NULL AND refunded_at IS NULL RETURNING backers$/i.test(q)) {
+      const o = state.offers.get(params[0]);
+      if (!o || o.paid_out_at || o.refunded_at) return { rows: [], rowCount: 0 };
+      o.remaining = 0;
+      return { rows: [{ backers: JSON.parse(JSON.stringify(o.backers)) }], rowCount: 1 };
+    }
+    // R3 (S1-3) — createStake: the per (tournament, seller) lock, then his unsettled offered % from the DB.
+    if (/^SELECT pg_advisory_xact_lock\(hashtext\(\$1\)::bigint\)$/i.test(q)) {
+      locks.push(String(params[0]));
+      return { rows: [{ pg_advisory_xact_lock: '' }], rowCount: 1 };
+    }
+    if (/^SELECT COALESCE\(SUM\(total_pct\), 0\)::int AS offered FROM staking_offers WHERE tournament_id = \$1 AND seller_id = \$2 AND escrow = TRUE AND paid_out_at IS NULL AND refunded_at IS NULL$/i.test(q)) {
+      const [tid, seller] = params;
+      const offered = [...state.offers.values()]
+        .filter((o) => o.tournament_id === tid && o.seller_id === seller && o.escrow && !o.paid_out_at && !o.refunded_at)
+        .reduce((s, o) => s + Number(o.total_pct), 0);
+      return { rows: [{ offered }], rowCount: 1 };
+    }
     throw new Error(`fakePokerDb: unhandled SQL: ${q.slice(0, 120)}`);
   }
 
@@ -280,6 +301,7 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
     get members() { return state.members; },
     get clubs() { return state.clubs; },
     statements,
+    locks,
     failNext(pattern: RegExp, times = 1) { failures.push({ pattern, times }); },
   };
 }

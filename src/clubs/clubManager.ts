@@ -2745,6 +2745,20 @@ export async function getClubOfWeek(): Promise<{ success: boolean; club?: ClubIn
 }
 
 /**
+ * R3 (S1-5) — the ACTIVE club_tables row a runtime table belongs to: its row
+ * id (what joinClubTable takes) and its club. null = no such row (a scheduled
+ * club table has none, a closed one is inactive).
+ */
+export async function getClubTableRowForRuntimeTable(runtimeTableId: string): Promise<{ clubTableId: number; clubId: number } | null> {
+  const { rows } = await getPool().query('SELECT id, clubId FROM club_tables WHERE tableId = $1 AND isActive = 1 LIMIT 1', [runtimeTableId]);
+  const row = rows[0] as any;
+  if (!row) return null;
+  const clubTableId = Number(row.id);
+  const clubId = Number(row.clubid ?? row.clubId);
+  return Number.isInteger(clubTableId) && clubTableId > 0 && Number.isInteger(clubId) && clubId > 0 ? { clubTableId, clubId } : null;
+}
+
+/**
  * 2026-10-11 (.online R2, CLUBS P3) — the club a RUNTIME table belongs to (the
  * club_tables row createClubTable stamped with it), else null. Used by the
  * hand-complete path to feed club_stats / club XP (updateClubStats and

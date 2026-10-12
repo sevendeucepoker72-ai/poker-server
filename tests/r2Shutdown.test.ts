@@ -32,7 +32,7 @@ const A = 101;
 const B = 102;
 const C = 103;
 
-function world(opts: { stuckStakingRefund?: boolean } = {}) {
+function world(opts: { stuckStakingRefund?: boolean; flush?: string } = {}) {
   const db = createFakePokerDb({ [A]: 0, [B]: 0, [C]: 0 });
   const tm = new TournamentManager();
   const tables = new Map<string, PokerTable>();
@@ -52,6 +52,10 @@ function world(opts: { stuckStakingRefund?: boolean } = {}) {
   const creditRefunds: string[] = [];
   const saved: number[] = [];
   const directCredits: Array<[number, number]> = [];
+  // R3 — the sweep's buyer aliases (seat playerId -> account), frames to a master's live sockets, io-wide frames.
+  const buyers = new Map<string, number>();
+  const masterFrames: Array<[string, string, any]> = [];
+  const ioEmits: Array<[string, any]> = [];
   const ledger = createPrizeLedger({ connect: () => db.pool.connect() as any, sleep: async () => {}, log: () => {}, backoffMs: [0] });
   const scope: Record<string, unknown> = {
     tableManager: { getTable: (id: string) => tables.get(id), getTableList: () => [...tables.keys()].map((tableId) => ({ tableId })) },
@@ -65,9 +69,17 @@ function world(opts: { stuckStakingRefund?: boolean } = {}) {
     refundStakesOf: (tid: string) => { stakes.push(tid); return opts.stuckStakingRefund ? new Promise(() => {}) : Promise.resolve(0); },
     refundClubTournamentEntrants: async (clubTid: number, liveId: string, entrants: any[]) => { clubRefunds.push({ clubTid, liveId, entrants }); return 'committed'; },
     refundQuickEntryFee: async (tableId: string, qg: any) => { qg.settlement = 'refunded'; quickRefunds.push(tableId); },
-    finishQuickGame: (tableId: string, outcome: any) => { quickFinished.push([tableId, outcome]); },
+    // Like the real one: runs once (R3 — the flush settles decided games first, then its Spin & Go fallback skips a finished one).
+    finishQuickGame: (tableId: string, outcome: any) => {
+      quickFinished.push([tableId, outcome]);
+      const qg = (scope.quickGames as Map<string, any>).get(tableId);
+      if (qg) qg.finished = true;
+    },
     refundQualifierCreditOnMaster: async (id: string) => { creditRefunds.push(id); return true; },
-    progressionManager: { getClientProgress: (pid: string) => ({ hydrated: true, xp: 10, level: 2, achievements: [], pid }) },
+    // R3 (TOURNEY-9) — getProgress: the unclaimed-seat sweep names a seat's buyer by its progression alias (none here).
+    progressionManager: { getClientProgress: (pid: string) => ({ hydrated: true, xp: 10, level: 2, achievements: [], pid }), getProgress: (pid: string) => (buyers.has(pid) ? { userId: buyers.get(pid) } : undefined) },
+    socketsOfMaster: (master: string) => [{ emit: (ev: string, p: any) => masterFrames.push([master, ev, p]) }],
+    io: { emit: (ev: string, p: any) => ioEmits.push([ev, p]) },
     saveProgress: async (uid: number) => { saved.push(uid); },
     snapshotHand() {}, flushAllHandSnapshots: async () => {},
     addChipsToUser: async (uid: number, amt: number) => { directCredits.push([uid, amt]); return true; },
@@ -77,9 +89,9 @@ function world(opts: { stuckStakingRefund?: boolean } = {}) {
     Sentry: null,
     console: { log() {}, warn() {}, error() {} },
   };
-  const code = `${BROKEN}\n${IS_TOURNAMENT_RESERVATION}\n${CREDIT_SEAT}\n${RELEASE_QUALIFIER}\n${BUY_IN_GONE}\n${FLUSH}`;
+  const code = `${BROKEN}\n${IS_TOURNAMENT_RESERVATION}\n${CREDIT_SEAT}\n${RELEASE_QUALIFIER}\n${BUY_IN_GONE}\n${opts.flush ?? FLUSH}`;
   const { exports: m } = load(code, scope, '{ gracefulShutdown, shutdownFlushActive, shutdownFlushStats, creditSeatStackToWallet, buyInSocketGone }');
-  return { db, tm, tables, mk, scope, m, exits, audits, told, stakes, clubRefunds, quickRefunds, quickFinished, creditRefunds, saved, directCredits };
+  return { db, tm, tables, mk, scope, m, exits, audits, told, stakes, clubRefunds, quickRefunds, quickFinished, creditRefunds, saved, directCredits, buyers, masterFrames, ioEmits };
 }
 
 const S = (w: ReturnType<typeof world>) => w.scope as any;
@@ -284,5 +296,144 @@ describe('wiring', () => {
     expect(SRC).toContain("installProcessCrashHandlers({\n  flush: () => gracefulShutdown('uncaughtException', 1),");
     expect(FLUSH).toContain('!creditedSeats.has(seatKey) && !isTournamentTable(session.tableId)');
     expect(FLUSH).toContain('if (isTournamentReservation(reserved)) { shutdownFlushStats.seatsNotCashed++; continue; }');
+  });
+});
+
+// ─────────────────────────── R3 (2026-10-11, SF-A) ───────────────────────────
+describe('R3 (TOURNEY-9) — defense in depth: an occupied human CASH seat no claim reached is credited once, to its account', () => {
+  /** A sign-in RESTORED session: its playerId is the account's `user_<id>`, the seat keeps its own `player-<uuid>`. */
+  function restoredSession() {
+    const w = world();
+    const t = w.mk('cash');
+    t.sitDown(0, 'A', 4000, 'player-aaa', false);
+    t.sitDown(1, 'Bot', 3000, 'ai-1', true);
+    S(w).authSessions.set('SA', { userId: A, username: 'a' });
+    S(w).playerSessions.set('SA', { socketId: 'SA', tableId: 'cash', seatIndex: 0, playerId: `user_${A}` });
+    return { w, t };
+  }
+
+  it('a restored session\'s seat (session playerId user_<id> ≠ the seat\'s player-<uuid>): credited once to the account whose buy-in seated it', async () => {
+    const { w, t } = restoredSession();
+    w.buyers.set('player-aaa', A);
+    await w.m.gracefulShutdown('SIGTERM');
+    expect(w.db.wallets.get(A)).toBe(4000);
+    expect([...w.db.payouts.keys()]).toEqual(['shutdown:INST:cash:0']);
+    expect(t.seats[0].chipCount).toBe(0);
+    expect(t.seats[1].chipCount).toBe(3000);                                   // never a bot
+    expect(w.m.shutdownFlushStats).toMatchObject({ unclaimedSeatsCredited: 1, unclaimedSeatsUnowned: 0 });
+    expect(w.audits.find((x) => x.action === 'SHUTDOWN_UNCLAIMED_SEAT_CREDITED')?.d).toMatchObject({ userId: A, chips: 4000, via: 'unclaimed_buy_in' });
+  });
+
+  it('with no buyer alias left, the ONE account whose session pointed at the seat is its owner', async () => {
+    const { w } = restoredSession();
+    await w.m.gracefulShutdown('SIGTERM');
+    expect(w.db.wallets.get(A)).toBe(4000);
+    expect(w.audits.find((x) => x.action === 'SHUTDOWN_UNCLAIMED_SEAT_CREDITED')?.d).toMatchObject({ via: 'unclaimed_session' });
+  });
+
+  it('CONTROL — without the sweep the restored session\'s stack dies with the process (the main-seat claim refuses the playerId mismatch)', async () => {
+    const start = FLUSH.indexOf('  // R3 (TOURNEY-9) — DEFENSE IN DEPTH');
+    const end = FLUSH.indexOf('  return { credits, progress };\n', start);
+    expect([start > 0, end > start]).toEqual([true, true]);
+    const w = world({ flush: FLUSH.slice(0, start) + FLUSH.slice(end) });
+    const t = w.mk('cash');
+    t.sitDown(0, 'A', 4000, 'player-aaa', false);
+    S(w).authSessions.set('SA', { userId: A, username: 'a' });
+    S(w).playerSessions.set('SA', { socketId: 'SA', tableId: 'cash', seatIndex: 0, playerId: `user_${A}` });
+    w.buyers.set('player-aaa', A);
+    await w.m.gracefulShutdown('SIGTERM');
+    expect(w.db.wallets.get(A)).toBe(0);
+    expect(t.seats[0].chipCount).toBe(4000);
+  });
+
+  it('orphan seats (no session, reservation or removal): a `user_<id>` stamp, else the buyer; mid-hand with its investment; never a tournament / Spin & Go seat; no owner = audited, untouched', async () => {
+    const w = world();
+    const cash = w.mk('cash');
+    const hand = w.mk('hand');
+    const tour = w.mk('tour');
+    const spin = w.mk('spin');
+    cash.sitDown(0, 'B', 2500, `user_${B}`, false);                           // stamped
+    cash.sitDown(1, 'C', 1500, 'player-ccc', false);                          // its buyer: C
+    cash.sitDown(2, 'Who', 700, 'player-zzz', false, true);                       // nobody can be named
+    hand.sitDown(0, 'C', 900, 'player-hhh', false, true);
+    hand.sitDown(1, 'X', 900, 'player-xxx', false, true);
+    (hand as any).currentPhase = GamePhase.Flop;
+    hand.seats[0].totalInvestedThisHand = 100;
+    tour.sitDown(0, 'A', 9000, `user_${A}`, false);
+    spin.sitDown(0, 'A', 500, `user_${A}`, false, true);
+    S(w).tournamentTables.set('tour', 'T1');
+    S(w).spinGoMultipliers.set('spin', 3);
+    w.buyers.set('player-ccc', C);
+    w.buyers.set('player-hhh', C);
+    await w.m.gracefulShutdown('SIGTERM');
+    expect([w.db.wallets.get(A), w.db.wallets.get(B), w.db.wallets.get(C)]).toEqual([0, 2500, 1500 + 900 + 100]);
+    expect([...w.db.payouts.keys()].sort()).toEqual(['shutdown:INST:cash:0', 'shutdown:INST:cash:1', 'shutdown:INST:hand:0']);
+    expect([cash.seats[2].chipCount, tour.seats[0].chipCount, spin.seats[0].chipCount, hand.seats[1].chipCount]).toEqual([700, 9000, 500, 900]);
+    expect(w.audits.filter((x) => x.action === 'SHUTDOWN_UNCLAIMED_SEAT_NO_OWNER').map((x) => [x.d.tableId, x.d.seatIndex]).sort())
+      .toEqual([['cash', 2], ['hand', 1]]);
+    expect(w.m.shutdownFlushStats).toMatchObject({ unclaimedSeatsCredited: 3, unclaimedSeatsUnowned: 2 });
+  });
+
+  it('never twice: a seat a claim already credited, and a seat its teardown said is owed nothing (noCredit), are left alone by the sweep', async () => {
+    const w = world();
+    const t = w.mk('cash');
+    t.sitDown(0, 'A', 4000, 'pA', false);
+    t.sitDown(1, 'B', 600, 'pB', false, true);
+    (t as any).currentPhase = GamePhase.Turn;
+    t.seats[1].totalInvestedThisHand = 50;
+    S(w).authSessions.set('SA', { userId: A, username: 'a' });
+    S(w).playerSessions.set('SA', { socketId: 'SA', tableId: 'cash', seatIndex: 0, playerId: 'pA' });
+    S(w).pendingSeatRemovalAfterHand.set('cash', new Map<number, any>([[1, { userId: 0, username: '', noCredit: true, playerId: 'pB' }]]));
+    w.buyers.set('pA', A);
+    w.buyers.set('pB', B);
+    await w.m.gracefulShutdown('SIGTERM');
+    expect([w.db.wallets.get(A), w.db.wallets.get(B)]).toEqual([4000, 0]);
+    expect([...w.db.payouts.keys()]).toEqual(['shutdown:INST:cash:0']);
+    expect(w.m.shutdownFlushStats).toMatchObject({ seatsCashedOut: 1, unclaimedSeatsCredited: 0 });
+  });
+});
+
+describe('R3 (S1-6, contract Q1) — the flush TELLS an upcoming qualifier\'s registrants it was cancelled', () => {
+  it('registering / starting: qualifierCancelled {qualifierId, reason:\'server_restart\', creditRefunded} to each registrant (read BEFORE the release); every closed event: qualifierTournamentUpdate cancelled', async () => {
+    const w = world();
+    const reg = (id: string, master: string, credit?: string) => ({ playerId: id, masterPlayerId: master, playerName: id, phone: '', socketId: 's', ...(credit ? { consumedCreditId: credit } : {}) });
+    S(w).qualifierTournaments.set('qa', { qualifierId: 'qa', status: 'registering', tournamentId: null, buyIn: 0, players: [reg('user-101', 'm-a', 'c1'), reg('user-102', 'm-b')] });
+    S(w).qualifierTournaments.set('qb', { qualifierId: 'qb', status: 'starting', tournamentId: null, buyIn: 0, players: [reg('user-103', 'm-c', 'c3')] });
+    S(w).qualifierTournaments.set('qr', { qualifierId: 'qr', status: 'running', tournamentId: null, buyIn: 0, players: [reg('user-104', 'm-d', 'c4')] });
+    await w.m.gracefulShutdown('SIGTERM');
+    expect(w.masterFrames.filter(([, ev]) => ev === 'qualifierCancelled')).toEqual([
+      ['m-a', 'qualifierCancelled', { qualifierId: 'qa', reason: 'server_restart', creditRefunded: true }],
+      ['m-b', 'qualifierCancelled', { qualifierId: 'qa', reason: 'server_restart', creditRefunded: false }],
+      ['m-c', 'qualifierCancelled', { qualifierId: 'qb', reason: 'server_restart', creditRefunded: true }],
+    ]);
+    expect(w.ioEmits.filter(([ev]) => ev === 'qualifierTournamentUpdate').map(([, p]) => p)).toEqual(['qa', 'qb', 'qr'].map((qualifierId) => (
+      { qualifierId, status: 'finished', cancelled: true, registeredCount: 0, players: 0 })));
+    expect(w.creditRefunds.sort()).toEqual(['c1', 'c3', 'c4']);                  // still released + refunded
+    expect(w.m.shutdownFlushStats).toMatchObject({ qualifierRegistrationsReleased: 4, qualifierRegistrantsTold: 3 });
+  });
+});
+
+describe('R3 (S1-4) — the flush settles EVERY decided quick game first, while its seats still hold their stacks', () => {
+  it('heads-up / career / all-in-or-fold / Spin & Go decided: each finished once, BEFORE the seat claim zeroes the stack; undecided ones are not', async () => {
+    const w = world();
+    const hu = w.mk('hu');
+    hu.sitDown(0, 'A', 4000, 'pA', false);
+    S(w).authSessions.set('SA', { userId: A, username: 'a' });
+    S(w).playerSessions.set('SA', { socketId: 'SA', tableId: 'hu', seatIndex: 0, playerId: 'pA' });
+    const stackAtFinish: Record<string, number> = {};
+    const realFinish = S(w).finishQuickGame;
+    S(w).finishQuickGame = (tableId: string, outcome: any) => { stackAtFinish[tableId] = w.tables.get(tableId)?.seats[0].chipCount ?? -1; realFinish(tableId, outcome); };
+    const won = { winnerSeat: 0, humanWon: true };
+    S(w).quickGames.set('hu', { format: 'headsUp', settlement: 'open', ended: true, decided: won });
+    S(w).quickGames.set('car', { format: 'career', settlement: 'open', ended: true, decided: won });
+    S(w).quickGames.set('aof', { format: 'allInOrFold', settlement: 'open', ended: true, decided: won });
+    S(w).quickGames.set('sg', { format: 'spinGo', settlement: 'open', ended: true, decided: won });
+    S(w).quickGames.set('live', { format: 'headsUp', settlement: 'open', ended: false });
+    S(w).quickGames.set('done', { format: 'career', settlement: 'cashed', ended: true, decided: won, finished: true });
+    await w.m.gracefulShutdown('SIGTERM');
+    expect(w.quickFinished.map(([id]) => id)).toEqual(['hu', 'car', 'aof', 'sg']);
+    expect(stackAtFinish.hu).toBe(4000);                                        // the result saw the real stack
+    expect(w.db.wallets.get(A)).toBe(4000);                                     // and the claim still cashed it once
+    expect(w.m.shutdownFlushStats).toMatchObject({ quickGamesSettled: 3, spinGoSettled: 1 });
   });
 });

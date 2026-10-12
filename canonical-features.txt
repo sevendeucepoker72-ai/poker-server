@@ -1156,3 +1156,29 @@ function isFreeForEveryone(
 
 # 2026-10-11 (.online R2 merge) — season / leaderboard "chips won" = PUBLIC cash tables only; club tables feed club stats.
 function tableFeedsClubStats(
+
+# 2026-10-11 (.online R3, SF-A) — seats inside a table's cap (S1-1 / XL-1 / K3-1): fill / trim / backfill / joins
+# count only seats below maxOccupiableSeats; an invite join frees a bot's seat before any chip moves.
+seat_opens_after_hand
+const inviteSeatCap = Math.min(
+const joinSeatCap = Math.min(
+# S1-2: a staking refund CLOSES the offer first and plans from the backers that statement returns.
+UPDATE staking_offers SET remaining = 0 WHERE id = $1 AND paid_out_at IS NULL AND refunded_at IS NULL RETURNING backers
+# S1-3: the 100% cap is counted from the DB under a per (tournament, seller) advisory lock.
+stake_offer:${
+# S1-4: a decided quick game is settled before a leave / the cleanup / the shutdown claim tears its seats down.
+function settleDecidedQuickGame(
+settleDecidedQuickGamesForShutdown();
+# S1-5 (contract I1): friend table invites that can be accepted.
+invite_not_seated
+invite_not_joinable
+invite_target_offline
+# S1-6 (contract Q1): the shutdown flush tells an upcoming qualifier's registrants.
+qualifierRegistrantsTold
+# TOURNEY-9: the shutdown flush's defense-in-depth sweep of human cash seats no claim reached.
+SHUTDOWN_UNCLAIMED_SEAT_CREDITED
+# TOURNEY-P3-3: cancelled-tournament entry fees through the prize ledger; entry-fee moves durable.
+label: `tfee:${tournamentId}`
+'TOURNAMENT_ENTRY_DEDUCT', 'TOURNAMENT_ENTRY_REFUND', 'TOURNAMENT_ENTRY_REFUND_FAILED',
+# K3-3: stakingPayout names its offer.
+tournamentId: tid, offerId: String(c.details.offerId)

@@ -18,7 +18,7 @@ import { computeStakingSplit } from '../src/game/staking';
 import { planCashedSettlement, planEscrowRefund, validateStakeOffer, normalizeBackers } from '../src/game/stakingEscrow';
 import { createPrizeLedger } from '../src/game/prizeLedger';
 import { accountDisplayName } from '../src/auth/displayName';
-import { SRC, slice, fnSrc, handlerSrc, load, flush } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
 import { createFakePokerDb } from './helpers/fakePokerDb';
 
 const ALICE = 101;
@@ -527,5 +527,206 @@ describe('TOURNEY-9 / multi-table — a start never takes over a live cash seat;
     const seated = t.tableIds.map((id) => w.tables.get(id)!.seats.filter((s) => s.state === 'occupied').length);
     expect(seated).toEqual([6, 6]);
     for (const p of t.players) expect(t.playerTableMap.get(p.playerId)).toBeTruthy();
+  });
+});
+
+// ─────────────────────────── R3 (2026-10-11, SF-A) ───────────────────────────
+describe('R3 (S1-2 / S1-3 / K3-3) — staking: a refund never loses a backer, the 100% cap counts sold-out offers, a payout names its offer', () => {
+  /** Alice registered + a 50% escrow offer at 100/pct; Bob already backs 10% (1,000 escrowed). */
+  const offerWithOneBacker = async () => {
+    const w = world();
+    const tid = w.tm.createTournament(tpl({ name: 'Race Cup', buyIn: 1000 }));
+    const a = w.mkSocket('SA', ALICE, 'Alice');
+    const b = w.mkSocket('SB', BOB, 'Bob');
+    const c = w.mkSocket('SC', CARL, 'Carl');
+    await a.handlers.registerTournament({ tournamentId: tid, playerName: 'Alice' });
+    await a.handlers.createStake({ tournamentId: tid, percent: 50, pricePerPercent: 100 });
+    const offerId = w.of('SA', 'stakeCreated')[0].id;
+    await b.handlers.buyStake({ offerId, pct: 10 });
+    expect(w.db.wallets.get(BOB)).toBe(100_000 - 1000);
+    return { w, tid, a, b, c, offerId };
+  };
+  /** Carl's purchase (20% = 2,000) passes its in-memory checks, then waits on the seller check until released. */
+  const carlBuysWaiting = (w: ReturnType<typeof world>, c: any, offerId: string) => {
+    const sellerCheck = deferred();
+    w.scope.stakingSellerSuspended = async () => { await sellerCheck.p; return false; };
+    const done = c.handlers.buyStake({ offerId, pct: 20 });
+    return { sellerCheck, done };
+  };
+
+  it('S1-2: a purchase that COMMITS between the refund\'s read and its settlement is refunded too (the offer is closed first; its returned backers are planned)', async () => {
+    const { w, tid, c, offerId } = await offerWithOneBacker();
+    const carl = carlBuysWaiting(w, c, offerId);
+    await flush();
+    // The refund reads the offer, then its close waits — Carl's purchase commits meanwhile.
+    const closeGate = deferred();
+    const pool = w.db.pool;
+    w.scope.getPool = () => ({
+      ...pool,
+      query: async (sql: string, params?: any[]) => { if (/SET remaining = 0/.test(sql)) await closeGate.p; return pool.query(sql, params); },
+    });
+    const refund = w.m.refundStakesOf(tid, 'seller_unregistered', ALICE);
+    await flush();
+    carl.sellerCheck.resolve();
+    await carl.done; await flush();
+    expect(w.of('SC', 'buyStakeResult')).toEqual([{ success: true, offerId }]);
+    expect(w.db.wallets.get(CARL)).toBe(100_000 - 2000);
+    closeGate.resolve();
+    expect(await refund).toBe(1);
+    await flush();
+    expect([w.db.wallets.get(BOB), w.db.wallets.get(CARL)]).toEqual([100_000, 100_000]);   // both escrows back
+    expect([...w.db.payouts.keys()].sort()).toEqual([`stake:${offerId}:refund:0`, `stake:${offerId}:refund:1`]);
+    expect(w.db.offers.get(offerId)).toMatchObject({ remaining: 0, refunded_at: expect.any(String) });
+    expect(w.of('SC', 'stakeRefunded')).toEqual([{ offerId, tournamentId: tid, amount: 2000, reason: 'seller_unregistered' }]);
+  });
+
+  it('S1-2: a purchase that arrives AFTER the close is refused and charged nothing (the closed offer has nothing left to sell)', async () => {
+    const { w, tid, c, offerId } = await offerWithOneBacker();
+    const carl = carlBuysWaiting(w, c, offerId);
+    await flush();
+    expect(await w.m.refundStakesOf(tid, 'seller_unregistered', ALICE)).toBe(1);
+    carl.sellerCheck.resolve();
+    await carl.done; await flush();
+    expect(w.of('SC', 'buyStakeResult')).toEqual([{ success: false, error: 'Offer unavailable', offerId }]);
+    expect([w.db.wallets.get(BOB), w.db.wallets.get(CARL)]).toEqual([100_000, 100_000]);
+    expect(w.db.offers.get(offerId)!.backers.map((x: any) => x.userId)).toEqual([BOB]);
+  });
+
+  it('S1-2: the boot sweep goes through the same close (it refunds what the offer holds NOW, once)', async () => {
+    const { w, offerId } = await offerWithOneBacker();
+    w.db.offers.get(offerId)!.created_at = new Date(Date.now() - 3600_000).toISOString();   // a previous process's offer
+    await w.m.bootSweepUnsettledStakes();
+    await w.m.bootSweepUnsettledStakes();
+    expect(w.db.wallets.get(BOB)).toBe(100_000);
+    expect([...w.db.payouts.keys()]).toEqual([`stake:${offerId}:refund:0`]);
+  });
+
+  it('CONTROL — S1-2: planned from the backers read BEFORE the settlement (the pre-R3 refund), Carl\'s committed purchase is never refunded', async () => {
+    const start = PRIZES.indexOf('    let backers: EscrowBacker[] | null;');
+    const endNeedle = '    const credits = planEscrowRefund({ ...offer, backers }, reason);';
+    const end = PRIZES.indexOf(endNeedle);
+    expect([start > 0, end > start]).toEqual([true, true]);
+    const prePrizes = `${PRIZES.slice(0, start)}    const credits = planEscrowRefund(offer, reason);${PRIZES.slice(end + endNeedle.length)}`;
+    const code = `${BINDINGS}\n${VIEWER}\n${REG}\n${REFUND_CANCELLED}\n${prePrizes}\n${START}\nfunction wire(socket) {\n  ${Object.values(H).join('\n  ')}\n}`;
+    const { w, tid, c, offerId } = await offerWithOneBacker();
+    const { exports: pre } = load(code, w.scope, '{ refundStakesOf }');
+    const carl = carlBuysWaiting(w, c, offerId);
+    await flush();
+    const ledgerGate = deferred();
+    const pool = w.db.pool;
+    w.scope.prizeLedger = createPrizeLedger({ connect: async () => { await ledgerGate.p; return pool.connect() as any; }, sleep: async () => {}, log: () => {}, backoffMs: [0] });
+    const refund = pre.refundStakesOf(tid, 'seller_unregistered', ALICE);
+    await flush();
+    carl.sellerCheck.resolve();
+    await carl.done; await flush();
+    ledgerGate.resolve();
+    await refund; await flush();
+    expect(w.db.wallets.get(BOB)).toBe(100_000);
+    expect(w.db.wallets.get(CARL)).toBe(100_000 - 2000);                      // his escrow: lost
+    expect(w.db.offers.get(offerId)!.refunded_at).toEqual(expect.any(String));  // and the offer closed for good
+  });
+
+  it('S1-3: after an offer SELLS OUT the seller still cannot sell more than 100% of his action in total', async () => {
+    const w = world();
+    const tid = w.tm.createTournament(tpl({ name: 'Cap Cup', buyIn: 1000 }));
+    const a = w.mkSocket('SA', ALICE, 'Alice');
+    const b = w.mkSocket('SB', BOB, 'Bob');
+    await a.handlers.registerTournament({ tournamentId: tid, playerName: 'Alice' });
+    await a.handlers.createStake({ tournamentId: tid, percent: 100, pricePerPercent: 10 });
+    const offerId = w.of('SA', 'stakeCreated')[0].id;
+    await b.handlers.buyStake({ offerId, pct: 100 });
+    expect(w.m.stakingOffers.has(offerId)).toBe(false);                       // sold out: off the marketplace
+    await a.handlers.createStake({ tournamentId: tid, percent: 10, pricePerPercent: 10 });
+    expect(w.of('SA', 'error')).toEqual([{ message: 'You can sell at most 0% more of this tournament.', code: 'stake_invalid_offer' }]);
+    expect(w.of('SA', 'stakeCreated')).toHaveLength(1);
+    expect([...w.db.offers.values()].filter((o) => o.seller_id === ALICE)).toHaveLength(1);
+  });
+
+  it('S1-3: the check and the insert are ONE transaction under the per (tournament, seller) advisory lock — lock, then sum, then insert', async () => {
+    const w = world();
+    const tid = w.tm.createTournament(tpl({ name: 'Lock Cup', buyIn: 1000 }));
+    const a = w.mkSocket('SA', ALICE, 'Alice');
+    await a.handlers.registerTournament({ tournamentId: tid, playerName: 'Alice' });
+    w.db.statements.length = 0;
+    await a.handlers.createStake({ tournamentId: tid, percent: 40, pricePerPercent: 10 });
+    const seq = w.db.statements
+      .filter((s) => /^(BEGIN|COMMIT|ROLLBACK|SELECT pg_advisory|SELECT COALESCE\(SUM|INSERT INTO staking_offers)/.test(s))
+      .map((s) => s.split(' ').slice(0, 3).join(' '));
+    expect(seq).toEqual(['BEGIN', 'SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', 'SELECT COALESCE(SUM(total_pct), 0)::int', 'INSERT INTO staking_offers', 'COMMIT']);
+    expect(w.db.locks).toEqual([`stake_offer:${tid}:${ALICE}`]);
+    // A refused offer rolls back (nothing inserted, the lock released with the transaction).
+    await a.handlers.createStake({ tournamentId: tid, percent: 61, pricePerPercent: 10 });
+    expect(w.of('SA', 'error')).toEqual([expect.objectContaining({ code: 'stake_invalid_offer', message: 'You can sell at most 60% more of this tournament.' })]);
+    expect(w.db.statements[w.db.statements.length - 1]).toBe('ROLLBACK');
+  });
+
+  it('K3-3: stakingPayout names its offer (offerId) — the backer\'s client settles THAT stake', async () => {
+    jest.useFakeTimers();
+    try {
+      const w = world();
+      const tid = w.tm.createTournament(tpl({ name: 'Pay Cup', buyIn: 1000 }));
+      const a = w.mkSocket('SA', ALICE, 'Alice');
+      const b = w.mkSocket('SB', BOB, 'Bob');
+      await a.handlers.registerTournament({ tournamentId: tid, playerName: 'Alice' });
+      await a.handlers.createStake({ tournamentId: tid, percent: 20, pricePerPercent: 100 });
+      const offerId = w.of('SA', 'stakeCreated')[0].id;
+      await b.handlers.buyStake({ offerId, pct: 20 });
+      w.tm.registerPlayer(tid, 'user-103', 'Carl', 's3', CARL);
+      w.tm.registerPlayer(tid, 'p4', 'Dee', 's4', 104);
+      let data: any = null;
+      w.tm.onEvent(tid, (ev, d) => { if (ev === 'tournamentFinished') data = d; });
+      w.tm.startTournament(tid);
+      w.tm.eliminatePlayer(tid, 'p4'); w.tm.eliminatePlayer(tid, 'user-103');
+      await w.m.payTournamentPrizes(data);
+      expect(w.of('SB', 'stakingPayout')).toEqual([{ amount: 300, sellerName: 'Alice', tournamentId: tid, offerId }]);
+    } finally { jest.useRealTimers(); }
+  });
+});
+
+describe('R3 (TOURNEY-P3-3) — a cancelled tournament\'s entry fees are refunded through the prize ledger (durable, once, retried)', () => {
+  const cancelled = async () => {
+    const w = world();
+    const tid = w.tm.createTournament(tpl({ name: 'Void Cup', buyIn: 500 }));
+    const a = w.mkSocket('SA', ALICE, 'Alice');
+    const b = w.mkSocket('SB', BOB, 'Bob');
+    await a.handlers.registerTournament({ tournamentId: tid, playerName: 'Alice' });
+    await b.handlers.registerTournament({ tournamentId: tid, playerName: 'Bob' });
+    const regs = w.tm.cancelTournament(tid);
+    return { w, tid, regs };
+  };
+
+  it('one ledger settlement keyed per tournament + entrant (tfee:<tid>:<playerId> — the shutdown flush\'s key); a repeat pays nothing more', async () => {
+    const { w, tid, regs } = await cancelled();
+    w.m.refundCancelledTournamentEntrants(tid, regs, 'tournament_cancelled_stalled');
+    await flush();
+    w.m.refundCancelledTournamentEntrants(tid, regs, 'tournament_cancelled_stalled');
+    await flush();
+    expect([w.db.wallets.get(ALICE), w.db.wallets.get(BOB)]).toEqual([100_000, 100_000]);
+    expect([...w.db.payouts.keys()].sort()).toEqual([`tfee:${tid}:user-101`, `tfee:${tid}:user-102`]);
+    expect(w.db.payouts.get(`tfee:${tid}:user-101`)).toMatchObject({ userId: ALICE, amount: 500, kind: 'TOURNAMENT_ENTRY_REFUND' });
+    expect(w.audits.filter((x) => x.action === 'TOURNAMENT_ENTRY_REFUND').map((x) => x.d)).toEqual([
+      { tournamentId: tid, amount: 500, reason: 'tournament_cancelled_stalled' }, { tournamentId: tid, amount: 500, reason: 'tournament_cancelled_stalled' },
+    ]);
+  });
+
+  it('a DB blip: nothing half-paid, audited FAILED (pendingRetry), and the ledger\'s retry pays each entrant exactly once', async () => {
+    const { w, tid, regs } = await cancelled();
+    w.db.failNext(/UPDATE users SET chips = chips \+/, 2);                   // both attempts of the settlement fail
+    w.m.refundCancelledTournamentEntrants(tid, regs, 'tournament_cancelled_stalled');
+    await flush();
+    expect([w.db.wallets.get(ALICE), w.db.wallets.get(BOB)]).toEqual([100_000 - 500, 100_000 - 500]);
+    expect(w.db.payouts.size).toBe(0);
+    expect(w.audits.filter((x) => x.action === 'TOURNAMENT_ENTRY_REFUND_FAILED').map((x) => x.d.pendingRetry)).toEqual([true, true]);
+    await (w.scope.prizeLedger as any).retryPending();
+    await (w.scope.prizeLedger as any).retryPending();
+    expect([w.db.wallets.get(ALICE), w.db.wallets.get(BOB)]).toEqual([100_000, 100_000]);
+    // Every registrant was still told at once.
+    expect(w.of('SA', 'tournamentCancelled')).toEqual([{ tournamentId: tid, refunded: 500, reason: 'tournament_cancelled_stalled' }]);
+  });
+
+  it('the entry-fee moves keep a durable audit row (DURABLE_AUDIT_ACTIONS)', () => {
+    const durable = slice('const DURABLE_AUDIT_ACTIONS = new Set([', ']);');
+    for (const a of ['TOURNAMENT_ENTRY_DEDUCT', 'TOURNAMENT_ENTRY_REFUND', 'TOURNAMENT_ENTRY_REFUND_FAILED']) expect(durable).toContain(`'${a}'`);
+    expect(REFUND_CANCELLED).not.toContain('addChipsToUser(');
   });
 });

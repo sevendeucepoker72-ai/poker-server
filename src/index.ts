@@ -19,7 +19,7 @@ import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quick
 import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK } from './game/qualifierSchedule';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
-import { EscrowOffer, normalizeBackers, planEscrowRefund, planCashedSettlement, validateStakeOffer } from './game/stakingEscrow';
+import { EscrowBacker, EscrowOffer, normalizeBackers, planEscrowRefund, planCashedSettlement, validateStakeOffer } from './game/stakingEscrow';
 import {
   connectRedis as connectHandStore,
   snapshotHand,
@@ -177,11 +177,12 @@ import {
   getClubOfWeek,
   getMemberRole,
   getClubIdForRuntimeTable,
+  getClubTableRowForRuntimeTable,
   updateClubStats,
   CLUB_LEVEL_THRESHOLDS,
   CLUB_LEVEL_PERKS,
 } from './clubs/clubManager';
-import { initFriendTables, listFriends, sendFriendRequest, acceptFriendRequest, removeFriend } from './social/friendManager';
+import { initFriendTables, listFriends, sendFriendRequest, acceptFriendRequest, removeFriend, areAcceptedFriends } from './social/friendManager';
 import {
   initPredictionTables, getWallet as getPredictionWallet, placeMarketBet, placePick,
   getSpectatorStats, settleHand as settlePredictions, MARKET_ODDS,
@@ -1134,6 +1135,10 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // 2026-10-11 (.online R2, ECON-18) — an economy credit at / above
   // CHIP_GRANT_ALERT_THRESHOLD, and every monthly season award (rare, durable trail).
   'ECON_LARGE_CREDIT', 'SEASON_LEADERBOARD_AWARD',
+  // R3 (TOURNEY-P3-3) — a buy-in tournament's entry fee taken / given back
+  // (registration, unregister, cancel): a few per hour, money in and out of
+  // the wallet, so a durable trail (the cancel refund's own row is in prize_payouts).
+  'TOURNAMENT_ENTRY_DEDUCT', 'TOURNAMENT_ENTRY_REFUND', 'TOURNAMENT_ENTRY_REFUND_FAILED',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -1401,7 +1406,9 @@ function aiSeatTakeableNow(table: PokerTable, seatIndex: number): boolean {
 
 /** R2 (GAME-15) — free one takeable AI seat for a join (stood up, profile dropped); -1 when none. */
 function takeAiSeatForJoin(table: PokerTable, tableId: string): number {
-  for (let i = 0; i < MAX_SEATS; i++) {
+  // R3 (S1-1) — only a seat the joiner can then take: below the table's cap.
+  const seatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
+  for (let i = 0; i < seatCap; i++) {
     if (!aiSeatTakeableNow(table, i)) continue;
     table.standUp(i);
     aiProfiles.get(tableId)?.delete(i);
@@ -4984,8 +4991,14 @@ function fillWithAI(
     }
   }
 
+  // R3 (S1-1 / XL-1) — only seats a player can TAKE count: below the table's
+  // seat cap (a home game's / club table's maxSeats, a variant's deck cap).
+  // The "leave 1 open" rule below used to count seats PAST the cap (sitDown
+  // refuses them), so bots filled every seat inside it and no invitee or club
+  // member could ever sit at a 2-5 seat table.
+  const seatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
   const emptySeats: number[] = [];
-  for (let i = 0; i < MAX_SEATS; i++) {
+  for (let i = 0; i < seatCap; i++) {
     if (table.seats[i].state === 'empty') {
       emptySeats.push(i);
     }
@@ -4995,7 +5008,7 @@ function fillWithAI(
   // open seats and the table never shows "Full" (9/9) to walk-ups.
   const currentOccupied = table.getOccupiedSeatCount();
   const needed = Math.max(0, targetMaxOccupied - currentOccupied);
-  // And always leave at least 1 seat open regardless of cap.
+  // And always leave at least 1 (takeable) seat open regardless of cap.
   const seatsToFill = emptySeats
     .slice(0, Math.min(needed, Math.max(0, emptySeats.length - 1)));
 
@@ -5028,6 +5041,11 @@ function trimExcessAI(
 ): void {
   // No mid-hand roster changes — defer trims to the between-hands window.
   if (!aiSeatsMutableNow(table)) return;
+  // R3 (S1-1 / XL-1) — a table capped below the target (a 2-5 seat home game /
+  // club table) keeps one seat inside its cap free for the next invitee /
+  // member: the target is never above cap - 1 (fillWithAI's own limit). It
+  // only ever trimmed above 5 occupied, so such a table never freed a seat.
+  targetMaxOccupied = Math.max(0, Math.min(targetMaxOccupied, Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS) - 1));
   const occupied = table.getOccupiedSeatCount();
   if (occupied <= targetMaxOccupied) return;
   const aiSeats: number[] = [];
@@ -5716,13 +5734,17 @@ function backfillAIToMin(table: PokerTable, tableId: string, min: number): void 
   for (const seat of table.seats) {
     if (seat.state === 'occupied') usedNames.add(seat.playerName);
   }
+  // R3 (S1-1 / XL-1) — only seats below the table's cap, and one of them
+  // always left open (fillWithAI's rule): the heartbeat's floor of 3 filled a
+  // 2-3 seat club / home table solid, so no member could ever sit there.
+  const seatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
   const emptySeats: number[] = [];
-  for (let i = 0; i < MAX_SEATS; i++) {
+  for (let i = 0; i < seatCap; i++) {
     if (table.seats[i].state === 'empty') emptySeats.push(i);
   }
   const occupied = table.getOccupiedSeatCount();
   const needed = Math.max(0, min - occupied);
-  const seatsToFill = emptySeats.slice(0, needed);
+  const seatsToFill = emptySeats.slice(0, Math.min(needed, Math.max(0, emptySeats.length - 1)));
   for (const i of seatsToFill) {
     let profile = generateRandomProfile('hard');
     let attempts = 0;
@@ -8289,6 +8311,8 @@ function chipsOnTablesOfUser(userId: number): number {
 // (social/publicIdentity — whitelist-valid, not phone-like, else 'Player').
 const playerSearchLimiter = createWindowRateLimiter(30, 30_000);
 const usernameCheckLimiter = createWindowRateLimiter(20, 60_000);
+/** R3 (S1-5, contract I1) — friend table invites: 10 a minute per account. */
+const friendInviteLimiter = createWindowRateLimiter(10, 60_000);
 const publicNameCache = new Map<number, { name: string; at: number }>();
 const PUBLIC_NAME_CACHE_MS = 60_000;
 /** The public name of a local account (cached 60s; 'Player' when unknown or on a DB error). */
@@ -8613,6 +8637,21 @@ function finishQuickGame(tableId: string, outcome: { winnerSeat: number | null; 
 }
 
 /**
+ * R3 (S1-4) — a quick game already DECIDED whose result still waits out
+ * QUICK_GAME_RESULT_DELAY_MS is settled NOW (finishQuickGame: the Spin & Go
+ * prize, the career stage win + reward, the heads-up / all-in-or-fold result,
+ * a club challenge's winner) — called before anything tears its seats down
+ * (a leave, the cleanup, the shutdown flush), while the human still sits.
+ * true = it settled one. finishQuickGame runs once (qg.finished).
+ */
+function settleDecidedQuickGame(tableId: string): boolean {
+  const qg = quickGames.get(tableId);
+  if (!qg || !qg.decided || qg.finished) return false;
+  finishQuickGame(tableId, qg.decided);
+  return true;
+}
+
+/**
  * Refund a quick game's ENTRY FEE once (a Spin & Go interrupted by the server,
  * an admin close or a removal that was not the player's choice). Through the
  * prize ledger — never twice for one table.
@@ -8684,6 +8723,9 @@ setInterval(() => {
 }, 15_000).unref?.();
 
 function cleanupQuickTable(tableId: string): void {
+  // R3 (S1-4) — a decided game is settled before its seats are cashed / stood
+  // up (backstop: every leave path settles it first) — never thrown away.
+  settleDecidedQuickGame(tableId);
   const table = tableManager.getTable(tableId);
   const qg = quickGames.get(tableId);
   // R2 (ECON-8) — a Spin & Go's stacks are the prize format's, never cashed.
@@ -9716,13 +9758,6 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'Pick a tournament you are registered in that has not started yet.', code: 'stake_not_registered' });
       return;
     }
-    // Never more than 100% of his action across his offers in this tournament.
-    let alreadyOffered = 0;
-    for (const o of stakingOffers.values()) if (o.tournamentId === tournamentId && o.sellerId === auth.userId) alreadyOffered += Number(o.totalPct) || 0;
-    if (alreadyOffered + v.percent > 100) {
-      socket.emit('error', { message: `You can sell at most ${Math.max(0, 100 - alreadyOffered)}% more of this tournament.`, code: 'stake_invalid_offer' });
-      return;
-    }
     const id = uuidv4();
     const playerName = seatNameForSocket(socket);   // the public display name (server-derived)
     const offer = {
@@ -9737,21 +9772,49 @@ Give feedback in this JSON format:
       createdAt: Date.now(),
       escrow: true,
     };
+    // Never more than 100% of his action across his offers in this tournament.
+    // R3 (S1-3) — counted from the DB: EVERY unsettled escrow offer of his in
+    // this tournament, sold-out ones included (a sold-out offer leaves the
+    // in-memory marketplace but still pays out of his action — the in-memory
+    // sum let him re-list 100% after each sell-out, and when he cashed every
+    // backer got a scaled-down share while all the escrow went to him). The
+    // check and the INSERT run in ONE transaction under a per
+    // (tournament, seller) advisory lock: two concurrent creates (two tabs,
+    // two instances) cannot both pass the check.
+    let client: any = null;
     try {
       await ensureStakingSchema();
-      await getPool().query(
+      client = await getPool().connect();
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1)::bigint)', [`stake_offer:${tournamentId}:${auth.userId}`]);
+      const { rows: offeredRows } = await client.query(
+        `SELECT COALESCE(SUM(total_pct), 0)::int AS offered FROM staking_offers
+          WHERE tournament_id = $1 AND seller_id = $2 AND escrow = TRUE AND paid_out_at IS NULL AND refunded_at IS NULL`,
+        [tournamentId, auth.userId],
+      );
+      const alreadyOffered = Number(offeredRows[0]?.offered) || 0;
+      if (alreadyOffered + v.percent > 100) {
+        await client.query('ROLLBACK');
+        socket.emit('error', { message: `You can sell at most ${Math.max(0, 100 - alreadyOffered)}% more of this tournament.`, code: 'stake_invalid_offer' });
+        return;
+      }
+      await client.query(
         `INSERT INTO staking_offers (id, tournament_id, total_pct, price_per_pct, remaining, seller_id, player_name, backers, escrow, seller_entry_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, '[]', TRUE, $8)`,
         [id, offer.tournamentId, offer.totalPct, offer.pricePerPct, offer.remaining, offer.sellerId, offer.playerName, entry.entryId ?? null]
       );
+      await client.query('COMMIT');
       stakingOffers.set(id, offer);
       stakingStats.offersCreated++;
       auditLog(auth.username, 'STAKING_OFFER_CREATED', { offerId: id, tournamentId: offer.tournamentId, totalPct: offer.totalPct, pricePerPct: offer.pricePerPct });
       broadcastStakingOffers();   // R1 — display names, no ids
       socket.emit('stakeCreated', { id, tournamentId, percent: offer.totalPct, pricePerPercent: offer.pricePerPct });
     } catch (e: any) {
+      if (client) await client.query('ROLLBACK').catch(() => {});
       console.error('[Staking] createStake DB error:', e.message);
       socket.emit('error', { message: 'Failed to create staking offer', code: 'stake_create_failed' });
+    } finally {
+      try { client?.release(); } catch { /* ignore */ }
     }
   });
 
@@ -12484,10 +12547,15 @@ Give feedback in this JSON format:
       }
 
       // Auto-find seat if seatIndex is -1 or invalid
-      if (seatIndex < 0 || seatIndex >= MAX_SEATS || table.seats[seatIndex].state !== 'empty') {
+      // R3 (S1-1 / XL-1) — a seat at or past the table's cap (a club table's
+      // maxSeats, a variant's deck cap) is invalid too, and the search stays
+      // below it: it used to "find" seat N past the cap, deduct the buy-in and
+      // have sitDown refuse it — a 2-3 seat club table never seated a member.
+      const joinSeatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
+      if (seatIndex < 0 || seatIndex >= joinSeatCap || table.seats[seatIndex].state !== 'empty') {
         // Find an empty seat first
         seatIndex = -1;
-        for (let i = 0; i < MAX_SEATS; i++) {
+        for (let i = 0; i < joinSeatCap; i++) {
           if (table.seats[i].state === 'empty') {
             seatIndex = i;
             break;
@@ -12587,12 +12655,15 @@ Give feedback in this JSON format:
         // is debited with no seat. Previously this path silently swallowed
         // the deducted chips.
         if (authForJoin) {
+          // R3 (XL-1) — addChipsToUser answers false on a DB error (its catch
+          // never fired): a refund that did not land is audited as FAILED.
+          let refunded = false;
           try {
-            await addChipsToUser(authForJoin.userId, buyIn);
-            auditLog(authForJoin.username, 'BUY_IN_REFUND', { tableId, buyIn, reason: 'sitDown_failed' });
+            refunded = await addChipsToUser(authForJoin.userId, buyIn);
           } catch (e) {
-            auditLog(authForJoin.username, 'BUY_IN_REFUND_FAILED', { tableId, buyIn, error: String(e) });
+            refunded = false;
           }
+          auditLog(authForJoin.username, refunded ? 'BUY_IN_REFUND' : 'BUY_IN_REFUND_FAILED', { tableId, buyIn, reason: 'sitDown_failed' });
         }
         mySlots.delete(`${socket.id}:${tableSlotKey}`);
         socket.emit('error', { message: 'Could not sit down at that seat' });
@@ -12724,7 +12795,8 @@ Give feedback in this JSON format:
         const table = tableManager.getTable(candidate.tableId);
         if (!table) continue;
         let targetSeat = -1;
-        for (let i = 0; i < MAX_SEATS; i++) {
+        // R3 (S1-1 / XL-1) — never a seat past the table's cap (a 6/8-seat variant): sitDown refuses it after the deduct.
+        for (let i = 0; i < Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS); i++) {
           if (table.seats[i].state === 'empty') { targetSeat = i; break; }
         }
         // R2 (GAME-15) — an AI seat only when it is not in the hand being played.
@@ -14404,8 +14476,9 @@ Give feedback in this JSON format:
         }
 
         // 3) Find empty or AI seat
+        // R3 (S1-1 / XL-1) — below the table's cap only (sitDown refuses a seat past it).
         let targetSeat = -1;
-        for (let i = 0; i < MAX_SEATS; i++) {
+        for (let i = 0; i < Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS); i++) {
           if (table.seats[i].state === 'empty') {
             targetSeat = i;
             break;
@@ -15304,12 +15377,70 @@ Give feedback in this JSON format:
     await removeFriend(auth.userId, data.userId);
     socket.emit('friendsChanged'); emitFriendsTo(data.userId);
   });
+  // R3 (S1-5, contract I1) — a table invite the friend can ACCEPT. It used to
+  // relay any tableId to any account: a private home game's or a club table's
+  // invite carried no way in (joinTable refuses both since R2: invite_code_only
+  // / club_members_via_club), a quick / tournament table was offered, a
+  // stranger could be spammed. Now the inviter must sit at that table (main or
+  // extra-table seat), it must be a ring table (cash / private / club — never
+  // a quick game, tournament or club challenge), the invitee an ACCEPTED friend
+  // with a live socket, 10 invites a minute per account. Refusals:
+  // `friendError {code, message}` (invite_not_seated / invite_not_joinable /
+  // rate_limited / not_friends / invite_target_offline). Every live socket of
+  // the invitee gets `tableInvite {from, tableId, tableKind, inviteCode?,
+  // clubId?, clubTableId?}` — the join path for its kind.
   socket.on('inviteFriendToTable', async (data: { userId: number; tableId?: string }) => {
     const auth = authSessions.get(socket.id);
-    if (!auth?.userId || !data?.userId) return;
-    const inviterName = await publicNameForUser(auth.userId);   // R1 — never the login handle
-    for (const [sid, a] of authSessions) if (a?.userId === data.userId) io.to(sid).emit('tableInvite', { from: inviterName, tableId: data.tableId || null });
-    socket.emit('friendInviteSent', { userId: data.userId });
+    if (!auth?.userId) return;
+    const refuse = (code: string, message: string) => socket.emit('friendError', { code, message });
+    const targetId = Number(data?.userId);
+    const tableId = typeof data?.tableId === 'string' ? data.tableId : '';
+    if (!Number.isInteger(targetId) || targetId <= 0 || targetId === auth.userId) {
+      refuse('not_friends', 'You can only invite a player on your friends list.');
+      return;
+    }
+    const table = tableId ? tableManager.getTable(tableId) : undefined;
+    const holdsSeat = (s: { tableId: string; seatIndex: number } | undefined): boolean =>
+      !!s && s.tableId === tableId && table?.seats[s.seatIndex]?.state === 'occupied';
+    let seated = false;
+    for (const [sid, s] of playerSessions) if (!seated && authSessions.get(sid)?.userId === auth.userId && holdsSeat(s)) seated = true;
+    for (const [sid, list] of multiTableSessions) {
+      if (!seated && authSessions.get(sid)?.userId === auth.userId && (list || []).some((ms) => holdsSeat(ms))) seated = true;
+    }
+    if (!table || !seated) { refuse('invite_not_seated', 'Take a seat at the table first, then invite your friend.'); return; }
+    const tableKind = tableKindOf(tableId);
+    if (!(tableKind === 'cash' || tableKind === 'private' || tableKind === 'club') || challengeTables.has(tableId) || isFixedRosterTable(tableId)) {
+      refuse('invite_not_joinable', 'Friends can only be invited to a cash table, a home game or a club table.');
+      return;
+    }
+    if (!friendInviteLimiter.hit(String(auth.userId))) { refuse('rate_limited', 'Too many invites — wait a minute, then try again.'); return; }
+    try {
+      // A club table: its club_tables row (joinClubTable checks the invitee's membership).
+      let club: { clubTableId: number; clubId: number } | null = null;
+      if (tableKind === 'club') {
+        club = await getClubTableRowForRuntimeTable(tableId);
+        if (!club) { refuse('invite_not_joinable', 'This club table cannot be joined by invite right now.'); return; }
+      }
+      if (!(await areAcceptedFriends(auth.userId, targetId))) { refuse('not_friends', 'You can only invite a player on your friends list.'); return; }
+      const targets: Socket[] = [];
+      for (const [sid, a] of authSessions) {
+        if (a?.userId !== targetId) continue;
+        const s = io.sockets.sockets.get(sid);
+        if (s && s.connected) targets.push(s);
+      }
+      if (targets.length === 0) { refuse('invite_target_offline', 'Your friend is not online right now.'); return; }
+      const inviterName = await publicNameForUser(auth.userId);   // R1 — never the login handle
+      const invite = {
+        from: inviterName, tableId, tableKind,
+        ...(tableKind === 'private' ? { inviteCode: privateInviteCode(tableId) } : {}),
+        ...(club ? { clubId: club.clubId, clubTableId: club.clubTableId } : {}),
+      };
+      for (const s of targets) s.emit('tableInvite', invite);
+      socket.emit('friendInviteSent', { userId: targetId });
+    } catch (e: any) {
+      console.warn('[Friends] inviteFriendToTable failed:', e?.message || e);
+      socket.emit('friendError', { message: 'Could not send the invite — try again.' });
+    }
   });
 
   // ===== Prediction games (durable, server-authoritative) — Phase 3c 2026-06-18 =====
@@ -17362,10 +17493,21 @@ Give feedback in this JSON format:
       return;
     }
 
-    // Find an open seat
-    const openSeat = table.seats.findIndex((s) => s.state === 'empty');
+    // R3 (S1-1 / XL-1 / K3-1) — a seat BELOW the home game's cap (maxSeats):
+    // the first empty one, else a bot's seat freed for him (never a bot in the
+    // hand being played — takeAiSeatForJoin), decided BEFORE any chip moves.
+    // It used to take the first empty seat of all nine — past the cap once the
+    // bots filled the rest: the buy-in was deducted, sitDown refused, and the
+    // invitee was refunded and told 'Could not seat you' on every attempt.
+    // 'Table is full.' only when no seat can be freed at all.
+    const inviteSeatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
+    let openSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < inviteSeatCap);
+    if (openSeat === -1) openSeat = takeAiSeatForJoin(table, tableId);
     if (openSeat === -1) {
-      socket.emit('joinError', { message: 'Table is full.' });
+      const botInHand = table.seats.some((s, i) => i < inviteSeatCap && s.state === 'occupied' && s.isAI);
+      socket.emit('joinError', botInHand
+        ? { message: 'Every seat is in this hand — a seat opens when it ends. Try again in a moment.', code: 'seat_opens_after_hand' }
+        : { message: 'Table is full.', code: 'table_full' });
       return;
     }
 
@@ -17419,10 +17561,11 @@ Give feedback in this JSON format:
 
     if (!success) {
       if (chipsDeducted && authForJoin) {
-        try {
-          await addChipsToUser(authForJoin.userId, actualBuyIn);
-          auditLog(authForJoin.username, 'INVITE_REFUND', { tableId, buyIn: actualBuyIn, reason: 'sitDown_failed' });
-        } catch {}
+        // R3 (XL-1) — addChipsToUser answers false on a DB error (it does not
+        // throw): a refund that did not land is audited as FAILED, never as done.
+        let refunded = false;
+        try { refunded = await addChipsToUser(authForJoin.userId, actualBuyIn); } catch { refunded = false; }
+        auditLog(authForJoin.username, refunded ? 'INVITE_REFUND' : 'INVITE_REFUND_FAILED', { tableId, buyIn: actualBuyIn, reason: 'sitDown_failed' });
       }
       socket.emit('joinError', { message: 'Could not seat you at that table.' });
       return;
@@ -18927,6 +19070,12 @@ function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKi
   if (!session) return;
 
   const table = tableManager.getTable(session.tableId);
+  // R3 (S1-4) — a quick game already DECIDED (its result waits out
+  // QUICK_GAME_RESULT_DELAY_MS) is settled NOW, while the human still sits:
+  // a leave inside that second turned a Spin & Go win into a forfeit (no
+  // prize) and lost a career stage win (no progress, no reward) — the leave's
+  // cleanup removed the game before its result ran.
+  settleDecidedQuickGame(session.tableId);
   // S2 (2026-10-10) — a LIVE tournament seat is never stood up by a leave: it
   // stays in play, absent (keepTournamentSeatOnLeave); only this socket's
   // session at that table ends (below). `tournamentSeat` (S2 fixed protocol):
@@ -19366,13 +19515,33 @@ function refundCancelledTournamentEntrants(
     const owed = registrants.filter((r) => r.userId !== undefined && r.refund > 0).map((r) => ({ userId: r.userId as number, amount: r.refund }));
     void refundClubTournamentEntrants(clubTid, tournamentId, owed, reason);
   }
-  for (const r of registrants) {
-    if (clubTid === undefined && r.userId !== undefined && r.refund > 0) {
-      const userId = r.userId;
-      addChipsToUser(userId, r.refund)
-        .then((ok) => auditLog(String(userId), ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: r.refund, reason }))
-        .catch((e: any) => auditLog(String(userId), 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: r.refund, reason, error: String(e?.message || e) }));
+  // R3 (TOURNEY-P3-3) — the wallet refunds go through the PRIZE LEDGER: one
+  // settlement for the tournament, an idempotent key per tournament + entrant
+  // (`tfee:<tournamentId>:<playerId>` — the shutdown flush's key for the same
+  // entry, so the two can never both pay it), retried with backoff and kept
+  // for retryPending on a DB blip. It was a fire-and-forget addChipsToUser per
+  // entrant: a DB blip lost the refund for good (audited only to stdout).
+  if (clubTid === undefined) {
+    const credits: LedgerCredit[] = registrants
+      .filter((r) => r.userId !== undefined && r.refund > 0)
+      .map((r) => ({
+        key: `tfee:${tournamentId}:${r.playerId}`, userId: r.userId as number, amount: r.refund, kind: 'TOURNAMENT_ENTRY_REFUND',
+        details: { tournamentId, reason },
+      }));
+    if (credits.length > 0) {
+      void prizeLedger.settle({ label: `tfee:${tournamentId}`, credits })
+        .then((res) => {
+          for (const c of res.paid) auditLog(String(c.userId), 'TOURNAMENT_ENTRY_REFUND', { tournamentId, amount: c.amount, reason });
+          for (const c of res.noUser) auditLog(String(c.userId), 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: c.amount, reason, error: 'no_user_row' });
+          // Not settled yet: kept by the ledger and retried (retryPending) — the key pays it once.
+          if (res.status !== 'committed') {
+            for (const c of credits) auditLog(String(c.userId), 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: c.amount, reason, pendingRetry: true, error: res.error || res.status });
+          }
+        })
+        .catch((e: any) => console.error(`[Tournament ${tournamentId}] entry-fee refund settlement threw:`, e?.message || e));
     }
+  }
+  for (const r of registrants) {
     // R2 (C2 / TOURNEY-5) — every registrant is TOLD (he used to just vanish
     // from the field): `tournamentCancelled {tournamentId, refunded, reason}`.
     tellTournamentCancelled(tournamentId, r, reason);
@@ -20173,6 +20342,19 @@ function tellStakingCredit(userId: number, event: 'stakingPayout' | 'stakeRefund
 }
 
 /**
+ * R3 (S1-2) — CLOSE an unsettled offer to new purchases (remaining 0) and
+ * return its backers AS THEY ARE at that moment. A buyStake committed before
+ * this statement is in the returned list (a buy still in flight holds the row
+ * and is waited for); one after it fails its `remaining >= pct` guard and
+ * rolls back. null = already settled (paid / refunded) — nothing to refund.
+ */
+const STAKE_CLOSE_FOR_REFUND = `UPDATE staking_offers SET remaining = 0 WHERE id = $1 AND paid_out_at IS NULL AND refunded_at IS NULL RETURNING backers`;
+async function closeEscrowOfferForRefund(offerId: string): Promise<EscrowBacker[] | null> {
+  const { rows } = await getPool().query(STAKE_CLOSE_FOR_REFUND, [offerId]);
+  return rows.length > 0 ? normalizeBackers(rows[0].backers) : null;
+}
+
+/**
  * C4 — refund every backer of these offers (each offer once: the guard), one
  * settlement per offer. Never throws. Returns how many offers were refunded.
  */
@@ -20180,7 +20362,19 @@ async function refundEscrowOffers(offers: EscrowOffer[], reason: string, tournam
   let refunded = 0;
   for (const offer of offers) {
     stakingOffers.delete(offer.id);
-    const credits = planEscrowRefund(offer, reason);
+    // R3 (S1-2) — the refund is planned from the offer as CLOSED, never from
+    // the backers read earlier (outside any transaction): a purchase that
+    // committed between that read and the guard was charged, its offer
+    // stamped refunded, and his escrow never paid back (and no later sweep
+    // looks at a refunded offer). The offer is closed first, its backers
+    // returned by the same statement (closeEscrowOfferForRefund).
+    let backers: EscrowBacker[] | null;
+    try { backers = await closeEscrowOfferForRefund(offer.id); } catch (e: any) {
+      console.error(`[Staking] could not close offer ${offer.id} for its refund (${reason}) — left for the next sweep:`, e?.message || e);
+      continue;
+    }
+    if (!backers) continue;   // settled meanwhile (paid / refunded) — nothing owed here
+    const credits = planEscrowRefund({ ...offer, backers }, reason);
     const r = await prizeLedger.settle({
       label: `stake-refund:${offer.id}`,
       guard: { sql: STAKE_GUARD_REFUND, params: [[offer.id]], expectRows: 1 },
@@ -20382,7 +20576,9 @@ async function payTournamentPrizes(data: { tournamentId?: string; results?: Arra
       for (const c of res.paid) {
         auditLog(nameOf(c.userId), c.kind, { userId: c.userId, ...c.details, amount: c.amount });
         if (c.kind === 'STAKING_PAYOUT' && (c.details as any)?.offerId) {
-          tellStakingCredit(c.userId, 'stakingPayout', { amount: c.amount, sellerName: nameOf(Number((c.details as any).sellerId)), tournamentId: tid });
+          // R3 (K3-3) — + offerId: the backer's "My Stakes" settles THIS stake (it
+          // marked every escrow stake of the tournament paid with one amount).
+          tellStakingCredit(c.userId, 'stakingPayout', { amount: c.amount, sellerName: nameOf(Number((c.details as any).sellerId)), tournamentId: tid, offerId: String((c.details as any).offerId) });
         } else if (c.kind === 'STAKING_REFUND') {
           tellStakingCredit(c.userId, 'stakeRefunded', { offerId: (c.details as any)?.offerId ?? null, tournamentId: tid, amount: c.amount, reason: 'not_in_the_money' });
         }
@@ -21793,6 +21989,9 @@ const shutdownFlushStats = {
   seatsCashedOut: 0, chipsCashedOut: 0, seatsNotCashed: 0, tournamentsCancelled: 0, tournamentsVoided: 0,
   entryFeesRefunded: 0, clubTournamentsRefunded: 0, qualifierRegistrationsReleased: 0, spinGoFeesRefunded: 0,
   spinGoSettled: 0, ledgerStatus: '' as string, phasesCutShort: 0,
+  // R3 — decided career / heads-up / all-in-or-fold / challenge games settled (S1-4); upcoming-qualifier
+  // registrants told (S1-6); cash seats no claim reached, credited / with no owner to credit (TOURNEY-9).
+  quickGamesSettled: 0, qualifierRegistrantsTold: 0, unclaimedSeatsCredited: 0, unclaimedSeatsUnowned: 0,
 };
 
 interface ShutdownSeatCredit { userId: number; amount: number; tableId: string; seatIndex: number; via: string; invested: number }
@@ -21834,6 +22033,20 @@ function claimSeatsForShutdown(): { credits: ShutdownSeatCredit[]; progress: Arr
     }
     if (amount > 0) credits.push({ userId, amount, tableId, seatIndex, via, invested });
   };
+  // R3 (TOURNEY-9) — which accounts' sessions (main or extra-table) point at
+  // each seat, read BEFORE the claims below end every session: the last
+  // identity source of the defense-in-depth sweep at the end.
+  const sessionAccountsBySeat = new Map<string, Set<number>>();
+  const noteSessionSeat = (socketId: string, tableId: string, seatIndex: number): void => {
+    const uid = Number(authSessions.get(socketId)?.userId);
+    if (!(uid > 0)) return;
+    const k = `${tableId}:${seatIndex}`;
+    const set = sessionAccountsBySeat.get(k) ?? new Set<number>();
+    set.add(uid);
+    sessionAccountsBySeat.set(k, set);
+  };
+  for (const [sid, s] of playerSessions) noteSessionSeat(sid, s.tableId, s.seatIndex);
+  for (const [sid, list] of multiTableSessions) for (const ms of list || []) noteSessionSeat(sid, ms.tableId, ms.seatIndex);
   // Main seats (and whose progress to save).
   for (const [socketId, session] of [...playerSessions]) {
     const auth = authSessions.get(socketId);
@@ -21865,13 +22078,63 @@ function claimSeatsForShutdown(): { credits: ShutdownSeatCredit[]; progress: Arr
   // Seats waiting for their after-hand removal (a leaver folded with chips in
   // the pot) — never credited before R2. S2's entries may carry `noCredit`
   // (nothing owed) and the seat's `playerId` (credited only if it still holds it).
+  // R3 (TOURNEY-9) — a seat its teardown said is owed NOTHING (noCredit) is
+  // never paid by the sweep below either.
+  const owedNothing = new Set<string>();
   for (const [tableId, pend] of [...pendingSeatRemovalAfterHand]) {
     for (const [seatIndex, who] of pend) {
       const w = who as { userId: number; noCredit?: boolean; playerId?: string };
-      if (w.noCredit || !(w.userId > 0)) continue;
+      if (w.noCredit || !(w.userId > 0)) { owedNothing.add(`${tableId}:${seatIndex}`); continue; }
       take(w.userId, tableId, seatIndex, 'leave_after_hand', w.playerId);
     }
     pendingSeatRemovalAfterHand.delete(tableId);
+  }
+  // R3 (TOURNEY-9) — DEFENSE IN DEPTH: every occupied human CASH seat that no
+  // claim above reached is credited ONCE (the same `take`: deduped by physical
+  // seat, zeroed, the same per-seat ledger key) — an orphan seat with no
+  // session, reservation or after-hand removal (a rebind or a crash path left
+  // it), or a seat whose sign-in-RESTORED session carries the account's
+  // `user_<id>` playerId instead of the seat's own, which the main-seat claim
+  // refuses (its stack died with the process). Its account: the seat's own
+  // `user_<id>` stamp; else the account whose BUY-IN seated that playerId
+  // (its progression alias, recorded at the sit-down); else the ONE account
+  // whose session pointed at it. Never a tournament / Spin & Go seat (take()
+  // skips them), never a bot, never a seat already claimed or owed nothing; a
+  // seat with no owner to name is left as it is and audited. Its own
+  // try/catch: it can never cost the claims above their credits.
+  try {
+    for (const { tableId } of tableManager.getTableList()) {
+      if (isTournamentTable(tableId) || isPrizeFormatTable(tableId)) continue;
+      const table = tableManager.getTable(tableId);
+      if (!table) continue;
+      for (let i = 0; i < table.seats.length; i++) {
+        const seat = table.seats[i];
+        const seatKey = `${tableId}:${i}`;
+        if (!seat || seat.state !== 'occupied' || seat.isAI || creditedSeats.has(seatKey) || owedNothing.has(seatKey)) continue;
+        const inHand = table.isHandInProgress();
+        const chips = (seat.chipCount || 0) + (inHand ? (seat.totalInvestedThisHand || 0) : 0);
+        if (chips <= 0) continue;
+        const stamp = /^user_(\d+)$/.exec(String(seat.playerId || ''));
+        const buyer = Number(progressionManager.getProgress(seat.playerId)?.userId);
+        const pointed = sessionAccountsBySeat.get(seatKey);
+        const owner = stamp ? { userId: Number(stamp[1]), via: 'unclaimed_stamp' }
+          : buyer > 0 ? { userId: buyer, via: 'unclaimed_buy_in' }
+          : pointed && pointed.size === 1 ? { userId: [...pointed][0], via: 'unclaimed_session' }
+          : null;
+        if (!owner) {
+          shutdownFlushStats.unclaimedSeatsUnowned++;
+          auditLog('SYSTEM', 'SHUTDOWN_UNCLAIMED_SEAT_NO_OWNER', { tableId, seatIndex: i, chips, playerName: seat.playerName });
+          continue;
+        }
+        take(owner.userId, tableId, i, owner.via);
+        if (creditedSeats.has(seatKey)) {
+          shutdownFlushStats.unclaimedSeatsCredited++;
+          auditLog(String(owner.userId), 'SHUTDOWN_UNCLAIMED_SEAT_CREDITED', { userId: owner.userId, tableId, seatIndex: i, chips, via: owner.via });
+        }
+      }
+    }
+  } catch (e: any) {
+    console.error('[Shutdown] unclaimed-seat sweep failed (the claimed seats are unaffected):', e?.message || e);
   }
   return { credits, progress };
 }
@@ -21920,6 +22183,23 @@ function claimTournamentRefundsForShutdown(): {
 }
 
 /**
+ * R3 (S1-4) — Phase 0 (synchronous, FIRST) — every quick game already
+ * DECIDED whose result still waits out QUICK_GAME_RESULT_DELAY_MS is settled
+ * now, any format (a Spin & Go prize, a career stage win + reward, a heads-up
+ * / all-in-or-fold result, a club challenge's winner) — while its seats still
+ * hold their stacks; the seat claim then cashes the cash formats out. Only a
+ * decided Spin & Go was settled before (after the claim had zeroed the stacks).
+ */
+function settleDecidedQuickGamesForShutdown(): void {
+  for (const [tableId, qg] of [...quickGames]) {
+    if (!qg.decided || qg.finished) continue;
+    finishQuickGame(tableId, qg.decided);
+    if (qg.format === 'spinGo') shutdownFlushStats.spinGoSettled++;
+    else shutdownFlushStats.quickGamesSettled++;
+  }
+}
+
+/**
  * Phase 0c (synchronous claim, async work) — open Spin & Go games: an
  * undecided one refunds its fee (its stack is never cashed), a decided one
  * settles now (its prize, or nothing); every qualifier registration of an
@@ -21931,14 +22211,30 @@ function claimQuickAndQualifierRefundsForShutdown(entryFees: LedgerCredit[]): Pr
   const tasks: Promise<unknown>[] = [];
   for (const [tableId, qg] of [...quickGames]) {
     if (qg.format !== 'spinGo' || qg.settlement !== 'open') continue;
-    if (qg.ended && qg.decided) { finishQuickGame(tableId, qg.decided); shutdownFlushStats.spinGoSettled++; continue; }
+    // (A decided game was settled before the seat claim — settleDecidedQuickGamesForShutdown; this is its fallback.)
+    if (qg.ended && qg.decided) { if (!qg.finished) { finishQuickGame(tableId, qg.decided); shutdownFlushStats.spinGoSettled++; } continue; }
     shutdownFlushStats.spinGoFeesRefunded++;
     tasks.push(refundQuickEntryFee(tableId, qg, 'server_restart'));
   }
   for (const [qualId, qt] of [...qualifierTournaments]) {
     if (qt.status === 'finished') continue;
+    // R3 (S1-6, contract Q1) — an UPCOMING qualifier's registrants are TOLD
+    // (they were silently unregistered: credit refunded, master row dropped,
+    // the next instance re-opens the event empty) — `qualifierCancelled
+    // {qualifierId, reason:'server_restart', creditRefunded}` to every live
+    // socket of each, creditRefunded read BEFORE the release clears it. A
+    // RUNNING qualifier's entrants are told by its tournament's own
+    // tournamentCancelled (claimTournamentRefundsForShutdown).
+    const upcoming = qt.status === 'registering' || qt.status === 'starting';
     for (const p of qt.players) {
       shutdownFlushStats.qualifierRegistrationsReleased++;
+      if (upcoming) {
+        const creditRefunded = !!p.consumedCreditId;
+        try {
+          for (const s of socketsOfMaster(p.masterPlayerId)) s.emit('qualifierCancelled', { qualifierId: qualId, reason: 'server_restart', creditRefunded });
+          shutdownFlushStats.qualifierRegistrantsTold++;
+        } catch { /* the sockets are going anyway */ }
+      }
       tasks.push(releaseQualifierRegistration(qualId, qt, p, 'server_restart'));
       const rebuys = Math.max(0, Math.floor(Number(p.reEntries) || 0)) * Math.max(0, Math.floor(Number(qt.buyIn) || 0));
       if (rebuys > 0 && p.localUserId) {
@@ -21951,6 +22247,8 @@ function claimQuickAndQualifierRefundsForShutdown(entryFees: LedgerCredit[]): Pr
     qt.status = 'finished';
     qt.cancelled = true;
     qt.finishedAt = Date.now();
+    // R3 (Q1) — every lobby drops it (cancelQualifierEvent's frame).
+    try { io.emit('qualifierTournamentUpdate', { qualifierId: qualId, status: 'finished', cancelled: true, registeredCount: 0, players: 0 }); } catch { /* going anyway */ }
   }
   return tasks;
 }
@@ -22038,6 +22336,8 @@ async function runGracefulShutdown(signal: string): Promise<void> {
     let seats: ReturnType<typeof claimSeatsForShutdown> = { credits: [], progress: [] };
     let tourneys: ReturnType<typeof claimTournamentRefundsForShutdown> = { entryFees: [], clubRefunds: [], stakes: [] };
     let sideTasks: Promise<unknown>[] = [];
+    // R3 (S1-4) — decided quick games settle first, while their seats still hold their stacks.
+    try { settleDecidedQuickGamesForShutdown(); } catch (e: any) { console.error('[Shutdown] decided quick-game settlement failed:', e?.message || e); }
     try { seats = claimSeatsForShutdown(); } catch (e: any) { console.error('[Shutdown] seat claim failed:', e?.message || e); }
     try { tourneys = claimTournamentRefundsForShutdown(); } catch (e: any) { console.error('[Shutdown] tournament claim failed:', e?.message || e); }
     try { sideTasks = claimQuickAndQualifierRefundsForShutdown(tourneys.entryFees); } catch (e: any) { console.error('[Shutdown] quick / qualifier claim failed:', e?.message || e); }

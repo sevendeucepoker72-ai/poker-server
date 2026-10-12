@@ -201,6 +201,7 @@ function harness(opts: HarnessOpts = {}) {
     seatPlayedByAnotherAccount: () => false,
     // R2 (S1): the Spin & Go (prize format) helpers the leave / reservation paths ask.
     isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false,
+    settleDecidedQuickGame: () => false,   // R3 (S1-4) — no quick game decided here
     shutdownFlushActive: () => false,   // R2 (item 1) — the shutdown flush is not running
     addChipsToUser: async (uid: number, amount: number) => { credits.push({ uid, amount }); return true; },
     auditLog: (actor: string, action: string, details: Record<string, unknown>) => { audits.push([actor, action, details]); },

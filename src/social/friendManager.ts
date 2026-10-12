@@ -73,6 +73,14 @@ export async function acceptFriendRequest(userId: number, otherId: number): Prom
   return r.rowCount ? { ok: true } : { ok: false, error: 'No pending request' };
 }
 
+/** R3 (S1-5) — are these two accounts ACCEPTED friends (a pending request is not)? */
+export async function areAcceptedFriends(userId: number, otherId: number): Promise<boolean> {
+  if (!userId || !otherId || userId === otherId) return false;
+  const [lo, hi] = pair(userId, otherId);
+  const r = await getPool().query("SELECT 1 FROM friendships WHERE user_lo=$1 AND user_hi=$2 AND status='accepted'", [lo, hi]);
+  return (r.rows?.length ?? 0) > 0;
+}
+
 export async function removeFriend(userId: number, otherId: number): Promise<{ ok: boolean }> {
   const pool = getPool();
   const [lo, hi] = pair(userId, otherId);

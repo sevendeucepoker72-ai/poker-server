@@ -264,7 +264,9 @@ function world(opts: WorldOpts = {}) {
     lastEmoteTime: new Map(), lastReactionTime: new Map(), lastChatTime: new Map(),
     syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {},
     // R2 (S1): the Spin & Go (prize format) helpers the leave / reservation paths ask.
-    isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false, emitGameState() {},
+    isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false,
+    emitGameState() {},
+    settleDecidedQuickGame: () => false,   // R3 (S1-4) — no quick game decided here
     shutdownFlushActive: () => false,   // R2 (item 1) — the shutdown flush is not running
     getGameStateForPlayer: () => ({}), scheduleAIAction() {}, log: { debug() {}, info() {} },
     // R2 (2026-10-11): the seat-teardown helper block (SEAT_TEARDOWN_SRC) tests it.

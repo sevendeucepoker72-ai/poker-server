@@ -1022,8 +1022,12 @@ describe('index.ts — every play-entry handler is gated before its first side e
     expect(sweepAt).toBeGreaterThan(-1);
     expect(src.slice(sweepAt, sweepAt + 400)).toContain("refundCancelledTournamentEntrants(id, registrants, 'tournament_cancelled_stalled');");
     const refundFn = fnBody('function refundCancelledTournamentEntrants(');
-    expect(refundFn).toContain('addChipsToUser(userId, r.refund)');
-    expect(refundFn).toContain("'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED'");
+    // R3 (TOURNEY-P3-3) — through the prize ledger now (idempotent key per tournament + entrant, retried);
+    // every entrant still audited (refunded, or FAILED while the ledger retries it).
+    expect(refundFn).toContain('void prizeLedger.settle({ label: `tfee:${tournamentId}`, credits })');
+    expect(refundFn).toContain('key: `tfee:${tournamentId}:${r.playerId}`');
+    expect(refundFn).toContain("auditLog(String(c.userId), 'TOURNAMENT_ENTRY_REFUND', { tournamentId, amount: c.amount, reason });");
+    expect(refundFn).toContain("'TOURNAMENT_ENTRY_REFUND_FAILED'");
   });
 
   it('(B/D1) resumeSession: seat restored by LOCAL userId only (no display-name scan); session phone + orig_iat carried from the token', () => {
