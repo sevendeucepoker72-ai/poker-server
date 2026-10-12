@@ -926,7 +926,9 @@ invalid_draw
 # hand only at a ring table (wallet chips; a tournament / fixed-roster quick
 # seat's hand is dead); the guest-claim seat cash-out and the admin-DQ absent
 # tournament seat go through the one teardown.
-seat.allIn && leaverKeepsAllInHand(tableId)
+# R3 (S2-1) replaced `seat.allIn && leaverKeepsAllInHand(tableId)`: the seat
+# also keeps its hand while the runout is held (the covering caller).
+(seat.allIn || table.isRunoutHeld()) && leaverKeepsAllInHand(tableId)
 foldSeatOutOfHand(table, seatIndex)
 teardownSeat(tableId, table, seatIndex, null, reason)
 #
@@ -1156,3 +1158,25 @@ function isFreeForEveryone(
 
 # 2026-10-11 (.online R2 merge) — season / leaderboard "chips won" = PUBLIC cash tables only; club tables feed club stats.
 function tableFeedsClubStats(
+
+# 2026-10-11 (.online R3, SF-C) — engine / fast mode / auth hardening / AI / logs.
+# S2-1: a seat with no decision left (all-in, or the runout held for insurance)
+# keeps its hand at a ring table — locked by the GAME-15 teardown token above.
+# K1-6: a seat restore keeps the player's fast mode and tells the client; the per-player state carries it.
+restoreFastModeOnSeatRestore(socket, reserved);
+state.fastMode = session.fastMode === true;
+# AUTH-P3-1: voice signals / coach whispers only between sockets sharing the voice / table room.
+relayPeerSharingRoom(socket, data.to, 'voice_')
+relayPeerSharingRoom(socket, data.targetSocketId, 'table:')
+# AUTH-P3-2: identityGuard.stampDurable reports a TEXT users.stats as durable.
+stampDurable: statsStampDurable(_statsColumnType)
+# AUTH-P3-3: play tickets are burned durably (used_play_tickets).
+ON CONFLICT (ticket_hash) DO NOTHING RETURNING 1
+ticketReplayGuard:
+# AUTH-P3-4: Dealer's Choice only at a ring table, by a seated player.
+dealers_choice_not_allowed
+# GAME-P3-10: the AI opponent model is keyed by player id (bounded).
+function opponentModelKey(
+OPPONENT_PROFILES_CAP
+# OPS-P3-2: a phone-number login handle never reaches an [AUDIT] log line.
+phone-handle

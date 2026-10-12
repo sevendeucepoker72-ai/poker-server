@@ -67,6 +67,9 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
     clubTables: new Map(),
   };
   let clubSeq = 0;
+  // R3 (AUTH-P3-3) — used_play_tickets: ticket hash -> expires_at (ms); NOW() reads clockNow (tests move it).
+  const usedTickets = new Map<string, number>();
+  let clockNow = () => Date.now();
   const failures: Array<{ pattern: RegExp; times: number }> = [];
   const statements: string[] = [];
   const now = () => new Date().toISOString();
@@ -180,6 +183,18 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
     // ── R2 club tournaments / club tables (TOURNEY-14 / CLUBS-4) ──
     const club = clubQuery(q, params);
     if (club) return club;
+    // ── R3 (AUTH-P3-3) used_play_tickets — the durable play-ticket replay ledger ──
+    if (/^INSERT INTO used_play_tickets \(ticket_hash, expires_at\) VALUES \(\$1, \$2\) ON CONFLICT \(ticket_hash\) DO NOTHING RETURNING 1$/i.test(q)) {
+      const [hash, expiresAt] = params;
+      if (usedTickets.has(hash)) return { rows: [], rowCount: 0 };
+      usedTickets.set(hash, new Date(expiresAt).getTime());
+      return { rows: [{ '?column?': 1 }], rowCount: 1 };
+    }
+    if (/^DELETE FROM used_play_tickets WHERE expires_at < NOW\(\)$/i.test(q)) {
+      let n = 0;
+      for (const [h, exp] of usedTickets) if (exp < clockNow()) { usedTickets.delete(h); n++; }
+      return { rows: [], rowCount: n };
+    }
     // ── users ──
     if (/^UPDATE users SET chips = chips \+ \$1 WHERE id = \$2/i.test(q)) {
       const [amount, uid] = params;
@@ -279,6 +294,9 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
     get clubTables() { return state.clubTables; },
     get members() { return state.members; },
     get clubs() { return state.clubs; },
+    // R3 (AUTH-P3-3) — the play-ticket ledger, and the DB clock its NOW() reads.
+    usedTickets,
+    setClock(fn: () => number) { clockNow = fn; },
     statements,
     failNext(pattern: RegExp, times = 1) { failures.push({ pattern, times }); },
   };

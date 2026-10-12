@@ -154,6 +154,100 @@ describe('Addendum — an ALL-IN player leaving during the insurance hold does n
   });
 });
 
+describe('R3 (S2-1) — the COVERING caller leaving during the insurance hold keeps his hand too', () => {
+  /** The teardown condition before R3: only the ALL-IN seat kept its hand. */
+  const PRE_R3 = 'if (seat.allIn && leaverKeepsAllInHand(tableId)) {';
+  const R3 = 'if ((seat.allIn || table.isRunoutHeld()) && leaverKeepsAllInHand(tableId)) {';
+  const ring = { isTournamentTable: () => false, isFixedRosterQuickTable: () => false };
+
+  /**
+   * Heads-up cash: the shover (seat 0, 3000, 7c 2s) is all-in, the caller
+   * (seat 1, 9000, Ah Ad) called — 3000 each in the pot, 6000 behind him, the
+   * runout HELD for the shover's insurance window. The board is rigged
+   * (Kh 9d 4c 3s Jh): aces win.
+   */
+  function heldCoveringCall(w: ReturnType<typeof teardownWorld>, insureShover = false) {
+    w.table.sitDown(0, 'Shover', 3000, 'p-short', false);
+    w.table.sitDown(1, 'Caller', 9000, 'p-cover', false);
+    w.table.runoutHoldDecider = () => true;                     // index.ts holds for the insurance window
+    w.table.startNewHand();
+    let g = 0;
+    while (!w.table.seats[0].allIn && g++ < 6) {
+      const a = w.table.activeSeatIndex;
+      if (a === 0) w.table.playerAllIn(0); else w.table.playerCall(a) || w.table.playerCheck(a);
+    }
+    w.table.seats[0].holeCards = [{ rank: 7, suit: 2 }, { rank: 2, suit: 3 }] as any;
+    w.table.seats[1].holeCards = [{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }] as any;
+    const deck = (w.table as any).deck;
+    const dealOne = deck.dealOne.bind(deck);
+    const runout = [[5, 0], [13, 0], [9, 1], [4, 2], [6, 0], [3, 3], [8, 0], [11, 0]].map(([rank, suit]) => ({ rank, suit }));
+    deck.dealOne = () => (runout.length ? runout.shift() : dealOne());   // burn, flop, burn, turn, burn, river
+    g = 0;
+    while (!w.table.isRunoutHeld() && w.table.isHandInProgress() && g++ < 6) w.table.playerCall(w.table.activeSeatIndex);
+    expect(w.table.isRunoutHeld()).toBe(true);
+    expect(w.table.seats[1].allIn).toBe(false);
+    expect(w.table.seats[1].chipCount).toBe(6000);
+    expect(w.table.activeSeatIndex).toBe(-1);                  // nobody can be asked to act
+    if (insureShover) {
+      w.insuranceCashouts.set(T, [{ seatIndex: 0, playerId: 'p-short', cashout: 900, handNumber: w.table.handNumber, equityPct: 15, pot: 6000 }]);
+    }
+  }
+
+  it('wiring: the teardown keeps a seat when it is all-in OR the runout is held', () => {
+    expect(SEAT_TEARDOWN_SRC).toContain(R3);
+    expect(SEAT_TEARDOWN_SRC).not.toContain(PRE_R3);
+  });
+
+  it('the covering seat stays IN the hand; the board runs out; the aces win the 6000; his final stack (12,000) is credited once', () => {
+    const w = teardownWorld(undefined, ring);
+    heldCoveringCall(w);
+    expect(w.m.teardownSeat(T, w.table, 1, { userId: 21, username: 'u21' }, 'leave')).toBe('deferred');
+    expect(w.table.seats[1].folded).toBe(false);
+    expect(w.table.isRunoutHeld()).toBe(true);                 // the window goes on for the shover
+    expect(w.table.releaseRunoutHold()).toBe(true);
+    expect(w.table.currentPhase).toBe(GamePhase.HandComplete);
+    expect(w.table.wentToShowdown).toBe(true);
+    expect(w.credits).toEqual([{ userId: 21, chips: 12000, reason: 'leave_after_hand' }]);
+    expect(w.table.seats[1].state).toBe('empty');
+    expect(w.chipsOnTable() + w.credited()).toBe(12000);       // nothing created or destroyed
+  });
+
+  it('the shover insured: the insurance SETTLES against the real result (a payout), and the leaver is still paid his 12,000', () => {
+    const w = teardownWorld(undefined, ring);
+    heldCoveringCall(w, true);
+    expect(w.m.teardownSeat(T, w.table, 1, { userId: 21, username: 'u21' }, 'leave')).toBe('deferred');
+    w.table.releaseRunoutHold();
+    expect(w.audits).toEqual([expect.objectContaining({ action: 'INSURANCE_PAYOUT', d: expect.objectContaining({ delta: 900 }) })]);
+    expect(w.credits).toEqual([{ userId: 21, chips: 12000, reason: 'leave_after_hand' }]);
+  });
+
+  it('a tournament seat is still folded out (no wallet chips) — the hold never happens there, the rule stays ring-only', () => {
+    const w = teardownWorld(undefined, { isTournamentTable: () => true, isFixedRosterQuickTable: () => false });
+    heldCoveringCall(w);
+    w.m.teardownSeat(T, w.table, 1, null, 'admin_kick');
+    expect(w.table.currentPhase).toBe(GamePhase.HandComplete);  // folded out: awarded at once, uncontested
+    expect(w.table.wentToShowdown).toBe(false);
+    expect(w.table.lastHandResult?.winners.map((x: any) => [x.seatIndex, x.chipsWon])).toEqual([[0, 6000]]);
+  });
+
+  it('CONTROL — pre-R3 (only seat.allIn kept): the covering caller was folded; the 72o took the 6000 "by fold"; he got only his 6000 behind', () => {
+    const w = teardownWorld(undefined, ring);
+    heldCoveringCall(w);
+    const code = SEAT_TEARDOWN_SRC.replace(R3, PRE_R3);
+    expect(code).not.toBe(SEAT_TEARDOWN_SRC);
+    const { exports: old } = load(code, {
+      pendingSeatRemovalAfterHand: w.pendingSeatRemovalAfterHand, sitOutTracker: new Map(), scheduleAIAction() {}, syncSitOutToTable() {},
+      creditSeatStackToWallet: (userId: number, _u: string, _t: string, seat: any, reason: string) => w.credits.push({ userId, chips: seat.chipCount, reason }),
+      ...ring, DrawPhases: DRAWS, FiveCardDrawTable, GamePhase, MAX_SEATS, console: quiet,
+    }, '{ teardownSeat }');
+    expect(old.teardownSeat(T, w.table, 1, { userId: 21, username: 'u21' }, 'leave')).toBe('deferred');
+    expect(w.table.currentPhase).toBe(GamePhase.HandComplete);  // folded: awarded at once, uncontested
+    expect(w.table.wentToShowdown).toBe(false);
+    expect(w.table.lastHandResult?.winners.map((x: any) => [x.seatIndex, x.chipsWon])).toEqual([[0, 6000]]);
+    expect(w.credits).toEqual([{ userId: 21, chips: 6000, reason: 'leave_after_hand' }]);
+  });
+});
+
 describe('GAME-16 — every teardown hands the turn on; a draw round completes; a lone player is paid at once', () => {
   it('a leaver ON his turn: folded, and scheduleAIAction runs (the next bot acts now, not after its 30s clock)', () => {
     const w = teardownWorld();
@@ -609,7 +703,7 @@ describe('R2 — a seat torn down while ALL-IN keeps its hand only at a ring tab
 
   it('CONTROL — every all-in kept (the first R2 cut): a disqualified tournament seat stayed IN the pot; anything it won would leave play with it', () => {
     const w = teardownWorld(undefined, { isTournamentTable: () => true });
-    const code = SEAT_TEARDOWN_SRC.replace('if (seat.allIn && leaverKeepsAllInHand(tableId)) {', 'if (seat.allIn) {');
+    const code = SEAT_TEARDOWN_SRC.replace('if ((seat.allIn || table.isRunoutHeld()) && leaverKeepsAllInHand(tableId)) {', 'if (seat.allIn) {');
     expect(code).not.toBe(SEAT_TEARDOWN_SRC);
     const scope: Record<string, unknown> = {
       pendingSeatRemovalAfterHand: new Map(), sitOutTracker: new Map(), scheduleAIAction() {}, syncSitOutToTable() {},

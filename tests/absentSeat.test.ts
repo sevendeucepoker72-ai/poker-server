@@ -107,6 +107,8 @@ const P = {
   accountSwitch: slice('const socketAccountSwitches = {', '\n}\n'),
   // S2 fixed protocol (2026-10-10): the lobby's Return to tournament (P-c).
   returnToTournament: slice("socket.on('returnToTournamentSeat'", '\n  });\n'),
+  // R3 (K1-6): every seat restore gives the session its fast-mode choice back and tells the socket.
+  fastModeRestore: fnSrc('function restoreFastModeOnSeatRestore('),
 };
 
 const constOf = (name: string): number => {
@@ -156,6 +158,7 @@ ${p.isAbsentPastLimit}
 ${p.autoAct}
 ${p.armTurnTimer}
 ${p.tick}
+${p.fastModeRestore}
 function wire(socket) {
 ${p.resume}
   ${p.oauth}
@@ -457,7 +460,8 @@ describe('U1 — a login that outlives its socket never consumes the reservation
     expect(w.playerSessions.get('S3')).toMatchObject({ tableId: 't1', seatIndex: 0 });
     expect(w.authSessions.get('S3')).toMatchObject({ userId: ALICE, masterUserId: 'm-alice' });
     expect(w.reservedSeats.has(ALICE)).toBe(false);
-    expect(w.emitted('S3').map(([ev]) => ev)).toEqual(['reconnectedToTable', 'loginResult']);
+    // R3 (K1-6): the restore also tells the socket its fast-mode choice (off here) right after reconnectedToTable.
+    expect(w.emitted('S3').map(([ev]) => ev)).toEqual(['reconnectedToTable', 'fastModeSet', 'loginResult']);
     jest.advanceTimersByTime(SEAT_RESERVE_MS);                 // the consumed reservation's timer was cleared
     await flush();
     expect(w.credits).toEqual([]);
@@ -1963,5 +1967,59 @@ describe('round-7 review (major) — a seat is never played by two sessions; a s
     expect(w.reservedSeats.has(ALICE)).toBe(false);        // no stale reservation on the seat S2 plays
     expect(sessionsOnSeat(w, tableId, 0)).toEqual(['S2']); // S2 still plays it
     void s2;
+  });
+});
+
+// ── R3 (K1-6) — a player's fast mode survives a seat restore ──
+describe('R3 (K1-6) — the fast-mode choice survives a seat restore (and the client is told)', () => {
+  const signInAs = async (s: any, via: 'resumeSession' | 'oauthLogin' | 'tokenLogin_legacy') => {
+    if (via === 'resumeSession') await s.handlers.resumeSession({ resumeToken: 'tok' });
+    else if (via === 'oauthLogin') await s.handlers.oauthLogin({ accessToken: 'oidc-alice' });
+    else await s.handlers.tokenLogin({ token: 'legacy-alice' });
+  };
+
+  it.each(['resumeSession', 'oauthLogin', 'tokenLogin_legacy'] as const)(
+    '%s: Alice had fast mode ON; her socket dropped; the restored session has it ON and her socket gets fastModeSet {enabled:true} after reconnectedToTable',
+    async (via) => {
+      const w = world();
+      const s1 = w.seatLive('S1', ALICE, 0);
+      w.playerSessions.get('S1').fastMode = true;          // what setFastMode {enabled:true} set
+      await w.drop(s1);
+      expect(w.reservedSeats.get(ALICE)).toMatchObject({ tableId: 't1', seatIndex: 0, fastMode: true });
+      const s2 = w.mkSocket('S2');
+      await signInAs(s2, via);
+      expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0, fastMode: true });
+      const evs = w.emitted('S2');
+      const at = (ev: string) => evs.findIndex(([e]) => e === ev);
+      expect(evs).toContainEqual(['fastModeSet', { enabled: true }]);
+      expect(at('fastModeSet')).toBeGreaterThan(at('reconnectedToTable'));
+      expect(at('fastModeSet')).toBeLessThan(at('loginResult'));
+    },
+  );
+
+  it('fast mode OFF stays off — the socket is told {enabled:false} (a toggle left showing ON resyncs)', async () => {
+    const w = world();
+    const s1 = w.seatLive('S1', ALICE, 0);
+    await w.drop(s1);
+    expect(w.reservedSeats.get(ALICE).fastMode).toBeUndefined();
+    const s2 = w.mkSocket('S2');
+    await s2.handlers.resumeSession({ resumeToken: 'tok' });
+    expect(w.playerSessions.get('S2').fastMode).toBe(false);
+    expect(w.emitted('S2')).toContainEqual(['fastModeSet', { enabled: false }]);
+  });
+
+  it('CONTROL — pre-R3 (no carry, no tell): the restored session had no fastMode (normal-speed bots) and nothing told the client', async () => {
+    const DEPART = '    ...(session.fastMode ? { fastMode: true } : {}),\n';
+    expect(P.departure).toContain(DEPART);
+    const strip = (src: string) => src.split('restoreFastModeOnSeatRestore(socket, reserved);').join('');
+    const w = world({ over: { departure: P.departure.replace(DEPART, ''), resume: strip(P.resume) } });
+    const s1 = w.seatLive('S1', ALICE, 0);
+    w.playerSessions.get('S1').fastMode = true;
+    await w.drop(s1);
+    const s2 = w.mkSocket('S2');
+    await s2.handlers.resumeSession({ resumeToken: 'tok' });
+    expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
+    expect(w.playerSessions.get('S2').fastMode).toBeUndefined();
+    expect(w.emitted('S2').map(([ev]) => ev)).not.toContain('fastModeSet');
   });
 });

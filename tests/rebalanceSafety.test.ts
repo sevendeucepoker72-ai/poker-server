@@ -91,6 +91,8 @@ const P = {
   // Round 6 (2026-10-10): spectateNextTable (pe5 X5 — a busted player's dead seat) and banUser (P-k).
   spectateNextTable: handlerSrc('spectateNextTable', '\n  });\n'),
   banUser: handlerSrc('banUser', '\n  });\n'),
+  // R3 (K1-6): restoreAbsentTournamentSeat gives the session its fast-mode choice back and tells the socket.
+  fastModeRestore: fnSrc('function restoreFastModeOnSeatRestore('),
   // Z1 (2026-10-10): the main (last-registered) disconnect handler — its seat reserve runs after the save await.
   disconnect: slice("  socket.on('disconnect', async () => {\n    console.log(`Player disconnected: ${socket.id}`);", '\n  });\n'),
 };
@@ -159,6 +161,7 @@ ${p.canStandUp}
 ${p.standUpAbsent}
 ${p.standUpSuspended}
 ${p.seatKeep}
+${p.fastModeRestore}
 ${p.departure}
 ${p.noteNotCashed}
 ${p.accountSwitch}
@@ -2771,7 +2774,8 @@ describe('P-g (round 5) — one socket, one table view: detachSocketFromOtherTab
     expect(r).toMatchObject({ tableId: 'TB', seatIndex: 2 });
     expect(w.spectators.get('TA')?.has('S-b2') ?? false).toBe(false);
     expect([...s.rooms]).toEqual(['table:TB']);
-    expect(s.emitted.map(([ev]: [string]) => ev)).toEqual(['reconnectedToTable']);
+    // R3 (K1-6): + its fast-mode choice (off here), right after reconnectedToTable.
+    expect(s.emitted.map(([ev]: [string]) => ev)).toEqual(['reconnectedToTable', 'fastModeSet']);
   });
 
   it('CONTROL — the round-4 restore (only THIS table\'s spectating ended): still TA\'s spectator and in its room while seated at TB', () => {

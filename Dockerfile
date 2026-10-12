@@ -11,7 +11,7 @@
 # native modules against whatever Railway uses and paste the issue in
 # SITES.md known-issues.
 
-FROM node:20-alpine
+FROM node:22-alpine
 
 # Native-compile toolchain for any deps that need it (poker-server itself
 # doesn't use canvas, but transitively a future dep might).

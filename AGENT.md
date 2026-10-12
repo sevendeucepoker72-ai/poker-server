@@ -7,7 +7,7 @@
 
 ## Identity
 
-- **Purpose:** Real-time game server — socket.io for poker tables, REST for fairness verification, hand-state persistence
+- **Purpose:** Real-time game server — socket.io for poker tables, REST for fairness verification (in-progress hands do NOT survive a restart — hard rule 1)
 - **Live URL:** https://poker-server-production-60c0.up.railway.app
 - **Source:** `C:/Users/josh2/Downloads/developer setup/poker-server/`
 - **Stack:** Node.js + TypeScript + Socket.io + Express (for REST)
@@ -15,7 +15,7 @@
 - **Region:** **US East (Virginia)** since 2026-05-20. Was EU West (Amsterdam) before. Volume-attached services (`Postgres-dCcH`, `Redis-8Erh`) live in the same region. See SITES.md §2 for the deprecated EU services kept for 24h rollback.
 - **Plan:** Railway **Pro** since 2026-05-20 (was Hobby; Hobby plan was the first to be paused during platform incidents and Hobby's deploy queue blocked our same-day hotfix path).
 - **Database:** Postgres 18 SSL via `DATABASE_URL` env var. Currently references `${{Postgres-dCcH.DATABASE_URL}}`. (The poker-server in-memory state IS still ephemeral; "Database" here refers to the master-API-shared `users` table + per-user progression in Postgres, NOT a per-process SQLite.)
-- **Cache:** Redis via `REDIS_URL` env var (hand-state snapshots). Currently references `${{Redis-8Erh.REDIS_URL}}`.
+- **Cache:** Redis via `REDIS_URL` env var. Currently references `${{Redis-8Erh.REDIS_URL}}`. What it really keeps across a restart: the provably-fair revealed-commitment buffers (`/api/fairness/<old tableId>` still answers for the previous process's hands). Hand-state snapshots are WRITTEN on every broadcast but can never be restored — see hard rule 1 (2026-10-11, GAME-P3-9 / OPS-P3-8).
 
 ## Files an agent must read before editing
 
@@ -41,11 +41,31 @@ strict "use strict" emit); a stale local node_modules (TS 5.x) hid a red suite
 for four deploys (tests that slice index.ts must declare every module-level
 binding the slice assigns).
 
+**Node 22 LTS everywhere (2026-10-11, OPS-4):** `nixpacks.toml` (`nodejs_22`,
+the Railway build), `Dockerfile` (`node:22-alpine`), CI (`22.x`) and
+`package.json` `engines` (`^22.12.0`) move together — change all four or none.
+The floor is real: `jose` 6 is ESM-only and is loaded through `require(esm)`,
+which Node 22 has unflagged only from 22.12 (Node 20 from 20.19). After a
+deploy, the boot line `Poker server running on port … (Node v22.x.y)` names
+the runtime (a nixpkgs `nodejs_22` older than 22.12 would crash at boot on the
+jose import — the deploy healthcheck below then keeps the old deployment live).
+
+**Railway deploy health (2026-10-11, OPS-5, `railway.json`):** a deployment
+goes live only after `GET /api/health` answers 200 (`healthcheckPath`, within
+`healthcheckTimeout` 120 s — the route answers as soon as the HTTP server
+listens and a `SELECT 1` (+ a Redis PING once connected) returns under 1.5 s;
+it answers 503 while the DB cannot, so a deploy whose DB is unreachable never
+replaces the running one). Railway only uses it at deploy time — it is not a
+liveness monitor. `restartPolicyType: ALWAYS`: a crash (the processGuards
+flush exits 1) is restarted every time — `ON_FAILURE` with 3 retries left the
+room down after a third crash. Crash notifications are an owner setting in
+Railway (not in this repo).
+
 ## Hard rules (earned)
 
 | # | Rule | Earned |
 |---|---|---|
-| 1 | **Set `REDIS_URL` on Railway.** Without it, hand-state rehydration is a no-op and in-progress hands are LOST on every redeploy. | Convention |
+| 1 | **A redeploy / restart ENDS every hand in progress — nothing is rehydrated.** Table ids are new `uuidv4()`s on every boot (`TableManager` creates the default tables in its constructor; quick / private / club / tournament tables are created at runtime), so a Redis hand snapshot (`snapshotHand`, written every broadcast, flushed at shutdown) never matches a table of the new process, and the boot rehydrate (`scanHands` → `rehydrateFromSnapshot`) restores nothing. What protects players is the shutdown / crash flush (row 2, row 28 d): every seat's stack is credited once, what dies with the process is refunded. Do NOT "fix" rehydration by giving tables stable ids without first removing that flush's credit — a seat both credited at shutdown AND restored would be paid twice. **Set `REDIS_URL` anyway:** it keeps the provably-fair commitment buffers (`/api/fairness/*` for the previous process's hands). (Corrected 2026-10-11, GAME-P3-9 / OPS-P3-8 — this row used to promise that in-progress hands survive a redeploy; the snapshot writes are kept, unused.) | Convention; corrected .online R3 2026-10-11 |
 | 2 | **Graceful shutdown (`SIGTERM`/`SIGINT`) MUST flush state to DB.** Cash out seated chip stacks, flush in-memory XP/level/achievements. Don't hope hand-complete handlers have fired recently. | 2026-04-22 |
 | 3 | **Chip mutations server-authoritative.** Only paths: `addChipsToUser` (additive SQL `chips = chips + $1`), `deductChips` (atomic), pot distribution at hand-complete, admin grants (audited). NEVER accept `chips` from a client socket payload. | 2026-04-22 (saveProgress mint vector) |
 | 4 | **Player action nonces are deduped** (`actionNonces` Map, keyed `tableId:seat`) at `src/index.ts:~5700-5708`. Replay of same nonce returns "Duplicate action" error — clients treat as success (idempotent retry). | Convention |
@@ -73,6 +93,7 @@ binding the slice assigns).
 | 26 | **Tournament seat polish (round 7, Z1-Z7).** Z1: the `disconnect` handler re-checks `playerSessions.get(socket.id) === session` after its saveProgress await — a seat Returned / restored meanwhile is never reserved or acted for (`disconnect_session_replaced_during_save`). Z2: a bust notice carries the BUSTED entrant's own `finishPosition` (the final bust told the runner-up "1st"). Z3: the absent limp ceiling is `PokerTable.handBigBlind` (captured at hand start; a mid-hand level-up no longer widens it). Z4: Return takes over a seat another tab plays ONLY for a named tournamentId. Z5: `banUser` disqualifies a tournament seat his live socket plays too (as IP-ban). Z6: a leave / disconnect ON his turn CHECKS when a check is free, else folds (cash + tournament). Also (superseded 2026-10-11: the password `login` and `syncMasterUser` are removed, AUTH-8): every sign-in path is master-first now. **Review fixes:** the disconnect re-validates after its save await (session still its own, same live table not broken, seat still his, and NO other socket's session plays it — `otherSessionHoldsSeat`); tokenLogin's orphan-seat scan skips seats a live session plays (two sessions on one seat let the old socket's disconnect fold the new socket's live hand); departures never act in a draw phase; a tournament leave sets `handsRemaining:0` BEFORE acting (short absent clock on the very next turn); an empty Return `tournamentId` is none. | 2026-10-10 (pe6 review + merge review leftovers) |
 | 27 | **Identity, crash safety and seat identity (.online R1, 2026-10-11).** (a) **AUTH-1:** a sign-in finds its local row by MASTER ID only (`findLocalUserByMasterId`, under `withMasterLock`); a master with no row gets one from `createOrAdoptMasterRow` (src/auth/masterRow.ts): an existing UNOWNED row only with real proof — a master-attested phone (a signed phone claim / the master's own /me record) equal to the row's phone-number username, never an is_admin, GuestNNNN or tombstone row, atomic (`FOR UPDATE`) — else a NEW row under `m:<master id>` (`ON CONFLICT DO NOTHING`, re-read by master id, suffix on a foreign key holder). NEVER upsert or look up a row by a display name, slug or unattested phone again (the old `ON CONFLICT (LOWER(username)) DO UPDATE` handed renamed attackers the is_admin admin seed). `users.username` is not a display value (phone / slug / `m:<id>`): show `display_name`. The warn/enforce guard and `ONLINE_IDENTITY_GUARD_ENFORCE` are retired. AUTH-11: the waitlist link creates the row too. (b) **Crash safety (contract #6):** `installSocketListenerGuard(socket)` (src/socketGuard.ts) runs FIRST in the connection handler — a listener that declares a payload parameter gets only a plain-object payload (`[socket-payload-rejected]`, ack `invalid_payload`); a sync throw / rejected returned promise → `[socket-handler-error] {event}` + ack `{success:false,error:'server_error'}`. A listener that starts async work must RETURN its promise (joinTable / quickPlay / rebuy return their IIFE). src/processGuards.ts: `unhandledRejection` → log, keep running; `uncaughtException` → log, `gracefulShutdown('uncaughtException', 1)` (shared in-flight promise, bounded 20s), exit 1. No @socket.io/redis-adapter (single replica). (c) **No password login, no admin seed (AUTH-8/15):** the socket `login` handler, `loginUserAsync` / `syncMasterUser` and the ADMIN_PASSWORD seed are gone; no hardcoded `ADMIN_PHONE`. (d) **AUTH-3:** `clearGhostSeatsForUser` identifies ghost seats by ACCOUNT only (its sessions; its own still-valid reservation; cash seats stamped `user_<id>` nobody plays) — never by a name. (e) **Names + avatars (contract #3):** every seat / quick game / tournament + qualifier registration / waitlist / chat path names the seat with `seatNameForSocket(socket, …)` — the session's `displayName` (set by every sign-in, kept current by setDisplayName) through `accountDisplayName` (setDisplayName whitelist, never phone-like, else 'Player'); a client name only for an account-less socket. Avatars only through `sanitizeSeatAvatar` (style ids, #hex colors, sliders; no photo). (f) **AUTH-12:** `assertPlayable` also refuses a locally banned account (`bannedAccountRefusal`), and oauthLogin / tokenLogin / authWithTicket / the waitlist link refuse a banned row at sign-in. Tests that slice index.ts with explicit globals must be handed new helpers (`seatNameForSocket`, `sanitizeSeatAvatar`, `seatPlayedByAnotherAccount`, …). Pinned by tests/masterRow, crashSafety, ghostSeats, seatNames, bans. | 2026-10-11 (.online full audit, owner: "fix it all") |
 | 28 | **Table lifecycle, quick games, money settlement and progression (.online R2, 2026-10-11).** (a) **One seat teardown** (`teardownSeat`): every leave / departure / ghost cleanup / reservation end goes through it. A seat whose chips are in a live pot is stood up only at the hand's end (`pendingSeatRemovalAfterHand`); an ALL-IN leaver keeps his hand only at a ring table where the stack is his own wallet (`leaverKeepsAllInHand` — never a tournament or fixed-roster game); a bot seat is never taken for a joiner mid-hand (`aiSeatTakeableNow` / `takeAiSeatForJoin`); every fold or leave that moves the turn calls `scheduleAIAction(tableId)` so the next actor is always clocked. (b) **Fixed-roster tables** (`isFixedRosterTable`: every quick format — heads-up, Spin & Go, all-in-or-fold, career — plus a club challenge): no AI fill, a busted bot is never reloaded, and the game ENDS when decided (`quickGameEndCheck`). Ring-table bot stacks are reset to one buy-in above 3 buy-ins (`reloadAndCapBotStacks`, `BOT_STACK_CAP_BUYINS`). (c) **Only joinable PUBLIC cash tables** are listed, Quick-Played, waitlisted or joined by `joinTable` (`isPublicCashTable`; anything else answers `table_not_joinable` before any side effect); private / club tables have their own entry paths. (d) **Prize and refund settlements are durable** (`createPrizeLedger` → `prize_payouts`, retried on a DB blip); the shutdown flush (`claimSeatsForShutdown`, audited `SHUTDOWN_FLUSH`) cashes out each seat EXACTLY once. (e) **One progress record per account**, re-hydrated on login; the hand-end progress push is DB-fresh. `users.chips` is BIGINT — `src/economy/schema.ts` installs the int8 → number parser (`setTypeParser(20, …)`) at import; never read a BIGINT column without it. (f) **Season / leaderboard "chips won" counts PUBLIC cash tables only** (`tableCountsForChipsWon`: never private, club, quick or tournament hands — friends at a table of their choosing could feed one account a paid season place); a club table still feeds its own club stats (`tableFeedsClubStats`). | .online R2 audit 2026-10-11 |
+| 29 | **Engine, relays, tickets, logs (.online R3 SF-C, 2026-10-11).** (a) **S2-1:** `teardownSeat` keeps a seat's hand at a ring table when it has NO decision left — all-in OR the runout is HELD for the insurance window (`table.isRunoutHeld()`: the covering caller too); its final stack is credited at the hand's end. (b) **K1-6:** a seat restore keeps the player's fast mode — `reserveSeatForDeparture` snapshots `fastMode` on the reservation, every restore path (oauthLogin, tokenLogin x2, resumeSession, `restoreAbsentTournamentSeat`) calls `restoreFastModeOnSeatRestore` right after its `reconnectedToTable` (session flag + `fastModeSet {enabled}` to that socket); `setFastMode` also sets the socket's extra-table sessions; per-player state carries `fastMode`. (c) **AUTH-P3-1:** a peer relay (`voiceOffer` / `voiceAnswer` / `voiceIce`, `coachWhisper`) reaches only a LIVE socket that shares a `voice_<tableId>` (voice) / `table:<tableId>` (coach) room with the sender (`relayPeerSharingRoom`) — never `io.to(<client string>)`, which reached any socket id or any room; a whisper is a string, max 500 chars. (d) **AUTH-P3-3:** a play ticket (`authWithTicket`, `joinWithWaitlistContext`) is burned DURABLY — `src/auth/ticketReplay.ts`, table `used_play_tickets` (SHA-256 of the ticket only), one `INSERT … ON CONFLICT (ticket_hash) DO NOTHING RETURNING 1` per claim, the in-memory map as the fast path, hourly TTL prune; a DB that cannot answer falls back to the in-memory guard (`/api/health` `ticketReplayGuard.durableErrors`). (e) **AUTH-P3-4:** `enableDealersChoice` only by a player SEATED at that table (`socketSeatedAt`) and only at a ring table (`dealersChoiceAllowedAt`), else `error {code:'dealers_choice_not_allowed'}`. (f) **AUTH-P3-2:** `/api/health identityGuard.stampDurable` is true on a jsonb AND a TEXT `users.stats` (`statsStampDurable`). (g) **GAME-P3-10:** the AI opponent model is keyed by the seat's player id (`opponentModelKey`), never the display name; bounded (`OPPONENT_PROFILES_CAP`, least recently observed out). (h) **OPS-P3-2:** no login handle (legacy handles are phone numbers) in logs — an `[AUDIT]` actor that is a phone-number handle prints as `user:<id>` / `phone-handle` (`auditActorLabel`; the durable `audit_log` row keeps the raw actor), admin / ticket-login lines print ids, a malformed `/me` logs its keys only. | .online R3 2026-10-11 |
 
 ## Surface area
 
@@ -92,7 +113,7 @@ See `src/index.ts`. Key events:
 
 | Name | Required? | Purpose |
 |---|---|---|
-| `REDIS_URL` | **Required** | Hand-state snapshot persistence (rehydrate across redeploys) |
+| `REDIS_URL` | Recommended | Provably-fair commitment buffers across redeploys. Hand snapshots are written to it but never restorable (per-boot table ids — hard rule 1): unset, nothing about hands changes |
 | `LOG_LEVEL` | Optional (default `info` prod) | Pino level |
 | `ADMIN_PASSWORD` | **Unused** (2026-10-11) | The admin seed and the password `login` are gone (AUTH-8/15); a set value only logs a reminder to remove it |
 | `ADMIN_PHONE` | Optional, no default | Only the one-time admin recovery grant at boot (already applied) looks a row up by it; unset = skipped. The hardcoded default (a real phone number in this public repo) is removed |
@@ -153,9 +174,14 @@ git checkout <prior-sha> && railway up --service poker-server
 
 ## Gotchas
 
-- **SQLite is at `/data/poker.db` with NO persistent volume on Railway.**
-  Database is ephemeral. Don't store anything you can't reconstruct from
-  poker-prod-api on next boot.
+- **There is no SQLite (corrected 2026-10-11, CLUBS-P3-1).** Clubs (and
+  friends, predictions, brackets, the economy / prize / ticket ledgers) live in
+  the Railway Postgres (`DATABASE_URL`) and are durable — clubs moved off the
+  ephemeral better-sqlite3 `/data/poker.db` file on 2026-06-19
+  (`src/clubs/clubManager.ts` `initClubTables`). What IS ephemeral is the
+  in-process state: tables, seats, sessions, reservations, running
+  tournaments (a restart ends them — hard rule 1). `better-sqlite3` is still a
+  package.json dependency that nothing imports (CLUBS-P3-2).
 - **Authenticates against poker-prod-api** then caches locally. If
   poker-prod-api `/users/login` shape changes (Pattern A risk), this
   service breaks for new logins.

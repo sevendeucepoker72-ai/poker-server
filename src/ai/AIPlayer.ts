@@ -1148,7 +1148,7 @@ function postFlopStrategy(
 ): AIDecision {
   const isRiver = table.currentPhase === GamePhase.River;
   const params = ARCHETYPE_PARAMS[profile.archetype];
-  const oppNames = getActiveOpponentNames(table, seat.seatIndex);
+  const oppNames = getActiveOpponentKeys(table, seat.seatIndex);   // R3 (GAME-P3-10) — player ids
   // GAME-9 (R2) — a RAISE facing a bet is sized off that bet: call it, then add
   // `fraction` of the pot after the call ("raise to"). The old totals (a pot
   // fraction alone) fell under the minimum re-raise as soon as the bets grew,
@@ -1452,11 +1452,28 @@ export interface OpponentSessionProfile {
   lastHandNumber: number;
 }
 
+/**
+ * R3 (GAME-P3-10) — the profiles are keyed by the seat's PLAYER ID
+ * (opponentModelKey: `user_<id>` for a human, a per-seat `ai-<uuid>` for a bot),
+ * never by the display name: two players sharing a name ('Player', 'First L.',
+ * a bot name from the pool at another table) shared ONE read, so a bot played a
+ * nit's tendencies against a maniac. Bounded (least-recently-observed out) —
+ * bot ids are new per seating, so the map would otherwise only grow.
+ */
 const OPPONENT_PROFILES: Map<string, OpponentSessionProfile> = new Map();
+export const OPPONENT_PROFILES_CAP = 5000;
 
-function getOrCreateOpponentProfile(playerName: string): OpponentSessionProfile {
-  let p = OPPONENT_PROFILES.get(playerName);
-  if (!p) {
+/** R3 (GAME-P3-10) — the opponent-model key of a seat: its playerId (the display name only for a seat without one). */
+export function opponentModelKey(seat: { playerId?: string | null; playerName?: string | null }): string {
+  return seat.playerId || seat.playerName || '';
+}
+
+function getOrCreateOpponentProfile(opponentKey: string): OpponentSessionProfile {
+  let p = OPPONENT_PROFILES.get(opponentKey);
+  if (p) {
+    // Most recently observed last (Map order) — the eviction below drops the oldest.
+    OPPONENT_PROFILES.delete(opponentKey);
+  } else {
     p = {
       handsSeen: 0, vpipHands: 0, pfrHands: 0,
       threeBetsFaced: 0, threeBetFolds: 0,
@@ -1464,23 +1481,34 @@ function getOrCreateOpponentProfile(playerName: string): OpponentSessionProfile 
       showdownsReached: 0, showdownsWonWithBluff: 0,
       lastHandNumber: -1,
     };
-    OPPONENT_PROFILES.set(playerName, p);
+    while (OPPONENT_PROFILES.size >= OPPONENT_PROFILES_CAP) {
+      const oldest = OPPONENT_PROFILES.keys().next().value;
+      if (oldest === undefined) break;
+      OPPONENT_PROFILES.delete(oldest);
+    }
   }
+  OPPONENT_PROFILES.set(opponentKey, p);
   return p;
 }
 
-export function getOpponentProfile(playerName: string): OpponentSessionProfile | null {
-  return OPPONENT_PROFILES.get(playerName) || null;
+export function getOpponentProfile(opponentKey: string): OpponentSessionProfile | null {
+  return OPPONENT_PROFILES.get(opponentKey) || null;
 }
 
-// External hook — PokerTable calls on action events to build session view.
+/** Profiles held right now (tests / diagnostics). */
+export function opponentProfileCount(): number {
+  return OPPONENT_PROFILES.size;
+}
+
+// External hook — index.ts calls it on the table's action events to build the
+// session view. R3 (GAME-P3-10): `opponentKey` = opponentModelKey(seat).
 export function recordOpponentObservation(
-  playerName: string,
+  opponentKey: string,
   observation: 'hand_start' | 'vpip' | 'pfr' | 'face_3bet' | 'fold_to_3bet' | 'face_cbet' | 'fold_to_cbet' | 'showdown',
   extra?: { bluffed?: boolean; handNumber?: number }
 ): void {
-  if (!playerName) return;
-  const p = getOrCreateOpponentProfile(playerName);
+  if (!opponentKey) return;
+  const p = getOrCreateOpponentProfile(opponentKey);
   switch (observation) {
     case 'hand_start':
       if (extra && extra.handNumber != null && extra.handNumber !== p.lastHandNumber) {
@@ -1503,8 +1531,8 @@ export function recordOpponentObservation(
 
 export type OpponentCategory = 'unknown' | 'nit' | 'tag' | 'lag' | 'fish' | 'station' | 'maniac';
 
-export function categorizeOpponent(playerName: string): OpponentCategory {
-  const p = OPPONENT_PROFILES.get(playerName);
+export function categorizeOpponent(opponentKey: string): OpponentCategory {
+  const p = OPPONENT_PROFILES.get(opponentKey);
   if (!p || p.handsSeen < 10) return 'unknown';
   const vpip = p.vpipHands / p.handsSeen;
   const pfr = p.pfrHands / p.handsSeen;
@@ -1540,14 +1568,14 @@ export function shouldBluffBalanced(
   board: BoardTexture,
   phase: GamePhase,
   profile: AIPlayerProfile,
-  opponentNames: string[]
+  opponentKeys: string[]
 ): boolean {
   if (handStrength > 0.75) return false;
   if (handStrength < 0.08) return false;
   let foldyCount = 0;
   let stickyCount = 0;
-  for (const name of opponentNames) {
-    const cat = categorizeOpponent(name);
+  for (const key of opponentKeys) {
+    const cat = categorizeOpponent(key);
     if (cat === 'nit' || cat === 'tag') foldyCount++;
     if (cat === 'station' || cat === 'fish' || cat === 'maniac') stickyCount++;
   }
@@ -1573,17 +1601,17 @@ export function shouldThinValueBet(
   handStrength: number,
   phase: GamePhase,
   board: BoardTexture,
-  opponentNames: string[],
+  opponentKeys: string[],
   profile: AIPlayerProfile
 ): boolean {
   if (phase !== GamePhase.River) return false;
   if (handStrength < 0.45 || handStrength > 0.68) return false;
   if (board.isMonotone || (board.isPaired && board.hasHighCards)) return false;
-  const loose = opponentNames.filter((n) => {
-    const c = categorizeOpponent(n);
+  const loose = opponentKeys.filter((k) => {
+    const c = categorizeOpponent(k);
     return c === 'station' || c === 'fish' || c === 'lag';
   }).length;
-  const tight = opponentNames.filter((n) => categorizeOpponent(n) === 'nit').length;
+  const tight = opponentKeys.filter((k) => categorizeOpponent(k) === 'nit').length;
   if (loose === 0 || tight > loose) return false;
   if (profile.difficulty === 'easy') return false;
   const baseProb = profile.difficulty === 'expert' ? 0.45
@@ -1606,17 +1634,19 @@ export function getEffectiveStackBB(table: PokerTable, mySeat: number): number {
   return Math.max(1, Math.round(effective / bb));
 }
 
-/** Enumerate the non-folded opponent player names on a table.
+/** Enumerate the non-folded opponents' opponent-model keys on a table.
  * 2026-07-07: includes AI seats too (was humans-only), so bot-vs-bot tables
- * also build reads and adapt to each other, not just humans. */
-export function getActiveOpponentNames(table: PokerTable, mySeat: number): string[] {
-  const names: string[] = [];
+ * also build reads and adapt to each other, not just humans.
+ * R3 (GAME-P3-10): their opponentModelKey (player id), not their display names. */
+export function getActiveOpponentKeys(table: PokerTable, mySeat: number): string[] {
+  const keys: string[] = [];
   for (const s of table.seats) {
     if (s.seatIndex === mySeat) continue;
     if (s.state !== 'occupied' || s.folded || s.eliminated) continue;
-    if (s.playerName) names.push(s.playerName);
+    const key = opponentModelKey(s);
+    if (key) keys.push(key);
   }
-  return names;
+  return keys;
 }
 
 /**
@@ -1625,7 +1655,7 @@ export function getActiveOpponentNames(table: PokerTable, mySeat: number): strin
  * Used to make equity range-aware and to drive exploitative deviations.
  */
 export function dominantOpponentCategory(table: PokerTable, mySeat: number): OpponentCategory {
-  const cats = getActiveOpponentNames(table, mySeat).map(categorizeOpponent);
+  const cats = getActiveOpponentKeys(table, mySeat).map(categorizeOpponent);
   // Priority: a known nit's aggression means the most; then tag; then the
   // exploitable loose types; 'unknown' only if nothing else is known.
   for (const want of ['nit', 'tag', 'lag', 'maniac', 'station', 'fish'] as OpponentCategory[]) {
