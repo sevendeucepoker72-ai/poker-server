@@ -1467,6 +1467,30 @@ export async function recordHand(userId: number, handId: string, data: any): Pro
   }
 }
 
+/**
+ * R3 (H1 / TABLEUI-6) — a stored hand record as it may leave the server: every
+ * player whose `holeCards` are absent (null / empty — not tabled) loses his
+ * `handName`. Records stored before R1 named the strength of hidden hands (888
+ * of 8,463 rows: "Two Pair" next to an uncontested winner's masked cards); the
+ * rows stay in the DB, the hand name never leaves the server. Pure; a record
+ * stored as JSON text is parsed; anything unreadable is returned unchanged.
+ */
+export function maskUnshownHandNames(rec: any): any {
+  let r = rec;
+  if (typeof r === 'string') {
+    try { r = JSON.parse(r); } catch { return rec; }
+  }
+  if (!r || typeof r !== 'object' || !Array.isArray(r.players)) return r;
+  return {
+    ...r,
+    players: r.players.map((p: any) => {
+      if (!p || typeof p !== 'object') return p;
+      const shown = Array.isArray(p.holeCards) && p.holeCards.length > 0;
+      return shown || p.handName == null ? p : { ...p, handName: null };
+    }),
+  };
+}
+
 /** Load the most recent N hand history rows for a user. */
 export async function loadHandHistory(userId: number, limit = 100): Promise<any[]> {
   try {
@@ -1474,7 +1498,8 @@ export async function loadHandHistory(userId: number, limit = 100): Promise<any[
       `SELECT hand_id, data, created_at FROM user_hand_history WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2`,
       [userId, limit]
     );
-    return rows.map((r: any) => ({ ...r.data, handId: r.hand_id, timestamp: r.created_at }));
+    // R3 (H1) — no hidden hand's strength leaves the server (maskUnshownHandNames).
+    return rows.map((r: any) => ({ ...maskUnshownHandNames(r.data), handId: r.hand_id, timestamp: r.created_at }));
   } catch (e: any) {
     console.warn(`[loadHandHistory ${userId}]`, e.message);
     return [];

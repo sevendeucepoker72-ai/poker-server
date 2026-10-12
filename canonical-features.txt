@@ -1182,3 +1182,24 @@ label: `tfee:${tournamentId}`
 'TOURNAMENT_ENTRY_DEDUCT', 'TOURNAMENT_ENTRY_REFUND', 'TOURNAMENT_ENTRY_REFUND_FAILED',
 # K3-3: stakingPayout names its offer.
 tournamentId: tid, offerId: String(c.details.offerId)
+# 2026-10-11 (.online R3, SF-B) — economy / progression / season / catalog / hand history.
+# S3-1: Battle Pass premium = the purchase row or the parsed TOP-LEVEL stats flag — never a substring of the stats text.
+(rows[0]?.stats).battlePassPremium === true
+# S3-2: chips won per dealt-in human SEAT by account — a leaver's / dropped player's loss is recorded too.
+function chipsWonSeatsOfHand(
+function dealtInSeatAccount(
+# S3-3: users.chips → BIGINT only after the previous container is gone (MERGE_START_DELAY_MS + the pg_stat_activity wait).
+function scheduleChipsBigintMigration(
+waiting_for_previous_instance
+# S3-4: a level-up whose ledger settlement failed stays OWED and is re-sent (next XP / retry timer).
+kept owed, retried in
+# XL-2: a season that ended before the chips-won ledger existed is never awarded or marked.
+FIRST_CHIPS_WON_SEASON = '2026-10'
+pre_ledger_season
+# E1 (ECON-6 / APPUI-5 / K2-3 / K2-7): only rendered cosmetic types are bundled, rolled or sold.
+RENDERED_ITEM_TYPES
+# H1 (TABLEUI-6 / APPUI-16 / K2-6): each handHistory copy names the table, the viewer's seat and his own cards;
+# a stored record never carries a hidden hand's name.
+const viewer = handHistoryViewerOf(table, history, session);
+viewerHoleCards
+function maskUnshownHandNames(

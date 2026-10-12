@@ -81,8 +81,11 @@ describe('GAME-11 / ECON-13 — only seats DEALT INTO the hand are credited with
       mergeUserStats: async (uid: number) => { merges.push(uid); }, saveProgress: async () => true,
       tickScratchProgress: async (uid: number) => { scratch.push(uid); return false; },
       io: { sockets: { sockets: new Map() } }, console: quiet,
+      // R3 (S3-2) — the per-seat chips-won resolution (only read when a chips-won gate is open).
+      multiTableSessions: new Map(), reservedSeats: new Map(), pendingSeatRemovalAfterHand: new Map(),
     };
-    const { exports: m } = load(code, scope, 'handleHandComplete');
+    const R3_HELPERS = [fnSrc('function chipsWonSeatsOfHand('), fnSrc('function dealtInSeatAccount('), fnSrc('function seatPlayedByAnotherAccount(')].join('\n');
+    const { exports: m } = load(`${code}\n${R3_HELPERS}`, scope, 'handleHandComplete');
     table.startNewHand();
     expect(table.seats[1].holeCards).toHaveLength(0);               // sitting out: not dealt
     playOut(table);

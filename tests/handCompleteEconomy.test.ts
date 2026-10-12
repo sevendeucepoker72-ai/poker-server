@@ -36,6 +36,11 @@ import { publicNameOf, PUBLIC_NAME_FALLBACK } from '../src/social/publicIdentity
 
 const LISTENER = fnSrc('function ensureTableProgressListener(');
 const HAND_COMPLETE = fnSrc('async function handleHandComplete(');
+// R3 (S3-2 / H1) — the per-seat chips-won resolution and the viewer fields of each handHistory copy.
+const R3_HELPERS = [
+  fnSrc('function chipsWonSeatsOfHand('), fnSrc('function dealtInSeatAccount('), fnSrc('function handHistoryViewerOf('),
+  fnSrc('function seatPlayedByAnotherAccount('),
+].join('\n');
 
 function world(opts: { tableKind?: string; humanName?: string } = {}) {
   const pm = new ProgressionManager();
@@ -76,8 +81,9 @@ function world(opts: { tableKind?: string; humanName?: string } = {}) {
     tickScratchProgress: async (uid: number) => { ticks.push(uid); return { awarded: false, chips: 1, stars: 2, scratchCardsAvailable: 0 }; },
     sendProgressToPlayer: (sid: string, o: any) => { pushes.push([sid, o]); },
     io: { sockets: { sockets: new Map() }, to: () => ({ emit() {} }), emit() {} },
+    multiTableSessions: new Map(), reservedSeats: new Map(), pendingSeatRemovalAfterHand: new Map(),
   };
-  const { exports: m } = load(`${LISTENER}\n${HAND_COMPLETE}`, scope, '{ ensureTableProgressListener, handleHandComplete }');
+  const { exports: m } = load(`${LISTENER}\n${HAND_COMPLETE}\n${R3_HELPERS}`, scope, '{ ensureTableProgressListener, handleHandComplete }');
   return { m, pm, table, chipsWon, merges, saves, ticks, activity, pushes };
 }
 

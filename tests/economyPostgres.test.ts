@@ -308,6 +308,34 @@ d('economy on a real Postgres', () => {
       expect(await edb.purchaseBattlePassPremium(id, 'season_1_the_river', 950)).toEqual({ ok: false, code: 'already_owned' });
     });
 
+    it('R3 (S3-1) — a client-written stats.clientData.battlePassPremium (compact TEXT) is NOT premium; the top-level pre-R2 flag is', async () => {
+      const crafted = await mkUser({ stats: JSON.stringify({ handsPlayed: 813, clientData: { battlePassPremium: true } }) });
+      expect((await row(crafted)).stats).toContain('"battlePassPremium":true');
+      expect(await edb.hasBattlePassPremium(crafted, 'season_1_the_river')).toBe(false);
+      const legacy = await mkUser({ stats: '{"battlePassPremium":true}' });
+      expect(await edb.hasBattlePassPremium(legacy, 'season_1_the_river')).toBe(true);
+      const corrupt = await mkUser({ stats: '{not json' });
+      expect(await edb.hasBattlePassPremium(corrupt, 'season_1_the_river')).toBe(false);
+    });
+
+    it('R3 (H1 / TABLEUI-6) — a stored hand record keeps the viewer\'s own cards; a hidden hand\'s name never leaves loadHandHistory', async () => {
+      const id = await mkUser();
+      const viewerHoleCards = [{ suit: 0, rank: 14, display: 'A♥' }, { suit: 3, rank: 14, display: 'A♠' }];
+      await am.recordHand(id, `T1-7-1-${Date.now()}`, {
+        handNumber: 7, tableId: 'T1', viewerSeat: 1, viewerHoleCards, communityCards: [],
+        players: [
+          { seatIndex: 1, name: 'Alice', holeCards: null, handName: null, folded: true },
+          { seatIndex: 2, name: 'Bob', holeCards: null, handName: 'Two Pair, Kings and 7s', folded: false },   // a pre-R1 leaking row
+        ],
+        winners: [{ seatIndex: 2, name: 'Bob', chipsWon: 40, handName: 'Won by fold' }],
+      });
+      const raw = (await pool.query('SELECT data FROM user_hand_history WHERE user_id = $1', [id])).rows[0].data;
+      expect(JSON.stringify(raw)).toContain('Two Pair');            // the row itself is left as it is
+      const [h] = await am.loadHandHistory(id);
+      expect(h).toMatchObject({ handNumber: 7, tableId: 'T1', viewerSeat: 1, viewerHoleCards });
+      expect(h.players.map((p: any) => p.handName)).toEqual([null, null]);
+    });
+
     it('a Battle Pass tier claim + its chips in one transaction: a failing credit rolls the claim row back', async () => {
       const id = await mkUser();
       await expect(edb.withEconomyTx(async (tx) => {
@@ -375,26 +403,29 @@ d('economy on a real Postgres', () => {
       const c = await mkUser({ display_name: 'Charlie' });
       const loser = await mkUser({ display_name: 'Delta' });
       const add = (u: number, day: string, won: number) => edb.recordChipWins(u, day, won);
-      await add(admin, '2026-09-10', 9_000_000);
-      await add(banned, '2026-09-10', 8_000_000);
-      await add(guest, '2026-09-10', 7_000_000);
-      await add(a, '2026-09-03', 40_000); await add(a, '2026-09-04', 10_000);   // 50k
-      await add(b, '2026-09-30', 60_000);                                        // 60k
-      await add(c, '2026-09-15', 20_000);
-      await add(loser, '2026-09-15', -5_000);
-      await add(c, '2026-10-01', 999_999);                                       // October: not this season
-      const standings = await edb.chipsWonStandings('2026-09-01', '2026-09-30', 10);
+      await add(admin, '2026-10-10', 9_000_000);
+      await add(banned, '2026-10-10', 8_000_000);
+      await add(guest, '2026-10-10', 7_000_000);
+      await add(a, '2026-10-03', 40_000); await add(a, '2026-10-04', 10_000);   // 50k
+      await add(b, '2026-10-31', 60_000);                                        // 60k
+      await add(c, '2026-10-15', 20_000);
+      await add(loser, '2026-10-15', -5_000);
+      await add(c, '2026-11-01', 999_999);                                       // November: not this season
+      const standings = await edb.chipsWonStandings('2026-10-01', '2026-10-31', 10);
       expect(standings.map((s) => s.userId)).toEqual([b, a, c]);
-      const runs = await Promise.all([1, 2, 3].map(() => edb.awardSeason('2026-09', 'test')));
+      const runs = await Promise.all([1, 2, 3].map(() => edb.awardSeason('2026-10', 'test')));
       expect(runs.filter((r) => r.status === 'awarded')).toHaveLength(1);
       const won = runs.find((r) => r.status === 'awarded')!;
       expect(won.winners.map((w) => [w.id, w.place, w.chips, w.badge])).toEqual([[b, 1, 50000, 'season_gold'], [a, 2, 25000, 'season_silver'], [c, 3, 10000, 'season_bronze']]);
       expect((await row(b)).chips).toBe(60000);
       expect((await pool.query(`SELECT item_type, item_id FROM user_inventory WHERE user_id=$1`, [b])).rows).toEqual([{ item_type: 'badge', item_id: 'season_gold' }]);
-      expect((await pool.query(`SELECT winners FROM season_award_runs WHERE season_key='2026-09'`)).rows).toEqual([{ winners: 3 }]);
-      // A month with no eligible winner is marked run too (the sweep never retries it).
-      expect(await edb.awardSeason('2025-01', 'test')).toMatchObject({ status: 'awarded', winners: [] });
-      expect((await edb.awardSeason('2025-01', 'test')).status).toBe('already_awarded');
+      expect((await pool.query(`SELECT winners FROM season_award_runs WHERE season_key='2026-10'`)).rows).toEqual([{ winners: 3 }]);
+      // A LEDGER month with no eligible winner is marked run too (the sweep never retries it).
+      expect(await edb.awardSeason('2027-01', 'test')).toMatchObject({ status: 'awarded', winners: [] });
+      expect((await edb.awardSeason('2027-01', 'test')).status).toBe('already_awarded');
+      // R3 (XL-2) — a month before the ledger existed is never awarded and never marked (payable later by an owner rule).
+      expect(await edb.awardSeason('2026-09', 'boot')).toEqual({ status: 'pre_ledger', seasonKey: '2026-09', winners: [] });
+      expect((await pool.query(`SELECT 1 FROM season_award_runs WHERE season_key='2026-09'`)).rowCount).toBe(0);
     });
   });
 

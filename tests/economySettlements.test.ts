@@ -148,19 +148,33 @@ describe('claims: ledger row THEN credit, one transaction', () => {
     expect(log.map(kind)).toEqual(['BEGIN', 'lock', 'ledger', 'credit', 'COMMIT']);
   });
 
-  it('a scratch card that rolls a FREE wheel emote (fire) pays the duplicate stars — nothing is inserted into the inventory', async () => {
+  it('R3 (E1) — a scratch card emote is a SELLABLE one (love replaced the free fire): granted into the inventory', async () => {
     const { log, pool } = scripted((h) => {
       if (h.startsWith('SELECT id, chips, stars')) return { rows: [userRow({ scratch_cards_available: 1 })] };
       if (h.startsWith('UPDATE users SET scratch_cards_available')) return { rows: [{ scratch_cards_available: 0 }], rowCount: 1 };
+      if (h.startsWith('INSERT INTO user_inventory')) return { rowCount: 1 };
+      if (h.startsWith('UPDATE users SET chips = chips +')) return { rows: [{ chips: 1000, stars: 2000, scratch_cards_available: 0 }] };
+      return {};
+    });
+    // rng: 0.25 -> the emote branch; 0.6 -> index 2 of [nice_hand, good_game, love, crown] = love (was fire)
+    const seq = [0.25, 0.6];
+    const r: any = await settleScratchCard(7, { rng: () => seq.shift() ?? 0 }, pool);
+    expect(r).toMatchObject({ ok: true, stars: 0, reward: { kind: 'item', itemType: 'emote', itemId: 'love' } });
+    expect(log.map(kind)).toEqual(['BEGIN', 'lock', 'UPDATE', 'grant', 'credit', 'COMMIT']);
+  });
+
+  it('a scratch card emote the player already owns pays the duplicate stars — nothing is inserted', async () => {
+    const { log, pool } = scripted((h) => {
+      if (h.startsWith('SELECT id, chips, stars')) return { rows: [userRow({ scratch_cards_available: 1 })] };
+      if (h.startsWith('UPDATE users SET scratch_cards_available')) return { rows: [{ scratch_cards_available: 0 }], rowCount: 1 };
+      if (h.startsWith('INSERT INTO user_inventory')) return { rowCount: 0 };   // already owned
       if (h.startsWith('UPDATE users SET chips = chips +')) return { rows: [{ chips: 1000, stars: 2025, scratch_cards_available: 0 }] };
       return {};
     });
-    // rng: 0.25 -> the emote branch; 0.6 -> index 2 of [nice_hand, good_game, fire, crown] = fire
     const seq = [0.25, 0.6];
     const r: any = await settleScratchCard(7, { rng: () => seq.shift() ?? 0 }, pool);
-    expect(r).toMatchObject({ ok: true, stars: 25, reward: { kind: 'stars', amount: 25, reason: 'duplicate_refund', itemType: 'emote', itemId: 'fire' } });
-    expect(log.map(kind)).not.toContain('grant');
-    expect(log.map(kind)).toEqual(['BEGIN', 'lock', 'UPDATE', 'credit', 'COMMIT']);
+    expect(r).toMatchObject({ ok: true, stars: 25, reward: { kind: 'stars', amount: 25, reason: 'duplicate_refund', itemType: 'emote', itemId: 'love' } });
+    expect(log.map(kind)).toEqual(['BEGIN', 'lock', 'UPDATE', 'grant', 'credit', 'COMMIT']);
   });
 
   it('withEconomyTx: an error rolls back and is re-thrown', async () => {

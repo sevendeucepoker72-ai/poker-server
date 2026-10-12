@@ -236,6 +236,24 @@ describe('C7 / ECON-6 — the shop and equips only ever touch real catalog items
     expect(w.pm.vipActive(w.pm.userRecord(45))).toBe(true);
   });
 
+  it('R3 (E1) — a cosmetic the client does not render is not sold; fire / dead (no price any more) still answer already_owned', async () => {
+    const w = world();
+    w.users.set(48, { stars: 100000 });
+    const t = w.connect('S1', 48);
+    for (const [itemType, itemId] of [['celebration', 'confetti'], ['sound_pack', 'fantasy'], ['chip_skin', 'mythic'], ['card_front', 'artistic'], ['dealer_voice', 'robot'], ['profile_bg', 'aurora']]) {
+      await t.call('purchaseShopItem', { itemType, itemId });
+      expect(t.last('purchaseResult')).toMatchObject({ success: false, code: 'unknown_item', itemType, itemId });
+    }
+    for (const itemId of ['fire', 'dead']) {
+      await t.call('purchaseShopItem', { itemType: 'emote', itemId });
+      expect(t.last('purchaseResult')).toMatchObject({ success: false, code: 'already_owned', itemType: 'emote', itemId });
+    }
+    expect(w.fakes.purchaseCosmetic).not.toHaveBeenCalled();
+    // a rendered cosmetic still sells at the catalog price
+    await t.call('purchaseShopItem', { itemType: 'title', itemId: 'final_table' });
+    expect(w.fakes.purchaseCosmetic).toHaveBeenCalledWith(48, 'title', 'final_table', 1000);
+  });
+
   it('a whale chip pack is a LARGE CHIP GRANT (alert + durable audit); a refused purchase pushes the DB-fresh wallet', async () => {
     const w = world();
     w.users.set(46, { stars: 5000 });

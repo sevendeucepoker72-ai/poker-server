@@ -10,7 +10,7 @@ import {
   VIP_EMOTES, FREE_EMOTES, EQUIPPABLE_TYPES, BOOSTER_DURATION, VIP_PASS_DURATION, SPIN_WHEEL_SEGMENTS,
   LOGIN_CHIPS_BY_DAY, LOGIN_STARS_BY_DAY, CHIP_GRANT_ALERT_THRESHOLD,
   isOwnableItem, shopPrice, isFreeItem, isFreeForEveryone, normalizeItemType, rollMysteryBox, rollSpinWheel, rollScratchCard, loginCycleDay,
-  vipTierForSeasonXp, catalogForClient,
+  vipTierForSeasonXp, catalogForClient, RENDERED_ITEM_TYPES,
 } from '../src/economy/catalog';
 import {
   denverDateKey, denverMonthKey, previousDenverMonthKey, nextDenverMidnightMs, nextDenverMonthStartMs, monthDateRange,
@@ -195,16 +195,70 @@ describe('progress stats merge (ECON-10): never last-writer-wins', () => {
   });
 });
 
-describe('free wheel emotes the shop also lists (fire, dead) are never sold or won', () => {
+describe('free wheel emotes (fire, dead) are never sold or won', () => {
   it('isFreeForEveryone: the free wheel emotes and price-0 items; a priced shop-only emote is not', () => {
-    const overlap = Object.keys(SHOP_PRICES.emote).filter((id) => FREE_EMOTES.includes(id));
-    expect(overlap.sort()).toEqual(['dead', 'fire']);           // the owner call: rename or drop these two
-    for (const id of overlap) expect(isFreeForEveryone('emote', id)).toBe(true);
+    for (const id of ['fire', 'dead']) expect(isFreeForEveryone('emote', id)).toBe(true);
     expect(isFreeForEveryone('emote', 'nice_hand')).toBe(false);
     expect(isFreeForEveryone('card_back', 'classic_red')).toBe(true);   // price 0
     expect(isFreeForEveryone('card_back', 'mythic')).toBe(false);
-    // The scratch pool and the basic box still roll `fire` — settled as a duplicate (stars), see economySettlements.
-    expect(SCRATCH_EMOTE_POOL).toContain('fire');
-    expect(MYSTERY_BOX_TIERS.basic.itemPool).toContainEqual(['emote', 'fire']);
+  });
+
+  it('R3 (E1 / K2-3) — the shop no longer prices fire / dead, and no pool or bundle rolls a free wheel emote', () => {
+    expect(Object.keys(SHOP_PRICES.emote).filter((id) => FREE_EMOTES.includes(id))).toEqual([]);
+    expect(shopPrice('emote', 'fire')).toBeNull();
+    expect(shopPrice('emote', 'dead')).toBeNull();
+    expect(SCRATCH_EMOTE_POOL.filter((id) => FREE_EMOTES.includes(id))).toEqual([]);
+    const pools = Object.values(MYSTERY_BOX_TIERS).flatMap((t) => t.itemPool);
+    const bundles = Object.values(BUNDLE_CONTENTS).flat();
+    expect([...pools, ...bundles].filter(([t, id]) => isFreeForEveryone(t, id))).toEqual([]);
+  });
+});
+
+describe('R3 (E1 — ECON-6 / APPUI-5 / K2-7) — nothing sold or granted is inert', () => {
+  const bpPremium: Array<[string, string]> = [['card_back', 'dragon'], ['emote', 'trophy'], ['theme', 'neon_vegas'], ['frame', 'diamond'], ['title', 'royal']];
+
+  it('every bundle, mystery-box pool, scratch emote, Battle Pass and career item is a type the client RENDERS', () => {
+    expect([...RENDERED_ITEM_TYPES].sort()).toEqual(['card_back', 'emote', 'frame', 'theme', 'title']);
+    const grants: Array<[string, string]> = [
+      ...bpPremium,
+      ...CAREER_REWARDS.filter((r) => r.item).map((r) => r.item!),
+      ...Object.values(MYSTERY_BOX_TIERS).flatMap((t) => t.itemPool),
+      ...SCRATCH_EMOTE_POOL.map((id) => ['emote', id] as [string, string]),
+      ...Object.values(BUNDLE_CONTENTS).flat(),
+    ];
+    expect(grants.filter(([t]) => !RENDERED_ITEM_TYPES.has(t))).toEqual([]);
+    // … and each one is a real, PRICED (sellable) catalog item.
+    expect(grants.filter(([t, id]) => !(shopPrice(t, id)! > 0))).toEqual([]);
+    for (const t of ['celebration', 'sound_pack', 'dealer_voice', 'chip_skin', 'card_front', 'profile_bg']) {
+      expect(grants.some(([gt]) => gt === t)).toBe(false);
+    }
+  });
+
+  it('the final lists (the client BUNDLES / box copy are synced from these)', () => {
+    expect(BUNDLE_CONTENTS).toEqual({
+      starter: [['card_back', 'silver_foil'], ['emote', 'nice_hand'], ['frame', 'bronze']],
+      collector: [['card_back', 'gold_premium'], ['theme', 'casino_royale'], ['frame', 'silver'], ['emote', 'crown'], ['title', 'bad_beat_survivor']],
+      tournament: [['title', 'tournament_champ'], ['theme', 'royal_gold'], ['frame', 'gold'], ['card_back', 'holographic'], ['title', 'final_table'], ['emote', 'trophy']],
+      whale_bundle: [['theme', 'cosmic_nebula'], ['card_back', 'diamond_pattern'], ['frame', 'diamond'], ['title', 'tournament_champ'], ['emote', 'mic_drop'], ['title', 'royal'], ['theme', 'cherry_wood'], ['frame', 'gold']],
+      mythic_bundle: [['card_back', 'mythic'], ['frame', 'mythic'], ['title', 'godmode'], ['frame', 'flame'], ['frame', 'diamond'], ['title', 'royal'], ['card_back', 'diamond_pattern'], ['title', 'tournament_champ'], ['theme', 'cosmic_nebula']],
+    });
+    expect(Object.fromEntries(Object.entries(MYSTERY_BOX_TIERS).map(([k, v]) => [k, v.itemPool]))).toEqual({
+      basic: [['emote', 'nice_hand'], ['emote', 'tears'], ['emote', 'rocket']],
+      premium: [['frame', 'silver'], ['title', 'bad_beat_survivor'], ['title', 'the_shark'], ['card_back', 'holographic']],
+      legendary: [['frame', 'diamond'], ['frame', 'flame'], ['title', 'royal'], ['card_back', 'mythic']],
+    });
+    expect(SCRATCH_EMOTE_POOL).toEqual(['nice_hand', 'good_game', 'love', 'crown']);
+    // premium / legendary item rolls stay "a frame, title or card back" (the client copy, K2-7)
+    for (const tier of ['premium', 'legendary']) {
+      expect(MYSTERY_BOX_TIERS[tier].itemPool.every(([t]) => ['frame', 'title', 'card_back'].includes(t))).toBe(true);
+    }
+  });
+
+  it('a bundle never lists the same item twice (a duplicate would refund its own contents); prices are unchanged', () => {
+    for (const [id, items] of Object.entries(BUNDLE_CONTENTS)) {
+      expect([id, new Set(items.map(([t, i]) => `${t}:${i}`)).size]).toEqual([id, items.length]);
+    }
+    expect(SHOP_PRICES.bundle).toEqual({ starter: 800, collector: 2500, tournament: 4000, whale_bundle: 10000, mythic_bundle: 25000 });
+    expect(SHOP_PRICES.mystery_box).toEqual({ basic: 500, premium: 2000, legendary: 8000 });
   });
 });

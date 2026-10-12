@@ -48,8 +48,11 @@ describe('R2 merge — season "chips won" is public cash only', () => {
     expect(hc).toContain('const feedsClubStats = tableFeedsClubStats(tableId);');
     expect(hc).toMatch(/if \(countsForChipsWon\) \{\s+recordChipWins\(/);
     expect(hc).toContain('if (feedsClubStats) clubHandEntries.push(');
-    // the only recordChipWins call in the server is that gated one
-    expect(SRC.split('recordChipWins(auth.userId').length - 1).toBe(1);
+    // R3 (S3-2) — the entries are per dealt-in SEAT by account (chipsWonSeatsOfHand), read only
+    // when a gate is open; the only recordChipWins call in the server is that gated one.
+    expect(hc).toContain('const chipsWonSeats = (countsForChipsWon || feedsClubStats) ? chipsWonSeatsOfHand(tableId, table, dealtInSeats) : [];');
+    expect(SRC.split('recordChipWins(').length - 1).toBe(1);
+    expect(SRC.split('recordChipWins(cw.userId').length - 1).toBe(1);
   });
 });
 
