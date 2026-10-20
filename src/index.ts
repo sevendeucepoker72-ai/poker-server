@@ -9621,7 +9621,12 @@ io.on('connection', (socket: Socket) => {
             tournamentManager.setPlayerTable(qt.tournamentId!, existingEntry.playerId, tid);
             // Un-eliminate the player in tournament manager
             const tp = tournament.players.find(p => p.playerId === existingEntry.playerId);
-            if (tp) { tp.eliminated = false; tp.chips = startingStack; }
+            // 2026-10-20 — through TournamentManager so the places of those who
+            // busted after him move down one (they used to collide with the
+            // next bust). Fallback keeps the old behaviour for a non-busted entry.
+            if (tp && !tournamentManager.reinstateForReentry(qt.tournamentId!, existingEntry.playerId, startingStack)) {
+              tp.eliminated = false; tp.chips = startingStack;
+            }
             // Update socket session — or CREATE one (2026-10-10). A rebalance
             // that stood his busted seat up for a moved player
             // (vacateBustedTournamentSeat) dropped his session and left him

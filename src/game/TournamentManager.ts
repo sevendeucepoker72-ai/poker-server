@@ -476,7 +476,50 @@ export class TournamentManager {
     };
     t.players.push(tp);
     if (t.config.maxPlayers < t.players.length) t.config.maxPlayers = t.players.length;
+    // 2026-10-20 — the field grew: everyone already out finished BELOW the new
+    // entrant, so each busted place moves down one. A place is fixed at the
+    // bust ("players still alive + 1"); without this shift the next bust got a
+    // place someone already held and the last place was never given (local
+    // rig: 31 entrants, a late entry after 15 busts -> two 16ths, no 31st).
+    this.shiftBustedPlaces(t, null, +1);
     return tp;
+  }
+
+  /**
+   * 2026-10-20 — move busted entrants' places by `delta`: all of them
+   * (`better === null`), or only those who finished BETTER than `better`
+   * (a smaller place number). Keeps places a permutation of 1..N as the field
+   * grows (late entry, re-entry) or shrinks back (removeLateEntrant).
+   */
+  private shiftBustedPlaces(t: Tournament, better: number | null, delta: number): void {
+    for (const p of t.players) {
+      if (!p.eliminated || !(p.finishPosition > 0)) continue;
+      if (better === null || p.finishPosition < better) p.finishPosition += delta;
+    }
+  }
+
+  /**
+   * 2026-10-20 — a busted entrant RE-ENTERS (qualifier re-entry): he is alive
+   * again with `chips`, his old place is freed, and everyone who busted AFTER
+   * him (a better place) moves down one — so the next bust gets a free place
+   * and places stay 1..N. false = not a busted entrant of a running tournament.
+   */
+  reinstateForReentry(tournamentId: string, playerId: string, chips: number): boolean {
+    const t = this.tournaments.get(tournamentId);
+    if (!t || t.status !== 'running') return false;
+    const p = t.players.find((x) => x.playerId === playerId);
+    if (!p || !p.eliminated) return false;
+    const old = p.finishPosition;
+    if (old > 0) {
+      p.eliminated = false;          // out of the shift below (his own place is freed)
+      this.shiftBustedPlaces(t, old, +1);
+    }
+    p.eliminated = false;
+    p.finishPosition = 0;
+    p.chips = chips;
+    delete p.tieGroup;
+    t.eliminationOrder = t.eliminationOrder.filter((id) => id !== playerId);
+    return true;
   }
 
   /** R2 — undo addLateEntrant when the seat could not be taken after all (nothing else references him yet). */
@@ -486,6 +529,8 @@ export class TournamentManager {
     const before = t.players.length;
     t.players = t.players.filter((p) => p.playerId !== playerId || p.eliminated);
     t.playerTableMap.delete(playerId);
+    // 2026-10-20 — the field shrank back: undo addLateEntrant's place shift.
+    if (t.players.length < before) this.shiftBustedPlaces(t, null, -1);
     return t.players.length < before;
   }
 
