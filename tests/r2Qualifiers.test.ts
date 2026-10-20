@@ -23,6 +23,7 @@ import {
   parseMasterSchedule, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels,
   QUALIFIER_BASE_STACK,
 } from '../src/game/qualifierSchedule';
+import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from '../src/game/qualifierNoShow';
 import { SRC, slice, fnSrc, handlerSrc, load, flush } from './helpers/indexSource';
 
 // The master's REAL answer (captured from prod 2026-10-11, read-only): one weekly event + a TOC with no time.
@@ -93,6 +94,8 @@ const CODE = [
   fnSrc('function qualifierOfTournament('),
   fnSrc('function qualifierResultOf('),
   fnSrc('function pruneFinishedQualifiers('),
+  // 2026-10-20 — no-shows released at the start + their sign-in notice.
+  slice('const qualifierNoShows = { released: 0, toldOnSignIn: 0 };', '\n    return 0;\n  }\n}\n'),
   fnSrc('function tickQualifierAutoStart('),
   slice('const postedQualifierResults = new Set<string>();', '\n}\n'),
   fnSrc('function emitTournamentFinishedToEntrants('),
@@ -143,6 +146,7 @@ function world(opts: { now?: number } = {}) {
     },
     qualifierSyncStats: { syncs: 0, failures: 0, lastSyncAt: null, listed: 0, cancelledOffSchedule: 0 },
     qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, QUALIFIER_BASE_STACK,
+    samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS,
     assertPlayable: async () => null,
     isPlayerQualified: async () => true,
     consumeQualifierCreditOnMaster: async (masterId: string, tier: string, _q: string, label: string) => {
@@ -181,6 +185,7 @@ function world(opts: { now?: number } = {}) {
   const { exports: m } = load(`${CODE}\nfunction wire(socket) {\n  ${HANDLERS}\n}`, scope, `{
     wire, applyQualifierSchedule, qualifierList, qualifierEventFor, markQualifierFinished, emitTournamentFinishedToEntrants,
     tickQualifierAutoStart, postQualifierResults, cancelQualifierEvent, qualifierLateEntries, qualifierResultPosts,
+    qualifierNoShows, tellQualifierNoShowReleases,
   }`);
   const emitted: Array<[string, string, any]> = [];
   const mkSocket = (id: string, userId: number | null, master: string | null, name = 'Player') => {
@@ -641,6 +646,208 @@ describe('the qualifier lifecycle — started, cancelled for too few players, fi
       expect(w.fetches.filter((f) => /results\/internal$/.test(f.url) && f.body).length).toBe(2 + 8);
       expect(w.audits.filter((a) => a.action === 'QUALIFIER_RESULTS_POST_FAILED')).toEqual([expect.objectContaining({ d: expect.objectContaining({ tournamentId: 'TQ2', results: 4, finishOrder: order }) })]);
     } finally { jest.useRealTimers(); }
+  });
+});
+
+describe('2026-10-20 (owner: "Remove + refund at start") — no-shows are released at the start', () => {
+  const CAROL = 103;
+  async function three(w: ReturnType<typeof world>) {
+    const at = Date.now() + H;
+    w.sync(at);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    const b = w.mkSocket('SB', BOB, 'm-bob', 'Bob');
+    const c = w.mkSocket('SC', CAROL, 'm-carol', 'Carol');
+    for (const [s, n] of [[a, 'Alice'], [b, 'Bob'], [c, 'Carol']] as const) await s.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: n });
+    expect(w.qualifierTournaments.get(WEEKLY).players).toHaveLength(3);
+    return { at, a, b, c };
+  }
+  const offline = (w: ReturnType<typeof world>, s: any) => { s.connected = false; };
+  const online = (w: ReturnType<typeof world>, s: any) => { s.connected = true; };
+
+  it('offline at the start → released: credit refunded, master registration deleted, audited, not seated; the two online start', async () => {
+    const w = world();
+    const { at, c } = await three(w);
+    offline(w, c);
+    w.m.tickQualifierAutoStart(at);
+    await flush();
+    expect(w.started).toHaveLength(1);
+    expect(w.started[0].players.map((p: any) => p.masterId)).toEqual(['m-alice', 'm-bob']);
+    expect(w.qualifierTournaments.get(WEEKLY)).toMatchObject({ status: 'running' });
+    expect(w.qualifierTournaments.get(WEEKLY).players.map((p: any) => p.masterPlayerId)).toEqual(['m-alice', 'm-bob']);
+    expect(w.creditRefunds).toEqual(['credit-3']);
+    expect(w.fetches.filter((f) => f.method === 'DELETE' && /register\/internal$/.test(f.url)).map((f) => f.body)).toEqual([{ userId: 'm-carol' }]);
+    expect(w.audits.filter((x) => x.action === 'QUALIFIER_NO_SHOW_RELEASED')).toEqual([
+      expect.objectContaining({ d: expect.objectContaining({ qualifierId: WEEKLY, masterId: 'm-carol', creditRefunded: true }) }),
+    ]);
+    expect(w.m.qualifierNoShows.released).toBe(1);
+    // The start broadcast counts the field that actually started.
+    expect(w.globalEmits.filter(([e]) => e === 'qualifierTournamentUpdate').pop()![1]).toMatchObject({ status: 'running', playerCount: 2 });
+  });
+
+  it('CONTROL — everyone online: nobody released', async () => {
+    const w = world();
+    const { at } = await three(w);
+    w.m.tickQualifierAutoStart(at);
+    await flush();
+    expect(w.started[0].players).toHaveLength(3);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.m.qualifierNoShows.released).toBe(0);
+  });
+
+  it('a blip is not a no-show: seen online a minute before the start, offline AT the start → still seated', async () => {
+    const w = world();
+    const { at, c } = await three(w);
+    w.m.tickQualifierAutoStart(at - 60_000);          // the tick before the start sees Carol
+    expect(w.qualifierTournaments.get(WEEKLY).status).toBe('registering');
+    offline(w, c);
+    w.m.tickQualifierAutoStart(at);
+    await flush();
+    expect(w.started[0].players).toHaveLength(3);
+    expect(w.creditRefunds).toEqual([]);
+  });
+
+  it('seen online 5 minutes before but not since → a no-show', async () => {
+    const w = world();
+    const { at, c } = await three(w);
+    w.m.tickQualifierAutoStart(at - 5 * 60_000);
+    offline(w, c);
+    w.m.tickQualifierAutoStart(at);
+    await flush();
+    expect(w.started[0].players.map((p: any) => p.masterId)).toEqual(['m-alice', 'm-bob']);
+  });
+
+  it('a no-show who signs in on ANOTHER socket before the start is online (the master account counts, not the registration socket)', async () => {
+    const w = world();
+    const { at, c } = await three(w);
+    offline(w, c);
+    w.mkSocket('SC2', CAROL, 'm-carol', 'Carol');      // a reload: a new socket, same account
+    w.m.tickQualifierAutoStart(at);
+    await flush();
+    expect(w.started[0].players).toHaveLength(3);
+  });
+
+  it('fewer than 2 online: NOBODY is released, it waits; one comes back → it starts with the two, the third released then', async () => {
+    const w = world();
+    const { at, b, c } = await three(w);
+    offline(w, b); offline(w, c);
+    w.m.tickQualifierAutoStart(at);
+    await flush();
+    expect(w.started).toEqual([]);
+    expect(w.qualifierTournaments.get(WEEKLY)).toMatchObject({ status: 'registering' });
+    expect(w.qualifierTournaments.get(WEEKLY).players).toHaveLength(3);
+    expect(w.creditRefunds).toEqual([]);
+    online(w, b);
+    w.m.tickQualifierAutoStart(at + 60_000);
+    await flush();
+    expect(w.started[0].players.map((p: any) => p.masterId)).toEqual(['m-alice', 'm-bob']);
+    expect(w.creditRefunds).toEqual(['credit-3']);
+  });
+
+  it('still fewer than 2 online when late registration ends → cancelled, EVERY credit refunded (as with too few registered)', async () => {
+    const w = world();
+    const { at, b, c } = await three(w);
+    offline(w, b); offline(w, c);
+    w.m.tickQualifierAutoStart(at);
+    w.m.tickQualifierAutoStart(at + 1.5 * H + 1);
+    await flush();
+    expect(w.qualifierTournaments.get(WEEKLY)).toMatchObject({ status: 'finished', cancelled: true });
+    expect(w.creditRefunds.sort()).toEqual(['credit-1', 'credit-2', 'credit-3']);
+    expect(w.started).toEqual([]);
+  });
+
+  it('the released player is told at the next sign-in, once: qualifierCancelled {reason absent_at_start, late registration open, credit refunded}', async () => {
+    const w = world();
+    const { at, c } = await three(w);
+    offline(w, c);
+    w.m.tickQualifierAutoStart(at);
+    await flush();
+    const back = w.mkSocket('SC3', CAROL, 'm-carol', 'Carol');
+    const realNow = Date.now;
+    Date.now = () => at + 10 * 60_000;
+    try {
+      expect(w.m.tellQualifierNoShowReleases(back, w.authSessions.get('SC3'), 'test')).toBe(1);
+      expect(w.of('SC3', 'qualifierCancelled')).toEqual([{
+        qualifierId: WEEKLY, reason: 'absent_at_start', qualifierName: expect.any(String),
+        lateRegUntil: new Date(at + 1.5 * H).toISOString(), lateRegOpen: true, creditRefunded: true,
+      }]);
+      expect(w.m.tellQualifierNoShowReleases(back, w.authSessions.get('SC3'), 'test')).toBe(0);   // once
+      // Nobody else is told anything.
+      const alice = w.mkSocket('SA2', ALICE, 'm-alice', 'Alice');
+      expect(w.m.tellQualifierNoShowReleases(alice, w.authSessions.get('SA2'), 'test')).toBe(0);
+    } finally { Date.now = realNow; }
+  });
+
+  it('wiring: every sign-in path that tells kept seats also tells a no-show release (one hook)', () => {
+    const tell = fnSrc('function tellKeptTournamentSeats(');
+    expect(tell).toContain('tellQualifierNoShowReleases(socket, auth, via);');
+    expect(tell.indexOf('tellQualifierNoShowReleases(')).toBeLessThan(tell.indexOf('absentTournamentSeatsOf('));
+    for (const via of ['oauthLogin', 'tokenLogin', 'authWithTicket', 'resumeSession', 'joinWithWaitlistContext']) {
+      expect(SRC).toContain(`'${via}')`);
+    }
+  });
+});
+
+describe('2026-10-20 — the credit list (the entry gate) survives a master blip and sees new / refunded credits', () => {
+  const LIST = slice('const qualifiedPlayers = new Map<string, QualifiedPlayer[]>();', '\n  return false;\n}\n');
+  function gate(answers: Array<'ok' | 'throw' | '500' | 'bad'>, credits: () => Array<{ player_id: string; tier: string }>) {
+    const calls: string[] = [];
+    const scope: Record<string, unknown> = {
+      process: { env: { MASTER_API_URL: 'https://master.test', INTERNAL_NOTIFY_TOKEN: 't' } },
+      console: { log() {}, warn() {}, error() {} },
+      fetch: async (url: string) => {
+        calls.push(url);
+        const a = answers.length > 1 ? answers.shift()! : answers[0];
+        if (a === 'throw') throw new Error('ECONNRESET');
+        if (a === '500') return { ok: false, status: 500, json: async () => ({ success: false }) };
+        if (a === 'bad') return { ok: true, status: 200, json: async () => ({ success: false }) };
+        return { ok: true, status: 200, json: async () => ({ success: true, credits: credits() }) };
+      },
+    };
+    const { exports: g } = load(LIST, scope, '{ isPlayerQualified, getQualifiedPlayers }');
+    return { g, calls };
+  }
+  let clock = 0;
+  const realNow = Date.now;
+  beforeEach(() => { clock = Date.parse('2026-10-25T16:55:00Z'); Date.now = () => clock; });
+  afterEach(() => { Date.now = realNow; });
+
+  it('a failed read KEEPS the last good list (it used to cache [] and refuse every qualified player for 5 minutes)', async () => {
+    const { g, calls } = gate(['ok', 'throw'], () => [{ player_id: 'm1', tier: 'weekly' }]);
+    expect(await g.isPlayerQualified('m1', 'weekly')).toBe(true);
+    clock += 6 * 60_000;                                // cache expired; the master is down
+    expect(await g.isPlayerQualified('m1', 'weekly')).toBe(true);
+    expect(calls).toHaveLength(2);
+    clock += 5_000;                                     // inside the 15 s retry back-off: no new read
+    expect(await g.isPlayerQualified('m1', 'weekly')).toBe(true);
+    expect(calls).toHaveLength(2);
+  });
+
+  it('a non-2xx or a success:false answer is a failed read too (last good list kept)', async () => {
+    for (const bad of ['500', 'bad'] as const) {
+      const { g } = gate(['ok', bad], () => [{ player_id: 'm1', tier: 'weekly' }]);
+      expect(await g.isPlayerQualified('m1', 'weekly')).toBe(true);
+      clock += 6 * 60_000;
+      expect(await g.isPlayerQualified('m1', 'weekly')).toBe(true);
+    }
+  });
+
+  it('a credit earned (or refunded) after the list was read: "not in the list" re-reads it once before refusing (at most every 30 s)', async () => {
+    let credits = [{ player_id: 'm1', tier: 'weekly' }];
+    const { g, calls } = gate(['ok'], () => credits);
+    expect(await g.isPlayerQualified('m2', 'weekly')).toBe(false);     // fresh list: no re-read
+    expect(calls).toHaveLength(1);
+    credits = [...credits, { player_id: 'm2', tier: 'weekly' }];         // m2 finished top 5 / was refunded
+    clock += 10_000;
+    expect(await g.isPlayerQualified('m2', 'weekly')).toBe(false);     // list 10 s old: no re-read yet
+    expect(calls).toHaveLength(1);
+    clock += 25_000;
+    expect(await g.isPlayerQualified('m2', 'weekly')).toBe(true);      // 35 s old: re-read, now qualified
+    expect(calls).toHaveLength(2);
+  });
+
+  it('never read and the master is down → not qualified (the consume on the master stays the real gate)', async () => {
+    const { g } = gate(['throw'], () => []);
+    expect(await g.isPlayerQualified('m1', 'weekly')).toBe(false);
   });
 });
 

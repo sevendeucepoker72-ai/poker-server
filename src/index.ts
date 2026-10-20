@@ -17,6 +17,7 @@ import {
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
 import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK } from './game/qualifierSchedule';
+import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
 import { EscrowBacker, EscrowOffer, normalizeBackers, planEscrowRefund, planCashedSettlement, validateStakeOffer } from './game/stakingEscrow';
@@ -2918,7 +2919,7 @@ app.get('/api/health', async (_req, res) => {
         staking: { ...stakingStats, openOffers: stakingOffers.size },
         qualifiers: {
           sync: { ...qualifierSyncStats }, registry: qualifierTournaments.size, cancellations: { ...qualifierCancellations },
-          lateEntries: { ...qualifierLateEntries }, resultPosts: { ...qualifierResultPosts },
+          lateEntries: { ...qualifierLateEntries }, resultPosts: { ...qualifierResultPosts }, noShows: { ...qualifierNoShows },
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
@@ -2976,8 +2977,26 @@ interface QualifiedPlayer {
 const qualifiedPlayers = new Map<string, QualifiedPlayer[]>();
 let lastQualifierFetch = 0;
 const QUALIFIER_CACHE_MS = 5 * 60 * 1000; // 5-minute cache
+// 2026-10-20 — a credit-list read gives up after this (a registration awaits it).
+const QUALIFIER_FETCH_TIMEOUT_MS = 8000;
+// 2026-10-20 — after a FAILED read, wait this long before trying again (so a
+// master outage is not hit once per registration tap).
+const QUALIFIER_FETCH_RETRY_MS = 15 * 1000;
+let lastQualifierFetchFailedAt = 0;
+// 2026-10-20 — "not in the list" re-reads the list once before refusing,
+// at most this often: a credit earned (top 5 tonight) or refunded (a withdraw,
+// a no-show) in the last 5 minutes is not in the cache yet.
+const QUALIFIER_NEGATIVE_RECHECK_MS = 30 * 1000;
 
-async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<QualifiedPlayer[]> {
+/**
+ * null = the master could not be read (transport error, timeout, non-2xx, or
+ * success:false). getQualifiedPlayers then KEEPS its last good list. 2026-10-20:
+ * a failed read used to be cached as [] for 5 minutes, refusing every
+ * qualified player ("You need a weekly qualifier credit") during a master blip.
+ */
+async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<QualifiedPlayer[] | null> {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), QUALIFIER_FETCH_TIMEOUT_MS);
   try {
     const masterApi = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
     // Fetch ONLY unredeemed credits — a credit is consumed (redeemed_at stamped)
@@ -3002,9 +3021,10 @@ async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<Quali
     // undercounted qualified players (324 weekly / 209 monthly seen as 248 /
     // 132). 50000 covers the whole promotion; revisit with a dedicated
     // distinct-qualified-players endpoint if credit volume ever approaches it.
-    const res = await fetch(`${masterApi}/qualifier-credits?limit=50000&unredeemedOnly=true`, { headers });
+    const res = await fetch(`${masterApi}/qualifier-credits?limit=50000&unredeemedOnly=true`, { headers, signal: ac.signal });
+    if (!res.ok) { console.error(`[Qualifiers] credit list read failed: HTTP ${res.status}`); return null; }
     const data: any = await res.json();
-    if (!data.success || !data.credits) return [];
+    if (!data.success || !Array.isArray(data.credits)) { console.error('[Qualifiers] credit list read failed: unexpected answer'); return null; }
 
     // Group credits by master user-id + tier and count. Key on player_id
     // (the .online OIDC subject) — NOT phone_number, which was brittle
@@ -3032,16 +3052,23 @@ async function fetchQualifiersFromMaster(tier: string = 'weekly'): Promise<Quali
     return Array.from(byKey.values());
   } catch (err) {
     console.error('[Qualifiers] Failed to fetch from master API:', err);
-    return [];
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 async function getQualifiedPlayers(tier: string): Promise<QualifiedPlayer[]> {
   const now = Date.now();
-  if (now - lastQualifierFetch > QUALIFIER_CACHE_MS || !qualifiedPlayers.has(tier)) {
+  if ((now - lastQualifierFetch > QUALIFIER_CACHE_MS || !qualifiedPlayers.has(tier))
+      && now - lastQualifierFetchFailedAt > QUALIFIER_FETCH_RETRY_MS) {
     const players = await fetchQualifiersFromMaster(tier);
-    qualifiedPlayers.set(tier, players);
-    lastQualifierFetch = now;
+    if (players) {
+      qualifiedPlayers.set(tier, players);
+      lastQualifierFetch = now;
+    } else {
+      lastQualifierFetchFailedAt = now;   // keep the last good list (empty only if never read)
+    }
   }
   return qualifiedPlayers.get(tier) || [];
 }
@@ -3056,7 +3083,14 @@ async function getQualifiedPlayers(tier: string): Promise<QualifiedPlayer[]> {
 async function isPlayerQualified(masterId: string, tier: string): Promise<boolean> {
   if (!masterId) return false;
   const list = await getQualifiedPlayers(tier);
-  return list.some((p) => String(p.playerId) === masterId);
+  if (list.some((p) => String(p.playerId) === masterId)) return true;
+  // 2026-10-20 — not in a list older than 30 s: read it fresh once before refusing.
+  if (Date.now() - lastQualifierFetch > QUALIFIER_NEGATIVE_RECHECK_MS) {
+    lastQualifierFetch = 0;
+    const fresh = await getQualifiedPlayers(tier);
+    return fresh.some((p) => String(p.playerId) === masterId);
+  }
+  return false;
 }
 
 // REST endpoint: get qualified players for a tier
@@ -3128,6 +3162,8 @@ interface QualifierRegistrant {
   /** R2 — the credits his RE-ENTRIES consumed (refunded if the event dies with the process — the shutdown flush). */
   reentryCreditIds?: string[];
   registeredAt?: number;
+  /** 2026-10-20 — last time the auto-start tick saw a live socket of this account (qualifierNoShow). */
+  lastOnlineAt?: number;
 }
 
 const qualifierTournaments = new Map<string, QualifierTournamentReg>();
@@ -3377,7 +3413,13 @@ function releaseQualifierRegistration(qualId: string, qt: QualifierTournamentReg
   p.reentryCreditIds = [];
   for (const cid of creditIds) {
     tasks.push(refundQualifierCreditOnMaster(cid)
-      .then((refunded) => auditLog(p.playerId, refunded ? 'QUALIFIER_CREDIT_REFUND' : 'QUALIFIER_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: cid, reason }))
+      .then((refunded) => {
+        // 2026-10-20 — the credit is usable again: drop the cached list so a
+        // re-registration (late entry after a no-show release, a re-register
+        // after a withdraw) is not refused by a list read before the refund.
+        if (refunded) lastQualifierFetch = 0;
+        auditLog(p.playerId, refunded ? 'QUALIFIER_CREDIT_REFUND' : 'QUALIFIER_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: cid, reason });
+      })
       .catch(() => auditLog(p.playerId, 'QUALIFIER_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId: cid, reason })));
   }
   if (qt.masterQualifierId && p.masterPlayerId) {
@@ -3752,6 +3794,81 @@ app.get('/api/qualifier-tournaments/:qualifierId', (req, res) => {
 });
 
 /**
+ * 2026-10-20 (owner: "Remove + refund at start") — registrants not online at
+ * the start (qualifierNoShow: no live socket, none seen in the last 2 min) are
+ * taken out of the field before it is seated: credit refunded, master
+ * registration dropped (releaseQualifierRegistration), audited. They have no
+ * live socket to tell, so a one-time notice waits for their next sign-in
+ * (tellQualifierNoShowReleases). Late registration stays open to them while a
+ * seat is free.
+ */
+const qualifierNoShows = { released: 0, toldOnSignIn: 0 };
+const QUALIFIER_NO_SHOW_NOTICE_TTL_MS = 24 * 60 * 60 * 1000;
+const qualifierNoShowNotices = new Map<string, Array<{ qualifierId: string; qualifierName: string; lateRegUntil: number; creditRefunded: boolean; at: number }>>();
+
+/** 2026-10-20 — is this registrant connected right now (the master account; else the registration socket)? */
+function qualifierRegistrantOnline(p: QualifierRegistrant): boolean {
+  if (p.masterPlayerId) return socketsOfMaster(p.masterPlayerId).length > 0;
+  const s = p.socketId ? io.sockets.sockets.get(p.socketId) : undefined;
+  return !!s && !!s.connected;
+}
+
+function releaseQualifierNoShows(qualId: string, qt: QualifierTournamentReg, absent: QualifierRegistrant[], now: number): void {
+  const gone = new Set(absent);
+  qt.players = qt.players.filter((p) => !gone.has(p));
+  const lateRegUntil = qualifierWindows(new Date(qt.scheduledAt).getTime()).lateRegUntil;
+  for (const p of absent) {
+    qualifierNoShows.released++;
+    const creditRefunded = !!p.consumedCreditId || (p.reentryCreditIds || []).length > 0;
+    auditLog(p.playerId, 'QUALIFIER_NO_SHOW_RELEASED', {
+      qualifierId: qualId, masterId: p.masterPlayerId || null, creditRefunded,
+      lastSeenAt: Math.max(p.lastOnlineAt || 0, p.registeredAt || 0) || null,
+    });
+    void releaseQualifierRegistration(qualId, qt, p, 'absent_at_start');
+    if (p.masterPlayerId) {
+      const list = (qualifierNoShowNotices.get(p.masterPlayerId) || [])
+        .filter((n) => now - n.at < QUALIFIER_NO_SHOW_NOTICE_TTL_MS && n.qualifierId !== qualId);
+      list.push({ qualifierId: qualId, qualifierName: qt.qualifierName, lateRegUntil, creditRefunded, at: now });
+      qualifierNoShowNotices.set(p.masterPlayerId, list);
+    }
+  }
+  console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_no_shows_released', qualifierId: qualId, released: absent.length, starting: qt.players.length })}`);
+}
+
+/**
+ * 2026-10-20 — after a sign-in: tell this socket about qualifier entries that
+ * were released because the account was offline at the start
+ * ('qualifierCancelled' {qualifierId, reason:'absent_at_start', qualifierName,
+ * lateRegUntil, lateRegOpen, creditRefunded}). Once per release; never throws
+ * into the login handler.
+ */
+function tellQualifierNoShowReleases(socket: Socket, auth: SocketAuthSession, via: string): number {
+  try {
+    const masterId = String(auth.masterUserId || auth.statsMasterUserId || '');
+    if (!masterId || !socket.connected) return 0;
+    const list = qualifierNoShowNotices.get(masterId);
+    if (!list || list.length === 0) return 0;
+    qualifierNoShowNotices.delete(masterId);
+    const now = Date.now();
+    let told = 0;
+    for (const n of list) {
+      if (now - n.at >= QUALIFIER_NO_SHOW_NOTICE_TTL_MS) continue;
+      socket.emit('qualifierCancelled', {
+        qualifierId: n.qualifierId, reason: 'absent_at_start', qualifierName: n.qualifierName,
+        lateRegUntil: new Date(n.lateRegUntil).toISOString(), lateRegOpen: now < n.lateRegUntil, creditRefunded: n.creditRefunded,
+      });
+      told++;
+    }
+    qualifierNoShows.toldOnSignIn += told;
+    if (told > 0) console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_no_show_told_on_sign_in', via, told })}`);
+    return told;
+  } catch (e: any) {
+    console.warn(`[Qualifier] tellQualifierNoShowReleases failed (${via}):`, e?.message || e);
+    return 0;
+  }
+}
+
+/**
  * Auto-start qualifier tournaments when scheduled time arrives.
  * Runs every 30 seconds.
  * R2 (TOURNEY-3) — a qualifier still without two players when its late
@@ -3763,11 +3880,20 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
   for (const [qualId, qt] of qualifierTournaments) {
     if (qt.status !== 'registering') continue;
     const scheduledTime = new Date(qt.scheduledAt).getTime();
+    // 2026-10-20 — who is online, sampled every tick from 15 min before the start.
+    if (now >= scheduledTime - QUALIFIER_PRESENCE_LEAD_MS) samplePresence(qt.players, qualifierRegistrantOnline, now);
     if (now < scheduledTime) continue;
-    if (qt.players.length < 2) {
+    // 2026-10-20 (owner) — it starts with the registrants who are HERE; the
+    // others are released (credit refunded) just before the seating. Fewer
+    // than 2 here: nobody is released, it waits (a registrant who comes back
+    // counts at the next tick) and is cancelled, everyone refunded, when late
+    // registration ends — as with fewer than 2 registered.
+    const { present, absent } = partitionByPresence(qt.players, now);
+    if (present.length < 2) {
       if (now > qualifierWindows(scheduledTime).lateRegUntil) void cancelQualifierEvent(qualId, qt, 'too_few_players');
       continue;
     }
+    if (absent.length > 0) releaseQualifierNoShows(qualId, qt, absent, now);
 
     // Time to start!
     qt.status = 'starting';
@@ -18989,6 +19115,8 @@ function tellKeptTournamentSeats(socket: Socket, auth: SocketAuthSession, which:
   // handler (whose catch would answer a second, failed loginResult).
   try {
     if (!socket.connected || authSessions.get(socket.id) !== auth) return 0;
+    // 2026-10-20 — the same moment tells a qualifier no-show release (its own try/catch).
+    tellQualifierNoShowReleases(socket, auth, via);
     const seats = absentTournamentSeatsOf(auth, { voluntary: which === 'voluntary' ? 'only' : 'any' });
     for (const s of seats) socket.emit('tournamentSeatKept', tournamentSeatKeptPayload(s.tournamentId, s.tableId, s.seatIndex, s.seat));
     if (seats.length > 0) {
