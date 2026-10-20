@@ -82,10 +82,11 @@ export function seatsForTopOf(type: string): number {
 
 /**
  * The structure the server RUNS (C3 `structure`): the lobby's advertised 15
- * levels of 20 minutes (25/50 … 3000/6000, designed for a 50,000 stack),
- * scaled to the real starting stack, then continued (still 20 minutes each)
- * until one big blind is four starting stacks — a qualifier always ends (the
- * blind clock stops at the LAST level).
+ * levels (25/50 … 3000/6000, designed for a 50,000 stack), scaled to the real
+ * starting stack, then continued until one big blind is four starting stacks —
+ * a qualifier always ends (the blind clock stops at the LAST level).
+ * 2026-10-20 (owner: "about 4-5 hours") — 12-minute levels (were 20: 6-9
+ * hours). A field of 20-150 reaches its last few levels in roughly 4-5 hours.
  */
 export const QUALIFIER_BASE_STACK = 50_000;
 const ADVERTISED: Array<[number, number, number]> = [
@@ -98,7 +99,7 @@ const CONTINUATION: Array<[number, number, number]> = [
   [15000, 30000, 5000], [20000, 40000, 5000], [30000, 60000, 10000], [50000, 100000, 10000],
   [75000, 150000, 25000], [100000, 200000, 25000],
 ];
-export const QUALIFIER_LEVEL_MINUTES = 20;
+export const QUALIFIER_LEVEL_MINUTES = 12;
 
 export function qualifierStructure(startingStack: number = QUALIFIER_BASE_STACK): { startingStack: number; levels: Array<{ sb: number; bb: number; ante: number; minutes: number }> } {
   const stack = Number.isFinite(startingStack) && startingStack > 0 ? Math.floor(startingStack) : QUALIFIER_BASE_STACK;

@@ -3466,13 +3466,19 @@ function seatQualifierLateEntrant(socket: Socket, qt: QualifierTournamentReg, re
   const tournament = tournamentId ? tournamentManager.getTournament(tournamentId) : undefined;
   if (!tournamentId || !tournament || tournament.status !== 'running') return null;
   const stack = qt.startingStack || QUALIFIER_BASE_STACK;
+  // 2026-10-20 — fewest ALIVE players first, and a BUSTED seat counts as
+  // free (tournamentSeatIsPlaceable — the rebalance's own rule; it is stood up
+  // first, vacateBustedTournamentSeat). Busted seats stay occupied at 0 chips,
+  // so late entry used to find only never-used seats: none at all once the
+  // field had filled every table (9, 18, 27 … entrants), and the credit went back.
   const tables = tournament.tableIds
-    .map((tid) => ({ tid, table: tableManager.getTable(tid) }))
-    .filter((x): x is { tid: string; table: PokerTable } => !!x.table)
-    .sort((a, b) => a.table.getOccupiedSeatCount() - b.table.getOccupiedSeatCount());
+    .map((tid) => ({ tid, table: tableManager.getTable(tid), alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length }))
+    .filter((x): x is { tid: string; table: PokerTable; alive: number } => !!x.table)
+    .sort((a, b) => a.alive - b.alive);
   for (const { tid, table } of tables) {
     for (let s = 0; s < table.seats.length; s++) {
-      if (table.seats[s].state !== 'empty') continue;
+      if (!tournamentSeatIsPlaceable(tournamentId, table, s)) continue;
+      if (table.seats[s].state !== 'empty') vacateBustedTournamentSeat(table, tid, s);
       if (!tournamentManager.addLateEntrant(tournamentId, reg.playerId, reg.playerName, socket.id, stack, { masterUserId: reg.masterPlayerId })) return null;
       if (!table.sitDown(s, reg.playerName, stack, reg.playerId, false)) {
         tournamentManager.removeLateEntrant(tournamentId, reg.playerId);
@@ -3794,12 +3800,20 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
         const sock = boundSid ? io.sockets.sockets.get(boundSid) : undefined;
         if (sock) {
           const playerTable = tournamentManager.getPlayerTable(result.tournamentId, p.playerId);
+          // 2026-10-20 — `seated`: startQualifierTournament bound THIS socket's
+          // session to his seat (not kept absent for a live seat elsewhere).
+          // The client takes a seated registrant straight to his table; before,
+          // only a LATE entrant was moved and everyone who registered on time
+          // stayed in the lobby, dealt in absent, until he found "Return to Table".
+          const startSess = playerSessions.get(boundSid);
+          const seated = !!startSess && !!playerTable && startSess.tableId === playerTable && startSess.playerId === p.playerId;
           sock.emit('qualifierTournamentStarted', {
             qualifierId: qualId,
             tournamentId: result.tournamentId,
             tableId: playerTable || result.tableIds[0],
             tableCount: result.tableCount,
             playerCount: playerCount,
+            seated,
           });
         }
       }
@@ -9860,6 +9874,19 @@ io.on('connection', (socket: Socket) => {
     if (!tournament || tournament.status !== 'running') {
       socket.emit('error', { message: 'Tournament not found or not running' });
       return;
+    }
+    // 2026-10-20 — "Watch Live" from a socket that PLAYS a live seat in this
+    // very tournament: refused, the seat untouched. The P-g leave below used to
+    // stand him up (kept absent: folded / blinded out) to watch his own event.
+    {
+      const own = playerSessions.get(socket.id);
+      const ownSeat = own ? tableManager.getTable(own.tableId)?.seats[own.seatIndex] : undefined;
+      if (own && ownSeat && ownSeat.state === 'occupied' && !ownSeat.eliminated
+        && tournamentTables.get(own.tableId) === data.tournamentId) {
+        tournamentSpectateRefusedOwnSeat++;
+        socket.emit('error', { message: 'You are playing in this tournament - you are already at your table.', code: 'playing_in_tournament' });
+        return;
+      }
     }
 
     // Find the table with the most alive players
@@ -20651,6 +20678,8 @@ function startMultiTableTournament(
 // monthly credits). Fire-and-forget; safe to call for non-qualifier tournaments
 // (the master API matches by tournamentId against qualifierTournaments Map).
 const postedQualifierResults = new Set<string>();
+/** 2026-10-20 — "Watch Live" refused because the socket plays a live seat in that tournament. */
+let tournamentSpectateRefusedOwnSeat = 0;
 /** R2 (TOURNEY-3) — the results POST to the master (it awards the championship seats): posted / retried / failed for good. */
 const qualifierResultPosts = { posted: 0, retried: 0, failed: 0 };
 function postQualifierResults(tournamentId: string, data: { results?: Array<{ playerId: string; playerName: string; position: number; payout: number; userId?: number; disqualified?: boolean }> }): void {
@@ -20687,6 +20716,10 @@ function postQualifierResults(tournamentId: string, data: { results?: Array<{ pl
     })
     .filter(r => r.playerId); // only players we can map to master DB
   if (mappedResults.length === 0) return;
+  // 2026-10-20 — the FULL finish order is written to the audit log before the
+  // POST, so a POST that never lands can be replayed (admin POST
+  // /qualifiers/:id/results) instead of the order being lost with the process.
+  auditLog('SYSTEM', 'QUALIFIER_RESULTS_RECORDED', { tournamentId, masterQualifierId, finishOrder: mappedResults });
   // R2 (TOURNEY-3) — this POST is what awards the championship seats: a
   // failure (or a non-2xx answer) is RETRIED with backoff (the master upserts
   // results, so a retry is safe) and audited when it finally fails — it used
@@ -20701,7 +20734,9 @@ function postQualifierResults(tournamentId: string, data: { results?: Array<{ pl
       if (res && res.ok === false) throw new Error(`http_${res.status}`);
       qualifierResultPosts.posted++;
     }).catch((e: any) => {
-      if (attempt < 4) {
+      // 2026-10-20 — 7 retries (5s … 320s, ~10 minutes in all; was 4, ~75s),
+      // so a short master outage at the end of a qualifier is ridden out.
+      if (attempt < 7) {
         qualifierResultPosts.retried++;
         const t = setTimeout(() => post(attempt + 1), 5000 * 2 ** attempt);
         (t as any)?.unref?.();
@@ -20709,7 +20744,7 @@ function postQualifierResults(tournamentId: string, data: { results?: Array<{ pl
       }
       qualifierResultPosts.failed++;
       console.error('[QualifierResults] post failed for good:', e?.message);
-      auditLog('SYSTEM', 'QUALIFIER_RESULTS_POST_FAILED', { tournamentId, masterQualifierId, results: mappedResults.length, error: String(e?.message || e) });
+      auditLog('SYSTEM', 'QUALIFIER_RESULTS_POST_FAILED', { tournamentId, masterQualifierId, results: mappedResults.length, finishOrder: mappedResults, error: String(e?.message || e) });
     });
   };
   post(0);

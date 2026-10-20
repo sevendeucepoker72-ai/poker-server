@@ -67,15 +67,15 @@ describe('qualifierSchedule (pure)', () => {
       .toEqual([3, 3, 6, 6, 1, 0]);
   });
 
-  it('the structure the server RUNS: the 15 advertised 20-minute levels for 50,000, then continued to a big blind of four stacks; scaled to the real stack', () => {
+  it('the structure the server RUNS: the 15 advertised levels for 50,000 (12 minutes each since 2026-10-20, owner "about 4-5 hours"), then continued to a big blind of four stacks; scaled to the real stack', () => {
     const s = qualifierStructure(QUALIFIER_BASE_STACK);
     expect(s.startingStack).toBe(50_000);
-    expect(s.levels.slice(0, 3)).toEqual([{ sb: 25, bb: 50, ante: 0, minutes: 20 }, { sb: 50, bb: 100, ante: 0, minutes: 20 }, { sb: 75, bb: 150, ante: 25, minutes: 20 }]);
-    expect(s.levels[14]).toEqual({ sb: 3000, bb: 6000, ante: 1000, minutes: 20 });
+    expect(s.levels.slice(0, 3)).toEqual([{ sb: 25, bb: 50, ante: 0, minutes: 12 }, { sb: 50, bb: 100, ante: 0, minutes: 12 }, { sb: 75, bb: 150, ante: 25, minutes: 12 }]);
+    expect(s.levels[14]).toEqual({ sb: 3000, bb: 6000, ante: 1000, minutes: 12 });
     expect(s.levels[s.levels.length - 1].bb).toBe(4 * 50_000);
-    for (const l of s.levels) { expect(l.bb).toBeGreaterThanOrEqual(2 * l.sb); expect(l.minutes).toBe(20); }
-    expect(qualifierStructure(10_000).levels[0]).toEqual({ sb: 5, bb: 10, ante: 0, minutes: 20 });
-    expect(qualifierBlindLevels(50_000)[0]).toEqual({ sb: 25, bb: 50, ante: 0, duration: 1200 });
+    for (const l of s.levels) { expect(l.bb).toBeGreaterThanOrEqual(2 * l.sb); expect(l.minutes).toBe(12); }
+    expect(qualifierStructure(10_000).levels[0]).toEqual({ sb: 5, bb: 10, ante: 0, minutes: 12 });
+    expect(qualifierBlindLevels(50_000)[0]).toEqual({ sb: 25, bb: 50, ante: 0, duration: 720 });
   });
 });
 
@@ -99,8 +99,13 @@ const CODE = [
   fnSrc('function socketPlaysLiveSeatElsewhere('),
   fnSrc('function tournamentEntrantPlayerId('),
   slice('const buyInsOnDeadSocket = {', '\n  return true;\n}\n'),
+  // 2026-10-20 — late entry / re-entry take a busted seat (the rebalance's rule).
+  fnSrc('function tournamentLiveSeatIndex('),
+  fnSrc('function tournamentLiveSeatOf('),
+  fnSrc('function tournamentSeatIsPlaceable('),
+  fnSrc('function vacateBustedTournamentSeat('),
 ].join('\n');
-const HANDLERS = ['registerQualifierTournament', 'unregisterQualifierTournament', 'getQualifierTournaments']
+const HANDLERS = ['registerQualifierTournament', 'unregisterQualifierTournament', 'getQualifierTournaments', 'spectateTournament']
   .map((ev) => handlerSrc(ev, '\n  });\n')).join('\n  ');
 
 const ALICE = 101;
@@ -125,6 +130,8 @@ function world(opts: { now?: number } = {}) {
   const progress: string[] = [];
   const started: Array<{ players: any[]; stack: number }> = [];
   const wallet = new Map<number, number>([[ALICE, 100_000], [BOB, 100_000]]);
+  const tournamentTables = new Map<string, string>();
+  const leaves: string[] = [];
   let creditN = 0;
   const scope: Record<string, unknown> = {
     qualifierTournaments, tournamentManager: tm, authSessions, playerSessions, multiTableSessions, spectators,
@@ -165,6 +172,11 @@ function world(opts: { now?: number } = {}) {
     },
     uuidv4: () => `u${Math.random().toString(36).slice(2, 10)}`,
     console: { log() {}, warn() {}, error() {} },
+    // 2026-10-20 — the busted-seat helpers' world + Watch Live.
+    MAX_SEATS: 9, reservedSeats: new Map(), pendingSeatRemovalAfterHand: new Map(), sitOutTracker: new Map(), aiProfiles: new Map(),
+    syncSitOutToTable() {}, tournamentHandStartSafety: { bustedSeatsVacated: 0 }, tournamentTables,
+    handlePlayerLeave: (sock: any) => { leaves.push(sock.id); },
+    getGameStateForPlayer: () => ({}), emitGameState() {},
   };
   const { exports: m } = load(`${CODE}\nfunction wire(socket) {\n  ${HANDLERS}\n}`, scope, `{
     wire, applyQualifierSchedule, qualifierList, qualifierEventFor, markQualifierFinished, emitTournamentFinishedToEntrants,
@@ -193,7 +205,7 @@ function world(opts: { now?: number } = {}) {
   };
   return {
     m, tm, tables, scope, qualifierTournaments, authSessions, playerSessions, sockets, emitted, globalEmits, roomEmits, audits,
-    consumed, creditRefunds, fetches, postAnswers, progress, started, wallet, mkSocket, of, sync,
+    consumed, creditRefunds, fetches, postAnswers, progress, started, wallet, mkSocket, of, sync, tournamentTables, leaves,
   };
 }
 
@@ -392,6 +404,67 @@ describe('late entry into a RUNNING qualifier — seated at once or the credit g
     expect(w.of('SA', 'qualifierRegistrationResult')).toEqual([expect.objectContaining({ success: false, code: 'no_seat' })]);
   });
 
+  // 2026-10-20 — a FULL field: every seat was taken at the start; one entrant
+  // has busted (his seat stays occupied at 0 chips). The late entrant takes that
+  // seat — it used to be "no_seat" and the credit went back.
+  it('a full table with a BUSTED seat: the late entrant is seated there (the busted entrant becomes a spectator)', async () => {
+    const w = world();
+    w.sync(Date.now() - 10 * 60_000);
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    const tid = w.tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 3, startInterval: 0, blindLevels: qualifierBlindLevels(50_000), startingChips: 50_000 } as any);
+    for (const [id, n, sid] of [['user-201', 'Bob', 'sb'], ['user-202', 'Carl', 'sc'], ['user-203', 'Dan', 'sd']]) w.tm.registerPlayer(tid, id, n, sid, undefined, `m-${id.slice(5)}`);
+    w.tm.startTournament(tid);
+    const t = new PokerTable({ tableId: 'Q1', tableName: 'Q1', smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+    t.maxOccupiableSeats = 3;                                                  // every seat taken at the start
+    t.sitDown(0, 'Bob', 50_000, 'user-201', false, true);
+    t.sitDown(1, 'Carl', 50_000, 'user-202', false, true);
+    t.sitDown(2, 'Dan', 50_000, 'user-203', false, true);
+    w.tables.set('Q1', t);
+    w.tm.setTableIds(tid, ['Q1']);
+    for (const id of ['user-201', 'user-202', 'user-203']) w.tm.setPlayerTable(tid, id, 'Q1');
+    Object.assign(qt, { status: 'running', tournamentId: tid, players: [
+      { playerId: 'user-201', masterPlayerId: 'm-201', playerName: 'Bob', phone: '', socketId: 'sb' },
+      { playerId: 'user-202', masterPlayerId: 'm-202', playerName: 'Carl', phone: '', socketId: 'sc' },
+      { playerId: 'user-203', masterPlayerId: 'm-203', playerName: 'Dan', phone: '', socketId: 'sd' },
+    ] });
+    // Carl busts: 0 chips, eliminated, his seat still occupied; his socket's session still points at it.
+    w.tm.eliminatePlayer(tid, 'user-202');
+    t.seats[1].chipCount = 0;
+    (t.seats[1] as any).eliminated = true;
+    w.mkSocket('sc', 202, 'm-202', 'Carl');
+    w.playerSessions.set('sc', { socketId: 'sc', tableId: 'Q1', seatIndex: 1, playerName: 'Carl', playerId: 'user-202' });
+    expect(w.tm.getTournament(tid)!.status).toBe('running');
+
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await a.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
+    expect(t.seats[1]).toMatchObject({ state: 'occupied', playerId: 'user-101', chipCount: 50_000 });
+    expect(w.playerSessions.get('SA')).toMatchObject({ tableId: 'Q1', seatIndex: 1, playerId: 'user-101' });
+    expect(w.playerSessions.has('sc')).toBe(false);                            // Carl's dead session ended
+    expect(w.scope.spectators && (w.scope.spectators as Map<string, Set<string>>).get('Q1')?.has('sc')).toBe(true);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.of('SA', 'qualifierRegistrationResult')).toEqual([expect.objectContaining({ success: true, lateEntry: true, tableId: 'Q1' })]);
+    // Live seats are never taken.
+    expect(t.seats[0]).toMatchObject({ playerId: 'user-201', chipCount: 50_000 });
+    expect(t.seats[2]).toMatchObject({ playerId: 'user-203', chipCount: 50_000 });
+  });
+
+  it('Watch Live from a socket that PLAYS a live seat in that tournament: refused, the seat untouched (it used to stand him up)', async () => {
+    const { w, tid } = running();
+    w.tournamentTables.set('Q1', tid);
+    const b = w.mkSocket('sb', 201, 'm-201', 'Bob');
+    const bobSession = { socketId: 'sb', tableId: 'Q1', seatIndex: 0, playerName: 'Bob', playerId: 'user-201' };
+    w.playerSessions.set('sb', bobSession);
+    await b.handlers.spectateTournament({ tournamentId: tid });
+    expect(w.leaves).toEqual([]);
+    expect(w.playerSessions.get('sb')).toBe(bobSession);
+    expect(w.of('sb', 'error')).toEqual([expect.objectContaining({ code: 'playing_in_tournament' })]);
+    expect(w.of('sb', 'spectatingTournament')).toEqual([]);
+    // CONTROL — a socket with no seat there watches as before.
+    const x = w.mkSocket('SX', ALICE, 'm-alice', 'Alice');
+    await x.handlers.spectateTournament({ tournamentId: tid });
+    expect(w.of('SX', 'spectatingTournament')).toEqual([expect.objectContaining({ tournamentId: tid, tableId: 'Q1' })]);
+  });
+
   it('TOURNEY-9 — his socket plays a live cash seat: refused already_seated BEFORE any credit; the cash session untouched', async () => {
     const { w } = running();
     const cash = new PokerTable({ tableId: 'cash1', tableName: 'cash1', smallBlind: 10, bigBlind: 20, minBuyIn: 1000, maxBuyIn: 10_000, maxPlayers: 9 } as any);
@@ -455,6 +528,28 @@ describe('the qualifier lifecycle — started, cancelled for too few players, fi
       expect.objectContaining({ id: 'user-101', masterId: 'm-alice' }), expect.objectContaining({ id: 'user-102', masterId: 'm-bob' }),
     ] }]);
     expect(w.qualifierTournaments.get(WEEKLY)).toMatchObject({ status: 'running', tournamentId: 'TQ' });
+  });
+
+  it('the start signal tells each registrant whether THIS socket is seated (the client takes him to his table)', async () => {
+    const w = world();
+    const at = Date.now() + H;
+    w.sync(at);
+    await w.mkSocket('SA', ALICE, 'm-alice', 'Alice').handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
+    await w.mkSocket('SB', BOB, 'm-bob', 'Bob').handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Bob' });
+    // A real tournament: Alice's socket is bound to her seat, Bob's seat is
+    // kept absent (his socket plays elsewhere — no session at Q9).
+    w.scope.startQualifierTournament = (players: any[]) => {
+      const id = w.tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 2, startInterval: 0, blindLevels: qualifierBlindLevels(50_000), startingChips: 50_000 } as any);
+      for (const p of players) w.tm.registerPlayer(id, p.id, p.name, p.socketId, undefined, p.masterId);
+      w.tm.startTournament(id);
+      w.tm.setTableIds(id, ['Q9']);
+      for (const p of players) w.tm.setPlayerTable(id, p.id, 'Q9');
+      w.playerSessions.set('SA', { socketId: 'SA', tableId: 'Q9', seatIndex: 0, playerName: 'Alice', playerId: players[0].id });
+      return { tournamentId: id, tableIds: ['Q9'], tableCount: 1 };
+    };
+    w.m.tickQualifierAutoStart(at);
+    expect(w.of('SA', 'qualifierTournamentStarted')).toEqual([expect.objectContaining({ qualifierId: WEEKLY, tableId: 'Q9', seated: true })]);
+    expect(w.of('SB', 'qualifierTournamentStarted')).toEqual([expect.objectContaining({ qualifierId: WEEKLY, tableId: 'Q9', seated: false })]);
   });
 
   function finished() {
@@ -524,14 +619,27 @@ describe('the qualifier lifecycle — started, cancelled for too few players, fi
         { playerId: 'm-c', finishPosition: 3, pointsAwarded: 0 }, { playerId: 'm-d', finishPosition: 4, pointsAwarded: 0 },
       ] });
       expect(w.m.qualifierResultPosts).toMatchObject({ posted: 1, retried: 1, failed: 0 });
-      // Another event whose POST never lands: 5 attempts, then the audit row.
+      // 2026-10-20 — the full finish order is in the audit log before the POST.
+      const order = [
+        { playerId: 'm-a', finishPosition: 1, pointsAwarded: 0 }, { playerId: 'm-b', finishPosition: 2, pointsAwarded: 0 },
+        { playerId: 'm-c', finishPosition: 3, pointsAwarded: 0 }, { playerId: 'm-d', finishPosition: 4, pointsAwarded: 0 },
+      ];
+      expect(w.audits.filter((a) => a.action === 'QUALIFIER_RESULTS_RECORDED')).toEqual([
+        expect.objectContaining({ actor: 'SYSTEM', d: expect.objectContaining({ tournamentId: 'TQ', masterQualifierId: WEEKLY, finishOrder: order }) }),
+      ]);
+      // Another event whose POST never lands: 8 attempts (~10 minutes), then
+      // the audit row — with the finish order, so it can be replayed.
       const other = { ...qt, tournamentId: 'TQ2' };
       w.qualifierTournaments.set('other', other);
-      for (let i = 0; i < 5; i++) w.postAnswers.push({ ok: false, status: 503 });
+      for (let i = 0; i < 8; i++) w.postAnswers.push({ ok: false, status: 503 });
       w.m.postQualifierResults('TQ2', { ...data, tournamentId: 'TQ2' });
       for (let i = 0; i < 6; i++) { await flush(); jest.advanceTimersByTime(100_000); }
       await flush();
-      expect(w.audits.filter((a) => a.action === 'QUALIFIER_RESULTS_POST_FAILED')).toEqual([expect.objectContaining({ d: expect.objectContaining({ tournamentId: 'TQ2', results: 4 }) })]);
+      expect(w.audits.filter((a) => a.action === 'QUALIFIER_RESULTS_POST_FAILED')).toEqual([]);   // still retrying after ~5 minutes
+      for (let i = 0; i < 6; i++) { await flush(); jest.advanceTimersByTime(400_000); }
+      await flush();
+      expect(w.fetches.filter((f) => /results\/internal$/.test(f.url) && f.body).length).toBe(2 + 8);
+      expect(w.audits.filter((a) => a.action === 'QUALIFIER_RESULTS_POST_FAILED')).toEqual([expect.objectContaining({ d: expect.objectContaining({ tournamentId: 'TQ2', results: 4, finishOrder: order }) })]);
     } finally { jest.useRealTimers(); }
   });
 });

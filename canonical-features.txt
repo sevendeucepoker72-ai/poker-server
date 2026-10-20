@@ -1239,3 +1239,10 @@ economy: {
 # 2026-10-12 owner "loosen for pubs": 25 connections per address; same network at one table = admin alert, not a refusal; no per-network qualifier cap.
 same_network_same_table
 sameNetworkSeats
+
+# 2026-10-20 (owner: weekly qualifier every Sunday 11 AM Denver). The start
+# signal says who is seated (the client takes him to his table); Watch Live is
+# refused for an entrant's own tournament; the full finish order is audited
+# before the results POST.
+playing_in_tournament
+QUALIFIER_RESULTS_RECORDED
