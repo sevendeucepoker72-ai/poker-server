@@ -9674,7 +9674,9 @@ io.on('connection', (socket: Socket) => {
               { qualifierId: qualId, creditId: consumedCreditId, reason: 'no_seat' }
             );
           }
-          socket.emit('qualifierRegistrationResult', { success: false, error: 'No seats available for re-entry' });
+          // 2026-10-20 — say the credit came back (it did, just above), and a
+          // code the lobby can match, like a first entry's no_seat.
+          socket.emit('qualifierRegistrationResult', { success: false, code: 'no_seat', error: 'No seat is free for a re-entry right now — your qualifier credit was returned. Try again when a table breaks.' });
           return;
         }
         // Bump in-memory re-entry counter — survives until the qt is
