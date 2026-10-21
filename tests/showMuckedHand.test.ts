@@ -7,10 +7,14 @@
  * client's renderer (root ErrorBoundary) — and the winner of an uncontested
  * pot could not show at all (only `seat.folded` was allowed).
  * Real handler source (sliced from src/index.ts) on a real PokerTable.
+ *
+ * 2026-10-21 (gameplay F21) — a FOLDED seat's show asked for while the hand is
+ * still being played is QUEUED and revealed when the hand ends (never during
+ * it); case 1 runs the hand to its end before the reveal.
  */
 import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { cardToString } from '../src/game/Card';
-import { handlerSrc, load, flush, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
+import { handlerSrc, load, flush, SEAT_SESSION_FOR_SRC, MUCK_SHOWS_SRC } from './helpers/indexSource';
 
 const HANDLER = handlerSrc('showMuckedHand', '\n  });\n');
 
@@ -20,27 +24,35 @@ function world() {
   const playerSessions = new Map<string, any>();
   for (let i = 0; i < 3; i++) playerSessions.set(`S${i}`, { socketId: `S${i}`, tableId: 'T', seatIndex: i, playerName: `P${i}`, playerId: `p${i}` });
   const room: Array<[string, string, any]> = [];
+  const replies: Array<[string, string, any]> = [];
   // F156 (2026-10-21): the handler resolves its seat through seatSessionFor.
-  const { exports: m } = load(`const shownMuckedHands = new Set();\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${HANDLER}\n}`, {
+  // F21 (2026-10-21): + the real queue (pendingMuckShows) and its end-of-hand flush.
+  const { exports: m } = load(`${MUCK_SHOWS_SRC}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${HANDLER}\n}`, {
     playerSessions, multiTableSessions: new Map(), tableManager: { getTable: (id: string) => (id === 'T' ? t : undefined) },
     GamePhase, cardToString, io: { to: (r: string) => ({ emit: (ev: string, d: any) => room.push([r, ev, d]) }) },
-  }, '{ wire }');
+  }, '{ wire, flushPendingMuckShows, pendingMuckShows }');
   const sock = (id: string) => {
     const handlers: Record<string, (d?: any) => any> = {};
-    m.wire({ id, emit() {}, on: (ev: string, fn: any) => { handlers[ev] = fn; } });
+    m.wire({ id, emit: (ev: string, d: any) => replies.push([id, ev, d]), on: (ev: string, fn: any) => { handlers[ev] = fn; } });
     return async (d?: any) => { await handlers.showMuckedHand(d); await flush(); };
   };
-  return { t, room, sock, playerSessions };
+  return { t, room, replies, sock, playerSessions, m };
 }
 const real = (t: PokerTable, seat: number) => t.seats[seat].holeCards.map((c) => ({ suit: c.suit, rank: c.rank, display: cardToString(c) }));
 
 describe('showMuckedHand — real cards only (contract #4)', () => {
-  it('a folded player shows his REAL cards; forged / malformed client cards are ignored', async () => {
+  it('a folded player shows his REAL cards (at the hand\'s end — F21); forged / malformed client cards are ignored', async () => {
     const w = world();
     w.t.startNewHand();
     const a = w.t.activeSeatIndex;
     expect(w.t.playerFold(a)).toBe(true);
+    expect(w.t.isHandInProgress()).toBe(true);                             // the other two are still in the pot
     await w.sock(`S${a}`)({ cards: [{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }] });
+    expect(w.room).toEqual([]);                                            // F21 — nothing while the hand is played
+    expect(w.replies).toEqual([[`S${a}`, 'muckedHandShowQueued', { tableId: 'T', handNumber: w.t.handNumber, seatIndex: a }]]);
+    for (let g = 0; g < 10 && w.t.isHandInProgress(); g++) w.t.playerFold(w.t.activeSeatIndex);
+    expect(w.t.currentPhase).toBe(GamePhase.HandComplete);
+    expect(w.m.flushPendingMuckShows('T', w.t)).toBe(1);                   // the 'handResult' listener's flush
     expect(w.room).toEqual([['table:T', 'muckedHandRevealed', expect.objectContaining({
       seatIndex: a, playerName: `P${a}`, tableId: 'T', handNumber: w.t.handNumber, cards: real(w.t, a),
     })]]);

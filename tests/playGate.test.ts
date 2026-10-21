@@ -778,7 +778,9 @@ describe('index.ts — every play-entry handler is gated before its first side e
       for (let i = body.indexOf(needle); i >= 0; i = body.indexOf(needle, i + 1)) at.push(i);
       return at;
     };
-    const restores = all('playerSessions.set(socket.id');
+    // 2026-10-21 (gameplay S6) — every sign-in restores through the ONE shared
+    // restoreSeatReservation (its playerSessions.set lives there).
+    const restores = all('restoreSeatReservation(socket, userId,');
     const gates = all('await refuseSeatRestoreIfBarred(socket, userId,');
     expect(restores).toHaveLength(expectedRestores);
     expect(gates).toHaveLength(expectedRestores);
@@ -797,13 +799,18 @@ describe('index.ts — every play-entry handler is gated before its first side e
    */
   function expectRestoreSkippedOnRefusal(body: string, refusalVar: string, gateCall: string) {
     const gateAt = body.indexOf(` ${refusalVar} = await refuseSeatRestoreIfBarred(socket, userId, ${gateCall}`);
-    // S2 fixed protocol (P-b, 2026-10-10): a VOLUNTARY tournament reservation is never restored by a sign-in.
-    const guard = `if (!${refusalVar} && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {`;
-    const guardAt = body.indexOf(guard);
+    // 2026-10-21 (gameplay S6) — the restore is the shared restoreSeatReservation,
+    // called only inside `if (!<refusal>) {` (nothing else in between).
+    const guard = `if (!${refusalVar}) {`;
+    const guardAt = body.indexOf(guard, gateAt);
     expect({ refusalVar, gate: gateAt > -1 }).toEqual({ refusalVar, gate: true });
     expect({ refusalVar, guard: guardAt > gateAt }).toEqual({ refusalVar, guard: true });
-    const restoreAt = body.indexOf('playerSessions.set(socket.id', guardAt);
+    const restoreAt = body.indexOf('restoreSeatReservation(socket, userId,', guardAt);
     expect(restoreAt).toBeGreaterThan(guardAt);
+    expect(body.slice(guardAt + guard.length, restoreAt)).toMatch(/^\s*(const restore = |\w+ = )?$/);
+    // S2 fixed protocol (P-b, 2026-10-10): a VOLUNTARY tournament reservation is never restored by a sign-in.
+    const shared = fnBody('function restoreSeatReservation(');
+    expect(shared).toContain("if (!reserved || reserved.voluntary || !(reserved.expiresAt > Date.now())) return { outcome: 'none' };");
   }
 
   it('oauthLogin: the seat-restore gate runs before the restore; the refusal is sent after loginResult', () => {
@@ -1034,12 +1041,15 @@ describe('index.ts — every play-entry handler is gated before its first side e
     const body = handlerBody('resumeSession');
     expect(body).not.toContain('recoverName');
     expect(body).not.toContain('seat.playerName');
-    expect(body).toContain('const reserved = reservedSeats.get(userId);');
+    // 2026-10-21 (gameplay S6) — through the shared restore, by the LOCAL userId, ghost clearing on.
+    expect(body).toContain("restoreSeatReservation(socket, userId, 'resumeSession', { clearGhosts: true })");
+    const shared = fnBody('function restoreSeatReservation(');
+    expect(shared).toContain('const reserved = reservedSeats.get(userId);');
     expect(body).toContain('...(claims.phone ? { phone: claims.phone } : {}),');
     expect(body).toContain('isAdmin: !!row.is_admin, origIat: claims.orig_iat, phone: claims.phone,');
     // The ghost clearing around the restore is account-only — and since AUTH-3
     // (2026-10-11) for EVERY caller: the display-name step is gone.
-    expect(body).toContain('clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex);');
+    expect(shared).toContain('if (opts.clearGhosts) clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex);');
     expect(fnBody('function clearGhostSeatsForUser(')).not.toContain('namesToMatch');
   });
 

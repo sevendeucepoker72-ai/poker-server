@@ -1375,3 +1375,41 @@ keepHandOnDeparture: true
 ghost_seat_extra_session_scan
 const settledSid = socketIdForSeat(tableId, co.seatIndex);
 extraSeat: true
+
+# 2026-10-21 gameplay S6 (reconnect / restore / reservations, state deltas, privacy).
+# F46: a dropped socket's turn is left to its clock (only a chosen departure
+# acts at once — actNow). F80: a half-open reconnect's sign-in leaves a seat
+# claim; the reaped socket's reservation goes to it. F87: a restore keeps a cash
+# Sit Out (reconnectedToTable.sittingOut, sitOutToggled restored); sitOut
+# {sittingOut} sets, a repeat is 'unchanged'. F89: a reservation's timer ends
+# only its own reservation. F77: a secondary (Multi-Table View) socket never
+# displaces the primary reservation. G183 / G184: a dead tournament seat is
+# never restored nor reserved. F82: joinTable restores the account's
+# reservation at that table. G189: a dead socket's queued move never runs.
+# F155: a resync watches / closes / notices (seatReleased); a seated socket is
+# never its table's spectator. G174: a new-hand delta carries yourCards. F60: a
+# leave drops the delta baseline. G181: every seat carries sittingOut. G182:
+# maxSeats; moveSeat refuses past the cap; moveSeatCancelled always answers.
+# F21: a folded seat's mid-hand Show Hand is queued to the hand's end.
+function restoreSeatReservation(
+function isDeadTournamentSeat(
+dead_tournament_seat_not_reserved
+function adoptReservationByPendingClaim(
+pending_seat_claim_noted
+secondary_departure_kept_primary_reservation
+seatReservationRestores.joinTableRejoins++;
+if (reserved && reserved !== mine)
+opts.actNow && table.isHandInProgress()
+'yourCards', 'yourCardVisibility', 'trainingData'
+muckedHandShowQueued
+function flushPendingMuckShows(
+seatReleased
+const resyncTableView =
+reason: 'table_gone'
+!!sitOutTracker.get(table.config.tableId)?.has(seat.seatIndex)
+maxSeats: Math.min(
+code: 'invalid_target_seat'
+reason: 'cancelled'
+reason: 'unchanged'
+reason: 'restored'
+delete session.pendingSeatIndex;

@@ -1064,7 +1064,18 @@ function emitGameState(socket: any, state: any, forceFullState = false): void {
     lastSentState.set(socket.id, state);
     lastSentJson.delete(socket.id);
   } else {
-    const delta = shallowDiff(prev, state, socket.id) as Record<string, any> | null;
+    let delta = shallowDiff(prev, state, socket.id) as Record<string, any> | null;
+    // 2026-10-21 (gameplay G174) — a delta that starts a NEW hand always carries
+    // the seat's per-hand keys, even when unchanged: dealt the very same two
+    // cards as last hand (1 in 2,652 Hold'em hands), shallowDiff left yourCards
+    // out, the client — which clears its cards on a new handNumber without them
+    // — showed no cards and no action bar, and the 30s clock folded him.
+    // Contract: a delta that changes handNumber carries `yourCards`; an absent
+    // yourCards in any other delta means unchanged.
+    if (state && state.handNumber !== prev.handNumber) {
+      delta = delta || {};
+      for (const k of ['yourCards', 'yourCardVisibility', 'trainingData']) if (k in state) delta[k] = state[k];
+    }
     // Always re-stamp the turn/variant metadata — even on a no-op tick — so
     // the client's timer + variant guards stay fresh. Merging these into the
     // delta is idempotent: equal values are a no-op on the client merger.
@@ -1676,7 +1687,9 @@ setInterval(() => {
 // 2026-10-11 (R1 contract #3) — displayName: the ACCOUNT's display name (users.display_name,
 // else the row's public name), set by every sign-in and by setDisplayName; what
 // seatNameForSocket shows. `username` is NOT a display value (a phone, a slug, `m:<id>`).
-const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null; displayName?: string | null }>();
+// 2026-10-21 (gameplay F77) — secondary: this socket signed in with
+// skipSeatRecovery (a Multi-Table View per-table socket) — see ReservedSeat.secondary.
+const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null; displayName?: string | null; secondary?: boolean }>();
 
 /**
  * 2026-10-11 (R1 contract #3; audit AUTH-6, APPUI-13, TOURNEY-12) — the name
@@ -2522,6 +2535,19 @@ interface ReservedSeat {
    * given back to the restored session (restoreFastModeOnSeatRestore). Absent = off.
    */
   fastMode?: boolean;
+  /**
+   * 2026-10-21 (gameplay F87) — a SITTING-OUT departure's consecutive sat-out
+   * hands (PlayerSession.sitOutHands), given back when the restore keeps him
+   * sitting out, so a reconnect does not reset the 30-hand stand-up count.
+   */
+  sitOutHands?: number;
+  /**
+   * 2026-10-21 (gameplay F77) — made by a SECONDARY socket (the Multi-Table
+   * View's per-table socket, signed in with skipSeatRecovery). It never
+   * displaces a primary reservation, and a primary sign-in never restores it
+   * (that socket's rejoin — joinTable — does).
+   */
+  secondary?: boolean;
 }
 const reservedSeats = new Map<number, ReservedSeat>();
 
@@ -4215,6 +4241,13 @@ function getGameStateForPlayer(
       // blinds (audit finding: observers couldn't see who owed).
       missedBlind: seat.missedBlind || 'none',
       deadBlindOwedChips: seat.deadBlindOwedChips || 0,
+      // 2026-10-21 (gameplay G181) — ALWAYS present: this seat's player chose
+      // Sit Out (or was sat out AFK). Read from the sit-out tracker, never the
+      // engine set (a tournament table's engine set is always empty — P-j) and
+      // never seat.state (it stays 'occupied': the engine and every handler key
+      // on that). The client's AWAY badge waited for a 'sitting_out' state the
+      // server never sends.
+      sittingOut: seat.state === 'occupied' && !!sitOutTracker.get(table.config.tableId)?.has(seat.seatIndex),
     };
 
     // Attach rank and avatar for display on nameplates/seats
@@ -4329,6 +4362,11 @@ function getGameStateForPlayer(
       && !table.seats[playerSeatIndex].folded
       && table.seats[playerSeatIndex].holeCards.length === 3,
     sittingOut: false, // Will be overridden per-player in broadcastGameState
+    // 2026-10-21 (gameplay G182) — ALWAYS present: how many seats this table
+    // really has (a variant's deck cap, a heads-up / club / private table's
+    // maxSeats — it can drop at runtime). The client drew 9 seats everywhere and
+    // offered "Move here" on seats sitDown always refuses.
+    maxSeats: Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS),
   };
 
   // Add draw phase info for draw games
@@ -4963,6 +5001,19 @@ function broadcastGameState(tableId: string): void {
 
   // Send spectator-specific state (no hole cards unless showdown)
   const tableSpectators = spectators.get(tableId);
+  // 2026-10-21 (gameplay F155) — a socket that holds a SEAT here (main or
+  // extra-table session) is never also this table's spectator: a resync can
+  // spectate-attach a socket that a later sign-in restore / join then seats,
+  // and its seat frame would be followed by a spectator frame (yourSeat -1,
+  // isSpectator) that wipes its cards and action bar. Dropped here, uncounted.
+  if (tableSpectators && tableSpectators.size > 0) {
+    for (const specId of [...tableSpectators]) {
+      const seatedHere = playerSessions.get(specId)?.tableId === tableId
+        || (multiTableSessions.get(specId) || []).some((s) => s && s.tableId === tableId);
+      if (seatedHere) tableSpectators.delete(specId);
+    }
+    if (tableSpectators.size === 0) spectators.delete(tableId);
+  }
   if (tableSpectators && tableSpectators.size > 0) {
     const spectatorState = getGameStateForPlayer(table, -1, false);
     (spectatorState as any).isSpectator = true;
@@ -5308,6 +5359,9 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   });
 
   table.on('handResult', async (data: { results: any[]; handNumber: number }) => {
+    // F21 (2026-10-21) — the folded seats' queued Show Hand, now that the hand
+    // is over (first, synchronously: before any seat is stood up below).
+    try { flushPendingMuckShows(tableId, table); } catch (e: any) { console.warn(`[showMuckedHand] flush failed on ${tableId}:`, e?.message || e); }
     incrementHandsPlayed();
     // 2026-07-07 AI overhaul: record a 'showdown' observation for every player
     // who reached a CONTESTED showdown (didn't fold), completing the session
@@ -5956,20 +6010,34 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
   const target = session.pendingSeatIndex;
   if (target == null) return false;
   delete session.pendingSeatIndex;
+  // 2026-10-21 (gameplay G182 / F78) — every move that does not happen ends the
+  // client's pending-move pill: `moveSeatCancelled { tableId, reason }`
+  // (table_gone | seat_taken | seat_unavailable). It used to be told nothing
+  // and the "Moving to seat N" pill stayed for good.
+  const cancelled = (reason: 'table_gone' | 'seat_taken' | 'seat_unavailable'): false => {
+    io.sockets.sockets.get(session.socketId)?.emit('moveSeatCancelled', { tableId, reason });
+    return false;
+  };
 
   const table = tableManager.getTable(tableId);
-  if (!table) return false;
+  if (!table) return cancelled('table_gone');
 
   const src = table.seats[session.seatIndex];
   const dst = table.seats[target];
-  if (!src || !dst) return false;
+  if (!src || !dst) return cancelled('table_gone');
 
   // Re-check: target must still be empty or AI. A human may have joined
   // this seat between queue and execute.
   if (dst.state === 'occupied' && !dst.isAI) {
     const sock = io.sockets.sockets.get(session.socketId);
     if (sock) sock.emit('error', { message: 'Target seat was taken — move cancelled' });
-    return false;
+    return cancelled('seat_taken');
+  }
+  // G182 — a seat past the table's cap never seats anyone (sitDown refuses it):
+  // refused before the player is stood up.
+  if (target >= Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS)) {
+    io.sockets.sockets.get(session.socketId)?.emit('error', { message: 'That seat is not available — you stayed in your seat.', code: 'move_seat_failed' });
+    return cancelled('seat_unavailable');
   }
 
   // Evict an AI from the target if any.
@@ -5997,7 +6065,8 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
     // back by attempting to return to the original seat with the same stack.
     console.warn(`[MoveSeat] sitDown failed for ${playerName} on seat ${target}; restoring to ${session.seatIndex}`);
     table.sitDown(session.seatIndex, playerName, chipCount, playerId, false, true);
-    return false;
+    io.sockets.sockets.get(session.socketId)?.emit('error', { message: 'That seat is not available — you stayed in your seat.', code: 'move_seat_failed' });
+    return cancelled('seat_unavailable');   // G182
   }
 
   // Carry avatar forward on the new seat.
@@ -6144,17 +6213,24 @@ function autoStartNextHand(tableId: string): void {
   // tables allow these requests (the handler already refuses tournaments).
   if (!tournamentTables.has(tableId)) {
     const movedSockets: string[] = [];
+    // 2026-10-21 (gameplay G189) — never the queued move of a socket that is
+    // already GONE (socket.io removes it from io.sockets before 'disconnect'
+    // fires): the move ran while the disconnect handler awaited its progress
+    // save, replaced the seat it had captured, and the handler then reserved
+    // nothing — the moved seat was left with no session, no reservation and no
+    // cash-out, blinded every orbit. The queued move is dropped; the seat stays
+    // where the disconnect reserves it.
+    const moveIfLive = (sid: string, session: PlayerSession): void => {
+      if (!io.sockets.sockets.get(sid)) { delete session.pendingSeatIndex; return; }
+      if (executePendingMove(tableId, session)) movedSockets.push(sid);
+    };
     for (const [sid, session] of playerSessions) {
-      if (session.tableId === tableId && session.pendingSeatIndex != null) {
-        if (executePendingMove(tableId, session)) movedSockets.push(sid);
-      }
+      if (session.tableId === tableId && session.pendingSeatIndex != null) moveIfLive(sid, session);
     }
     // Also scan multi-table sessions that belong to this table.
     for (const [sid, multi] of multiTableSessions) {
       for (const session of multi) {
-        if (session.tableId === tableId && session.pendingSeatIndex != null) {
-          if (executePendingMove(tableId, session)) movedSockets.push(sid);
-        }
+        if (session.tableId === tableId && session.pendingSeatIndex != null) moveIfLive(sid, session);
       }
     }
     if (movedSockets.length > 0) {
@@ -8323,6 +8399,7 @@ function endTableViewsAndTimers(tableId: string): void {
   clearInsuranceOffer(tableId);
   clearPineappleDiscardHold(tableId);   // F16
   drawStartedAtMap.delete(tableId);     // G169
+  dropPendingMuckShows(tableId);        // F21
 }
 
 /** C12 — every minute: a private table with no human seat for PRIVATE_TABLE_IDLE_MS is removed. */
@@ -9158,6 +9235,51 @@ function predictionWindowClosed(tableId: string, handNumber: number, kind: 'mark
 
 // R1 contract #4 — showMuckedHand: one reveal per (table, hand, seat).
 const shownMuckedHands = new Set<string>();
+/**
+ * F21 (2026-10-21) — Show Hand asked for by a FOLDED seat while its hand is
+ * still being played: `tableId:handNumber:seatIndex` → the seat's occupant at
+ * the time. Revealed when that hand ends (flushPendingMuckShows), never during it.
+ */
+const pendingMuckShows = new Map<string, { playerId: string }>();
+/**
+ * F21 — run synchronously from the table's 'handResult' listener (the pot is
+ * awarded, the seats and their cards are still there; the next hand deals
+ * later): every show queued for THIS hand whose seat is still held by the same
+ * occupant (with its cards) and not already shown is revealed to the room —
+ * the same `muckedHandRevealed` frame as an end-of-hand show. Entries of other
+ * hands of this table are dropped. Returns how many were revealed.
+ */
+function flushPendingMuckShows(tableId: string, table: PokerTable): number {
+  let revealed = 0;
+  const prefix = `${tableId}:`;
+  for (const [key, q] of [...pendingMuckShows]) {
+    if (!key.startsWith(prefix)) continue;
+    pendingMuckShows.delete(key);
+    const [handStr, seatStr] = key.slice(prefix.length).split(':');
+    const seatIndex = Number(seatStr);
+    if (Number(handStr) !== table.handNumber) continue;
+    const seat = table.seats[seatIndex];
+    if (!seat || seat.state !== 'occupied' || seat.isAI || String(seat.playerId) !== q.playerId || seat.holeCards.length === 0) continue;
+    if (shownMuckedHands.has(key)) continue;
+    if (shownMuckedHands.size >= 10_000) shownMuckedHands.clear();
+    shownMuckedHands.add(key);
+    io.to(`table:${tableId}`).emit('muckedHandRevealed', {
+      playerName: seat.playerName,
+      seatIndex,
+      tableId,
+      handNumber: table.handNumber,
+      cards: seat.holeCards.map((c) => ({ suit: c.suit, rank: c.rank, display: cardToString(c) })),
+      timestamp: Date.now(),
+    });
+    revealed++;
+  }
+  return revealed;
+}
+/** F21 — a table that goes away drops its queued shows. */
+function dropPendingMuckShows(tableId: string): void {
+  const prefix = `${tableId}:`;
+  for (const key of [...pendingMuckShows.keys()]) if (key.startsWith(prefix)) pendingMuckShows.delete(key);
+}
 
 /**
  * R1 (2026-10-11, ECON-19) — wallet chips the account has OUT ON TABLES right
@@ -9872,13 +9994,11 @@ io.on('connection', (socket: Socket) => {
   // (delta compression means the next delta may not repaint everything). The
   // client emits this on visibilitychange->visible to snap straight to the live
   // hand. force=true sends a complete frame, not a delta. Read-only + per-socket.
-  socket.on('requestState', () => {
+  // F155 (2026-10-21) — `{ tableId?, wasSeated? }` (it took no payload; a bare
+  // requestState is answered exactly as before), answered by resyncTableView.
+  socket.on('requestState', (data?: { tableId?: string; wasSeated?: boolean }) => {
     try {
-      const session = playerSessions.get(socket.id);
-      if (!session) return;
-      const table = tableManager.getTable(session.tableId);
-      if (!table) return;
-      emitGameState(socket, getGameStateForPlayer(table, session.seatIndex), true);
+      resyncTableView(data, 'requestState');
     } catch { /* best-effort resync */ }
   });
 
@@ -11011,6 +11131,10 @@ Give feedback in this JSON format:
       // falsy, so its proven reconnect behavior is unchanged.
       // 2026-10-07 — set when the seat-restore play gate refuses (see (a2)).
       let seatRestoreRefusal: PlayRefusal | null = null;
+      // G183 (2026-10-21) — a dead tournament reservation (b) dropped: told after loginResult.
+      let deadTournamentSeat: DeadTournamentReservation | undefined;
+      // F77 (2026-10-21) — a Multi-Table View socket (skipSeatRecovery) is SECONDARY.
+      if (data?.skipSeatRecovery) oauthSession.secondary = true;
       if (!data?.skipSeatRecovery) try {
         // (a) 2026-10-11 (.online R1 review, R1REV-1 — P1 chip theft): the old
         // post-restart "orphan-seat recovery (name)" matched ANY occupied human seat
@@ -11064,43 +11188,21 @@ Give feedback in this JSON format:
         // (b) Restore the reserved seat (the normal reconnect path). P-b (S2
         // fixed protocol): never a VOLUNTARY tournament reservation — he left
         // that seat on purpose; it is left intact and he is TOLD instead
-        // (tellKeptTournamentSeats after loginResult).
-        const reserved = reservedSeats.get(userId);
-        if (!seatRestoreRefusal && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {
-          const rTable = tableManager.getTable(reserved.tableId);
-          const rSeat = rTable?.seats?.[reserved.seatIndex];
-          if (rTable && rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
-            if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
-            reservedSeats.delete(userId);
-            // Guarantee EXACTLY ONE seat: clear any OTHER seats this user holds
-            // on this table (sessions + name-matched orphans) before claiming the
-            // restored one. Kills the "two of me" duplicate; stacks are credited
-            // back to the wallet inside clearGhostSeatsForUser.
-            clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex);
-            detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'oauthLogin');   // P-g (round 5)
-            playerSessions.set(socket.id, {
-              socketId: socket.id, tableId: reserved.tableId, seatIndex: reserved.seatIndex,
-              playerName: reserved.playerName, playerId: `user_${userId}`, seatPlayerId: rSeat.playerId,   // R3 (live P1)
-              trainingEnabled: false, sittingOut: false, avatar: reserved.avatar,
-            } as PlayerSession);
-            socket.join(`table:${reserved.tableId}`);
-            const tracker = sitOutTracker.get(reserved.tableId);
-            if (tracker) tracker.delete(reserved.seatIndex);
-            syncSitOutToTable(reserved.tableId);
-            if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
-            // P-b — a tournament reservation says which tournament (+tournamentId).
-            socket.emit('reconnectedToTable', { tableId: reserved.tableId, seatIndex: reserved.seatIndex, ...reconnectTournamentFields(reserved) });
-            restoreFastModeOnSeatRestore(socket, reserved);   // R3 (K1-6) — his fast mode survives the restore; the client is told
-            emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
-            broadcastGameState(reserved.tableId);
-            console.log(`[OAuth Reserve] user ${userId} reconnected to seat ${reserved.seatIndex}`);
-          } else {
-            reservedSeats.delete(userId);
-          }
+        // (tellKeptTournamentSeats after loginResult). 2026-10-21 (gameplay
+        // S6) — THE shared restore (restoreSeatReservation): F87 keeps a cash
+        // Sit Out, F89 drops a gone seat's reservation with its timer, G183
+        // never restores a dead tournament seat (told after loginResult).
+        if (!seatRestoreRefusal) {
+          const restore = restoreSeatReservation(socket, userId, 'oauthLogin', { clearGhosts: true });
+          deadTournamentSeat = restore.dead;
         }
         // (c) S2 / M5 (2026-10-10) — no seat restored above: his ABSENT live
         // tournament seat, found by ACCOUNT (gated by (a2) above; synchronous).
         if (!seatRestoreRefusal) restoreAbsentTournamentSeat(socket, oauthSession, 'oauthLogin');
+        // F80 (2026-10-21) — still unseated while ANOTHER socket of this
+        // account plays his seat (a half-open reconnect): claim it for when
+        // that socket is reaped.
+        if (!seatRestoreRefusal) noteHeldSeatClaim(socket, userId, 'oauthLogin');
       } catch (e: any) {
         console.warn(`[OAuth seat-recovery] user ${userId}:`, e?.message);
       }
@@ -11117,6 +11219,7 @@ Give feedback in this JSON format:
       // 2026-10-07 — the sign-in succeeded; only the seat restore was refused.
       // Sent after loginResult so the client is signed in when it lands (C5).
       if (seatRestoreRefusal) emitPlayRefusal(socket, seatRestoreRefusal);
+      tellDeadTournamentSeat(socket, oauthSession, deadTournamentSeat);   // G183
       // P-b (S2 fixed protocol) — his VOLUNTARILY left tournament seats were
       // not restored: tell this socket (not a secondary multi-table socket).
       if (!data?.skipSeatRecovery) tellKeptTournamentSeats(socket, oauthSession, 'voluntary', 'oauthLogin');
@@ -11390,70 +11493,13 @@ Give feedback in this JSON format:
 
           // Check for reserved seat (same reconnection logic as legacy). P-b:
           // never a VOLUNTARY tournament reservation (left intact; told below).
-          const reserved = reservedSeats.get(userId);
-          if (!tlSeatRestoreRefusal && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {
-            const table = tableManager.getTable(reserved.tableId);
-            if (table) {
-              const seat = table.seats[reserved.seatIndex];
-              if (seat && seat.state === 'occupied' && !seat.isAI) {
-                if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
-                reservedSeats.delete(userId);
-                const restoredSession: PlayerSession = {
-                  socketId: socket.id,
-                  tableId: reserved.tableId,
-                  seatIndex: reserved.seatIndex,
-                  playerName: reserved.playerName,
-                  playerId: `user_${userId}`, seatPlayerId: seat.playerId,   // R3 (live P1)
-                  trainingEnabled: false,
-                  sittingOut: false,
-                  avatar: reserved.avatar,
-                };
-                detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'tokenLogin');   // P-g (round 5)
-                playerSessions.set(socket.id, restoredSession);
-                socket.join(`table:${reserved.tableId}`);
-                // MISSED-BLINDS FIX: on reconnect, remove seat from
-                // sit-out set AND push the fresh set to the table so
-                // markSittingOutBlinds on next hand doesn't re-mark.
-                // Also clear any dead-blind debt that accumulated during
-                // the brief disconnect — the user didn't intentionally
-                // sit out; their socket just blipped (PWA background,
-                // WiFi hiccup). If they meant to sit out they'd use the
-                // explicit Sit Out button.
-                const tracker = sitOutTracker.get(reserved.tableId);
-                if (tracker) tracker.delete(reserved.seatIndex);
-                syncSitOutToTable(reserved.tableId);
-                const reSeat = table.seats[reserved.seatIndex];
-                // 2026-06-11 audit E5: only forgive dead-blind debt for a
-                // genuine connectivity blip. If the player was SITTING OUT when
-                // they dropped, they legitimately owe the accrued dead blinds —
-                // preserve them so a drop+reconnect can't dodge owed blinds.
-                if (reSeat && !reserved.sittingOut) {
-                  reSeat.deadBlindOwedChips = 0;
-                  reSeat.missedBlind = 'none';
-                }
-                socket.emit('reconnectedToTable', {
-                  tableId: reserved.tableId,
-                  seatIndex: reserved.seatIndex,
-                  ...reconnectTournamentFields(reserved),   // P-b: + tournamentId for a tournament seat
-                });
-                restoreFastModeOnSeatRestore(socket, reserved);   // R3 (K1-6) — his fast mode survives the restore; the client is told
-                // Send a FORCED full state to the reconnecting socket so they
-                // get hole cards + current phase + turn info immediately, not
-                // wait for the next delta. `broadcastGameState` alone uses
-                // delta compression and can send an empty frame if nothing
-                // changed during the disconnect window.
-                const rTable = tableManager.getTable(reserved.tableId);
-                if (rTable) {
-                  emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
-                }
-                broadcastGameState(reserved.tableId);
-                console.log(`[OAuth Reserve] User ${userId} reconnected to seat ${reserved.seatIndex}`);
-              } else {
-                reservedSeats.delete(userId);
-              }
-            } else {
-              reservedSeats.delete(userId);
-            }
+          // 2026-10-21 (gameplay S6) — THE shared restore (restoreSeatReservation,
+          // see oauthLogin (b)); tokenLogin never cleared ghost seats — still not.
+          // A FORCED full state goes to the reconnecting socket (hole cards,
+          // phase, turn — broadcastGameState alone is a delta).
+          let tlDeadTournamentSeat: DeadTournamentReservation | undefined;
+          if (!tlSeatRestoreRefusal) {
+            tlDeadTournamentSeat = restoreSeatReservation(socket, userId, 'tokenLogin', { clearGhosts: false }).dead;
           }
           // S2 / M5 (2026-10-10) — no seat restored above: his ABSENT live
           // tournament seat, found by ACCOUNT (gated above; synchronous).
@@ -11461,6 +11507,7 @@ Give feedback in this JSON format:
             try { restoreAbsentTournamentSeat(socket, tlSession, 'tokenLogin'); } catch (e: any) {
               console.warn(`[tokenLogin tournament-seat recovery] user ${userId}:`, e?.message);
             }
+            noteHeldSeatClaim(socket, userId, 'tokenLogin');   // F80 (2026-10-21)
           }
 
           socket.emit('loginResult', {
@@ -11469,6 +11516,7 @@ Give feedback in this JSON format:
             ...(tlRequestId ? { requestId: tlRequestId } : {}),
           });
           if (tlSeatRestoreRefusal) emitPlayRefusal(socket, tlSeatRestoreRefusal); // 2026-10-07
+          tellDeadTournamentSeat(socket, tlSession, tlDeadTournamentSeat);   // G183
           tellKeptTournamentSeats(socket, tlSession, 'voluntary', 'tokenLogin'); // P-b (S2 fixed protocol)
           hydrateAndPushProgress(socket, progress.userData.id, progress.userData.username).catch(() => {});
           return;
@@ -11478,6 +11526,7 @@ Give feedback in this JSON format:
       // Legacy HS256 JWT fallback
       const result = await getUserFromToken(data.token);
       let legacySeatRestoreRefusal: PlayRefusal | null = null;
+      let legacyDeadTournamentSeat: DeadTournamentReservation | undefined;   // G183 (2026-10-21)
       if (result.success && result.userData) {
         const userId = result.userData.id;
         // U1 — the socket dropped during the awaits above: no session, no restore.
@@ -11505,70 +11554,11 @@ Give feedback in this JSON format:
 
         // Check for a reserved seat and restore it. P-b: never a VOLUNTARY
         // tournament reservation (left intact; told after loginResult).
-        const reserved = reservedSeats.get(userId);
-        if (!legacySeatRestoreRefusal && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {
-          const table = tableManager.getTable(reserved.tableId);
-          if (table) {
-            const seat = table.seats[reserved.seatIndex];
-            // Seat still belongs to this player (state occupied, not AI)
-            if (seat && seat.state === 'occupied' && !seat.isAI) {
-              if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
-              reservedSeats.delete(userId);
-
-              // Re-associate socket with the session
-              const restoredSession: PlayerSession = {
-                socketId: socket.id,
-                tableId: reserved.tableId,
-                seatIndex: reserved.seatIndex,
-                playerName: reserved.playerName,
-                playerId: `user_${userId}`, seatPlayerId: seat.playerId,   // R3 (live P1)
-                trainingEnabled: false,
-                sittingOut: reserved.sittingOut,
-                avatar: reserved.avatar,
-              };
-              detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'tokenLogin_legacy');   // P-g (round 5)
-              playerSessions.set(socket.id, restoredSession);
-              socket.join(`table:${reserved.tableId}`);
-
-              // Remove from sit-out if they were marked out during disconnect
-              // (they'll sit back in since they reconnected). MUST mirror the
-              // OAuth reconnect path (line ~2866): clear the tracker entry,
-              // sync the change into the PokerTable's _sittingOutSeats set,
-              // AND zero out any dead-blind debt that accumulated during the
-              // brief disconnect. Without this, a PWA backgrounding blip on
-              // the legacy tokenLogin path left the user flagged + billed.
-              restoredSession.sittingOut = false;
-              const tracker = sitOutTracker.get(reserved.tableId);
-              if (tracker) tracker.delete(reserved.seatIndex);
-              syncSitOutToTable(reserved.tableId);
-              const reSeatLegacy = table.seats[reserved.seatIndex];
-              // E5: preserve owed dead blinds if they were sitting out (no dodge).
-              if (reSeatLegacy && !reserved.sittingOut) {
-                reSeatLegacy.deadBlindOwedChips = 0;
-                reSeatLegacy.missedBlind = 'none';
-              }
-
-              socket.emit('reconnectedToTable', {
-                tableId: reserved.tableId,
-                seatIndex: reserved.seatIndex,
-                ...reconnectTournamentFields(reserved),   // P-b: + tournamentId for a tournament seat
-              });
-              restoreFastModeOnSeatRestore(socket, reserved);   // R3 (K1-6) — his fast mode survives the restore; the client is told
-
-              // Forced full state to the reconnecting socket — see the OAuth
-              // branch above for rationale.
-              const rTable2 = tableManager.getTable(reserved.tableId);
-              if (rTable2) {
-                emitGameState(socket, getGameStateForPlayer(rTable2, reserved.seatIndex), true);
-              }
-              broadcastGameState(reserved.tableId);
-              console.log(`[Reserve] User ${userId} (${reserved.playerName}) reconnected to seat ${reserved.seatIndex}`);
-            } else {
-              reservedSeats.delete(userId);
-            }
-          } else {
-            reservedSeats.delete(userId);
-          }
+        // 2026-10-21 (gameplay S6) — THE shared restore (restoreSeatReservation,
+        // see oauthLogin (b)): F87 — a cash seat he SAT OUT stays sitting out
+        // (this branch used to restore reserved.sittingOut, then force it off).
+        if (!legacySeatRestoreRefusal) {
+          legacyDeadTournamentSeat = restoreSeatReservation(socket, userId, 'tokenLogin_legacy', { clearGhosts: false }).dead;
         }
         // S2 / M5 (2026-10-10) — no seat restored above: his ABSENT live
         // tournament seat, found by ACCOUNT (gated above; synchronous).
@@ -11576,6 +11566,7 @@ Give feedback in this JSON format:
           try { restoreAbsentTournamentSeat(socket, legacySession, 'tokenLogin_legacy'); } catch (e: any) {
             console.warn(`[tokenLogin_legacy tournament-seat recovery] user ${userId}:`, e?.message);
           }
+          noteHeldSeatClaim(socket, userId, 'tokenLogin_legacy');   // F80 (2026-10-21)
         }
       }
       // 2026-08-17 — THE cross-talk emitter. A stale `poker_auth_token` in a
@@ -11600,6 +11591,7 @@ Give feedback in this JSON format:
         // P-b (S2 fixed protocol) — his voluntarily left tournament seats: told, not restored.
         const legacyAuthNow = authSessions.get(socket.id);
         if (legacyAuthNow && result.userData && legacyAuthNow.userId === result.userData.id) {
+          tellDeadTournamentSeat(socket, legacyAuthNow, legacyDeadTournamentSeat);   // G183
           tellKeptTournamentSeats(socket, legacyAuthNow, 'voluntary', 'tokenLogin_legacy');
         }
       } else {
@@ -13450,6 +13442,35 @@ Give feedback in this JSON format:
         }
       }
 
+      // 2026-10-21 (gameplay F82) — a REJOIN: this socket has no seat and its
+      // account holds a live (non-voluntary) reservation at THIS table — the
+      // Multi-Table View's socket rejoining its table after a blip, or the
+      // player joining back from the lobby. The reserved seat is restored onto
+      // this socket exactly as a sign-in restores it (same seat, same stack,
+      // his hand kept; the client's buyIn / seatIndex are ignored, nothing is
+      // deducted). It used to fall through to the ghost-seat clear below, which
+      // FOLDED his live hand, then bought him in again at another seat.
+      {
+        const rjAuth = authSessions.get(socket.id);
+        const rj = rjAuth && !playerSessions.has(socket.id) ? reservedSeats.get(rjAuth.userId) : undefined;
+        const rjSeat = rj ? table.seats[rj.seatIndex] : undefined;
+        if (rjAuth && rj && rjSeat && rj.tableId === tableId && !rj.voluntary && rj.expiresAt > Date.now()
+            && (!(Number.isInteger(seatIndex) && seatIndex >= 0) || seatIndex === rj.seatIndex)
+            && rjSeat.state === 'occupied' && !rjSeat.isAI && rjSeat.playerName === rj.playerName
+            && !seatPlayedByAnotherAccount(rjAuth.userId, tableId, rj.seatIndex)
+            && !seatReservedByOtherAccount(rjAuth.userId, tableId, rj.seatIndex)
+            && !pendingSeatRemovalAfterHand.get(tableId)?.has(rj.seatIndex)
+            && !otherSessionHoldsSeat(socket.id, tableId, rj.seatIndex)) {
+          const rejoin = restoreSeatReservation(socket, rjAuth.userId, 'joinTable', { clearGhosts: true, allowSecondary: true, onlyTableId: tableId });
+          if (rejoin.outcome === 'restored') {
+            seatReservationRestores.joinTableRejoins++;
+            sendProgressToPlayer(socket.id);
+            scheduleAIAction(tableId);
+            return;
+          }
+        }
+      }
+
       // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.
       // A socket that did `spectate` → `joinTable` would remain in the
       // `spectators` Map AND get added to `playerSessions`. The next
@@ -14892,6 +14913,9 @@ Give feedback in this JSON format:
         // the disconnect handler). D1: NO display-name orphan scan here (unlike
         // oauthLogin's post-restart scan) — names collide, a userId does not.
         let rsSeatRestoreRefusal: PlayRefusal | null = null;
+        let rsDeadTournamentSeat: DeadTournamentReservation | undefined;   // G183 (2026-10-21)
+        // F77 (2026-10-21) — a Multi-Table View socket (skipSeatRecovery) is SECONDARY.
+        if (data?.skipSeatRecovery) rsSession.secondary = true;
         if (!data?.skipSeatRecovery) try {
           // (a2) The seat-restore play gate: a suspended player is not put
           // back (his seat is stood up, stack credited); no lookup at all when
@@ -14905,40 +14929,17 @@ Give feedback in this JSON format:
           if (loginSessionReplaced(socket, rsSession, 'resumeSession', 'after_seat_restore_gate')) return;
           // (b) Restore the reserved seat. P-b (S2 fixed protocol): never a
           // VOLUNTARY tournament reservation (left intact; told below).
-          const reserved = reservedSeats.get(userId);
-          if (!rsSeatRestoreRefusal && reserved && !reserved.voluntary && reserved.expiresAt > Date.now()) {
-            const rTable = tableManager.getTable(reserved.tableId);
-            const rSeat = rTable?.seats?.[reserved.seatIndex];
-            if (rTable && rSeat && rSeat.state === 'occupied' && !rSeat.isAI) {
-              if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);
-              reservedSeats.delete(userId);
-              // userId-only ghost clearing (no display-name match — D1).
-              clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex);
-              detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'resumeSession');   // P-g (round 5)
-              playerSessions.set(socket.id, {
-                socketId: socket.id, tableId: reserved.tableId, seatIndex: reserved.seatIndex,
-                playerName: reserved.playerName, playerId: `user_${userId}`, seatPlayerId: rSeat.playerId,   // R3 (live P1)
-                trainingEnabled: false, sittingOut: false, avatar: reserved.avatar,
-              } as PlayerSession);
-              socket.join(`table:${reserved.tableId}`);
-              const tracker = sitOutTracker.get(reserved.tableId);
-              if (tracker) tracker.delete(reserved.seatIndex);
-              syncSitOutToTable(reserved.tableId);
-              if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
-              // P-b — + tournamentId for a tournament reservation.
-              socket.emit('reconnectedToTable', { tableId: reserved.tableId, seatIndex: reserved.seatIndex, ...reconnectTournamentFields(reserved) });
-              restoreFastModeOnSeatRestore(socket, reserved);   // R3 (K1-6) — his fast mode survives the restore; the client is told
-              emitGameState(socket, getGameStateForPlayer(rTable, reserved.seatIndex), true);
-              broadcastGameState(reserved.tableId);
-              console.log(`[resumeSession] user ${userId} reconnected to seat ${reserved.seatIndex}`);
-            } else {
-              reservedSeats.delete(userId);
-            }
+          // 2026-10-21 (gameplay S6) — THE shared restore (restoreSeatReservation,
+          // see oauthLogin (b)), with userId-only ghost clearing (D1).
+          if (!rsSeatRestoreRefusal) {
+            rsDeadTournamentSeat = restoreSeatReservation(socket, userId, 'resumeSession', { clearGhosts: true }).dead;
           }
           // (c) S2 / M5 (2026-10-10) — no seat restored above: his ABSENT live
           // tournament seat, found by ACCOUNT (the LOCAL userId / master id —
           // never a display name, D1; gated by (a2) above; synchronous).
           if (!rsSeatRestoreRefusal) restoreAbsentTournamentSeat(socket, rsSession, 'resumeSession');
+          // F80 (2026-10-21) — a half-open reconnect: claim the seat his old socket still holds.
+          if (!rsSeatRestoreRefusal) noteHeldSeatClaim(socket, userId, 'resumeSession');
         } catch (e: any) {
           console.warn(`[resumeSession seat-recovery] user ${userId}:`, e?.message);
         }
@@ -14958,6 +14959,7 @@ Give feedback in this JSON format:
         });
         // The sign-in succeeded; only the seat restore was refused (C5, after loginResult).
         if (rsSeatRestoreRefusal) emitPlayRefusal(socket, rsSeatRestoreRefusal);
+        tellDeadTournamentSeat(socket, rsSession, rsDeadTournamentSeat);   // G183
         // P-b (S2 fixed protocol) — voluntarily left tournament seats: told, not restored.
         if (!data?.skipSeatRecovery) tellKeptTournamentSeats(socket, rsSession, 'voluntary', 'resumeSession');
         hydrateAndPushProgress(socket, userId, row.username).catch(() => {});
@@ -15644,14 +15646,9 @@ Give feedback in this JSON format:
   // reconnect/app-resume so the player immediately sees the current
   // table state (phase, turn, community cards, chips) instead of
   // whatever stale gameState was last in their store.
-  socket.on('syncTableState', (data: { tableId?: string } = {}) => {
-    const session = playerSessions.get(socket.id);
-    const tableId = session?.tableId || data?.tableId;
-    if (!tableId) return;
-    const table = tableManager.getTable(tableId);
-    if (!table) return;
-    const state = getGameStateForPlayer(table, session?.seatIndex ?? -1, session?.trainingEnabled || false);
-    emitGameState(socket, state, true);
+  // F155 (2026-10-21) — `{ tableId?, wasSeated? }`, answered by resyncTableView.
+  socket.on('syncTableState', (data: { tableId?: string; wasSeated?: boolean } = {}) => {
+    resyncTableView(data, 'syncTableState');
   });
 
   // F156 (2026-10-21) — `{ amount?, tableId? }`: the top-up is for the seat at
@@ -15801,6 +15798,13 @@ Give feedback in this JSON format:
       }
       const table = tableManager.getTable(session.tableId);
       if (!table) { socket.emit('error', { message: 'Table not found' }); return; }
+      // 2026-10-21 (gameplay G182) — a seat past this table's cap (a variant's
+      // deck cap, a heads-up / club / private table's maxSeats) does not exist:
+      // the move used to be queued and could never happen (sitDown refuses it).
+      if (targetSeat >= Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS)) {
+        socket.emit('error', { message: 'Invalid target seat', code: 'invalid_target_seat' });
+        return;
+      }
 
       // Gate: cash tables only. Tournament table seat assignment is owned
       // by TournamentManager (rebalance logic); allowing self-serve seat
@@ -15813,7 +15817,7 @@ Give feedback in this JSON format:
       if (targetSeat === session.seatIndex) {
         // Same seat — treat as a cancel of any pending move.
         delete session.pendingSeatIndex;
-        socket.emit('moveSeatCancelled', { tableId: session.tableId });
+        socket.emit('moveSeatCancelled', { tableId: session.tableId, reason: 'same_seat' });
         broadcastGameState(session.tableId);
         return;
       }
@@ -15850,13 +15854,19 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('cancelMoveSeat', () => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
-    if (session.pendingSeatIndex == null) return;
-    delete session.pendingSeatIndex;
-    socket.emit('moveSeatCancelled', { tableId: session.tableId });
-    console.log(`[MoveSeat] ${session.playerName} cancelled pending move on ${session.tableId}`);
+  // 2026-10-21 (gameplay G182 / F78) — `{ tableId? }` (the seat at that table —
+  // seatSessionFor, an extra multi-table seat too), and ALWAYS answered
+  // `moveSeatCancelled { tableId, reason: 'cancelled' }` (idempotent): a Cancel
+  // for a move the server had already dropped (or never had) was answered with
+  // nothing, so the client's "Moving to seat N" pill could never be dismissed.
+  socket.on('cancelMoveSeat', (data: { tableId?: string } = {}) => {
+    const requested = typeof data?.tableId === 'string' && data.tableId ? data.tableId : null;
+    const session = seatSessionFor(requested ?? undefined);
+    if (session && session.pendingSeatIndex != null) {
+      delete session.pendingSeatIndex;
+      console.log(`[MoveSeat] ${session.playerName} cancelled pending move on ${session.tableId}`);
+    }
+    socket.emit('moveSeatCancelled', { tableId: session?.tableId ?? requested ?? null, reason: 'cancelled' });
   });
 
   // F156 (2026-10-21) — `{ tableId? }`: deal at THAT table (an extra
@@ -16662,12 +16672,24 @@ Give feedback in this JSON format:
   // folded his live hand; an auto-rebuy topped up the wrong seat). Replies name
   // the table acted on (`tableId`). Refusal: notSeatedThere (next to seatSessionFor).
 
-  socket.on('sitOut', async (data: { tableId?: string } = {}) => {
+  // F87 (2026-10-21) — `{ tableId?, sittingOut? }`: a boolean `sittingOut` SETS
+  // the state (the client's remembered Sit Out replayed after a reload / a
+  // restore can no longer toggle a seat the server already sat out back IN);
+  // without it the request TOGGLES as before. Asking for the state he is
+  // already in changes nothing: `sitOutToggled { sittingOut, reason:
+  // 'unchanged', tableId }`.
+  socket.on('sitOut', async (data: { tableId?: string; sittingOut?: boolean } = {}) => {
     const session = seatSessionFor(data?.tableId);
     if (!session) { notSeatedThere(data?.tableId); return; }
 
-    session.sittingOut = !session.sittingOut;
+    const want = typeof data?.sittingOut === 'boolean' ? data.sittingOut : !session.sittingOut;
+    if (want === !!session.sittingOut) {
+      socket.emit('sitOutToggled', { sittingOut: !!session.sittingOut, reason: 'unchanged', tableId: session.tableId });
+      return;
+    }
+    session.sittingOut = want;
     socket.emit('sitOutToggled', { sittingOut: session.sittingOut, tableId: session.tableId });
+    let broadcastDone = false;   // G181 — one broadcast for the AWAY badge (skipped when the turn fold below sent one)
 
     // Track sit-out for missed blinds (#16)
     if (session.sittingOut) {
@@ -16704,17 +16726,21 @@ Give feedback in this JSON format:
         // for like any sitting-out seat's.
         if ((table as FiveCardDrawTable).playerDraw(session.seatIndex, [])) {
           broadcastGameState(session.tableId);
+          broadcastDone = true;
           scheduleAIAction(session.tableId);
         }
       } else if (table && table.activeSeatIndex === session.seatIndex) {
         if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);
         else table.playerFold(session.seatIndex);
         broadcastGameState(session.tableId);
+        broadcastDone = true;
         // 2026-10-10 — hand the turn on: the next bot acts now, not after its 30s
         // turn timer (the watchdog no longer cuts a live clock short).
         scheduleAIAction(session.tableId);
       }
     }
+    // G181 (2026-10-21) — every seat's `sittingOut` changed: the table sees the AWAY badge now.
+    if (!broadcastDone) broadcastGameState(session.tableId);
   });
 
   // ========== AFK Handler ==========
@@ -16723,6 +16749,7 @@ Give feedback in this JSON format:
     const session = seatSessionFor(data?.tableId);
     if (!session) return;
 
+    const changed = !session.sittingOut;   // G181 (2026-10-21)
     session.sittingOut = true;
     if (!sitOutTracker.has(session.tableId)) sitOutTracker.set(session.tableId, new Set());
     sitOutTracker.get(session.tableId)!.add(session.seatIndex);
@@ -16732,25 +16759,31 @@ Give feedback in this JSON format:
 
     // Auto-fold if it's currently their turn (P-j: a tournament seat is acted
     // for as ABSENT — check, or fold).
+    let broadcastDone = false;
     const table = tableManager.getTable(session.tableId);
     if (table && DrawPhases.includes(table.currentPhase)) {
       // F29 (2026-10-21) — as 'sitOut': in a draw round stand pat, never fold.
       if ((table as FiveCardDrawTable).playerDraw(session.seatIndex, [])) {
         broadcastGameState(session.tableId);
+        broadcastDone = true;
         scheduleAIAction(session.tableId);
       }
     } else if (table && table.activeSeatIndex === session.seatIndex) {
       if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);
       else table.playerFold(session.seatIndex);
       broadcastGameState(session.tableId);
+      broadcastDone = true;
       scheduleAIAction(session.tableId); // 2026-10-10 — the next bot acts now
     }
+    // G181 — the seat's AWAY badge reaches the table now.
+    if (changed && !broadcastDone) broadcastGameState(session.tableId);
   });
 
   socket.on('playerBack', async (data: { tableId?: string } = {}) => {
     const session = seatSessionFor(data?.tableId);   // F156 — silent on an unknown table
     if (!session) return;
 
+    const changed = !!session.sittingOut;   // G181 (2026-10-21)
     session.sittingOut = false;
     const tracker = sitOutTracker.get(session.tableId);
     if (tracker) tracker.delete(session.seatIndex);
@@ -16764,6 +16797,7 @@ Give feedback in this JSON format:
     syncSitOutToTable(session.tableId);
 
     socket.emit('sitOutToggled', { sittingOut: false, reason: 'back', tableId: session.tableId });
+    if (changed) broadcastGameState(session.tableId);   // G181 — the AWAY badge goes now
   });
 
   // ========== Fast Mode (#12) ==========
@@ -16845,16 +16879,36 @@ Give feedback in this JSON format:
   // every client at the table). Allowed for a player who FOLDED this hand, or
   // for the UNCONTESTED winner once the hand is over (a contested showdown
   // already tabled his cards). Once per seat per hand; nothing for spectators
-  // or bots. Payload: `{ tableId? }` (any `cards` are ignored).
+  // or bots. Payload: `{ tableId?, handNumber? }` (any `cards` are ignored).
   // `muckedHandRevealed { playerName, seatIndex, tableId, handNumber, cards: [{suit, rank, display}], timestamp }`.
-  socket.on('showMuckedHand', async (data: { tableId?: string; cards?: unknown } = {}) => {
+  // 2026-10-21 (gameplay F21) — a FOLDED seat's cards are shown only once the
+  // hand is OVER (HandComplete / Showdown): asked for while the others are
+  // still betting, the show is QUEUED (pendingMuckShows), answered to the
+  // requester alone with `muckedHandShowQueued { tableId, handNumber,
+  // seatIndex }`, and revealed to the room when the hand ends
+  // (flushPendingMuckShows, from the 'handResult' listener). It used to be
+  // broadcast at once — live card-removal information for the players still in
+  // the pot (TDA: no disclosure while action is pending). A `handNumber` that is
+  // not the table's current hand is ignored (a stale tap).
+  socket.on('showMuckedHand', async (data: { tableId?: string; handNumber?: number; cards?: unknown } = {}) => {
     const session = seatSessionFor(data?.tableId);   // F156 (2026-10-21) — the one resolver; silent when not seated there
     if (!session) return;
     const table = tableManager.getTable(session.tableId);
     if (!table) return;
+    if (Number.isInteger(data?.handNumber) && data.handNumber !== table.handNumber) return;   // F21 — another hand's tap
     const seat = table.seats[session.seatIndex];
     if (!seat || seat.state !== 'occupied' || seat.isAI || seat.holeCards.length === 0) return;
     const handOver = table.currentPhase === GamePhase.HandComplete || table.currentPhase === GamePhase.Showdown;
+    if (!handOver) {
+      // F21 — a folded seat mid-hand: queued, never broadcast now.
+      if (!seat.folded) return;
+      const queuedKey = `${session.tableId}:${table.handNumber}:${session.seatIndex}`;
+      if (shownMuckedHands.has(queuedKey)) return;
+      if (pendingMuckShows.size >= 10_000) pendingMuckShows.clear();
+      pendingMuckShows.set(queuedKey, { playerId: String(seat.playerId) });
+      socket.emit('muckedHandShowQueued', { tableId: session.tableId, handNumber: table.handNumber, seatIndex: session.seatIndex });
+      return;
+    }
     const uncontestedWinner = handOver && !seat.folded && !table.wentToShowdown
       && !!table.lastHandResult && table.lastHandResult.handNumber === table.handNumber
       && table.lastHandResult.winners.some((w) => w.seatIndex === session.seatIndex);
@@ -17746,6 +17800,68 @@ Give feedback in this JSON format:
     socket.emit('error', { message: 'You are not seated at that table.', code: 'not_at_table', tableId });
     return true;
   };
+  // F155 (2026-10-21) — THE resync answer of 'syncTableState' (after a
+  // reconnect's sign-in) and 'requestState' (tab visible again / error
+  // boundary), payload `{ tableId?, wasSeated? }` (both optional):
+  //   1. a seat at the named table (main or extra — seatSessionFor; none named =
+  //      the main seat): its full state (the main one as the delta baseline, an
+  //      extra one as a RAW full snapshot — never the main baseline);
+  //   2. a socket holding ANY seat that names a table it has no seat at: its
+  //      MAIN seat, as before — a seated socket is never made a spectator;
+  //   3. no seat and no table named: nothing (as before);
+  //   4. the named table is GONE (a redeploy: table ids are new every boot):
+  //      `tableClosed { tableId, reason: 'table_gone' }` — the view used to stay
+  //      frozen on the dead table, buttons live, every tap 'Not at a table';
+  //   5. the named table exists: the socket WATCHES it (the 'spectate' handler
+  //      minus its leave): spectators set + room + `isSpectator` full state +
+  //      'spectating'. It used to get one seat -1 snapshot with no room and no
+  //      further frames (a frozen table after a long phone sleep or any
+  //      spectator's reconnect). When the client says it WAS seated
+  //      (`wasSeated: true`) and its signed-in account has no reservation and
+  //      no seat there any more: `seatReleased { tableId, reason:
+  //      'seat_released' }` (a notice only — his chips were credited when the
+  //      reservation ended).
+  const resyncTableView = (data: { tableId?: unknown; wasSeated?: unknown } | undefined, via: string): void => {
+    const wanted = typeof data?.tableId === 'string' && data.tableId ? data.tableId : undefined;
+    const main = playerSessions.get(socket.id);
+    const hasExtra = (multiTableSessions.get(socket.id) || []).some((s) => !!s);
+    let session = seatSessionFor(wanted);
+    if (!session && (main || hasExtra)) session = main;
+    if (session) {
+      const table = tableManager.getTable(session.tableId);
+      if (!table) return;
+      const state: any = getGameStateForPlayer(table, session.seatIndex, session.trainingEnabled || false);
+      state.sittingOut = session.sittingOut || false;
+      state.fastMode = session.fastMode === true;
+      if (session === main) emitGameState(socket, state, true);
+      else socket.emit('gameState', { full: true, state, _serverTs: Date.now() });
+      return;
+    }
+    if (main || hasExtra || !wanted) return;
+    const table = tableManager.getTable(wanted);
+    if (!table) {
+      socket.emit('tableClosed', { tableId: wanted, reason: 'table_gone' });
+      return;
+    }
+    detachSocketFromOtherTables(socket, wanted, 'spectate', via);
+    if (!spectators.has(wanted)) spectators.set(wanted, new Set());
+    spectators.get(wanted)!.add(socket.id);
+    socket.join(`table:${wanted}`);
+    const spectatorState: any = getGameStateForPlayer(table, -1, false);
+    spectatorState.isSpectator = true;
+    spectatorState.spectatorCount = spectators.get(wanted)!.size;
+    emitGameState(socket, spectatorState, true);
+    socket.emit('spectating', { tableId: wanted, tableName: table.config.tableName });
+    const auth = authSessions.get(socket.id);
+    if (data?.wasSeated === true && auth) {
+      const r = reservedSeats.get(auth.userId);
+      const held = !!r && r.tableId === wanted && r.expiresAt > Date.now();
+      const mine = (sid: string) => authSessions.get(sid)?.userId === auth.userId;
+      const accountSeated = [...playerSessions].some(([sid, s]) => s.tableId === wanted && mine(sid))
+        || [...multiTableSessions].some(([sid, list]) => mine(sid) && Array.isArray(list) && list.some((s) => s && s.tableId === wanted));
+      if (!held && !accountSeated) socket.emit('seatReleased', { tableId: wanted, reason: 'seat_released' });
+    }
+  };
   const insuranceSessionFor = (tableId: unknown): PlayerSession | undefined => seatSessionFor(tableId);
   socket.on('acceptInsurance', (data: { tableId?: string; handNumber?: number } = {}) => {
     const refuse = (code: string, message: string): void => {
@@ -18435,7 +18551,8 @@ Give feedback in this JSON format:
         tournamentSeatKeep.returnAlreadyThere++;
         detachSocketFromOtherTables(socket, own.tableId, 'seat', 'returnToTournamentSeat');   // P-g
         socket.join(`table:${own.tableId}`);
-        socket.emit('reconnectedToTable', { tableId: own.tableId, seatIndex: own.seatIndex, tournamentId: ownTournamentId });
+        // F87 (2026-10-21) — + sittingOut (the client takes the server's value instead of replaying its own).
+        socket.emit('reconnectedToTable', { tableId: own.tableId, seatIndex: own.seatIndex, tournamentId: ownTournamentId, sittingOut: own.sittingOut === true });
         emitGameState(socket, getGameStateForPlayer(ownTable!, own.seatIndex, own.trainingEnabled), true);
         answer({ success: true, tournamentId: ownTournamentId, tableId: own.tableId, seatIndex: own.seatIndex });
         return;
@@ -18790,6 +18907,15 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
 
     const authSession = authSessions.get(socket.id);
     const session = playerSessions.get(socket.id);
+    // F80 (2026-10-21) — this socket's own pending seat claim ends with it.
+    dropPendingSeatClaimsOf(socket.id);
+    // G189 (2026-10-21) — this socket's queued seat moves end with it, BEFORE
+    // the save await below: a hand boundary inside that await ran the move on
+    // the dead socket's session (stand up, sit at the target), the seat captured
+    // below was no longer his and nothing was reserved — the moved seat was
+    // blinded with no reservation and no cash-out.
+    if (session) delete session.pendingSeatIndex;
+    for (const ms of multiTableSessions.get(socket.id) || []) if (ms) delete ms.pendingSeatIndex;
 
     // Auto-save progress on disconnect
     if (authSession && session) {
@@ -18861,7 +18987,7 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
             return;
           }
 
-          reserveSeatForDeparture(authSession, session, table, seat);
+          const reservedNow = reserveSeatForDeparture(authSession, session, table, seat);
 
           // 2026-06-11 audit E4 — see cashOutAdditionalSeatsOnDeparture.
           cashOutAdditionalSeatsOnDeparture(socket, authSession, 'additional_table_disconnect');
@@ -18870,6 +18996,11 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
           playerSessions.delete(socket.id);
           authSessions.delete(socket.id);
           lastSentState.delete(socket.id); lastSentJson.delete(socket.id);
+          // F80 (2026-10-21) — the account is ALREADY back on another socket
+          // (a half-open reconnect: the new socket signed in while this one was
+          // still held open until its ping timeout, so its sign-in restored
+          // nothing): the reservation just made goes to that socket now.
+          if (reservedNow) adoptReservationByPendingClaim(authSession.userId);
           return;
         }
       }
@@ -18969,7 +19100,7 @@ function releaseSeatedSlot(socketId: string, tableId: string): void {
 }
 
 /** One socket's signed-in account (the values of `authSessions`). */
-type SocketAuthSession = { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null; displayName?: string | null };
+type SocketAuthSession = { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null; displayName?: string | null; secondary?: boolean };
 
 /**
  * The 'disconnect' handler's MAIN-seat reservation, extracted unchanged
@@ -18987,11 +19118,41 @@ function reserveSeatForDeparture(
   // check that hands the action straight back to this seat (heads-up big blind
   // → flop) arms the SHORT absent clock (isAbsentTournamentSeatPastHandLimit
   // reads handsRemaining when the turn timer arms).
-  opts: { handsRemaining?: number; voluntary?: boolean } = {},
-): void {
+  // 2026-10-21 (gameplay F46) — `actNow`: act for the seat NOW when it is his
+  // turn (Z6: check when free, else fold). Only a CHOSEN departure asks for it
+  // (the voluntary tournament keep, an account switch). A dropped socket does
+  // not: the turn clock armed when his turn began acts at its end (autoActForSeat
+  // — check when free, else fold), so a player back within his clock (a reload,
+  // a PWA kill, a network change) still plays his hand. It used to be folded
+  // facing a bet at 0ms of a 30s clock.
+  opts: { handsRemaining?: number; voluntary?: boolean; actNow?: boolean } = {},
+): boolean {
+  // G184 (2026-10-21) — a DEAD tournament seat (busted: a spectator still
+  // bound to it) is nothing to reserve: reserving it displaced the account's
+  // live reservation (a cash seat cashed out and stood up) and the next sign-in
+  // restored the dead seat. The seat stays as the bust flow left it.
+  if (isDeadTournamentSeat(session.tableId, seat)) {
+    console.log(`[Reserve] ${JSON.stringify({ event: 'dead_tournament_seat_not_reserved', userId: authSession.userId, tableId: session.tableId, seatIndex: session.seatIndex })}`);
+    return false;
+  }
   // Reserve the seat for 10 minutes so the player can reconnect
   // Cancel any existing reservation for this user first
   const existing = reservedSeats.get(authSession.userId);
+  // F77 (2026-10-21) — a SECONDARY socket (the Multi-Table View's per-table
+  // socket: it signs in with skipSeatRecovery) never displaces the account's
+  // PRIMARY reservation: one blip that dropped both used to cash out and stand
+  // up the primary table, and the primary's sign-in restored the secondary's
+  // table. Its cash seat is settled like an extra-table seat instead (credited;
+  // a hand in progress with chips in it is kept and credited at the hand's end).
+  if (existing && authSession.secondary && !existing.secondary && !isTournamentTable(session.tableId)
+      && (existing.tableId !== session.tableId || existing.seatIndex !== session.seatIndex)) {
+    teardownSeat(session.tableId, table, session.seatIndex,
+      { userId: authSession.userId, username: authSession.username }, 'secondary_socket_departure', { keepHandOnDeparture: true });
+    broadcastGameState(session.tableId);
+    scheduleAIAction(session.tableId);
+    console.log(`[Reserve] ${JSON.stringify({ event: 'secondary_departure_kept_primary_reservation', userId: authSession.userId, tableId: session.tableId, seatIndex: session.seatIndex, primaryTableId: existing.tableId })}`);
+    return false;
+  }
   if (existing) clearTimeout(existing.cleanupTimer);
   // 2026-10-11 (R2, APPUI-21) — reservedSeats still holds ONE reservation per
   // account (keyed by userId; ~70 readers across the server rely on that). A
@@ -19013,9 +19174,45 @@ function reserveSeatForDeparture(
     }
   }
 
+  // F89 (2026-10-21) — the reservation object is built first so its expiry
+  // timer acts on IT alone: a timer whose reservation was dropped without a
+  // clearTimeout (a sign-in's "table or seat gone" branch, a removed table)
+  // used to end whatever reservation the account held THEN — a cash seat
+  // cashed out and stood up minutes after its own drop.
+  const mine: ReservedSeat = {
+    tableId: session.tableId,
+    seatIndex: session.seatIndex,
+    playerName: session.playerName,
+    chips: seat.chipCount,
+    avatar: session.avatar,
+    sittingOut: session.sittingOut,
+    expiresAt: Date.now() + SEAT_RESERVE_MS,
+    cleanupTimer: undefined as unknown as ReturnType<typeof setTimeout>,
+    handsRemaining: typeof opts.handsRemaining === 'number' ? opts.handsRemaining : DISCONNECT_HANDS_LIMIT,
+    ...(opts.voluntary ? { voluntary: true } : {}),
+    // R3 (S3-2) — the occupant, for the chips-won account of hands he is away for.
+    ...(seat?.playerId ? { playerId: String(seat.playerId) } : {}),
+    // R3 (K1-6) — his fast-mode choice survives the restore (restoreFastModeOnSeatRestore).
+    ...(session.fastMode ? { fastMode: true } : {}),
+    // F87 (2026-10-21) — a sitting-out seat keeps counting toward its 30-hand stand-up after a restore.
+    ...(session.sittingOut && session.sitOutHands ? { sitOutHands: session.sitOutHands } : {}),
+    // F77 — made by a secondary (Multi-Table View) socket: its rejoin (joinTable) restores it, never the primary's sign-in.
+    ...(authSession.secondary ? { secondary: true } : {}),
+    // T1: snapshot — a later table break drops the id from tournamentTables.
+    // F2: and a disconnect IN the break window (session still on the
+    // broken table, id already gone from tournamentTables) is still a
+    // tournament seat — isTournamentTable keeps broken tables.
+    tournament: isTournamentTable(session.tableId),
+    // U2: snapshot — the hand-start gate screens an absent tournament
+    // seat by it (the session is deleted below).
+    ...(authSession.masterUserId
+      ? { masterUserId: String(authSession.masterUserId) }
+      : authSession.statsMasterUserId !== undefined ? { masterUserId: authSession.statsMasterUserId || null } : {}),
+  };
   const cleanupTimer = setTimeout(() => {
     if (shutdownFlushActive()) return;   // R2 — the shutdown flush credits reserved seats (once)
     const reserved = reservedSeats.get(authSession.userId);
+    if (reserved && reserved !== mine) return;   // F89 — another reservation's; never ours to end
     if (reserved) {
       // 2026-10-09 (T1) — a TOURNAMENT seat is never cashed out to the
       // wallet (a mint) and never bare-stood-up (the tournament could
@@ -19036,37 +19233,13 @@ function reserveSeatForDeparture(
       console.log(`[Reserve] Seat reservation expired for user ${authSession.userId} (returned ${chipsToReturn} chips)`);
     }
   }, SEAT_RESERVE_MS);
-
-  reservedSeats.set(authSession.userId, {
-    tableId: session.tableId,
-    seatIndex: session.seatIndex,
-    playerName: session.playerName,
-    chips: seat.chipCount,
-    avatar: session.avatar,
-    sittingOut: session.sittingOut,
-    expiresAt: Date.now() + SEAT_RESERVE_MS,
-    cleanupTimer,
-    handsRemaining: typeof opts.handsRemaining === 'number' ? opts.handsRemaining : DISCONNECT_HANDS_LIMIT,
-    ...(opts.voluntary ? { voluntary: true } : {}),
-    // R3 (S3-2) — the occupant, for the chips-won account of hands he is away for.
-    ...(seat?.playerId ? { playerId: String(seat.playerId) } : {}),
-    // R3 (K1-6) — his fast-mode choice survives the restore (restoreFastModeOnSeatRestore).
-    ...(session.fastMode ? { fastMode: true } : {}),
-    // T1: snapshot — a later table break drops the id from tournamentTables.
-    // F2: and a disconnect IN the break window (session still on the
-    // broken table, id already gone from tournamentTables) is still a
-    // tournament seat — isTournamentTable keeps broken tables.
-    tournament: isTournamentTable(session.tableId),
-    // U2: snapshot — the hand-start gate screens an absent tournament
-    // seat by it (the session is deleted below).
-    ...(authSession.masterUserId
-      ? { masterUserId: String(authSession.masterUserId) }
-      : authSession.statsMasterUserId !== undefined ? { masterUserId: authSession.statsMasterUserId || null } : {}),
-  });
+  mine.cleanupTimer = cleanupTimer;
+  reservedSeats.set(authSession.userId, mine);
 
   // Act for the seat if it's their turn right now (Z6: check when
-  // free, else fold — below). That's the ONLY behavior we need on
-  // disconnect. Previously we ALSO flagged
+  // free, else fold — below) — F46: only for a CHOSEN departure
+  // (opts.actNow); a dropped socket's turn is left to its turn clock.
+  // Previously we ALSO flagged
   // the seat as sitting-out after a 20s timer so future hands'
   // markSittingOutBlinds would charge dead-blind debt — but
   // PWA backgrounding / WiFi handoff / iOS suspend triggered
@@ -19080,7 +19253,7 @@ function reserveSeatForDeparture(
 
   // Round-7 review — never in a draw phase (activeSeatIndex / currentBetToMatch
   // are stale there; every other auto-act path skips draws too).
-  if (table.isHandInProgress() && table.activeSeatIndex === session.seatIndex && !DrawPhases.includes(table.currentPhase)) {
+  if (opts.actNow && table.isHandInProgress() && table.activeSeatIndex === session.seatIndex && !DrawPhases.includes(table.currentPhase)) {
     // Z6 (2026-10-10) — the seat stays in play: CHECK when a check is free,
     // FOLD only when facing a bet (P-i's absent action, without its limp).
     // It used to fold whatever was owed — a big blind with the option, or a
@@ -19095,6 +19268,7 @@ function reserveSeatForDeparture(
   }
 
   console.log(`[Reserve] Seat ${session.seatIndex} on table ${session.tableId} reserved for user ${authSession.userId} (${session.playerName})`);
+  return true;
 }
 
 /**
@@ -19138,6 +19312,209 @@ function cashOutAdditionalSeatsOnDeparture(socket: Socket, authSession: SocketAu
   }
 }
 
+// ===== Seat reservation restore (gameplay S6, 2026-10-21) =====
+/**
+ * G183 / G184 (2026-10-21) — a TOURNAMENT seat that is nobody's live seat any
+ * more: flagged eliminated AND its entrant is out (the bust check ran) or plays
+ * a live seat elsewhere (a qualifier re-entry leaves the old busted seat with
+ * the same playerId), or the tournament / entrant is gone. A seat flagged
+ * eliminated whose bust check is still PENDING (entrant alive, no live seat) is
+ * not dead: that check tells the session sitting on it. A dead seat is never
+ * reserved by a departure (G184) and never restored by a sign-in (G183).
+ * Checked per seat object, never by playerId alone (Q2 re-entry). A cash seat
+ * (0 chips flags `eliminated` until a rebuy) is never "dead".
+ */
+function isDeadTournamentSeat(tableId: string, seat: Seat | undefined, tournamentHint = false): boolean {
+  if (!seat || !seat.eliminated || seat.state !== 'occupied') return false;
+  if (!tournamentHint && !isTournamentTable(tableId)) return false;
+  const tid = tournamentIdOfTable(tableId);
+  const t = tid ? tournamentManager.getTournament(tid) : undefined;
+  if (!tid || !t) return true;
+  const tp = t.players.find((p) => p.playerId === seat.playerId);
+  if (!tp) return true;
+  return !!tp.eliminated || tournamentEntrantHasLiveSeat(tid, tp.playerId);
+}
+
+/** A dead tournament reservation a restore dropped (G183): what to tell the player. */
+interface DeadTournamentReservation { tableId: string; tournamentId?: string; playerId?: string; playerName: string }
+type ReservationRestoreOutcome = { outcome: 'restored' | 'dropped' | 'none'; dead?: DeadTournamentReservation };
+const seatReservationRestores = { restored: 0, keptSittingOut: 0, droppedGone: 0, droppedDeadTournamentSeat: 0, joinTableRejoins: 0 };
+
+/**
+ * THE restore of a departure's seat reservation onto `socket` — step (b) of
+ * every sign-in (oauthLogin, tokenLogin ×2, resumeSession), joinTable's rejoin
+ * (F82) and the half-open reconnect adoption (F80). One copy, so they cannot
+ * drift (they had four):
+ *   - nothing to do for no reservation, a VOLUNTARY one (P-b), an expired one,
+ *     one made by a SECONDARY socket unless `allowSecondary` (F77: that socket's
+ *     rejoin restores it), or — `onlyTableId` — one at another table;
+ *   - F89: a reservation whose table / seat is gone is dropped WITH its timer
+ *     (the stale timer used to end the account's NEXT reservation);
+ *   - G183: a TOURNAMENT reservation whose seat is dead (he busted while away)
+ *     is dropped, never restored — the caller tells him his result after its
+ *     answer (tellDeadTournamentSeat); he used to be seated on a 0-chip
+ *     eliminated seat, never told he was out;
+ *   - F87: a CASH seat he had SAT OUT keeps sitting out (the tracker keeps the
+ *     seat, the dead-blind debt is kept, his sat-out hand count goes on) and
+ *     the socket is told (`reconnectedToTable.sittingOut`, then `sitOutToggled
+ *     {sittingOut:true, reason:'restored'}`, then the full state stamped). A
+ *     restore used to deal him back in and charge his dead blinds. A seat not
+ *     sitting out is cleared exactly as before (tracker + debt — E5).
+ * `clearGhosts`: the account's other seats at that table are cleared first
+ * (oauthLogin / resumeSession / the rejoin / the adoption — tokenLogin never did).
+ */
+function restoreSeatReservation(
+  socket: Socket, userId: number, via: string,
+  opts: { clearGhosts: boolean; allowSecondary?: boolean; onlyTableId?: string } = { clearGhosts: true },
+): ReservationRestoreOutcome {
+  const reserved = reservedSeats.get(userId);
+  if (!reserved || reserved.voluntary || !(reserved.expiresAt > Date.now())) return { outcome: 'none' };
+  if (reserved.secondary && !opts.allowSecondary) return { outcome: 'none' };
+  if (opts.onlyTableId !== undefined && reserved.tableId !== opts.onlyTableId) return { outcome: 'none' };
+  const rTable = tableManager.getTable(reserved.tableId);
+  const rSeat = rTable?.seats?.[reserved.seatIndex];
+  const dead = !!rSeat && isTournamentReservation(reserved) && isDeadTournamentSeat(reserved.tableId, rSeat, true);
+  if (reserved.cleanupTimer) clearTimeout(reserved.cleanupTimer);   // F89 — every branch below ends it
+  reservedSeats.delete(userId);
+  if (!rTable || !rSeat || rSeat.state !== 'occupied' || rSeat.isAI || dead) {
+    if (dead) {
+      seatReservationRestores.droppedDeadTournamentSeat++;
+      console.log(`[Reserve] ${JSON.stringify({ event: 'dead_tournament_reservation_dropped', via, userId, tableId: reserved.tableId, seatIndex: reserved.seatIndex })}`);
+      return {
+        outcome: 'dropped',
+        dead: { tableId: reserved.tableId, ...reconnectTournamentFields(reserved), playerId: rSeat!.playerId, playerName: reserved.playerName },
+      };
+    }
+    seatReservationRestores.droppedGone++;
+    return { outcome: 'dropped' };
+  }
+  // Guarantee EXACTLY ONE seat: clear any OTHER seats this user holds on this
+  // table (sessions + account-stamped orphans) before claiming the restored
+  // one; stacks are credited back to the wallet inside clearGhostSeatsForUser.
+  if (opts.clearGhosts) clearGhostSeatsForUser(userId, reserved.tableId, socket.id, reserved.seatIndex);
+  detachSocketFromOtherTables(socket, reserved.tableId, 'seat', via);   // P-g (round 5)
+  const keepSitOut = reserved.sittingOut === true && !isTournamentReservation(reserved);
+  const session: PlayerSession = {
+    socketId: socket.id, tableId: reserved.tableId, seatIndex: reserved.seatIndex,
+    playerName: reserved.playerName, playerId: `user_${userId}`, seatPlayerId: rSeat.playerId,   // R3 (live P1)
+    trainingEnabled: false, sittingOut: keepSitOut, avatar: reserved.avatar,
+    ...(keepSitOut && reserved.sitOutHands ? { sitOutHands: reserved.sitOutHands } : {}),
+  };
+  playerSessions.set(socket.id, session);
+  socket.join(`table:${reserved.tableId}`);
+  if (keepSitOut) {
+    if (!sitOutTracker.has(reserved.tableId)) sitOutTracker.set(reserved.tableId, new Set());
+    sitOutTracker.get(reserved.tableId)!.add(reserved.seatIndex);
+    seatReservationRestores.keptSittingOut++;
+  } else {
+    sitOutTracker.get(reserved.tableId)?.delete(reserved.seatIndex);
+  }
+  syncSitOutToTable(reserved.tableId);
+  // 2026-06-11 audit E5: only forgive dead-blind debt for a genuine
+  // connectivity blip — a player who was SITTING OUT owes what accrued.
+  if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
+  // P-b — + tournamentId for a tournament reservation; F87 — + sittingOut.
+  socket.emit('reconnectedToTable', {
+    tableId: reserved.tableId, seatIndex: reserved.seatIndex, ...reconnectTournamentFields(reserved), sittingOut: keepSitOut,
+  });
+  if (keepSitOut) socket.emit('sitOutToggled', { sittingOut: true, reason: 'restored', tableId: reserved.tableId });
+  restoreFastModeOnSeatRestore(socket, reserved);   // R3 (K1-6) — his fast mode survives the restore; the client is told
+  // A FORCED full state (hole cards, phase, turn) — broadcastGameState alone is
+  // a delta and can be empty. F87: stamped with his sit-out state (the build's
+  // default is false).
+  const full: any = getGameStateForPlayer(rTable, reserved.seatIndex);
+  full.sittingOut = keepSitOut;
+  full.fastMode = session.fastMode === true;
+  emitGameState(socket, full, true);
+  broadcastGameState(reserved.tableId);
+  seatReservationRestores.restored++;
+  console.log(`[Reserve] ${JSON.stringify({ event: 'seat_reservation_restored', via, userId, tableId: reserved.tableId, seatIndex: reserved.seatIndex, sittingOut: keepSitOut })}`);
+  return { outcome: 'restored' };
+}
+
+/**
+ * G183 — tell a socket whose restore dropped a DEAD tournament reservation
+ * where he finished (sent after the sign-in's answer, like every refusal):
+ * still running → 'playerEliminated' {tournamentId, playerId, playerName,
+ * position} (the P-e plain notice); finished → 'tournamentFinishedForEntrant'
+ * {tournamentId, position, tournamentName}. Nothing when nothing is known (a
+ * re-entered entrant is alive: (c) restores his live seat by account).
+ */
+function tellDeadTournamentSeat(socket: Socket, auth: SocketAuthSession, dead: DeadTournamentReservation | undefined): void {
+  if (!dead?.tournamentId) return;
+  const why = tournamentEntryOutcomeOfAccount(auth, dead.tournamentId);
+  if (!why) return;
+  if (why.kind === 'eliminated') {
+    noticeTournamentEliminationToEntrant(dead.tournamentId, dead.playerId || '', [socket.id], dead.playerName, why.position);
+  } else {
+    socket.emit('tournamentFinishedForEntrant', {
+      tournamentId: dead.tournamentId, position: why.position,
+      tournamentName: tournamentManager.getTournament(dead.tournamentId)?.config.name || 'Tournament',
+    });
+  }
+}
+
+/**
+ * F80 (2026-10-21) — the HALF-OPEN reconnect. A phone switching networks
+ * reconnects on a NEW socket within ~1s while the server still holds the OLD
+ * one open until its ping timeout (pingInterval 20s + pingTimeout 45s): the new
+ * socket's sign-in finds its seat played by that old session, restores nothing
+ * (never two sessions on one seat), and when the old socket is finally reaped
+ * its disconnect reserves the seat for 20 hands / 6h — and told nobody: his
+ * live socket stayed unseated, the seat blinded and auto-folded until a reload.
+ * Now such a sign-in leaves a CLAIM (the account's seat is held by ANOTHER
+ * primary socket of the SAME account), and the reap's reservation goes to that
+ * socket at once (adoptReservationByPendingClaim) — gated like a sign-in
+ * restore (refuseSeatRestoreIfBarred), only while the claim socket is live,
+ * still this account and still unseated. A claim lives two ping cycles.
+ */
+const PENDING_SEAT_CLAIM_MS = 2 * (20_000 + 45_000);
+const pendingSeatClaims = new Map<number, { socketId: string; until: number }>();
+const pendingSeatClaimStats = { noted: 0, adopted: 0, expired: 0, refused: 0 };
+function noteHeldSeatClaim(socket: Socket, userId: number, via: string): boolean {
+  if (playerSessions.has(socket.id)) return false;
+  for (const [sid, s] of playerSessions) {
+    if (sid === socket.id) continue;
+    const a = authSessions.get(sid);
+    if (!a || a.userId !== userId || a.secondary) continue;   // F77 — never a Multi-Table View socket's seat
+    const seat = tableManager.getTable(s.tableId)?.seats[s.seatIndex];
+    if (!seat || seat.state !== 'occupied' || seat.isAI) continue;
+    pendingSeatClaims.set(userId, { socketId: socket.id, until: Date.now() + PENDING_SEAT_CLAIM_MS });
+    pendingSeatClaimStats.noted++;
+    console.log(`[Reserve] ${JSON.stringify({ event: 'pending_seat_claim_noted', via, userId, tableId: s.tableId, seatIndex: s.seatIndex, heldBy: sid })}`);
+    return true;
+  }
+  return false;
+}
+function dropPendingSeatClaimsOf(socketId: string): void {
+  for (const [uid, c] of [...pendingSeatClaims]) if (c.socketId === socketId) pendingSeatClaims.delete(uid);
+}
+function adoptReservationByPendingClaim(userId: number): void {
+  const claim = pendingSeatClaims.get(userId);
+  if (!claim) return;
+  pendingSeatClaims.delete(userId);
+  if (!(claim.until > Date.now())) { pendingSeatClaimStats.expired++; return; }
+  const sock = io.sockets.sockets.get(claim.socketId);
+  const auth = authSessions.get(claim.socketId);
+  if (!sock || !sock.connected || !auth || auth.userId !== userId || auth.secondary || playerSessions.has(claim.socketId)) return;
+  const r = reservedSeats.get(userId);
+  if (!r || r.voluntary || r.secondary) return;
+  void (async () => {
+    // The seat-restore play gate (suspension / ban), as every sign-in's.
+    const refusal = await refuseSeatRestoreIfBarred(sock, userId, auth.username, 'reaped_claim', auth);
+    if (!sock.connected || authSessions.get(claim.socketId) !== auth || playerSessions.has(claim.socketId)) return;
+    if (refusal) { pendingSeatClaimStats.refused++; emitPlayRefusal(sock, refusal); return; }
+    const res = restoreSeatReservation(sock, userId, 'reaped_claim', { clearGhosts: true });
+    if (res.outcome === 'restored') {
+      pendingSeatClaimStats.adopted++;
+      return;
+    }
+    if (res.dead) tellDeadTournamentSeat(sock, auth, res.dead);
+    restoreAbsentTournamentSeat(sock, auth, 'reaped_claim');
+  })().catch((e: any) => console.warn(`[Reserve] reaped-claim restore failed (user ${userId}):`, e?.message || e));
+}
+// ===== end seat reservation restore =====
+
 /**
  * 2026-10-10 (P4) — a login that binds a socket to a DIFFERENT account.
  * Every login handler (`login`, `register`, `oauthLogin`, `tokenLogin` both
@@ -19174,7 +19551,7 @@ function releaseSocketForAccountSwitch(socket: Socket, nextUserId: number, via: 
   const table = session ? tableManager.getTable(session.tableId) : undefined;
   const seat = session && table ? table.seats[session.seatIndex] : undefined;
   if (prev && session && table && seat && seat.state === 'occupied' && !seat.isAI) {
-    reserveSeatForDeparture(prev, session, table, seat);
+    reserveSeatForDeparture(prev, session, table, seat, { actNow: true });   // F46: another account took this socket — acted for now
     cashOutAdditionalSeatsOnDeparture(socket, prev, 'additional_table_account_switch');
     playerSessions.delete(socket.id);
     releaseSeatedSlot(socket.id, session.tableId);
@@ -19413,7 +19790,7 @@ function keepTournamentSeatOnLeave(
         // id snapshot for the U2 gate, fold-on-turn), started PAST its hand
         // limit: the short absent clock from his next turn on. P-b: a voluntary
         // one is flagged — no sign-in restores it.
-        reserveSeatForDeparture(auth, session, table, seat, { handsRemaining: 0, voluntary });
+        reserveSeatForDeparture(auth, session, table, seat, { handsRemaining: 0, voluntary, actNow: true });   // F46: a chosen leave acts now
         const r = reservedSeats.get(auth.userId);
         reserved = !!r;
       }
@@ -19614,7 +19991,8 @@ function restoreAbsentTournamentSeat(
   tp.socketId = socket.id;
   voluntarilyAbsentTournamentEntrants.delete(voluntaryAbsenceKey(tournamentId, tp.playerId));
   tournamentSeatKeep.returned++;
-  socket.emit('reconnectedToTable', { tableId, seatIndex, tournamentId });
+  // F87 (2026-10-21) — + sittingOut: a tournament seat comes back playing (P-j).
+  socket.emit('reconnectedToTable', { tableId, seatIndex, tournamentId, sittingOut: false });
   restoreFastModeOnSeatRestore(socket, fastModeFrom);   // R3 (K1-6) — his fast mode survives the restore; the client is told
   emitGameState(socket, getGameStateForPlayer(table, seatIndex), true);
   broadcastGameState(tableId);
@@ -20252,6 +20630,15 @@ function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKi
 
   releaseSeatedSlot(socket.id, session.tableId); // #6: free the same-IP slot
   playerSessions.delete(socket.id);
+  // 2026-10-21 (gameplay F60) — the left table's delta baseline goes with the
+  // seat (as keepTournamentSeatOnLeave already did): the next table's first
+  // frame is a FULL one. It was a delta against the old table — every key equal
+  // to the old table's value (yourSeat, blinds, currentBetToMatch, minRaise,
+  // pot) left out, so a qualifier / quick game started from the lobby showed no
+  // seat and no action bar. (emitGameState also sends a full frame for a new
+  // table since F64.)
+  lastSentState.delete(socket.id);
+  lastSentJson.delete(socket.id);
 
   // #12 (2026-07-01 audit): if this was the last human on an ephemeral
   // quick-play table, tear it down now (table + its blind interval) instead of

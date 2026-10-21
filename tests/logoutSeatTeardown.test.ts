@@ -35,7 +35,7 @@
 import fs from 'fs';
 import path from 'path';
 import { PokerTable, GamePhase } from '../src/game/PokerTable';
-import { SEAT_TEARDOWN_SRC } from './helpers/indexSource';
+import { SEAT_TEARDOWN_SRC, SEAT_RESTORE_SRC } from './helpers/indexSource';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
 import { Suit, Rank, Card } from '../src/game/Card';
 import { isClaimableGuestRow } from '../src/auth/guestClaim';
@@ -116,6 +116,8 @@ ${parts.tick ?? TICK_RESERVED}
 ${parts.credit ?? CREDIT_SEAT}
 ${SEAT_TEARDOWN_SRC}
 ${SEAT_KEEP}
+// 2026-10-21 (gameplay S6): the disconnect handler and reserveSeatForDeparture call into the restore block.
+${SEAT_RESTORE_SRC}
 ${HANDLE_PLAYER_LEAVE}
 ${BUST_CHECK}
 function bustCheck(tableId, table, results) {

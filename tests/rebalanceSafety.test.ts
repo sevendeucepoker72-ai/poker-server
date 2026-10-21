@@ -48,7 +48,7 @@ import { qualifierBlindLevels } from '../src/game/qualifierSchedule';
 import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE_MAX_STATUS_AGE_MS } from '../src/auth/playGate';
 import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
-import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, SEAT_RESTORE_SRC } from './helpers/indexSource';
 
 const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
@@ -81,7 +81,8 @@ const P = {
   startHand: handlerSrc('startHand', '\n  });\n'),
   returnToTournament: handlerSrc('returnToTournamentSeat', '\n  });\n'),
   seatKeep: slice('// ===== Tournament seat kept on leave', '// ===== end tournament seat kept on leave =====\n'),
-  departure: fnSrc('function otherSessionHoldsSeat(') + fnSrc('function reserveSeatForDeparture(') + fnSrc('function cashOutAdditionalSeatsOnDeparture('),
+  // 2026-10-21 (gameplay S6): + the restore block (isDeadTournamentSeat — G184; the F80 claims the disconnect uses).
+  departure: fnSrc('function otherSessionHoldsSeat(') + fnSrc('function reserveSeatForDeparture(') + fnSrc('function cashOutAdditionalSeatsOnDeparture(') + SEAT_RESTORE_SRC,
   noteNotCashed: fnSrc('function noteTournamentReservationNotCashed('),
   accountSwitch: slice('const socketAccountSwitches = {', '\n}\n'),
   // Round 5 (2026-10-10): the REAL seat / spectate handlers P-g covers and the admin removals (P-f gap).
@@ -1597,7 +1598,7 @@ describe('S2 — a voluntary leave from a LIVE tournament seat keeps the seat in
     await sock.handlers.returnToTournamentSeat({}, (r: unknown) => acks.push(r));
     expect(acks).toEqual([{ success: true, tournamentId: w.tid, tableId: 'TB', seatIndex: 2 }]);
     expect(sock.emitted).toContainEqual(['returnToTournamentResult', { success: true, tournamentId: w.tid, tableId: 'TB', seatIndex: 2 }]);
-    expect(sock.emitted).toContainEqual(['reconnectedToTable', { tableId: 'TB', seatIndex: 2, tournamentId: w.tid }]);
+    expect(sock.emitted).toContainEqual(['reconnectedToTable', { tableId: 'TB', seatIndex: 2, tournamentId: w.tid, sittingOut: false }]);   // F87 (2026-10-21): + sittingOut
     expect(w.playerSessions.get('S-b2')).toMatchObject({ tableId: 'TB', seatIndex: 2, playerId: 'b2' });
     expect(sock.rooms.has('table:TB')).toBe(true);
     expect(w.reservedSeats.has(202)).toBe(false);
@@ -2488,7 +2489,7 @@ describe('V4 — a rebalance that moves an ABSENT seat tells his sockets; Return
     const acks: any[] = [];
     await sock.handlers.returnToTournamentSeat({ tournamentId: w.tid }, (r: unknown) => acks.push(r));
     expect(acks).toEqual([{ success: true, tournamentId: w.tid, tableId: 'TA', seatIndex: seat }]);
-    expect(sock.emitted).toContainEqual(['reconnectedToTable', { tableId: 'TA', seatIndex: seat, tournamentId: w.tid }]);
+    expect(sock.emitted).toContainEqual(['reconnectedToTable', { tableId: 'TA', seatIndex: seat, tournamentId: w.tid, sittingOut: false }]);   // F87 (2026-10-21): + sittingOut
     expect(w.playerSessions.get('S-b2')).toMatchObject({ tableId: 'TA', seatIndex: seat });
     expect(w.reservedSeats.has(202)).toBe(false);
     expect(w.m.voluntarilyAbsentTournamentEntrants.size).toBe(0);
@@ -2579,6 +2580,10 @@ describe('P-b — what a sign-in tells about kept seats (tellKeptTournamentSeats
     const wl = handlerSrc('joinWithWaitlistContext', '\n    }\n  );');
     after(wl, "socket.emit('gameState', getGameStateForPlayer(table, targetSeat));", "if (wlAuthNow) tellKeptTournamentSeats(socket, wlAuthNow, 'voluntary', 'joinWithWaitlistContext');");
     // Every reservation-path reconnectedToTable carries the tournament (P-b).
+    // 2026-10-21 (gameplay S6) — the sign-ins restore through the ONE shared restore: its emit carries it.
+    const shared = fnSrc('function restoreSeatReservation(');
+    expect(shared.split("socket.emit('reconnectedToTable'").length - 1).toBe(1);
+    expect(shared).toContain('...reconnectTournamentFields(reserved), sittingOut: keepSitOut,');
     for (const [name, body] of [['oauthLogin', oauth], ['tokenLogin', tl], ['resumeSession', rs]] as const) {
       const n = body.split("socket.emit('reconnectedToTable'").length - 1;
       expect({ name, withTournament: body.split('...reconnectTournamentFields(reserved)').length - 1 }).toEqual({ name, withTournament: n });
@@ -2818,10 +2823,11 @@ describe('P-g (round 5) — one socket, one table view: detachSocketFromOtherTab
       ["socket.on('spectate', async", "detachSocketFromOtherTables(socket, tableId, 'spectate', 'spectate');", 'spectators.get(tableId)!.add(socket.id);'],
       ["socket.on('spectateTournament'", "detachSocketFromOtherTables(socket, bestTable, 'spectate', 'spectateTournament');", 'specSet.add(socket.id);'],
       ["socket.on('spectateNextTable'", "detachSocketFromOtherTables(socket, nextTableId, 'spectate', 'spectateNextTable');", 'newSet.add(socket.id);'],
-      ["socket.on('oauthLogin'", "detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'oauthLogin');", 'playerSessions.set(socket.id, {'],
-      ["socket.on('tokenLogin'", "detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'tokenLogin');", 'playerSessions.set(socket.id, restoredSession);'],
-      ["socket.on('tokenLogin'", "detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'tokenLogin_legacy');", 'playerSessions.set(socket.id, restoredSession);'],
-      ["    'resumeSession',\n", "detachSocketFromOtherTables(socket, reserved.tableId, 'seat', 'resumeSession');", 'playerSessions.set(socket.id, {'],
+      // 2026-10-21 (gameplay S6) — oauthLogin, tokenLogin ×2, resumeSession, joinTable's rejoin and the
+      // F80 adoption restore a reservation through ONE function (its `via` names the caller).
+      ['function restoreSeatReservation(', "detachSocketFromOtherTables(socket, reserved.tableId, 'seat', via);", 'playerSessions.set(socket.id, session);'],
+      // F155 — a resync of a table the socket has no seat at watches it (the 'spectate' path minus the leave).
+      ['  const resyncTableView = ', "detachSocketFromOtherTables(socket, wanted, 'spectate', via);", 'spectators.get(wanted)!.add(socket.id);'],
       ['function restoreAbsentTournamentSeat(', "detachSocketFromOtherTables(socket, tableId, 'seat', via);", 'playerSessions.set(socket.id, {'],
       ['function startTournamentGame(', "detachSocketFromOtherTables(sock, tableId, 'seat', 'startTournamentGame');", 'playerSessions.set(boundSid, session);'],
       ['function startQualifierTournament(', "detachSocketFromOtherTables(sock, tid, 'seat', 'startQualifierTournament');", 'playerSessions.set(boundSid, sess);'],
@@ -3443,15 +3449,17 @@ describe('Z1 — a disconnect acts on its seat only while the seat is still its 
     expect(P.disconnect).toContain(GUARD);
     const x = await dropDuringSave(true, { disconnect: P.disconnect.replace(GUARD, '          if (false) {\n') });
     expect(x.s2Session).toEqual({ tableId: 'T1', seatIndex: 1 });
-    expect(x.reservation).toEqual({ tableId: 'T1', seatIndex: 1, handsRemaining: 20 });
-    expect(x.stillHisTurn).toBe(false);
+    expect(x.reservation).toEqual({ tableId: 'T1', seatIndex: 1, handsRemaining: 20 });   // re-reserved while S2 plays it
+    // F46 (2026-10-21) — a dropped socket's turn is left to its clock (no act at the drop), so the
+    // re-reservation no longer acts at once; the stray reservation above is the pre-Z1 defect.
+    expect(x.stillHisTurn).toBe(true);
   });
 
   it('no Return in the window: the plain disconnect reserves the seat exactly as before (S1 session + auth end)', async () => {
     const x = await dropDuringSave(false);
     expect(x.reservation).toEqual({ tableId: 'T1', seatIndex: 1, handsRemaining: 20 });
     expect(x.s1Left).toBe(true);
-    expect(x.stillHisTurn).toBe(false);                                       // acted for on his turn (Z6: a free check)
+    expect(x.stillHisTurn).toBe(true);                                        // F46 (2026-10-21): left to his turn clock, not acted for at the drop
     expect(x.T1.seats[1].folded).toBe(false);
     expect(x.chipsKept).toBe(true);
     expect(x.w.logs.some((l) => l.includes('disconnect_session_replaced_during_save'))).toBe(false);

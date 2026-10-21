@@ -23,7 +23,7 @@ import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { cardToString } from '../src/game/Card';
 import { insuranceSettlementDelta } from '../src/game/insurance';
 import {
-  SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC,
+  SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, MUCK_SHOWS_SRC,
 } from './helpers/indexSource';
 
 const quiet = { log() {}, warn() {}, error() {} };
@@ -201,7 +201,7 @@ function seatWorld(opts: { handlers?: Partial<typeof H>; drawB?: boolean } = {})
     seatNameForSocket: (_s: unknown, n: string) => n, progressionManager: { recordAction() {} }, lastChatTime: new Map(),
     actionNonces: new Map(), actionTimings: new Map(), pendingAutoStartTimers: new Map(),
     bombPotPending, bombPotCooldownUntil: new Map(), BOMB_POT_COOLDOWN_MS: 300_000,
-    shownMuckedHands: new Set(), lastSentState, lastSentJson: new Map(),
+    lastSentState, lastSentJson: new Map(),
     getGameStateForPlayer: (t: PokerTable, seat: number, training?: boolean) => ({
       tableId: t.config.tableId, yourSeat: seat, trainingData: training ? {} : undefined,
       currentBetToMatch: t.currentBetToMatch, stateVersion: t.stateVersion,
@@ -209,9 +209,10 @@ function seatWorld(opts: { handlers?: Partial<typeof H>; drawB?: boolean } = {})
     log: { debug() {}, info() {}, warn() {} }, console: quiet,
   };
   const h = { ...H, ...(opts.handlers || {}) };
-  const code = `${KIND}\n${BUY_IN}\n${EMIT}\n${fnSrc('function syncSitOutToTable(')}\n${slice('const bombPotStats', '};\n')}\n`
+  // F21 (2026-10-21, S6): + the Show Hand queue and its end-of-hand flush (MUCK_SHOWS_SRC).
+  const code = `${KIND}\n${BUY_IN}\n${EMIT}\n${fnSrc('function syncSitOutToTable(')}\n${slice('const bombPotStats', '};\n')}\n${MUCK_SHOWS_SRC}\n`
     + `function wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${Object.values(h).join('\n')}\n}`;
-  const { exports: m, stubbed } = load(code, scope, '{ wire, buyInStateChanged }');
+  const { exports: m, stubbed } = load(code, scope, '{ wire, buyInStateChanged, flushPendingMuckShows }');
   m.wire(sock);
   expect([...stubbed].filter((n) => /seatSessionFor|notSeatedThere|Sessions|buyIn|syncSitOut/.test(n))).toEqual([]);
   return { A, B, tables, main, extra, playerSessions, multiTableSessions, sitOutTracker, wallet, deducts, refunds, room, broadcasts, bombPotPending, lastSentState, gates, sock, m };
@@ -340,8 +341,9 @@ describe('F64 — an extra table\'s frame never becomes the MAIN table\'s delta 
 
 // ══════════════════════════════════════════════════════════════════ F156 ══
 describe('F156 — table-scoped seat controls act on the seat at the NAMED table (main or extra), never the wrong one', () => {
-  const SITOUT_NEW = '    const session = seatSessionFor(data?.tableId);\n    if (!session) { notSeatedThere(data?.tableId); return; }\n\n    session.sittingOut = !session.sittingOut;';
-  const SITOUT_OLD = '    const session = playerSessions.get(socket.id);\n    if (!session) return;\n\n    session.sittingOut = !session.sittingOut;';
+  // F87 (2026-10-21, S6): sitOut SETS a boolean `sittingOut` (else toggles) — the resolver lines are unchanged.
+  const SITOUT_NEW = '    const session = seatSessionFor(data?.tableId);\n    if (!session) { notSeatedThere(data?.tableId); return; }\n\n    const want =';
+  const SITOUT_OLD = '    const session = playerSessions.get(socket.id);\n    if (!session) return;\n\n    const want =';
 
   it('sitOut {tableId:B} while it is his turn at A: B sits out; his live hand at A is NOT folded', async () => {
     const w = seatWorld();
@@ -486,10 +488,14 @@ describe('F156 — table-scoped seat controls act on the seat at the NAMED table
     expect(w.B.playerFold(0)).toBe(true);
     w.room.length = 0;
     await w.sock.handlers.showMuckedHand({ tableId: 'B' });
-    expect(w.room).toEqual([['table:B', 'muckedHandRevealed', expect.objectContaining({ tableId: 'B', seatIndex: 0, playerName: 'Hero' })]]);
-    // the hand ends; the rabbit hunt is B's and says so.
+    // F21 (2026-10-21, S6): B's hand is still being played — queued for B, shown at its end.
+    expect(w.room).toEqual([]);
+    expect(events(w.sock, 'muckedHandShowQueued')).toEqual([{ tableId: 'B', handNumber: w.B.handNumber, seatIndex: 0 }]);
+    // the hand ends; the queued show is B's; the rabbit hunt is B's and says so.
     for (let g = 0; g < 50 && w.B.isHandInProgress(); g++) w.B.playerFold(w.B.activeSeatIndex);
     expect(w.B.currentPhase).toBe(GamePhase.HandComplete);
+    expect(w.m.flushPendingMuckShows('B', w.B)).toBe(1);
+    expect(w.room).toEqual([['table:B', 'muckedHandRevealed', expect.objectContaining({ tableId: 'B', seatIndex: 0, playerName: 'Hero' })]]);
     expect(w.B.communityCards).toHaveLength(0);                      // ended pre-flop: the whole board is huntable
     w.sock.handlers.rabbitHunt({ tableId: 'B' });
     expect(events(w.sock, 'rabbitHuntResult')).toEqual([{ cards: expect.any(Array), tableId: 'B' }]);

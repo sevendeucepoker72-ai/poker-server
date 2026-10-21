@@ -16,7 +16,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { SRC, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_IDENTITY_SRC, INSURANCE_HISTORY_SRC } from './helpers/indexSource';
+import { SRC, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_IDENTITY_SRC, INSURANCE_HISTORY_SRC, MUCK_SHOWS_SRC } from './helpers/indexSource';
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
 import { HandRank } from '../src/game/HandEvaluator';
 import { Card, cardToString } from '../src/game/Card';
@@ -315,6 +315,7 @@ const HAND_CODE = [
   fnSrc('function handHistoryViewerOf('),
   fnSrc('function ensureTableProgressListener('),
   INSURANCE_HISTORY_SRC,   // G165 — the listener's player rows go through withInsuranceSettlement
+  MUCK_SHOWS_SRC,   // F21 (2026-10-21) — the listener reveals the folded seats' queued Show Hand first
   fnSrc('async function handleHandComplete('),
 ].join('\n');
 

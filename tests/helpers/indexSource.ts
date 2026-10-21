@@ -139,3 +139,35 @@ export function deferred(): { p: Promise<void>; resolve: () => void } {
   const p = new Promise<void>((r) => { resolve = r; });
   return { p, resolve };
 }
+
+/**
+ * 2026-10-21 (gameplay S6) — the ONE seat-reservation restore block of
+ * index.ts: isDeadTournamentSeat (G183 / G184), restoreSeatReservation (every
+ * sign-in's step (b), joinTable's rejoin — F82 — and the F80 adoption, with
+ * F87 / F89), tellDeadTournamentSeat, and the F80 pending seat claims
+ * (noteHeldSeatClaim / dropPendingSeatClaimsOf / adoptReservationByPendingClaim).
+ * The sign-in handlers, the 'disconnect' handler and reserveSeatForDeparture
+ * call into it, so a harness that slices one of them appends this. Scope it
+ * reads: reservedSeats, tableManager, playerSessions, authSessions, sitOutTracker,
+ * io, tournamentManager, isTournamentReservation, isTournamentTable,
+ * tournamentIdOfTable, tournamentEntrantHasLiveSeat, clearGhostSeatsForUser,
+ * detachSocketFromOtherTables, syncSitOutToTable, reconnectTournamentFields,
+ * restoreFastModeOnSeatRestore, getGameStateForPlayer, emitGameState,
+ * broadcastGameState, tournamentEntryOutcomeOfAccount,
+ * noticeTournamentEliminationToEntrant, refuseSeatRestoreIfBarred,
+ * emitPlayRefusal, restoreAbsentTournamentSeat.
+ */
+export const SEAT_RESTORE_SRC: string = slice(
+  '// ===== Seat reservation restore (gameplay S6, 2026-10-21) =====',
+  '// ===== end seat reservation restore =====\n',
+);
+
+/**
+ * 2026-10-21 (gameplay F21) — the Show Hand bookkeeping: shownMuckedHands (one
+ * reveal per table / hand / seat), pendingMuckShows (a folded seat's show asked
+ * for mid-hand), flushPendingMuckShows (run by the 'handResult' listener) and
+ * dropPendingMuckShows (table teardown). A harness that slices showMuckedHand or
+ * ensureTableProgressListener appends this. Scope it reads: io, cardToString.
+ */
+export const MUCK_SHOWS_SRC: string = slice('const shownMuckedHands = new Set<string>();', '\nfunction dropPendingMuckShows(')
+  + slice('function dropPendingMuckShows(', '\n}\n');
