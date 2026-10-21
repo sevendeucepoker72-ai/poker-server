@@ -30,7 +30,7 @@ import { createPrizeLedger } from '../src/game/prizeLedger';
 import { createWindowRateLimiter } from '../src/auth/rateLimit';
 import { validateTableConfig } from '../src/game/tableConfigValidation';
 import { accountDisplayName } from '../src/auth/displayName';
-import { slice, fnSrc, handlerSrc, load, flush, SEAT_TEARDOWN_SRC } from './helpers/indexSource';
+import { slice, fnSrc, handlerSrc, load, flush, SEAT_TEARDOWN_SRC, JOIN_PRECHECK_SRC } from './helpers/indexSource';
 import { createFakeLedgerDb } from './helpers/fakeLedgerDb';
 
 const HOST = 101;
@@ -153,6 +153,7 @@ ${SEAT_TEARDOWN_SRC}
 ${CREDIT_SEAT}
 ${opts.fill ?? FILL}
 ${HEARTBEAT}
+${JOIN_PRECHECK_SRC}
 function wire(socket) {
   ${Object.values(handlers).join('\n  ')}
 }`;
@@ -287,8 +288,13 @@ describe('S1-1 / XL-1 / K3-1 — a home game seats its invitees up to its maxSea
     const prePick = H.joinByInviteCode.replace(
       "let openSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < inviteSeatCap);\n    if (openSeat === -1) openSeat = takeAiSeatForJoin(table, tableId);",
       "let openSeat = table.seats.findIndex((s) => s.state === 'empty');",
+    // 2026-10-21 (gameplay F143) — the pre-leave seat lookup (inside the cap) is the R3 rule too: not in the pre-R3 text.
+    ).replace(
+      "    if (!table.seats.some((s, i) => i < inviteSeatCap && (s.state === 'empty' || aiSeatTakeableNow(table, i)))\n        && !accountHoldsSeatAt(socket.id, authAtInvite?.userId, tableId)) {",
+      '    if (false) {',
     );
     expect(prePick).not.toBe(H.joinByInviteCode);
+    expect(prePick).toContain('    if (false) {');
     const w = world({ fill: preFill, joinByInviteCode: prePick });
     const { inviteCode, t } = await hostHomeGame(w, 4);
     expect(seatMap(t).slice(0, 4)).toBe('HBBB');                    // every seat inside the cap taken

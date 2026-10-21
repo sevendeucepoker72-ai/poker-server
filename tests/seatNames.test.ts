@@ -17,7 +17,7 @@
  * TournamentManager.
  */
 
-import { handlerSrc, slice, load, flush, SRC, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
+import { handlerSrc, slice, load, flush, SRC, SEAT_SESSION_FOR_SRC, JOIN_PRECHECK_SRC } from './helpers/indexSource';
 import { PokerTable } from '../src/game/PokerTable';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
 import { accountDisplayName } from '../src/auth/displayName';
@@ -83,7 +83,7 @@ function world(session: { displayName?: string | null } | null) {
     accountDisplayName, sanitizeSeatAvatar,
   };
   // F156 (2026-10-21): chatMessage resolves its seat through seatSessionFor.
-  const loaded = load(`${SEAT_NAME}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${Object.values(H).join('\n')}\n}`, scope, '{ wire }');
+  const loaded = load(`${SEAT_NAME}\n${JOIN_PRECHECK_SRC}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${Object.values(H).join('\n')}\n}`, scope, '{ wire }');
   const handlers: Record<string, (...a: any[]) => any> = {};
   const emitted: Array<[string, any]> = [];
   const socket: any = {

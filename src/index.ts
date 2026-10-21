@@ -1483,6 +1483,32 @@ type SeatTeardownOutcome = 'deferred' | 'stood_up' | 'none';
 const seatTeardownStats = { deferred: 0, stoodUp: 0, allInKept: 0, foldedOnClock: 0, foldedOutOfTurn: 0, awardedUncontested: 0, departureKept: 0 };
 
 /**
+ * 2026-10-21 (gameplay F143) — the wallet credits of seats a teardown stood up,
+ * still in flight (creditSeatStackToWallet's addChipsToUser is not awaited by
+ * the teardown), per account. A join that left a seat awaits them
+ * (seatCreditsSettled) before it reads the wallet: the read used to race the
+ * leaving stack's credit and refuse "Insufficient chips" with the seat gone.
+ */
+const seatCreditsInFlight = new Map<number, Set<Promise<void>>>();
+function noteSeatCreditInFlight(userId: number, credit: unknown): void {
+  if (!credit || typeof (credit as Promise<unknown>).then !== 'function') return;
+  const settled: Promise<void> = (credit as Promise<unknown>).then(() => undefined, () => undefined);
+  let set = seatCreditsInFlight.get(userId);
+  if (!set) { set = new Set(); seatCreditsInFlight.set(userId, set); }
+  set.add(settled);
+  void settled.then(() => {
+    const s = seatCreditsInFlight.get(userId);
+    if (!s) return;
+    s.delete(settled);
+    if (s.size === 0) seatCreditsInFlight.delete(userId);
+  });
+}
+async function seatCreditsSettled(userId: number): Promise<void> {
+  const set = seatCreditsInFlight.get(userId);
+  if (set && set.size > 0) await Promise.all([...set]);
+}
+
+/**
  * R2 — does a seat torn down while ALL-IN keep its hand? Only where its stack
  * is the player's own WALLET chips — a ring game (not a tournament, not a
  * fixed-roster quick game or club challenge): he is paid what he wins at the
@@ -1570,7 +1596,7 @@ function teardownSeat(
   }
   const now = table.seats[seatIndex];
   if (now.state === 'occupied' && !now.isAI) {
-    if (who) creditSeatStackToWallet(who.userId, who.username, tableId, now, reason);
+    if (who) noteSeatCreditInFlight(who.userId, creditSeatStackToWallet(who.userId, who.username, tableId, now, reason));   // F143
     now.deadBlindOwedChips = 0;
     now.missedBlind = 'none';
     sitOutTracker.get(tableId)?.delete(seatIndex);
@@ -3477,6 +3503,14 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     lateRegUntil: new Date(w.lateRegUntil).toISOString(),
     status,
     registered: !!mine,
+    // 2026-10-21 (gameplay F142) — per viewer, always present: his entry is OUT
+    // (busted; he stays in qt.players, so `registered` stays true) and how many
+    // re-entries he has left (null = not registered). The lobby offered only
+    // "Go to my table" to a busted entrant (refused: no seat), so the paid
+    // re-entry during late registration could never be reached.
+    eliminated: !!(mine && qt.tournamentId
+      && tournamentManager.getTournament(qt.tournamentId)?.players.find((p) => p.playerId === mine.playerId)?.eliminated),
+    reEntriesLeft: mine ? Math.max(0, (qt.maxReEntries ?? 3) - (mine.reEntries || 0)) : null,
     players: qt.players.length,
     structure: qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK),
     seatsForTop,
@@ -3741,7 +3775,7 @@ function validateClubTableConfig(cfg: unknown) {
 }
 
 /** A club table's runtime table from its (validated) stored numbers: '[Club] name', tableKind 'club', its seat count. */
-async function createClubRuntimeTable(clubId: number, cfg: { tableName: string; variant?: string; smallBlind: number; bigBlind: number; minBuyIn: number; maxSeats?: number }): Promise<string | null> {
+async function createClubRuntimeTable(clubId: number, cfg: { tableName: string; variant?: string; smallBlind: number; bigBlind: number; minBuyIn: number; maxBuyIn?: number; maxSeats?: number }): Promise<string | null> {
   let clubName = 'Club';
   try { clubName = (await getClubInfo(clubId)).club?.name || 'Club'; } catch { /* the default name */ }
   const variant = (cfg.variant || 'texas-holdem') as VariantType;
@@ -3763,6 +3797,12 @@ async function createClubRuntimeTable(clubId: number, cfg: { tableName: string; 
   const t = tableManager.getTable(tableId);
   const seats = Number(cfg.maxSeats);
   if (t && Number.isInteger(seats) && seats >= 2) t.maxOccupiableSeats = Math.min(t.maxOccupiableSeats, seats);
+  // 2026-10-21 (gameplay F110) — the club's Max Buy-In is enforced (join,
+  // rebuy, the state's maxBuyIn): it was validated and stored, then dropped
+  // here, so every join / rebuy was capped at 10 x minBuyIn only. A stored
+  // value below the minimum (an older row) is ignored (the 10x cap applies).
+  const maxBuyIn = Number(cfg.maxBuyIn);
+  if (t && Number.isInteger(maxBuyIn) && maxBuyIn >= cfg.minBuyIn) t.maxBuyInSetting = maxBuyIn;
   return tableId;
 }
 
@@ -4472,7 +4512,8 @@ function getGameStateForPlayer(
   stateObj.tableKind = tableKindOf(table.config.tableId);
   stateObj.rebuyAllowed = rebuyAllowedAt(table.config.tableId);
   stateObj.minBuyIn = table.config.minBuyIn;
-  stateObj.maxBuyIn = table.config.minBuyIn * 10;
+  // F110 (2026-10-21) — a club table's own Max Buy-In when it is lower than 10x.
+  stateObj.maxBuyIn = Math.min(table.config.minBuyIn * 10, table.maxBuyInSetting ?? Infinity);
   // R2 (C7) — ALWAYS present: this seat's EQUIPPED table theme id, else null
   // (spectators, AI, an account-less or not-yet-loaded seat).
   const myUid = playerSeatIndex >= 0 ? seatAccounts?.get(playerSeatIndex) : undefined;
@@ -5999,7 +6040,9 @@ function executeAIAction(
 
 // Atomically move a session's seat at a cash table. Transfers chip stack,
 // avatar, all seat-level state from the old seat to the new seat; evicts
-// an AI occupant if the target is held by a bot; clears sit-out state.
+// an AI occupant if the target is held by a bot. 2026-10-21 (gameplay F65 /
+// F66 / G188): his Sit Out and his owed dead blinds move WITH him, and a move
+// that puts the big blind further away from him owes the big blind it skips.
 // Returns true on success, false if the target turned out invalid (e.g.
 // a human took it between queue and execute — the player stays put).
 //
@@ -6021,6 +6064,12 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
 
   const table = tableManager.getTable(tableId);
   if (!table) return cancelled('table_gone');
+  // 2026-10-21 (gameplay F100) — never at a FIXED-ROSTER table (every quick
+  // format, a club challenge): its seats are the ones it started with. A move
+  // onto a bot's seat stood the bot up, and a Spin & Go / career stage was then
+  // "won" with no hand played (quickGameOutcome counts the bots left). A move
+  // queued there anyway (an older server, a crafted frame) is dropped here.
+  if (isFixedRosterTable(tableId)) return cancelled('seat_unavailable');
 
   const src = table.seats[session.seatIndex];
   const dst = table.seats[target];
@@ -6040,6 +6089,30 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
     return cancelled('seat_unavailable');
   }
 
+  // G188 (2026-10-21) — how many hands until the big blind (it moves one
+  // occupied seat per hand from previousBigBlindSeat) reaches a seat, counted
+  // over the OTHER players (his old seat and the target left out, so both are
+  // measured against the same field). -1 = no rotation yet (nothing to skip).
+  const oldSeat = session.seatIndex;
+  const handsUntilBigBlind = (seatIndex: number): number => {
+    const from = table.previousBigBlindSeat;
+    if (!(from >= 0)) return -1;
+    let d = 0;
+    for (let k = 1; k <= MAX_SEATS; k++) {
+      const i = (from + k) % MAX_SEATS;
+      if (i === seatIndex) return d;
+      const s = table.seats[i];
+      if (i !== oldSeat && i !== target && s && s.state === 'occupied' && !s.eliminated) d++;
+    }
+    return -1;
+  };
+  // A move AWAY from the big blind (it reaches him later at the target) skips
+  // the blinds he was due: he owes the big blind as dead money (collected at
+  // his next deal; markMissedBlind caps a debt at one set). He used to be dealt
+  // every hand and never post ("Move here" each time his blind came round).
+  // Stud / Razz have no blinds (antes + bring-in): nothing is owed there.
+  const skipsBigBlind = !(table instanceof SevenStudTable) && handsUntilBigBlind(target) > handsUntilBigBlind(oldSeat);
+
   // Evict an AI from the target if any.
   if (dst.state === 'occupied' && dst.isAI) {
     table.standUp(target);
@@ -6052,6 +6125,11 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
   const avatar = session.avatar;
   const playerName = session.playerName;
   const playerId = session.playerId;
+  // F66 (2026-10-21) — the dead blinds he owes (sitDown starts every seat with
+  // none: a move used to erase the debt) and F65 his own Sit Out choice.
+  const owedMissedBlind = src.missedBlind;
+  const owedDeadBlindChips = src.deadBlindOwedChips || 0;
+  const wasSittingOut = !!session.sittingOut;
   table.standUp(session.seatIndex);
 
   // Sit down at the new seat with the preserved stack. `sitDown`'s buy-in
@@ -6064,7 +6142,12 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
     // Extremely rare — sitDown shouldn't fail on an empty seat — but fall
     // back by attempting to return to the original seat with the same stack.
     console.warn(`[MoveSeat] sitDown failed for ${playerName} on seat ${target}; restoring to ${session.seatIndex}`);
-    table.sitDown(session.seatIndex, playerName, chipCount, playerId, false, true);
+    if (table.sitDown(session.seatIndex, playerName, chipCount, playerId, false, true)) {
+      // F66 — back on his own seat with the debt he owed there (sitDown cleared it).
+      table.seats[session.seatIndex].missedBlind = owedMissedBlind;
+      table.seats[session.seatIndex].deadBlindOwedChips = owedDeadBlindChips;
+    }
+    syncSitOutToTable(tableId);   // F65 — standUp took his seat out of the engine's sit-out set
     io.sockets.sockets.get(session.socketId)?.emit('error', { message: 'That seat is not available — you stayed in your seat.', code: 'move_seat_failed' });
     return cancelled('seat_unavailable');   // G182
   }
@@ -6074,17 +6157,31 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
     (table.seats[target] as any).avatar = avatar;
   }
 
-  // Update the session to reflect the new seat + clear sit-out.
+  // F66 — the dead blinds he owed come with him; G188 — and the big blind the move skips.
+  table.seats[target].missedBlind = owedMissedBlind;
+  table.seats[target].deadBlindOwedChips = owedDeadBlindChips;
+  if (skipsBigBlind) {
+    table.markMissedBlind(target, 'big');
+    console.log(`[MoveSeat] ${JSON.stringify({ event: 'seat_move_owes_big_blind', tableId, from: oldSeat, to: target, owed: table.seats[target].deadBlindOwedChips })}`);
+  }
+
+  // Update the session to reflect the new seat.
   session.seatIndex = target;
-  session.sittingOut = false;
+  // F65 (2026-10-21) — a player who chose Sit Out stays sitting out at the new
+  // seat (the full state that follows says so). The move used to clear it — he
+  // was dealt in and blinded while away, his client still showing Sit Out —
+  // and left his OLD seat in the tracker: its next occupant was dealt out every
+  // hand and charged dead blinds.
+  session.sittingOut = wasSittingOut;
   // R2 (TABLEUI-11 / contract C11) — a seat move sends a FULL state next.
   lastSentState.delete(session.socketId);
   lastSentJson.delete(session.socketId);
-  const tracker = sitOutTracker.get(tableId);
-  if (tracker) {
-    tracker.delete(target);
-    // Clean up any lingering old-seat entry too.
-  }
+  if (!sitOutTracker.has(tableId)) sitOutTracker.set(tableId, new Set());
+  const tracker = sitOutTracker.get(tableId)!;
+  tracker.delete(oldSeat);
+  tracker.delete(target);
+  if (wasSittingOut) tracker.add(target);
+  syncSitOutToTable(tableId);
 
   // Notify the socket that their move completed.
   const sock = io.sockets.sockets.get(session.socketId);
@@ -7304,6 +7401,85 @@ function seatPlayedByAnotherAccount(userId: number, tableId: string, seatIndex: 
   }
   return false;
 }
+
+// ========== Join pre-checks (gameplay F143, 2026-10-21) ==========
+/**
+ * F143 — the refusal a join sends when the buy-in needs chips that are still in
+ * a live pot at the player's current table (they come back when that hand
+ * ends). He is refused BEFORE anything is left — never folded out first.
+ */
+const FINISH_HAND_FIRST_MESSAGE = 'Your chips are in a hand at your current table. Finish that hand first - they return to your balance when it ends.';
+
+/**
+ * F143 — does this socket, or (signed in) this account, hold a seat at
+ * `tableId` that a join's leave / ghost-seat clear frees (his own seat — a seat
+ * change —, another socket's seat of his account, his reservation there, a seat
+ * stamped with his account)? A full table is then decided after those, as before.
+ */
+function accountHoldsSeatAt(socketId: string, userId: number | undefined, tableId: string): boolean {
+  if (playerSessions.get(socketId)?.tableId === tableId) return true;
+  if (userId === undefined) return false;
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId === tableId && authSessions.get(sid)?.userId === userId) return true;
+  }
+  for (const [sid, list] of multiTableSessions) {
+    if (!Array.isArray(list) || authSessions.get(sid)?.userId !== userId) continue;
+    if (list.some((ms) => ms && ms.tableId === tableId)) return true;
+  }
+  if (reservedSeats.get(userId)?.tableId === tableId) return true;
+  const t = tableManager.getTable(tableId);
+  const stamp = `user_${userId}`;
+  return !!t && t.seats.some((s) => s.state === 'occupied' && !s.isAI && s.playerId === stamp);
+}
+
+/**
+ * F143 — the wallet chips a join's leave (handlePlayerLeave: the socket's main
+ * seat and, with it, its extra-table seats) and its ghost-seat clear (this
+ * account's other seats at the table joined) give back. `now`: stacks a
+ * teardown credits at once (no chips in a live pot); `later`: stacks credited
+ * only when that hand ends (chips in its pot — teardownSeat defers them),
+ * `laterTableId` the table of the largest. A stack that is never wallet chips
+ * (a tournament, a Spin & Go) counts nothing.
+ */
+function projectedJoinCredits(socketId: string, userId: number, targetTableId: string): { now: number; later: number; laterTableId: string | null } {
+  const out: { now: number; later: number; laterTableId: string | null } = { now: 0, later: 0, laterTableId: null };
+  let laterMax = -1;
+  const seen = new Set<string>();
+  const add = (tableId: string, seatIndex: number): void => {
+    const key = `${tableId}:${seatIndex}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (isTournamentTable(tableId) || isPrizeFormatTable(tableId)) return;
+    const t = tableManager.getTable(tableId);
+    const seat = t?.seats[seatIndex];
+    if (!t || !seat || seat.state !== 'occupied' || seat.isAI) return;
+    const chips = seat.chipCount || 0;
+    const deferred = !!pendingSeatRemovalAfterHand.get(tableId)?.has(seatIndex)
+      || (t.isHandInProgress() && (seat.totalInvestedThisHand || 0) > 0);
+    if (!deferred) { out.now += chips; return; }
+    out.later += chips;
+    if (chips > laterMax) { laterMax = chips; out.laterTableId = tableId; }
+  };
+  const main = playerSessions.get(socketId);
+  if (main) {
+    add(main.tableId, main.seatIndex);
+    for (const ms of multiTableSessions.get(socketId) || []) if (ms) add(ms.tableId, ms.seatIndex);
+  }
+  for (const [sid, s] of playerSessions) {
+    if (sid !== socketId && s.tableId === targetTableId && authSessions.get(sid)?.userId === userId) add(s.tableId, s.seatIndex);
+  }
+  for (const [sid, list] of multiTableSessions) {
+    if (sid === socketId || !Array.isArray(list) || authSessions.get(sid)?.userId !== userId) continue;
+    for (const ms of list) if (ms && ms.tableId === targetTableId) add(ms.tableId, ms.seatIndex);
+  }
+  const r = reservedSeats.get(userId);
+  if (r && r.tableId === targetTableId && !isTournamentReservation(r)) {
+    const rSeat = tableManager.getTable(r.tableId)?.seats[r.seatIndex];
+    if (rSeat && rSeat.playerName === r.playerName && !seatPlayedByAnotherAccount(userId, r.tableId, r.seatIndex)) add(r.tableId, r.seatIndex);
+  }
+  return out;
+}
+// ========== end join pre-checks ==========
 
 // ========== Seat-restore play gate (2026-10-07 review fix) ==========
 /**
@@ -9764,7 +9940,8 @@ function cleanupQuickTable(tableId: string): void {
       if (!seat.isAI && !isTournament) {
         const owner = quickSeatOwner(tableId, i);
         endQuickSeatClaims(tableId, i);
-        if (owner && !prizeFormat) {
+        // F69 (2026-10-21) — a pending removal with no account (noCredit) names userId 0: nobody to pay.
+        if (owner && owner.userId > 0 && !prizeFormat) {
           const refund = seat.chipCount + (inHand ? (seat.totalInvestedThisHand || 0) : 0);
           if (refund > 0) {
             quickGameStats.cashedOut++;
@@ -10306,7 +10483,15 @@ io.on('connection', (socket: Socket) => {
           success: true, qualifierId: qualId, reentry: true, registered: true,
           tournamentId: qt.tournamentId, tableId: reentryTableId, registeredCount: qt.players.length,
         });
+        // 2026-10-21 (gameplay F142) — told like a late first entry, so the
+        // client opens his new seat (it only refreshed the lobby list: his new
+        // stack was blinded off while he looked at the lobby).
+        socket.emit('qualifierTournamentStarted', {
+          qualifierId: qualId, tournamentId: qt.tournamentId, tableId: reentryTableId,
+          tableCount: tournament.tableIds.length, playerCount: qt.players.length, lateEntry: true, reentry: true,
+        });
         broadcastGameState(reentryTableId);
+        broadcastQualifierUpdate(qualId, qt);
         return;
       }
 
@@ -12231,31 +12416,50 @@ Give feedback in this JSON format:
     for (let i = 0; i < MAX_SEATS; i++) {
       const seat = table.seats[i];
       if (!seat || seat.state !== 'occupied') continue;
-      if (!seat.isAI && !isTournament) {
-        const uid = userIdForSeat(data.tableId, i);
-        if (uid) {
-          let uname = String(uid);
-          for (const [, a] of authSessions) if (a.userId === uid) { uname = a.username; break; }
-          const refund = seat.chipCount + (inHand ? (seat.totalInvestedThisHand || 0) : 0);
-          if (refund > 0) {
-            addChipsToUser(uid, refund)
-              .then((ok) => auditLog(uname, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: uid, tableId: data.tableId, amount: refund, reason: 'admin_force_close' }))
-              .catch(() => {});
+      if (!seat.isAI) {
+        // 2026-10-21 (gameplay F69) — the seat's owner through his session, his
+        // EXTRA-table session, his RESERVATION (disconnected) or a pending
+        // after-hand removal (he left mid-hand) — quickSeatOwner, as
+        // cleanupQuickTable does. Only a main session was found before: every
+        // other human stack was stood up with nothing credited, and a
+        // disconnected player's reservation later paid its stale snapshot. The
+        // claims that would credit the seat LATER end here (endQuickSeatClaims),
+        // so it is credited exactly once, with its live stack.
+        const owner = quickSeatOwner(data.tableId, i);
+        endQuickSeatClaims(data.tableId, i);
+        if (!isTournament) {
+          // A pending removal made for a seat with no account (noCredit) names userId 0: nobody to pay.
+          if (owner && owner.userId > 0) {
+            const refund = seat.chipCount + (inHand ? (seat.totalInvestedThisHand || 0) : 0);
+            if (refund > 0) {
+              addChipsToUser(owner.userId, refund)
+                .then((ok) => auditLog(owner.username, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: owner.userId, tableId: data.tableId, amount: refund, reason: 'admin_force_close' }))
+                .catch(() => {});
+            }
           }
+        } else {
+          auditLog(owner ? owner.username : '', 'TOURNAMENT_STACK_NOT_CASHED', { userId: owner?.userId ?? null, tableId: data.tableId, reason: 'admin_force_close' });
         }
-      } else if (!seat.isAI && isTournament) {
-        auditLog(String(userIdForSeat(data.tableId, i) || ''), 'TOURNAMENT_STACK_NOT_CASHED', { tableId: data.tableId, reason: 'admin_force_close' });
       }
       table.standUp(i);
     }
-    // Clear timers + boot everyone from the room.
-    const at = turnTimers.get(data.tableId); if (at) { clearTimeout(at.timeout); turnTimers.delete(data.tableId); }
-    const aw = turnWarningTimers.get(data.tableId); if (aw) { clearTimeout(aw.timeout); turnWarningTimers.delete(data.tableId); } // #12
-    const pa = pendingAutoStartTimers.get(data.tableId); if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(data.tableId); }
-    io.to(`table:${data.tableId}`).emit('tableClosedByAdmin', { tableId: data.tableId });
+    // F147 (2026-10-21) — the seated / watching clients are told the table is
+    // gone the way every other close tells them ('tableClosed', which closes
+    // the table view; 'tableClosedByAdmin' kept for older clients — it was a
+    // toast only, and the player sat on a frozen table). Emitted BEFORE the
+    // sockets leave the room. Then every session, extra-table session,
+    // spectator view, room membership and timer of the table ends with it
+    // (endTableViewsAndTimers — they pointed at a removed table).
+    const closedRoom = `table:${data.tableId}`;
+    io.to(closedRoom).emit('tableClosedByAdmin', { tableId: data.tableId });
+    io.to(closedRoom).emit('tableClosed', { tableId: data.tableId, reason: 'admin_force_close' });
+    endTableViewsAndTimers(data.tableId);
     tableManager.removeTable(data.tableId);
     tableProgressListeners.delete(data.tableId); // #7: don't leak the listener key
     quickTables.delete(data.tableId);
+    privateTableIds.delete(data.tableId);
+    privateTableMeta.delete(data.tableId);
+    bombPotPending.delete(data.tableId);
     socket.emit('adminForceCloseTableResult', { success: true, tableId: data.tableId });
   });
 
@@ -13485,13 +13689,82 @@ Give feedback in this JSON format:
       // P-g (round 5): through detachSocketFromOtherTables — the spectated
       // tables' ROOMS are left too (the old scrub left the socket in them:
       // their chat / emotes / tournament events reached the new seat).
+      //
+      // 2026-10-21 (gameplay F143) — every refusal comes BEFORE that scrub and
+      // the leave below. A join that left his seat and was then refused ("No
+      // seats available", "Insufficient chips") cost him his seat and his hand
+      // at the table he was playing, and left his client on a frozen view of
+      // it. Decided here, with nothing changed yet:
+      //   (a) a seat the join can take — an empty seat below the cap, or a bot
+      //       not in the hand (a pure lookup: the bot is stood up only after the
+      //       leave). A seat of HIS at this table (a seat change, a ghost seat)
+      //       is freed by the leave / ghost clear: then the search after them
+      //       decides, as before;
+      //   (b) the buy-in against his wallet plus what the leave credits AT ONCE
+      //       (projectedJoinCredits). Chips still in a live pot come back only
+      //       when that hand ends: refused `finish_hand_first` (never folded).
+      // The checks after the leave stay (the authoritative ones); a refusal
+      // there names the table he left (`leftTableId`).
+      const joinSeatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
+      const authAtJoin = authSessions.get(socket.id);
+      {
+        let seatFound = false;
+        for (let i = 0; i < joinSeatCap && !seatFound; i++) {
+          seatFound = table.seats[i].state === 'empty' || aiSeatTakeableNow(table, i);
+        }
+        if (!seatFound && !accountHoldsSeatAt(socket.id, authAtJoin?.userId, tableId)) {
+          socket.emit('error', { message: 'No seats available', code: 'no_seat_available' });
+          return;
+        }
+      }
+
+      // 2026-06-11 audit C6: clamp the CLIENT-supplied buy-in. PokerTable.sitDown
+      // only enforced the minimum, so a crafted joinTable payload could seat an
+      // arbitrarily large stack, distorting table economics / SPR. (Not a mint —
+      // it's the player's own wallet chips, deducted + credited back — but a
+      // fairness issue.) The cap is a generous heuristic: 10× the table minimum
+      // — F110 (2026-10-21): or the table's own Max Buy-In (a club table's) when
+      // lower. A missing/zero buy-in defaults to the minimum. (F143: before the
+      // affordability check below.)
+      if (table) {
+        const cap = Math.min(table.config.minBuyIn * 10, table.maxBuyInSetting ?? Infinity);
+        buyIn = Math.max(table.config.minBuyIn, Math.min(buyIn || table.config.minBuyIn, cap));
+        // R2 (CLUBS-1) — a club challenge is a freezeout for its stakes: both
+        // players buy in for EXACTLY the stakes (the table's minBuyIn).
+        if (challengeTables.has(tableId)) buyIn = table.config.minBuyIn;
+      }
+
+      const existingSession = playerSessions.get(socket.id);
+      if (authAtJoin) {
+        // P3 — priced against: this account, the socket's seat as it is NOW
+        // (not left yet), no seat at this table, this live table.
+        const preLeaveState: BuyInExpectation = {
+          userId: authAtJoin.userId, mainSession: existingSession ?? null,
+          ...(existingSession?.tableId === tableId ? {} : { notSeatedAt: tableId }),
+          table: { tableId, table },
+        };
+        const walletBeforeLeave = await ensureChipsForBuyIn(authAtJoin.userId, authAtJoin.username, buyIn);
+        if (await buyInSocketGone(socket, 'joinTable', 'pre_leave_balance', undefined, preLeaveState)) return; // nothing left or deducted
+        const leaveCredits = projectedJoinCredits(socket.id, authAtJoin.userId, tableId);
+        if (buyIn > walletBeforeLeave + leaveCredits.now) {
+          if (leaveCredits.laterTableId && buyIn <= walletBeforeLeave + leaveCredits.now + leaveCredits.later) {
+            socket.emit('error', { message: FINISH_HAND_FIRST_MESSAGE, code: 'finish_hand_first', tableId: leaveCredits.laterTableId });
+          } else {
+            socket.emit('error', { message: 'Insufficient chips', code: 'insufficient_chips' });
+          }
+          return;
+        }
+      }
+
       detachSocketFromOtherTables(socket, tableId, 'seat', 'joinTable');
 
       // If player already has a session, leave old table first
-      const existingSession = playerSessions.get(socket.id);
       if (existingSession) {
         handlePlayerLeave(socket);
       }
+      // F143 — every refusal from here on names the table he just left.
+      const leftTableId: string | null = existingSession ? existingSession.tableId : null;
+      const afterLeave = <T extends Record<string, unknown>>(frame: T): T => (leftTableId ? { ...frame, leftTableId } : frame);
 
       // Ghost-seat cleanup: stand up any other seat on this table held by
       // the same authenticated user via a prior socket / reserved entry.
@@ -13507,7 +13780,6 @@ Give feedback in this JSON format:
       // maxSeats, a variant's deck cap) is invalid too, and the search stays
       // below it: it used to "find" seat N past the cap, deduct the buy-in and
       // have sitDown refuse it — a 2-3 seat club table never seated a member.
-      const joinSeatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
       if (seatIndex < 0 || seatIndex >= joinSeatCap || table.seats[seatIndex].state !== 'empty') {
         // Find an empty seat first
         seatIndex = -1;
@@ -13521,7 +13793,7 @@ Give feedback in this JSON format:
         // the hand being played (its pot chips were erased with it).
         if (seatIndex === -1) seatIndex = takeAiSeatForJoin(table, tableId);
         if (seatIndex === -1) {
-          socket.emit('error', { message: 'No seats available', code: 'no_seat_available' });
+          socket.emit('error', afterLeave({ message: 'No seats available', code: 'no_seat_available' }));
           return;
         }
       }
@@ -13549,25 +13821,8 @@ Give feedback in this JSON format:
       const tableSlotKey = `${tableId}`;
       if (!ipSeatedSlots.has(clientIp)) ipSeatedSlots.set(clientIp, new Set());
       const mySlots = ipSeatedSlots.get(clientIp)!;
-      const sameNetworkSockets = [...mySlots]
-        .filter((slot) => slot.endsWith(`:${tableSlotKey}`))
-        .map((slot) => slot.slice(0, slot.length - tableSlotKey.length - 1))
-        .filter((sid) => sid !== socket.id);
 
-      // 2026-06-11 audit C6: clamp the CLIENT-supplied buy-in. PokerTable.sitDown
-      // only enforced the minimum, so a crafted joinTable payload could seat an
-      // arbitrarily large stack, distorting table economics / SPR. (Not a mint —
-      // it's the player's own wallet chips, deducted + credited back — but a
-      // fairness issue.) TableConfig has no maxBuyIn field, so the cap is a
-      // generous heuristic: 10× the table minimum. A missing/zero buy-in
-      // defaults to the minimum.
-      if (table) {
-        const cap = table.config.minBuyIn * 10;
-        buyIn = Math.max(table.config.minBuyIn, Math.min(buyIn || table.config.minBuyIn, cap));
-        // R2 (CLUBS-1) — a club challenge is a freezeout for its stakes: both
-        // players buy in for EXACTLY the stakes (the table's minBuyIn).
-        if (challengeTables.has(tableId)) buyIn = table.config.minBuyIn;
-      }
+      // (The C6 buy-in clamp runs above, before the F143 affordability check.)
 
       // Validate buy-in against DB balance for authenticated users. In
       // testing mode, ensureChipsForBuyIn auto-tops-up below-buyin balances
@@ -13575,15 +13830,21 @@ Give feedback in this JSON format:
       if (authForJoin) {
         // P3 — what this buy-in is priced against: still this account, still no
         // seat on this socket (left above), still this live table.
-        const joinState: BuyInExpectation = { userId: authForJoin.userId, mainSession: null, notSeatedAt: tableId, table: { tableId, table } };
+        const joinState: BuyInExpectation = {
+          userId: authForJoin.userId, mainSession: null, notSeatedAt: tableId, table: { tableId, table },
+          answer: () => socket.emit('error', afterLeave({ message: BUY_IN_CANCELLED_MESSAGE, code: 'buy_in_cancelled' })),
+        };
+        // F143 — the stacks the leave / ghost clear just credited land first
+        // (their addChipsToUser was not awaited: the read raced them).
+        await seatCreditsSettled(authForJoin.userId);
         const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, buyIn);
         if (await buyInSocketGone(socket, 'joinTable', 'balance_read', undefined, joinState)) return; // F3 — nothing deducted yet
         if (buyIn > dbChips) {
-          socket.emit('error', { message: 'Insufficient chips' });
+          socket.emit('error', afterLeave({ message: 'Insufficient chips', code: 'insufficient_chips' }));
           return;
         }
         if (!(await deductChips(authForJoin.userId, buyIn))) {
-          socket.emit('error', { message: 'Could not deduct chips — try again' });
+          socket.emit('error', afterLeave({ message: 'Could not deduct chips — try again' }));
           return;
         }
         auditLog(authForJoin.username, 'BUY_IN_DEDUCT', { tableId, buyIn });
@@ -13594,8 +13855,25 @@ Give feedback in this JSON format:
         }, joinState)) return;
       }
 
+      // G190 (2026-10-21) — the same-network check reads the slots AFTER the
+      // awaits (two racing joins each saw the other's slot missing).
+      const sameNetworkSockets = [...mySlots]
+        .filter((slot) => slot.endsWith(`:${tableSlotKey}`))
+        .map((slot) => slot.slice(0, slot.length - tableSlotKey.length - 1))
+        .filter((sid) => sid !== socket.id);
       mySlots.add(`${socket.id}:${tableSlotKey}`);
       if (sameNetworkSockets.length > 0) noteSameNetworkSeat(tableId, table, playerName, sameNetworkSockets, authForJoin?.userId);
+
+      // G190 (2026-10-21) — the ghost-seat clear AGAIN at the commit (nothing
+      // awaited between it and sitDown), as quickPlay / the waitlist / an extra
+      // table do: two joins of one account racing through the buy-in awaits
+      // each cleared before the other sat, and both sat (two seats, two hands,
+      // four hole cards for one account). The later one now ends the earlier
+      // one's seat (credited; seatVacated) — latest join wins.
+      {
+        const authNow = authSessions.get(socket.id);
+        if (authNow) clearGhostSeatsForUser(authNow.userId, tableId, socket.id, seatIndex);
+      }
 
       const playerId = `player-${uuidv4()}`;
       const success = table.sitDown(
@@ -13622,7 +13900,7 @@ Give feedback in this JSON format:
           auditLog(authForJoin.username, refunded ? 'BUY_IN_REFUND' : 'BUY_IN_REFUND_FAILED', { tableId, buyIn, reason: 'sitDown_failed' });
         }
         mySlots.delete(`${socket.id}:${tableSlotKey}`);
-        socket.emit('error', { message: 'Could not sit down at that seat' });
+        socket.emit('error', afterLeave({ message: 'Could not sit down at that seat' }));
         return;
       }
 
@@ -15574,6 +15852,11 @@ Give feedback in this JSON format:
                   ? resumeFieldsFor(lu.id, wlBootstrapSession.masterUserId, lu.token_version, { isAdmin: !!lu.is_admin })
                   : {}),
                 ...(wlRequestId ? { requestId: wlRequestId } : {}),
+                // 2026-10-21 (gameplay F140) — WHERE he was just seated (this
+                // success frame only): the client opens that table. A sign-in
+                // lands on the lobby, so the seat he had paid for was dealt in
+                // and blinded off while he looked at the lobby.
+                seatedAt: { tableId: bestTable.tableId, seatIndex: targetSeat },
               });
             } else {
               console.error(`[waitlistContext] seated but local user ${seatedAuth.userId} vanished — no loginResult sent`);
@@ -15699,7 +15982,8 @@ Give feedback in this JSON format:
     // (it's the player's own wallet, deducted + balance-checked below) but
     // without an upper bound a crafted rebuy could seat an oversized stack and
     // distort table economics / SPR — the same fairness issue C6 addressed.
-    const maxBuyIn = table.config.minBuyIn * 10;
+    // F110 (2026-10-21) — and never above a club table's own Max Buy-In.
+    const maxBuyIn = Math.min(table.config.minBuyIn * 10, table.maxBuyInSetting ?? Infinity);
     const requested = Math.min(maxBuyIn, Math.max(table.config.minBuyIn, data?.amount || table.config.minBuyIn));
     // How much are we actually trying to top up to?
     const topUpAmount = Math.max(0, requested - seat.chipCount);
@@ -15811,6 +16095,14 @@ Give feedback in this JSON format:
       // change there would race with table-balance decisions.
       if (isTournamentTable(session.tableId)) {
         socket.emit('error', { message: 'Seat moves are disabled in tournaments' });
+        return;
+      }
+      // 2026-10-21 (gameplay F100) — nor at a FIXED-ROSTER table (Heads-Up Snap,
+      // Spin & Go, all-in-or-fold, career, a club challenge): a move onto a bot's
+      // seat stood the bot up, and the game was then "won" with no hand played
+      // (a Spin & Go prize, a career stage's reward). Its seats never change.
+      if (isFixedRosterTable(session.tableId)) {
+        socket.emit('error', { message: 'Seat changes are not available in this game.', code: 'seat_move_not_allowed', tableId: session.tableId });
         return;
       }
 
@@ -18369,7 +18661,8 @@ Give feedback in this JSON format:
     // cleanup in handlePlayerLeave).
     const effectiveBuyIn = Math.max(
       table.config.minBuyIn,
-      Math.min(buyIn || table.config.minBuyIn, table.config.minBuyIn * 10) // C6: 10× heuristic cap (no maxBuyIn field)
+      // C6: 10× heuristic cap; F110 (2026-10-21): a table's own Max Buy-In (club) when lower.
+      Math.min(buyIn || table.config.minBuyIn, table.config.minBuyIn * 10, table.maxBuyInSetting ?? Infinity)
     );
     const authAdd = authSessions.get(socket.id);
     if (authAdd) {
@@ -18703,22 +18996,50 @@ Give feedback in this JSON format:
       return;
     }
 
-    // R3 (S1-1 / XL-1 / K3-1) — a seat BELOW the home game's cap (maxSeats):
-    // the first empty one, else a bot's seat freed for him (never a bot in the
-    // hand being played — takeAiSeatForJoin), decided BEFORE any chip moves.
-    // It used to take the first empty seat of all nine — past the cap once the
-    // bots filled the rest: the buy-in was deducted, sitDown refused, and the
-    // invitee was refunded and told 'Could not seat you' on every attempt.
-    // 'Table is full.' only when no seat can be freed at all.
+    // R3 (S1-1 / XL-1 / K3-1) — the seat is one BELOW the home game's cap
+    // (maxSeats), decided BEFORE any chip moves (the pick itself is after the
+    // leave below).
     const inviteSeatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
-    let openSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < inviteSeatCap);
-    if (openSeat === -1) openSeat = takeAiSeatForJoin(table, tableId);
-    if (openSeat === -1) {
-      const botInHand = table.seats.some((s, i) => i < inviteSeatCap && s.state === 'occupied' && s.isAI);
-      socket.emit('joinError', botInHand
+    const noInviteSeat = (): { message: string; code: string } => (
+      table.seats.some((s, i) => i < inviteSeatCap && s.state === 'occupied' && s.isAI)
         ? { message: 'Every seat is in this hand — a seat opens when it ends. Try again in a moment.', code: 'seat_opens_after_hand' }
         : { message: 'Table is full.', code: 'table_full' });
+    // 2026-10-21 (gameplay F143) — the seat (a pure lookup here: a bot is stood
+    // up only after the leave below) and the buy-in are decided BEFORE the
+    // socket leaves its seat: a refusal after the leave ("Insufficient chips
+    // for this table.") cost him his seat and hand at his current table. A seat
+    // of HIS at this table (freed by the leave / the ghost clear) defers the
+    // seat decision to after them.
+    const authAtInvite = authSessions.get(socket.id);
+    if (!table.seats.some((s, i) => i < inviteSeatCap && (s.state === 'empty' || aiSeatTakeableNow(table, i)))
+        && !accountHoldsSeatAt(socket.id, authAtInvite?.userId, tableId)) {
+      socket.emit('joinError', noInviteSeat());
       return;
+    }
+
+    // 2026-06-19 Phase 4: clamp the client buy-in to [minBuyIn, minBuyIn*10],
+    // matching joinTable's audit-C6 cap (this invite path only enforced the
+    // minimum). Own-wallet + balance-checked below, so not a mint — this is the
+    // same table-economics/SPR fairness bound.
+    const actualBuyIn = Math.min(table.config.minBuyIn * 10, table.maxBuyInSetting ?? Infinity, Math.max(table.config.minBuyIn, buyIn || table.config.minBuyIn));   // F110
+
+    const sessionBeforeLeave = playerSessions.get(socket.id);
+    if (authAtInvite) {
+      // F143 — affordable with his wallet plus what the leave credits AT ONCE?
+      // Priced against this account, the socket's seat as it is now, this table.
+      const preLeaveState: BuyInExpectation = {
+        userId: authAtInvite.userId, mainSession: sessionBeforeLeave ?? null, table: { tableId, table },
+        answer: (reason) => socket.emit('joinError', { message: BUY_IN_CANCELLED_MESSAGE, code: 'buy_in_cancelled', reason }),
+      };
+      const walletBeforeLeave = await ensureChipsForBuyIn(authAtInvite.userId, authAtInvite.username, actualBuyIn);
+      if (await buyInSocketGone(socket, 'joinByInviteCode', 'pre_leave_balance', undefined, preLeaveState)) return; // nothing left or deducted
+      const leaveCredits = projectedJoinCredits(socket.id, authAtInvite.userId, tableId);
+      if (actualBuyIn > walletBeforeLeave + leaveCredits.now) {
+        socket.emit('joinError', leaveCredits.laterTableId && actualBuyIn <= walletBeforeLeave + leaveCredits.now + leaveCredits.later
+          ? { message: FINISH_HAND_FIRST_MESSAGE, code: 'finish_hand_first', tableId: leaveCredits.laterTableId }
+          : { message: 'Insufficient chips for this table.', code: 'insufficient_chips' });
+        return;
+      }
     }
 
     // P-g / P-a (round 5) — a socket that holds a seat leaves it FIRST, through
@@ -18729,12 +19050,31 @@ Give feedback in this JSON format:
     // the socket stayed in the old table's room.
     if (playerSessions.get(socket.id)) handlePlayerLeave(socket);
     detachSocketFromOtherTables(socket, tableId, 'seat', 'joinByInviteCode');
+    // F143 — every refusal from here on names the table he just left.
+    const leftTableId: string | null = sessionBeforeLeave && !playerSessions.has(socket.id) ? sessionBeforeLeave.tableId : null;
+    const afterLeave = <T extends Record<string, unknown>>(frame: T): T => (leftTableId ? { ...frame, leftTableId } : frame);
 
-    // 2026-06-19 Phase 4: clamp the client buy-in to [minBuyIn, minBuyIn*10],
-    // matching joinTable's audit-C6 cap (this invite path only enforced the
-    // minimum). Own-wallet + balance-checked below, so not a mint — this is the
-    // same table-economics/SPR fairness bound.
-    const actualBuyIn = Math.min(table.config.minBuyIn * 10, Math.max(table.config.minBuyIn, buyIn || table.config.minBuyIn));
+    // 2026-10-21 (gameplay F72) — ONE seat per account per table, as every other
+    // join enforces: this account's other seats here (another device's session,
+    // an extra-table seat, its reservation) are ended first (credited;
+    // seatVacated 'joined_new_seat'). The invite join never did: the same
+    // account sat twice at a home game (two hands, both dealt in).
+    if (authAtInvite) clearGhostSeatsForUser(authAtInvite.userId, tableId, socket.id);
+
+    // R3 (S1-1 / XL-1 / K3-1) — a seat BELOW the home game's cap (maxSeats):
+    // the first empty one, else a bot's seat freed for him (never a bot in the
+    // hand being played — takeAiSeatForJoin), before any chip moves (F143: the
+    // same pure lookup above refused before the leave). It used to take the first empty
+    // seat of all nine — past the cap once the bots filled the rest: the
+    // buy-in was deducted, sitDown refused, and the invitee was refunded and
+    // told 'Could not seat you' on every attempt. 'Table is full.' only when no
+    // seat can be freed at all.
+    let openSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < inviteSeatCap);
+    if (openSeat === -1) openSeat = takeAiSeatForJoin(table, tableId);
+    if (openSeat === -1) {
+      socket.emit('joinError', afterLeave(noInviteSeat()));
+      return;
+    }
 
     // Server-authoritative chip deduction for authenticated users — previously
     // this path bypassed deductChips entirely, letting a player multi-table
@@ -18746,16 +19086,18 @@ Give feedback in this JSON format:
       // this request began, still this live table; answered on joinError.
       const inviteState: BuyInExpectation = {
         userId: authForJoin.userId, mainSession: playerSessions.get(socket.id) ?? null, table: { tableId, table },
-        answer: (reason) => socket.emit('joinError', { message: BUY_IN_CANCELLED_MESSAGE, code: 'buy_in_cancelled', reason }),
+        answer: (reason) => socket.emit('joinError', afterLeave({ message: BUY_IN_CANCELLED_MESSAGE, code: 'buy_in_cancelled', reason })),
       };
+      // F143 — the stacks the leave / ghost clear just credited land first.
+      await seatCreditsSettled(authForJoin.userId);
       const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, actualBuyIn);
       if (await buyInSocketGone(socket, 'joinByInviteCode', 'balance_read', undefined, inviteState)) return; // F3 — nothing deducted yet
       if (actualBuyIn > dbChips) {
-        socket.emit('joinError', { message: 'Insufficient chips for this table.' });
+        socket.emit('joinError', afterLeave({ message: 'Insufficient chips for this table.', code: 'insufficient_chips' }));
         return;
       }
       if (!(await deductChips(authForJoin.userId, actualBuyIn))) {
-        socket.emit('joinError', { message: 'Could not deduct chips — try again.' });
+        socket.emit('joinError', afterLeave({ message: 'Could not deduct chips — try again.' }));
         return;
       }
       chipsDeducted = true;
@@ -18766,6 +19108,12 @@ Give feedback in this JSON format:
       }, inviteState)) return;
     }
 
+    // F72 — and again at the commit (nothing awaited between it and sitDown):
+    // another device of the account that sat down here during the buy-in awaits.
+    {
+      const authNow = authSessions.get(socket.id);
+      if (authNow) clearGhostSeatsForUser(authNow.userId, tableId, socket.id, openSeat);
+    }
     const playerId = `player-${uuidv4()}`;
     const success = table.sitDown(openSeat, playerName, actualBuyIn, playerId, false);
 
@@ -18777,7 +19125,7 @@ Give feedback in this JSON format:
         try { refunded = await addChipsToUser(authForJoin.userId, actualBuyIn); } catch { refunded = false; }
         auditLog(authForJoin.username, refunded ? 'INVITE_REFUND' : 'INVITE_REFUND_FAILED', { tableId, buyIn: actualBuyIn, reason: 'sitDown_failed' });
       }
-      socket.emit('joinError', { message: 'Could not seat you at that table.' });
+      socket.emit('joinError', afterLeave({ message: 'Could not seat you at that table.' }));
       return;
     }
 
@@ -19039,15 +19387,15 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
 // so a seat already cashed out won't be credited twice.
 function creditSeatStackToWallet(
   userId: number, username: string, tableId: string, seat: any, reason: string
-): void {
+): Promise<void> | undefined {   // F143 (2026-10-21) — the credit, for a caller that must await it
   const chips = (seat && seat.chipCount) || 0;
-  if (chips <= 0) return;
+  if (chips <= 0) return undefined;
   // R2 (item 1, GAME-3 / OPS-2) — the shutdown / crash flush OWNS every seat's
   // chips from the moment it starts (it claimed each seat once): no other path
   // credits one again.
   if (shutdownFlushActive()) {
     auditLog(username, 'CASH_OUT_LEFT_TO_SHUTDOWN_FLUSH', { userId, tableId, reason, chips });
-    return;
+    return undefined;
   }
   // 2026-06-11 audit (tournament economy): NEVER credit a tournament-table
   // stack to the wallet. Tournament stacks are tournament chips, not
@@ -19063,15 +19411,15 @@ function creditSeatStackToWallet(
     // R2 (2026-10-11): `amount` too — the row a leave wrote itself before the
     // seat teardown became one helper (teardownSeat) carried that key.
     auditLog(username, 'TOURNAMENT_STACK_NOT_CASHED', { userId, tableId, reason, chips, amount: chips });
-    return;
+    return undefined;
   }
   // R2 (ECON-8) — nor a Spin & Go stack: the prize format's chips (the entry
   // fee bought the seat; the winner is paid the prize).
   if (isPrizeFormatTable(tableId)) {
     auditLog(username, 'SPINGO_STACK_NOT_CASHED', { userId, tableId, reason, chips });
-    return;
+    return undefined;
   }
-  addChipsToUser(userId, chips)
+  return addChipsToUser(userId, chips)
     .then((ok: boolean) => {
       if (!ok) {
         console.error(`[creditSeatStackToWallet] addChipsToUser false userId=${userId} amount=${chips} (${reason})`);

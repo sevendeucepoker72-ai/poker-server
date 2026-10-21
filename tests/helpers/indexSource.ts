@@ -171,3 +171,15 @@ export const SEAT_RESTORE_SRC: string = slice(
  */
 export const MUCK_SHOWS_SRC: string = slice('const shownMuckedHands = new Set<string>();', '\nfunction dropPendingMuckShows(')
   + slice('function dropPendingMuckShows(', '\n}\n');
+
+/**
+ * 2026-10-21 (gameplay F143) — joinTable / joinByInviteCode decide the seat and
+ * the buy-in BEFORE they leave the socket's seat, through the join pre-check
+ * block (FINISH_HAND_FIRST_MESSAGE, accountHoldsSeatAt, projectedJoinCredits).
+ * A harness that slices either handler (or joinClubTable, which re-dispatches
+ * into joinTable) appends this. Scope it reads: playerSessions,
+ * multiTableSessions, authSessions, reservedSeats, tableManager,
+ * pendingSeatRemovalAfterHand, isTournamentTable, isPrizeFormatTable,
+ * isTournamentReservation, seatPlayedByAnotherAccount.
+ */
+export const JOIN_PRECHECK_SRC: string = slice('// ========== Join pre-checks', '// ========== end join pre-checks ==========\n');

@@ -506,6 +506,63 @@ describe('late entry into a RUNNING qualifier — seated at once or the credit g
   });
 });
 
+describe('F142 (2026-10-21) — a busted entrant is told he is OUT (and his re-entries left); a re-entry opens his new seat', () => {
+  /** A running qualifier (Bob + Carl at Q1) that Alice entered late and busted out of. */
+  function bustedAlice() {
+    const w = world();
+    w.sync(Date.now() - 10 * 60_000);
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    const tid = w.tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: qualifierBlindLevels(50_000), startingChips: 50_000 } as any);
+    w.tm.registerPlayer(tid, 'user-201', 'Bob', 'sb', undefined, 'm-201');
+    w.tm.registerPlayer(tid, 'user-202', 'Carl', 'sc', undefined, 'm-202');
+    w.tm.startTournament(tid);
+    const t = new PokerTable({ tableId: 'Q1', tableName: 'Q1', smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+    t.sitDown(0, 'Bob', 50_000, 'user-201', false, true);
+    t.sitDown(1, 'Carl', 50_000, 'user-202', false, true);
+    w.tables.set('Q1', t);
+    w.tm.setTableIds(tid, ['Q1']);
+    w.tm.setPlayerTable(tid, 'user-201', 'Q1');
+    w.tm.setPlayerTable(tid, 'user-202', 'Q1');
+    Object.assign(qt, {
+      status: 'running', tournamentId: tid,
+      players: [
+        { playerId: 'user-201', masterPlayerId: 'm-201', playerName: 'Bob', phone: '', socketId: 'sb' },
+        { playerId: 'user-202', masterPlayerId: 'm-202', playerName: 'Carl', phone: '', socketId: 'sc' },
+      ],
+    });
+    w.tm.addLateEntrant(tid, 'user-101', 'Alice', 'old', 50_000, { masterUserId: 'm-alice' });
+    qt.players.push({ playerId: 'user-101', masterPlayerId: 'm-alice', playerName: 'Alice', phone: '', socketId: 'old', reEntries: 0 });
+    w.tm.eliminatePlayer(tid, 'user-101');
+    expect(w.tm.getTournament(tid)!.status).toBe('running');
+    return { w, tid, qt, t };
+  }
+
+  it('the list item, per viewer: his busted entry → registered + eliminated, 3 re-entries left; a live entrant → not eliminated; no entry → reEntriesLeft null', () => {
+    const { w } = bustedAlice();
+    expect(w.m.qualifierList('m-alice')[0]).toMatchObject({ status: 'running', registered: true, eliminated: true, reEntriesLeft: 3 });
+    expect(w.m.qualifierList('m-201')[0]).toMatchObject({ registered: true, eliminated: false, reEntriesLeft: 3 });
+    expect(w.m.qualifierList('m-nobody')[0]).toMatchObject({ registered: false, eliminated: false, reEntriesLeft: null });
+    expect(w.m.qualifierList(null)[0]).toMatchObject({ registered: false, eliminated: false, reEntriesLeft: null });
+  });
+
+  it('his re-entry seats him AND tells him like a late entry (qualifierTournamentStarted {reentry, lateEntry, tableId}); the list then says 2 left, not out', async () => {
+    const { w, tid, t } = bustedAlice();
+    const before = w.globalEmits.length;
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await a.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
+    await flush();
+    expect(t.seats.find((s) => s.playerId === 'user-101')).toMatchObject({ state: 'occupied', chipCount: 50_000 });
+    expect(w.of('SA', 'qualifierRegistrationResult')).toEqual([expect.objectContaining({ success: true, reentry: true, tableId: 'Q1' })]);
+    expect(w.of('SA', 'qualifierTournamentStarted')).toEqual([expect.objectContaining({
+      qualifierId: WEEKLY, tournamentId: tid, tableId: 'Q1', lateEntry: true, reentry: true,
+    })]);
+    // The lobby list everyone sees follows (broadcastQualifierUpdate).
+    expect(w.globalEmits.slice(before).filter(([ev]) => ev === 'qualifierTournamentUpdate').map(([, d]) => d))
+      .toEqual([expect.objectContaining({ qualifierId: WEEKLY, status: 'running', tournamentId: tid })]);
+    expect(w.m.qualifierList('m-alice')[0]).toMatchObject({ registered: true, eliminated: false, reEntriesLeft: 2 });
+  });
+});
+
 describe('the qualifier lifecycle — started, cancelled for too few players, finished with each finisher\'s place + seat', () => {
   it('at its time with fewer than 2 players it WAITS; still short after late registration → cancelled, credits refunded', async () => {
     const w = world();

@@ -27,7 +27,7 @@ import { createPrizeLedger } from '../src/game/prizeLedger';
 import { createWindowRateLimiter } from '../src/auth/rateLimit';
 import { validateTableConfig } from '../src/game/tableConfigValidation';
 import { accountDisplayName } from '../src/auth/displayName';
-import { SRC, slice, fnSrc, handlerSrc, load, flush } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, JOIN_PRECHECK_SRC } from './helpers/indexSource';
 import { createFakeLedgerDb } from './helpers/fakeLedgerDb';
 
 const ALICE = 101;
@@ -154,6 +154,7 @@ ${CLUB_RUNTIME}
 ${LEAVE}
 ${BOT_STACKS}
 ${AUTOSTART}
+${JOIN_PRECHECK_SRC}
 function wire(socket) {
   ${Object.values(H).join('\n  ')}
 }`;

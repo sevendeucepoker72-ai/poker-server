@@ -16,7 +16,7 @@
  */
 import { PokerTable } from '../src/game/PokerTable';
 import { TournamentManager } from '../src/game/TournamentManager';
-import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_SESSION_FOR_SRC, JOIN_PRECHECK_SRC } from './helpers/indexSource';
 // R1 contract #3 (2026-10-11): the seat paths name the seat from the ACCOUNT and allowlist the avatar.
 import { accountDisplayName } from '../src/auth/displayName';
 import { sanitizeSeatAvatar } from '../src/seatProfile';
@@ -212,6 +212,7 @@ ${WAITLIST_MISMATCH}
 ${SEAT_NAME}
 ${WHO_SITS}
 ${QUALIFIER_HELPERS}
+${JOIN_PRECHECK_SRC}
 function wire(socket) {
 ${SEAT_SESSION_FOR_SRC}
   ${Object.values(h).join('\n  ')}
@@ -417,6 +418,37 @@ describe('F3 — a LIVE socket is unaffected: one deduct, no refund, seated/regi
     expect(w.deductions).toEqual([{ uid: ALICE, amount: 6000 }]);
     expect(w.credits).toEqual([]);
     expect(w.cash.seats[4].chipCount).toBe(8000);
+  });
+});
+
+describe('F140 (2026-10-21) — the waitlist link\'s success loginResult says WHERE he was just seated', () => {
+  const SEATED_AT = '                seatedAt: { tableId: bestTable.tableId, seatIndex: targetSeat },\n';
+  const waitlistPath = () => PATHS.find((x) => (x.event as string) === 'waitlist')!;
+  const successFrames = (w: ReturnType<typeof world>) =>
+    w.emitted.filter(([ev, d]) => ev === 'loginResult' && d?.success === true).map(([, d]) => d);
+
+  it('loginResult.seatedAt = { tableId, seatIndex } of the seat just bought (the client opens that table, not the lobby)', async () => {
+    const w = world();
+    const s = w.mkSocket('S1');
+    await run(w, waitlistPath(), s);
+    jest.advanceTimersByTime(4000);
+    await flush();
+    const seat = w.playerSessions.get('S1');
+    expect(seat).toMatchObject({ tableId: 'cash1' });
+    expect(successFrames(w)).toEqual([expect.objectContaining({ seatedAt: { tableId: 'cash1', seatIndex: seat.seatIndex } })]);
+  });
+
+  it('CONTROL — pre-F140: the success frame does not say where he sits (poker-3d landed him on the lobby)', async () => {
+    expect(H.waitlist).toContain(SEATED_AT);
+    const w = world({ handlers: { waitlist: H.waitlist.replace(SEATED_AT, '') } });
+    const s = w.mkSocket('S1');
+    await run(w, waitlistPath(), s);
+    jest.advanceTimersByTime(4000);
+    await flush();
+    expect(w.playerSessions.get('S1')).toMatchObject({ tableId: 'cash1' });
+    const [frame] = successFrames(w);
+    expect(frame).toBeTruthy();
+    expect(frame.seatedAt).toBeUndefined();
   });
 });
 

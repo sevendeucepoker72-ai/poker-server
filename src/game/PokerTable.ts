@@ -358,6 +358,15 @@ export class PokerTable extends EventEmitter {
    */
   public maxOccupiableSeats: number = MAX_SEATS;
 
+  /**
+   * 2026-10-21 (gameplay F110) — the table's own MAXIMUM buy-in, when it has
+   * one (a club table's Max Buy-In, stored in club_tables and validated to be at
+   * least minBuyIn). null = none: a join / rebuy / top-up is capped at the
+   * 10 x minBuyIn heuristic only. Set by the server when it creates the table;
+   * the cap the server applies is the smaller of the two.
+   */
+  public maxBuyInSetting: number | null = null;
+
   constructor(config: TableConfig) {
     super();
     this.config = config;

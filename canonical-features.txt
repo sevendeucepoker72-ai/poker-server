@@ -1413,3 +1413,34 @@ reason: 'cancelled'
 reason: 'unchanged'
 reason: 'restored'
 delete session.pendingSeatIndex;
+
+# 2026-10-21 gameplay S7 (seat lifecycle: join, invite, move, force-close, buy-in limits).
+# F100: no seat move at a fixed-roster table (quick formats, club challenges).
+# F65 / F66 / G188: a seat move keeps the mover's Sit Out and owed dead blinds,
+# drops his old seat from the sit-out tracker and owes the big blind it skips.
+# F69 / F147: admin force-close credits every human seat once (session, extra
+# seat, reservation, leaving seat) and sends tableClosed admin_force_close.
+# F143: joinTable / joinByInviteCode refuse before leaving the current seat
+# (finish_hand_first; a refusal after the leave carries leftTableId) and await
+# the leave's credit. G190 / F72: one seat per account per table at the join
+# commit. F110: a club table's Max Buy-In. F140: waitlist loginResult.seatedAt.
+# F142: qualifier list eliminated / reEntriesLeft; a re-entry is told like a late entry.
+seat_move_not_allowed
+if (isFixedRosterTable(session.tableId)) {
+seat_move_owes_big_blind
+tracker.delete(oldSeat);
+session.sittingOut = wasSittingOut;
+table.seats[target].deadBlindOwedChips = owedDeadBlindChips;
+endQuickSeatClaims(data.tableId, i);
+reason: 'admin_force_close'
+function projectedJoinCredits(
+function accountHoldsSeatAt(
+finish_hand_first
+leftTableId
+await seatCreditsSettled(authForJoin.userId);
+clearGhostSeatsForUser(authNow.userId, tableId, socket.id, seatIndex);
+clearGhostSeatsForUser(authAtInvite.userId, tableId, socket.id);
+maxBuyInSetting
+seatedAt: { tableId: bestTable.tableId, seatIndex: targetSeat }
+reEntriesLeft
+lateEntry: true, reentry: true

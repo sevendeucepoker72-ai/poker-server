@@ -28,7 +28,7 @@ import { ShortDeckTable } from '../src/game/variants/ShortDeckTable';
 import { cardToString } from '../src/game/Card';
 import {
   SRC, slice, fnSrc, handlerSrc, load, flush, deferred,
-  SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, SEAT_RESTORE_SRC, MUCK_SHOWS_SRC,
+  SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, SEAT_RESTORE_SRC, MUCK_SHOWS_SRC, JOIN_PRECHECK_SRC,
 } from './helpers/indexSource';
 
 const quiet = { log() {}, warn() {}, error() {} };
@@ -681,7 +681,7 @@ function seatWorld(opts: { disconnect?: string; join?: string; autoStart?: strin
     activateBombPotIfPending() {}, tournamentManager: { getTournament: () => undefined }, log: { debug() {}, info() {} },
     console: quiet,
   };
-  const code = `${DEP}\n${opts.autoStart ?? AUTO_START}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${opts.join ?? JOIN}\n${opts.disconnect ?? DISCONNECT}\n}`;
+  const code = `${DEP}\n${JOIN_PRECHECK_SRC}\n${opts.autoStart ?? AUTO_START}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${opts.join ?? JOIN}\n${opts.disconnect ?? DISCONNECT}\n}`;
   const { exports: m, stubbed } = load(code, scope, '{ wire, autoStartNextHand }');
   const mk = (id: string) => { const s = fakeSocket(id); sockets.set(id, s); m.wire(s); return s; };
   for (const id of ['SB', 'SC']) mk(id);

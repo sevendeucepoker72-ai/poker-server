@@ -11,7 +11,7 @@
  */
 import { PokerTable } from '../src/game/PokerTable';
 import { validateTableConfig, validateChallengeStakes, sanitizeTableName, TABLE_CONFIG_LIMITS } from '../src/game/tableConfigValidation';
-import { handlerSrc, fnSrc, load, flush } from './helpers/indexSource';
+import { handlerSrc, fnSrc, load, flush, JOIN_PRECHECK_SRC } from './helpers/indexSource';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const authManager = require('../src/auth/authManager') as typeof import('../src/auth/authManager');
 
@@ -180,10 +180,12 @@ describe('the handlers (real src/index.ts source)', () => {
           return true;
         };
       }
-      const code = `function wire(socket) {\n${handlerSrc('joinTable', '\n    })(); }\n  );')}\n}`;
+      const code = `${JOIN_PRECHECK_SRC}\nfunction wire(socket) {\n${handlerSrc('joinTable', '\n    })(); }\n  );')}\n}`;
       const { exports: m } = load(code, {
         tableManager: { getTable: (id: string) => (id === 'mint' ? table : undefined) },
         playerSessions: new Map(), authSessions: new Map([['S1', { userId: 7, username: 'u7' }]]),
+        // 2026-10-21 (gameplay F143) — the join pre-check reads the extra-table sessions / reservations.
+        multiTableSessions: new Map(), reservedSeats: new Map(),
         MAX_SEATS: 9, aiProfiles: new Map(), ipSeatedSlots: new Map(), clientIp: '10.0.0.1',
         ensureChipsForBuyIn: async () => wallet.get(7)!,
         deductChips: async (uid: number, n: number) => {

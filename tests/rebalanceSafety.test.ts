@@ -48,7 +48,7 @@ import { qualifierBlindLevels } from '../src/game/qualifierSchedule';
 import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE_MAX_STATUS_AGE_MS } from '../src/auth/playGate';
 import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
-import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, SEAT_RESTORE_SRC } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, SEAT_RESTORE_SRC, JOIN_PRECHECK_SRC } from './helpers/indexSource';
 
 const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
@@ -176,6 +176,7 @@ ${p.rebalance}
 ${p.autoStart}
 ${p.handComplete}
 ${p.chipsWonSeats}
+${JOIN_PRECHECK_SRC}
 function registerEvents(tournamentId) {
 ${p.events}
 }
