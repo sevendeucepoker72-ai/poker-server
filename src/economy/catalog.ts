@@ -421,6 +421,15 @@ export const CAREER_REWARDS: ReadonlyArray<{ chips: number; item?: [ItemType, st
   { chips: 500000, item: ['card_back', 'mythic'] },
 ];
 
+/**
+ * 2026-10-21 (gameplay F109) — the player level each career venue unlocks at,
+ * indexed like CAREER_REWARDS. MUST equal poker-3d CareerMode.jsx VENUES[].level
+ * (Home Game 1, Local Casino 5, Vegas Strip 10, Monte Carlo 20, Macau 30, WSOP
+ * 50): startCareerGame refuses a venue above the account's level — the client's
+ * lock used to be the only gate.
+ */
+export const CAREER_VENUE_LEVELS: ReadonlyArray<number> = [1, 5, 10, 20, 30, 50];
+
 // ───────────────────────────── Season awards (C9) ─────────────────────────────
 
 export const SEASON_REWARDS: ReadonlyArray<{ place: number; chips: number; badge: string }> = [

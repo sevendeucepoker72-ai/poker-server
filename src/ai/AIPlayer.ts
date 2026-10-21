@@ -8,7 +8,7 @@ import {
   OPEN_THRESHOLD, THREEBET_THRESHOLD, FOURBET_THRESHOLD, CALL_VS_RAISE_THRESHOLD,
   ARCHETYPE_RANGE_FACTOR, adjustThreshold,
 } from './preflopRanges';
-import { inPushFoldZone, nashPushPctile, nashCallPctile } from './pushFoldSolver';
+import { inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB } from './pushFoldSolver';
 
 export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
 export type Personality =
@@ -78,6 +78,17 @@ const ARCHETYPE_PARAMS: Record<Archetype, ArchetypeParams> = {
 export interface AIDecision {
   action: PlayerAction;
   raiseAmount: number;
+}
+
+/**
+ * 2026-10-21 (gameplay F49) — the table's format, for the decision. All-In or
+ * Fold: every pre-flop decision is shove-or-fold from the push/fold solver at
+ * any stack depth (the deepest baked stack stands in for a deeper one) — the
+ * bots used to open, limp and min-raise at 50 BB where the human may only fold
+ * or go all-in. index.ts maps whatever is left to fold / free check / all-in.
+ */
+export interface DecideOptions {
+  allInOrFold?: boolean;
 }
 
 // ============================================================
@@ -804,7 +815,8 @@ export function generateRandomProfile(difficulty: Difficulty): AIPlayerProfile {
 export function decideAction(
   table: PokerTable,
   seatIndex: number,
-  profile: AIPlayerProfile
+  profile: AIPlayerProfile,
+  opts: DecideOptions = {}
 ): AIDecision {
   const seat = table.seats[seatIndex];
   if (!seat || seat.state !== 'occupied' || seat.folded || seat.allIn) {
@@ -976,7 +988,7 @@ export function decideAction(
   if (isPreFlop) {
     const pre = preFlopStrategy(
       handStrength, callAmount, totalPot, seat, table, profile,
-      myPosition, totalActive, opponents, bigBlind
+      myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true
     );
     return limitBotRaiseWar(table, seat, pre, true, handStrength);
   }
@@ -1005,7 +1017,8 @@ function preFlopStrategy(
   position: number,
   totalActive: number,
   opponents: OpponentModel,
-  bigBlind: number
+  bigBlind: number,
+  allInOrFold = false
 ): AIDecision {
   // 2026-07-07 AI overhaul: `handStrength` is now a real preflop PERCENTILE
   // (1.0 = AA, 0.85 = top 15%). Thresholds come from the solver-sized position
@@ -1050,12 +1063,17 @@ function preFlopStrategy(
   //    huFactor here — only the archetype `factor` as a personality overlay.
   //    Stations still flat; nobody limps a short stack. ──
   const playersYetToAct = Math.min(3, Math.max(1, totalActive - 1));
-  if (inPushFoldZone(effBB, playersYetToAct) && profile.archetype !== 'CALLING_STATION') {
-    const nashPush = nashPushPctile(effBB, playersYetToAct);
+  // F49 (2026-10-21) — an All-In or Fold table plays this branch at ANY depth
+  // and for every archetype (a call there is a shove too): the stack is read as
+  // at most the deepest baked one, and a bet above the big blind is a shove to
+  // CALL (the Nash call threshold), never one to re-shove over on push odds.
+  const pfBB = allInOrFold ? Math.min(effBB, PUSH_FOLD_MAX_BB) : effBB;
+  if (allInOrFold || (inPushFoldZone(effBB, playersYetToAct) && profile.archetype !== 'CALLING_STATION')) {
+    const nashPush = nashPushPctile(pfBB, playersYetToAct);
     if (nashPush !== null) {
-      if (callAmount >= seat.chipCount && callAmount > 0) {
+      if ((callAmount >= seat.chipCount && callAmount > 0) || (allInOrFold && callAmount > bigBlind)) {
         // Facing an all-in that covers us: use the Nash CALL threshold, not push.
-        const callTh = adjustThreshold(nashCallPctile(effBB, playersYetToAct), factor);
+        const callTh = adjustThreshold(nashCallPctile(pfBB, playersYetToAct), factor);
         return pctile >= callTh
           ? { action: PlayerAction.AllIn, raiseAmount: 0 }
           : { action: PlayerAction.Fold, raiseAmount: 0 };

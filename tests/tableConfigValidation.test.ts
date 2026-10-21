@@ -11,7 +11,7 @@
  */
 import { PokerTable } from '../src/game/PokerTable';
 import { validateTableConfig, validateChallengeStakes, sanitizeTableName, TABLE_CONFIG_LIMITS } from '../src/game/tableConfigValidation';
-import { handlerSrc, fnSrc, load, flush, JOIN_PRECHECK_SRC } from './helpers/indexSource';
+import { handlerSrc, fnSrc, slice, load, flush, JOIN_PRECHECK_SRC } from './helpers/indexSource';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const authManager = require('../src/auth/authManager') as typeof import('../src/auth/authManager');
 
@@ -245,17 +245,25 @@ describe('the handlers (real src/index.ts source)', () => {
 
   it('a scheduled table stored with a bad config never becomes a table (null, nothing created)', async () => {
     const created: any[] = [];
-    const code = fnSrc('function validateScheduledTableConfig(') + fnSrc('async function createTableFromScheduledConfig(');
+    // F104 (2026-10-21): a scheduled table fires as a REAL club table — its club_tables row
+    // (clubTableForScheduledTable) and that row's runtime table (the club-table block).
+    const code = fnSrc('function validateScheduledTableConfig(')
+      + slice('// ========== Club tables survive a redeploy (R2, CLUBS-4) ==========', '\n  return job;\n}\n')
+      + fnSrc('async function createTableFromScheduledConfig(');
     const clubTableIds = new Set<string>();
+    const rows: any[] = [];
     const { exports: m } = load(code, {
-      validateTableConfig, clubTableIds, getClubInfo: async () => ({ club: { name: 'C' } }),
-      tableManager: { createTable: (cfg: any) => { created.push(cfg); return 'tid-1'; }, createVariantTable: (cfg: any) => { created.push(cfg); return 'tid-2'; } },
+      validateTableConfig, clubTableIds, getClubInfo: async () => ({ club: { name: 'C' } }), clubIdByTable: new Map(),
+      clubTableForScheduledTable: async (_sid: number, clubId: number, cfg: any) => { const r = { id: rows.length + 1, clubId, ...cfg, isActive: true }; rows.push(r); return r; },
+      updateClubTableId: async () => {},
+      tableManager: { getTable: () => undefined, createTable: (cfg: any) => { created.push(cfg); return 'tid-1'; }, createVariantTable: (cfg: any) => { created.push(cfg); return 'tid-2'; } },
     }, '{ createTableFromScheduledConfig }');
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
-    expect(await m.createTableFromScheduledConfig(1, { minBuyIn: -1_000_000 })).toBeNull();
+    expect(await m.createTableFromScheduledConfig({ id: 1, clubId: 1 }, { minBuyIn: -1_000_000 })).toBeNull();
     warn.mockRestore();
     expect(created).toEqual([]);
-    expect(await m.createTableFromScheduledConfig(1, { tableName: 'Sun', smallBlind: 25, bigBlind: 50, minBuyIn: 1000 })).toBe('tid-1');
+    expect(rows).toEqual([]);
+    expect(await m.createTableFromScheduledConfig({ id: 1, clubId: 1 }, { tableName: 'Sun', smallBlind: 25, bigBlind: 50, minBuyIn: 1000 })).toBe('tid-1');
     expect(created).toEqual([{ tableName: '[C] Sun', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 }]);
     expect(clubTableIds.has('tid-1')).toBe(true);
   });

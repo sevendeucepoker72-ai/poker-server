@@ -30,6 +30,7 @@ import { createPrizeLedger } from '../src/game/prizeLedger';
 import { createWindowRateLimiter } from '../src/auth/rateLimit';
 import { validateTableConfig } from '../src/game/tableConfigValidation';
 import { accountDisplayName } from '../src/auth/displayName';
+import { CAREER_VENUE_LEVELS } from '../src/economy/catalog';
 import { slice, fnSrc, handlerSrc, load, flush, SEAT_TEARDOWN_SRC, JOIN_PRECHECK_SRC } from './helpers/indexSource';
 import { createFakeLedgerDb } from './helpers/fakeLedgerDb';
 
@@ -107,7 +108,8 @@ function world(opts: { joinByInviteCode?: string; fill?: string; leave?: string;
     keepTournamentSeatOnLeave: () => false, shutdownFlushActive: () => false, Sentry: null, activateBombPotIfPending() {},
     tournamentDealWaitsForBustCheck: () => false,
     emitGameState() {}, getGameStateForPlayer: () => ({}), sanitizeSeatAvatar: () => undefined,
-    progressionManager: { getOrCreateProgress() {}, getClientProgress: () => null },
+    // F109 (2026-10-21): startCareerGame reads the account's level (none loaded here = not refused).
+    progressionManager: { getOrCreateProgress() {}, getClientProgress: () => null, userRecord: () => undefined },
     assertPlayable: async () => null, emitPlayRefusal: (s: any, r: any) => s.emit('error', { code: r.code }),
     isUserBanned: async () => false, buyInSocketGone: async () => false, blockedByMaintenance: () => false,
     quickPlayRateLimited: () => false, refuseCashJoinAtTournamentTable: (s: any) => s.emit('error', { code: 'tournament_table' }),
@@ -135,6 +137,7 @@ function world(opts: { joinByInviteCode?: string; fill?: string; leave?: string;
     getClubTableById: async (id: number) => ({ id, clubId: 7, tableName: 'Club', variant: 'texas-holdem', smallBlind: 25, bigBlind: 50, minBuyIn: 1000, maxSeats: 3, isActive: true, tableId: 'club1' }),
     isClubMember: async () => true,
     upsertCareerProgress: async (u: number, venue: number, stage: number, stars: number) => { careerProgress.push([u, venue, stage, stars]); },
+    CAREER_VENUE_LEVELS,   // F109 (2026-10-21)
     claimCareerReward: async () => false,
     getPool: () => ({ connect: () => db.connect() }),
     createPrizeLedger, quickGameOutcome, spinGoMultiplierFor, createWindowRateLimiter, validateTableConfig,
@@ -378,13 +381,15 @@ describe('S1-4 — a DECIDED quick game is settled before the leaving seat (or t
     const t = w.tables.get(tableId)!;
     const bots = t.seats.filter((x) => x.state === 'occupied' && x.isAI).map((x) => x.seatIndex);
     finishHand(t, { 0: 4000, ...Object.fromEntries(bots.map((i) => [i, 0])) });
-    expect(w.m.quickGames.get(tableId)?.decided).toEqual({ winnerSeat: 0, humanWon: true });
+    // F105 (2026-10-21): the decision carries the winner's name + stack read before any seat is stood up.
+    expect(w.m.quickGames.get(tableId)?.decided).toEqual({ winnerSeat: 0, humanWon: true, winnerName: 'Host', winnerChips: 4000 });
     jest.advanceTimersByTime(300);
     await s.handlers.leaveTable();
     await flush();
     jest.advanceTimersByTime(10_000);
     await flush();
-    expect(w.of('S1', 'careerGameComplete')).toEqual([{ venue: 0, stage: 0, won: true, stars: 3 }]);
+    // F108 (2026-10-21): + tableId (the client marks THAT table left).
+    expect(w.of('S1', 'careerGameComplete')).toEqual([{ venue: 0, stage: 0, won: true, stars: 3, tableId }]);
     expect(w.careerProgress).toEqual([[HOST, 0, 0, 3]]);
     expect(w.credits).toEqual([{ uid: HOST, amount: 4000 }]);      // cashed exactly once
   });

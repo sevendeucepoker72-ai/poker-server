@@ -132,8 +132,13 @@ const REFUND_CANCELLED = fnSrc('function refundCancelledTournamentEntrants(');
 const PRIZES = slice('const paidOutTournaments = new Set<string>();', '    tournamentsSettlingStakes.delete(tid);\n  }\n}\n');
 const ENTRANT_ID = fnSrc('function tournamentEntrantPlayerId(');
 const CLUB_TABLES = slice('// ========== Club tables survive a redeploy (R2, CLUBS-4) ==========', '\n  return job;\n}\n');
-const HANDLERS = ['registerClubTournament', 'startClubTournament', 'cancelClubTournament', 'joinClubTable', 'getClubTables']
+// 2026-10-21 (gameplay F103 / F104): + deleteClub and the scheduled-table handlers.
+const HANDLERS = ['registerClubTournament', 'startClubTournament', 'cancelClubTournament', 'joinClubTable', 'getClubTables',
+  'deleteClub', 'scheduleClubTable', 'activateScheduledClubTable']
   .map((ev) => handlerSrc(ev, '\n  });\n')).join('\n  ');
+// F104 — a scheduled table fires as a REAL club table (the Activate button and the auto-fire sweep).
+const SCHEDULED = fnSrc('function validateScheduledTableConfig(') + fnSrc('async function createTableFromScheduledConfig(')
+  + slice('let sweepScheduledInFlight = false;', '    sweepScheduledInFlight = false;\n  }\n}\n');
 
 function world() {
   const d = db();
@@ -145,12 +150,14 @@ function world() {
   const runtime = new Map<string, any>();
   const created: any[] = [];
   const clubTableIds = new Set<string>();
+  const clubIdByTable = new Map<string, number>();
+  const globalEmits: Array<[string, any]> = [];
   let n = 0;
   const ledger = createPrizeLedger({ connect: () => d.pool.connect() as any, sleep: async () => {}, log: () => {}, backoffMs: [0, 0] });
   const scope: Record<string, unknown> = {
     ...clubs,                                   // the real club data layer (on the fake DB); the fakes below win
     tournamentManager: tm, authSessions, prizeLedger: ledger, getPool: () => d.pool,
-    io: { emit() {}, to: () => ({ emit() {} }), sockets: { sockets } },
+    io: { emit: (ev: string, p: any) => globalEmits.push([ev, p]), to: () => ({ emit() {} }), sockets: { sockets } },
     auditLog: (actor: string, action: string, det: any) => audits.push({ actor, action, d: det }),
     addChipsToUser: async (uid: number, amt: number) => { d.wallets.set(uid, (d.wallets.get(uid) ?? 0) + amt); return true; },
     screenAndStartTournament: async (tid: string, via: string) => { screened.push([tid, via]); },
@@ -166,13 +173,13 @@ function world() {
       createTable: (cfg: any) => { const id = `rt${++n}`; created.push(cfg); runtime.set(id, { maxOccupiableSeats: 9 }); return id; },
       createVariantTable: (cfg: any) => { const id = `rv${++n}`; created.push(cfg); runtime.set(id, { maxOccupiableSeats: 9 }); return id; },
     },
-    clubTableIds, validateTableConfig, clubJoinGrants: new WeakSet(),
+    clubTableIds, clubIdByTable, validateTableConfig, clubJoinGrants: new WeakSet(),
     assertPlayable: async () => null, emitPlayRefusal: (s: any, r: any) => s.emit('error', r),
     console: { log() {}, warn() {}, error() {} },
   };
-  const code = `${ENTRANT_ID}\n${CLUB}\n${REFUND_CANCELLED}\n${PRIZES}\n${CLUB_TABLES}\nfunction wire(socket) {\n  ${HANDLERS}\n}`;
+  const code = `${ENTRANT_ID}\n${CLUB}\n${REFUND_CANCELLED}\n${PRIZES}\n${CLUB_TABLES}\n${SCHEDULED}\nfunction wire(socket) {\n  ${HANDLERS}\n}`;
   const { exports: m } = load(code, scope, `{ wire, clubLiveTournaments, clubTournamentStats, refundCancelledTournamentEntrants, payTournamentPrizes,
-    refundClubTournamentEntrants, bootSweepStrandedClubTournaments, ensureClubRuntimeTable, clubTableRuntimeStats }`);
+    refundClubTournamentEntrants, bootSweepStrandedClubTournaments, ensureClubRuntimeTable, clubTableRuntimeStats, sweepScheduledClubTables }`);
   const emitted: Array<[string, string, any]> = [];
   const joins: any[] = [];
   const mkSocket = (id: string, userId: number) => {
@@ -190,7 +197,7 @@ function world() {
     return s;
   };
   const of = (sid: string, ev: string) => emitted.filter(([s, e]) => s === sid && e === ev).map(([, , p]) => p);
-  return { d, tm, m, audits, screened, runtime, created, clubTableIds, joins, mkSocket, of };
+  return { d, tm, m, audits, screened, runtime, created, clubTableIds, clubIdByTable, globalEmits, joins, mkSocket, of };
 }
 
 async function startedClubTournament(w: ReturnType<typeof world>, buyIn = 500) {
@@ -374,5 +381,133 @@ describe('CLUBS-4 — a club table survives a redeploy (its runtime table re-cre
     await a.handlers.getClubTables({ clubId: 7 });
     const listed = w.of('SA', 'clubTables')[0].tables[0];
     expect(w.runtime.has(listed.tableId)).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════ F103 (gameplay audit 2026-10-21) ══
+describe('F103 — deleting a club never destroys its club tournaments\' buy-ins', () => {
+  it('a club tournament still REGISTERING is cancelled and every registration refunded in the delete; audited + told (club_deleted)', async () => {
+    const w = world();
+    const r = await clubs.createClubTournament(7, OWNER, { name: 'Friday Freezeout', buyIn: 500, startingChips: 5000, maxPlayers: 9, scheduledAt: 'x' });
+    const id = r.tournament.id as number;
+    const owner = w.mkSocket('SO', OWNER);
+    const a = w.mkSocket('SA', A);
+    const b = w.mkSocket('SB', B);
+    await a.handlers.registerClubTournament({ tournamentId: id });
+    await b.handlers.registerClubTournament({ tournamentId: id });
+    expect([w.d.wallets.get(A), w.d.wallets.get(B)]).toEqual([9_500, 9_500]);
+    await owner.handlers.deleteClub({ clubId: 7 });
+    expect(w.of('SO', 'clubDeleted')).toEqual([{ clubId: 7 }]);
+    expect([w.d.wallets.get(A), w.d.wallets.get(B)]).toEqual([10_000, 10_000]);       // pre-F103: 9,500 / 9,500 — lost with the cascade
+    expect(w.d.clubs.has(7)).toBe(false);
+    expect(w.d.clubTournaments.has(id)).toBe(false);
+    expect(w.d.clubRegs).toEqual([]);
+    expect(w.audits.filter((x) => x.action === 'CLUB_TOURNAMENT_REFUND').map((x) => [x.actor, x.d.amount, x.d.reason]))
+      .toEqual([[String(A), 500, 'club_deleted'], [String(B), 500, 'club_deleted']]);
+    expect(w.of('SA', 'clubTournamentCancelled')).toEqual([{ tournamentId: id, clubId: 7, refunded: 500, reason: 'club_deleted' }]);
+    expect(w.m.clubTournamentStats.cancelledBeforeStart).toBe(1);
+  });
+
+  it('a RUNNING club tournament refuses the delete (club_tournament_running) — nothing changes and its prizes are still paid', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+    try {
+      const w = world();
+      const { id, liveId, owner } = await startedClubTournament(w);
+      await owner.handlers.deleteClub({ clubId: 7 });
+      expect(w.of('SO', 'clubDeleted')).toEqual([]);
+      expect(w.of('SO', 'error')).toEqual([expect.objectContaining({ code: 'club_tournament_running' })]);
+      expect(w.d.clubs.has(7)).toBe(true);
+      expect(w.d.clubTournaments.get(id)!.status).toBe('running');
+      // It still finishes and pays (the outcome guard's row is there).
+      let data: any = null;
+      w.tm.onEvent(liveId, (ev, dd) => { if (ev === 'tournamentFinished') data = dd; });
+      w.tm.startTournament(liveId);
+      w.tm.eliminatePlayer(liveId, 'user-102');
+      await w.m.payTournamentPrizes(data);
+      expect([w.d.wallets.get(A), w.d.wallets.get(B)]).toEqual([9_500 + 625, 9_500 + 375]);   // pre-F103: TOURNAMENT_PRIZE_CONFLICT_UNRESOLVED, 9,500 each
+    } finally { jest.useRealTimers(); }
+  });
+
+  it('only the owner deletes (a member is refused, nothing moves); a club without tournaments is deleted as before', async () => {
+    const w = world();
+    const r = await clubs.createClubTournament(7, OWNER, { name: 'Cup', buyIn: 300, scheduledAt: 'x' });
+    const a = w.mkSocket('SA', A);
+    await a.handlers.registerClubTournament({ tournamentId: r.tournament.id });
+    await a.handlers.deleteClub({ clubId: 7 });
+    expect(w.of('SA', 'error')).toEqual([expect.objectContaining({ message: 'Only the club owner can delete the club' })]);
+    expect(w.d.wallets.get(A)).toBe(9_700);
+    expect(w.d.clubs.has(7)).toBe(true);
+    const w2 = world();
+    const o2 = w2.mkSocket('SO', OWNER);
+    await o2.handlers.deleteClub({ clubId: 7 });
+    expect(w2.of('SO', 'clubDeleted')).toEqual([{ clubId: 7 }]);
+    expect(w2.d.members.filter((m) => m.clubid === 7)).toEqual([]);
+  });
+});
+
+// ═══════════════════════════════════════════ F104 (gameplay audit 2026-10-21) ══
+describe('F104 — a scheduled club table fires as a REAL club table members can see and join', () => {
+  const past = () => new Date(Date.now() - 60_000).toISOString();
+
+  it('Activate Now: a club_tables row of the SCHEDULE\'s club, pointed at the runtime table — listed, and joinable through joinClubTable', async () => {
+    const w = world();
+    const owner = w.mkSocket('SO', OWNER);
+    await owner.handlers.scheduleClubTable({ clubId: 7, config: { tableName: 'Sunday Game', smallBlind: 25, bigBlind: 50, minBuyIn: 1000, maxSeats: 6 }, scheduledTime: past(), recurring: false });
+    const sid = w.of('SO', 'clubTableScheduled')[0].scheduledTable.id as number;
+    // The client's clubId (8) is not the row's (7): the row's wins.
+    await owner.handlers.activateScheduledClubTable({ id: sid, clubId: 8 });
+    const act = w.of('SO', 'scheduledClubTableActivated')[0];
+    expect(act).toMatchObject({ success: true, clubId: 7 });
+    const rows = [...w.d.clubTables.values()];
+    expect(rows).toEqual([expect.objectContaining({ clubid: 7, tablename: 'Sunday Game', maxseats: 6, isactive: 1, tableid: act.tableId })]);   // pre-F104: []
+    expect(rows[0].maxbuyin).toBeGreaterThanOrEqual(1000);
+    expect(w.clubTableIds.has(act.tableId)).toBe(true);
+    expect(w.clubIdByTable.get(act.tableId)).toBe(7);
+    expect(w.created).toEqual([{ tableName: '[Pub Club] Sunday Game', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000 }]);
+    expect(w.runtime.get(act.tableId).maxOccupiableSeats).toBe(6);
+    const a = w.mkSocket('SA', A);
+    await a.handlers.getClubTables({ clubId: 7 });
+    expect(w.of('SA', 'clubTables')[0].tables).toEqual([expect.objectContaining({ id: rows[0].id, tableId: act.tableId })]);
+    await a.handlers.joinClubTable({ clubTableId: rows[0].id, playerName: 'x', seatIndex: 2, buyIn: 2000 });
+    expect(w.joins).toEqual([expect.objectContaining({ tableId: act.tableId, seatIndex: 2, buyIn: 2000 })]);
+  });
+
+  it('a RECURRING schedule keeps ONE club table: the next occurrence reuses it (no new row, no new runtime table)', async () => {
+    const w = world();
+    const owner = w.mkSocket('SO', OWNER);
+    await owner.handlers.scheduleClubTable({ clubId: 7, config: { tableName: 'Daily', smallBlind: 25, bigBlind: 50, minBuyIn: 1000 }, scheduledTime: past(), recurring: true, recurrencePattern: 'daily' });
+    await w.m.sweepScheduledClubTables();
+    expect(w.d.clubTables.size).toBe(1);
+    const row = [...w.d.clubTables.values()][0];
+    const next = [...w.d.scheduledTables.values()].find((t) => t.status === 'scheduled')!;
+    expect(next.clubtableid).toBe(row.id);                                // carried to the next occurrence
+    expect(w.globalEmits.filter(([ev]) => ev === 'scheduledClubTableActivated')).toEqual([[
+      'scheduledClubTableActivated', { success: true, tableId: row.tableid, clubId: 7 },
+    ]]);
+    next.scheduledtime = past();                                          // the next day comes
+    await w.m.sweepScheduledClubTables();
+    expect(w.d.clubTables.size).toBe(1);                                  // pre-F104: one more bots-only orphan per day
+    expect(w.created).toHaveLength(1);
+    // Closed by a manager meanwhile: the next occurrence makes a new one.
+    row.isactive = 0;
+    const third = [...w.d.scheduledTables.values()].find((t) => t.status === 'scheduled')!;
+    third.scheduledtime = past();
+    await w.m.sweepScheduledClubTables();
+    expect(w.d.clubTables.size).toBe(2);
+  });
+
+  it('a DB error while making the club table puts the claimed row back to scheduled: the next sweep makes it (the occurrence is not lost)', async () => {
+    const w = world();
+    const owner = w.mkSocket('SO', OWNER);
+    await owner.handlers.scheduleClubTable({ clubId: 7, config: { tableName: 'Blip', smallBlind: 25, bigBlind: 50, minBuyIn: 1000 }, scheduledTime: past(), recurring: false });
+    const sid = w.of('SO', 'clubTableScheduled')[0].scheduledTable.id as number;
+    w.d.failNext(/INSERT INTO club_tables/);
+    await w.m.sweepScheduledClubTables();
+    expect(w.d.clubTables.size).toBe(0);
+    expect(w.d.scheduledTables.get(sid)!.status).toBe('scheduled');
+    expect(w.created).toEqual([]);                                        // never a bare runtime table
+    await w.m.sweepScheduledClubTables();
+    expect(w.d.clubTables.size).toBe(1);
+    expect(w.d.scheduledTables.get(sid)!.status).toBe('active');
   });
 });

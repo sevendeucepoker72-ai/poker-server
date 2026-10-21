@@ -27,6 +27,7 @@ import { createPrizeLedger } from '../src/game/prizeLedger';
 import { createWindowRateLimiter } from '../src/auth/rateLimit';
 import { validateTableConfig } from '../src/game/tableConfigValidation';
 import { accountDisplayName } from '../src/auth/displayName';
+import { CAREER_VENUE_LEVELS } from '../src/economy/catalog';
 import { SRC, slice, fnSrc, handlerSrc, load, flush, JOIN_PRECHECK_SRC } from './helpers/indexSource';
 import { createFakeLedgerDb } from './helpers/fakeLedgerDb';
 
@@ -111,7 +112,8 @@ function world(opts: { wallets?: Record<number, number> } = {}) {
     keepTournamentSeatOnLeave: () => false, activateBombPotIfPending() {}, executePendingMove: () => false, trimExcessAI() {},
     fillWithAI() {}, tournamentDealWaitsForBustCheck: () => false,
     emitGameState() {}, getGameStateForPlayer: () => ({}), sanitizeSeatAvatar: () => undefined,
-    progressionManager: { getOrCreateProgress() {}, getClientProgress: () => null },
+    // F109 (2026-10-21): startCareerGame reads the account's level (none loaded here = not refused).
+    progressionManager: { getOrCreateProgress() {}, getClientProgress: () => null, userRecord: () => undefined },
     assertPlayable: async () => null, emitPlayRefusal: (s: any, r: any) => s.emit('error', { code: r.code }),
     isUserBanned: async () => false, buyInSocketGone: async () => false, blockedByMaintenance: () => false,
     quickPlayRateLimited: () => false, refuseCashJoinAtTournamentTable: (s: any) => s.emit('error', { code: 'tournament_table' }),
@@ -138,7 +140,7 @@ function world(opts: { wallets?: Record<number, number> } = {}) {
     resolveChallenge: async (id: number, w: number | null) => { challengesResolved.push([id, w]); },
     getClubTableById: async () => ({ clubId: 7, tableId: 'club1' }),
     isClubMember: async (_c: number, uid: number) => uid === ALICE,
-    upsertCareerProgress: async () => {}, claimCareerReward: async () => false,
+    upsertCareerProgress: async () => {}, claimCareerReward: async () => false, CAREER_VENUE_LEVELS,   // F109
     getPool: () => ({ connect: () => db.connect() }),
     createPrizeLedger, quickGameOutcome, spinGoMultiplierFor, createWindowRateLimiter, validateTableConfig,
     console: { log() {}, warn() {}, error() {} },
@@ -680,6 +682,22 @@ describe('quick games END — heads-up / all-in-or-fold / career cash out once; 
       expect(w.challengesResolved).toEqual([[4, null]]);
       expect(w.credits).toEqual([{ uid: ALICE, amount: 2000 }]);
     });
+
+    it('F102 (2026-10-21) — a started challenge resting at a hand end with no deal scheduled (both sat out, one came back) is dealt again by the sweep', () => {
+      const { w, t } = challengeWorld();
+      (w.m as any).quickGames.set('chal', { format: 'challenge', ownerUserId: null, ownerName: 'Club Challenge', entryFee: 0, challengeId: 4, ended: false, settlement: 'open', createdAt: Date.now(), started: true });
+      t.sitDown(0, 'Alice', 2000, 'user_101', false);
+      t.sitDown(1, 'Bob', 2000, 'user_102', false);
+      expect(t.startNewHand()).toBe(true);
+      finishHand(t, { 0: 1500, 1: 2500 });                                  // undecided: both have chips
+      const kicks: string[] = [];
+      w.scope.scheduleAutoStart = (id: string) => kicks.push(id);
+      w.m.sweepQuickTables();
+      expect(kicks).toEqual(['chal']);                                      // pre-F102: nothing — the challenge sat there
+      (w.scope.pendingAutoStartTimers as Map<string, any>).set('chal', 1);  // a deal already scheduled: left alone
+      w.m.sweepQuickTables();
+      expect(kicks).toEqual(['chal']);
+    });
   });
 
   it('quickGameOutcome (pure)', () => {
@@ -759,5 +777,92 @@ describe('wiring — every quick format registers its end; the challenge table i
     // R2 merge: S2's capped bot step, with the one fixed-roster predicate.
     expect(AUTOSTART).toContain('reloadAndCapBotStacks(table, tableId, isFixedRosterQuickTable(tableId));');
     expect(BOT_STACKS).toContain('function isFixedRosterQuickTable(tableId: string): boolean {\n  return isFixedRosterTable(tableId);\n}');
+  });
+});
+
+// ════════════════════════════ gameplay audit 2026-10-21 — S9 (F105 / F108 / F109) ══
+describe('S9 — quick-game results and the career entry', () => {
+  const startHU = async (w: ReturnType<typeof world>) => {
+    const s = w.mkSocket('S1');
+    await s.handlers.quickHeadsUp({ playerName: 'Alice' });
+    const tableId = w.playerSessions.get('S1').tableId;
+    return { s, tableId, t: w.tables.get(tableId)! };
+  };
+
+  it("F105 — Heads-Up Snap's clock decides FOR THE BOT: the result names the bot and its stack (it said \"Nobody wins with 0 chips!\")", async () => {
+    const w = world();
+    const { tableId, t } = await startHU(w);
+    const bot = t.seats[1].playerName;
+    jest.advanceTimersByTime(5 * 60_000);
+    finishHand(t, { 0: 975, 1: 1025 });
+    expect(w.m.quickGames.get(tableId).decided).toEqual({ winnerSeat: 1, humanWon: false, winnerName: bot, winnerChips: 1025 });
+    expect(t.seats[1].state).toBe('empty');                              // stood up at the decision, before the result
+    jest.advanceTimersByTime(6000);
+    await flush();
+    expect(w.roomEmits.find(([, ev]) => ev === 'quickGameOver')![2]).toEqual({
+      type: 'headsUp', tableId, winner: bot, chips: 1025, won: false, message: `Time's up! ${bot} wins with 1,025 chips!`,
+    });
+    expect(w.credits).toEqual([{ uid: ALICE, amount: 975 }]);           // settlement unchanged
+  });
+
+  it('F105 — a heads-up bust loss names the bot (it fell back to "The house"); a human win is unchanged', async () => {
+    const w = world();
+    const { t } = await startHU(w);
+    const bot = t.seats[1].playerName;
+    finishHand(t, { 0: 0, 1: 2000 });
+    jest.advanceTimersByTime(1000);
+    expect(w.roomEmits.find(([, ev]) => ev === 'quickGameOver')![2]).toMatchObject({ won: false, winner: bot, chips: 2000, message: `${bot} wins — better luck next time.` });
+  });
+
+  it('F108 — the career result goes to the socket holding the seat NOW (a restore re-bound it), with tableId — never to the dead starting socket', async () => {
+    const w = world();
+    const s1 = w.mkSocket('S1');
+    await s1.handlers.startCareerGame({ venue: 0, stage: 0 });
+    const tableId = w.playerSessions.get('S1').tableId;
+    const t = w.tables.get(tableId)!;
+    // A page reload: S1 is gone, the sign-in restores his seat on S2 (oauthLogin (b) / resumeSession).
+    const session = w.playerSessions.get('S1');
+    s1.connected = false;
+    w.playerSessions.delete('S1');
+    w.authSessions.delete('S1');
+    const s2 = w.mkSocket('S2');
+    w.playerSessions.set('S2', { ...session, socketId: 'S2' });
+    finishHand(t, { 0: 4000, 1: 0, 2: 0, 3: 0 });
+    jest.advanceTimersByTime(1000);
+    const career = w.emitted.filter(([, ev]) => ev === 'careerGameComplete');
+    expect(career).toEqual([['S2', 'careerGameComplete', { venue: 0, stage: 0, won: true, stars: 3, tableId }]]);   // pre-F108: [['S1', …]] only
+    expect(s2.connected).toBe(true);
+  });
+
+  it('F109 — a non-integer venue / a stage outside 0..2 is refused BEFORE his current seat is left (no leave, no cash-out)', async () => {
+    const w = world();
+    const s = w.mkSocket('S1');
+    await s.handlers.startCareerGame({ venue: 0, stage: 0 });
+    const tableId = w.playerSessions.get('S1').tableId;
+    for (const bad of [{ venue: 1.5, stage: 0 }, { venue: 0, stage: 9 }, { venue: 0, stage: 0.5 }, { venue: 6, stage: 0 }, { venue: '1', stage: 0 }]) {
+      await s.handlers.startCareerGame(bad);
+    }
+    expect(w.errorsOf('S1').map((e) => e.message)).toEqual(Array(5).fill('Invalid venue'));
+    expect(w.playerSessions.get('S1')?.tableId).toBe(tableId);          // pre-F109: venue 1.5 left this table, then threw
+    expect(w.credits).toEqual([]);
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);         // only the first (valid) start paid
+  });
+
+  it("F109 — the venue's LEVEL unlock is the server's too: a level-1 account cannot start the WSOP; level 50 can; a level not loaded yet is not refused", async () => {
+    const w = world();
+    const s = w.mkSocket('S1');
+    let level: { hydrated: boolean; level: number } | undefined = { hydrated: true, level: 1 };
+    w.scope.progressionManager = { getOrCreateProgress() {}, getClientProgress: () => null, userRecord: () => level };
+    await s.handlers.startCareerGame({ venue: 5, stage: 2 });
+    expect(w.errorsOf('S1')).toEqual([{ message: 'WSOP Main Event unlocks at level 50.', code: 'career_venue_locked', venue: 5, level: 50 }]);
+    expect(w.deductions).toEqual([]);
+    expect(w.playerSessions.has('S1')).toBe(false);
+    level = { hydrated: true, level: 50 };
+    await s.handlers.startCareerGame({ venue: 5, stage: 2 });
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 500_000 }]);
+    const s2 = w.mkSocket('S2', BOB, 'Bob');
+    level = { hydrated: false, level: 1 };                                // not hydrated yet: the client shows the same record
+    await s2.handlers.startCareerGame({ venue: 1, stage: 0 });
+    expect(w.deductions).toContainEqual({ uid: BOB, amount: 5000 });
   });
 });

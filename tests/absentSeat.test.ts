@@ -1766,7 +1766,8 @@ describe('P-i (round 6) — an absent tournament seat checks, limps at most ONE 
       // F156 (2026-10-21): both handlers now take an optional `{ tableId }`.
       // F87 (2026-10-21): sitOut's payload also takes `sittingOut?` — the slice starts at the common prefix.
       const body = slice(`socket.on('${ev}', async (data: { tableId?: string`, '\n  });\n');
-      expect(body).toContain('if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);');
+      // F102 (2026-10-21): a club challenge seat is acted for the same way.
+      expect(body).toContain('if (isTournamentTable(session.tableId) || challengeTables.has(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);');
     }
     expect(SRC).not.toContain('tournamentHandAllAbsent');
   });

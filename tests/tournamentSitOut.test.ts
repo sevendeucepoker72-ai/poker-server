@@ -43,7 +43,8 @@ const P = {
   sitOut: handlerSrc('sitOut', '\n  });\n'),
 };
 /** The P-j line; the controls put back the engine sit-out set every table had before (the cash rule). */
-const PJ = 'table.setSittingOutSeats(isTournamentTable(tableId) ? [] : set);';
+// F102 (2026-10-21): the line also deals a sitting-out CLUB CHALLENGE seat in (challengeDealsIn).
+const PJ = 'table.setSittingOutSeats(isTournamentTable(tableId) || challengeDealsIn ? [] : set);';
 
 function world(opts: { tournament: boolean; over?: Partial<typeof P> }) {
   const p = { ...P, ...(opts.over || {}) };
@@ -58,7 +59,7 @@ function world(opts: { tournament: boolean; over?: Partial<typeof P> }) {
   const tournamentHandStartSafety = { allAbsentAutoCalls: 0 };
   const scope: Record<string, unknown> = {
     tableManager: { getTable: (id: string) => (id === 't1' ? table : undefined) },
-    tournamentTables, playerSessions, sitOutTracker, reservedSeats, tournamentHandStartSafety,
+    tournamentTables, playerSessions, sitOutTracker, reservedSeats, tournamentHandStartSafety, challengeTables: new Map(),
     MAX_SEATS: 9, TURN_TIMEOUT_MS, ABSENT_TOURNAMENT_SEAT_TURN_MS, DrawPhases: [], GamePhase,
     turnTimers: new Map(), turnWarningTimers: new Map(), turnStartedAtMap: new Map(), turnStartedSeatMap: new Map(),
     turnStartedHandMap: new Map(), turnStartedPhaseMap: new Map(), globalTurnId: 0,

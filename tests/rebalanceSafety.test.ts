@@ -1237,9 +1237,13 @@ function withoutLeftoverBusts(helpers: string): string {
   expect(helpers).toContain(LEFTOVER);
   return helpers.replace(LEFTOVER, '    if (!s.eliminated) bustedSeatIdx.push(i);');
 }
+// F50 (2026-10-21): a hand END deals through autoStartNextHand at EVERY table now (not only
+// inside the tournament branch) — the pre-S1 control takes that route out as well.
+const HAND_END_ROUTE = '    if (table.currentPhase === GamePhase.HandComplete) {\n      autoStartNextHand(session.tableId);';
 function withoutStartHandRoute(startHand: string): string {
   expect(startHand).toContain(START_ROUTE);
-  return startHand.replace(START_ROUTE, '    if (false) {');
+  expect(startHand).toContain(HAND_END_ROUTE);
+  return startHand.replace(START_ROUTE, '    if (false) {').replace(HAND_END_ROUTE, '    if (false) {\n      autoStartNextHand(session.tableId);');
 }
 /** All three S1 locks out: the pre-S1 code. */
 const PRE_S1 = { autoStart: withoutDealGuard(P.autoStart), helpers: withoutLeftoverBusts(P.helpers), startHand: withoutStartHandRoute(P.startHand) };

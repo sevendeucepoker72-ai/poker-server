@@ -1468,3 +1468,35 @@ ADMIN_FORCE_CLOSE_TABLE_REFUSED
 success: false, code: 'tournament_table', tableId: data.tableId,
 rehomeBrokenTableWatchers(tournamentId, breakTableId);
 tournament_table_broken
+
+# 2026-10-21 gameplay S9 (quick modes, clubs, career, auto-deal, sit-out turns,
+# deck commitment).
+# F49: All-In or Fold holds the BOTS to the format (shove / fold / free check);
+# the human may check when nothing is owed.
+# F50: a client startHand at a hand end runs the hand-boundary step (bot cap,
+# bomb pot, seat moves); a join deals inline only from WaitingForPlayers.
+# F56: a cash seat sitting out mid-hand is acted for 500ms into its turn.
+# F102: a club challenge deals a sitting-out seat in (no frozen freezeout).
+# F103: deleting a club refunds its unstarted club tournaments; refused while one runs.
+# F104: a scheduled club table fires as a real club_tables row (listed, joinable).
+# F105: a quick-game result names the winner read at the decision.
+# F108: the career result goes to the socket holding the seat now.
+# F109: career venue / stage / level are checked before the seat is left.
+# F162: deckCommitment carries tableId (the seed reveal waits on the owner).
+!allInOrFoldAllows(table, session.seatIndex, data.type)
+allInOrFoldDecision(table, seatIndex
+allInOrFold: true
+const pa = pendingAutoStartTimers.get(session.tableId);
+activateBombPotIfPending(session.tableId, table);
+function dealAfterJoin(
+const started = dealAfterJoin(chosenTableId, table);
+seatHasAnyPlayingSession(tableId, activeIdx)
+const challengeDealsIn = challengeTables.has(tableId)
+club_tournament_running
+reason: 'club_deleted'
+scheduled_table_club_table
+UPDATE scheduled_tables SET clubTableId = $1 WHERE id = $2
+humanWon: outcome.humanWon, winnerName, winnerChips }
+liveSeatSocketsAt(tableId)
+career_venue_locked
+committedAt: Date.now(), tableId

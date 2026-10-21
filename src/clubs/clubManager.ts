@@ -462,6 +462,9 @@ export async function initClubTables(): Promise<void> {
   await pool.query(`ALTER TABLE club_tournament_registrations ADD COLUMN IF NOT EXISTS paid INTEGER NOT NULL DEFAULT 0`).catch((e) => console.error('[Clubs] club_tournament_registrations.paid:', e?.message));
   await pool.query(`ALTER TABLE club_tournament_registrations ADD COLUMN IF NOT EXISTS transferredAt TIMESTAMPTZ DEFAULT NULL`).catch((e) => console.error('[Clubs] club_tournament_registrations.transferredAt:', e?.message));
   await pool.query(`ALTER TABLE club_tournaments ADD COLUMN IF NOT EXISTS liveTournamentId TEXT DEFAULT NULL`).catch((e) => console.error('[Clubs] club_tournaments.liveTournamentId:', e?.message));
+  // 2026-10-21 (gameplay F104) — the club_tables row a scheduled table fired as
+  // (a recurring series reuses it: clubTableForScheduledTable).
+  await pool.query(`ALTER TABLE scheduled_tables ADD COLUMN IF NOT EXISTS clubTableId INTEGER DEFAULT NULL`).catch((e) => console.error('[Clubs] scheduled_tables.clubTableId:', e?.message));
 
   console.log('[Clubs] Database tables initialized (with social features)');
 }
@@ -897,6 +900,19 @@ export async function createClubTable(
     return { success: false, error: 'Table name must be at least 2 characters' };
   }
 
+  try {
+    return { success: true, table: await insertClubTableRow(clubId, config) };
+  } catch (err: any) {
+    console.error('[Clubs] Create table error:', err);
+    return { success: false, error: 'Failed to create table' };
+  }
+}
+
+/** The club_tables row itself (createClubTable after its checks; a scheduled table when it fires — F104). */
+async function insertClubTableRow(
+  clubId: number,
+  config: { tableName: string; variant?: string; smallBlind?: number; bigBlind?: number; minBuyIn?: number; maxBuyIn?: number; maxSeats?: number }
+): Promise<ClubTable> {
   const pool = getPool();
   const sb = config.smallBlind || 5;
   const bb = config.bigBlind || 10;
@@ -905,31 +921,52 @@ export async function createClubTable(
   const maxSeats = Math.min(9, Math.max(2, config.maxSeats || 9));
   const variant = config.variant || 'texas-holdem';
 
-  try {
-    const result = await pool.query(
-      `INSERT INTO club_tables (clubId, tableName, variant, smallBlind, bigBlind, minBuyIn, maxBuyIn, maxSeats)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
-      [clubId, config.tableName.trim(), variant, sb, bb, minBuy, maxBuy, maxSeats]
-    );
+  const result = await pool.query(
+    `INSERT INTO club_tables (clubId, tableName, variant, smallBlind, bigBlind, minBuyIn, maxBuyIn, maxSeats)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+    [clubId, config.tableName.trim(), variant, sb, bb, minBuy, maxBuy, maxSeats]
+  );
 
-    const tableRow: ClubTable = {
-      id: result.rows[0].id as number,
-      clubId,
-      tableName: config.tableName.trim(),
-      variant,
-      smallBlind: sb,
-      bigBlind: bb,
-      minBuyIn: minBuy,
-      maxBuyIn: maxBuy,
-      maxSeats,
-      isActive: true,
-    };
+  return {
+    id: result.rows[0].id as number,
+    clubId,
+    tableName: config.tableName.trim(),
+    variant,
+    smallBlind: sb,
+    bigBlind: bb,
+    minBuyIn: minBuy,
+    maxBuyIn: maxBuy,
+    maxSeats,
+    isActive: true,
+  };
+}
 
-    return { success: true, table: tableRow };
-  } catch (err: any) {
-    console.error('[Clubs] Create table error:', err);
-    return { success: false, error: 'Failed to create table' };
+/**
+ * 2026-10-21 (gameplay F104) — the REAL club table a scheduled table fires as
+ * (the Activate button and the auto-fire sweep): a club_tables row of the
+ * SCHEDULE's club, so it is listed (getClubTables) and joinable
+ * (joinClubTable). It used to be a bare runtime table with no row — no member
+ * could ever sit there, it ran bots-only for good, and a recurring schedule
+ * added one more each day. A recurring series keeps ONE table: the row an
+ * earlier occurrence made is reused while it is open (scheduled_tables
+ * .clubTableId, carried to the next occurrence by rescheduleRecurring). No role
+ * re-check — the schedule was authorised when it was made.
+ */
+export async function clubTableForScheduledTable(
+  scheduledId: number,
+  clubId: number,
+  config: { tableName: string; variant?: string; smallBlind?: number; bigBlind?: number; minBuyIn?: number; maxBuyIn?: number; maxSeats?: number }
+): Promise<ClubTable> {
+  const pool = getPool();
+  const st = (await pool.query('SELECT clubTableId FROM scheduled_tables WHERE id = $1', [scheduledId])).rows[0] as any;
+  const priorId = Number(st?.clubtableid);
+  if (Number.isInteger(priorId) && priorId > 0) {
+    const prior = await getClubTableById(priorId);
+    if (prior && prior.isActive && prior.clubId === clubId) return prior;
   }
+  const row = await insertClubTableRow(clubId, config);
+  await pool.query('UPDATE scheduled_tables SET clubTableId = $1 WHERE id = $2', [row.id, scheduledId]);
+  return row;
 }
 
 export async function getClubTables(
@@ -1016,10 +1053,24 @@ export async function updateClubSettings(
   };
 }
 
+/**
+ * 2026-10-21 (gameplay F103) — deleting a club no longer destroys its club
+ * tournaments' buy-ins. `DELETE FROM clubs` cascades to club_tournaments and on
+ * to club_tournament_registrations (ON DELETE CASCADE): every PAID registration
+ * vanished unrefunded, and a RUNNING club tournament lost the row its prize /
+ * refund settlement is guarded by (CLUB_TOURNAMENT_OUTCOME_GUARD) — its prizes
+ * could never be paid. Now ONE transaction: the club row and its tournament
+ * rows are locked (a concurrent registration / start / new tournament waits,
+ * then finds nothing); a RUNNING tournament refuses the delete
+ * (club_tournament_running — delete it after it finishes); every tournament not
+ * yet started is cancelled and each registration refunded what it paid (the
+ * cancelClubTournament statements); then the club goes. `cancelled` / `refunded`
+ * list them for the caller's audit / notices.
+ */
 export async function deleteClub(
   ownerId: number,
   clubId: number
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; code?: string; cancelled?: number[]; refunded?: Array<{ tournamentId: number; userId: number; paid: number }> }> {
   const club = await getClubById(clubId);
   if (!club) return { success: false, error: 'Club not found' };
   if (club.ownerId !== ownerId) {
@@ -1027,11 +1078,49 @@ export async function deleteClub(
   }
 
   const pool = getPool();
-  await pool.query('DELETE FROM club_members WHERE clubId = $1', [clubId]);
-  await pool.query('DELETE FROM club_tables WHERE clubId = $1', [clubId]);
-  await pool.query('DELETE FROM clubs WHERE id = $1', [clubId]);
-
-  return { success: true };
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const own = await client.query('SELECT id FROM clubs WHERE id = $1 AND ownerId = $2 FOR UPDATE', [clubId, ownerId]);
+    if (!own.rowCount) { await client.query('ROLLBACK'); return { success: false, error: 'Only the club owner can delete the club' }; }
+    const tourneys = (await client.query('SELECT id, status FROM club_tournaments WHERE clubId = $1 FOR UPDATE', [clubId])).rows as any[];
+    if (tourneys.some((t) => t.status === 'running')) {
+      await client.query('ROLLBACK');
+      return { success: false, error: 'A club tournament is in play — delete the club after it finishes.', code: 'club_tournament_running' };
+    }
+    const refunded: Array<{ tournamentId: number; userId: number; paid: number }> = [];
+    const cancelled: number[] = [];
+    for (const t of tourneys) {
+      if (t.status !== 'registering' && t.status !== 'scheduled') continue;
+      const tid = Number(t.id);
+      const claim = await client.query(
+        `UPDATE club_tournaments SET status = 'cancelled' WHERE id = $1 AND status IN ('registering', 'scheduled') RETURNING id`,
+        [tid]
+      );
+      if (!claim.rowCount) continue;
+      cancelled.push(tid);
+      const regs = await client.query(
+        'DELETE FROM club_tournament_registrations WHERE tournamentId = $1 AND transferredAt IS NULL RETURNING userId, paid',
+        [tid]
+      );
+      for (const r of regs.rows as any[]) {
+        const paid = Math.max(0, Number(r.paid) || 0);
+        if (paid > 0) await client.query('UPDATE users SET chips = chips + $1 WHERE id = $2', [paid, r.userid]);
+        refunded.push({ tournamentId: tid, userId: Number(r.userid), paid });
+      }
+    }
+    await client.query('DELETE FROM club_members WHERE clubId = $1', [clubId]);
+    await client.query('DELETE FROM club_tables WHERE clubId = $1', [clubId]);
+    await client.query('DELETE FROM clubs WHERE id = $1', [clubId]);
+    await client.query('COMMIT');
+    return { success: true, cancelled, refunded };
+  } catch (err: any) {
+    await client.query('ROLLBACK').catch(() => {});
+    console.error('[Clubs] delete club failed:', err?.message || err);
+    return { success: false, error: 'Could not delete the club — nothing was changed. Please try again.', code: 'delete_failed' };
+  } finally {
+    client.release();
+  }
 }
 
 export async function searchClubs(
@@ -1888,7 +1977,7 @@ export async function getScheduledTables(
 export async function activateScheduledTable(
   id: number,
   userId: number
-): Promise<{ success: boolean; error?: string; tableConfig?: any }> {
+): Promise<{ success: boolean; error?: string; tableConfig?: any; clubId?: number }> {
   const pool = getPool();
   const row = (await pool.query('SELECT * FROM scheduled_tables WHERE id = $1', [id])).rows[0] as any;
   if (!row) return { success: false, error: 'Scheduled table not found' };
@@ -1907,7 +1996,8 @@ export async function activateScheduledTable(
   );
   if (!rowCount) return { success: false, error: 'Already activated' };
 
-  return { success: true, tableConfig: JSON.parse(row.tableconfig || '{}') };
+  // F104 (2026-10-21) — the ROW's club (the one the role check used), never the client's clubId.
+  return { success: true, tableConfig: JSON.parse(row.tableconfig || '{}'), clubId: Number(row.clubid) };
 }
 
 export async function deleteScheduledTable(
@@ -1949,6 +2039,19 @@ export async function getDueScheduledTables(now: string): Promise<ScheduledTable
   }));
 }
 
+/**
+ * 2026-10-21 (gameplay F104) — a claimed ('active') scheduled row whose club
+ * table could not be made (a DB error) goes back to 'scheduled': the next
+ * sweep / an Activate retries it instead of the occurrence being lost.
+ */
+export async function releaseScheduledActivation(id: number): Promise<boolean> {
+  const { rowCount } = await getPool().query(
+    `UPDATE scheduled_tables SET status = 'scheduled' WHERE id = $1 AND status = 'active'`,
+    [id]
+  );
+  return (rowCount || 0) > 0;
+}
+
 // 2026-07-07 review fix — ATOMIC claim. Flips 'scheduled'->'active' only if the
 // row is still 'scheduled', and returns whether THIS call won the claim. The
 // sweep calls this BEFORE creating the table, so two overlapping sweeps (slow
@@ -1980,10 +2083,11 @@ export async function rescheduleRecurring(id: number): Promise<void> {
   const now = Date.now();
   while (nextMs <= now) nextMs += stepMs;
   const nextTime = new Date(nextMs).toISOString();
+  // F104 (2026-10-21) — the next occurrence fires as the same club table (clubTableId).
   await pool.query(
-    `INSERT INTO scheduled_tables (clubId, tableConfig, scheduledTime, recurring, recurrencePattern, status, createdBy)
-     VALUES ($1, $2, $3, $4, $5, 'scheduled', $6)`,
-    [row.clubid, row.tableconfig, nextTime, row.recurring, row.recurrencepattern || null, row.createdby]
+    `INSERT INTO scheduled_tables (clubId, tableConfig, scheduledTime, recurring, recurrencePattern, status, createdBy, clubTableId)
+     VALUES ($1, $2, $3, $4, $5, 'scheduled', $6, $7)`,
+    [row.clubid, row.tableconfig, nextTime, row.recurring, row.recurrencepattern || null, row.createdby, row.clubtableid ?? null]
   );
 }
 

@@ -32,16 +32,22 @@ export interface FakeClubTable {
   id: number; clubid: number; tablename: string; variant: string; smallblind: number; bigblind: number; minbuyin: number;
   maxbuyin: number; maxseats: number; isactive: number; tableid: string | null;
 }
+/** 2026-10-21 (gameplay F104) — a scheduled club table row. */
+export interface FakeScheduledTable {
+  id: number; clubid: number; tableconfig: string; scheduledtime: string; recurring: number; recurrencepattern: string | null;
+  status: string; createdby: number; clubtableid: number | null;
+}
 
 interface State {
   wallets: Map<number, number>;
   payouts: Map<string, { userId: number; amount: number; kind: string; credited: boolean }>;
   offers: Map<string, FakeOffer>;
-  clubs: Map<number, { id: number; name: string }>;
+  clubs: Map<number, { id: number; name: string; ownerid?: number }>;
   members: Array<{ clubid: number; userid: number; role: string; status: string }>;
   clubTournaments: Map<number, FakeClubTournament>;
   clubRegs: FakeClubReg[];
   clubTables: Map<number, FakeClubTable>;
+  scheduledTables: Map<number, FakeScheduledTable>;
 }
 
 const clone = (s: State): State => ({
@@ -53,6 +59,7 @@ const clone = (s: State): State => ({
   clubTournaments: new Map([...s.clubTournaments].map(([k, v]) => [k, { ...v }])),
   clubRegs: s.clubRegs.map((r) => ({ ...r })),
   clubTables: new Map([...s.clubTables].map(([k, v]) => [k, { ...v }])),
+  scheduledTables: new Map([...s.scheduledTables].map(([k, v]) => [k, { ...v }])),
 });
 
 export function createFakePokerDb(wallets: Record<number, number> = {}) {
@@ -65,8 +72,11 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
     clubTournaments: new Map(),
     clubRegs: [],
     clubTables: new Map(),
+    scheduledTables: new Map(),
   };
   let clubSeq = 0;
+  let clubTableSeq = 0;
+  let scheduledSeq = 0;
   // R3 (AUTH-P3-3) — used_play_tickets: ticket hash -> expires_at (ms); NOW() reads clockNow (tests move it).
   const usedTickets = new Map<string, number>();
   let clockNow = () => Date.now();
@@ -168,7 +178,79 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
       if (t) t.tableid = String(params[0]);
       return res(t ? [{}] : []);
     }
-    if (/^SELECT \* FROM clubs WHERE id = \$1$/i.test(q)) { const c = S.clubs.get(Number(params[0])); return res(c ? [{ id: c.id, name: c.name, clubcode: 'X', ownerid: 1, settings: '{}', description: '' }] : []); }
+    if (/^SELECT \* FROM clubs WHERE id = \$1$/i.test(q)) { const c = S.clubs.get(Number(params[0])); return res(c ? [{ id: c.id, name: c.name, clubcode: 'X', ownerid: c.ownerid ?? 1, settings: '{}', description: '' }] : []); }
+    // ── 2026-10-21 (gameplay F103) — deleteClub, one transaction (ON DELETE CASCADE modelled on the clubs row) ──
+    if (/^SELECT id FROM clubs WHERE id = \$1 AND ownerId = \$2 FOR UPDATE$/i.test(q)) {
+      const c = S.clubs.get(Number(params[0]));
+      return res(c && (c.ownerid ?? 1) === Number(params[1]) ? [{ id: c.id }] : []);
+    }
+    if (/^SELECT id, status FROM club_tournaments WHERE clubId = \$1 FOR UPDATE$/i.test(q)) {
+      return res([...S.clubTournaments.values()].filter((t) => t.clubid === Number(params[0])).map((t) => ({ id: t.id, status: t.status })));
+    }
+    if (/^DELETE FROM club_members WHERE clubId = \$1$/i.test(q)) {
+      const before = S.members.length;
+      S.members = S.members.filter((m) => m.clubid !== Number(params[0]));
+      return { rows: [], rowCount: before - S.members.length };
+    }
+    if (/^DELETE FROM club_tables WHERE clubId = \$1$/i.test(q)) {
+      const hit = [...S.clubTables.values()].filter((t) => t.clubid === Number(params[0]));
+      for (const t of hit) S.clubTables.delete(t.id);
+      return { rows: [], rowCount: hit.length };
+    }
+    if (/^DELETE FROM clubs WHERE id = \$1$/i.test(q)) {
+      const cid = Number(params[0]);
+      if (!S.clubs.delete(cid)) return { rows: [], rowCount: 0 };
+      // ON DELETE CASCADE: club_tournaments -> club_tournament_registrations; club_tables, members, scheduled_tables.
+      const gone = new Set([...S.clubTournaments.values()].filter((t) => t.clubid === cid).map((t) => t.id));
+      for (const id of gone) S.clubTournaments.delete(id);
+      S.clubRegs = S.clubRegs.filter((r) => !gone.has(r.tournamentid));
+      for (const t of [...S.clubTables.values()]) if (t.clubid === cid) S.clubTables.delete(t.id);
+      for (const t of [...S.scheduledTables.values()]) if (t.clubid === cid) S.scheduledTables.delete(t.id);
+      S.members = S.members.filter((m) => m.clubid !== cid);
+      return { rows: [], rowCount: 1 };
+    }
+    // ── 2026-10-21 (gameplay F104) — club_tables rows + scheduled_tables ──
+    if (/^INSERT INTO club_tables \(clubId, tableName, variant, smallBlind, bigBlind, minBuyIn, maxBuyIn, maxSeats\) VALUES \(\$1, \$2, \$3, \$4, \$5, \$6, \$7, \$8\) RETURNING id$/i.test(q)) {
+      const id = ++clubTableSeq;
+      const [clubid, tablename, variant, smallblind, bigblind, minbuyin, maxbuyin, maxseats] = params;
+      S.clubTables.set(id, { id, clubid: Number(clubid), tablename, variant, smallblind, bigblind, minbuyin, maxbuyin, maxseats, isactive: 1, tableid: null });
+      return res([{ id }]);
+    }
+    if (/^INSERT INTO scheduled_tables \(clubId, tableConfig, scheduledTime, recurring, recurrencePattern, status, createdBy(, clubTableId)?\) VALUES \(\$1, \$2, \$3, \$4, \$5, 'scheduled', \$6(, \$7)?\)( RETURNING id)?$/i.test(q)) {
+      const id = ++scheduledSeq;
+      const [clubid, tableconfig, scheduledtime, recurring, recurrencepattern, createdby, clubtableid] = params;
+      S.scheduledTables.set(id, {
+        id, clubid: Number(clubid), tableconfig, scheduledtime, recurring: Number(recurring), recurrencepattern: recurrencepattern ?? null,
+        status: 'scheduled', createdby: Number(createdby), clubtableid: clubtableid ?? null,
+      });
+      return res([{ id }]);
+    }
+    if (/^SELECT \* FROM scheduled_tables WHERE id = \$1$/i.test(q)) { const t = S.scheduledTables.get(Number(params[0])); return res(t ? [{ ...t }] : []); }
+    if (/^SELECT clubTableId FROM scheduled_tables WHERE id = \$1$/i.test(q)) {
+      const t = S.scheduledTables.get(Number(params[0]));
+      return res(t ? [{ clubtableid: t.clubtableid }] : []);
+    }
+    if (/^UPDATE scheduled_tables SET clubTableId = \$1 WHERE id = \$2$/i.test(q)) {
+      const t = S.scheduledTables.get(Number(params[1]));
+      if (t) t.clubtableid = Number(params[0]);
+      return { rows: [], rowCount: t ? 1 : 0 };
+    }
+    if (/^UPDATE scheduled_tables SET status = 'active' WHERE id = \$1 AND status = 'scheduled'$/i.test(q)) {
+      const t = S.scheduledTables.get(Number(params[0]));
+      if (!t || t.status !== 'scheduled') return { rows: [], rowCount: 0 };
+      t.status = 'active';
+      return { rows: [], rowCount: 1 };
+    }
+    if (/^UPDATE scheduled_tables SET status = 'scheduled' WHERE id = \$1 AND status = 'active'$/i.test(q)) {
+      const t = S.scheduledTables.get(Number(params[0]));
+      if (!t || t.status !== 'active') return { rows: [], rowCount: 0 };
+      t.status = 'scheduled';
+      return { rows: [], rowCount: 1 };
+    }
+    if (/^SELECT \* FROM scheduled_tables WHERE status = 'scheduled' AND scheduledTime <= \$1 ORDER BY scheduledTime ASC LIMIT 50$/i.test(q)) {
+      return res([...S.scheduledTables.values()].filter((t) => t.status === 'scheduled' && t.scheduledtime <= String(params[0]))
+        .sort((a, b) => (a.scheduledtime < b.scheduledtime ? -1 : 1)).map((t) => ({ ...t })));
+    }
     return null;
   }
 
@@ -313,6 +395,7 @@ export function createFakePokerDb(wallets: Record<number, number> = {}) {
     get clubTournaments() { return state.clubTournaments; },
     get clubRegs() { return state.clubRegs; },
     get clubTables() { return state.clubTables; },
+    get scheduledTables() { return state.scheduledTables; },   // F104
     get members() { return state.members; },
     get clubs() { return state.clubs; },
     // R3 (AUTH-P3-3) — the play-ticket ledger, and the DB clock its NOW() reads.
