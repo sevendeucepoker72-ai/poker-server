@@ -1348,3 +1348,30 @@ function seatPositions(
 variant: this.variantId,
 DEALERS_CHOICE_DEALS_THE_VARIANT
 Dealer's Choice is not available yet.
+
+# 2026-10-21 gameplay S5 (multi-table: extra-table seats and action routing).
+# F45: the 500ms orphan auto-act counts an extra-table session as live. F156:
+# every table-scoped seat control takes an optional tableId (seatSessionFor)
+# and refuses a table he holds no seat at (notSeatedThere); an extra seat's
+# rebuy is re-validated against its own session; the sit-out limit holds an
+# extra seat too. F51: action / moveSeat never fall back to the main seat.
+# F64: an extra table's stale-action frame is a raw snapshot; a frame for
+# another table than the delta baseline is full. F73: a disconnect cashes out
+# a socket's extra seats first. F85: a departing extra seat keeps its live
+# hand. F62: one socket, one seat per table. G166: insuranceSettled reaches an
+# extra seat. G191: the ghost-seat clear ends another socket's extra seat of
+# the same account.
+const hasLiveSession = seatHasAnySession(tableId, activeIdx);
+const nowHasLiveSession = seatHasAnySession(tableId, activeIdx);
+const notSeatedThere =
+const session = seatSessionFor(data?.tableId);
+extraSession: session
+notSeatedAt: tableId
+code: 'already_seated'
+socketHasSessionAt(socket.id, candidate.tableId)
+|| prev.tableId !== state?.tableId
+socket.emit('gameState', { full: true, state: staleState, _serverTs: Date.now() });
+keepHandOnDeparture: true
+ghost_seat_extra_session_scan
+const settledSid = socketIdForSeat(tableId, co.seatIndex);
+extraSeat: true

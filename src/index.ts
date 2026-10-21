@@ -1054,9 +1054,15 @@ function pickAlwaysEmit(state: any): Record<string, any> {
 
 function emitGameState(socket: any, state: any, forceFullState = false): void {
   const prev = lastSentState.get(socket.id);
-  if (!prev || forceFullState) {
+  // 2026-10-21 (gameplay F64) — a frame for ANOTHER table than the baseline is
+  // always full (a delta against a foreign table's frame drops every key whose
+  // value happens to match), and a full frame starts a fresh per-key JSON cache
+  // (the old one described frames from before it: a key reverting to its
+  // pre-full value was wrongly left out of the next delta).
+  if (!prev || forceFullState || prev.tableId !== state?.tableId) {
     socket.emit('gameState', { full: true, state, _serverTs: Date.now() });
     lastSentState.set(socket.id, state);
+    lastSentJson.delete(socket.id);
   } else {
     const delta = shallowDiff(prev, state, socket.id) as Record<string, any> | null;
     // Always re-stamp the turn/variant metadata — even on a no-op tick — so
@@ -1463,7 +1469,7 @@ function seatBoughtInBy(seat: { playerId?: string | null }, userId: number): boo
  * tournament stack itself). Callers own sessions, rooms and broadcasts.
  */
 type SeatTeardownOutcome = 'deferred' | 'stood_up' | 'none';
-const seatTeardownStats = { deferred: 0, stoodUp: 0, allInKept: 0, foldedOnClock: 0, foldedOutOfTurn: 0, awardedUncontested: 0 };
+const seatTeardownStats = { deferred: 0, stoodUp: 0, allInKept: 0, foldedOnClock: 0, foldedOutOfTurn: 0, awardedUncontested: 0, departureKept: 0 };
 
 /**
  * R2 — does a seat torn down while ALL-IN keep its hand? Only where its stack
@@ -1501,6 +1507,15 @@ function foldSeatOutOfHand(table: PokerTable, seatIndex: number): void {
 function teardownSeat(
   tableId: string, table: PokerTable, seatIndex: number,
   who: { userId: number; username: string } | null, reason: string,
+  // 2026-10-21 (gameplay F85) — a DEPARTURE, not a leave (a dropped socket's /
+  // an account switch's extra-table seats, cashOutAdditionalSeatsOnDeparture):
+  // a seat still in the hand with chips in its pot at a RING table is not
+  // folded out of turn. On the clock it gets the Z6 departure action (check
+  // when free, else fold — reserveSeatForDeparture's rule for the main seat);
+  // off the clock it keeps its hand and the session-less turn clock acts for
+  // it (autoActForSeat: check / fold). The stand-up waits for the hand's end
+  // either way (pendingSeatRemovalAfterHand credits the final stack).
+  opts: { keepHandOnDeparture?: boolean } = {},
 ): SeatTeardownOutcome {
   const seat = table.seats[seatIndex];
   if (!seat || seat.state !== 'occupied') return 'none';
@@ -1524,6 +1539,13 @@ function teardownSeat(
     // ('Won by fold') — or, with the shover insured, to the house.
     if ((seat.allIn || table.isRunoutHeld()) && leaverKeepsAllInHand(tableId)) {
       seatTeardownStats.allInKept++;
+    } else if (opts.keepHandOnDeparture && inPot && leaverKeepsAllInHand(tableId)) {
+      // F85 — keeps his hand (and his chips' equity); acted for only on the clock.
+      seatTeardownStats.departureKept++;
+      if (!DrawPhases.includes(table.currentPhase) && table.activeSeatIndex === seatIndex) {
+        const owed = table.currentBetToMatch - (seat.currentBet || 0);
+        if (!(owed <= 0 && table.playerCheck(seatIndex))) table.playerFold(seatIndex);
+      }
     } else {
       foldSeatOutOfHand(table, seatIndex);
     }
@@ -1926,11 +1948,17 @@ const buyInsOnDeadSocket = { abandoned: 0, refunded: 0, refundFailed: 0 };
  *   answer      — how a LIVE socket is told (default: `error` with
  *                 code 'buy_in_cancelled').
  * Returns the reason ('user_changed' | 'session_changed' | 'table_gone' |
- * 'seat_gone'), or null when nothing changed.
+ * 'seat_gone' | 'already_seated' (F62)), or null when nothing changed.
  */
 interface BuyInExpectation {
   userId?: number;
   mainSession?: PlayerSession | null;
+  // 2026-10-21 (gameplay F156) — a top-up for an EXTRA-table seat: that session
+  // must still be in this socket's multiTableSessions (and point at `seat`).
+  extraSession?: PlayerSession;
+  // 2026-10-21 (gameplay F62) — the socket must still hold NO session (main or
+  // extra-table) at this table: two buy-ins racing for one table ('already_seated').
+  notSeatedAt?: string;
   table?: { tableId: string; table: PokerTable };
   seat?: { tableId: string; table: PokerTable; seatIndex: number; seat: unknown };
   answer?: (reason: string) => void;
@@ -1958,6 +1986,11 @@ function buyInStateChanged(socket: Socket, expect: BuyInExpectation): string | n
     const same = expect.mainSession === null ? now === undefined : now === expect.mainSession;
     if (!same) return expect.seat ? 'seat_gone' : 'session_changed';
   }
+  if (expect.extraSession) {
+    const extras = multiTableSessions.get(socket.id);
+    if (!Array.isArray(extras) || !extras.includes(expect.extraSession)) return 'seat_gone';
+  }
+  if (expect.notSeatedAt !== undefined && socketHasSessionAt(socket.id, expect.notSeatedAt)) return 'already_seated';
   if (expect.table && tableManager.getTable(expect.table.tableId) !== expect.table.table) {
     return expect.seat ? 'seat_gone' : 'table_gone';
   }
@@ -1966,7 +1999,7 @@ function buyInStateChanged(socket: Socket, expect: BuyInExpectation): string | n
     if (tableManager.getTable(tableId) !== table) return 'seat_gone';
     const live = table.seats[seatIndex];
     if (live !== seat || live.state !== 'occupied') return 'seat_gone';
-    const s = expect.mainSession;
+    const s = expect.mainSession || expect.extraSession;
     if (s && (s.tableId !== tableId || s.seatIndex !== seatIndex)) return 'seat_gone';
   }
   return null;
@@ -4569,6 +4602,17 @@ function otherSessionHoldsSeat(exceptSocketId: string, tableId: string, seatInde
   return false;
 }
 
+/**
+ * 2026-10-21 (gameplay F62) — does THIS socket hold a session at `tableId` — its
+ * main seat or one of its extra-table (multi-table) seats? A socket never gets
+ * a second seat at a table it already plays (two hands, four hole cards).
+ */
+function socketHasSessionAt(socketId: string, tableId: string): boolean {
+  if (playerSessions.get(socketId)?.tableId === tableId) return true;
+  const list = multiTableSessions.get(socketId);
+  return Array.isArray(list) && list.some((s) => s && s.tableId === tableId);
+}
+
 /** A session points at (tableId, seatIndex) — the same test broadcastGameState's auto-act uses. */
 function seatHasLiveSession(tableId: string, seatIndex: number): boolean {
   for (const s of playerSessions.values()) {
@@ -4824,15 +4868,26 @@ function broadcastGameState(tableId: string): void {
         break;
       }
     }
+    // F156 (2026-10-21) — an extra-table (multi-table) session can sit out too.
+    if (!shouldAutoAct) {
+      for (const list of multiTableSessions.values()) {
+        if (Array.isArray(list) && list.some((s) => s && s.tableId === tableId && s.sittingOut && s.seatIndex === activeIdx)) {
+          shouldAutoAct = true;
+          break;
+        }
+      }
+    }
 
     // Also auto-act if the active seat belongs to a player whose socket is gone
     // (reserved seat scenario) so a disconnected human doesn't deadlock the table.
+    // 2026-10-21 (gameplay F45) — "a live session" is the main OR an extra-table
+    // session (seatHasAnySession): an extra seat (joinAdditionalTable) lives only
+    // in multiTableSessions, and the playerSessions-only test treated the LIVE
+    // multi-tabler as an orphan — checked / folded 500ms into every turn there.
     if (!shouldAutoAct && activeIdx >= 0) {
       const seat = table.seats[activeIdx];
       if (seat && seat.state === 'occupied' && !seat.isAI) {
-        const hasLiveSession = [...playerSessions.values()].some(
-          (s) => s.tableId === tableId && s.seatIndex === activeIdx
-        );
+        const hasLiveSession = seatHasAnySession(tableId, activeIdx);
         if (!hasLiveSession) shouldAutoAct = true;
       }
     }
@@ -4853,9 +4908,7 @@ function broadcastGameState(tableId: string): void {
           // Genuinely-gone seats still have no session → the fold proceeds; the
           // 30s turn timer + disconnect-time fold still prevent any deadlock, so
           // this cannot wedge the table.
-          const nowHasLiveSession = [...playerSessions.values()].some(
-            (s) => s.tableId === tableId && s.seatIndex === activeIdx
-          );
+          const nowHasLiveSession = seatHasAnySession(tableId, activeIdx);   // F45 — main or extra-table
           // Also spare a RECENTLY-DISCONNECTED player whose seat is still reserved.
           // A real reconnect (socket backoff + auth) takes ~1-3s — longer than this
           // 500ms window — so re-checking the session alone can't save them. Their
@@ -5051,6 +5104,37 @@ function standUpSeatsPastSitOutLimit(tableId: string, table: PokerTable): void {
     sitOutLimitStats.stoodUp++;
     console.log(`[sit-out] ${JSON.stringify({ event: 'sit_out_limit_stood_up', tableId, seatIndex: session.seatIndex, hands: SIT_OUT_HANDS_LIMIT, localUserId: authSessions.get(sid)?.userId ?? null })}`);
   }
+  // 2026-10-21 (gameplay F156) — an EXTRA-table (multi-table) seat sitting out
+  // (its Sit Out now acts on that seat) is held to the same limit: its stack is
+  // credited and the seat stood up (teardownSeat — between hands, nothing in a
+  // pot); only that seat ends — the socket's main seat and other extra seats
+  // stay — and the socket is told for that table (seatVacated + sit_out_limit).
+  let extraStoodUp = false;
+  for (const [sid, list] of [...multiTableSessions]) {
+    if (!Array.isArray(list)) continue;
+    for (const ms of [...list]) {
+      if (!ms || ms.tableId !== tableId) continue;
+      const seat = table.seats[ms.seatIndex];
+      if (!seat || seat.state !== 'occupied' || seat.isAI) continue;
+      if (!ms.sittingOut || seat.holeCards.length > 0) { ms.sitOutHands = 0; continue; }
+      ms.sitOutHands = (ms.sitOutHands || 0) + 1;
+      if (ms.sitOutHands < SIT_OUT_HANDS_LIMIT) continue;
+      const sock = io.sockets.sockets.get(sid);
+      if (!sock) continue;   // a socket that is gone is its disconnect's to cash out
+      const auth = authSessions.get(sid);
+      teardownSeat(tableId, table, ms.seatIndex, auth ? { userId: auth.userId, username: auth.username } : null, 'sit_out_limit');
+      const keep = (multiTableSessions.get(sid) || []).filter((x) => x !== ms);
+      if (keep.length) multiTableSessions.set(sid, keep); else multiTableSessions.delete(sid);
+      if (playerSessions.get(sid)?.tableId !== tableId) sock.leave(`table:${tableId}`);
+      sock.emit('seatVacated', { tableId, seatIndex: ms.seatIndex, reason: 'sit_out_limit' });
+      sock.emit('sitOutToggled', { sittingOut: false, reason: 'sit_out_limit', stoodUp: true, tableId });
+      sock.emit('error', { message: SIT_OUT_LIMIT_MESSAGE, code: 'sit_out_limit', tableId });
+      sitOutLimitStats.stoodUp++;
+      console.log(`[sit-out] ${JSON.stringify({ event: 'sit_out_limit_stood_up', tableId, seatIndex: ms.seatIndex, hands: SIT_OUT_HANDS_LIMIT, extraSeat: true, localUserId: auth?.userId ?? null })}`);
+      extraStoodUp = true;
+    }
+  }
+  if (extraStoodUp) broadcastGameState(tableId);
 }
 
 /**
@@ -7041,6 +7125,33 @@ function clearGhostSeatsForUser(
     }
   }
 
+  // 1b. 2026-10-21 (gameplay G191) — the same for another socket's EXTRA-table
+  // (joinAdditionalTable) session of this account on this table: step 1 read
+  // playerSessions only, so a second device joining a table the first device
+  // multi-tabled gave one account two seats (two hands) at one table.
+  for (const [otherSocketId, list] of [...multiTableSessions]) {
+    if (otherSocketId === excludeSocketId || !Array.isArray(list)) continue;
+    const otherAuth = authSessions.get(otherSocketId);
+    if (!otherAuth || otherAuth.userId !== userId) continue;
+    const here = list.filter((ms) => ms && ms.tableId === tableId
+      && (excludeSeatIndex === undefined || ms.seatIndex !== excludeSeatIndex));
+    if (here.length === 0) continue;
+    const keep = list.filter((ms) => !here.includes(ms));
+    if (keep.length) multiTableSessions.set(otherSocketId, keep); else multiTableSessions.delete(otherSocketId);
+    const ghostSocket = io.sockets.sockets.get(otherSocketId);
+    for (const ms of here) {
+      const seat = table.seats[ms.seatIndex];
+      if (seat && seat.state === 'occupied' && !seat.isAI) {
+        teardownSeat(tableId, table, ms.seatIndex,
+          { userId: otherAuth.userId, username: otherAuth.username }, 'ghost_seat_extra_session_scan');
+        cleared++;
+      }
+      ghostSocket?.emit('seatVacated', { tableId, seatIndex: ms.seatIndex, reason: 'joined_new_seat' });
+    }
+    // Its main seat is never at this table here (step 1 ended any such session).
+    if (ghostSocket && playerSessions.get(otherSocketId)?.tableId !== tableId) ghostSocket.leave(`table:${tableId}`);
+  }
+
   // 2. This account's reservation on this table — still its seat?
   const reserved = reservedSeats.get(userId);
   if (reserved && reserved.tableId === tableId
@@ -8281,6 +8392,21 @@ function seatHasAnySession(tableId: string, seatIndex: number): boolean {
 }
 
 /**
+ * 2026-10-21 (gameplay G166) — the socket whose session plays (tableId,
+ * seatIndex): a main session first, else an extra-table (multi-table) one.
+ * undefined when none does.
+ */
+function socketIdForSeat(tableId: string, seatIndex: number): string | undefined {
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId === tableId && s.seatIndex === seatIndex) return sid;
+  }
+  for (const [sid, list] of multiTableSessions) {
+    if (Array.isArray(list) && list.some((s) => s && s.tableId === tableId && s.seatIndex === seatIndex)) return sid;
+  }
+  return undefined;
+}
+
+/**
  * R1 contract #1 — the seats that may insure this hand, each with its one
  * opponent: everything except "the betting is closed", which the caller adds
  * (runOutBoard asking the decider, or the runout hold being in place).
@@ -8547,11 +8673,12 @@ function settleInsuranceForHand(tableId: string, table: PokerTable, totalWonPerS
     insuranceStats.settled++;
     auditLog(co.playerId, delta >= 0 ? 'INSURANCE_PAYOUT' : 'INSURANCE_COLLECT',
       { tableId, seatIndex: co.seatIndex, handNumber: co.handNumber, cashout: co.cashout, equityPct: co.equityPct, pot: co.pot, exclusive, actualWon, delta, newStack: iseat!.chipCount });
-    for (const [sid, s] of playerSessions) {
-      if (s.tableId === tableId && s.seatIndex === co.seatIndex) {
-        io.sockets.sockets.get(sid)?.emit('insuranceSettled', { cashout: co.cashout, delta, stack: iseat!.chipCount, tableId, handNumber: co.handNumber });
-        break;
-      }
+    // G166 (2026-10-21) — the seat's socket, main OR extra-table session: an
+    // extra seat can be quoted and accept (insuranceSessionFor), so it is told
+    // the settlement too (it used to get only 'insuranceAccepted').
+    const settledSid = socketIdForSeat(tableId, co.seatIndex);
+    if (settledSid) {
+      io.sockets.sockets.get(settledSid)?.emit('insuranceSettled', { cashout: co.cashout, delta, stack: iseat!.chipCount, tableId, handNumber: co.handNumber });
     }
   }
   if (settledBySeat.size > 0) lastInsuranceSettlement.set(tableId, { handNumber: table.handNumber, bySeat: settledBySeat });
@@ -13283,6 +13410,13 @@ Give feedback in this JSON format:
         const notJoinable = joinTableRefusalReason(tableId, authSessions.get(socket.id), clubJoinGrants.has(data));
         if (notJoinable) { refuseTableNotJoinable(socket, 'joinTable', tableId, notJoinable); return; }
       }
+      // 2026-10-21 (gameplay F62) — this socket already plays an EXTRA-table seat
+      // here (joinAdditionalTable): a join would seat it twice at one table (the
+      // leave below only ends a MAIN session). Refused before any side effect.
+      if ((multiTableSessions.get(socket.id) || []).some((s) => s && s.tableId === tableId)) {
+        socket.emit('error', { message: 'You already have a seat at this table.', code: 'already_seated', tableId });
+        return;
+      }
 
       // Variant sanity check — if the client told us which variant they
       // thought they were joining, refuse to seat them at a different one.
@@ -13420,7 +13554,7 @@ Give feedback in this JSON format:
       if (authForJoin) {
         // P3 — what this buy-in is priced against: still this account, still no
         // seat on this socket (left above), still this live table.
-        const joinState: BuyInExpectation = { userId: authForJoin.userId, mainSession: null, table: { tableId, table } };
+        const joinState: BuyInExpectation = { userId: authForJoin.userId, mainSession: null, notSeatedAt: tableId, table: { tableId, table } };
         const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, buyIn);
         if (await buyInSocketGone(socket, 'joinTable', 'balance_read', undefined, joinState)) return; // F3 — nothing deducted yet
         if (buyIn > dbChips) {
@@ -13593,6 +13727,8 @@ Give feedback in this JSON format:
       // pick the same empty seat and the second one silently failed.
       let chosen: { tableId: string; table: any; targetSeat: number } | null = null;
       for (const candidate of sorted) {
+        // F62 (2026-10-21) — never a table this socket already plays an extra-table seat at.
+        if (socketHasSessionAt(socket.id, candidate.tableId)) continue;
         const table = tableManager.getTable(candidate.tableId);
         if (!table) continue;
         let targetSeat = -1;
@@ -13624,7 +13760,7 @@ Give feedback in this JSON format:
       let chipsDeducted = false;
       if (authForJoin) {
         // P3 — still this account, still no seat on this socket, still this live table.
-        const qpState: BuyInExpectation = { userId: authForJoin.userId, mainSession: null, table: { tableId: chosenTableId, table } };
+        const qpState: BuyInExpectation = { userId: authForJoin.userId, mainSession: null, notSeatedAt: chosenTableId, table: { tableId: chosenTableId, table } };
         const dbChips = await ensureChipsForBuyIn(authForJoin.userId, authForJoin.username, buyIn);
         if (await buyInSocketGone(socket, 'quickPlay', 'balance_read', undefined, qpState)) return; // F3 — nothing deducted yet
         if (buyIn > dbChips) {
@@ -15518,13 +15654,20 @@ Give feedback in this JSON format:
     emitGameState(socket, state, true);
   });
 
-  socket.on('rebuy', async (data: { amount?: number } = {}) => { return (async () => {
+  // F156 (2026-10-21) — `{ amount?, tableId? }`: the top-up is for the seat at
+  // THAT table (an extra multi-table seat too); a table he holds no seat at is
+  // refused (not_at_table). An auto-rebuy on an extra table used to top up the
+  // MAIN seat from the wallet and leave the busted extra seat at 0.
+  socket.on('rebuy', async (data: { amount?: number; tableId?: string } = {}) => { return (async () => {
     // 2026-10-07 play gate — a rebuy puts fresh chips in play.
     const rbGate = await assertPlayable(socket, 'rebuy');
     if (rbGate) { emitPlayRefusal(socket, rbGate); return; }
     if (await buyInSocketGone(socket, 'rebuy', 'gate')) return; // F3 (2026-10-10)
-    const session = playerSessions.get(socket.id);
-    if (!session) { socket.emit('error', { message: 'Not at a table' }); return; }
+    const session = seatSessionFor(data?.tableId);
+    if (!session) {
+      if (!notSeatedThere(data?.tableId)) socket.emit('error', { message: 'Not at a table' });
+      return;
+    }
     const table = tableManager.getTable(session.tableId);
     if (!table) { socket.emit('error', { message: 'Table not found' }); return; }
     const seat = table.seats[session.seatIndex];
@@ -15564,7 +15707,7 @@ Give feedback in this JSON format:
     // How much are we actually trying to top up to?
     const topUpAmount = Math.max(0, requested - seat.chipCount);
     if (topUpAmount <= 0) {
-      socket.emit('rebuyComplete', { success: true, newStack: seat.chipCount, added: 0 });
+      socket.emit('rebuyComplete', { success: true, newStack: seat.chipCount, added: 0, tableId: session.tableId });
       return;
     }
     const authForRebuy = authSessions.get(socket.id);
@@ -15575,8 +15718,14 @@ Give feedback in this JSON format:
       // the awaits (leaveTable, another device's join, the hand-start stand-up,
       // a guest-claim cash-out, an account switch) → the top-up is refunded.
       const tableIdForRebuy = session.tableId;
+      // F156 — an EXTRA-table seat's top-up is checked against that session
+      // (still in this socket's multiTableSessions), not the main one (which
+      // would refund every extra-table rebuy as seat_gone).
+      const isMainSession = session === playerSessions.get(socket.id);
       const rebuyState: BuyInExpectation = {
-        userId: authForRebuy.userId, mainSession: session, table: { tableId: tableIdForRebuy, table },
+        userId: authForRebuy.userId,
+        ...(isMainSession ? { mainSession: session } : { extraSession: session }),
+        table: { tableId: tableIdForRebuy, table },
         seat: { tableId: tableIdForRebuy, table, seatIndex: session.seatIndex, seat },
       };
       const dbChips = await ensureChipsForBuyIn(authForRebuy.userId, authForRebuy.username, topUpAmount);
@@ -15620,7 +15769,7 @@ Give feedback in this JSON format:
     seat.chipCount += topUpAmount;
     seat.eliminated = false;
     broadcastGameState(session.tableId);
-    socket.emit('rebuyComplete', { success: true, newStack: seat.chipCount, added: topUpAmount });
+    socket.emit('rebuyComplete', { success: true, newStack: seat.chipCount, added: topUpAmount, tableId: session.tableId });
     // 2026-05-12 audit: throttled to debug, was console.log
     log.debug(`[Rebuy] ${seat.playerName} topped up by ${topUpAmount} to ${requested}`);
   })(); });
@@ -15640,17 +15789,12 @@ Give feedback in this JSON format:
         socket.emit('error', { message: 'Invalid target seat' });
         return;
       }
-      // Resolve the player's session. Multi-table support: if `tableId` is
-      // passed and matches a secondary session, use that; otherwise the
-      // primary session.
-      let session: PlayerSession | undefined = playerSessions.get(socket.id);
-      if (data?.tableId) {
-        if (session?.tableId !== data.tableId) {
-          const multi = multiTableSessions.get(socket.id) || [];
-          const match = multi.find((s) => s.tableId === data.tableId);
-          if (match) session = match;
-        }
-      }
+      // Resolve the player's session. Multi-table support: a `tableId` picks
+      // the seat at that table (main or secondary session); none = the primary.
+      // F51 (2026-10-21) — through seatSessionFor: a tableId he holds no seat at
+      // is refused (not_at_table), never queued as a move at his main table.
+      const session: PlayerSession | undefined = seatSessionFor(data?.tableId);
+      if (!session && notSeatedThere(data?.tableId)) return;
       if (!session) {
         socket.emit('error', { message: 'Not at a table' });
         return;
@@ -15715,10 +15859,12 @@ Give feedback in this JSON format:
     console.log(`[MoveSeat] ${session.playerName} cancelled pending move on ${session.tableId}`);
   });
 
-  socket.on('startHand', async () => {
-    const session = playerSessions.get(socket.id);
+  // F156 (2026-10-21) — `{ tableId? }`: deal at THAT table (an extra
+  // multi-table seat's Deal / Auto Deal too); a table he holds no seat at: not_at_table.
+  socket.on('startHand', async (data: { tableId?: string } = {}) => {
+    const session = seatSessionFor(data?.tableId);
     if (!session) {
-      socket.emit('error', { message: 'Not at a table' });
+      if (!notSeatedThere(data?.tableId)) socket.emit('error', { message: 'Not at a table' });
       return;
     }
 
@@ -15810,11 +15956,16 @@ Give feedback in this JSON format:
       // moveSeat @8479). Without this, an action taken on a SECONDARY table was
       // applied to the player's PRIMARY table (or rejected 'Not your turn'),
       // because the handler only ever read the primary playerSessions entry.
-      let session: PlayerSession | undefined = playerSessions.get(socket.id);
-      if (data.tableId && session?.tableId !== data.tableId) {
-        const multi = multiTableSessions.get(socket.id) || [];
-        const match = multi.find((s) => s.tableId === data.tableId);
-        if (match) session = match;
+      // 2026-10-21 (gameplay F51) — through seatSessionFor (F156): a tableId he
+      // holds NO seat at is refused (`not_at_table`) — it used to fall back to
+      // the PRIMARY session, so a tap on a dead extra-table pane (its seat was
+      // cashed out by a reconnect) folded / called / raised his live hand at the
+      // main table whenever that table's stateVersion was not ahead of the
+      // pane's. No tableId = the main seat exactly as before.
+      const session: PlayerSession | undefined = seatSessionFor(data?.tableId);
+      if (!session && typeof data?.tableId === 'string' && data.tableId) {
+        socket.emit('error', { message: 'You are not seated at that table.', code: 'not_at_table', tableId: data.tableId });
+        return;
       }
       if (!session) {
         socket.emit('error', { message: 'Not at a table' });
@@ -15899,7 +16050,17 @@ Give feedback in this JSON format:
           code: 'STALE_STATE',
           stateVersion: table.stateVersion,
         });
-        emitGameState(socket, getGameStateForPlayer(table, session.seatIndex, session.trainingEnabled), true);
+        // 2026-10-21 (gameplay F64) — an EXTRA-table session's fresh state goes
+        // out as a RAW full snapshot, like broadcastGameState's multi-table loop:
+        // emitGameState keys the delta baseline on socket.id alone, so it made
+        // this extra table's frame the MAIN table's baseline (the main table's
+        // next delta then dropped every key equal to the extra table's — a
+        // stale bet-to-match / min-raise / pot there, Call shown for a check).
+        const staleState: any = getGameStateForPlayer(table, session.seatIndex, session.trainingEnabled);
+        staleState.sittingOut = session.sittingOut || false;
+        staleState.fastMode = session.fastMode === true;
+        if (session === playerSessions.get(socket.id)) emitGameState(socket, staleState, true);
+        else socket.emit('gameState', { full: true, state: staleState, _serverTs: Date.now() });
         return;
       }
 
@@ -15982,10 +16143,12 @@ Give feedback in this JSON format:
   );
 
   // ========== Draw Game: Player Draw Action ==========
-  socket.on('playerDraw', async (data: { discardIndices: number[] }) => {
-    const session = playerSessions.get(socket.id);
+  // F156 (2026-10-21) — `{ discardIndices, tableId? }`: the draw at THAT table
+  // (an extra multi-table seat too); a table he holds no seat at: not_at_table.
+  socket.on('playerDraw', async (data: { discardIndices: number[]; tableId?: string }) => {
+    const session = seatSessionFor(data?.tableId);
     if (!session) {
-      socket.emit('error', { message: 'Not at a table' });
+      if (!notSeatedThere(data?.tableId)) socket.emit('error', { message: 'Not at a table' });
       return;
     }
 
@@ -16020,8 +16183,10 @@ Give feedback in this JSON format:
   });
 
   // Chat message handler
-  socket.on('chatMessage', async (data: { message: string }) => {
-    const session = playerSessions.get(socket.id);
+  // F156 (2026-10-21) — `{ message, tableId? }`: said at THAT
+  // table (silent when not seated there); the room broadcast names the table.
+  socket.on('chatMessage', async (data: { message: string; tableId?: string }) => {
+    const session = seatSessionFor(data?.tableId);
     if (!session) return;
     if (!data.message || data.message.length > 200) return;
 
@@ -16038,6 +16203,7 @@ Give feedback in this JSON format:
       playerName: seatNameForSocket(socket, session.playerName),   // R1 contract #3
       message: data.message,
       timestamp: Date.now(),
+      tableId: session.tableId,
     };
 
     io.to(`table:${session.tableId}`).emit('chatMessage', chatMsg);
@@ -16487,13 +16653,21 @@ Give feedback in this JSON format:
   });
 
   // ========== Sit Out ==========
+  // 2026-10-21 (gameplay F156) — every table-scoped seat control below takes an
+  // OPTIONAL `tableId` (additive): none = the main seat exactly as before; a
+  // table he holds a seat at = THAT seat (an extra multi-table seat too —
+  // seatSessionFor); a table he holds no seat at is refused, never applied to
+  // the main seat. Tapping Sit Out / Rebuy / Draw / Straddle / Bomb Pot / chat
+  // on an extra table used to act on the MAIN table (Sit Out on his turn there
+  // folded his live hand; an auto-rebuy topped up the wrong seat). Replies name
+  // the table acted on (`tableId`). Refusal: notSeatedThere (next to seatSessionFor).
 
-  socket.on('sitOut', async () => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
+  socket.on('sitOut', async (data: { tableId?: string } = {}) => {
+    const session = seatSessionFor(data?.tableId);
+    if (!session) { notSeatedThere(data?.tableId); return; }
 
     session.sittingOut = !session.sittingOut;
-    socket.emit('sitOutToggled', { sittingOut: session.sittingOut });
+    socket.emit('sitOutToggled', { sittingOut: session.sittingOut, tableId: session.tableId });
 
     // Track sit-out for missed blinds (#16)
     if (session.sittingOut) {
@@ -16511,7 +16685,7 @@ Give feedback in this JSON format:
       const seat = tableForSitIn?.seats?.[session.seatIndex];
       const owed = seat?.deadBlindOwedChips || 0;
       if (owed > 0) {
-        socket.emit('missedBlinds', { amount: owed, type: seat?.missedBlind || 'big' });
+        socket.emit('missedBlinds', { amount: owed, type: seat?.missedBlind || 'big', tableId: session.tableId });
       }
     }
 
@@ -16544,8 +16718,9 @@ Give feedback in this JSON format:
   });
 
   // ========== AFK Handler ==========
-  socket.on('playerAFK', async () => {
-    const session = playerSessions.get(socket.id);
+  // F156 (2026-10-21) — `{ tableId? }`: an unknown table is ignored (silent).
+  socket.on('playerAFK', async (data: { tableId?: string } = {}) => {
+    const session = seatSessionFor(data?.tableId);
     if (!session) return;
 
     session.sittingOut = true;
@@ -16553,7 +16728,7 @@ Give feedback in this JSON format:
     sitOutTracker.get(session.tableId)!.add(session.seatIndex);
     syncSitOutToTable(session.tableId);
 
-    socket.emit('sitOutToggled', { sittingOut: true, reason: 'afk' });
+    socket.emit('sitOutToggled', { sittingOut: true, reason: 'afk', tableId: session.tableId });
 
     // Auto-fold if it's currently their turn (P-j: a tournament seat is acted
     // for as ABSENT — check, or fold).
@@ -16572,8 +16747,8 @@ Give feedback in this JSON format:
     }
   });
 
-  socket.on('playerBack', async () => {
-    const session = playerSessions.get(socket.id);
+  socket.on('playerBack', async (data: { tableId?: string } = {}) => {
+    const session = seatSessionFor(data?.tableId);   // F156 — silent on an unknown table
     if (!session) return;
 
     session.sittingOut = false;
@@ -16588,7 +16763,7 @@ Give feedback in this JSON format:
     // those on their first hand back, standard missed-blind rule.)
     syncSitOutToTable(session.tableId);
 
-    socket.emit('sitOutToggled', { sittingOut: false, reason: 'back' });
+    socket.emit('sitOutToggled', { sittingOut: false, reason: 'back', tableId: session.tableId });
   });
 
   // ========== Fast Mode (#12) ==========
@@ -16616,15 +16791,21 @@ Give feedback in this JSON format:
   // surface "Not enough chips" or "Nothing owed" instead of silently
   // failing. Adds dead money to totalInvestedThisHand ONLY — NOT currentBet
   // — so the post doesn't count toward the player's live call obligation.
-  socket.on('postMissedBlinds', async () => {
-    const session = playerSessions.get(socket.id);
+  // F156 (2026-10-21) — `{ tableId? }` (it took no payload): the seat at that
+  // table; one he holds no seat at answers no_session for it. Replies carry tableId.
+  socket.on('postMissedBlinds', async (data: { tableId?: string } = {}) => {
+    const session = seatSessionFor(data?.tableId);
     if (!session) {
-      socket.emit('missedBlindsError', { code: 'no_session', message: 'Not seated at a table.' });
+      if (typeof data?.tableId === 'string' && data.tableId) {
+        socket.emit('missedBlindsError', { code: 'no_session', message: 'Not seated at that table.', tableId: data.tableId });
+      } else {
+        socket.emit('missedBlindsError', { code: 'no_session', message: 'Not seated at a table.' });
+      }
       return;
     }
     const table = tableManager.getTable(session.tableId);
     if (!table) {
-      socket.emit('missedBlindsError', { code: 'no_table', message: 'Table not found.' });
+      socket.emit('missedBlindsError', { code: 'no_table', message: 'Table not found.', tableId: session.tableId });
       return;
     }
 
@@ -16641,11 +16822,12 @@ Give feedback in this JSON format:
       socket.emit('missedBlindsError', {
         code: result.reason,
         message: messages[result.reason || ''] || 'Could not post blinds.',
+        tableId: session.tableId,
       });
       return;
     }
 
-    socket.emit('missedBlindsPosted', { amount: result.amount });
+    socket.emit('missedBlindsPosted', { amount: result.amount, tableId: session.tableId });
     const authSessionForAudit = authSessions.get(socket.id);
     if (authSessionForAudit) {
       auditLog(authSessionForAudit.username, 'DEAD_BLIND_POSTED', {
@@ -16666,11 +16848,7 @@ Give feedback in this JSON format:
   // or bots. Payload: `{ tableId? }` (any `cards` are ignored).
   // `muckedHandRevealed { playerName, seatIndex, tableId, handNumber, cards: [{suit, rank, display}], timestamp }`.
   socket.on('showMuckedHand', async (data: { tableId?: string; cards?: unknown } = {}) => {
-    const main = playerSessions.get(socket.id);
-    const wanted = typeof data?.tableId === 'string' && data.tableId ? data.tableId : main?.tableId;
-    const session = main && main.tableId === wanted
-      ? main
-      : (multiTableSessions.get(socket.id) || []).find((s) => s && s.tableId === wanted);
+    const session = seatSessionFor(data?.tableId);   // F156 (2026-10-21) — the one resolver; silent when not seated there
     if (!session) return;
     const table = tableManager.getTable(session.tableId);
     if (!table) return;
@@ -16697,32 +16875,44 @@ Give feedback in this JSON format:
 
   // ========== Training Mode ==========
 
-  socket.on('toggleTraining', async () => {
-    const session = playerSessions.get(socket.id);
+  // F156 (2026-10-21) — `{ tableId? }`: the seat at that table (silent when none).
+  socket.on('toggleTraining', async (data: { tableId?: string } = {}) => {
+    const session = seatSessionFor(data?.tableId);
     if (!session) return;
 
     session.trainingEnabled = !session.trainingEnabled;
-    socket.emit('trainingToggled', { enabled: session.trainingEnabled });
+    socket.emit('trainingToggled', { enabled: session.trainingEnabled, tableId: session.tableId });
 
     // If training was just enabled, send current training data
     if (session.trainingEnabled) {
       const table = tableManager.getTable(session.tableId);
       if (table) {
-        socket.emit(
-          'gameState',
-          getGameStateForPlayer(table, session.seatIndex, true)
-        );
+        if (session === playerSessions.get(socket.id)) {
+          socket.emit(
+            'gameState',
+            getGameStateForPlayer(table, session.seatIndex, true)
+          );
+        } else {
+          // An EXTRA-table seat: a RAW full snapshot (never emitGameState — it
+          // would make this table's frame the MAIN table's delta baseline).
+          const state: any = getGameStateForPlayer(table, session.seatIndex, true);
+          state.sittingOut = session.sittingOut || false;
+          state.fastMode = session.fastMode === true;
+          socket.emit('gameState', { full: true, state, _serverTs: Date.now() });
+        }
       }
     }
   });
 
   // ========== Bomb Pot ==========
   socket.on('triggerBombPot', async (data: { tableId?: string }) => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
-    // Only players seated at the table may trigger a bomb pot
-    const tableId = data?.tableId || session.tableId;
-    if (session.tableId !== tableId) return;
+    // Only players seated at the table may trigger a bomb pot. F156
+    // (2026-10-21) — at THAT table: an extra multi-table seat too (it used to
+    // be ignored unless it named the main table); a table he holds no seat at
+    // is refused (not_at_table).
+    const session = seatSessionFor(data?.tableId);
+    if (!session) { notSeatedThere(data?.tableId); return; }
+    const tableId = session.tableId;
     // 2026-10-11 (R2, GAME-12 / C11) — Hold'em / Omaha ring tables only (the
     // state's `canBombPot` says so; the button hides elsewhere). Refused before
     // the cooldown is spent.
@@ -17512,8 +17702,9 @@ Give feedback in this JSON format:
   // HandComplete ONLY — revealing while the hand is live would leak future
   // community cards to players still in the pot. Reads the committed deck order
   // and rewinds, so it's side-effect free and consistent with the fairness reveal.
-  socket.on('rabbitHunt', () => {
-    const session = playerSessions.get(socket.id);
+  // F156 (2026-10-21) — `{ tableId? }`: that table's board (silent when not seated there).
+  socket.on('rabbitHunt', (data: { tableId?: string } = {}) => {
+    const session = seatSessionFor(data?.tableId);
     if (!session) return;
     const table = tableManager.getTable(session.tableId);
     if (!table) return;
@@ -17522,6 +17713,7 @@ Give feedback in this JSON format:
     if (!board.length) return;
     socket.emit('rabbitHuntResult', {
       cards: board.map((c) => ({ suit: c.suit, rank: c.rank, display: cardToString(c) })),
+      tableId: session.tableId,
     });
   });
 
@@ -17545,6 +17737,14 @@ Give feedback in this JSON format:
     const main = playerSessions.get(socket.id);
     if (typeof tableId !== 'string' || !tableId || main?.tableId === tableId) return main;
     return (multiTableSessions.get(socket.id) || []).find((s) => s && s.tableId === tableId);
+  };
+  // F156 (2026-10-21) — the refusal for a NAMED table seatSessionFor found no
+  // seat at: `error { message, code: 'not_at_table', tableId }`; true when sent
+  // (false = no tableId was named: the caller keeps its own no-session answer).
+  const notSeatedThere = (tableId: unknown): boolean => {
+    if (typeof tableId !== 'string' || !tableId) return false;
+    socket.emit('error', { message: 'You are not seated at that table.', code: 'not_at_table', tableId });
+    return true;
   };
   const insuranceSessionFor = (tableId: unknown): PlayerSession | undefined => seatSessionFor(tableId);
   socket.on('acceptInsurance', (data: { tableId?: string; handNumber?: number } = {}) => {
@@ -17610,9 +17810,11 @@ Give feedback in this JSON format:
   // ========== Straddle ==========
   // UTG posts 2x the big blind as a live blind bet (retains the option). The
   // engine validates it's a genuine first-action UTG straddle; we just relay it.
-  socket.on('straddle', () => {
-    const session = playerSessions.get(socket.id);
-    if (!session) return;
+  // F156 (2026-10-21) — `{ tableId? }`: the straddle at THAT table; a table he
+  // holds no seat at: not_at_table.
+  socket.on('straddle', (data: { tableId?: string } = {}) => {
+    const session = seatSessionFor(data?.tableId);
+    if (!session) { notSeatedThere(data?.tableId); return; }
     const table = tableManager.getTable(session.tableId);
     if (!table) return;
     // 2026-10-11 (R2, GAME-12 / C11) — ring tables only: never at a tournament
@@ -18023,6 +18225,14 @@ Give feedback in this JSON format:
       refuseTableNotJoinable(socket, 'joinAdditionalTable', tableId, joinTableRefusalReason(tableId, authSessions.get(socket.id), false) || 'not_public_cash');
       return;
     }
+    // 2026-10-21 (gameplay F62) — never a second seat at a table this socket
+    // already plays (its main seat or another extra seat there): both seats were
+    // dealt in and the socket saw four hole cards. Before the AI stand-up and the
+    // buy-in (re-checked after the awaits: BuyInExpectation.notSeatedAt).
+    if (socketHasSessionAt(socket.id, tableId)) {
+      socket.emit('error', { message: 'You already have a seat at this table.', code: 'already_seated', tableId });
+      return;
+    }
 
     // Find empty seat — R2 (GAME-15): an empty seat FIRST (this loop used to
     // take whichever came first, a bot at seat 0 before an empty seat 5), and
@@ -18048,7 +18258,7 @@ Give feedback in this JSON format:
     const authAdd = authSessions.get(socket.id);
     if (authAdd) {
       // P3 (2026-10-10) — still this account and still this live table.
-      const addState: BuyInExpectation = { userId: authAdd.userId, table: { tableId, table } };
+      const addState: BuyInExpectation = { userId: authAdd.userId, notSeatedAt: tableId, table: { tableId, table } };
       const dbChips = await ensureChipsForBuyIn(authAdd.userId, authAdd.username, effectiveBuyIn);
       if (await buyInSocketGone(socket, 'joinAdditionalTable', 'balance_read', undefined, addState)) return; // F3 — nothing deducted yet
       if (effectiveBuyIn > dbChips) { socket.emit('error', { message: 'Insufficient chips for the additional-table buy-in' }); return; }
@@ -18673,6 +18883,13 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
     // branch above; this guards the multi-table / fallthrough cases.)
     // S2: a tournament seat reached here (no account behind it) is kept
     // absent like any disconnect — not a voluntary leave.
+    // 2026-10-21 (gameplay F73) — this socket's EXTRA-table seats first, while
+    // authSessions still names the account: handlePlayerLeave returns at once
+    // when the socket has no MAIN session (its seat stood up by the sit-out
+    // limit / a suspension stand-up), so a socket left with only extra seats
+    // stranded them — occupied, unreserved, blinded off every hand, and its
+    // dead multiTableSessions entry kept the next sign-in's orphan scan off them.
+    cashOutAdditionalSeatsOnDeparture(socket, authSession, 'additional_table_disconnect');
     handlePlayerLeave(socket, 'kept');
     if (authSession) authSessions.delete(socket.id);
     // Clear delta tracking so a reconnect gets a fresh full state
@@ -18883,9 +19100,14 @@ function reserveSeatForDeparture(
 /**
  * 2026-06-11 audit E4 (extracted from the 'disconnect' handler, 2026-10-10):
  * a departing socket's ADDITIONAL-table seats are not reserved — each is
- * folded if on the clock, its stack credited to `authSession`
- * (creditSeatStackToWallet skips tournament stacks; no account → nothing is
- * credited) and stood up.
+ * credited to `authSession` (creditSeatStackToWallet skips tournament stacks;
+ * no account → nothing is credited) and stood up. 2026-10-21 (gameplay F85):
+ * a seat still in a live hand with chips in its pot is NOT folded out of turn
+ * (a routine socket drop used to forfeit that hand): on the clock it is checked
+ * when a check is free, else folded (Z6, as the main seat's departure); off the
+ * clock it keeps its hand and the turn clock acts for it later; it is stood up
+ * — its final stack credited — at the hand's end (teardownSeat
+ * keepHandOnDeparture). A seat not in a hand is credited and stood up now.
  */
 function cashOutAdditionalSeatsOnDeparture(socket: Socket, authSession: SocketAuthSession | undefined, reason: string): void {
   // 2026-06-11 audit E4: only the MAIN seat is reserved here. Any
@@ -18904,7 +19126,8 @@ function cashOutAdditionalSeatsOnDeparture(socket: Socket, authSession: SocketAu
         const mSeat = mt.seats[ms.seatIndex];
         if (mSeat && mSeat.state === 'occupied' && !mSeat.isAI) {
           teardownSeat(ms.tableId, mt, ms.seatIndex,
-            authSession ? { userId: authSession.userId, username: authSession.username } : null, reason);
+            authSession ? { userId: authSession.userId, username: authSession.username } : null, reason,
+            { keepHandOnDeparture: true });   // F85
         }
       }
       socket.leave(`table:${ms.tableId}`);

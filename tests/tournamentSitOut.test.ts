@@ -22,7 +22,7 @@
  * PokerTable.
  */
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
-import { SRC, slice, fnSrc, handlerSrc, load } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
 
 const constOf = (name: string): number => {
   const m = new RegExp(`const ${name} = ([0-9_]+);`).exec(SRC);
@@ -64,7 +64,8 @@ function world(opts: { tournament: boolean; over?: Partial<typeof P> }) {
     turnStartedHandMap: new Map(), turnStartedPhaseMap: new Map(), globalTurnId: 0,
     broadcastGameState() {}, scheduleAIAction() {}, log: { debug() {}, info() {} },
   };
-  const code = `${p.broken}\n${p.isTournamentReservation}\n${p.sync}\n${p.liveSession}\n${p.pastLimit}\n${p.autoAct}\n${p.armTurnTimer}\nfunction wire(socket) {\n${p.sitOut}\n}`;
+  // F156 (2026-10-21): sitOut resolves its seat through seatSessionFor.
+  const code = `${p.broken}\n${p.isTournamentReservation}\n${p.sync}\n${p.liveSession}\n${p.pastLimit}\n${p.autoAct}\n${p.armTurnTimer}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${p.sitOut}\n}`;
   const { exports: m, stubbed } = load(code, scope, '{ syncSitOutToTable, armTurnTimer, autoActForSeat, tournamentSeatSitsOut, wire }');
   /** Alice's live session (S-A) sitting out, as 'sitOut' / 'playerAFK' leave it. */
   const aliceSitsOut = () => {

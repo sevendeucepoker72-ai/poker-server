@@ -34,7 +34,7 @@ import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
 import { ShortDeckTable } from '../src/game/variants/ShortDeckTable';
 import { Card, cardToString } from '../src/game/Card';
-import { slice, fnSrc, handlerSrc, load, SEAT_IDENTITY_SRC } from './helpers/indexSource';
+import { slice, fnSrc, handlerSrc, load, SEAT_IDENTITY_SRC, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
 
 const RANKS: Record<string, number> = { '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, T: 10, J: 11, Q: 12, K: 13, A: 14 };
 const SUITS: Record<string, number> = { h: 0, d: 1, c: 2, s: 3 };
@@ -140,7 +140,8 @@ describe('F28 — no betting in a draw round', () => {
       DrawPhases: DRAWS, GamePhase, allInOrFoldTables: new Set(), pendingAutoStartTimers: new Map(),
       broadcastGameState() {}, scheduleAIAction() {},
     };
-    const { exports: wire } = load(`function wire(socket) {\n${handlerSrc('action', '\n  );\n')}\n}`, scope, 'wire');
+    // S5 F51 (2026-10-21): the action handler resolves its seat through seatSessionFor.
+    const { exports: wire } = load(`function wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${handlerSrc('action', '\n  );\n')}\n}`, scope, 'wire');
     wire(sock);
     const before = t.seats[stale].chipCount;
     sock.handlers.action({ type: 'call', nonce: 'n1', stateVersion: t.stateVersion });
@@ -174,7 +175,8 @@ describe('F29 — sitting out during a draw round never freezes it', () => {
       DrawPhases: DRAWS, GamePhase, FiveCardDrawTable,
       broadcastGameState: (id: string) => broadcasts.push(id), scheduleAIAction() {},
     };
-    const code = `${P.broken}\n${P.isTournamentReservation}\n${P.sync}\nfunction wire(socket) {\n${handlerSrc(event, '\n  });\n')}\n}`;
+    // S5 F156 (2026-10-21): sitOut / playerAFK resolve their seat through seatSessionFor.
+    const code = `${P.broken}\n${P.isTournamentReservation}\n${P.sync}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${handlerSrc(event, '\n  });\n')}\n}`;
     const { exports: wire } = load(code, scope, 'wire');
     wire(sock);
     return { t, stale, sock, broadcasts };

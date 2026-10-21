@@ -10,7 +10,7 @@
  */
 import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { cardToString } from '../src/game/Card';
-import { handlerSrc, load, flush } from './helpers/indexSource';
+import { handlerSrc, load, flush, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
 
 const HANDLER = handlerSrc('showMuckedHand', '\n  });\n');
 
@@ -20,7 +20,8 @@ function world() {
   const playerSessions = new Map<string, any>();
   for (let i = 0; i < 3; i++) playerSessions.set(`S${i}`, { socketId: `S${i}`, tableId: 'T', seatIndex: i, playerName: `P${i}`, playerId: `p${i}` });
   const room: Array<[string, string, any]> = [];
-  const { exports: m } = load(`const shownMuckedHands = new Set();\nfunction wire(socket) {\n${HANDLER}\n}`, {
+  // F156 (2026-10-21): the handler resolves its seat through seatSessionFor.
+  const { exports: m } = load(`const shownMuckedHands = new Set();\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${HANDLER}\n}`, {
     playerSessions, multiTableSessions: new Map(), tableManager: { getTable: (id: string) => (id === 'T' ? t : undefined) },
     GamePhase, cardToString, io: { to: (r: string) => ({ emit: (ev: string, d: any) => room.push([r, ev, d]) }) },
   }, '{ wire }');

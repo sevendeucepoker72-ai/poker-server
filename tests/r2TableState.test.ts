@@ -22,7 +22,7 @@ import { ShortDeckTable } from '../src/game/variants/ShortDeckTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
 import { cardToString } from '../src/game/Card';
 import { HandRank } from '../src/game/HandEvaluator';
-import { SRC, slice, fnSrc, handlerSrc, load, flush, SEAT_TEARDOWN_SRC } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
 
 const T = 'cash-1';
 const quiet = { log() {}, warn() {}, error() {} };
@@ -325,7 +325,8 @@ describe('GAME-12 — bomb pots only at Hold\'em / Omaha ring tables; no straddl
       const roomEmits: string[] = [];
       const bombPotPending = new Map<string, boolean>();
       const bombPotCooldownUntil = new Map<string, number>();
-      const { exports: wire } = load(`function wire(socket) {\n${h}\n}\n${KIND_SRC}\n${slice('const bombPotStats', '};\n')}`, {
+      // F156 (2026-10-21): the handler resolves its seat through seatSessionFor.
+      const { exports: wire } = load(`function wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${h}\n}\n${KIND_SRC}\n${slice('const bombPotStats', '};\n')}`, {
         ...registries(), playerSessions: new Map([['s1', { tableId: T, seatIndex: 0 }]]), tableManager: { getTable: () => table },
         bombPotPending, bombPotCooldownUntil, BOMB_POT_COOLDOWN_MS: 300000, io: { to: () => ({ emit: (ev: string) => roomEmits.push(ev) }) },
       }, 'wire');
@@ -345,7 +346,7 @@ describe('GAME-12 — bomb pots only at Hold\'em / Omaha ring tables; no straddl
       for (let i = 0; i < 4; i++) table.sitDown(i, `P${i}`, 5000, `p${i}`, false);
       table.startNewHand();
       const sock = fakeSocket('s1');
-      const { exports: wire } = load(`function wire(socket) {\n${h}\n}\n${KIND_SRC}`, {
+      const { exports: wire } = load(`function wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${h}\n}\n${KIND_SRC}`, {   // F156: seatSessionFor
         ...registries({ tournament }), playerSessions: new Map([['s1', { tableId: T, seatIndex: table.activeSeatIndex }]]),
         tableManager: { getTable: () => table }, broadcastGameState() {}, scheduleAIAction() {},
       }, 'wire');
@@ -359,12 +360,12 @@ describe('GAME-12 — bomb pots only at Hold\'em / Omaha ring tables; no straddl
 
 describe('TABLEUI-11 — spectate next / prev, spectateTournament and seat moves send a FULL state', () => {
   const EMIT = [slice('const ALWAYS_EMIT_KEYS = [', '];\n'), fnSrc('function shallowDiff('), fnSrc('function pickAlwaysEmit('), fnSrc('function emitGameState(')].join('\n');
-  function spectateWorld(handler: string) {
+  function spectateWorld(handler: string, emit = EMIT) {
     const tables = new Map<string, PokerTable>([['A', new PokerTable(cfg({ tableId: 'A' }))], ['B', new PokerTable(cfg({ tableId: 'B' }))]]);
     const sock = fakeSocket('s1');
     const lastSentState = new Map<string, any>();
     const lastSentJson = new Map<string, any>();
-    const { exports: wire } = load(`${EMIT}\nfunction wire(socket) {\n${handler}\n}`, {
+    const { exports: wire } = load(`${emit}\nfunction wire(socket) {\n${handler}\n}`, {
       tableManager: { getTable: (id: string) => tables.get(id) }, lastSentState, lastSentJson, spectators: new Map(),
       tournamentManager: {
         getTournament: () => ({ status: 'running', tableIds: ['A', 'B'] }), getTournamentStatus: () => ({}),
@@ -392,7 +393,11 @@ describe('TABLEUI-11 — spectate next / prev, spectateTournament and seat moves
     const h = handlerSrc('spectateNextTable', '\n  });');
     const old = h.replace('emitGameState(socket, state, true);', 'emitGameState(socket, state);');
     expect(old).not.toBe(h);
-    const w = spectateWorld(old);
+    // F64 (2026-10-21): emitGameState itself now sends a frame for ANOTHER table
+    // full; the control runs the pre-F64 emitGameState too (both guards off).
+    const F64 = ' || prev.tableId !== state?.tableId';
+    expect(EMIT).toContain(F64);
+    const w = spectateWorld(old, EMIT.replace(F64, ''));
     await w.sock.handlers.spectateNextTable({ tournamentId: 't', currentTableId: 'A' });
     expect(frames(w.sock)[0].full).toBe(false);
   });
@@ -416,7 +421,7 @@ describe('GAME-5 — a human\'s draw hands the turn on', () => {
     table.playerDraw(1, []);                                       // the bot drew first (0.5-1.5s)
     const scheduled: string[] = [];
     const sock = fakeSocket('sH');
-    const { exports: wire } = load(`function wire(socket) {\n${handler}\n}`, {
+    const { exports: wire } = load(`function wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${handler}\n}`, {   // F156: seatSessionFor
       playerSessions: new Map([['sH', { tableId: T, seatIndex: 0 }]]), tableManager: { getTable: () => table }, FiveCardDrawTable,
       broadcastGameState() {}, scheduleAIAction: (id: string) => scheduled.push(id),
     }, 'wire');

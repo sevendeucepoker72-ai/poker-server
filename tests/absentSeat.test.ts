@@ -1751,7 +1751,8 @@ describe('P-i (round 6) — an absent tournament seat checks, limps at most ONE 
     expect(bc).toContain('autoActForSeat(tableId, t, activeIdx);');
     expect(bc).not.toContain('t.playerFold(activeIdx);');
     for (const ev of ['sitOut', 'playerAFK']) {
-      const body = slice(`socket.on('${ev}', async () => {`, '\n  });\n');
+      // F156 (2026-10-21): both handlers now take an optional `{ tableId }`.
+      const body = slice(`socket.on('${ev}', async (data: { tableId?: string } = {}) => {`, '\n  });\n');
       expect(body).toContain('if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);');
     }
     expect(SRC).not.toContain('tournamentHandAllAbsent');

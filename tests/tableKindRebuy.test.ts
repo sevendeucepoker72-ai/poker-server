@@ -12,7 +12,7 @@
  */
 import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { cardToString } from '../src/game/Card';
-import { slice, fnSrc, handlerSrc, load, flush } from './helpers/indexSource';
+import { slice, fnSrc, handlerSrc, load, flush, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
 
 const KIND = slice('// ========== Table kind (R1 contract #2, 2026-10-11) ==========', "    code: 'rebuy_not_allowed',\n  };\n}\n");
 const REBUY = handlerSrc('rebuy', '\n  })(); });');
@@ -32,14 +32,15 @@ function world() {
     isTournamentTable: (id: string) => tournament.has(id),
     quickTables, spinGoMultipliers, careerTables, allInOrFoldTables, challengeTables,
     tableManager: { getTable: (id: string) => tables.get(id) },
-    playerSessions, authSessions,
+    playerSessions, authSessions, multiTableSessions: new Map(),
     assertPlayable: async () => null, emitPlayRefusal() {}, buyInSocketGone: async () => false,
     ensureChipsForBuyIn: async () => 1_000_000,
     deductChips: async (uid: number, n: number) => { deducts.push([uid, n]); return true; },
     addChipsToUser: async () => true, auditLog() {}, broadcastGameState() {},
     log: { debug() {}, info() {}, warn() {} },
   };
-  const code = KIND + `\nfunction registerRebuy(socket) {\n${REBUY}\n}\n`;
+  // F156 (2026-10-21): the handler resolves its seat through seatSessionFor.
+  const code = KIND + `\nfunction registerRebuy(socket) {\n${SEAT_SESSION_FOR_SRC}\n${REBUY}\n}\n`;
   const { exports: m } = load(code, scope, '{ tableKindOf, rebuyAllowedAt, rebuyRefusalAt, privateTableIds, clubTableIds, registerRebuy }');
   const mkTable = (id: string) => {
     const t = new PokerTable({ tableId: id, tableName: id, smallBlind: 10, bigBlind: 20, ante: 0, minBuyIn: 500 } as any);
@@ -123,7 +124,7 @@ describe('the rebuy handler refuses rebuy_not_allowed before any deduction', () 
     await flush();
     expect(w.deducts).toEqual([[7, 400]]);
     expect(t.seats[0].chipCount).toBe(500);
-    expect(emitted).toContainEqual(['rebuyComplete', { success: true, newStack: 500, added: 400 }]);
+    expect(emitted).toContainEqual(['rebuyComplete', { success: true, newStack: 500, added: 400, tableId: 'lobby' }]);   // F156: names the table
   });
 
   it('wiring: the refusal comes before the balance read and the deduct', () => {

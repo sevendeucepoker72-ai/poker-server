@@ -71,6 +71,17 @@ export const INSURANCE_HISTORY_SRC: string = [
   fnSrc('function withInsuranceSettlement<'),
 ].join('\n');
 
+/**
+ * 2026-10-21 (gameplay F156) — the socket-scoped seat resolver `seatSessionFor`
+ * and its refusal `notSeatedThere`, declared INSIDE the connection handler
+ * (they close over `socket`). Every table-scoped seat control resolves its
+ * session through them, so a harness that slices one of those handlers puts
+ * this first inside its `function wire(socket) { … }`. Scope it reads:
+ * playerSessions, multiTableSessions.
+ */
+export const SEAT_SESSION_FOR_SRC: string = slice('  const seatSessionFor = ', '\n  const insuranceSessionFor = ')
+  .replace(/\n {2}const insuranceSessionFor = $/, '\n');
+
 /** The `socket.on('<event>', …)` registration (either layout), through `endNeedle`. */
 export function handlerSrc(event: string, endNeedle: string): string {
   let at = SRC.indexOf(`socket.on('${event}'`);

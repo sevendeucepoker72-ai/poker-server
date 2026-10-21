@@ -48,7 +48,7 @@ import { qualifierBlindLevels } from '../src/game/qualifierSchedule';
 import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE_MAX_STATUS_AGE_MS } from '../src/auth/playGate';
 import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
-import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
 
 const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
@@ -179,6 +179,7 @@ function registerEvents(tournamentId) {
 ${p.events}
 }
 function wireSocket(socket) {
+${SEAT_SESSION_FOR_SRC}
   ${p.startHand}
   ${p.returnToTournament}
   ${p.quickHeadsUp}
@@ -2682,14 +2683,21 @@ describe('P-d — every full gameState says whether its table is a tournament ta
   it('the per-socket delta carries the change when one socket moves from a tournament table to a cash table (never a stale isTournament:true)', () => {
     const m = stateFn(new Map([['TB', 'tour-1']]));
     const code = slice('const ALWAYS_EMIT_KEYS', ';\n') + fnSrc('function shallowDiff(') + fnSrc('function pickAlwaysEmit(') + fnSrc('function emitGameState(');
-    const { exports: e } = load(code, { lastSentState: new Map(), lastSentJson: new Map() }, '{ emitGameState }');
-    const sent: any[] = [];
-    const sock = { id: 'S1', emit: (_ev: string, d: any) => sent.push(d) };
-    e.emitGameState(sock, m.getGameStateForPlayer(mk('TB'), 0), true);
-    e.emitGameState(sock, m.getGameStateForPlayer(mk('CASH-1'), 0));
-    expect(sent[0].state).toMatchObject({ isTournament: true, tournamentId: 'tour-1' });
-    expect(sent[1].full).toBe(false);
-    expect(sent[1].delta).toMatchObject({ tableId: 'CASH-1', isTournament: false, tournamentId: null });
+    // F64 (2026-10-21): a frame for ANOTHER table than the socket's baseline is
+    // now always FULL (it carries the cash values outright); the delta path the
+    // pre-F64 emitGameState took carries them too (both checked).
+    const F64 = ' || prev.tableId !== state?.tableId';
+    expect(code).toContain(F64);
+    for (const [src, full] of [[code, true], [code.replace(F64, ''), false]] as const) {
+      const { exports: e } = load(src, { lastSentState: new Map(), lastSentJson: new Map() }, '{ emitGameState }');
+      const sent: any[] = [];
+      const sock = { id: 'S1', emit: (_ev: string, d: any) => sent.push(d) };
+      e.emitGameState(sock, m.getGameStateForPlayer(mk('TB'), 0), true);
+      e.emitGameState(sock, m.getGameStateForPlayer(mk('CASH-1'), 0));
+      expect(sent[0].state).toMatchObject({ isTournament: true, tournamentId: 'tour-1' });
+      expect(sent[1].full).toBe(full);
+      expect(full ? sent[1].state : sent[1].delta).toMatchObject({ tableId: 'CASH-1', isTournament: false, tournamentId: null });
+    }
   });
 });
 

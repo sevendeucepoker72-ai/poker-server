@@ -16,7 +16,7 @@
  */
 import { PokerTable } from '../src/game/PokerTable';
 import { TournamentManager } from '../src/game/TournamentManager';
-import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
 // R1 contract #3 (2026-10-11): the seat paths name the seat from the ACCOUNT and allowlist the avatar.
 import { accountDisplayName } from '../src/auth/displayName';
 import { sanitizeSeatAvatar } from '../src/seatProfile';
@@ -45,7 +45,9 @@ const H = {
   startHand: handlerSrc('startHand', '\n  });\n'),
 };
 // P3 (2026-10-10): + BuyInExpectation, buyInsOnStaleState, buyInStateChanged — through buyInSocketGone's end.
-const BUY_IN_GONE = slice('const buyInsOnDeadSocket = {', '\n  return true;\n}\n');
+const BUY_IN_GONE = slice('const buyInsOnDeadSocket = {', '\n  return true;\n}\n')
+  // F62 / F156 (2026-10-21): buyInStateChanged's notSeatedAt test.
+  + fnSrc('function socketHasSessionAt(');
 const LOGIN_GONE = slice('const loginsOnDeadSocket = { abandoned: 0 };', '\n}\n');
 const BROKEN_TABLES = slice('const brokenTournamentTables = new Map', 'brokenTournamentTables.has(tableId);\n}\n');
 // P5 / P4 (2026-10-10): the tournament-table refusal and the waitlist account-mismatch constants.
@@ -211,6 +213,7 @@ ${SEAT_NAME}
 ${WHO_SITS}
 ${QUALIFIER_HELPERS}
 function wire(socket) {
+${SEAT_SESSION_FOR_SRC}
   ${Object.values(h).join('\n  ')}
 }`;
   const { exports: m, stubbed } = load(code, scope, '{ wire, buyInsOnDeadSocket, buyInsOnStaleState, loginsOnDeadSocket, noteBrokenTournamentTable, cashJoinsAtTournamentTable, waitlistAccountMismatches }');
@@ -623,7 +626,8 @@ describe('P3 — rebuy: the seat stood up during the deduct on a LIVE socket (le
     await flush();
     expect(w.wallet.get(ALICE)).toBe(96_000);                                  // the loss
     expect(w.credits).toEqual([]);
-    expect(w.emitted).toContainEqual(['rebuyComplete', { success: true, newStack: 8000, added: 6000 }]);
+    // F156 (2026-10-21): rebuyComplete names the table it topped up.
+    expect(w.emitted).toContainEqual(['rebuyComplete', { success: true, newStack: 8000, added: 6000, tableId: 'cash1' }]);
   });
 });
 
