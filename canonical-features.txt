@@ -1050,7 +1050,7 @@ event: 'qualifier_late_entry_seated'
 void cancelQualifierEvent(qualId, qt, 'too_few_players');
 setInterval(() => tickQualifierAutoStart(), 30000);
 registeredCount: qt.players.length, players: qt.players.length, tournamentId: qt.tournamentId,
-qualifierId: qualId, myResult: mine ? { place: mine.place, wonSeat: mine.wonSeat } : null,
+qualifierId: qualId, myResult: mine ? { place: mine.place, wonSeat: mine.wonSeat, seats: mine.seats } : null,
 const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop:
 'QUALIFIER_RESULTS_POST_FAILED'
 r2Play: {
