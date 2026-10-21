@@ -302,13 +302,21 @@ export class TableManager {
     return tableId;
   }
 
-  createQuickTable(name: string, maxPlayers: number, smallBlind: number, bigBlind: number, minBuyIn: number, variant?: VariantType): string {
+  /**
+   * `ante` (2026-10-21, gameplay F96) — a tournament's LEVEL-1 ante. Every
+   * tournament table used to be created with ante 0 and got its ante only at
+   * the first blind level-up, so a custom / club structure with a level-1 ante
+   * played its whole first level without one (while the lobby showed it).
+   * Default 0: quick / cash callers are unchanged.
+   */
+  createQuickTable(name: string, maxPlayers: number, smallBlind: number, bigBlind: number, minBuyIn: number, variant?: VariantType, ante: number = 0): string {
+    const anteChips = Math.max(0, Math.floor(Number(ante) || 0));
     if (variant && variant !== 'texas-holdem') {
       return this.createVariantTable({
         tableName: name,
         smallBlind,
         bigBlind,
-        ante: 0,
+        ante: anteChips,
         minBuyIn,
       }, variant);
     }
@@ -319,7 +327,7 @@ export class TableManager {
       tableName: name,
       smallBlind,
       bigBlind,
-      ante: 0,
+      ante: anteChips,
       minBuyIn,
     };
     const table = new PokerTable(config);

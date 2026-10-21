@@ -1220,9 +1220,17 @@ export class TournamentManager {
       const eliminated = !!p.eliminated || (p.finishPosition && p.finishPosition > 0);
       let chipCount = 0;
       if (!eliminated) {
-        const tid = t.playerTableMap.get(p.playerId);
+        // 2026-10-21 (gameplay F94) — a SINGLE-table tournament never maps its
+        // players (playerTableMap stays empty; only `tableId` is set), so every
+        // alive player showed the starting stack: his table is `tableId` then.
+        const tid = t.playerTableMap.get(p.playerId) ?? t.tableId ?? undefined;
         const table = tid ? tableManager?.getTable?.(tid) : null;
-        const seat = table?.seats?.find((s: any) => s.playerId === p.playerId);
+        // F97 — his LIVE seat first: a qualifier re-entry leaves his old busted
+        // seat (occupied, eliminated, 0 chips) on the table under the same
+        // playerId, and the first match showed the re-entered player at 0.
+        const seats: any[] = Array.isArray(table?.seats) ? table.seats : [];
+        const seat = seats.find((s: any) => s?.state === 'occupied' && !s.eliminated && s.playerId === p.playerId)
+          ?? seats.find((s: any) => s?.state === 'occupied' && s.playerId === p.playerId);
         chipCount = seat?.chipCount ?? p.chips ?? 0;
       }
       return {

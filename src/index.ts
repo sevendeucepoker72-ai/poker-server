@@ -1643,6 +1643,17 @@ function takeAiSeatForJoin(table: PokerTable, tableId: string): number {
  */
 const botStripAfterHand = new Set<string>();
 function stripBotsWhenNoHumans(tableId: string, table: PokerTable): void {
+  // 2026-10-21 (gameplay F99) — never on a TOURNAMENT table (live, or broken
+  // in the last seconds): a bot there is an ENTRANT whose stack TournamentManager
+  // counts alive (the admin's simulated tournament). A busted human leaving his
+  // dead seat stood every bot up: the table never dealt again and a later break
+  // eliminated them with no eliminator, their stacks gone. A mark set earlier
+  // (mid-hand) is dropped too.
+  if (isTournamentTable(tableId)) {
+    botStripAfterHand.delete(tableId);
+    console.log(`[Tables] ${JSON.stringify({ event: 'bot_strip_skipped_tournament_table', tableId })}`);
+    return;
+  }
   if (table.seats.some((s) => s.state === 'occupied' && !s.isAI)) return;
   if (!aiSeatsMutableNow(table)) {
     botStripAfterHand.add(tableId);
@@ -3631,6 +3642,24 @@ async function refundQualifierReentryCharges(
 }
 
 /**
+ * 2026-10-21 (gameplay F95) — a tournament seat was just filled OUTSIDE a
+ * hand-ending path (a qualifier late entry or re-entry): a table that sat idle
+ * at its hand boundary (HandComplete, one player left, no timer — waiting for a
+ * rebalance that cannot happen) gets its next deal scheduled. Nothing else ever
+ * dealt it: the heartbeat skips tournament tables and the sweep acts only on a
+ * planned break, so the new player and the one waiting there were dealt no
+ * hand until a bust elsewhere. Through the hand-boundary scheduler only
+ * (autoStartNextHand keeps every tournament hold: pause, bust check, deferred
+ * break, the under-5 wait); a table mid-hand or already scheduled is left alone.
+ */
+function scheduleDealAfterTournamentSeat(tableId: string): void {
+  const table = tableManager.getTable(tableId);
+  if (!table || table.currentPhase !== GamePhase.HandComplete) return;
+  if (pendingAutoStartTimers.has(tableId)) return;
+  scheduleAutoStart(tableId);
+}
+
+/**
  * R2 (TOURNEY-3) — a LATE first entry into a RUNNING qualifier: a NEW entrant
  * (TournamentManager.addLateEntrant) seated at once with the starting stack on
  * an empty seat of the least-full table, this socket's session bound to it
@@ -3671,6 +3700,7 @@ function seatQualifierLateEntrant(socket: Socket, qt: QualifierTournamentReg, re
       for (const ttid of tournament.tableIds) spectators.get(ttid)?.delete(socket.id);
       socket.join(`table:${tid}`);
       console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_late_entry_seated', tournamentId, tableId: tid, seatIndex: s })}`);
+      scheduleDealAfterTournamentSeat(tid);   // F95
       return { tableId: tid, seatIndex: s };
     }
   }
@@ -4876,6 +4906,24 @@ function armTurnTimer(tableId: string): void {
   }
 }
 
+/**
+ * 2026-10-21 (gameplay F98) — a busted tournament player who keeps watching
+ * his own table: his main session still points at his DEAD seat (eliminated or
+ * stood up — runTournamentBustCheck keeps it: table chat, his nameplate and the
+ * disconnect handler read it) while his socket is that table's SPECTATOR
+ * (eliminatedToSpectator). His view is the spectator one ONLY: every broadcast
+ * used to send him the dead seat's player view AND the spectator view on one
+ * per-socket delta channel (the HUD flipped seated / spectator each time), and
+ * since F155 the spectator loop dropped him as "seated here", leaving only the
+ * dead seat's view. A tournament table only (a cash seat is never dead).
+ */
+function watchesFromDeadTournamentSeat(socketId: string, session: { tableId: string; seatIndex: number } | undefined, table: PokerTable): boolean {
+  if (!session || !spectators.get(session.tableId)?.has(socketId)) return false;
+  if (!isTournamentTable(session.tableId)) return false;
+  const seat = table.seats[session.seatIndex];
+  return !seat || seat.state !== 'occupied' || !!seat.eliminated;
+}
+
 function broadcastGameState(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
@@ -4885,6 +4933,8 @@ function broadcastGameState(tableId: string): void {
   // Send personalized state to each player at the table
   for (const [socketId, session] of playerSessions) {
     if (session.tableId === tableId) {
+      // F98 — a dead seat watched as a spectator gets the spectator frame below only.
+      if (watchesFromDeadTournamentSeat(socketId, session, table)) continue;
       const socket = io.sockets.sockets.get(socketId);
       if (socket) {
         const state: any = getGameStateForPlayer(table, session.seatIndex, session.trainingEnabled);
@@ -5049,7 +5099,9 @@ function broadcastGameState(tableId: string): void {
   // isSpectator) that wipes its cards and action bar. Dropped here, uncounted.
   if (tableSpectators && tableSpectators.size > 0) {
     for (const specId of [...tableSpectators]) {
-      const seatedHere = playerSessions.get(specId)?.tableId === tableId
+      // F98 — a busted player's DEAD seat here is not a seat: he stays a spectator.
+      const mainHere = playerSessions.get(specId);
+      const seatedHere = (mainHere?.tableId === tableId && !watchesFromDeadTournamentSeat(specId, mainHere, table))
         || (multiTableSessions.get(specId) || []).some((s) => s && s.tableId === tableId);
       if (seatedHere) tableSpectators.delete(specId);
     }
@@ -10443,6 +10495,7 @@ io.on('connection', (socket: Socket) => {
             detachSocketFromOtherTables(socket, tid, 'seat', 'qualifierReentry');
             socket.join(`table:${tid}`);
             seated = true;
+            scheduleDealAfterTournamentSeat(tid);   // F95 — an idle table deals again
             console.log(`[Tournament] Re-entry: ${existingEntry.playerName} seated at table ${tid} seat ${s}`);
             break;
           }
@@ -12392,6 +12445,24 @@ Give feedback in this JSON format:
     if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
     const table = tableManager.getTable(data.tableId);
     if (!table) { socket.emit('adminForceCloseTableResult', { success: false, error: 'Table not found' }); return; }
+    // G185 (2026-10-21) — never a table of a RUNNING tournament: Force Close
+    // stood every alive entrant up WITHOUT eliminating him and removed the table
+    // while TournamentManager kept them alive on it — a single-table event (or
+    // one whose other tables cannot seat them) could then never finish: no
+    // winner, no prizes, no qualifier seats, until a restart voided it. Refused
+    // before any side effect; the tournament's own controls (pause, rebalance)
+    // stay. A table a rebalance already BROKE (out of tournamentTables, removed
+    // within seconds, its players moved) can still be closed.
+    // (tournamentTables.get: the RUNNING tournament of this table — F2's rule.)
+    const runningTournamentId = tournamentTables.get(data.tableId);
+    if (runningTournamentId) {
+      auditLog(auth.username, 'ADMIN_FORCE_CLOSE_TABLE_REFUSED', { tableId: data.tableId, reason: 'tournament_table', tournamentId: runningTournamentId });
+      socket.emit('adminForceCloseTableResult', {
+        success: false, code: 'tournament_table', tableId: data.tableId,
+        error: 'This is a running tournament table. Use the tournament controls (pause / rebalance) - Force Close would strand its players.',
+      });
+      return;
+    }
     auditLog(auth.username, 'ADMIN_FORCE_CLOSE_TABLE', { tableId: data.tableId });
     // R2 (S1) — a QUICK table closes through cleanupQuickTable: a cash format's
     // stacks are cashed out to whoever holds the seat (session or reservation,
@@ -18122,6 +18193,15 @@ Give feedback in this JSON format:
     if (session) {
       const table = tableManager.getTable(session.tableId);
       if (!table) return;
+      // F98 (2026-10-21) — a busted player watching his own table from his DEAD
+      // seat resyncs to the spectator view he is shown (never the dead seat's).
+      if (session === main && watchesFromDeadTournamentSeat(socket.id, session, table)) {
+        const spectatorState: any = getGameStateForPlayer(table, -1, false);
+        spectatorState.isSpectator = true;
+        spectatorState.spectatorCount = spectators.get(session.tableId)?.size || 0;
+        emitGameState(socket, spectatorState, true);
+        return;
+      }
       const state: any = getGameStateForPlayer(table, session.seatIndex, session.trainingEnabled || false);
       state.sittingOut = session.sittingOut || false;
       state.fastMode = session.fastMode === true;
@@ -18581,7 +18661,13 @@ Give feedback in this JSON format:
     const tourn = tournamentManager.getTournament(data.tournamentId);
     auditLog(auth.username, 'TOURNAMENT_PAUSE', { tournamentId: data.tournamentId, paused: !!data.paused });
     const evt = data.paused ? 'tournamentPaused' : 'tournamentResumed';
-    for (const tid of tourn?.tableIds || []) {
+    // F90 (2026-10-21) — a SINGLE-table tournament (startTournamentGame, 9 or
+    // fewer entrants) records only `tableId`; its `tableIds` stay empty, so
+    // Resume re-kicked no table: one that reached its hand boundary while
+    // paused sat in HandComplete for good while the blind clock ran on (and
+    // its players were never told paused / resumed).
+    const pauseTableIds = tourn?.tableIds?.length ? tourn.tableIds : (tourn?.tableId ? [tourn.tableId] : []);
+    for (const tid of pauseTableIds) {
       io.to(`table:${tid}`).emit(evt, { tournamentId: data.tournamentId });
       // On resume, re-kick any table that stalled at the hand boundary while paused.
       if (!data.paused) scheduleAutoStart(tid);
@@ -21153,7 +21239,8 @@ function startRegisteredTournamentTables(tournamentId: string, startingChips: nu
   const tableCount = Math.max(1, Math.ceil(tournament.players.length / seatsPerTable));
   const tableIds: string[] = [];
   for (let k = 0; k < tableCount; k++) {
-    const tid = tableManager.createQuickTable(`Tournament: ${tournament.config.name} — Table ${k + 1}`, seatsPerTable, blinds.sb, blinds.bb, startingChips);
+    // F96 (2026-10-21) — with the level-1 ante (it was 0 until the first level-up).
+    const tid = tableManager.createQuickTable(`Tournament: ${tournament.config.name} — Table ${k + 1}`, seatsPerTable, blinds.sb, blinds.bb, startingChips, undefined, blinds.ante);
     tableIds.push(tid);
     tournamentTables.set(tid, tournamentId);
   }
@@ -21204,7 +21291,9 @@ function startTournamentGame(tournamentId: string): void {
     Math.min(tournament.players.length, 9),
     blinds.sb,
     blinds.bb,
-    result.startingChips
+    result.startingChips,
+    undefined,
+    blinds.ante,   // F96 (2026-10-21) — the level-1 ante from hand 1
   );
 
   const table = tableManager.getTable(tableId)!;
@@ -21758,6 +21847,8 @@ function startQualifierTournament(
       blinds.sb,
       blinds.bb,
       startingStack,
+      undefined,
+      blinds.ante,   // F96 (2026-10-21) — the level-1 ante (0 in today's qualifier structure)
     );
     tableIds.push(tid);
     tournamentTables.set(tid, tournamentId);
@@ -21967,6 +22058,8 @@ function startMultiTableTournament(
       blinds.sb,
       blinds.bb,
       startingChips,
+      undefined,
+      blinds.ante,   // F96 (2026-10-21) — the level-1 ante
     );
     tableIds.push(tid);
     tournamentTables.set(tid, tournamentId);
@@ -22806,6 +22899,13 @@ interface TournamentBustCheck {
   capturedAt: number;
   /** This hand's pot winners IN POT ORDER (main pot first) — read when the hand ended. */
   orderedWinnerIds: string[];
+  /**
+   * F92 (2026-10-21) — each seat this hand busted → who knocked him out: the
+   * first winner of the HIGHEST pot he was eligible for (the pot that took his
+   * last chips). Absent for a seat the engine left no pot record for (then the
+   * positional orderedWinnerIds pairing is the fallback).
+   */
+  eliminatorBySeat?: Map<number, string>;
   /** The finished hand's PRE-hand stacks (PokerTable.startChips at its end). */
   startChips: Map<number, number>;
   /** The seats THIS hand left at 0 chips (seat index → playerId). */
@@ -22914,7 +23014,8 @@ function captureTournamentBustCheck(tableId: string, table: PokerTable, results:
   if (!isTournamentTable(tableId)) return null;
   // Pot winners IN POT ORDER (results are emitted main pot first, then each
   // side pot). 2026-07-05 audit P2: each busted player is eliminated by the
-  // winner of the pot his all-in chips were in — mapped positionally later.
+  // winner of the pot his all-in chips were in (F92: eliminatorBySeat below;
+  // this positional list is only its fallback).
   const orderedWinnerIds: string[] = [];
   for (const r of results || []) {
     if ((r?.amount || 0) > 0) {
@@ -22927,8 +23028,28 @@ function captureTournamentBustCheck(tableId: string, table: PokerTable, results:
     const s = table.seats[i];
     if (s?.state === 'occupied' && s.chipCount <= 0 && !s.eliminated) bustedThisHand.set(i, s.playerId);
   }
+  // F92 (2026-10-21) — the k-th bust used to be paired with the k-th POT
+  // RESULT: when the shortest all-in won the main pot (or a pot was split into
+  // two results) the bounty went to a player who never won the busted
+  // player's chips. Each bust is now credited to the first winner of the
+  // highest pot he was eligible for (PokerTable.lastHandPotEligibility, this
+  // hand's record only).
+  const eliminatorBySeat = new Map<number, string>();
+  const elig = table.lastHandPotEligibility;
+  if (elig && elig.handNumber === table.handNumber && Array.isArray(elig.pots)) {
+    for (const [i] of bustedThisHand) {
+      for (let k = elig.pots.length - 1; k >= 0; k--) {
+        const pot = elig.pots[k];
+        if (!pot || !pot.eligibleSeatIndices.includes(i)) continue;
+        const winnerSeat = pot.winners.find((w) => w !== i);
+        const winnerId = winnerSeat !== undefined ? table.seats[winnerSeat]?.playerId : undefined;
+        if (winnerId) eliminatorBySeat.set(i, winnerId);
+        break;
+      }
+    }
+  }
   const check: TournamentBustCheck = {
-    handNumber: table.handNumber, capturedAt: Date.now(), orderedWinnerIds,
+    handNumber: table.handNumber, capturedAt: Date.now(), orderedWinnerIds, eliminatorBySeat,
     startChips: new Map(table.startChips), bustedThisHand, ran: false,
   };
   // V1 (a) — pending whatever the hand left (see above).
@@ -22953,7 +23074,7 @@ function roomEliminationNoticeExcept(playerId: unknown): string[] {
  * every 0-chip seat on `tableId` is eliminated through TournamentManager —
  * exactly once (seat.eliminated is set first; eliminatePlayer ignores an
  * entrant already out) — shortest PRE-hand stack first (it finishes worst),
- * the k-th bust paired with the k-th pot winner. `check` = the capture of the
+ * each bust credited to the winner of the highest pot he was in (F92). `check` = the capture of the
  * hand that busted them (null: an uncovered bust — no eliminator). Resolves the
  * tournament NOW (Q1: a table broken meanwhile is still found through the
  * broken-table registry).
@@ -23048,14 +23169,17 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
     if (seat?.state !== 'occupied' || seat.chipCount > 0 || inHandInProgress(seat)) continue;
     const leftover = seat.eliminated;
     if (leftover && !unsettledLeftover(seat)) continue;
-    // Only a seat THIS hand busted is paired with this hand's pot winners: the
-    // k-th shortest bust with the k-th pot winner (clamped to the last winner)
-    // — the shortest all-in was in the main pot, the next in side pot 1, and
-    // so on — so distinct busts credit their true eliminators.
+    // Only a seat THIS hand busted is credited to this hand's pot winners:
+    // F92 (2026-10-21) — to the winner of the highest pot he was in
+    // (eliminatorBySeat). The old positional pairing (the k-th shortest bust
+    // with the k-th pot result, clamped) is only the fallback for a hand with
+    // no pot record.
     const thisHand = !!check && check.bustedThisHand.get(i) === seat.playerId;
     seat.eliminated = true;
-    const eliminatorId = thisHand && orderedWinnerIds.length > 0
-      ? orderedWinnerIds[Math.min(bustRank, orderedWinnerIds.length - 1)]
+    const eliminatorId = thisHand
+      ? (check?.eliminatorBySeat?.get(i) ?? (orderedWinnerIds.length > 0
+        ? orderedWinnerIds[Math.min(bustRank, orderedWinnerIds.length - 1)]
+        : undefined))
       : undefined;
     if (thisHand) bustRank++;
     if (leftover) {
@@ -23252,6 +23376,86 @@ function tournamentDealHoldReason(tableId: string, tournamentId: string, table: 
   }
   return null;
 }
+
+/**
+ * 2026-10-21 (gameplay G186) — a rebalance BROKE `breakTableId` (its movers are
+ * already at their new seats): everyone still WATCHING it — its spectators (a
+ * busted player of that table, a lobby Watch Live) and every session on a DEAD
+ * seat there (eliminated / stood up / gone) — watches the tournament's live
+ * table with the most alive players instead, exactly as spectateTournament /
+ * spectateNextTable switch a watcher (the detach ends the dead-seat session —
+ * the broken table is still a tournament table through the broken-table
+ * registry; spectator set + room; a FULL spectator state; 'spectatingTournament').
+ * They used to get only the room's 'tableBroken' and sat on a frozen copy of a
+ * table removed seconds later. A socket that holds a seat at ANOTHER table (P-e
+ * — one per-socket delta channel) is never made a spectator: it only stops
+ * watching the broken table. No live table left (the tournament ended
+ * meanwhile): 'tableClosed { tableId, reason: 'tournament_table_broken' }'.
+ * A session on a LIVE seat there (a mover's on a socket that is gone, another
+ * account's) is never touched — its disconnect / reconnect path owns it.
+ * Called by handleTableRebalance just before the broken table is removed.
+ */
+const brokenTableWatchersRehomed = { watchers: 0, closed: 0 };
+function rehomeBrokenTableWatchers(tournamentId: string, breakTableId: string): void {
+  const breakTable = tableManager.getTable(breakTableId);
+  const sids = new Set<string>(spectators.get(breakTableId) || []);
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId !== breakTableId) continue;
+    const seat = breakTable?.seats[s.seatIndex];
+    if (!seat || seat.state !== 'occupied' || seat.eliminated) sids.add(sid);
+  }
+  if (sids.size === 0) return;
+  const tournament = tournamentManager.getTournament(tournamentId);
+  let target = '';
+  let bestAlive = -1;
+  if (tournament && tournament.status === 'running') {
+    for (const tid of tournament.tableIds) {
+      if (tid === breakTableId || !tableManager.getTable(tid)) continue;
+      const alive = tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length;
+      if (alive > bestAlive) { bestAlive = alive; target = tid; }
+    }
+  }
+  const room = `table:${breakTableId}`;
+  for (const sid of sids) {
+    const sock = io.sockets.sockets.get(sid);
+    const specs = spectators.get(breakTableId);
+    if (!sock) {
+      if (specs?.delete(sid) && specs.size === 0) spectators.delete(breakTableId);
+      continue;
+    }
+    const main = playerSessions.get(sid);
+    const mainSeat = main?.tableId === breakTableId ? breakTable?.seats[main.seatIndex] : undefined;
+    const liveSeatHere = !!mainSeat && mainSeat.state === 'occupied' && !mainSeat.eliminated;
+    if (liveSeatHere || socketHoldsPlayerSessionElsewhere(sid, breakTableId)) {
+      if (specs?.delete(sid) && specs.size === 0) spectators.delete(breakTableId);
+      if (main?.tableId !== breakTableId) sock.leave(room);
+      continue;
+    }
+    const targetTable = target ? tableManager.getTable(target) : undefined;
+    if (!tournament || !targetTable) {
+      detachSocketFromOtherTables(sock, null, 'spectate', 'tournament_table_broken');
+      sock.emit('tableClosed', { tableId: breakTableId, reason: 'tournament_table_broken' });
+      brokenTableWatchersRehomed.closed++;
+      continue;
+    }
+    detachSocketFromOtherTables(sock, target, 'spectate', 'tournament_table_broken');
+    const specSet = spectators.get(target) || new Set<string>();
+    specSet.add(sid);
+    spectators.set(target, specSet);
+    sock.join(`table:${target}`);
+    const state: any = getGameStateForPlayer(targetTable, -1, false);
+    state.isSpectator = true;
+    state.spectatorCount = specSet.size;
+    state.tournamentStatus = tournamentManager.getTournamentStatus(tournamentId);
+    state.tournamentTableIds = tournament.tableIds;
+    emitGameState(sock, state, true);
+    sock.emit('spectatingTournament', {
+      tournamentId, tableId: target, tableIds: tournament.tableIds, status: tournamentManager.getTournamentStatus(tournamentId),
+    });
+    brokenTableWatchersRehomed.watchers++;
+  }
+  console.log(`[Tournament] ${JSON.stringify({ event: 'broken_table_watchers_rehomed', tournamentId, tableId: breakTableId, target: target || null, sockets: sids.size })}`);
+}
 // ===== end tournament rebalance helpers =====
 
 function handleTableRebalance(tournamentId: string): void {
@@ -23425,6 +23629,9 @@ function handleTableRebalance(tournamentId: string): void {
   // Don't remove the table from tableManager yet — let current hand finish
   // Mark it for cleanup
   setTimeout(() => {
+    // G186 (2026-10-21) — its watchers (spectators, busted players' dead-seat
+    // sessions) move to a live table first: they sat on a frozen copy.
+    rehomeBrokenTableWatchers(tournamentId, breakTableId);
     tableManager.removeTable(breakTableId);
     tableProgressListeners.delete(breakTableId); // #7: don't leak the listener key
   }, 5000);

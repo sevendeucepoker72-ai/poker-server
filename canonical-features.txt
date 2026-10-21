@@ -1444,3 +1444,27 @@ maxBuyInSetting
 seatedAt: { tableId: bestTable.tableId, seatIndex: targetSeat }
 reEntriesLeft
 lateEntry: true, reentry: true
+
+# 2026-10-21 gameplay S8 (tournaments: pause/resume, late seat deal, antes,
+# bounties, standings, breaks, force-close).
+# F90: Pause / Resume reach a single-table tournament (tableId when tableIds is empty).
+# F95: a qualifier late entry / re-entry onto an idle table schedules its deal.
+# F96: tournament tables are created with the level-1 ante.
+# F92: a bounty goes to the winner of the highest pot the busted player was in.
+# F94 / F97: Live Bracket stacks from the single table and the LIVE seat.
+# F98: a busted player watching his own table gets the spectator view only.
+# F99: no bot strip on a tournament table. G185: no Force Close of a running
+# tournament table. G186: a broken table's watchers move to a live table.
+const pauseTableIds = tourn?.tableIds?.length ? tourn.tableIds : (tourn?.tableId ? [tourn.tableId] : []);
+scheduleDealAfterTournamentSeat(tid);
+ante: anteChips,
+eliminatorBySeat
+lastHandPotEligibility
+const tid = t.playerTableMap.get(p.playerId) ?? t.tableId ?? undefined;
+s?.state === 'occupied' && !s.eliminated && s.playerId === p.playerId
+watchesFromDeadTournamentSeat(socketId, session, table)
+bot_strip_skipped_tournament_table
+ADMIN_FORCE_CLOSE_TABLE_REFUSED
+success: false, code: 'tournament_table', tableId: data.tableId,
+rehomeBrokenTableWatchers(tournamentId, breakTableId);
+tournament_table_broken

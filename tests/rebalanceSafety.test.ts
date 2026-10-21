@@ -3698,3 +3698,238 @@ describe('Z5 — banUser on an entrant whose live socket PLAYS his tournament se
     expect(ban).not.toContain('s.disconnect(');
   });
 });
+
+// ═══════════════════════════════════════════════ gameplay S8 (2026-10-21) ══
+const S8_RANKS: Record<string, number> = { '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, T: 10, J: 11, Q: 12, K: 13, A: 14 };
+const S8_SUITS: Record<string, number> = { h: 0, d: 1, c: 2, s: 3 };
+const s8Cards = (s: string): any[] => s.trim().split(/\s+/).map((t) => ({ rank: S8_RANKS[t[0]], suit: S8_SUITS[t[1]] }));
+/** Fix the hole cards of the given seats and the board (burn, flop, burn, turn, burn, river). */
+function s8Rig(t: PokerTable, holes: Record<number, string>, board: string): void {
+  const used = new Set<number>();
+  for (const [i, h] of Object.entries(holes)) {
+    t.seats[Number(i)].holeCards = s8Cards(h);
+    for (const c of s8Cards(h)) used.add(c.suit * 16 + c.rank);
+  }
+  const b = s8Cards(board);
+  for (const c of b) used.add(c.suit * 16 + c.rank);
+  const rest: any[] = [];
+  for (let suit = 0; suit < 4; suit++) for (let rank = 2; rank <= 14; rank++) if (!used.has(suit * 16 + rank)) rest.push({ suit, rank });
+  const deck = (t as any).deck;
+  deck.cards = [rest[0], b[0], b[1], b[2], rest[1], b[3], rest[2], b[4], ...rest.slice(3)];
+  deck.currentIndex = 0;
+}
+
+describe('F92 — a bounty goes to the winner of the pot that took the busted player\'s last chips', () => {
+  const NEW_ELIM = 'check?.eliminatorBySeat?.get(i) ?? ';
+  /** A 300 / B 500 / C 1000, everyone all-in on a real hand (rigged), bounty 200; its handResult through the real hand-complete + bust check. */
+  async function allIn(holes: Record<number, string>, board: string, over: Partial<typeof P> = {}) {
+    const w = world({
+      layout: { TA: [{ pid: 'A', name: 'A', stack: 300, uid: 100 }, { pid: 'B', name: 'B', stack: 500, uid: 101 }, { pid: 'C', name: 'C', stack: 1000, uid: 102 }] },
+      scope: persistenceScope(null), config: { isBounty: true, bountyAmount: 200 }, over,
+    });
+    const elim = eliminations(w);
+    const TA = w.tables.get('TA')!;
+    expect(TA.startNewHand()).toBe(true);
+    s8Rig(TA, holes, board);
+    let results: any[] = [];
+    TA.once('handResult', (d: any) => { results = d.results; });
+    for (let g = 0; g < 40 && TA.isHandInProgress(); g++) {
+      const a = TA.activeSeatIndex;
+      if (a < 0) break;
+      if (!TA.playerAllIn(a) && !TA.playerCall(a)) TA.playerCheck(a);
+    }
+    expect(TA.isHandInProgress()).toBe(false);
+    await w.m.handleHandComplete('TA', results);
+    await flush();
+    const t = w.tm.getTournament(w.tid)!;
+    const bounties = Object.fromEntries(t.players.map((p) => [p.playerId, p.bountyEarnings]));
+    return { w, elim, results: results.map((r) => [r.potName, r.seatIndex, r.amount]), bounties, stacks: [0, 1, 2].map((i) => TA.seats[i].chipCount) };
+  }
+
+  it('the SHORT all-in wins the main pot, C wins side pot 1 and busts B: C knocked B out (+200 on his stack), not A', async () => {
+    expect(P.helpers).toContain(NEW_ELIM);
+    const r = await allIn({ 0: 'Ah Ad', 1: 'Qh Qd', 2: 'Kh Kd' }, '2c 7d 9s 3h 4c');
+    expect(r.results).toEqual([['Main Pot', 0, 900], ['Side Pot 1', 2, 400]]);
+    expect(r.elim).toEqual([{ playerId: 'B', eliminatorId: 'C' }]);
+    expect(r.bounties).toEqual({ A: 0, B: 0, C: 200 });
+    expect(r.stacks).toEqual([900, 0, 1100]);
+  });
+
+  it('a SPLIT main pot (A and C tie) and C alone wins side pot 1: the bust is C\'s', async () => {
+    const r = await allIn({ 0: 'Ah Kd', 1: 'Qh Td', 2: 'As Kc' }, '2c 7d 9s 3h 5c');
+    expect(r.elim).toEqual([{ playerId: 'B', eliminatorId: 'C' }]);
+    expect(r.bounties).toEqual({ A: 0, B: 0, C: 200 });
+  });
+
+  it('CONTROL — the k-th bust paired with the k-th pot RESULT (pre-F92): A gets B\'s bounty although C won his chips', async () => {
+    const r = await allIn({ 0: 'Ah Ad', 1: 'Qh Qd', 2: 'Kh Kd' }, '2c 7d 9s 3h 4c', { helpers: P.helpers.replace(NEW_ELIM, '') });
+    expect(r.elim).toEqual([{ playerId: 'B', eliminatorId: 'A' }]);
+    expect(r.bounties).toEqual({ A: 200, B: 0, C: 0 });
+    expect(r.stacks).toEqual([1100, 0, 900]);
+  });
+
+  it('a synthetic hand result with no pot record (no eliminatorBySeat entry) keeps the positional pairing', async () => {
+    const w = world({ layout: { TA: field('a', 3, 5000, 100) }, scope: persistenceScope(null) });
+    const elim = eliminations(w);
+    const TA = w.tables.get('TA')!;
+    TA.seats[0].chipCount += TA.seats[1].chipCount;
+    TA.seats[1].chipCount = 0;
+    (TA as any).currentPhase = GamePhase.HandComplete;
+    await w.m.handleHandComplete('TA', [{ seatIndex: 0, amount: 5000 }]);
+    expect(elim).toEqual([{ playerId: 'a1', eliminatorId: 'a0' }]);
+  });
+});
+
+/** The REAL broadcastGameState (+ F98's dead-seat test), recording what each socket is sent. */
+function realBroadcastS8(w: ReturnType<typeof world>, deadSeatTest?: () => boolean) {
+  const got: Array<{ sid: string; tableId: string; yourSeat: number; isSpectator?: boolean }> = [];
+  const code = (deadSeatTest ? '' : fnSrc('function watchesFromDeadTournamentSeat(')) + fnSrc('function broadcastGameState(');
+  const { exports } = load(code, {
+    tableManager: { getTable: (id: string) => w.tables.get(id) },
+    playerSessions: w.playerSessions, multiTableSessions: w.multiTableSessions, spectators: w.spectators, reservedSeats: w.reservedSeats,
+    io: { to: () => ({ emit() {} }), sockets: { sockets: w.live } }, isTournamentTable: w.m.isTournamentTable,
+    ...(deadSeatTest ? { watchesFromDeadTournamentSeat: deadSeatTest } : {}),
+    getGameStateForPlayer: (t: PokerTable, seat: number) => ({ tableId: t.config.tableId, yourSeat: seat }),
+    emitGameState: (sock: any, state: any) => got.push({ sid: sock.id, tableId: state.tableId, yourSeat: state.yourSeat, ...(state.isSpectator ? { isSpectator: true } : {}) }),
+    DrawPhases: [], isHandStoreReady: () => false, console: { log() {}, warn() {}, error() {} },
+  }, '{ broadcastGameState }');
+  return { bc: exports.broadcastGameState as (id: string) => void, got };
+}
+
+/** TA 6 / TB 5: a5 PLAYS TA on S-a5 and busts there (eliminatedToSpectator: TA's spectator, his DEAD seat's session kept). */
+async function bustA5Live(over: Partial<typeof P> = {}, scope: Record<string, unknown> = {}) {
+  const w = world({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 5, 5000, 200) }, scope: { ...persistenceScope(null), ...scope }, over });
+  const TA = w.tables.get('TA')!;
+  const s5 = w.seatLive('S-a5', 'TA', 5, 105, 'm-a5');
+  TA.seats[0].chipCount += TA.seats[5].chipCount;
+  TA.seats[5].chipCount = 0;
+  (TA as any).currentPhase = GamePhase.HandComplete;
+  await w.m.handleHandComplete('TA', [{ seatIndex: 0, amount: 5000 }]);
+  await flush();
+  expect(s5.emitted.map(([ev]: [string]) => ev)).toContain('eliminatedToSpectator');
+  expect(w.spectators.get('TA')?.has('S-a5')).toBe(true);
+  expect(w.playerSessions.get('S-a5')).toMatchObject({ tableId: 'TA', seatIndex: 5 });
+  return { w, s5, TA };
+}
+
+describe('F98 — a busted player watching his own table gets ONLY the spectator view (one view per socket)', () => {
+  it('every broadcast: one spectator frame for S-a5 (no dead-seat frame), and he stays TA\'s spectator', async () => {
+    const { w } = await bustA5Live();
+    const { bc, got } = realBroadcastS8(w);
+    bc('TA');
+    bc('TA');
+    expect(got.filter((g) => g.sid === 'S-a5')).toEqual([
+      { sid: 'S-a5', tableId: 'TA', yourSeat: -1, isSpectator: true }, { sid: 'S-a5', tableId: 'TA', yourSeat: -1, isSpectator: true },
+    ]);
+    expect(w.spectators.get('TA')?.has('S-a5')).toBe(true);
+    expect(w.playerSessions.get('S-a5')).toMatchObject({ tableId: 'TA', seatIndex: 5 });   // kept (chat, nameplate, disconnect)
+    // A LIVE seat is untouched: a0 still gets his own seat's view.
+    w.seatLive('S-a0', 'TA', 0, 100, 'm-a0');
+    bc('TA');
+    expect(got.filter((g) => g.sid === 'S-a0')).toEqual([{ sid: 'S-a0', tableId: 'TA', yourSeat: 0 }]);
+  });
+
+  it('CONTROL — pre-F98 (no dead-seat test): the dead seat\'s player view, and the F155 choke drops him from the spectators (no spectator view at all)', async () => {
+    const { w } = await bustA5Live();
+    const { bc, got } = realBroadcastS8(w, () => false);
+    bc('TA');
+    bc('TA');
+    expect(got.filter((g) => g.sid === 'S-a5')).toEqual([{ sid: 'S-a5', tableId: 'TA', yourSeat: 5 }, { sid: 'S-a5', tableId: 'TA', yourSeat: 5 }]);
+    expect(w.spectators.get('TA')?.has('S-a5') ?? false).toBe(false);
+  });
+
+  it('a resync (requestState) answers him with the spectator view, never the dead seat\'s', async () => {
+    const { w } = await bustA5Live();
+    const frames: any[] = [];
+    const run = (deadSeatTest?: () => boolean) => {
+      const code = `${deadSeatTest ? '' : fnSrc('function watchesFromDeadTournamentSeat(')}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n  ${handlerSrc('requestState', '\n  });\n')}\n}`;
+      const { exports } = load(code, {
+        tableManager: { getTable: (id: string) => w.tables.get(id) }, playerSessions: w.playerSessions, multiTableSessions: w.multiTableSessions,
+        spectators: w.spectators, isTournamentTable: w.m.isTournamentTable, ...(deadSeatTest ? { watchesFromDeadTournamentSeat: deadSeatTest } : {}),
+        getGameStateForPlayer: (t: PokerTable, seat: number) => ({ tableId: t.config.tableId, yourSeat: seat }),
+        emitGameState: (_s: any, state: any) => frames.push(state), console: { log() {}, warn() {}, error() {} },
+      }, '{ wire }');
+      const sock: any = { id: 'S-a5', handlers: {}, on: (ev: string, fn: any) => { sock.handlers[ev] = fn; }, emit() {}, join() {}, leave() {} };
+      exports.wire(sock);
+      sock.handlers.requestState();
+    };
+    run();
+    run(() => false);
+    expect(frames.map((f) => [f.yourSeat, !!f.isSpectator])).toEqual([[-1, true], [5, false]]);   // fixed, then the pre-F98 control
+  });
+});
+
+describe('G186 — a broken table\'s watchers (busted players, lobby spectators) move to a live table', () => {
+  const REHOME = '    rehomeBrokenTableWatchers(tournamentId, breakTableId);\n';
+  /** a5 busts live on TA (watching it), a lobby socket watches TA, then a4 busts: 9 alive → TA (4 left) broken into TB. */
+  async function breakWithWatchers(over: Partial<typeof P> = {}) {
+    const frames: Array<{ sid: string; state: any }> = [];
+    const { w, s5, TA } = await bustA5Live(over, { emitGameState: (sock: any, state: any) => frames.push({ sid: sock.id, state }) });
+    const watch = w.mkSocket('S-watch');
+    w.spectators.get('TA')!.add('S-watch');
+    watch.join('table:TA');
+    TA.seats[0].chipCount += TA.seats[4].chipCount;
+    TA.seats[4].chipCount = 0;
+    (TA as any).currentPhase = GamePhase.HandComplete;
+    await w.m.handleHandComplete('TA', [{ seatIndex: 0, amount: 5000 }]);
+    await flush();
+    expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TB']);
+    s5.emitted.length = 0;
+    watch.emitted.length = 0;
+    frames.length = 0;
+    jest.advanceTimersByTime(6000);
+    return { w, s5, watch, frames };
+  }
+
+  it('5s later: both watch TB (spectator set, room, a FULL spectator state, spectatingTournament); a5\'s dead-seat session ended; TA removed', async () => {
+    const { w, s5, watch, frames } = await breakWithWatchers();
+    expect(w.tables.has('TA')).toBe(false);
+    expect(w.spectators.has('TA')).toBe(false);
+    expect([...(w.spectators.get('TB') || [])].sort()).toEqual(['S-a5', 'S-watch']);
+    expect(w.playerSessions.has('S-a5')).toBe(false);
+    expect([...s5.rooms]).toEqual(['table:TB']);
+    expect([...watch.rooms]).toEqual(['table:TB']);
+    for (const s of [s5, watch]) {
+      expect(s.emitted.filter(([ev]: [string]) => ev === 'spectatingTournament').map(([, d]: [string, any]) => d))
+        .toEqual([expect.objectContaining({ tournamentId: w.tid, tableId: 'TB', tableIds: ['TB'] })]);
+    }
+    expect(frames.map((f) => [f.sid, f.state.isSpectator, f.state.tournamentTableIds])).toEqual([['S-a5', true, ['TB']], ['S-watch', true, ['TB']]]);
+    expect(w.m.tableViewDetaches.deadSeatSessionsEnded).toBeGreaterThanOrEqual(1);
+  });
+
+  it('CONTROL — pre-G186 (no re-home): both are left on the removed table — its spectators, its room, a5\'s dead session pointing at it; nothing is sent', async () => {
+    const { w, s5, watch } = await breakWithWatchers({ rebalance: P.rebalance.replace(REHOME, '') });
+    expect(w.tables.has('TA')).toBe(false);
+    expect([...(w.spectators.get('TA') || [])].sort()).toEqual(['S-a5', 'S-watch']);
+    expect(w.playerSessions.get('S-a5')).toMatchObject({ tableId: 'TA' });
+    expect([...s5.rooms]).toEqual(['table:TA']);
+    expect(s5.emitted).toEqual([]);
+    expect(watch.emitted).toEqual([]);
+  });
+
+  it('wiring: the re-home runs in the break\'s removal timer, before the table is removed', () => {
+    expect(P.rebalance).toContain(REHOME);
+    expect(P.rebalance.indexOf(REHOME)).toBeLessThan(P.rebalance.indexOf('    tableManager.removeTable(breakTableId);'));
+    expect(P.rebalance.indexOf(REHOME)).toBeGreaterThan(P.rebalance.indexOf('noteBrokenTournamentTable(breakTableId, tournamentId);'));
+  });
+});
+
+describe('F99 — a busted human leaving a tournament table with bots never strips them (end to end)', () => {
+  it('a0 busts on TA (4 bots alive), then leaves: the bots stay seated with their stacks, as TournamentManager counts them', async () => {
+    const w = world({ layout: { TA: field('a', 5, 5000, 100) }, scope: persistenceScope(null) });
+    const TA = w.tables.get('TA')!;
+    for (let i = 1; i <= 4; i++) TA.seats[i].isAI = true;                    // the admin's simulated tournament: bots are entrants
+    const s0 = w.seatLive('S-a0', 'TA', 0, 100, 'm-a0');
+    TA.seats[1].chipCount += TA.seats[0].chipCount;
+    TA.seats[0].chipCount = 0;
+    (TA as any).currentPhase = GamePhase.HandComplete;
+    await w.m.handleHandComplete('TA', [{ seatIndex: 1, amount: 5000 }]);
+    await flush();
+    expect(w.tm.getTournament(w.tid)!.players.find((p) => p.playerId === 'a0')!.eliminated).toBe(true);
+    w.m.handlePlayerLeave(s0);
+    // Old: [] — every bot stood up while 4 entrants stayed alive on TA.
+    expect(TA.seats.filter((s) => s.state === 'occupied' && s.isAI).map((s) => [s.playerId, s.chipCount]))
+      .toEqual([['a1', 10000], ['a2', 5000], ['a3', 5000], ['a4', 5000]]);
+    expect(w.tm.getAliveCount(w.tid)).toBe(4);
+  });
+});

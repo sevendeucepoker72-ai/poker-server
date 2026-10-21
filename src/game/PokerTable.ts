@@ -289,6 +289,19 @@ export class PokerTable extends EventEmitter {
   public lastHandResult: LastHandResult | null = null;
 
   /**
+   * 2026-10-21 (gameplay F92) — the finished hand's pots in pot order (main
+   * first), each with the seats that could win it and the seats that did.
+   * Server-side only (never sent): the tournament bust check reads it to credit
+   * a knockout to the winner of the highest pot the busted player was in — the
+   * pot that took his last chips. Recorded by buildPotBreakdown (base, Omaha
+   * hi-lo, Stud hi-lo); `handNumber` tells a stale record apart.
+   */
+  public lastHandPotEligibility: {
+    handNumber: number;
+    pots: Array<{ name: string; eligibleSeatIndices: number[]; winners: number[] }>;
+  } | null = null;
+
+  /**
    * True only when the hand reached a genuine CONTESTED showdown (>= 2 non-folded
    * players tabled their hands). Reset each hand; set in determineWinners. Consumers
    * (getGameStateForPlayer reveal, hand-history serialize) must NOT reveal hole cards
@@ -2763,11 +2776,11 @@ export class PokerTable extends EventEmitter {
    * Nobody won (the all-fold refund): no results, so every pot stays empty.
    */
   protected buildPotBreakdown(
-    pots: Array<{ name: string; amount: number }>,
+    pots: Array<{ name: string; amount: number; eligibleSeatIndices?: number[] }>,
     results: Array<{ seatIndex: number; amount: number; potName: string }>,
     loneWinner: number | null,
   ): PotBreakdownEntry[] {
-    return pots.map(p => {
+    const breakdown = pots.map(p => {
       const bySeat = new Map<number, number>();
       if (loneWinner !== null && loneWinner >= 0) {
         if (p.amount > 0) bySeat.set(loneWinner, p.amount);
@@ -2781,6 +2794,16 @@ export class PokerTable extends EventEmitter {
       const winnerAmounts = [...bySeat].map(([seatIndex, amount]) => ({ seatIndex, amount }));
       return { name: p.name, amount: p.amount, winners: winnerAmounts.map(w => w.seatIndex), winnerAmounts };
     });
+    // F92 — who could win each pot, kept beside the (unchanged) public breakdown.
+    this.lastHandPotEligibility = {
+      handNumber: this.handNumber,
+      pots: pots.map((p, i) => ({
+        name: p.name,
+        eligibleSeatIndices: Array.isArray(p.eligibleSeatIndices) ? [...p.eligibleSeatIndices] : [],
+        winners: [...breakdown[i].winners],
+      })),
+    };
+    return breakdown;
   }
 
   /**

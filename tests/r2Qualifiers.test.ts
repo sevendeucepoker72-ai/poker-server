@@ -17,7 +17,7 @@
  * Everything runs the REAL src/index.ts source (sliced + transpiled) with the
  * REAL TournamentManager / PokerTable and the pure qualifierSchedule module.
  */
-import { PokerTable } from '../src/game/PokerTable';
+import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { TournamentManager } from '../src/game/TournamentManager';
 import {
   parseMasterSchedule, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels,
@@ -973,5 +973,96 @@ describe('wiring', () => {
     const ev = slice('  tournamentManager.onEvent(tournamentId, (event, data) => {', '\n  });\n', SRC.indexOf('function bootstrapTournamentTables('));
     expect(ev.indexOf('markQualifierFinished(')).toBeGreaterThan(-1);
     expect(ev.indexOf('markQualifierFinished(')).toBeLessThan(ev.indexOf('emitTournamentFinishedToEntrants('));
+  });
+});
+
+describe('F95 (2026-10-21) — a late entry or re-entry seated at an IDLE table gets that table\'s next deal scheduled', () => {
+  /**
+   * Q1: Bob alone alive (Carl busted — his seat occupied at 0 chips), its hand
+   * over and nothing scheduled: it waits for a rebalance that cannot come (Q2,
+   * Dan + Eve, plays on). With
+   * `aliceBusted`, Alice entered late and busted (no seat left: she re-enters).
+   */
+  function idle(phase: GamePhase = GamePhase.HandComplete, aliceBusted = false) {
+    const w = world();
+    w.sync(Date.now() - 10 * 60_000);
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    const tid = w.tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: qualifierBlindLevels(50_000), startingChips: 50_000 } as any);
+    w.tm.registerPlayer(tid, 'user-201', 'Bob', 'sb', undefined, 'm-201');
+    w.tm.registerPlayer(tid, 'user-202', 'Carl', 'sc', undefined, 'm-202');
+    w.tm.registerPlayer(tid, 'user-203', 'Dan', 'sd', undefined, 'm-203');
+    w.tm.registerPlayer(tid, 'user-204', 'Eve', 'se', undefined, 'm-204');
+    w.tm.startTournament(tid);
+    const t = new PokerTable({ tableId: 'Q1', tableName: 'Q1', smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+    t.sitDown(0, 'Bob', 100_000, 'user-201', false, true);
+    t.sitDown(1, 'Carl', 50_000, 'user-202', false, true);
+    const t2 = new PokerTable({ tableId: 'Q2', tableName: 'Q2', smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+    t2.sitDown(0, 'Dan', 50_000, 'user-203', false, true);
+    t2.sitDown(1, 'Eve', 50_000, 'user-204', false, true);
+    w.tables.set('Q1', t);
+    w.tables.set('Q2', t2);
+    w.tm.setTableIds(tid, ['Q1', 'Q2']);
+    w.tm.setPlayerTable(tid, 'user-201', 'Q1');
+    w.tm.setPlayerTable(tid, 'user-202', 'Q1');
+    w.tm.setPlayerTable(tid, 'user-203', 'Q2');
+    w.tm.setPlayerTable(tid, 'user-204', 'Q2');
+    w.tm.eliminatePlayer(tid, 'user-202');
+    t.seats[1].chipCount = 0;
+    t.seats[1].eliminated = true;
+    (t as any).currentPhase = phase;
+    Object.assign(qt, {
+      status: 'running', tournamentId: tid,
+      players: [
+        { playerId: 'user-201', masterPlayerId: 'm-201', playerName: 'Bob', phone: '', socketId: 'sb' },
+        { playerId: 'user-202', masterPlayerId: 'm-202', playerName: 'Carl', phone: '', socketId: 'sc' },
+        { playerId: 'user-203', masterPlayerId: 'm-203', playerName: 'Dan', phone: '', socketId: 'sd' },
+        { playerId: 'user-204', masterPlayerId: 'm-204', playerName: 'Eve', phone: '', socketId: 'se' },
+      ],
+    });
+    if (aliceBusted) {
+      w.tm.addLateEntrant(tid, 'user-101', 'Alice', 'old', 50_000, { masterUserId: 'm-alice' });
+      qt.players.push({ playerId: 'user-101', masterPlayerId: 'm-alice', playerName: 'Alice', phone: '', socketId: 'old', reEntries: 0 });
+      w.tm.eliminatePlayer(tid, 'user-101');
+    }
+    expect(w.tm.getTournament(tid)!.status).toBe('running');
+    const scheduled: string[] = [];
+    const pendingAutoStartTimers = new Map<string, any>();
+    Object.assign(w.scope, { GamePhase, pendingAutoStartTimers, scheduleAutoStart: (id: string) => { scheduled.push(id); } });
+    return { w, tid, t, qt, scheduled, pendingAutoStartTimers };
+  }
+
+  it('a LATE ENTRY onto the idle table: seated on the busted seat AND the table\'s deal is scheduled (it sat frozen: nothing ever dealt it)', async () => {
+    const { w, t, scheduled } = idle();
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await a.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
+    expect(t.seats[1]).toMatchObject({ state: 'occupied', playerId: 'user-101', chipCount: 50_000 });
+    expect(w.of('SA', 'qualifierRegistrationResult')).toEqual([expect.objectContaining({ success: true, lateEntry: true, tableId: 'Q1' })]);
+    // Old: [] — scheduled by nothing.
+    expect(scheduled).toEqual(['Q1']);
+  });
+
+  it('a RE-ENTRY onto the idle table: seated on its empty seat AND the deal is scheduled', async () => {
+    const { w, t, scheduled } = idle(GamePhase.HandComplete, true);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await a.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
+    await flush();
+    expect(w.of('SA', 'qualifierRegistrationResult')).toEqual([expect.objectContaining({ success: true, reentry: true, tableId: 'Q1' })]);
+    expect(t.seats.find((s) => s.state === 'occupied' && !s.eliminated && s.playerId === 'user-101')).toMatchObject({ chipCount: 50_000 });
+    // Old: [].
+    expect(scheduled).toEqual(['Q1']);
+  });
+
+  it('a table MID-HAND (the normal case) or one whose deal is already scheduled is left alone', async () => {
+    const mid = idle(GamePhase.PreFlop);
+    await mid.w.mkSocket('SA', ALICE, 'm-alice', 'Alice').handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
+    expect(mid.t.seats[1]).toMatchObject({ playerId: 'user-101' });
+    expect(mid.scheduled).toEqual([]);
+    const already = idle();
+    const pending = setTimeout(() => {}, 1500);
+    already.pendingAutoStartTimers.set('Q1', pending);
+    await already.w.mkSocket('SA', ALICE, 'm-alice', 'Alice').handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
+    clearTimeout(pending);
+    expect(already.t.seats[1]).toMatchObject({ playerId: 'user-101' });
+    expect(already.scheduled).toEqual([]);
   });
 });
