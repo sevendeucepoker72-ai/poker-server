@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -3145,7 +3145,9 @@ interface QualifierTournamentReg {
   /** Ended without being played (too few players / taken off the schedule) — every consumed credit refunded. */
   cancelled?: boolean;
   /** The final standings (C3): each finisher's own place + whether that place wins a championship seat. */
-  results?: Array<{ masterUserId: string | null; playerName: string; place: number; wonSeat: boolean }> | null;
+  results?: Array<{ masterUserId: string | null; playerName: string; place: number; wonSeat: boolean; seats?: number }> | null;
+  /** 2026-10-21 — the event's championship SEAT PACKAGE from the master ({place: seats}); null = the standard award. */
+  seatPackage?: Record<number, number> | null;
 }
 
 /** R2 (TOURNEY-3 / AUTH-9) — a registration is the MASTER account's (masterPlayerId), never a login handle / phone / name. */
@@ -3293,6 +3295,7 @@ function applyQualifierSchedule(list: MasterScheduleEntry[], now: number): void 
     const existing = qualifierTournaments.get(q.id);
     if (existing) {
       existing.lastSeenInSchedule = now;
+      existing.seatPackage = q.seatPackage;
       // The master owns the time / name until the event STARTS.
       if (existing.status === 'registering' && !existing.tournamentId) {
         existing.scheduledAt = new Date(q.scheduledAt).toISOString();
@@ -3321,6 +3324,7 @@ function applyQualifierSchedule(list: MasterScheduleEntry[], now: number): void 
       lastSeenInSchedule: now,
       finishedAt: null,
       results: null,
+      seatPackage: q.seatPackage,
     });
   }
   // Taken off the schedule before it started (the master closed / moved it):
@@ -3365,7 +3369,8 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
   const status = qualifierStatusOf(phase, at, now);
   const mine = viewerMasterId ? qt.players.find((p) => p.masterPlayerId === viewerMasterId) : undefined;
   const myResult = viewerMasterId && qt.results ? qt.results.find((r) => r.masterUserId === viewerMasterId) : undefined;
-  const seatsForTop = seatsForTopOf(qt.qualifierType);
+  // 2026-10-21 — an event with a seat package: seats down to its last place.
+  const seatsForTop = seatsForTopWith(qt.qualifierType, qt.seatPackage);
   return {
     qualifierId: id,
     masterQualifierId: qt.masterQualifierId ?? id,
@@ -3381,10 +3386,12 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     players: qt.players.length,
     structure: qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK),
     seatsForTop,
+    // 2026-10-21 — {place: seats} when this event has a seat package (the lobby lists it), else null.
+    seatPackage: qt.seatPackage || null,
     tournamentId: qt.tournamentId,
     ...(qt.cancelled ? { cancelled: true } : {}),
     // The asking account's own result (C3): `myResult {place, wonSeat}` (+ the same two at the top level).
-    myResult: myResult ? { place: myResult.place, wonSeat: myResult.wonSeat } : null,
+    myResult: myResult ? { place: myResult.place, wonSeat: myResult.wonSeat, seats: myResult.seats ?? (myResult.wonSeat ? 1 : 0) } : null,
     ...(myResult ? { place: myResult.place, wonSeat: myResult.wonSeat } : {}),
     // Pre-R2 names (older lobbies): the same values.
     qualifierType: qt.qualifierType,
@@ -3580,24 +3587,26 @@ function cancelQualifierEvent(qualId: string, qt: QualifierTournamentReg, reason
 function markQualifierFinished(tournamentId: string, data: { results?: Array<{ playerId: string; playerName: string; position: number; disqualified?: boolean }> }): void {
   for (const [qualId, qt] of qualifierTournaments) {
     if (qt.tournamentId !== tournamentId || qt.status === 'finished') continue;
-    const seats = seatsForTopOf(qt.qualifierType);
+    // 2026-10-21 — a seat package pays several seats per place (seatsWonAt).
+    const seats = seatsForTopWith(qt.qualifierType, qt.seatPackage);
     const results = (data?.results || [])
       .filter((r) => r.position > 0 && !r.disqualified)
       .map((r) => {
         const reg = qt.players.find((p) => p.playerId === r.playerId);
-        return { masterUserId: reg?.masterPlayerId ?? null, playerName: publicNameOf(r.playerName), place: r.position, wonSeat: r.position <= seats };
+        const won = seatsWonAt(qt.qualifierType, qt.seatPackage, r.position);
+        return { masterUserId: reg?.masterPlayerId ?? null, playerName: publicNameOf(r.playerName), place: r.position, wonSeat: won > 0, seats: won };
       })
       .sort((a, b) => a.place - b.place);
     qt.status = 'finished';
     qt.finishedAt = Date.now();
     qt.results = results;
-    const publicResults = results.map((r) => ({ place: r.place, playerName: r.playerName, wonSeat: r.wonSeat }));
+    const publicResults = results.map((r) => ({ place: r.place, playerName: r.playerName, wonSeat: r.wonSeat, seats: r.seats }));
     for (const p of qt.players) {
       const mine = results.find((r) => r.masterUserId && r.masterUserId === p.masterPlayerId);
       for (const s of socketsOfMaster(p.masterPlayerId)) {
         s.emit('qualifierResults', {
-          qualifierId: qualId, myResult: mine ? { place: mine.place, wonSeat: mine.wonSeat } : null,
-          place: mine?.place ?? null, wonSeat: !!mine?.wonSeat, seatsForTop: seats, results: publicResults,
+          qualifierId: qualId, myResult: mine ? { place: mine.place, wonSeat: mine.wonSeat, seats: mine.seats } : null,
+          place: mine?.place ?? null, wonSeat: !!mine?.wonSeat, seatsForTop: seats, seatPackage: qt.seatPackage || null, results: publicResults,
         });
       }
     }
@@ -3612,11 +3621,11 @@ function qualifierOfTournament(tournamentId: string): { qualId: string; qt: Qual
 }
 
 /** R2 (C3) — one socket's account's own qualifier result (`myResult`), or null (not a finisher / not signed in). */
-function qualifierResultOf(qt: QualifierTournamentReg, auth: SocketAuthSession | undefined): { place: number; wonSeat: boolean } | null {
+function qualifierResultOf(qt: QualifierTournamentReg, auth: SocketAuthSession | undefined): { place: number; wonSeat: boolean; seats: number } | null {
   const master = auth ? String(auth.masterUserId || auth.statsMasterUserId || '') : '';
   if (!master || !qt.results) return null;
   const r = qt.results.find((x) => !!x.masterUserId && x.masterUserId === master);
-  return r ? { place: r.place, wonSeat: r.wonSeat } : null;
+  return r ? { place: r.place, wonSeat: r.wonSeat, seats: r.seats ?? (r.wonSeat ? 1 : 0) } : null;
 }
 
 /** R2 — finished qualifiers stay listed a day (their results), then leave the registry. */
@@ -19374,7 +19383,7 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
   if (!q) {
     for (const room of rooms) io.to(room).emit('tournamentFinished', data);
   } else {
-    const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop: seatsForTopOf(q.qt.qualifierType) };
+    const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop: seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage), seatPackage: q.qt.seatPackage || null };
     for (const [sid, sock] of io.sockets.sockets) {
       if (!sock || !rooms.some((r) => sock.rooms?.has(r))) continue;
       const mine = qualifierResultOf(q.qt, authSessions.get(sid));

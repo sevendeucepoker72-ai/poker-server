@@ -20,6 +20,43 @@ export interface MasterScheduleEntry {
   clientQualifierId: string;
   scheduledAt: number;   // ms
   status: string;
+  /** 2026-10-21 — the event's championship SEAT PACKAGE ({place: seats}); null = the standard award. */
+  seatPackage: Record<number, number> | null;
+}
+
+/**
+ * 2026-10-21 (owner: "1st gets 3 seats, 2nd thru 4th get 2 seats and 5th
+ * through 10th get 1 seat") — the master's `seatPackage` ({"<place>": <seats>})
+ * → {place: seats}, or null when absent / unusable. Same rules as the master's
+ * championshipCap.normalizeSeatPackage: places 1-100, 1-10 seats each, at most
+ * 100 seats.
+ */
+export function parseSeatPackage(raw: unknown): Record<number, number> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out: Record<number, number> = {};
+  let total = 0;
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const place = Number(k);
+    const seats = Number(v);
+    if (!Number.isInteger(place) || place < 1 || place > 100) return null;
+    if (!Number.isInteger(seats) || seats < 1 || seats > 10) return null;
+    out[place] = seats;
+    total += seats;
+  }
+  return total > 0 && total <= 100 ? out : null;
+}
+
+/** The lowest place that still wins a seat: the package's last place, else the standard rule. */
+export function seatsForTopWith(type: string, pkg: Record<number, number> | null | undefined): number {
+  if (pkg) return Math.max(...Object.keys(pkg).map(Number));
+  return seatsForTopOf(type);
+}
+
+/** Championship seats a finish at `place` wins: the package's count, else 1 inside the standard top. */
+export function seatsWonAt(type: string, pkg: Record<number, number> | null | undefined, place: number): number {
+  if (!(place > 0)) return 0;
+  if (pkg) return pkg[place] || 0;
+  return place <= seatsForTopOf(type) ? 1 : 0;
 }
 
 /**
@@ -45,6 +82,7 @@ export function parseMasterSchedule(body: unknown): MasterScheduleEntry[] {
       clientQualifierId: typeof r.clientQualifierId === 'string' && r.clientQualifierId ? r.clientQualifierId : id,
       scheduledAt: at,
       status: typeof r.status === 'string' ? r.status : 'open',
+      seatPackage: parseSeatPackage(r.seatPackage),
     });
   }
   return out;

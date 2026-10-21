@@ -21,6 +21,7 @@ import { PokerTable } from '../src/game/PokerTable';
 import { TournamentManager } from '../src/game/TournamentManager';
 import {
   parseMasterSchedule, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels,
+  parseSeatPackage, seatsForTopWith, seatsWonAt,
   QUALIFIER_BASE_STACK,
 } from '../src/game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from '../src/game/qualifierNoShow';
@@ -44,7 +45,7 @@ describe('qualifierSchedule (pure)', () => {
     const list = parseMasterSchedule(MASTER_BODY);
     expect(list).toEqual([{
       id: WEEKLY, name: 'Weekly Qualifier — 2026-10-05', type: 'weekly', clientQualifierId: 'weekly-qualifier',
-      scheduledAt: Date.parse('2026-10-11T12:00:00.000Z'), status: 'open',
+      scheduledAt: Date.parse('2026-10-11T12:00:00.000Z'), status: 'open', seatPackage: null,
     }]);
     expect(parseMasterSchedule({ schedule: MASTER_BODY.data.schedule })).toHaveLength(1);   // a bare {schedule} too
     expect(parseMasterSchedule(null)).toEqual([]);
@@ -145,7 +146,7 @@ function world(opts: { now?: number } = {}) {
       sockets: { sockets },
     },
     qualifierSyncStats: { syncs: 0, failures: 0, lastSyncAt: null, listed: 0, cancelledOffSchedule: 0 },
-    qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, QUALIFIER_BASE_STACK,
+    qualifierWindows, qualifierStatusOf, seatsForTopOf, seatsForTopWith, seatsWonAt, qualifierStructure, QUALIFIER_BASE_STACK,
     samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS,
     assertPlayable: async () => null,
     isPlayerQualified: async () => true,
@@ -595,8 +596,8 @@ describe('the qualifier lifecycle — started, cancelled for too few players, fi
     const spec = w.mkSocket('Sx', null, null); spec.join('table:Q1');
     w.m.markQualifierFinished('TQ', data);
     w.m.emitTournamentFinishedToEntrants('TQ', ['Q1'], data);
-    expect(w.of('Sa', 'tournamentFinished')).toEqual([expect.objectContaining({ tournamentId: 'TQ', results: data.results, isQualifier: true, qualifierId: WEEKLY, seatsForTop: 3, myResult: { place: 1, wonSeat: true }, place: 1, wonSeat: true })]);
-    expect(w.of('Sd', 'tournamentFinished')).toEqual([expect.objectContaining({ myResult: { place: 4, wonSeat: false }, place: 4, wonSeat: false })]);
+    expect(w.of('Sa', 'tournamentFinished')).toEqual([expect.objectContaining({ tournamentId: 'TQ', results: data.results, isQualifier: true, qualifierId: WEEKLY, seatsForTop: 3, myResult: { place: 1, wonSeat: true, seats: 1 }, place: 1, wonSeat: true })]);
+    expect(w.of('Sd', 'tournamentFinished')).toEqual([expect.objectContaining({ myResult: { place: 4, wonSeat: false, seats: 0 }, place: 4, wonSeat: false })]);
     expect(w.of('Sx', 'tournamentFinished')).toEqual([expect.objectContaining({ isQualifier: true, myResult: null })]);
     expect(w.roomEmits).toEqual([]);                                          // per socket, not one broadcast
   });
@@ -848,6 +849,56 @@ describe('2026-10-20 — the credit list (the entry gate) survives a master blip
   it('never read and the master is down → not qualified (the consume on the master stays the real gate)', async () => {
     const { g } = gate(['throw'], () => []);
     expect(await g.isPlayerQualified('m1', 'weekly')).toBe(false);
+  });
+});
+
+describe('2026-10-21 (owner) — a SEAT PACKAGE: 1st 3 seats, 2nd-4th 2, 5th-10th 1', () => {
+  const PKG = { 1: 3, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 1 };
+
+  it('parseSeatPackage: the master\'s package; junk -> null', () => {
+    expect(parseSeatPackage({ '1': 3, '2': 2, '3': 2, '4': 2, '5': 1, '6': 1, '7': 1, '8': 1, '9': 1, '10': 1 })).toEqual(PKG);
+    for (const bad of [null, undefined, 'x', [], {}, { 1: 0 }, { 0: 1 }, { 1: 1.5 }, { 1: 11 }]) expect(parseSeatPackage(bad)).toBeNull();
+    expect(seatsForTopWith('weekly', PKG)).toBe(10);
+    expect(seatsForTopWith('weekly', null)).toBe(3);
+    expect([1, 2, 4, 5, 10, 11].map((pl) => seatsWonAt('weekly', PKG, pl))).toEqual([3, 2, 2, 1, 1, 0]);
+    expect([1, 3, 4].map((pl) => seatsWonAt('weekly', null, pl))).toEqual([1, 1, 0]);
+  });
+
+  function withPackage() {
+    const w = world();
+    const body = JSON.parse(JSON.stringify(MASTER_BODY));
+    body.data.schedule[0].scheduledAt = new Date(Date.now() + H).toISOString();
+    body.data.schedule[0].seatPackage = { '1': 3, '2': 2, '3': 2, '4': 2, '5': 1, '6': 1, '7': 1, '8': 1, '9': 1, '10': 1 };
+    w.m.applyQualifierSchedule(parseMasterSchedule(body), Date.now());
+    return { w, body };
+  }
+
+  it('the lobby item shows it: seatsForTop 10 + seatPackage; a re-sync without it falls back to the standard top 3', () => {
+    const { w, body } = withPackage();
+    expect(w.m.qualifierList(null)[0]).toMatchObject({ qualifierId: WEEKLY, seatsForTop: 10, seatPackage: PKG });
+    delete body.data.schedule[0].seatPackage;
+    w.m.applyQualifierSchedule(parseMasterSchedule(body), Date.now());
+    expect(w.m.qualifierList(null)[0]).toMatchObject({ seatsForTop: 3, seatPackage: null });
+  });
+
+  it('results: places 1-10 win, each told how many seats; 11th does not', () => {
+    const { w } = withPackage();
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    Object.assign(qt, {
+      status: 'running', tournamentId: 'TQ',
+      players: Array.from({ length: 12 }, (_, i) => ({ playerId: `user-${400 + i}`, masterPlayerId: `m-${i + 1}`, playerName: `P${i + 1}`, phone: '', socketId: `S${i + 1}` })),
+    });
+    const data = { tournamentId: 'TQ', results: Array.from({ length: 12 }, (_, i) => ({ playerId: `user-${400 + i}`, playerName: `P${i + 1}`, position: i + 1, payout: 0 })) };
+    const s1 = w.mkSocket('S1x', 401, 'm-1', 'P1');
+    const s2 = w.mkSocket('S2x', 402, 'm-2', 'P2');
+    const s11 = w.mkSocket('S11x', 411, 'm-11', 'P11');
+    w.m.markQualifierFinished('TQ', data);
+    expect(w.of('S1x', 'qualifierResults')[0]).toMatchObject({ myResult: { place: 1, wonSeat: true, seats: 3 }, seatsForTop: 10, seatPackage: PKG });
+    expect(w.of('S2x', 'qualifierResults')[0]).toMatchObject({ myResult: { place: 2, wonSeat: true, seats: 2 } });
+    expect(w.of('S11x', 'qualifierResults')[0]).toMatchObject({ myResult: { place: 11, wonSeat: false, seats: 0 }, wonSeat: false });
+    expect(w.of('S1x', 'qualifierResults')[0].results.map((r: any) => r.seats)).toEqual([3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0]);
+    expect(w.m.qualifierList('m-4')[0]).toMatchObject({ myResult: { place: 4, wonSeat: true, seats: 2 } });
+    void s1; void s2; void s11;
   });
 });
 
