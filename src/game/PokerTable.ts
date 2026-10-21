@@ -187,6 +187,20 @@ export interface HandHistoryRecord {
   variant?: string;
 }
 
+/**
+ * F22 fix-up (2026-10-21) — one increase of the bet to match within a betting
+ * round (a raise, a bet, an all-in over the bet) and the betting state just
+ * BEFORE it. See PokerTable._betIncreases.
+ */
+interface BetIncreaseRecord {
+  level: number;
+  lastRaiseAmount: number;
+  acted: Array<[number, boolean]>;
+  betLevelsThisStreet: number;
+  raisesThisStreet: number;
+  lastAggressorSeat: number;
+}
+
 function createEmptySeat(index: number): Seat {
   return {
     seatIndex: index,
@@ -284,6 +298,30 @@ export class PokerTable extends EventEmitter {
    * one hand (they start folded, pay no ante). Cleared every deal.
    */
   private _dealtOutSeats: Set<number> = new Set();
+  /**
+   * F5 fix-up (2026-10-21) — per seat, the missed-blind debt its LIVE big
+   * blind settled THIS hand (postBlinds), so a bomb pot that refunds that big
+   * blind restores it (restoreRefundedDeadBlind). Cleared every deal; an entry
+   * counts only for its own hand and the player it was taken from.
+   */
+  private _debtSettledByLiveBB: Map<number, { handNumber: number; playerId: string; owed: number; flag: Seat['missedBlind'] }> = new Map();
+  /**
+   * F22 fix-up (2026-10-21) — the UTG straddle posted this hand (straddle()):
+   * the effective big blind pre-flop, so a fold out of turn never takes it
+   * away (forcedBetOfRound), as a dead big blind stays the bet to call.
+   */
+  private _straddleOfHand: { handNumber: number; amount: number } | null = null;
+  /**
+   * F22 fix-up (2026-10-21) — every INCREASE of the bet to match in this
+   * betting round, with the betting state just before it (the raise size in
+   * force, who had acted since the last full raise, the bet-level and raise
+   * counters, the aggressor). When a leaver's unmatched bet is lowered, the
+   * increases above the new level — made only by seats now out of the hand —
+   * are undone exactly (lowerBetAfterOutOfTurnFold). Cleared every betting
+   * round; keyed by hand + street so a stale entry is never used.
+   */
+  private _betIncreases: BetIncreaseRecord[] = [];
+  private _betIncreasesKey = '';
 
   /** Persists until next hand starts - contains showdown results for display */
   public lastHandResult: LastHandResult | null = null;
@@ -476,6 +514,7 @@ export class PokerTable extends EventEmitter {
     seat.missedBlind = 'none';
     seat.deadBlindOwedChips = 0;
     seat.deadMoneyThisHand = 0;
+    this._debtSettledByLiveBB.delete(seatIndex);   // F5 fix-up — never the previous occupant's
     // Also drop the seat from the sitting-out set if it was still in
     // there — the new occupant is not sitting out.
     this._sittingOutSeats.delete(seatIndex);
@@ -849,6 +888,9 @@ export class PokerTable extends EventEmitter {
     this.handBigBlind = this.config.bigBlind;   // Z3: this hand's level (a mid-hand level-up changes config only)
     this.lastAggressorSeat = -1;
     this.actionLog = [];
+    this._debtSettledByLiveBB.clear();   // F5 fix-up — this hand's record only
+    this._straddleOfHand = null;          // F22 fix-up
+    this.clearBetIncreases();             // F22 fix-up — a new betting round
     this.wentToShowdown = false; // set true only on a contested showdown (>= 2 tabled)
     this._runoutHeld = false;    // R1 insurance window — never carried into a new hand
 
@@ -1146,7 +1188,14 @@ export class PokerTable extends EventEmitter {
     // (this hand was only skipped below) and taken as dead money two hands
     // later. bbSeat is already -1 for a big blind that is still sitting out,
     // so a debt that is still growing is never wiped here.
+    // F5 fix-up (2026-10-21): what was settled is remembered for THIS hand, so a
+    // bomb pot that refunds that big blind puts the debt back
+    // (restoreRefundedDeadBlind) — before, the refund forgave both.
     if (bbSeat !== -1 && (this.seats[bbSeat].deadBlindOwedChips || 0) > 0) {
+      const bb = this.seats[bbSeat];
+      this._debtSettledByLiveBB.set(bbSeat, {
+        handNumber: this.handNumber, playerId: bb.playerId, owed: bb.deadBlindOwedChips, flag: bb.missedBlind,
+      });
       this.clearDeadBlind(bbSeat);
     }
 
@@ -1164,6 +1213,14 @@ export class PokerTable extends EventEmitter {
       // immediately pays it back out, draining a sitting-out player.
       if (this._sittingOutSeats.has(seatIdx) || this._dealtOutSeats.has(seatIdx)) continue;   // F13: not in this hand either
       if (owed > 0 && seatIdx !== sbSeat && seatIdx !== bbSeat) {
+        // F1 fix-up (2026-10-21) — never take dead money that leaves the seat
+        // no LIVE chips: a stack no bigger than the debt (at most one SB + BB,
+        // F6) went in whole as dead money, all-in with nothing live — dealt
+        // cards he could only lose with (the dead pot was his own chips; he
+        // could never win a chip of anyone else's). He plays this hand with his
+        // stack and keeps the debt: collected at a later deal once his stack
+        // covers it with chips to spare, or settled by his big blind (F5).
+        if (seat.chipCount <= owed) continue;
         const postAmount = Math.min(owed, seat.chipCount);
         if (postAmount > 0) {
           seat.chipCount -= postAmount;
@@ -1177,9 +1234,9 @@ export class PokerTable extends EventEmitter {
             playerName: seat.playerName,
             action: `posted dead blind ${postAmount}`,
           });
-          // Track remaining debt (if seat couldn't cover the full amount
-          // e.g., short stack). The unpaid remainder stays on the seat
-          // and will be attempted again next hand.
+          // Track remaining debt. Since the F1 fix-up the whole debt is posted
+          // (a stack that cannot cover it with chips to spare is skipped
+          // above), so this is 0; kept as the defensive bookkeeping.
           seat.deadBlindOwedChips = Math.max(0, owed - postAmount);
           if (seat.deadBlindOwedChips === 0) {
             seat.missedBlind = 'none';
@@ -1596,9 +1653,11 @@ export class PokerTable extends EventEmitter {
    * exists — before, a check was refused, and folding (also the turn timer's
    * answer to a bet) handed a short all-in the leaver's chips and the main pot.
    * The round's FORCED bet stays the bet (the big blind pre-flop, as postBlinds
-   * keeps it for a dead BB; Stud's bring-in). The min-raise follows. A seat
-   * the leaver's raise had reopened still gets its turn (owes()). The decision
-   * point changed, so stateVersion moves (a stale "call" is refused).
+   * keeps it for a dead BB; a UTG straddle; Stud's bring-in). The min-raise
+   * follows. Fix-up: the betting state goes back to what it was before the
+   * void raise(s) — who may still act or raise, the min-raise, the fixed-limit
+   * counters — while the seat on the clock keeps its turn. The decision point
+   * changed, so stateVersion moves (a stale "call" is refused).
    */
   private lowerBetAfterOutOfTurnFold(folded: Seat): void {
     if (!this.isHandInProgress() || this.currentPhase === GamePhase.Showdown) return;
@@ -1610,25 +1669,105 @@ export class PokerTable extends EventEmitter {
     const floor = Math.min(top, this.forcedBetOfRound());
     const highestLive = Math.max(floor, ...live.map(s => s.currentBet));
     if (highestLive >= top) return;
+    // F22 fix-up (2026-10-21) — every increase above highestLive was made by a
+    // seat now out of the hand (a live seat that had matched one would hold
+    // it, and nobody live can have acted on one without matching it, folding
+    // or going all-in), so the betting goes back EXACTLY to the state before
+    // the first of them: the raise size then in force (TDA 40), who had acted
+    // since the last full raise (TDA 41 — a seat that acted before the void
+    // raise and now faces only a short all-in is locked to call / fold again;
+    // the void raise had reopened it), the bet-level / raise counters (fixed
+    // limit: every void level, not just one) and the aggressor.
+    const before = this.popBetIncreasesAbove(highestLive);
     this.currentBetToMatch = highestLive;
-    this.lastRaiseAmount = this.raiseIncrementAfterLoweredBet(highestLive);
-    if (this.raisesThisStreet > 0) this.raisesThisStreet--;
-    this.betLevelsThisStreet = highestLive > 0 ? Math.max(0, this.betLevelsThisStreet - 1) : 0;
-    if (this.lastAggressorSeat === folded.seatIndex) this.lastAggressorSeat = -1;
+    if (before) {
+      this.lastRaiseAmount = this.bettingStructure === 'fixed-limit'
+        ? this.raiseIncrementAfterLoweredBet(highestLive)
+        : Math.max(this.raiseUnitOfRound(), before.lastRaiseAmount);
+      this.raisesThisStreet = before.raisesThisStreet;
+      this.betLevelsThisStreet = before.betLevelsThisStreet;
+      const acted = new Map(before.acted);
+      for (const s of this.seats) {
+        if (s.state !== 'occupied' || s.folded || s.allIn || !acted.has(s.seatIndex)) continue;
+        s.hasActedSinceLastFullRaise = acted.get(s.seatIndex) === true;
+      }
+      // The seat on the clock keeps its turn (as before: it may check now).
+      const onClock = this.seats[this.activeSeatIndex];
+      if (onClock && this.canAct(onClock) && !this.owes(onClock.seatIndex)) onClock.hasActedSinceLastFullRaise = false;
+      const aggr = before.lastAggressorSeat;
+      this.lastAggressorSeat = aggr >= 0 && this.seats[aggr] && !this.seats[aggr].folded ? aggr : -1;
+    } else {
+      // No record of the increase (a rehydrated hand): the original F22 approximation.
+      this.lastRaiseAmount = this.raiseIncrementAfterLoweredBet(highestLive);
+      if (this.raisesThisStreet > 0) this.raisesThisStreet--;
+      this.betLevelsThisStreet = highestLive > 0 ? Math.max(0, this.betLevelsThisStreet - 1) : 0;
+      if (this.lastAggressorSeat === folded.seatIndex) this.lastAggressorSeat = -1;
+    }
     this.stateVersion++;
   }
 
-  /** F22 — the forced bet of this betting round no fold can take away: the big blind pre-flop (Stud overrides: the bring-in). */
-  protected forcedBetOfRound(): number {
-    return this.currentPhase === GamePhase.PreFlop ? (this.handBigBlind || this.config.bigBlind) : 0;
+  /** F22 fix-up — record an increase of the bet to match to `level`, with the betting state just before it. */
+  private noteBetIncrease(level: number): void {
+    const key = `${this.handNumber}|${this.currentPhase}`;
+    if (this._betIncreasesKey !== key) {
+      this._betIncreases = [];
+      this._betIncreasesKey = key;
+    }
+    this._betIncreases.push({
+      level,
+      lastRaiseAmount: this.lastRaiseAmount,
+      acted: this.seats.filter(s => s.state === 'occupied').map(s => [s.seatIndex, s.hasActedSinceLastFullRaise] as [number, boolean]),
+      betLevelsThisStreet: this.betLevelsThisStreet,
+      raisesThisStreet: this.raisesThisStreet,
+      lastAggressorSeat: this.lastAggressorSeat,
+    });
   }
 
-  /** F22 — the min-raise increment once the bet to match was lowered to `toMatch`: never above the live bet, never under a big blind. */
+  /** F22 fix-up — drop this round's increases above `level`; the state before the earliest dropped one (null: none recorded). */
+  private popBetIncreasesAbove(level: number): BetIncreaseRecord | null {
+    if (this._betIncreasesKey !== `${this.handNumber}|${this.currentPhase}`) {
+      this.clearBetIncreases();
+      return null;
+    }
+    let earliest: BetIncreaseRecord | null = null;
+    while (this._betIncreases.length > 0 && this._betIncreases[this._betIncreases.length - 1].level > level) {
+      earliest = this._betIncreases.pop()!;
+    }
+    return earliest;
+  }
+
+  private clearBetIncreases(): void {
+    this._betIncreases = [];
+    this._betIncreasesKey = '';
+  }
+
+  /** F22 fix-up — the UTG straddle posted this hand (0 = none). */
+  protected straddleOfHand(): number {
+    return this._straddleOfHand && this._straddleOfHand.handNumber === this.handNumber ? this._straddleOfHand.amount : 0;
+  }
+
+  /** F22 fix-up — the round's smallest full raise: a big blind, and pre-flop after a straddle the straddle (straddle(): the new effective big blind). */
+  protected raiseUnitOfRound(): number {
+    const bb = this.handBigBlind || this.config.bigBlind;
+    return this.currentPhase === GamePhase.PreFlop ? Math.max(bb, this.straddleOfHand()) : bb;
+  }
+
+  /**
+   * F22 — the forced bet of this betting round no fold can take away: the big
+   * blind pre-flop — the UTG straddle once one was posted (fix-up: it is the
+   * effective big blind, and a dead big blind stays the bet too) — (Stud
+   * overrides: the bring-in).
+   */
+  protected forcedBetOfRound(): number {
+    if (this.currentPhase !== GamePhase.PreFlop) return 0;
+    return Math.max(this.handBigBlind || this.config.bigBlind, this.straddleOfHand());
+  }
+
+  /** F22 — the min-raise increment once the bet to match was lowered to `toMatch`: never above the live bet, never under a big blind (pre-flop after a straddle: the straddle). */
   protected raiseIncrementAfterLoweredBet(toMatch: number): number {
     // F30 (2026-10-21) — fixed limit: the street's bet size, whatever was lowered.
     if (this.bettingStructure === 'fixed-limit') return this.getFixedLimitBetSize();
-    const bb = this.handBigBlind || this.config.bigBlind;
-    return Math.max(bb, Math.min(this.lastRaiseAmount, toMatch));
+    return Math.max(this.raiseUnitOfRound(), Math.min(this.lastRaiseAmount, toMatch));
   }
 
   /**
@@ -1787,6 +1926,8 @@ export class PokerTable extends EventEmitter {
 
     if (additionalChips <= 0) return false;
 
+    if (totalRaiseAmount > this.currentBetToMatch) this.noteBetIncrease(totalRaiseAmount);   // F22 fix-up
+
     // Track if this is a full raise (for re-raise eligibility)
     const raiseSize = totalRaiseAmount - this.currentBetToMatch;
     if (raiseSize >= this.lastRaiseAmount) {
@@ -1885,6 +2026,9 @@ export class PokerTable extends EventEmitter {
     // and a short all-in under a straddle no longer reopens the betting.
     // Fixed limit keeps its one-small-bet raise (min = max there).
     if (this.bettingStructure !== 'fixed-limit') this.lastRaiseAmount = straddleAmount;
+    // F22 fix-up — and a FORCED bet: a fold out of turn never lowers the bet
+    // below it (forcedBetOfRound), as a dead big blind stays the bet to call.
+    this._straddleOfHand = { handNumber: this.handNumber, amount: straddleAmount };
     const last = this.actionLog[this.actionLog.length - 1];
     if (last && last.seatIndex === seatIndex) last.action = 'straddle';
     return true;
@@ -1947,6 +2091,18 @@ export class PokerTable extends EventEmitter {
    * its 'posted dead blind N' log line goes too: that post never counted.
    */
   private restoreRefundedDeadBlind(seat: Seat): void {
+    // F5 fix-up (2026-10-21) — the debt his LIVE big blind settled this hand
+    // (postBlinds) comes back too: that big blind is refunded with the rest, so
+    // he would otherwise pay neither the big blind nor the debt.
+    const settled = this._debtSettledByLiveBB.get(seat.seatIndex);
+    this._debtSettledByLiveBB.delete(seat.seatIndex);
+    if (settled && settled.handNumber === this.handNumber && settled.playerId === seat.playerId && settled.owed > 0) {
+      const cur = seat.missedBlind;
+      const flag: Seat['missedBlind'] = cur === 'none' ? settled.flag
+        : settled.flag === 'none' || settled.flag === cur ? cur : 'both';
+      seat.missedBlind = flag;
+      seat.deadBlindOwedChips = Math.min(this.missedBlindSetChips(flag), (seat.deadBlindOwedChips || 0) + settled.owed);
+    }
     const dead = seat.deadMoneyThisHand || 0;
     seat.deadMoneyThisHand = 0;
     if (dead <= 0) return;
@@ -2004,6 +2160,7 @@ export class PokerTable extends EventEmitter {
 
     // Check if this constitutes a raise
     if (totalBet > this.currentBetToMatch) {
+      this.noteBetIncrease(totalBet);   // F22 fix-up
       const raiseSize = totalBet - this.currentBetToMatch;
       // TDA Rule 41: Only reset action flags if this is a FULL raise
       if (raiseSize >= this.lastRaiseAmount) {
@@ -2284,6 +2441,7 @@ export class PokerTable extends EventEmitter {
     this.betLevelsThisStreet = 0;
     // TDA Rule 16: reset per-street so showdown order uses final-street aggressor only
     this.lastAggressorSeat = -1;
+    this.clearBetIncreases();       // F22 fix-up
 
     for (const seat of this.seats) {
       if (seat.state === 'occupied') {

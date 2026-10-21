@@ -21,6 +21,7 @@
 import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
 import { OmahaTable } from '../src/game/variants/OmahaTable';
+import { FiveCardDrawTable } from '../src/game/variants/FiveCardDrawTable';
 import { SidePotManager, SeatInfo } from '../src/game/SidePotManager';
 import { Card } from '../src/game/Card';
 import { SRC } from './helpers/indexSource';
@@ -474,5 +475,194 @@ describe('money conservation with dead blinds, sit-outs, leaves and bomb pots (r
       for (const s of t.seats) if (s.state === 'occupied') expect(s.deadBlindOwedChips).toBeLessThanOrEqual(75);
     }
     expect(dealt).toBeGreaterThan(300);
+  });
+});
+
+/*
+ * S1 fix-up (review round, 2026-10-21) — what the two reviews of the S1 commit
+ * found the fixes themselves had left or opened. Every test fails on the S1
+ * commit's code (the old numbers are quoted inline).
+ */
+describe('S1 fix-up — F5 x F14: a bomb pot never forgives the debt a live big blind settled', () => {
+  it('back at his big blind (debt settled live), the hand becomes a bomb pot: the BB is refunded AND the 75 is owed again, then paid dead on the button (old: debt 0, he paid neither)', () => {
+    const t = new PokerTable(cfg());
+    seatN(t, 4);
+    t.setSittingOutSeats([3]);
+    for (let h = 0; h < 5; h++) { expect(t.startNewHand()).toBe(true); foldOut(t); }
+    expect(t.seats[3]).toMatchObject({ deadBlindOwedChips: 75, missedBlind: 'both' });
+    t.setSittingOutSeats([]);
+    expect(t.startNewHand()).toBe(true);                           // hand 6: his big blind, live: the debt is settled (F5)
+    expect(t.seats[3]).toMatchObject({ currentBet: 50, deadBlindOwedChips: 0, missedBlind: 'none' });
+    const total = tableChips(t);
+    expect(t.applyBombPot(100)).toBe(true);
+    expect(t.seats[3]).toMatchObject({ chipCount: 4900, totalInvestedThisHand: 100, deadBlindOwedChips: 75, missedBlind: 'both' });
+    expect(tableChips(t)).toBe(total);
+    checkDown(t);
+    expect(tableChips(t)).toBe(total);
+    expect(t.startNewHand()).toBe(true);                           // his small blind: kept, not taken
+    expect(deadPosts(t, 3)).toEqual([]);
+    expect(t.seats[3].deadBlindOwedChips).toBe(75);
+    foldOut(t);
+    expect(t.startNewHand()).toBe(true);                           // the button: paid dead now
+    expect(deadPosts(t, 3).map((a) => a.action)).toEqual(['posted dead blind 75']);
+    expect(t.seats[3]).toMatchObject({ deadBlindOwedChips: 0, missedBlind: 'none' });
+  });
+
+  it('CONTROL: a big-blind hand that is NOT a bomb pot keeps the debt settled (F5), and the record never reaches the next hand', () => {
+    const t = new PokerTable(cfg());
+    seatN(t, 4);
+    t.setSittingOutSeats([3]);
+    for (let h = 0; h < 5; h++) { expect(t.startNewHand()).toBe(true); foldOut(t); }
+    t.setSittingOutSeats([]);
+    expect(t.startNewHand()).toBe(true);                           // his big blind
+    foldOut(t);
+    expect(t.startNewHand()).toBe(true);                           // his small blind
+    expect(t.applyBombPot(100)).toBe(true);                        // a bomb pot on a LATER hand
+    expect(t.seats[3]).toMatchObject({ deadBlindOwedChips: 0, missedBlind: 'none' });
+  });
+});
+
+describe('S1 fix-up — F1: a dead blind never takes a returning seat\'s last live chip', () => {
+  it('a stack no bigger than the debt keeps the debt and plays live: AA wins the 200 pot (old: 60 of 60 in dead, all-in, AA won back only his own 60; stacks [5100, 4950, 4950, 60])', () => {
+    const t = new PokerTable(cfg());
+    seatN(t, 4);
+    t.seats[3].chipCount = 60;
+    t.seats[3].deadBlindOwedChips = 75; t.seats[3].missedBlind = 'both';
+    expect(t.startNewHand()).toBe(true);                           // button 0, SB 1, BB 2, UTG 3: not a blind
+    expect(deadPosts(t, 3)).toEqual([]);
+    expect(t.seats[3]).toMatchObject({ chipCount: 60, totalInvestedThisHand: 0, deadMoneyThisHand: 0, allIn: false, deadBlindOwedChips: 75, missedBlind: 'both' });
+    expect(t.activeSeatIndex).toBe(3);                             // he has a decision
+    const total = tableChips(t);
+    rig(t, { 0: 'Kc Ks', 1: 'Qh Qd', 2: 'Jh 8d', 3: 'Ah Ad' }, '2c 7d 9s 3h 4c');
+    checkDown(t);
+    expect(tableChips(t)).toBe(total);
+    expect(t.seats.slice(0, 4).map((s) => s.chipCount)).toEqual([4950, 4950, 4950, 210]);
+    expect(t.seats[3].deadBlindOwedChips).toBe(75);                // still owed: collected once his stack covers it
+  });
+
+  it('CONTROL: a stack that covers the debt with chips to spare still pays it dead at the deal', () => {
+    const t = new PokerTable(cfg());
+    seatN(t, 4);
+    t.seats[3].chipCount = 80;
+    t.seats[3].deadBlindOwedChips = 75; t.seats[3].missedBlind = 'both';
+    expect(t.startNewHand()).toBe(true);
+    expect(deadPosts(t, 3).map((a) => a.action)).toEqual(['posted dead blind 75']);
+    expect(t.seats[3]).toMatchObject({ chipCount: 5, deadMoneyThisHand: 75, deadBlindOwedChips: 0, allIn: false });
+  });
+});
+
+describe('S1 fix-up — F22: a straddle is a forced bet a leaver never takes away', () => {
+  it('the straddler leaves before anyone matched: the straddle stays the bet to call, with a straddle-sized min-raise (old: 50 to call, min-raise 50)', () => {
+    const t = new PokerTable(cfg());
+    seatN(t, 5);
+    expect(t.startNewHand()).toBe(true);                           // button 0, SB 1, BB 2, UTG 3
+    expect(t.straddle(3)).toBe(true);
+    expect(t.activeSeatIndex).toBe(4);
+    expect(t.forceFoldSeat(3)).toBe(true);
+    expect(t.currentBetToMatch).toBe(100);
+    expect(t.getCallAmount(t.seats[4])).toBe(100);
+    expect([t.lastRaiseAmount, t.getMinRaise()]).toEqual([100, 200]);
+  });
+
+  it('a raise over the straddle, straddler and raiser both gone: back to the dead straddle, not the big blind (old: toMatch 50, min-raise 100)', () => {
+    const t = new PokerTable(cfg());
+    seatN(t, 5);
+    expect(t.startNewHand()).toBe(true);
+    expect(t.straddle(3)).toBe(true);
+    expect(t.playerRaise(4, 300)).toBe(true);
+    expect(t.activeSeatIndex).toBe(0);
+    expect(t.forceFoldSeat(3)).toBe(true);                         // not the top bet: nothing lowered
+    expect(t.currentBetToMatch).toBe(300);
+    expect(t.forceFoldSeat(4)).toBe(true);
+    expect([t.currentBetToMatch, t.lastRaiseAmount, t.getMinRaise()]).toEqual([100, 100, 200]);
+    expect(t.getCallAmount(t.seats[0])).toBe(100);
+  });
+
+  it('CONTROL: the raiser over a live straddle leaves: back to the straddle, and the straddler keeps his option', () => {
+    const t = new PokerTable(cfg());
+    seatN(t, 4);
+    expect(t.startNewHand()).toBe(true);                           // button 0, SB 1, BB 2, UTG 3
+    expect(t.straddle(3)).toBe(true);
+    expect(t.playerRaise(0, 300)).toBe(true);
+    expect(t.activeSeatIndex).toBe(1);
+    expect(t.forceFoldSeat(0)).toBe(true);
+    expect([t.currentBetToMatch, t.lastRaiseAmount]).toEqual([100, 100]);
+    expect(t.playerCall(1)).toBe(true);
+    expect(t.playerCall(2)).toBe(true);
+    expect(t.activeSeatIndex).toBe(3);                             // the straddler's option
+    expect(t.playerCheck(3)).toBe(true);
+    expect(t.currentPhase).toBe(GamePhase.Flop);
+  });
+});
+
+describe('S1 fix-up — F22 x TDA 41: a lowered bet gives back the betting state from before the void raise', () => {
+  const flop4 = (stacks: number[]) => {
+    const t = new PokerTable(cfg({ smallBlind: 10, bigBlind: 20, minBuyIn: 100 }));
+    stacks.forEach((c, i) => expect(t.sitDown(i, `P${i}`, c, `p${i}`, false)).toBe(true));
+    expect(t.startNewHand()).toBe(true);                           // button 0, SB 1, BB 2, UTG 3
+    expect(t.playerCall(3)).toBe(true);
+    expect(t.playerCall(0)).toBe(true);
+    expect(t.playerCall(1)).toBe(true);
+    expect(t.playerCheck(2)).toBe(true);
+    expect(t.currentPhase).toBe(GamePhase.Flop);                  // flop order: 1, 2, 3, 0
+    return t;
+  };
+
+  it('X bets 100, Y all-in 140 (short), Z raises to 400 and leaves: X who already acted is locked to call or fold, the min-raise is 100 (old: X reopened, lastRaise 140, min-raise 280)', () => {
+    const t = flop4([2000, 2000, 160, 2000]);
+    expect(t.playerRaise(1, 100)).toBe(true);                      // X
+    expect(t.playerAllIn(2)).toBe(true);                           // Y: 140, +40 < 100
+    expect(t.playerRaise(3, 400)).toBe(true);                      // Z: a full raise
+    expect(t.activeSeatIndex).toBe(0);
+    const total = tableChips(t);
+    expect(t.forceFoldSeat(3)).toBe(true);
+    expect(t.currentBetToMatch).toBe(140);
+    expect(t.lastRaiseAmount).toBe(100);
+    expect(t.seats[1].hasActedSinceLastFullRaise).toBe(true);
+    expect(t.canRaise(1)).toBe(false);
+    expect(t.canRaise(0)).toBe(true);                              // W has not acted: he may raise, to 240 at least
+    expect(t.getMinRaise()).toBe(240);
+    expect(t.playerCall(0)).toBe(true);
+    expect(t.activeSeatIndex).toBe(1);
+    expect(t.playerRaise(1, 400)).toBe(false);
+    expect(t.playerAllIn(1)).toBe(true);                           // a shove is only a call (F3)
+    expect(t.seats[1].allIn).toBe(false);
+    expect(t.currentPhase).toBe(GamePhase.Turn);
+    expect(tableChips(t)).toBe(total);
+  });
+
+  it('X bets, W calls, Z raises and leaves with X on the clock: X may check and the round closes, W is not asked again (old: W\'s action was reopened)', () => {
+    const t = flop4([2000, 2000, 2000, 2000]);
+    expect(t.playerRaise(1, 100)).toBe(true);                      // X bets
+    expect(t.playerCall(2)).toBe(true);                            // W calls
+    expect(t.playerRaise(3, 300)).toBe(true);                      // Z raises
+    expect(t.playerFold(0)).toBe(true);
+    expect(t.activeSeatIndex).toBe(1);
+    expect(t.forceFoldSeat(3)).toBe(true);
+    expect(t.currentBetToMatch).toBe(100);
+    expect(t.seats[2].hasActedSinceLastFullRaise).toBe(true);
+    expect(t.playerCheck(1)).toBe(true);                           // the seat on the clock keeps its turn
+    expect(t.currentPhase).toBe(GamePhase.Turn);
+  });
+
+  it('fixed limit: two void raise levels both go back to the cap (old: one, betLevels 2 and raises 1, and the field lost a raise)', () => {
+    const t = new FiveCardDrawTable(cfg(), true);                  // Triple Draw: fixed limit, a 50 bet before the first draw
+    seatN(t, 5);
+    expect(t.startNewHand()).toBe(true);
+    expect(t.activeSeatIndex).toBe(3);                             // button 0, SB 1, BB 2, UTG 3
+    expect([t.betLevelsThisStreet, t.raisesThisStreet]).toEqual([1, 0]);
+    expect(t.playerRaise(3, 100)).toBe(true);
+    expect(t.playerRaise(4, 150)).toBe(true);
+    expect([t.betLevelsThisStreet, t.raisesThisStreet]).toEqual([3, 2]);
+    expect(t.activeSeatIndex).toBe(0);
+    expect(t.forceFoldSeat(3)).toBe(true);
+    expect(t.currentBetToMatch).toBe(150);
+    expect(t.forceFoldSeat(4)).toBe(true);
+    expect(t.currentBetToMatch).toBe(50);
+    expect([t.betLevelsThisStreet, t.raisesThisStreet]).toEqual([1, 0]);
+    expect(t.playerRaise(0, 100)).toBe(true);
+    expect(t.playerRaise(1, 150)).toBe(true);
+    expect(t.playerRaise(2, 200)).toBe(true);                      // old: refused (capped at 150)
+    expect(t.isRaiseCapped()).toBe(true);
   });
 });

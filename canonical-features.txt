@@ -1269,6 +1269,17 @@ ante + bring-in game: nothing is ever owed for sitting out
 withInsuranceSettlement(
 insuranceDelta: Math.round(s.delta)
 lastInsuranceSettlement.delete(tableId);
+# S1 fix-up (review round). F5 x F14: a bomb pot that refunds a returner's live
+# big blind restores the debt it settled. F1: a dead blind never takes a seat's
+# last live chip (a stack no bigger than the debt keeps it and plays live).
+# F22: a UTG straddle is a forced bet a leaver never takes away; a lowered bet
+# undoes the void raises exactly (who may still act / raise, the min-raise, the
+# fixed-limit counters).
+this._debtSettledByLiveBB.set(bbSeat,
+if (seat.chipCount <= owed)
+this._straddleOfHand = { handNumber: this.handNumber, amount: straddleAmount };
+this.noteBetIncrease(totalBet);
+popBetIncreasesAbove(
 
 # 2026-10-21 gameplay S2 (betting rules). F3: a shove the betting was not
 # reopened to is only a call (TDA 41). F7: short all-ins that add up to a full
