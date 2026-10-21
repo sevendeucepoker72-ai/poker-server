@@ -1511,3 +1511,17 @@ humanWon: outcome.humanWon, winnerName, winnerChips }
 liveSeatSocketsAt(tableId)
 career_venue_locked
 committedAt: Date.now(), tableId
+
+# 2026-10-21 gameplay S2 fix-up (F11 / F13 review). The dead zone applies to
+# the walk derivation too (heads-up gaining a third player, a 3-handed table
+# whose button left): a newcomer on the button / small blind waits one hand,
+# down to a 2-handed hand between the established players. The small blind is
+# dead only when nobody plays its seat (a newcomer the table cannot deal out
+# posts it). The game state names the blind seats the engine chose, additively:
+# smallBlindSeat / bigBlindSeat / deadSmallBlind / deadButton and per-seat
+# dealtOut (poker-3d labels positions from them when present).
+this.dealtOutNewcomers(buttonSlot, sbSlot, lastHolders)
+this.deadSmallBlind = !playsSeat(sbSlot);
+dealtOut: table.isDealtOut(seat.seatIndex)
+table.deadSmallBlind ? -1 : table.smallBlindSeat
+deadButton: table.deadButton,

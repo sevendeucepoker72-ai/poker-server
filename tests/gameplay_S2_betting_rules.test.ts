@@ -359,14 +359,151 @@ describe('F13 — a newcomer between the small and big blind waits out the dead 
     expect(t.seats[3].totalInvestedThisHand).toBe(0);
   });
 
-  it('never deals a hand down to two players: 3 seats + a newcomer after one leaves is dealt in', () => {
+  // S2 fix-up (2026-10-21): S2 kept 3 dealt in, so whenever the next hand
+  // would be 3-handed the newcomer in the dead zone was dealt in free. Now the
+  // hand runs heads-up between the established players and he posts the big
+  // blind next hand. At least 2 are always left dealt in.
+  it('3 seats + a newcomer after one leaves: the newcomer waits, the hand is heads-up between the others', () => {
     const t = new PokerTable(cfg());
     seatAt(t, { 0: 5000, 2: 5000, 4: 5000 });
     deal(t); foldOut(t);                               // button 0, SB 2, BB 4
     t.standUp(2);
     t.sitDown(3, 'New', 5000, 'pNew', false);
-    deal(t);
+    // Old (S2): the newcomer at 3 was dealt in (2 cards, 0 invested).
+    expect(deal(t)).toEqual({ button: 2, sb: 4, bb: 0 });
+    expect(t.deadButton).toBe(true);                   // the button is on the empty seat 2
+    expect(t.seats[3].holeCards).toHaveLength(0);
+    expect(t.seats[3].folded).toBe(true);
+    expect(t.seats[3].totalInvestedThisHand).toBe(0);
+    expect(t.getTotalPot()).toBe(75);
+    expect(t.activeSeatIndex).toBe(4);                 // the small blind acts first (the newcomer is skipped)
+    foldOut(t);
+    expect(t.seats[3].chipCount).toBe(5000);
+    expect(deal(t)).toEqual({ button: 4, sb: 0, bb: 3 });   // he enters by posting the big blind
     expect(t.seats[3].holeCards).toHaveLength(2);
+  });
+
+  it('heads-up gaining a newcomer between the button / SB and the BB: he is not dealt in free on the button', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 4: 5000 });
+    expect(deal(t)).toEqual({ button: 0, sb: 0, bb: 4 });
+    foldOut(t);
+    expect(t.sitDown(2, 'New', 5000, 'pNew', false)).toBe(true);
+    // Old: button 2 = the newcomer, dealt 2 cards with 0 invested.
+    expect(deal(t)).toEqual({ button: 2, sb: 4, bb: 0 });
+    expect(t.seats[2].holeCards).toHaveLength(0);
+    expect(t.seats[2].totalInvestedThisHand).toBe(0);
+    expect(t.deadButton).toBe(true);
+    expect(t.getTotalPot()).toBe(75);
+    // A real hand between the two established players, chips conserved.
+    callDown(t);
+    expect(tableChips(t)).toBe(15000);
+    expect(t.seats[2].chipCount).toBe(5000);
+    expect(deal(t)).toEqual({ button: 4, sb: 0, bb: 2 });   // the newcomer posts the big blind
+    expect(t.seats[2].holeCards).toHaveLength(2);
+    expect(t.deadButton).toBe(false);
+  });
+
+  it('3-handed, the button leaves and a newcomer sits on the next button seat: dealt out one hand', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 2: 5000, 4: 5000 });
+    deal(t); foldOut(t);                               // button 0, SB 2, BB 4
+    t.standUp(0);
+    t.sitDown(3, 'New', 5000, 'pNew', false);
+    // Old: button 3 = the newcomer, dealt in with 0 invested.
+    expect(deal(t)).toEqual({ button: 3, sb: 4, bb: 2 });
+    expect(t.seats[3].holeCards).toHaveLength(0);
+    expect(t.seats[3].totalInvestedThisHand).toBe(0);
+    expect(t.deadButton).toBe(true);
+    foldOut(t);
+    expect(deal(t)).toEqual({ button: 4, sb: 2, bb: 3 });
+    expect(t.seats[3].holeCards).toHaveLength(2);
+  });
+
+  it('a newcomer in the vacated big-blind seat, 3-handed: dealt out with a dead small blind (old: dealt in, nobody posted the SB)', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 2: 5000, 4: 5000 });
+    deal(t); foldOut(t);                               // button 0, SB 2, BB 4
+    t.standUp(4);
+    t.sitDown(4, 'New', 5000, 'pNew', false);
+    expect(deal(t)).toEqual({ button: 2, sb: -1, bb: 0 });
+    expect(t.deadSmallBlind).toBe(true);
+    expect(t.seats[4].holeCards).toHaveLength(0);     // old: 2 cards, 0 invested
+    expect(t.seats[4].totalInvestedThisHand).toBe(0);
+    expect(t.getTotalPot()).toBe(50);
+  });
+
+  it('the same with seats 0 / 1 / 2: the newcomer at the old big blind is dealt out, the small blind is dead', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 1: 5000, 2: 5000 });
+    deal(t); foldOut(t);                               // button 0, SB 1, BB 2
+    t.standUp(2);
+    t.sitDown(2, 'New', 5000, 'pNew', false);
+    expect(deal(t)).toEqual({ button: 1, sb: -1, bb: 0 });
+    expect(t.seats[2].holeCards).toHaveLength(0);     // old: dealt in free (pot 50, nobody posted the SB)
+    expect(t.seats[2].totalInvestedThisHand).toBe(0);
+  });
+
+  it('a newcomer the table cannot deal out (only 1 would be left) posts the small blind, as before S2', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 1: 5000, 2: 5000 });
+    deal(t); foldOut(t);                               // button 0, SB 1, BB 2
+    t.setSittingOutSeats([1]);
+    t.standUp(2);
+    t.sitDown(2, 'New', 5000, 'pNew', false);
+    // Old (S2): {sb: -1, bb: 0}, deadSmallBlind, the newcomer dealt in with 0 invested.
+    expect(deal(t)).toEqual({ button: 1, sb: 2, bb: 0 });
+    expect(t.deadSmallBlind).toBe(false);
+    expect(t.seats[2].holeCards).toHaveLength(2);
+    expect(t.seats[2].totalInvestedThisHand).toBe(25);
+    expect(t.getTotalPot()).toBe(75);
+  });
+
+  it('with a sitting-out seat, the newcomer at the old big blind is still dealt out while 2 others play', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 1: 5000, 2: 5000, 3: 5000 });
+    deal(t); foldOut(t);                               // button 0, SB 1, BB 2
+    t.setSittingOutSeats([3]);
+    t.standUp(2);
+    t.sitDown(2, 'New', 5000, 'pNew', false);
+    const before = tableChips(t);
+    deal(t);
+    // Old (S2): the newcomer dealt in with 0 invested and no blind posted by anyone.
+    expect(t.seats[2].holeCards).toHaveLength(0);
+    expect(t.seats[2].totalInvestedThisHand).toBe(0);
+    expect(t.deadSmallBlind).toBe(true);
+    expect(t.seats[0].holeCards).toHaveLength(2);
+    expect(t.seats[1].holeCards).toHaveLength(2);
+    foldOut(t);
+    expect(tableChips(t)).toBe(before);
+    expect(t.seats[2].chipCount).toBe(5000);
+  });
+
+  it('two newcomers in the dead zone next to one established player: the small-blind newcomer posts, the button one waits', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 4: 5000 });
+    deal(t); foldOut(t);                               // heads-up: button / SB 0, BB 4
+    t.standUp(4);
+    t.sitDown(4, 'N4', 5000, 'n4', false);
+    t.sitDown(2, 'N2', 5000, 'n2', false);
+    expect(deal(t)).toEqual({ button: 2, sb: 4, bb: 0 });
+    expect(t.seats[2].holeCards).toHaveLength(0);     // dealt out on the button
+    expect(t.seats[4].holeCards).toHaveLength(2);     // kept in: posts the small blind
+    expect(t.seats[4].totalInvestedThisHand).toBe(25);
+    expect(t.deadSmallBlind).toBe(false);
+    expect(t.deadButton).toBe(true);
+  });
+
+  it('4+ handed is unchanged: the old small blind gets the button and the dead-zone newcomer waits', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 2: 5000, 4: 5000, 6: 5000 });
+    expect(deal(t)).toEqual({ button: 0, sb: 2, bb: 4 });
+    foldOut(t);
+    t.sitDown(3, 'New', 5000, 'pNew', false);
+    expect(deal(t)).toEqual({ button: 2, sb: 4, bb: 6 });
+    expect(t.seats[3].holeCards).toHaveLength(0);
+    expect(t.deadButton).toBe(false);
+    expect(t.deadSmallBlind).toBe(false);
   });
 
   it('a table everyone left and new players filled starts its rotation afresh (no dead blind, nobody dealt out)', () => {
@@ -386,6 +523,71 @@ describe('F13 — a newcomer between the small and big blind waits out the dead 
     t.sitDown(3, 'New', 5000, 'pNew', false);
     expect(t.startNewHand()).toBe(true);
     expect(t.seats[3].holeCards.length).toBeGreaterThan(0);
+  });
+});
+
+describe('S2 fix-up — the game state names the blind seats the engine chose (additive)', () => {
+  const blindFields = (s: any) => ({
+    button: s.dealerButtonSeat, sb: s.smallBlindSeat, bb: s.bigBlindSeat, deadSB: s.deadSmallBlind, deadBtn: s.deadButton,
+  });
+  const dealtOutSeats = (s: any) => s.seats.filter((x: any) => x.dealtOut).map((x: any) => x.seatIndex);
+
+  it('always present: -1 / false before the first deal; every seat carries dealtOut', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 1: 5000 });
+    const s = stateOf(t, 0);
+    expect(blindFields(s)).toEqual({ button: -1, sb: -1, bb: -1, deadSB: false, deadBtn: false });
+    for (const seat of s.seats) expect(seat.dealtOut).toBe(false);
+  });
+
+  it('a steady table: the seats after the button', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 1: 5000, 2: 5000, 3: 5000 });
+    deal(t);
+    expect(blindFields(stateOf(t, 0))).toEqual({ button: 0, sb: 1, bb: 2, deadSB: false, deadBtn: false });
+  });
+
+  it('heads-up: the button is the small blind', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 3: 5000 });
+    deal(t);
+    expect(blindFields(stateOf(t, 3))).toEqual({ button: 0, sb: 0, bb: 3, deadSB: false, deadBtn: false });
+  });
+
+  it('F11: a dead small blind, then a dead button on the empty seat (button-derived labels would be off by one)', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 1: 5000, 2: 5000, 3: 5000 });
+    deal(t); foldOut(t);
+    t.standUp(2);
+    deal(t);
+    expect(blindFields(stateOf(t, 0))).toEqual({ button: 1, sb: -1, bb: 3, deadSB: true, deadBtn: false });
+    foldOut(t);
+    deal(t);
+    expect(blindFields(stateOf(t, 0))).toEqual({ button: 2, sb: 3, bb: 0, deadSB: false, deadBtn: true });
+  });
+
+  it('F13: the dealt-out newcomer is flagged on his seat (spectators see it too); cleared at the next deal', () => {
+    const t = new PokerTable(cfg());
+    seatAt(t, { 0: 5000, 2: 5000, 4: 5000 });
+    deal(t); foldOut(t);
+    t.sitDown(3, 'New', 5000, 'pNew', false);
+    deal(t);
+    expect(dealtOutSeats(stateOf(t, 3))).toEqual([3]);
+    expect(dealtOutSeats(stateOf(t, -1))).toEqual([3]);
+    expect(blindFields(stateOf(t, 0))).toEqual({ button: 2, sb: 4, bb: 0, deadSB: false, deadBtn: false });
+    foldOut(t);
+    deal(t);
+    expect(dealtOutSeats(stateOf(t, 3))).toEqual([]);
+  });
+
+  it('Stud (no blinds): no small / big blind seat', () => {
+    const t = new SevenStudTable(cfg({ ante: 5 }), false, false);
+    seatAt(t, { 0: 5000, 2: 5000, 4: 5000 });
+    expect(t.startNewHand()).toBe(true);
+    const s = stateOf(t, 0);
+    expect(s.smallBlindSeat).toBe(-1);
+    expect(s.bigBlindSeat).toBe(-1);
+    expect(s.deadSmallBlind).toBe(false);
   });
 });
 

@@ -1069,27 +1069,33 @@ export class PokerTable extends EventEmitter {
     if (strict) {
       sbSlot = prevBB;
       buttonSlot = prevSB;
-      this.deadSmallBlind = !this.seatHeldBy(prevBB, blindHolders!.bb);
-      this.deadButton = !this.seatHeldBy(prevSB, blindHolders!.sb);
-      if (this.dealsOutNewSeatsInDeadZone()) {
-        const isNew = (i: number): boolean => {
-          const s = this.seats[i];
-          return s.state === 'occupied' && !s.eliminated && (lastHolders![i] || '') !== this.holderIdOf(s);
-        };
-        const out = new Set<number>();
-        for (let k = 0; k < MAX_SEATS; k++) {
-          const i = (buttonSlot + k) % MAX_SEATS;
-          if (isNew(i)) out.add(i);
-          if (i === sbSlot) break;
-        }
-        // Never deal so many out that the hand is not a real 3+-handed one
-        // (a newcomer is then dealt in, as before).
-        const dealtIn = this.seats.filter(s =>
-          s.state === 'occupied' && !s.eliminated && s.chipCount > 0 &&
-          !this._sittingOutSeats.has(s.seatIndex) && !out.has(s.seatIndex)).length;
-        if (out.size > 0 && dealtIn >= 3) this._dealtOutSeats = out;
-      }
     }
+
+    // F13 fix-up (2026-10-21) — the dead zone applies to BOTH derivations. The
+    // walk above is still used when the rotation is not a clean step (a
+    // heads-up table gaining a third player: the last small blind is the new
+    // big blind; a 3-handed table whose button left), and there it put a
+    // newcomer on the button, dealt in without posting. A seat taken since the
+    // last deal on the button, in the small blind or between them sits this one
+    // hand out, down to a 2-handed hand between the established players (the
+    // start gate already plays heads-up); see dealtOutNewcomers.
+    if (lastHolders !== null && this.dealsOutNewSeatsInDeadZone()) {
+      this._dealtOutSeats = this.dealtOutNewcomers(buttonSlot, sbSlot, lastHolders);
+    }
+
+    // F11 / F13 fix-up — the blinds follow who is really dealt in. The small
+    // blind is dead only when nobody plays its seat: the last big blind left or
+    // busted (empty / eliminated), or the newcomer who took that seat is dealt
+    // out. A newcomer the table cannot deal out (fewer than 2 would be left)
+    // posts it, as the walk made him before F11. (It used to be dead whenever
+    // the seat changed hands, so such a newcomer was dealt in free and nobody
+    // posted a small blind.) The button is dead when nobody plays it.
+    const playsSeat = (i: number): boolean => {
+      const s = this.seats[i];
+      return !!s && s.state === 'occupied' && !s.eliminated && !this._dealtOutSeats.has(i);
+    };
+    this.deadSmallBlind = !playsSeat(sbSlot);
+    this.deadButton = !playsSeat(buttonSlot);
 
     this.dealerButtonSeat = buttonSlot;
     this.previousBigBlindSeat = newBBSeat;
@@ -1107,6 +1113,50 @@ export class PokerTable extends EventEmitter {
   private seatHeldBy(i: number, holder: string): boolean {
     if (i < 0 || i >= MAX_SEATS || !holder) return false;
     return this.holderIdOf(this.seats[i]) === holder;
+  }
+
+  /**
+   * F13 fix-up (2026-10-21) — the seats taken since the last deal (`lastHolders`)
+   * that sit on the button, in the small blind or between them (the TDA dead
+   * zone, `buttonSlot` .. `sbSlot` clockwise): dealt out of this one hand.
+   * At least 2 seats are always left dealt in: if dealing every such newcomer
+   * out would leave fewer, the one in the small blind is kept (he posts it);
+   * if that is still not enough, nobody is dealt out. (S2 kept 3 dealt in, so a
+   * heads-up table gaining a third player, or a 3-handed table whose button
+   * left, dealt the newcomer in on the button without posting.) The big blind
+   * is never in the zone: a newcomer there posts it and plays.
+   */
+  private dealtOutNewcomers(buttonSlot: number, sbSlot: number, lastHolders: string[]): Set<number> {
+    const isNew = (i: number): boolean => {
+      const s = this.seats[i];
+      return !!s && s.state === 'occupied' && !s.eliminated && !this.seatHeldBy(i, lastHolders[i] || '');
+    };
+    const out = new Set<number>();
+    if (buttonSlot < 0 || sbSlot < 0) return out;
+    for (let k = 0; k < MAX_SEATS; k++) {
+      const i = (buttonSlot + k) % MAX_SEATS;
+      if (isNew(i)) out.add(i);
+      if (i === sbSlot) break;
+    }
+    if (out.size === 0) return out;
+    const dealtInWithout = (o: Set<number>): number => this.seats.filter(s =>
+      s.state === 'occupied' && !s.eliminated && s.chipCount > 0 &&
+      !this._sittingOutSeats.has(s.seatIndex) && !o.has(s.seatIndex)).length;
+    if (dealtInWithout(out) >= 2) return out;
+    out.delete(sbSlot);
+    if (out.size > 0 && dealtInWithout(out) >= 2) return out;
+    return new Set();
+  }
+
+  /**
+   * F13 fix-up (2026-10-21) — was this seat dealt out of the hand in progress
+   * (or the last one dealt) for joining in the dead zone? Cleared at the next
+   * deal. getGameStateForPlayer sends it per seat (`dealtOut`).
+   */
+  isDealtOut(seatIndex: number): boolean {
+    if (this.currentPhase === GamePhase.WaitingForPlayers) return false;
+    const s = this.seats[seatIndex];
+    return !!s && s.state === 'occupied' && this._dealtOutSeats.has(seatIndex);
   }
 
   /** F13 — is `x` strictly between `from` and `to`, going clockwise? */

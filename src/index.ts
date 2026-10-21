@@ -4344,6 +4344,11 @@ function getGameStateForPlayer(
       // on that). The client's AWAY badge waited for a 'sitting_out' state the
       // server never sends.
       sittingOut: seat.state === 'occupied' && !!sitOutTracker.get(table.config.tableId)?.has(seat.seatIndex),
+      // 2026-10-21 (gameplay S2 fix-up, F11 / F13) — ALWAYS present: this seat
+      // was taken since the last deal in the dead zone (button .. small blind)
+      // and is dealt out of this one hand (no cards, pays nothing). It is not a
+      // fold and not a sit-out; cleared at the next deal.
+      dealtOut: table.isDealtOut(seat.seatIndex),
     };
 
     // Attach rank and avatar for display on nameplates/seats
@@ -4419,6 +4424,20 @@ function getGameStateForPlayer(
     turnStartedAt: turnStartedAtMap.get(table.config.tableId) ?? 0,
     turnTimeout: TURN_TIMEOUT_MS,
     dealerButtonSeat: table.dealerButtonSeat,
+    // 2026-10-21 (gameplay S2 fix-up, F11 / F13) — the blind positions the
+    // engine really chose, ALWAYS present (additive: an older client keeps
+    // deriving SB / BB from the button). Since the TDA dead button they are not
+    // always the seats after the button: a dead small blind (smallBlindSeat
+    // -1, deadSmallBlind true), a dead button (deadButton true: the button
+    // seat is empty or dealt out) and dealt-out newcomers (seat `dealtOut`).
+    //   smallBlindSeat — the seat posting the small blind; -1 when it is dead,
+    //     before the first deal and in Stud (no blinds).
+    //   bigBlindSeat — the big-blind position (a sitting-out big blind's seat
+    //     too: he owes it as a missed blind); -1 before the first deal / Stud.
+    smallBlindSeat: table instanceof SevenStudTable || table.deadSmallBlind ? -1 : table.smallBlindSeat,
+    bigBlindSeat: table instanceof SevenStudTable ? -1 : table.previousBigBlindSeat,
+    deadSmallBlind: !(table instanceof SevenStudTable) && table.deadSmallBlind,
+    deadButton: table.deadButton,
     currentBetToMatch: table.currentBetToMatch,
     handNumber: table.handNumber,
     // Monotonic decision-point version (2026-07-05). The client stores this
