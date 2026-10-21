@@ -261,8 +261,13 @@ describe('R3 (AUTH-P3-3) — play tickets are burned durably (used_play_tickets)
 
 // ── AUTH-P3-4 ──────────────────────────────────────────────────────────────
 describe('R3 (AUTH-P3-4) — Dealer\'s Choice: a seated player, a ring table only', () => {
+  // 2026-10-21 (gameplay F15) — the real switch (false: refused for everyone,
+  // the label never shown). The ring-table / seated checks below run the kept
+  // code with it ON (the feature is off, not deleted).
+  const FLAG_SRC = slice('const DEALERS_CHOICE_DEALS_THE_VARIANT', ';\n');
   const HANDLER = handlerSrc('enableDealersChoice', '\n  });\n');
-  function world(kind: 'cash' | 'private' | 'club' | 'tournament' | 'headsup' | 'challenge', code = HANDLER) {
+  const ON = `const DEALERS_CHOICE_DEALS_THE_VARIANT = true;\n${HANDLER}`;
+  function world(kind: 'cash' | 'private' | 'club' | 'tournament' | 'headsup' | 'challenge', code = ON) {
     const t = new PokerTable({ tableId: 'T', tableName: 'T', smallBlind: 10, bigBlind: 20, ante: 0, minBuyIn: 400 } as any);
     expect(t.sitDown(0, 'Alice', 2000, 'user_1', false)).toBe(true);
     expect(t.sitDown(1, 'Bot', 2000, 'ai-1', true)).toBe(true);
@@ -289,12 +294,28 @@ describe('R3 (AUTH-P3-4) — Dealer\'s Choice: a seated player, a ring table onl
     return { t, sock, dealersChoiceState, room };
   }
 
-  it.each(['cash', 'private', 'club'] as const)('%s table: the seated player turns it on (everyone told)', async (kind) => {
+  it.each(['cash', 'private', 'club'] as const)('%s table: the seated player turns it on (everyone told) — with the switch ON (kept code)', async (kind) => {
     const w = world(kind);
     const a = w.sock('SA');
     await a.handlers.enableDealersChoice({ enabled: true });
     expect(w.dealersChoiceState.get('T')).toMatchObject({ enabled: true });
     expect(w.room).toEqual([['table:T', 'dealersChoiceToggled', { tableId: 'T', enabled: true, currentVariant: 'texas-holdem' }]]);
+  });
+
+  it('F15 — the shipped switch is OFF: a seated ring-table player is refused (dealers_choice_not_allowed); nothing is written or broadcast', async () => {
+    expect(FLAG_SRC).toBe('const DEALERS_CHOICE_DEALS_THE_VARIANT: boolean = false;\n');
+    for (const kind of ['cash', 'private', 'club'] as const) {
+      const w = world(kind, `${FLAG_SRC}${HANDLER}`);
+      const a = w.sock('SA');
+      await a.handlers.enableDealersChoice({ enabled: true });
+      await a.handlers.enableDealersChoice({ enabled: false });
+      expect(w.dealersChoiceState.size).toBe(0);              // old: { enabled: true }
+      expect(w.room).toEqual([]);                             // old: dealersChoiceToggled to the room
+      expect(a.emitted).toEqual([
+        ['error', { message: "Dealer's Choice is not available yet.", code: 'dealers_choice_not_allowed' }],
+        ['error', { message: "Dealer's Choice is not available yet.", code: 'dealers_choice_not_allowed' }],
+      ]);
+    }
   });
 
   it.each(['tournament', 'headsup', 'challenge'] as const)('%s table: refused dealers_choice_not_allowed; nothing changes', async (kind) => {

@@ -417,6 +417,7 @@ export class OmahaTable extends PokerTable {
         handName: w.handName,
       })),
       pots: potBreakdown,
+      variant: this.variantId,   // G180 (2026-10-21) — 'omaha-hi-lo' / 'omaha-5' / 'omaha-6'
     };
 
     // Reset totalInvestedThisHand

@@ -48,6 +48,7 @@ import {
 } from './ai/AIPlayer';
 import { ProgressionManager, lifetimeAchievementsUnlockedByLevel, maxXpAtLevel } from './progression/ProgressionManager';
 import { sanitizeClientProgressSave, PAYOUT_KEYS_FROM_CLIENT } from './progression/clientProgressSave';
+import { progressionHandRank } from './progression/progressionHandRank';
 import { HandRank } from './game/HandEvaluator';
 import { getFullTrainingData } from './training/TrainingEngine';
 import { insuranceSettlementDelta, priceInsuranceQuote, InsuranceQuote } from './game/insurance';
@@ -2708,6 +2709,17 @@ const dealersChoiceState = new Map<string, DealersChoiceState>();
 const DEALERS_CHOICE_VARIANTS: VariantType[] = [
   'texas-holdem', 'omaha', 'short-deck', 'five-card-draw', 'seven-card-stud',
 ];
+/**
+ * 2026-10-21 (gameplay F15) — Dealer's Choice is OFF: 'enableDealersChoice'
+ * refuses every request while this is false. Nothing ever switched the table's
+ * game: the rotation only changed the LABEL every seat saw ("Omaha", "Seven
+ * Card Stud" …) while Hold'em kept being dealt and scored, and the first
+ * rotation came after one hand (the orbit test ran before the button moved).
+ * OWNER: turning it on needs a real variant rebuild at the hand boundary
+ * (seats, stacks, button, sit-outs, dead blinds carried over) and an orbit
+ * counted after the button moves. All of the feature's code is kept.
+ */
+const DEALERS_CHOICE_DEALS_THE_VARIANT: boolean = false;
 
 // ========== REST Endpoints ==========
 
@@ -4080,10 +4092,14 @@ function getVariantInfo(table: PokerTable): { variant: VariantType; variantName:
       pineappleDiscardActive: discardActive,
     };
   }
+  // 2026-10-21 (gameplay F40) — the table's OWN name (variantName, set by each
+  // variant table and shown in the lobby): the variant helper's name labelled
+  // 5- / 6-card Omaha 'Pot-Limit Omaha', Badugi '2-7 Triple Draw' and Stud 8
+  // 'Seven Card Stud'. `variant` (the id the client's rules key on) is unchanged.
   if (table instanceof OmahaTable) {
     return {
       variant: table.variant.type,
-      variantName: table.variant.name,
+      variantName: table.variantName || table.variant.name,
       holeCardCount: table.holeCardCount,
       hasDrawPhase: false,
       isStudGame: false,
@@ -4101,7 +4117,7 @@ function getVariantInfo(table: PokerTable): { variant: VariantType; variantName:
   if (table instanceof FiveCardDrawTable) {
     return {
       variant: table.variant.type,
-      variantName: table.variant.name,
+      variantName: table.variantName || table.variant.name,   // F40 — Badugi is 'Badugi'
       holeCardCount: table.holeCardCount,
       hasDrawPhase: true,
       isStudGame: false,
@@ -4110,7 +4126,7 @@ function getVariantInfo(table: PokerTable): { variant: VariantType; variantName:
   if (table instanceof SevenStudTable) {
     return {
       variant: table.variant.type,
-      variantName: table.variant.name,
+      variantName: table.variantName || table.variant.name,   // F40 — Stud 8 is named as one
       holeCardCount: table.holeCardCount,
       hasDrawPhase: false,
       isStudGame: true,
@@ -6698,10 +6714,10 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // if they won chips from both Main Pot and Side Pots).
   const winnerSeatIndices = new Set(results.map((r: any) => r.seatIndex));
   const totalWonPerSeat = new Map<number, number>();
-  const handResultPerSeat = new Map<number, any>();
+  const resultsPerSeat = new Map<number, any[]>();
   for (const r of results) {
     totalWonPerSeat.set(r.seatIndex, (totalWonPerSeat.get(r.seatIndex) || 0) + (r.amount || 0));
-    if (!handResultPerSeat.has(r.seatIndex)) handResultPerSeat.set(r.seatIndex, r.handResult);
+    resultsPerSeat.set(r.seatIndex, [...(resultsPerSeat.get(r.seatIndex) || []), r]);
   }
 
   // All-in insurance settlement — BEFORE bust removal, so an insured player who
@@ -6799,7 +6815,13 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
 
     if (isWinner) {
       const potSize = totalWonPerSeat.get(session.seatIndex) || 0;
-      const handRank = handResultPerSeat.get(session.seatIndex)?.handRank;
+      // 2026-10-21 (gameplay F42) — a STANDARD high-hand rank, or none: a
+      // lowball "badness", a Badugi size, a hi-lo low half, Short Deck's own
+      // ranks and an uncontested pot's hand used to reach the bluff / rare-hand
+      // rewards raw (every Razz win was a "bluff", a Short Deck flush a full house).
+      const handRank = progressionHandRank(
+        (table as any).variantId, resultsPerSeat.get(session.seatIndex) || [], !!(table as any).wentToShowdown,
+      );
       const wasAllIn = seat?.allIn || false;
 
       progressionManager.recordHandWon(session.playerId, potSize, handRank, wasAllIn);
@@ -16743,6 +16765,12 @@ Give feedback in this JSON format:
     if (!table) return;
     if (!dealersChoiceAllowedAt(tableId)) {
       socket.emit('error', { message: "Dealer's Choice is only available at cash tables.", code: 'dealers_choice_not_allowed' });
+      return;
+    }
+    // F15 (2026-10-21) — refused until the variant really changes (the
+    // dealersChoiceState is never written, so no table shows the label).
+    if (!DEALERS_CHOICE_DEALS_THE_VARIANT) {
+      socket.emit('error', { message: "Dealer's Choice is not available yet.", code: 'dealers_choice_not_allowed' });
       return;
     }
     const enabled = data?.enabled === true;

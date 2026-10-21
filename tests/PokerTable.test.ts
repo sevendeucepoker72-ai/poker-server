@@ -445,7 +445,9 @@ describe('Stud — C13 ante/bring-in (not SB/BB) + R4 action order by exposed ha
       if (s !== posted[0]) { expect(s.currentBet).toBe(0); expect(s.totalInvestedThisHand).toBe(0); }
     }
     expect(t.activeSeatIndex).toBeGreaterThanOrEqual(0);
-    expect(t.activeSeatIndex).not.toBe(posted[0].seatIndex); // the action starts on its left
+    // 2026-10-21 (gameplay G168) — the bring-in seat decides first (stay or
+    // complete); it used to be skipped, the action starting on its left.
+    expect(t.activeSeatIndex).toBe(posted[0].seatIndex);
   });
 
   test('C13: with an ante configured, every active seat antes (dead money); the bring-in seat also posts its bring-in', () => {

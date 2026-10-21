@@ -60,6 +60,23 @@ const SHORT_DECK_HAND_NAMES: Record<ShortDeckHandRank, string> = {
 // Internal helpers
 // ============================================================
 
+/**
+ * 2026-10-21 (gameplay F31) — the tie-break vector of a LOWBALL hand, grouped
+ * like a high hand: ranks ordered by (count desc, rank desc), one entry per
+ * group. Two hands of the same category are decided by the pair / trips rank
+ * first (2-2-K-Q-J is a better 2-7 low than 3-3-7-6-5; A-A-2-3-9 a better
+ * Razz low than 4-4-2-3-5), then the other groups. The old vector was the
+ * five values highest first, so a paired hand was decided by its top kicker.
+ * Unpaired hands (and straights / flushes) are unchanged: every group has
+ * one card, so the vector is still the values highest first.
+ */
+function lowballTieBreak(values: number[]): { primaryValue: number; kickers: number[] } {
+  const counts = new Map<number, number>();
+  for (const v of values) counts.set(v, (counts.get(v) || 0) + 1);
+  const groups = [...counts.entries()].sort((a, b) => (b[1] - a[1]) || (b[0] - a[0])).map(([v]) => v);
+  return { primaryValue: groups[0], kickers: groups.slice(1) };
+}
+
 function getRankCounts(cards: Card[]): Map<Rank, number> {
   const counts = new Map<Rank, number>();
   for (const card of cards) {
@@ -628,25 +645,29 @@ function evaluateRazzFiveCards(cards: Card[]): HandResult {
     else if (count >= 2) hasPair = true;
   }
 
-  // Assign a "badness" handRank: no pairs is best (0), pair (1), two pair (2), trips (3), etc.
+  // Assign a "badness" handRank: no pairs is best (0), pair (1), two pair (2),
+  // trips (3), full house (4), quads (5). F31 (2026-10-21): a full house has its
+  // own badness (it shared trips' 3 — trips and a full house compared by group
+  // order then pitted the full house's pair against the trips' top kicker).
   let badnessRank = 0;
-  if (hasQuads) badnessRank = 4;
-  else if (hasTrips && hasPair) badnessRank = 3; // full house equivalent
+  if (hasQuads) badnessRank = 5;
+  else if (hasTrips && hasPair) badnessRank = 4; // full house
   else if (hasTrips) badnessRank = 3;
   else if (hasPair) {
     const pairCount = [...counts.values()].filter(c => c >= 2).length;
     badnessRank = pairCount >= 2 ? 2 : 1;
   }
 
-  // For comparison: sort values highest first
-  const highestFirst = [...razzValues].sort((a, b) => b - a);
+  // For comparison (F31): the pair / trips rank first, then the other groups
+  // (ace = 1, so A-A is the lowest pair) — highest first within a count.
+  const { primaryValue, kickers } = lowballTieBreak(razzValues);
 
   const sorted = [...cards].sort((a, b) => razzRankValue(a.rank) - razzRankValue(b.rank));
 
   return {
     handRank: badnessRank as HandRank,
-    primaryValue: highestFirst[0],
-    kickers: highestFirst.slice(1),
+    primaryValue,
+    kickers,
     bestFiveCards: sorted,
     handName: `Low: ${razzValues.join('-')}`,
   };
@@ -746,6 +767,10 @@ function evaluate27FiveCards(cards: Card[]): HandResult {
   else if (hasPair) badnessRank = 1;
 
   const highestFirst = [...values].sort((a, b) => b - a);
+  // F31 (2026-10-21) — the comparison vector: the pair / trips rank first (a
+  // pair of deuces is the better paired low), then the other groups. For an
+  // unpaired hand, a straight or a flush it equals highestFirst.
+  const { primaryValue, kickers } = lowballTieBreak(values);
   const sorted = [...cards].sort((a, b) => a.rank - b.rank);
 
   // 2-7 lowball naming: hands are described by the high card ("8-low") with
@@ -780,8 +805,8 @@ function evaluate27FiveCards(cards: Card[]): HandResult {
 
   return {
     handRank: badnessRank as HandRank,
-    primaryValue: highestFirst[0],
-    kickers: highestFirst.slice(1),
+    primaryValue,
+    kickers,
     bestFiveCards: sorted,
     handName,
   };

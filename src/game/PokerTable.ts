@@ -180,6 +180,11 @@ export interface HandHistoryRecord {
   // 2026-06-19 Phase 5: full street-tagged action sequence (chronological)
   // for client-side opponent-stat tracking (3-bet%, fold-to-cbet%, AF).
   actionLog?: ActionLogEntry[];
+  // 2026-10-21 (gameplay G180) — the table's variantId ('holdem', 'omaha',
+  // 'omaha-5', 'omaha-hi-lo', 'short-deck', 'pineapple', 'razz', 'badugi', …):
+  // the replay labels a hand by the game's own rules (an Omaha replay was
+  // judged by Hold'em's any-5-of-N). Additive; persisted with the record.
+  variant?: string;
 }
 
 function createEmptySeat(index: number): Seat {
@@ -2723,6 +2728,7 @@ export class PokerTable extends EventEmitter {
       // client opponent-tracker can compute real 3-bet% / fold-to-cbet% / AF.
       // Copied because this.actionLog is reset when the next hand starts.
       actionLog: this.actionLog.map(a => ({ ...a })),
+      variant: this.variantId,   // G180 (2026-10-21)
     };
 
     // Reset totalInvestedThisHand

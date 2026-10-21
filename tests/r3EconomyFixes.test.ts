@@ -24,6 +24,7 @@ import { publicNameOf, PUBLIC_NAME_FALLBACK } from '../src/social/publicIdentity
 import { sanitizeClientProgressSave } from '../src/progression/clientProgressSave';
 import { mergeProgressStats } from '../src/progression/progressMerge';
 import { FIRST_CHIPS_WON_SEASON } from '../src/economy/catalog';
+import { progressionHandRank } from '../src/progression/progressionHandRank';
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'unit-test-r3-economy';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -361,7 +362,7 @@ function handWorld(kind: 'cash' | 'club' = 'cash') {
     denverDateKey: () => '2026-10-11', economyStats: { chipsWonWrites: 0, chipsWonWriteFailures: 0 },
     recordChipWins: async (userId: number, _day: string, net: number) => { chipsWon.push({ userId, net }); },
     recordClubHand: (_t: string, entries: any[]) => { club.push(...entries); },
-    publicNameOf, PUBLIC_NAME_FALLBACK, pushActivity() {},
+    publicNameOf, PUBLIC_NAME_FALLBACK, pushActivity() {}, progressionHandRank,   // F42 (2026-10-21) — the real rank normaliser
     recordHand: async (userId: number, handId: string, data: any) => { stored.push({ userId, handId, data }); },
     mergeUserStats: async () => {}, saveProgress: async () => true, tickScratchProgress: async () => false, sendProgressToPlayer() {},
     io: { sockets: { sockets }, to: () => ({ emit() {} }), emit() {} },

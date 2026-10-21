@@ -1323,3 +1323,28 @@ isPineapple: !!variantInfo.isPineapple,
 pineappleDiscardActive: !!variantInfo.pineappleDiscardActive
 const seatSessionFor =
 code: 'not_at_table'
+
+# 2026-10-21 gameplay S4 (Stud / Razz rules, lowball evaluation, variant
+# labels, progression ranks). F31: a paired 2-7 / Razz hand is decided by its
+# pair (lowballTieBreak). F32: Stud 8 counts the shared 7th-street card. F36:
+# Razz action order counts the Ace low. F37: two pair showing is its own tier.
+# G167: the completion after a short all-in is a full bet (Raise or All-In).
+# G168: the bring-in seat decides first (stay or complete). F40: the in-table
+# label is the table's own variantName. F42: progression gets a standard hand
+# rank. F117: bot position from the button / big blind. G180: the hand-history
+# record carries the variant. F15: Dealer's Choice refused until the game
+# really changes (the feature's code is kept).
+function lowballTieBreak(
+const cards = [...s.holeCards, ...this.communityCards];
+this.orderRank(
+const tier = top >= 4 ? 6 : top === 3 ? 4 : pairs >= 2 ? 3 : top === 2 ? 2 : 1;
+withCompletionAsFullBet(
+bringer.hasActedSinceLastFullRaise = false;
+variantName: table.variantName || table.variant.name,
+function progressionHandRank(
+SHORT_DECK_TO_STANDARD
+LOWBALL_PROGRESSION_VARIANTS
+function seatPositions(
+variant: this.variantId,
+DEALERS_CHOICE_DEALS_THE_VARIANT
+Dealer's Choice is not available yet.

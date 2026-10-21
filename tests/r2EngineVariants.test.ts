@@ -235,7 +235,10 @@ describe('GAME-9 — fixed limit: a bet and three raises per betting round', () 
 });
 
 describe('Stud bring-in is mandatory (GAME P3)', () => {
-  it('the low door card POSTS the bring-in; the action starts on its left; nobody can check it; a completion is exactly the small bet', () => {
+  // 2026-10-21 (gameplay G168) — the bring-in is still POSTED for him, but the
+  // bring-in seat then decides first: stay (check) or complete. It used to be
+  // marked as acted with the action handed to its left.
+  it('the low door card POSTS the bring-in, then decides first (stay); nobody after him can check it; a completion is exactly the small bet', () => {
     for (let k = 0; k < 20; k++) {
       const t = new SevenStudTable(cfg({ ante: 5 }), false, false);
       seatN(t, 4);
@@ -245,8 +248,11 @@ describe('Stud bring-in is mandatory (GAME P3)', () => {
       expect(bringIn).toBeGreaterThanOrEqual(0);
       expect(t.seats[bringIn].totalInvestedThisHand).toBe(5 + 25);
       expect(t.currentBetToMatch).toBe(25);
-      expect(t.activeSeatIndex).not.toBe(bringIn);
+      expect(t.activeSeatIndex).toBe(bringIn);               // G168: his decision first
+      expect(t.getMinRaise()).toBe(50);                      // ... the completion
+      expect(t.playerCheck(bringIn)).toBe(true);             // he stays at the bring-in
       const a = t.activeSeatIndex;
+      expect(a).not.toBe(bringIn);
       expect(t.playerCheck(a)).toBe(false);                   // 25 to call
       expect(t.getMinRaise()).toBe(50);
       expect(t.playerRaise(a, 400)).toBe(true);              // any bigger request completes
@@ -255,22 +261,25 @@ describe('Stud bring-in is mandatory (GAME P3)', () => {
     }
   });
 
-  it('when everyone just calls the bring-in, the round ends without an option for the bring-in seat', () => {
+  it('when he stays and everyone just calls the bring-in, the round ends without a second option for the bring-in seat', () => {
     const t = new SevenStudTable(cfg({ ante: 5 }), false, false);
     seatN(t, 3);
     t.startNewHand();
+    const bringIn = t.activeSeatIndex;
+    expect(t.seats[bringIn].currentBet).toBe(25);
+    expect(t.playerCheck(bringIn)).toBe(true);               // stays
     let calls = 0;
     while (t.currentPhase === GamePhase.ThirdStreet && calls < 10) { expect(t.playerCall(t.activeSeatIndex)).toBe(true); calls++; }
-    expect(calls).toBe(2);                                    // the two other seats call; the bring-in gets no option
+    expect(calls).toBe(2);                                    // the two other seats call; no second option for the bring-in
     expect(t.currentPhase).toBe(GamePhase.FourthStreet);
   });
 
-  it('Razz: the HIGHEST door card brings it in', () => {
+  it('Razz: the HIGHEST door card brings it in (the Ace counts LOW — F36)', () => {
     const t = new SevenStudTable(cfg({ ante: 5 }), true, false);
     seatN(t, 4);
     t.startNewHand();
     const bringIn = t.seats.findIndex((s) => s.currentBet === 25);
-    const door = (i: number) => t.getFaceUpCards(i)[0].rank;
+    const door = (i: number) => { const r = t.getFaceUpCards(i)[0].rank; return r === 14 ? 1 : r; };
     for (let i = 0; i < 4; i++) expect(door(bringIn)).toBeGreaterThanOrEqual(door(i));
   });
 

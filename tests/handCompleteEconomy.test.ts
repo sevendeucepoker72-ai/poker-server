@@ -34,6 +34,7 @@ import { ProgressionManager } from '../src/progression/ProgressionManager';
 import { denverDateKey } from '../src/economy/denverTime';
 import { publicNameOf, PUBLIC_NAME_FALLBACK } from '../src/social/publicIdentity';
 import { opponentModelKey } from '../src/ai/AIPlayer';
+import { progressionHandRank } from '../src/progression/progressionHandRank';
 
 const LISTENER = fnSrc('function ensureTableProgressListener(');
 const HAND_COMPLETE = fnSrc('async function handleHandComplete(');
@@ -78,6 +79,7 @@ function world(opts: { tableKind?: string; humanName?: string } = {}) {
     tableCountsForChipsWon: () => (opts.tableKind ?? 'cash') === 'cash', denverDateKey, economyStats: { chipsWonWrites: 0, chipsWonWriteFailures: 0 },
     recordChipWins: async (uid: number, day: string, net: number) => { chipsWon.push([uid, day, net]); },
     recordClubHand() {}, publicNameOf, PUBLIC_NAME_FALLBACK, recordHand: async () => {},
+    progressionHandRank,   // F42 (2026-10-21) — the real rank normaliser
     pushActivity: (t: string) => { activity.push(t); },
     mergeUserStats: async (uid: number, patch: any, o: any) => { merges.push([uid, patch, o]); },
     saveProgress: async (uid: number, d: any) => { saves.push([uid, d]); return true; },

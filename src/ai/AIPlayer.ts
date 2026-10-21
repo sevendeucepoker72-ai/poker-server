@@ -662,6 +662,49 @@ function getOpenRaiseRange(position: number, totalActive: number): number {
   return 0.25; // button/cutoff: very wide
 }
 
+/**
+ * 2026-10-21 (gameplay F117) — a bot's position in the hand, as the strategy
+ * reads it (0 = first to act), over the seats DEALT INTO the hand (a
+ * sitting-out seat is not a position):
+ *  - preflop: UTG = 0 … button = n-3, small blind = n-2, big blind = n-1 —
+ *    posBucket's convention — counted from the first seat after THIS hand's
+ *    big blind (heads-up: the button / small blind 0, the big blind 1);
+ *  - postflop: small blind = 0 … button = n-1 — counted from the first seat
+ *    after the button (a dead button counts from its empty seat).
+ * Stud has no button: both count from the street's first actor (the bring-in
+ * on Third Street, the best — Razz: lowest — board after). Before a hand has
+ * a button / big blind it falls back to the seat's place in seat order (the
+ * old behaviour, which used that order for every hand).
+ */
+export function seatPositions(table: PokerTable, seatIndex: number): { preflop: number; postflop: number; total: number } {
+  const dealt = table.seats
+    .filter(s => s.state === 'occupied' && !s.eliminated && s.holeCards.length > 0)
+    .map(s => s.seatIndex);
+  const seats = dealt.includes(seatIndex) ? dealt : table.getActivePlayerSeats();
+  const n = seats.length;
+  const me = seats.indexOf(seatIndex);
+  if (n === 0 || me < 0) return { preflop: Math.max(0, me), postflop: Math.max(0, me), total: n };
+  // The listed seat first clockwise strictly after `seat` (wrapping round).
+  const firstAfter = (seat: number): number => {
+    const i = seats.findIndex(s => s > seat);
+    return i >= 0 ? i : 0;
+  };
+  const from = (startIdx: number): number => (((me - startIdx) % n) + n) % n;
+  const studFirstActor = (table as any).getStudFirstActor;
+  if (typeof studFirstActor === 'function') {
+    const at = seats.indexOf(studFirstActor.call(table));
+    const p = at >= 0 ? from(at) : me;
+    return { preflop: p, postflop: p, total: n };
+  }
+  const bb = table.previousBigBlindSeat;
+  const btn = table.dealerButtonSeat;
+  return {
+    preflop: bb >= 0 ? from(firstAfter(bb)) : me,
+    postflop: btn >= 0 ? from(firstAfter(btn)) : me,
+    total: n,
+  };
+}
+
 function get3BetRange(position: number): number {
   // 3-bet range threshold (tighter than opening)
   if (position < 3) return 0.7; // early: only premiums
@@ -812,10 +855,12 @@ export function decideAction(
     s => s.state === 'occupied' && !s.folded && !s.eliminated && s.seatIndex !== seatIndex
   ).length;
 
-  // Get position info
-  const activeSeats = table.getActivePlayerSeats();
-  const myPosition = activeSeats.indexOf(seatIndex);
-  const totalActive = activeSeats.length;
+  // Get position info. 2026-10-21 (gameplay F117) — RELATIVE to the button /
+  // the big blind (it was the seat's rank in seat-number order: seat 0 always
+  // played the early-position range, the highest seat the big blind's).
+  const pos = seatPositions(table, seatIndex);
+  const myPosition = pos.preflop;
+  const totalActive = pos.total;
 
   // ============================================================
   // Hand strength evaluation
@@ -862,8 +907,10 @@ export function decideAction(
 
   // Position: postflop keeps the 0.88(EP)→1.12(LP) nudge. Preflop position is
   // handled by position-bucketed range thresholds in preFlopStrategy (percentile
-  // scale), so don't ALSO scale the percentile there.
-  const relativePosition = totalActive > 1 ? myPosition / (totalActive - 1) : 0.5;
+  // scale), so don't ALSO scale the percentile there. F117 — the POSTFLOP order
+  // (small blind first, button last), not the pre-flop one (the blinds act
+  // first after the flop: out of position).
+  const relativePosition = totalActive > 1 ? pos.postflop / (totalActive - 1) : 0.5;
   const positionMult = 0.88 + relativePosition * 0.24;
   if (!isPreFlop) handStrength *= positionMult;
   if (!isFinite(handStrength)) handStrength = 0.3;

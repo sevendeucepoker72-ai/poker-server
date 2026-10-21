@@ -380,6 +380,8 @@ describe('F22 — a leaver\'s unmatched top bet is dead money, not a bet to call
     seatN(t, 3);
     expect(t.startNewHand()).toBe(true);
     expect(t.currentBetToMatch).toBe(25);                            // the bring-in
+    // G168 (2026-10-21) — the bring-in seat decides first: it stays here.
+    expect(t.playerCheck(t.activeSeatIndex)).toBe(true);
     const completer = t.activeSeatIndex;
     expect(t.playerRaise(completer, 50)).toBe(true);
     const next = t.activeSeatIndex;

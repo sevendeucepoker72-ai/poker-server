@@ -101,13 +101,82 @@ export class SevenStudTable extends PokerTable {
         // 2026-10-11 (R2) — facing only the (posted) bring-in, the one raise is
         // the COMPLETION to the small bet: any larger request completes to
         // exactly it, and the next raise is a full small bet more.
+        // 2026-10-21 (gameplay G167) — also after a short all-in between the
+        // bring-in and the completion (e.g. 40 at 25/50): the completion is
+        // the round's first FULL bet. It was refused there (the base min-raise
+        // read 40 + 25 = 65 while the cap was 50, so no raise could pass).
         if (totalRaiseAmount < complete) return false;
-        const ok = super.playerRaise(seatIndex, complete);
-        if (ok) this.lastRaiseAmount = complete;
-        return ok;
+        return this.withCompletionAsFullBet(seatIndex, () => super.playerRaise(seatIndex, complete));
       }
     }
     return super.playerRaise(seatIndex, totalRaiseAmount);
+  }
+
+  /**
+   * G167 — Third Street while the most anyone has put in is below the
+   * completion: only the bring-in, or short all-ins between it and the
+   * completion. The completion is still to be made.
+   */
+  private completionPending(): boolean {
+    return this.currentPhase === GamePhase.ThirdStreet
+      && this.currentBetToMatch > 0
+      && this.currentBetToMatch < this.getCompleteAmount();
+  }
+
+  /**
+   * G167 — while the completion is pending, the minimum raise IS the
+   * completion (the game state's minRaise; the base would add the bring-in's
+   * increment to a short all-in: 40 + 25 = 65 above the 50 cap).
+   */
+  getMinRaise(): number {
+    if (this.completionPending()) return this.getCompleteAmount();
+    return super.getMinRaise();
+  }
+
+  /**
+   * G167 — All-In while the completion is pending. A stack deeper than the
+   * completion is capped AT it (getMaxRaise), so the shove is the completion
+   * itself: made as one (a full bet that reopens the betting and is a bet
+   * level). It used to land as a non-full "raise" that reopened nothing, took
+   * the bring-in's and the callers' re-raise away and left a 25-chip raise
+   * increment in a 50-chip game. A stack that does not reach past the
+   * completion stays a real all-in (a short one, or exactly the completion).
+   * A seat the betting was not reopened to still only calls (base, TDA 41).
+   */
+  playerAllIn(seatIndex: number): boolean {
+    if (!this.completionPending()) return super.playerAllIn(seatIndex);
+    const complete = this.getCompleteAmount();
+    const seat = this.seats[seatIndex];
+    if (seat && this.isValidAction(seatIndex) && this.canRaise(seatIndex) && seat.chipCount + seat.currentBet > complete) {
+      return this.playerRaise(seatIndex, complete);
+    }
+    return this.withCompletionAsFullBet(seatIndex, () => super.playerAllIn(seatIndex));
+  }
+
+  /**
+   * G167 — run a bet while the completion is pending with the completion
+   * counting as a FULL bet: the raise increment is set to what is left to the
+   * completion (so the base marks it a full raise — everyone else's action is
+   * reopened and betLevelsThisStreet counts it), then the street's real
+   * increment is restored: the small bet once the completion is in, otherwise
+   * the increment from before (a short all-in under the completion reopens
+   * nothing). The TDA 41 lock is read against the real increment first: a
+   * seat that already acted and faces only short all-ins still only calls.
+   * Nothing is touched once the action ended the street or the hand.
+   */
+  private withCompletionAsFullBet(seatIndex: number, act: () => boolean): boolean {
+    const complete = this.getCompleteAmount();
+    const prev = this.lastRaiseAmount;
+    const hand = this.handNumber;
+    const seat = this.seats[seatIndex];
+    if (seat && !this.raiseLockedFor(seat)) {
+      this.lastRaiseAmount = Math.max(1, complete - this.currentBetToMatch);
+    }
+    const ok = act();
+    if (this.handNumber === hand && this.currentPhase === GamePhase.ThirdStreet) {
+      this.lastRaiseAmount = this.currentBetToMatch >= complete ? complete : prev;
+    }
+    return ok;
   }
 
   /**
@@ -120,6 +189,8 @@ export class SevenStudTable extends PokerTable {
    * fold, call the bring-in, or complete to the small bet. The bring-in seat has
    * acted (no option of its own unless someone completes). Not a bet level for
    * the fixed-limit cap — the completion is.
+   * G168 (2026-10-21): startNewHand then hands the bring-in seat the FIRST
+   * decision (stay or complete) whenever someone else is left to act.
    */
   private postBringIn(seatIndex: number): number {
     const seat = this.seats[seatIndex];
@@ -335,14 +406,21 @@ export class SevenStudTable extends PokerTable {
       .filter(s => s.state === 'occupied' && !s.eliminated && s.totalInvestedThisHand > 0)
       .map(s => ({ seatIndex: s.seatIndex, invested: s.totalInvestedThisHand, folded: s.folded || s.holeCards.length === 0, holeCards: [...s.holeCards] }));
 
-    // Evaluate every non-folded player's high and low hands
+    // Evaluate every non-folded player's high and low hands. 2026-10-21
+    // (gameplay F32) — with the SHARED 7th-street card when the deck ran short
+    // (8-handed: dealStudCards turns one community card everyone counts as his
+    // 7th, R5): it was left out here, so a full house or a wheel made with it
+    // lost the pot. communityCards is empty in every other hand (no change).
     const evaluations = seatInfos
       .filter(s => !s.folded)
-      .map(s => ({
-        seatIndex: s.seatIndex,
-        high: evaluateHand(s.holeCards),
-        low: evaluateLowHand(s.holeCards),
-      }));
+      .map(s => {
+        const cards = [...s.holeCards, ...this.communityCards];
+        return {
+          seatIndex: s.seatIndex,
+          high: evaluateHand(cards),
+          low: evaluateLowHand(cards),
+        };
+      });
 
     if (evaluations.length === 0) {
       super.determineWinners();
@@ -492,7 +570,8 @@ export class SevenStudTable extends PokerTable {
       handNumber: this.handNumber,
       winners: winnerInfos,
       showdownHands,
-      communityCards: [],
+      // F32 — the shared 7th-street card, as the base result reports it (empty in a normal hand).
+      communityCards: [...this.communityCards],
       // 2026-10-21 (gameplay F19 / F20 / F23) — the shared per-pot list (exact
       // pot names — a bare prefix matched 'Side Pot 10' to 'Side Pot 1' — and
       // a scooper's high + low halves summed into one entry).
@@ -602,14 +681,26 @@ export class SevenStudTable extends PokerTable {
       this.currentPhase = GamePhase.ThirdStreet;
       this.emit('phaseChanged', { phase: this.currentPhase });
 
-      // The low (Razz: high) door card brings it in — a forced bet (R2) — and
-      // the action starts on its left.
+      // The low (Razz: high) door card brings it in — a forced bet (R2).
+      // 2026-10-21 (gameplay G168) — and then HE decides first: stay at the
+      // bring-in (a check — what a timeout / an absent seat does, the chips
+      // are already posted) or complete to the small bet (the Third Street
+      // raise branch above). It used to be marked as acted with the action
+      // handed to its left, so the low card could never open for the full
+      // bet. If the field only calls, the round still ends with no second
+      // option for him (the stud rule); a completion reopens it as usual.
       const bringInSeat = this.getStudFirstActor();
       if (bringInSeat >= 0) {
         this.postBringIn(bringInSeat);
         const next = this.nextActor(bringInSeat);
         if (next >= 0) {
-          this.activeSeatIndex = next;
+          const bringer = this.seats[bringInSeat];
+          if (this.canAct(bringer)) {
+            bringer.hasActedSinceLastFullRaise = false;   // his decision is still to come
+            this.activeSeatIndex = bringInSeat;
+          } else {
+            this.activeSeatIndex = next;                  // all-in on the bring-in: the action starts on its left
+          }
           this.emit('turnChanged', { seatIndex: this.activeSeatIndex });
         } else {
           // Nobody else can act (all-in on the antes): the round is over.
@@ -765,7 +856,7 @@ export class SevenStudTable extends PokerTable {
   /**
    * Determine the seat that acts first based on showing cards.
    * For Stud: lowest showing card brings it in.
-   * For Razz: highest showing card (worst low) brings it in.
+   * For Razz: highest showing card (worst low; the Ace is LOW — F36) brings it in.
    * On 4th+ street: highest showing hand acts first (Stud) or lowest (Razz).
    */
   /**
@@ -806,10 +897,14 @@ export class SevenStudTable extends PokerTable {
         const suitB = SevenStudTable.SUIT_RANK[cardB.suit] ?? 0;
 
         if (this.variant.isRazz) {
-          // Razz: highest card brings in; ties → highest suit
-          if (cardA.rank > cardB.rank) {
+          // Razz: highest card brings in; ties → highest suit. 2026-10-21
+          // (gameplay F36) — the ACE is the LOWEST Razz card (it was compared
+          // as 14, so an Ace door card was forced to bring it in): a King brings it in.
+          const vA = this.orderRank(cardA.rank);
+          const vB = this.orderRank(cardB.rank);
+          if (vA > vB) {
             target = seat;
-          } else if (cardA.rank === cardB.rank && suitA > suitB) {
+          } else if (vA === vB && suitA > suitB) {
             target = seat;
           }
         } else {
@@ -845,28 +940,40 @@ export class SevenStudTable extends PokerTable {
 
   /**
    * Score a set of exposed (face-up) cards as a partial poker hand for Stud
-   * action order. The made tier (trips=3 > pair=2 > high=1) dominates, then
-   * the rank of that group, then the descending kickers. Lets the BEST board
-   * act first (Stud) or the LOWEST act first (Razz) — not just the single
-   * highest card. Not a full hand evaluator; only a total order over boards.
+   * action order. The made tier dominates (quads 6 > trips 4 > two pair 3 >
+   * pair 2 > high card 1), then the ranks group by group (count desc, rank
+   * desc: top pair, second pair, kicker …). Lets the BEST board act first
+   * (Stud) or the LOWEST act first (Razz) — not just the single highest card.
+   * Not a full hand evaluator; only a total order over boards (at most 4 up
+   * cards, so no full house; straights / flushes do not count for the order).
+   * 2026-10-21 (gameplay F37) — two pair is its own tier: it scored as the
+   * top pair alone, so A-A-2-3 showing acted before K-K-5-5. (F36) Razz
+   * counts the Ace LOW (A-2 showing is the best Razz board, not ace-high).
    */
   private scoreExposedBoard(cards: Card[]): number {
     if (!cards || cards.length === 0) return 0;
     const counts = new Map<number, number>();
-    for (const c of cards) counts.set(c.rank, (counts.get(c.rank) || 0) + 1);
-    let maxCount = 1;
-    let groupRank = 0;
-    for (const [rank, n] of counts) {
-      if (n > maxCount || (n === maxCount && rank > groupRank)) {
-        maxCount = n;
-        groupRank = rank;
-      }
+    for (const c of cards) {
+      const v = this.orderRank(c.rank);
+      counts.set(v, (counts.get(v) || 0) + 1);
     }
-    const ranksDesc = cards.map(c => c.rank).sort((a, b) => b - a);
-    let score = maxCount * 1e12 + groupRank * 1e9;
-    for (let i = 0; i < ranksDesc.length && i < 4; i++) {
-      score += ranksDesc[i] * Math.pow(20, 3 - i);
+    const groups = [...counts.entries()].sort((a, b) => (b[1] - a[1]) || (b[0] - a[0]));
+    const top = groups[0][1];
+    const pairs = groups.filter(([, n]) => n === 2).length;
+    const tier = top >= 4 ? 6 : top === 3 ? 4 : pairs >= 2 ? 3 : top === 2 ? 2 : 1;
+    let score = tier * 1e12;
+    for (let i = 0; i < groups.length && i < 4; i++) {
+      score += groups[i][0] * Math.pow(20, 3 - i);
     }
     return score;
+  }
+
+  /**
+   * F36 (2026-10-21) — a card's rank for Stud ACTION ORDER: the Ace is low (1)
+   * in Razz (ace-to-five), high (14) in Seven Card Stud and Stud 8 (where the
+   * Ace counts high for the bring-in and the high board).
+   */
+  private orderRank(rank: number): number {
+    return this.variant.isRazz && rank === Rank.Ace ? 1 : rank;
   }
 }
