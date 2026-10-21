@@ -147,13 +147,27 @@ export class SevenStudTable extends PokerTable {
     if (this.currentPhase === GamePhase.ThirdStreet && this.currentBetToMatch > 0 && this.currentBetToMatch < this.getCompleteAmount()) {
       return this.getCompleteAmount();
     }
+    return this.currentBetToMatch + this.getFixedLimitBetSize();
+  }
+
+  /**
+   * 2026-10-21 (gameplay F30) — the street's fixed-limit bet: the small bet
+   * (one big blind) on 3rd and 4th street, the big bet (two) on 5th-7th. The
+   * base resetBettingRound makes it the street's raise size, so the opening bet
+   * on 5th street is exactly the big bet (a half-size bet used to be accepted).
+   */
+  protected getFixedLimitBetSize(): number {
     const isLateRound = [
       GamePhase.FifthStreet,
       GamePhase.SixthStreet,
       GamePhase.SeventhStreet,
     ].includes(this.currentPhase);
-    const betSize = isLateRound ? this.config.bigBlind * 2 : this.config.bigBlind;
-    return this.currentBetToMatch + betSize;
+    return isLateRound ? this.handBB() * 2 : this.handBB();
+  }
+
+  /** F13 (2026-10-21) — Stud has no blinds: a new player is dealt into any hand (no dead zone). */
+  protected dealsOutNewSeatsInDeadZone(): boolean {
+    return false;
   }
 
   /**
@@ -479,12 +493,10 @@ export class SevenStudTable extends PokerTable {
       winners: winnerInfos,
       showdownHands,
       communityCards: [],
-      pots: pots.map(p => ({
-        name: p.name,
-        amount: p.amount,
-        winners: [...new Set(results.filter(r => r.potName?.startsWith(p.name)).map(r => r.seatIndex))],
-        winnerAmounts: results.filter(r => r.potName?.startsWith(p.name)).map(r => ({ seatIndex: r.seatIndex, amount: r.amount })),
-      })),
+      // 2026-10-21 (gameplay F19 / F20 / F23) — the shared per-pot list (exact
+      // pot names — a bare prefix matched 'Side Pot 10' to 'Side Pot 1' — and
+      // a scooper's high + low halves summed into one entry).
+      pots: this.buildPotBreakdown(pots, results, contested ? null : evaluations[0].seatIndex),
     };
 
     for (const seat of this.seats) {

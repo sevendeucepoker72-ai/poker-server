@@ -355,16 +355,11 @@ export class OmahaTable extends PokerTable {
 
     // Calculate pot breakdown for hand history
     const pots = this.sidePotManager.calculatePots(seatInfos);
-    const potBreakdown = pots.map(p => {
-      const potResults = results.filter(r => r.potName === p.name);
-      const winnerAmounts = potResults.map(r => ({ seatIndex: r.seatIndex, amount: r.amount }));
-      return {
-        name: p.name,
-        amount: p.amount,
-        winners: [...new Set(potResults.map(r => r.seatIndex))],
-        winnerAmounts,
-      };
-    });
+    // 2026-10-21 (gameplay F19 / F20 / F23) — the shared per-pot list: a
+    // contested pot's results are named "<pot> (High)" / "<pot> (Low)", which
+    // the old exact-name filter never matched (every hi-lo showdown pot was
+    // winnerless); a scooper's two halves are one summed entry.
+    const potBreakdown = this.buildPotBreakdown(pots, results, nonFolded.length === 1 ? nonFolded[0].seatIndex : null);
     if (potBreakdown.length === 0 && winnerInfos.length > 0) {
       const totalPot = seatInfos.reduce((sum, s) => sum + s.totalInvestedThisHand, 0);
       potBreakdown.push({

@@ -380,7 +380,10 @@ describe('playerRaise — E2: no illegal re-raise after a short all-in (TDA Rule
     t.seats[0].folded = false; t.seats[0].allIn = false; t.seats[0].eliminated = false;
     t.seats[0].currentBet = 100;
     t.currentBetToMatch = 150; // a short all-in bumped the bet to 150...
-    t.lastRaiseAmount = 50;     // ...by less than a full raise → action NOT reopened
+    // ...by less than a full raise (the last full raise was the 100 bet) →
+    // action NOT reopened. 2026-10-21 (gameplay F7): this fixture said
+    // lastRaiseAmount 50, i.e. the seat faced a FULL raise — TDA 47 reopens that.
+    t.lastRaiseAmount = 100;
     t.seats[0].hasActedSinceLastFullRaise = true; // seat 0 already acted this round
 
     // Voluntary re-raise is illegal — call/fold only.

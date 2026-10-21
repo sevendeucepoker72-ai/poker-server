@@ -1269,3 +1269,26 @@ ante + bring-in game: nothing is ever owed for sitting out
 withInsuranceSettlement(
 insuranceDelta: Math.round(s.delta)
 lastInsuranceSettlement.delete(tableId);
+
+# 2026-10-21 gameplay S2 (betting rules). F3: a shove the betting was not
+# reopened to is only a call (TDA 41). F7: short all-ins that add up to a full
+# raise reopen the betting (TDA 47). F8: the min-raise over a straddle is a
+# straddle more. F91: a mid-hand level-up applies from the next hand. F10:
+# heads-up rotates from the last big blind. F11/F13: TDA dead button (a dead
+# small blind after the big blind leaves, the button to the old small blind, a
+# newcomer in the dead zone dealt out one hand). F30: fixed-limit street bet
+# sizes. F12/F41: canRaise / maxRaise / bettingStructure in the game state.
+# F19: a fold-won pot names its winner. F23: Split Pot only for a split pot.
+if (stack > callAmount && !this.canRaise(seatIndex))
+raiseLockedFor(
+this.lastRaiseAmount = straddleAmount;
+return this.handBigBlind > 0 ? this.handBigBlind : this.config.bigBlind;
+this.dealerButtonSeat = this.getNextOccupiedSeat(newBB + 1);
+recordBlindHolders()
+dealsOutNewSeatsInDeadZone()
+getFixedLimitBetSize()
+stateObj.canRaise =
+stateObj.maxRaise =
+stateObj.bettingStructure = table.bettingStructure;
+buildPotBreakdown(
+splitPots.length > 0

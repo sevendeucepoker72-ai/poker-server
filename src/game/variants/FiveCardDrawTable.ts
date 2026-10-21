@@ -383,15 +383,22 @@ export class FiveCardDrawTable extends PokerTable {
    */
   protected getMaxRaise(seatIndex: number): number {
     if (this.variant.bettingStructure === 'fixed-limit') {
-      // 2-7 Triple Draw: small bet only on Bet1 (before any draw); big bet
-      // on every betting round after the first draw.
-      const isLateRound =
-        this.currentPhase === GamePhase.Bet2 ||
-        this.currentPhase === GamePhase.Bet3 ||
-        this.currentPhase === GamePhase.Bet4;
-      const betSize = isLateRound ? this.config.bigBlind * 2 : this.config.bigBlind;
-      return this.currentBetToMatch + betSize;
+      return this.currentBetToMatch + this.getFixedLimitBetSize();
     }
     return Infinity;
+  }
+
+  /**
+   * 2-7 Triple Draw (and Badugi): small bet only on Bet1 (before any draw); big
+   * bet on every betting round after the first draw. 2026-10-21 (gameplay F30)
+   * — also the street's raise size (base resetBettingRound), so a Bet2-Bet4
+   * opening bet is exactly the big bet (a half-size bet used to be accepted).
+   */
+  protected getFixedLimitBetSize(): number {
+    const isLateRound =
+      this.currentPhase === GamePhase.Bet2 ||
+      this.currentPhase === GamePhase.Bet3 ||
+      this.currentPhase === GamePhase.Bet4;
+    return isLateRound ? this.handBB() * 2 : this.handBB();
   }
 }

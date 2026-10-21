@@ -127,13 +127,27 @@ export interface WinnerInfo {
   bestFiveCards: Card[];
 }
 
+/**
+ * One pot of a finished hand, for the hand result and hand history.
+ * 2026-10-21 (gameplay F19 / F20 / F23) — every AWARDED pot names its winners:
+ * `winners` = the distinct seats that won a share of it, `winnerAmounts` = one
+ * entry per seat (its summed share — a hi-lo scooper's two halves are one
+ * entry). Built by PokerTable.buildPotBreakdown.
+ */
+export interface PotBreakdownEntry {
+  name: string;
+  amount: number;
+  winners: number[];
+  winnerAmounts: { seatIndex: number; amount: number }[];
+}
+
 /** Complete hand result for showdown display and hand history */
 export interface LastHandResult {
   handNumber: number;
   winners: WinnerInfo[];
   showdownHands: ShowdownHandInfo[];
   communityCards: Card[];
-  pots: { amount: number; winners: number[] }[];
+  pots: { amount: number; winners: number[]; name?: string; winnerAmounts?: { seatIndex: number; amount: number }[] }[];
 }
 
 /** Player action log entry for hand history */
@@ -248,6 +262,23 @@ export class PokerTable extends EventEmitter {
   public deadSmallBlind: boolean = false;
   /** When true, the button sits on an empty seat this hand (dead button). */
   public deadButton: boolean = false;
+  /**
+   * 2026-10-21 (gameplay F11 / F13) — the SMALL-BLIND POSITION of the last
+   * deal (a seat index; the vacated seat when that blind was dead). The next
+   * hand's button goes there and its small blind to the last big blind's seat
+   * (TDA dead button). -1 = not known yet.
+   */
+  public smallBlindSeat: number = -1;
+  /** F11 — who held the last deal's SB / BB positions ('' = nobody: a dead blind). null = unknown (C10 walk). */
+  private _blindHolders: { sb: string; bb: string } | null = null;
+  /** F13 — who sat in each seat at the last deal ('' = empty). null = unknown. */
+  private _seatHoldersAtLastDeal: string[] | null = null;
+  /**
+   * F13 — seats taken since the last deal that sit on the button, in the small
+   * blind or between them this hand (the TDA "dead zone"): dealt out of this
+   * one hand (they start folded, pay no ante). Cleared every deal.
+   */
+  private _dealtOutSeats: Set<number> = new Set();
 
   /** Persists until next hand starts - contains showdown results for display */
   public lastHandResult: LastHandResult | null = null;
@@ -536,8 +567,15 @@ export class PokerTable extends EventEmitter {
     }
 
     const isHeadsUp = allPlayable.length === 2;
-    const sbSeat = isHeadsUp ? btn : orderedFromButton[0];
-    const bbSeat = isHeadsUp ? orderedFromButton[0] : orderedFromButton[1];
+    let sbSeat: number | undefined = isHeadsUp ? btn : orderedFromButton[0];
+    let bbSeat: number | undefined = isHeadsUp ? orderedFromButton[0] : orderedFromButton[1];
+    // 2026-10-21 (gameplay F11) — the positions moveDealerButton actually chose
+    // (the same seats as the walk above on a standing table; after a big blind
+    // left, the dead-button rule puts the small blind on that vacated seat).
+    if (!isHeadsUp && this.previousBigBlindSeat >= 0 && this.smallBlindSeat >= 0) {
+      sbSeat = this.smallBlindSeat;
+      bbSeat = this.previousBigBlindSeat;
+    }
 
     // Mark ONLY if that position is in our sitting-out set.
     //
@@ -800,6 +838,9 @@ export class PokerTable extends EventEmitter {
 
     // Move dealer button
     this.moveDealerButton();
+    // F13 (2026-10-21) — a seat taken since the last deal and sitting in the
+    // dead zone (button .. small blind) waits this one hand out: no cards, no ante.
+    for (const i of this._dealtOutSeats) this.seats[i].folded = true;
 
     // Missed-blinds refactor: BEFORE posting blinds, mark any sitting-out
     // seats whose "natural" position this hand would be SB or BB. The
@@ -856,12 +897,22 @@ export class PokerTable extends EventEmitter {
     // Reset dead-button flags
     this.deadSmallBlind = false;
     this.deadButton = false;
+    this._dealtOutSeats = new Set();
+    // F11 / F13 — the last deal's blind holders and seat occupants (read before
+    // this deal records its own).
+    const blindHolders = this._blindHolders;
+    const lastHolders = this._seatHoldersAtLastDeal;
 
     const occupied = this.getActivePlayerSeats();
     if (occupied.length < 2) return;
 
+    // F13 — nobody from the last deal is still in his seat (an emptied table
+    // that filled up again): a fresh table, its rotation starts over (no dead
+    // blinds, nobody dealt out for joining).
+    const freshTable = lastHolders !== null && !lastHolders.some((h, i) => h !== '' && this.holderIdOf(this.seats[i]) === h);
+
     // First hand: pick first occupied seat as dealer button
-    if (this.dealerButtonSeat === -1 || this.previousBigBlindSeat === -1) {
+    if (this.dealerButtonSeat === -1 || this.previousBigBlindSeat === -1 || freshTable) {
       const firstOccupied = this.getNextOccupiedSeat(0);
       if (firstOccupied === -1) return;
       this.dealerButtonSeat = firstOccupied;
@@ -871,20 +922,29 @@ export class PokerTable extends EventEmitter {
         // Heads-up: button = SB
         const bbSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
         this.previousBigBlindSeat = bbSeat;
+        this.smallBlindSeat = this.dealerButtonSeat;
       } else {
         const sbSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
         const bbSeat = this.getNextOccupiedSeat(sbSeat + 1);
         this.previousBigBlindSeat = bbSeat;
+        this.smallBlindSeat = sbSeat;
       }
+      this.recordBlindHolders();
       return;
     }
 
-    // Heads-up rotation: button alternates between the two players
+    // Heads-up: the big blind moves one seat on from the LAST big blind and the
+    // other player is the button / small blind. 2026-10-21 (gameplay F10, TDA
+    // 34) — it used to move the button on from the old button, so when the
+    // button left or busted 3-handed the previous big blind posted it again.
+    // In steady heads-up this still alternates the button.
     if (occupied.length === 2) {
-      const otherSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
-      this.dealerButtonSeat = otherSeat;
-      const bbSeat = this.getNextOccupiedSeat(this.dealerButtonSeat + 1);
-      this.previousBigBlindSeat = bbSeat;
+      const newBB = this.getNextOccupiedSeat(this.previousBigBlindSeat + 1);
+      if (newBB === -1) return;
+      this.dealerButtonSeat = this.getNextOccupiedSeat(newBB + 1);
+      this.previousBigBlindSeat = newBB;
+      this.smallBlindSeat = this.dealerButtonSeat;
+      this.recordBlindHolders();
       return;
     }
 
@@ -902,22 +962,106 @@ export class PokerTable extends EventEmitter {
     // on the real player. With this, a seating GAP never produces a dead
     // blind/button (a "moving button" — the simplified, fair online
     // convention); the dead-blind flags stay false here and are reserved
-    // for genuine bust handling if ever reintroduced. Contiguous seating is
+    // for genuine bust handling (reintroduced below, F11). Contiguous seating is
     // unchanged: getPrevOccupiedSeat(newBBSeat-1) === newBBSeat-1 when that
     // seat is occupied.
-    const newBBSeat = this.getNextOccupiedSeat(this.previousBigBlindSeat + 1);
+    const prevBB = this.previousBigBlindSeat;
+    const prevSB = this.smallBlindSeat;
+    const newBBSeat = this.getNextOccupiedSeat(prevBB + 1);
     if (newBBSeat === -1) return;
 
-    const sbSlot = this.getPrevOccupiedSeat(newBBSeat - 1 + MAX_SEATS);
-    const buttonSlot = this.getPrevOccupiedSeat(sbSlot - 1 + MAX_SEATS);
+    let sbSlot = this.getPrevOccupiedSeat(newBBSeat - 1 + MAX_SEATS);
+    let buttonSlot = this.getPrevOccupiedSeat(sbSlot - 1 + MAX_SEATS);
 
     // SB/button now always reference real occupied seats; no dead blind
     // from a seating gap.
     this.deadSmallBlind = false;
     this.deadButton = false;
 
+    // 2026-10-21 (gameplay F11 / F13) — TDA DEAD BUTTON when a blind seat
+    // changed hands since the last deal: the small blind is the last big
+    // blind's seat and the button the last small blind's seat. On a standing
+    // table these are exactly the seats the walk above found. They differ when
+    //  F11: the last big blind left / busted — the walk moved the small blind
+    //       back onto the last small blind (he paid it twice) and left the
+    //       button where it was. Now: no small blind this hand (dead), the
+    //       button moves to the last small blind;
+    //  F13: a player sat down between the last small and big blind — the walk
+    //       gave HIM the button (dealt in without posting) and the old small
+    //       blind never got it. Now the old small blind gets the button and a
+    //       seat taken since the last deal on the button, in the small blind or
+    //       between them is dealt out of this one hand (TDA: never dealt in there).
+    // Not known yet (a fresh table) or not a clean rotation (heads-up becoming
+    // 3-handed, the button seat would be the new big blind) → the walk, as before.
+    const strict =
+      blindHolders !== null && lastHolders !== null &&
+      prevSB >= 0 && prevSB !== prevBB && prevSB !== newBBSeat &&
+      !this.seatStrictlyBetween(newBBSeat, prevSB, prevBB);
+    if (strict) {
+      sbSlot = prevBB;
+      buttonSlot = prevSB;
+      this.deadSmallBlind = !this.seatHeldBy(prevBB, blindHolders!.bb);
+      this.deadButton = !this.seatHeldBy(prevSB, blindHolders!.sb);
+      if (this.dealsOutNewSeatsInDeadZone()) {
+        const isNew = (i: number): boolean => {
+          const s = this.seats[i];
+          return s.state === 'occupied' && !s.eliminated && (lastHolders![i] || '') !== this.holderIdOf(s);
+        };
+        const out = new Set<number>();
+        for (let k = 0; k < MAX_SEATS; k++) {
+          const i = (buttonSlot + k) % MAX_SEATS;
+          if (isNew(i)) out.add(i);
+          if (i === sbSlot) break;
+        }
+        // Never deal so many out that the hand is not a real 3+-handed one
+        // (a newcomer is then dealt in, as before).
+        const dealtIn = this.seats.filter(s =>
+          s.state === 'occupied' && !s.eliminated && s.chipCount > 0 &&
+          !this._sittingOutSeats.has(s.seatIndex) && !out.has(s.seatIndex)).length;
+        if (out.size > 0 && dealtIn >= 3) this._dealtOutSeats = out;
+      }
+    }
+
     this.dealerButtonSeat = buttonSlot;
     this.previousBigBlindSeat = newBBSeat;
+    this.smallBlindSeat = sbSlot;
+    this.recordBlindHolders();
+  }
+
+  /** F11 / F13 — the identity a seat is remembered by between deals ('' = nobody). */
+  private holderIdOf(s: Seat | undefined): string {
+    if (!s || s.state !== 'occupied' || s.eliminated) return '';
+    return s.playerId || s.playerName || `#${s.seatIndex}`;
+  }
+
+  /** F11 — is seat `i` still held by the player remembered there (`holder`, '' = nobody)? */
+  private seatHeldBy(i: number, holder: string): boolean {
+    if (i < 0 || i >= MAX_SEATS || !holder) return false;
+    return this.holderIdOf(this.seats[i]) === holder;
+  }
+
+  /** F13 — is `x` strictly between `from` and `to`, going clockwise? */
+  private seatStrictlyBetween(x: number, from: number, to: number): boolean {
+    const d = (a: number) => (((a - from) % MAX_SEATS) + MAX_SEATS) % MAX_SEATS;
+    return d(x) > 0 && d(x) < d(to);
+  }
+
+  /** F11 / F13 — remember this deal's blind holders and seat occupants for the next deal. */
+  private recordBlindHolders(): void {
+    this._blindHolders = {
+      sb: this.deadSmallBlind ? '' : this.holderIdOf(this.seats[this.smallBlindSeat]),
+      bb: this.holderIdOf(this.seats[this.previousBigBlindSeat]),
+    };
+    this._seatHoldersAtLastDeal = this.seats.map(s => this.holderIdOf(s));
+  }
+
+  /**
+   * F13 — does this game keep a seat taken since the last deal out of the hand
+   * while it sits in the dead zone? Blind games do; Stud (antes + bring-in, no
+   * blinds to skip) overrides it to false.
+   */
+  protected dealsOutNewSeatsInDeadZone(): boolean {
+    return true;
   }
 
   protected postBlinds(): void {
@@ -991,7 +1135,7 @@ export class PokerTable extends EventEmitter {
       // sitting out — their debt is paid on the first hand AFTER they return.
       // Without this, markSittingOutBlinds accrues the debt and this loop
       // immediately pays it back out, draining a sitting-out player.
-      if (this._sittingOutSeats.has(seatIdx)) continue;
+      if (this._sittingOutSeats.has(seatIdx) || this._dealtOutSeats.has(seatIdx)) continue;   // F13: not in this hand either
       if (owed > 0 && seatIdx !== sbSeat && seatIdx !== bbSeat) {
         const postAmount = Math.min(owed, seat.chipCount);
         if (postAmount > 0) {
@@ -1025,7 +1169,7 @@ export class PokerTable extends EventEmitter {
         // (the SB/BB/dead-blind loops all have this guard; the ante loop lacked
         // it). getActivePlayerSeats includes sit-outs (tracked separately), so
         // the explicit guard is required here.
-        if (this._sittingOutSeats.has(seat)) continue;
+        if (this._sittingOutSeats.has(seat) || this._dealtOutSeats.has(seat)) continue;   // F13: a dealt-out newcomer antes nothing
         const anteAmount = Math.min(this.config.ante, this.seats[seat].chipCount);
         this.seats[seat].chipCount -= anteAmount;
         this.seats[seat].totalInvestedThisHand += anteAmount;
@@ -1150,6 +1294,71 @@ export class PokerTable extends EventEmitter {
    */
   protected getMaxRaise(_seatIndex: number): number {
     return Infinity;
+  }
+
+  /**
+   * 2026-10-21 (gameplay F12 / F41) — the largest legal raise-to total for a
+   * seat (pot-limit / fixed-limit caps; Infinity = no limit). A public read of
+   * the variant's protected getMaxRaise for the game state.
+   */
+  maxRaiseFor(seatIndex: number): number {
+    if (seatIndex < 0 || seatIndex >= MAX_SEATS) return Infinity;
+    return this.getMaxRaise(seatIndex);
+  }
+
+  /**
+   * 2026-10-21 (gameplay F91) — the big blind of the hand IN PROGRESS. A
+   * tournament level-up (and the quick / Spin & Go turbo) rewrites
+   * config.bigBlind mid-hand; the opening-bet minimum and every later
+   * street's min-raise of the hand being played stay at the level it was
+   * dealt at (TDA: a new level starts with the next hand). 0 (no hand dealt
+   * yet / an older snapshot) falls back to the table's current level.
+   */
+  protected handBB(): number {
+    return this.handBigBlind > 0 ? this.handBigBlind : this.config.bigBlind;
+  }
+
+  /**
+   * 2026-10-21 (gameplay F30) — a FIXED-LIMIT game's bet size on the current
+   * street: the small bet (one big blind) by default. Stud (5th-7th street)
+   * and Triple Draw / Badugi (after the first draw) override it with the big
+   * bet. Every bet and raise on the street is exactly this much (resetBettingRound
+   * makes it the street's raise size, getMaxRaise caps at it).
+   */
+  protected getFixedLimitBetSize(): number {
+    return this.handBB();
+  }
+
+  /**
+   * 2026-10-21 (gameplay F3 / F7, TDA 41 / 47) — is this seat locked to call or
+   * fold because the betting was NOT reopened to it? Only a seat that has acted
+   * since the last full raise and now faces LESS than a full raise (short
+   * all-ins). lastRaiseAmount only moves on a full raise (which also clears the
+   * flag), so what such a seat faces is exactly the short all-ins since it
+   * acted: several of them that add up to a full raise reopen the betting.
+   */
+  protected raiseLockedFor(seat: Seat): boolean {
+    if (!seat.hasActedSinceLastFullRaise) return false;
+    const facing = this.currentBetToMatch - seat.currentBet;
+    return facing > 0 && facing < this.lastRaiseAmount;
+  }
+
+  /**
+   * 2026-10-21 (gameplay F12 / F3) — may this seat RAISE (or bet) right now,
+   * whether or not it is its turn? In the hand, not all-in, a betting round
+   * (not a draw, not a held runout), the betting reopened to it (TDA 41 / 47),
+   * fixed limit not capped, and more chips than the call. playerAllIn turns a
+   * shove into a call when this is false; the game state sends it as `canRaise`.
+   */
+  canRaise(seatIndex: number): boolean {
+    if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
+    if (!this.isHandInProgress() || this.currentPhase === GamePhase.Showdown) return false;
+    if (NO_BETTING_PHASES.includes(this.currentPhase) || this._runoutHeld) return false;
+    const seat = this.seats[seatIndex];
+    if (!seat || seat.state !== 'occupied' || seat.folded || seat.allIn || seat.eliminated) return false;
+    if (this.raiseLockedFor(seat)) return false;
+    if (this.isRaiseCapped()) return false;
+    return seat.chipCount > this.currentBetToMatch - seat.currentBet;
   }
 
   /**
@@ -1389,6 +1598,8 @@ export class PokerTable extends EventEmitter {
 
   /** F22 — the min-raise increment once the bet to match was lowered to `toMatch`: never above the live bet, never under a big blind. */
   protected raiseIncrementAfterLoweredBet(toMatch: number): number {
+    // F30 (2026-10-21) — fixed limit: the street's bet size, whatever was lowered.
+    if (this.bettingStructure === 'fixed-limit') return this.getFixedLimitBetSize();
     const bb = this.handBigBlind || this.config.bigBlind;
     return Math.max(bb, Math.min(this.lastRaiseAmount, toMatch));
   }
@@ -1503,9 +1714,11 @@ export class PokerTable extends EventEmitter {
     // betting. A full raise would have reset hasActedSinceLastFullRaise=false
     // for this seat (see below), so if it's still true while they're facing a
     // raise (currentBetToMatch > their currentBet), the action wasn't reopened
-    // to them and a voluntary re-raise is illegal. (All-in is always allowed —
-    // that path is playerAllIn, not here.)
-    if (seat.hasActedSinceLastFullRaise && this.currentBetToMatch > seat.currentBet) {
+    // to them and a voluntary re-raise is illegal. 2026-10-21 (gameplay F7, TDA
+    // 47): unless the short all-ins it now faces ADD UP to a full raise — then
+    // the betting is reopened (raiseLockedFor). The same lock now holds for a
+    // shove (playerAllIn turns it into a call — F3).
+    if (this.raiseLockedFor(seat)) {
       return false;
     }
 
@@ -1515,8 +1728,9 @@ export class PokerTable extends EventEmitter {
 
     const minRaise = this.getMinRaise();
 
-    // TDA: Opening bet must be at least one big blind
-    if (this.currentBetToMatch === 0 && totalRaiseAmount < this.config.bigBlind) {
+    // TDA: Opening bet must be at least one big blind (F91: the big blind the
+    // hand was dealt at — a mid-hand level-up does not raise it).
+    if (this.currentBetToMatch === 0 && totalRaiseAmount < this.handBB()) {
       if (totalRaiseAmount >= seat.chipCount + seat.currentBet) {
         return this.playerAllIn(seatIndex);
       }
@@ -1614,7 +1828,7 @@ export class PokerTable extends EventEmitter {
   canStraddle(seatIndex: number): boolean {
     if (this.currentPhase !== GamePhase.PreFlop) return false;
     if (this.activeSeatIndex !== seatIndex) return false;
-    if (this.currentBetToMatch !== this.config.bigBlind) return false;
+    if (this.currentBetToMatch !== this.handBB()) return false;   // F91: this hand's big blind
     // Straddle must be the FIRST voluntary action of the hand (blinds are
     // logged without a street, so no pre-flop entry == nobody has acted yet).
     if (this.actionLog.some(a => a.street === this.currentPhase)) return false;
@@ -1623,7 +1837,7 @@ export class PokerTable extends EventEmitter {
     if (!seat || seat.state !== 'occupied' || seat.folded || seat.allIn || seat.holeCards.length === 0) return false;
     const dealtIn = this.seats.filter(s => s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0).length;
     if (dealtIn < 3) return false;
-    const additional = 2 * this.config.bigBlind - seat.currentBet;
+    const additional = 2 * this.handBB() - seat.currentBet;
     // Require the full straddle without going all-in (keep reopening semantics simple).
     return additional > 0 && additional < seat.chipCount;
   }
@@ -1631,7 +1845,7 @@ export class PokerTable extends EventEmitter {
   straddle(seatIndex: number): boolean {
     if (!this.canStraddle(seatIndex)) return false;
     const seat = this.seats[seatIndex];
-    const straddleAmount = 2 * this.config.bigBlind;
+    const straddleAmount = 2 * this.handBB();
 
     const ok = this.playerRaise(seatIndex, straddleAmount);
     if (!ok) return false;
@@ -1639,6 +1853,11 @@ export class PokerTable extends EventEmitter {
     // The straddle's one difference from a normal raise: the straddler keeps
     // their option, so owes() re-selects them when the action comes back around.
     seat.hasActedSinceLastFullRaise = false;
+    // 2026-10-21 (gameplay F8) — the straddle is the new effective big blind,
+    // so a full raise over it is a straddle more (min-raise 4 BB, not 3 BB),
+    // and a short all-in under a straddle no longer reopens the betting.
+    // Fixed limit keeps its one-small-bet raise (min = max there).
+    if (this.bettingStructure !== 'fixed-limit') this.lastRaiseAmount = straddleAmount;
     const last = this.actionLog[this.actionLog.length - 1];
     if (last && last.seatIndex === seatIndex) last.action = 'straddle';
     return true;
@@ -1736,7 +1955,13 @@ export class PokerTable extends EventEmitter {
     const callAmount = Math.max(0, this.currentBetToMatch - seat.currentBet);
     // GAME-9 — fixed limit capped (a bet and three raises): an "all-in" that
     // would raise is only a call now (a covered player keeps the rest).
-    if (stack > callAmount && this.isRaiseCapped()) {
+    // 2026-10-21 (gameplay F3, TDA 41) — likewise when the betting was NOT
+    // reopened to this seat (it acted, then only short all-ins came in): the
+    // shove used to be accepted as a full re-raise (it reset everyone's flags
+    // and forced the callers to call the whole stack again). Raise refused it,
+    // All-In did not. canRaise covers both (and an all-in for no more than the
+    // call is unchanged — that is a call).
+    if (stack > callAmount && !this.canRaise(seatIndex)) {
       return callAmount > 0 ? this.playerCall(seatIndex) : this.playerCheck(seatIndex);
     }
     if (stack > callAmount) {
@@ -2022,7 +2247,12 @@ export class PokerTable extends EventEmitter {
 
   protected resetBettingRound(): void {
     this.currentBetToMatch = 0;
-    this.lastRaiseAmount = this.config.bigBlind;
+    // 2026-10-21 (gameplay F91 / F30) — the street's opening bet / raise size:
+    // the big blind the HAND was dealt at (a mid-hand level-up applies from the
+    // next hand); fixed limit: that street's bet size (the big bet on Stud
+    // 5th-7th and Triple Draw / Badugi after the first draw — it was always the
+    // small bet, so half-size and odd-size bets and raises were accepted there).
+    this.lastRaiseAmount = this.bettingStructure === 'fixed-limit' ? this.getFixedLimitBetSize() : this.handBB();
     this.raisesThisStreet = 0;      // GAME-9
     this.betLevelsThisStreet = 0;
     // TDA Rule 16: reset per-street so showdown order uses final-street aggressor only
@@ -2427,24 +2657,9 @@ export class PokerTable extends EventEmitter {
       console.error('[PokerTable.determineWinners] pot-breakdown recompute threw post-payment; using synthetic breakdown:', (e as Error)?.message);
       pots = [];
     }
-    // Build per-pot winner amounts from perPot details (available in multi-player path)
-    // For single-player (fold) path, winnerInfos already has the right data.
-    const potBreakdown = pots.map(p => {
-      // Find perPot entries for this pot name
-      const potEntries = (nonFolded.length > 1 && (results as any[]).length > 0)
-        ? results.filter(r => r.potName === p.name)
-        : [];
-      const winnerAmounts: { seatIndex: number; amount: number }[] = potEntries.map(r => ({
-        seatIndex: r.seatIndex,
-        amount: r.amount,
-      }));
-      return {
-        name: p.name,
-        amount: p.amount,
-        winners: [...new Set(potEntries.map(r => r.seatIndex))],
-        winnerAmounts,
-      };
-    });
+    // Per-pot winners (F19, 2026-10-21: a hand won by fold names its winner too —
+    // the old `nonFolded.length > 1` guard left every fold-won pot winnerless).
+    const potBreakdown = this.buildPotBreakdown(pots, results, nonFolded.length === 1 ? nonFolded[0].seatIndex : null);
     // If no pots calculated (single winner by fold), create a synthetic one
     if (potBreakdown.length === 0 && winnerInfos.length > 0) {
       const totalPot = seatInfos.reduce((sum, s) => sum + s.totalInvestedThisHand, 0);
@@ -2521,6 +2736,36 @@ export class PokerTable extends EventEmitter {
 
     this.emitHandCompletion(results, handHistory);
     this.emit('phaseChanged', { phase: this.currentPhase });
+  }
+
+  /**
+   * 2026-10-21 (gameplay F19 / F20 / F23) — THE per-pot winner list of a
+   * finished hand, shared by the base determineWinners and the Omaha / Stud
+   * hi-lo overrides. `loneWinner` = the one seat left when everyone else
+   * folded: he wins every pot whole. Otherwise a pot's results are those named
+   * exactly `name`, `name (High)` or `name (Low)` (never a bare prefix: 'Side
+   * Pot 1' is not 'Side Pot 10'), summed per seat in first-appearance order.
+   * Nobody won (the all-fold refund): no results, so every pot stays empty.
+   */
+  protected buildPotBreakdown(
+    pots: Array<{ name: string; amount: number }>,
+    results: Array<{ seatIndex: number; amount: number; potName: string }>,
+    loneWinner: number | null,
+  ): PotBreakdownEntry[] {
+    return pots.map(p => {
+      const bySeat = new Map<number, number>();
+      if (loneWinner !== null && loneWinner >= 0) {
+        if (p.amount > 0) bySeat.set(loneWinner, p.amount);
+      } else {
+        const names = new Set([p.name, `${p.name} (High)`, `${p.name} (Low)`]);
+        for (const r of results) {
+          if (!r || !names.has(r.potName)) continue;
+          bySeat.set(r.seatIndex, (bySeat.get(r.seatIndex) || 0) + r.amount);
+        }
+      }
+      const winnerAmounts = [...bySeat].map(([seatIndex, amount]) => ({ seatIndex, amount }));
+      return { name: p.name, amount: p.amount, winners: winnerAmounts.map(w => w.seatIndex), winnerAmounts };
+    });
   }
 
   /**
@@ -2792,6 +3037,11 @@ export class PokerTable extends EventEmitter {
       previousBigBlindSeat: this.previousBigBlindSeat,
       deadSmallBlind: this.deadSmallBlind,
       deadButton: this.deadButton,
+      // F11 / F13 (2026-10-21) — the dead-button memory of the last deal.
+      smallBlindSeat: this.smallBlindSeat,
+      blindHolders: this._blindHolders,
+      seatHoldersAtLastDeal: this._seatHoldersAtLastDeal,
+      dealtOutSeats: Array.from(this._dealtOutSeats),
       communityCards: this.communityCards,
       seats: this.seats.map((s) => ({
         seatIndex: s.seatIndex,
@@ -2843,6 +3093,11 @@ export class PokerTable extends EventEmitter {
     this.previousBigBlindSeat = snap.previousBigBlindSeat;
     this.deadSmallBlind = snap.deadSmallBlind;
     this.deadButton = snap.deadButton;
+    // F11 / F13 — older snapshots lack them: unknown (the C10 walk until a deal records them).
+    this.smallBlindSeat = typeof snap.smallBlindSeat === 'number' ? snap.smallBlindSeat : -1;
+    this._blindHolders = snap.blindHolders ?? null;
+    this._seatHoldersAtLastDeal = Array.isArray(snap.seatHoldersAtLastDeal) ? snap.seatHoldersAtLastDeal : null;
+    this._dealtOutSeats = new Set(snap.dealtOutSeats || []);
     this.communityCards = snap.communityCards || [];
     this.actionLog = snap.actionLog || [];
     this.startChips = new Map(snap.startChips || []);
@@ -2883,6 +3138,11 @@ export interface PokerTableSnapshot {
   previousBigBlindSeat: number;
   deadSmallBlind: boolean;
   deadButton: boolean;
+  /** F11 / F13 (2026-10-21) — optional: older snapshots lack them. */
+  smallBlindSeat?: number;
+  blindHolders?: { sb: string; bb: string } | null;
+  seatHoldersAtLastDeal?: string[] | null;
+  dealtOutSeats?: number[];
   communityCards: Card[];
   seats: Array<{
     seatIndex: number;

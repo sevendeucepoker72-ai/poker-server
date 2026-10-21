@@ -4362,6 +4362,20 @@ function getGameStateForPlayer(
   //     Omaha ring tables only); triggerBombPot refuses wherever it is false.
   stateObj.isFirstActor = !!(playerSeatIndex >= 0 && straddleAllowedAt(table.config.tableId) && table.canStraddle(playerSeatIndex));
   stateObj.canBombPot = !!(playerSeatIndex >= 0 && bombPotAllowedAt(table.config.tableId, table));
+  // 2026-10-21 (gameplay F12 / F41) — the legal raise for THIS seat, ALWAYS
+  // present (the per-socket delta keeps a stale value when a key is left out):
+  //   canRaise — may it raise / bet now (table.canRaise: the betting reopened to
+  //     it — TDA 41 / 47 — fixed limit not capped, chips beyond the call).
+  //     False: Raise is refused and an All-In is only a call. Computed whether
+  //     or not it is his turn; spectators false.
+  //   maxRaise — the largest legal raise-to total (pot-limit / fixed-limit cap,
+  //     never above stack + bet); null for no limit, spectators, empty seats.
+  //   bettingStructure — 'no-limit' | 'pot-limit' | 'fixed-limit'.
+  const raiseSeat = playerSeatIndex >= 0 && playerSeatIndex < MAX_SEATS ? table.seats[playerSeatIndex] : undefined;
+  stateObj.canRaise = !!(raiseSeat && table.canRaise(playerSeatIndex));
+  const raiseCap = raiseSeat && raiseSeat.state === 'occupied' ? table.maxRaiseFor(playerSeatIndex) : Infinity;
+  stateObj.maxRaise = raiseSeat && Number.isFinite(raiseCap) ? Math.min(raiseCap, raiseSeat.chipCount + raiseSeat.currentBet) : null;
+  stateObj.bettingStructure = table.bettingStructure;
 
   // Add missed-blind info for this player. Now sourced directly from the
   // seat object (seat.deadBlindOwedChips + seat.missedBlind) — single
@@ -4389,15 +4403,29 @@ function getGameStateForPlayer(
   // Add pots breakdown data for side pot display (#18)
   if (table.lastHandResult && (table.currentPhase === GamePhase.Showdown || table.currentPhase === GamePhase.HandComplete)) {
     stateObj.potBreakdown = table.lastHandResult.pots;
-    // Add chop indicator (#19)
-    const winnerSet = new Set(table.lastHandResult.winners.map(w => w.seatIndex));
-    if (winnerSet.size > 1) {
+    // Add chop indicator (#19). 2026-10-21 (gameplay F23) — only when some ONE
+    // pot was split (two or more distinct winners of it: a tie, or a hi-lo
+    // split). It used to fire whenever two players won anything — a short
+    // stack's main pot and another player's side pot read "Split Pot!" — and
+    // stays absent otherwise (the delta sends that as null). chopDetails keeps
+    // its shape but lists the split pots' winners only, each with his summed
+    // share of those pots.
+    const splitPots = (table.lastHandResult.pots as any[]).filter(p => new Set(Array.isArray(p?.winners) ? p.winners : []).size > 1);
+    if (splitPots.length > 0) {
       stateObj.isChoppedPot = true;
-      stateObj.chopDetails = table.lastHandResult.winners.map(w => ({
-        seatIndex: w.seatIndex,
-        playerName: w.playerName,
-        share: w.chipsWon,
-      }));
+      const nameOf = (i: number) => table.lastHandResult!.winners.find(w => w.seatIndex === i)?.playerName ?? table.seats[i]?.playerName ?? '';
+      const shares = new Map<number, number>();
+      for (const p of splitPots) {
+        const wa = Array.isArray(p.winnerAmounts) ? p.winnerAmounts : [];
+        for (const w of wa) shares.set(w.seatIndex, (shares.get(w.seatIndex) || 0) + (Number(w.amount) || 0));
+      }
+      stateObj.chopDetails = shares.size > 0
+        ? [...shares].map(([seatIndex, share]) => ({ seatIndex, playerName: nameOf(seatIndex), share }))
+        : table.lastHandResult.winners.map(w => ({
+          seatIndex: w.seatIndex,
+          playerName: w.playerName,
+          share: w.chipsWon,
+        }));
     }
   }
 
