@@ -37,6 +37,9 @@ export class FiveCardDrawTable extends PokerTable {
   /** Discarded cards pile (for reshuffling if deck runs out) */
   private discardPile: Card[] = [];
 
+  /** F26 (2026-10-21): reshuffles of the discard pile this hand (each its own shuffle domain). */
+  private discardReshuffles: number = 0;
+
   constructor(config: TableConfig, isTripleDraw: boolean = false) {
     super(config);
     this.variant = new FiveCardDrawVariant(isTripleDraw);
@@ -106,6 +109,8 @@ export class FiveCardDrawTable extends PokerTable {
       currentDrawPhase: this.currentDrawPhase,
       drawRound: this.drawRound,
       discardPile: this.discardPile,
+      discardOverflow: this._discardOverflow,
+      discardReshuffles: this.discardReshuffles,
     };
     return snap;
   }
@@ -118,6 +123,8 @@ export class FiveCardDrawTable extends PokerTable {
       if (vs.currentDrawPhase !== undefined) this.currentDrawPhase = vs.currentDrawPhase;
       if (typeof vs.drawRound === 'number') this.drawRound = vs.drawRound;
       if (Array.isArray(vs.discardPile)) this.discardPile = vs.discardPile;
+      if (Array.isArray(vs.discardOverflow)) this._discardOverflow = vs.discardOverflow;
+      if (typeof vs.discardReshuffles === 'number') this.discardReshuffles = vs.discardReshuffles;
     }
   }
 
@@ -165,14 +172,9 @@ export class FiveCardDrawTable extends PokerTable {
       };
       this.currentDrawPhase = drawPhaseMap[_phase] || null;
       this.drawsCompleted.clear();
-
-      // Auto-stand pat for all-in players
-      const allInPlayers = this.seats.filter(
-        s => s.state === 'occupied' && !s.folded && s.allIn && !s.eliminated
-      );
-      for (const p of allInPlayers) {
-        this.drawsCompleted.add(p.seatIndex);
-      }
+      // F27 (2026-10-21): an all-in seat is NOT stood pat here any more. All-in
+      // ends a player's betting, not his drawing: he draws in every draw round
+      // like everyone else (he used to be frozen at the hand he was dealt).
 
       this.emit('drawPhaseStarted', { phase: this.currentDrawPhase, drawRound: this.drawRound });
     }
@@ -205,19 +207,31 @@ export class FiveCardDrawTable extends PokerTable {
     if (nextPhase === GamePhase.Draw1 || nextPhase === GamePhase.Draw2 || nextPhase === GamePhase.Draw3) {
       this.accumulateInvestments();
       this.currentPhase = nextPhase;
+      // F28 (2026-10-21): a draw round has no bet to match. accumulateInvestments
+      // put the closed round's bets in the pot (every currentBet is 0), but
+      // currentBetToMatch still held that round's bet, so every seat "owed" it
+      // during the draw. isValidAction also refuses every betting action in a
+      // draw round now (the seat that closed the betting is still
+      // activeSeatIndex: a call / raise / fold there used to be accepted).
+      this.currentBetToMatch = 0;
       this.dealCommunityCardsForPhase(nextPhase); // Sets up draw state
       this.emit('phaseChanged', { phase: this.currentPhase });
+      // F27 (2026-10-21): the round always waits for the draws — an all-in
+      // seat draws too (it used to be stood pat, and a hand where everyone was
+      // all-in skipped every draw round).
+      return;
+    }
 
-      // Check if all active players are all-in (auto-complete draw)
-      const activePlayers = this.seats.filter(
-        s => s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated && s.holeCards.length > 0
-      );
-      if (activePlayers.length === 0) {
-        // Everyone is all-in, skip draw and go to next phase
-        this.drawsCompleted.clear();
-        this.currentDrawPhase = null;
-        this.advanceToNextStreet();
-      }
+    // F44 (2026-10-21): no betting round when at most one player can still bet
+    // (the others are all-in): nobody could call a bet, so the lone player was
+    // handed a pointless turn (three of them in Triple Draw / Badugi) on a 30s
+    // clock. Skip it — on to the next draw round (where everyone still draws)
+    // or the showdown, as the base engine runs out the board.
+    if (this.actingPlayers().length <= 1) {
+      this.currentPhase = nextPhase;
+      this.resetBettingRound();
+      this.emit('phaseChanged', { phase: this.currentPhase });
+      this.advanceToNextStreet();
       return;
     }
 
@@ -255,6 +269,7 @@ export class FiveCardDrawTable extends PokerTable {
     this.drawRound = 0;
     this.discardPile = [];
     this._discardOverflow = [];
+    this.discardReshuffles = 0;
     return super.startNewHand();
   }
 
@@ -293,24 +308,23 @@ export class FiveCardDrawTable extends PokerTable {
     // Sort indices descending so removal doesn't shift later indices
     const sortedIndices = [...discardIndices].sort((a, b) => b - a);
 
-    // Remove discarded cards, add to discard pile
+    // Remove the discarded cards. F26 (2026-10-21): they are held aside and
+    // reach the discard pile only AFTER this player's replacements are dealt —
+    // a drawer never gets his own discards back (the standard rule). Before, a
+    // reshuffle during his draw could hand them straight back to him.
+    const thrown: Card[] = [];
     for (const idx of sortedIndices) {
-      const removed = seat.holeCards.splice(idx, 1);
-      this.discardPile.push(...removed);
+      thrown.push(...seat.holeCards.splice(idx, 1));
     }
 
-    // Deal replacement cards from the deck
+    // Deal replacement cards: the deck, then the reshuffled discards
     for (let i = 0; i < discardIndices.length; i++) {
-      let newCard = this.deck.dealOne();
-      if (!newCard) {
-        // Deck ran out - reshuffle discard pile into overflow buffer
-        this.reshuffleDiscardPile();
-        newCard = this._discardOverflow.length > 0 ? this._discardOverflow.pop()! : null;
-      }
+      const newCard = this.dealReplacementCard();
       if (newCard) {
         seat.holeCards.push(newCard);
       }
     }
+    this.discardPile.push(...thrown);
 
     this.drawsCompleted.add(seatIndex);
 
@@ -337,20 +351,13 @@ export class FiveCardDrawTable extends PokerTable {
    */
   completeDrawRoundIfDone(): boolean {
     if (!FiveCardDrawTable.DRAW_PHASES.includes(this.currentPhase)) return false;
-    // Check if all active players have drawn
-    const activePlayers = this.seats.filter(
-      s => s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated && s.holeCards.length > 0
-    );
-    const allInPlayers = this.seats.filter(
-      s => s.state === 'occupied' && !s.folded && s.allIn && !s.eliminated
+    // Check if every seat still in the hand has drawn. F27 (2026-10-21): an
+    // all-in seat too — it is no longer stood pat for the player.
+    const mustDraw = this.seats.filter(
+      s => s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0
     );
 
-    // All-in players auto-stand pat
-    for (const p of allInPlayers) {
-      this.drawsCompleted.add(p.seatIndex);
-    }
-
-    const allDrawn = activePlayers.every(s => this.drawsCompleted.has(s.seatIndex));
+    const allDrawn = mustDraw.every(s => this.drawsCompleted.has(s.seatIndex));
     if (!allDrawn) return false;
 
     // Move to next betting phase
@@ -367,15 +374,36 @@ export class FiveCardDrawTable extends PokerTable {
   private _discardOverflow: Card[] = [];
 
   /**
+   * F26 (2026-10-21) — the next replacement card: the deck, then what is left
+   * of the reshuffled discards, and only when both are empty a new reshuffle.
+   * (It used to reshuffle on every card once the deck ran dry, REPLACING the
+   * cards still waiting in the overflow — they dropped out of the hand — so
+   * every later drawer was dealt back only his own discards.)
+   */
+  private dealReplacementCard(): Card | null {
+    const fromDeck = this.deck.dealOne();
+    if (fromDeck) return fromDeck;
+    if (this._discardOverflow.length === 0) this.reshuffleDiscardPile();
+    return this._discardOverflow.length > 0 ? this._discardOverflow.pop()! : null;
+  }
+
+  /**
    * Reshuffle the discard pile into _discardOverflow so playerDraw can draw from it.
    * Uses the deck's seeded PRNG so the reshuffle is provably fair (verifiable
    * after the hand by combining the revealed seed with the 'discards' domain tag).
+   * F26: the first reshuffle of a hand keeps the domain `discards-h<hand>`; each
+   * later one appends `-r<n>` (the same domain would replay the same shuffle).
+   * The shuffled cards are added to the overflow, never replace it.
    */
   private reshuffleDiscardPile(): void {
     if (this.discardPile.length === 0) return;
-    const cards = this.deck.shuffleForeignCards(this.discardPile, `discards-h${this.handNumber}`);
+    this.discardReshuffles++;
+    const domain = this.discardReshuffles === 1
+      ? `discards-h${this.handNumber}`
+      : `discards-h${this.handNumber}-r${this.discardReshuffles}`;
+    const cards = this.deck.shuffleForeignCards(this.discardPile, domain);
     this.discardPile = [];
-    this._discardOverflow = cards;
+    this._discardOverflow = [...cards, ...this._discardOverflow];
   }
 
   /**
@@ -389,16 +417,17 @@ export class FiveCardDrawTable extends PokerTable {
   }
 
   /**
-   * 2-7 Triple Draw (and Badugi): small bet only on Bet1 (before any draw); big
-   * bet on every betting round after the first draw. 2026-10-21 (gameplay F30)
-   * — also the street's raise size (base resetBettingRound), so a Bet2-Bet4
-   * opening bet is exactly the big bet (a half-size bet used to be accepted).
+   * 2-7 Triple Draw (and Badugi): the small bet before the draw (Bet1) and
+   * after the first draw (Bet2); the big bet after the second and third draws
+   * (Bet3, Bet4). 2026-10-21 (gameplay F39) — Bet2 took the big bet; limit
+   * triple draw / Badugi use the small bet for the first two rounds.
+   * 2026-10-21 (gameplay F30) — also the street's raise size (base
+   * resetBettingRound), so a big-bet round's opening bet is exactly the big bet.
    */
   protected getFixedLimitBetSize(): number {
-    const isLateRound =
-      this.currentPhase === GamePhase.Bet2 ||
+    const isBigBetRound =
       this.currentPhase === GamePhase.Bet3 ||
       this.currentPhase === GamePhase.Bet4;
-    return isLateRound ? this.handBB() * 2 : this.handBB();
+    return isBigBetRound ? this.handBB() * 2 : this.handBB();
   }
 }

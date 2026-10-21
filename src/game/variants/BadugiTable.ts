@@ -12,7 +12,8 @@ import { FiveCardDrawTable } from './FiveCardDrawTable';
  * hand, which always beats a 2-card hand. Within the same size, lower wins.
  *
  * Aces are LOW. Pairs and same-suit duplicates are dropped from the hand.
- * Fixed-limit betting structure (small bet on Bet1, big bet on Bet2-Bet4).
+ * Fixed-limit betting structure (small bet on Bet1-Bet2, big bet on Bet3-Bet4;
+ * 2026-10-21 gameplay F39 — FiveCardDrawTable.getFixedLimitBetSize).
  *
  * Reuses FiveCardDrawTable's draw infrastructure (3 draw rounds, discard
  * reshuffle, etc.) but with 4 hole cards instead of 5 and a Badugi evaluator.

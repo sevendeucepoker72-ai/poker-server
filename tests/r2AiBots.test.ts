@@ -64,7 +64,8 @@ function playBotHands(table: PokerTable, bots: number, hands: number, difficulty
     while (table.isHandInProgress() && guard++ < 2000) {
       if ([GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3].includes(table.currentPhase)) {
         const d = table as FiveCardDrawTable;
-        for (const s of d.seats) if (s.isAI && s.state === 'occupied' && !s.folded && !s.allIn && s.holeCards.length > 0 && !d.drawsCompleted.has(s.seatIndex)) d.playerDraw(s.seatIndex, []);
+        // gameplay S3 F27 (2026-10-21): an all-in bot draws too, as the server's bot loop does now.
+        for (const s of d.seats) if (s.isAI && s.state === 'occupied' && !s.folded && s.holeCards.length > 0 && !d.drawsCompleted.has(s.seatIndex)) d.playerDraw(s.seatIndex, []);
         continue;
       }
       const a = table.activeSeatIndex;

@@ -438,11 +438,14 @@ describe('F30 — fixed limit: every big-bet street takes exactly the big bet', 
     expect(t.maxRaiseFor(t.activeSeatIndex)).toBe(50);
   });
 
+  // 2026-10-21 (gameplay S3, F39) — the big bet starts after the SECOND draw
+  // (Bet3); Bet2 is a small-bet round (gameplay_S3 tests it). This case used
+  // to check Bet2.
   for (const [name, mk] of [
     ['2-7 Triple Draw', () => new FiveCardDrawTable(cfg(), true)],
     ['Badugi', () => new BadugiTable(cfg())],
   ] as Array<[string, () => FiveCardDrawTable]>) {
-    it(`${name}: Bet2`, () => {
+    it(`${name}: Bet3`, () => {
       const t = mk();
       seatAt(t, { 0: 5000, 1: 5000, 2: 5000 });
       t.startNewHand();
@@ -450,6 +453,10 @@ describe('F30 — fixed limit: every big-bet street takes exactly the big bet', 
       expect(t.currentPhase).toBe(GamePhase.Draw1);
       for (const i of [0, 1, 2]) expect(t.playerDraw(i, [])).toBe(true);
       expect(t.currentPhase).toBe(GamePhase.Bet2);
+      callAround(t, () => t.currentPhase === GamePhase.Bet2);
+      expect(t.currentPhase).toBe(GamePhase.Draw2);
+      for (const i of [0, 1, 2]) expect(t.playerDraw(i, [])).toBe(true);
+      expect(t.currentPhase).toBe(GamePhase.Bet3);
       expectBigBetStreet(t);
     });
   }

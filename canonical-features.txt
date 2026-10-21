@@ -1292,3 +1292,34 @@ stateObj.maxRaise =
 stateObj.bettingStructure = table.bettingStructure;
 buildPotBreakdown(
 splitPots.length > 0
+
+# 2026-10-21 gameplay S3 (draw games, Pineapple, Omaha hi-lo). F28/F29: no
+# betting action in a draw round (engine + 'action' handler); a seat that sits
+# out mid-draw is stood pat, never folded. F26: a drawer never gets his own
+# discards back; the reshuffled stub is never dropped. F27: an all-in seat
+# draws. F44: no betting turn when nobody can call. F39: Triple Draw / Badugi
+# Bet2 is a small-bet round. G169: the draw clock is sent. F116: 2-7 bots draw
+# to a low. F16: the Crazy Pineapple all-in discard window + board-aware pick.
+# F17: a discard pick never outlives its deal. F18: the shared hand history
+# never names a discard. F34: the Pineapple picker keys + seatSessionFor.
+a draw round has no betting: the seat
+code: 'draw_round'
+.playerDraw(session.seatIndex, [])
+dealReplacementCard()
+discards-h${this.handNumber}-r${this.discardReshuffles}
+const mustDraw = this.seats.filter(
+no betting round when at most one player can still bet
+const isBigBetRound =
+function drawClockStart(
+stateObj.drawStartedAt = drawClockStart(
+const maxDiscard = isLowball && !isBadugi ? 5 : 3;
+discardHoldDecider
+PINEAPPLE_DISCARD_WINDOW_MS = 10000
+fallbackDiscardIndex(
+this.discardsThisHand.clear();
+'auto-discarded a card'
+forViewer.viewerDiscard = serializeCard(viewer.discard);
+isPineapple: !!variantInfo.isPineapple,
+pineappleDiscardActive: !!variantInfo.pineappleDiscardActive
+const seatSessionFor =
+code: 'not_at_table'

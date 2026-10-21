@@ -61,6 +61,7 @@ import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
+import type { PineappleTable } from './game/variants/PineappleTable';
 import { VariantType } from './game/variants/PokerVariant';
 import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus } from './auth/oauthValidator';
@@ -884,6 +885,25 @@ const ABSENT_TOURNAMENT_SEAT_TURN_MS = 3000;
 // the human's playerDraw that never arrives). One draw-phase timer per table,
 // keyed by (handNumber, phase) so it's idempotent across re-broadcasts.
 const drawTimers = new Map<string, { timeout: ReturnType<typeof setTimeout>; handNumber: number; phase: GamePhase }>();
+/**
+ * 2026-10-21 (gameplay G169) — when the current draw round's clock started
+ * (server epoch ms), per table, keyed by (handNumber, phase). The draw clock is
+ * ONE clock for every drawer (draws are simultaneous); it was never sent, so
+ * only the seat that closed the betting saw a countdown — his stale betting
+ * clock — and everyone else was stood pat at 30s without one. The game state
+ * sends it as `drawStartedAt` / `drawTimeout`; the stand-pat timer
+ * (scheduleAIAction) fires at the same start + TURN_TIMEOUT_MS.
+ */
+const drawStartedAtMap = new Map<string, { handNumber: number; phase: GamePhase; startedAt: number }>();
+/** G169 — the draw round's clock start (created at the first read of the round; idempotent); 0 outside a draw round. */
+function drawClockStart(tableId: string, table: FiveCardDrawTable): number {
+  if (!table || table.currentDrawPhase === null || !DrawPhases.includes(table.currentPhase)) return 0;
+  const cur = drawStartedAtMap.get(tableId);
+  if (cur && cur.handNumber === table.handNumber && cur.phase === table.currentPhase) return cur.startedAt;
+  const startedAt = Date.now();
+  drawStartedAtMap.set(tableId, { handNumber: table.handNumber, phase: table.currentPhase, startedAt });
+  return startedAt;
+}
 const TURN_WARNING_LEAD_MS = 10000; // fire warning 10s before timeout
 
 // 2026-08-25 — `lastActiveSeatByTable` removed with the server-side `your_turn`
@@ -1018,6 +1038,9 @@ const ALWAYS_EMIT_KEYS = [
   'variant',
   'variantName',
   'tableId',
+  // G169 (2026-10-21) — the draw round's clock (draw tables only: pickAlwaysEmit copies present keys).
+  'drawStartedAt',
+  'drawTimeout',
 ];
 function pickAlwaysEmit(state: any): Record<string, any> {
   const out: Record<string, any> = {};
@@ -4243,6 +4266,19 @@ function getGameStateForPlayer(
     holeCardCount: variantInfo.holeCardCount,
     hasDrawPhase: variantInfo.hasDrawPhase,
     isStudGame: variantInfo.isStudGame,
+    // 2026-10-21 (gameplay F34) — the Pineapple discard picker's keys. The
+    // client gates the picker on exactly these, and they were never sent: every
+    // discard was the server's auto-pick. ALWAYS present (false off-Pineapple /
+    // outside the window) so the per-socket delta clears them.
+    // pineappleDiscardActive is per seat: the discard window is open (Pineapple
+    // pre-flop, Crazy Pineapple on the flop) and THIS seat, in the hand, still
+    // holds 3 cards (a folded seat keeps its 3 cards but has nothing to pick).
+    isPineapple: !!variantInfo.isPineapple,
+    pineappleDiscardActive: !!variantInfo.pineappleDiscardActive
+      && playerSeatIndex >= 0 && playerSeatIndex < MAX_SEATS
+      && table.seats[playerSeatIndex].state === 'occupied'
+      && !table.seats[playerSeatIndex].folded
+      && table.seats[playerSeatIndex].holeCards.length === 3,
     sittingOut: false, // Will be overridden per-player in broadcastGameState
   };
 
@@ -4252,6 +4288,12 @@ function getGameStateForPlayer(
     stateObj.isDrawPhase = drawTable.currentDrawPhase !== null;
     stateObj.drawPhase = drawTable.currentDrawPhase;
     stateObj.drawsCompleted = [...drawTable.drawsCompleted];
+    // G169 (2026-10-21) — the draw round's ONE clock (server epoch ms; 0
+    // outside a draw round) and its length. The first state built in a draw
+    // round starts it (before scheduleAIAction arms the stand-pat timer, which
+    // reads the same start).
+    stateObj.drawStartedAt = drawClockStart(table.config.tableId, drawTable);
+    stateObj.drawTimeout = TURN_TIMEOUT_MS;
   }
 
   // Add stud card visibility info
@@ -5286,6 +5328,8 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         if (viewer) {
           forViewer.viewerSeat = viewer.seatIndex;
           if (viewer.holeCards) forViewer.viewerHoleCards = viewer.holeCards.map(serializeCard);
+          // F18 (2026-10-21) — Pineapple: HIS discarded card (the shared record only says "discarded a card").
+          if (viewer.discard) forViewer.viewerDiscard = serializeCard(viewer.discard);
         }
         const socket = io.sockets.sockets.get(socketId);
         if (socket) {
@@ -5318,7 +5362,7 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
  */
 function handHistoryViewerOf(
   table: PokerTable, history: HandHistoryRecord, session: PlayerSession,
-): { seatIndex: number; holeCards: Card[] | null } | null {
+): { seatIndex: number; holeCards: Card[] | null; discard: Card | null } | null {
   const seatIndex = session.seatIndex;
   if (!Number.isInteger(seatIndex) || seatIndex < 0) return null;
   const row = history.players.find((p) => p.seatIndex === seatIndex);
@@ -5326,7 +5370,10 @@ function handHistoryViewerOf(
   if (!row || !seat || seat.state !== 'occupied' || seat.isAI) return null;
   if (!sessionHoldsSeat(session, seat) && seat.playerName !== session.playerName) return null;
   if (row.name !== seat.playerName) return null;
-  return { seatIndex, holeCards: seat.holeCards.length > 0 ? [...seat.holeCards] : null };
+  // F18 (2026-10-21) — a Pineapple seat's own discard of that hand (PineappleTable.discardOf), else null.
+  const discardOf = (table as any).discardOf;
+  const discard: Card | null = typeof discardOf === 'function' ? (discardOf.call(table, seatIndex) ?? null) : null;
+  return { seatIndex, holeCards: seat.holeCards.length > 0 ? [...seat.holeCards] : null, discard };
 }
 
 // Target occupancy for cash tables. Keeps the game alive without hogging
@@ -5504,14 +5551,24 @@ function scheduleAIAction(tableId: string): void {
   // For draw phases, AI should auto-draw (stand pat or discard)
   if (DrawPhases.includes(table.currentPhase) && table instanceof FiveCardDrawTable) {
     const drawTable = table as FiveCardDrawTable;
+    const armedHand = drawTable.handNumber;
+    const dphase = drawTable.currentPhase;
     // Schedule AI draws for all AI players who haven't drawn yet
     const profiles = aiProfiles.get(tableId);
     if (profiles) {
       for (const seat of drawTable.seats) {
-        if (seat.isAI && seat.state === 'occupied' && !seat.folded && !seat.allIn && !seat.eliminated) {
+        // F27 (2026-10-21) — an all-in bot draws too: the engine waits for
+        // every seat in the hand (all-in ends the betting, not the drawing).
+        if (seat.isAI && seat.state === 'occupied' && !seat.folded && !seat.eliminated && seat.holeCards.length > 0) {
           if (!drawTable.drawsCompleted.has(seat.seatIndex)) {
             const delay = 500 + Math.floor(Math.random() * 1000);
             setTimeout(() => {
+              // F44 (2026-10-21) — a draw scheduled for an earlier round (or
+              // hand) does nothing: a betting round nobody can bet in is now
+              // skipped, so the NEXT draw round can already be open when it
+              // fires; that round's own scheduling draws for it.
+              if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) return;
+              if (drawTable.drawsCompleted.has(seat.seatIndex)) return;
               // 2026-06-19 fix: discard the WORST cards deterministically.
               // 2026-07-07 fix: LOWBALL-aware. The old rule kept pairs + the two
               // HIGHEST cards — correct for high draw, but exactly BACKWARDS for
@@ -5536,13 +5593,28 @@ function scheduleAIAction(tableId: string): void {
                 }
               } else if (isLowball) {
                 // 2-7 triple draw: ace is HIGH, so aces/pairs/high cards are the
-                // WORST. Keep the lowest distinct-rank cards (up to 5), draw the rest.
+                // WORST. F116 (2026-10-21) — keep only LOW cards (8 or lower,
+                // never an ace) of distinct ranks; the old loop kept the lowest
+                // five distinct ranks, i.e. every unpaired hand (A-K high, a
+                // made straight) stood pat. A kept five that is a straight or a
+                // flush (bad in 2-7) breaks its highest card.
                 const dVal = (c: any) => c.rank; // 2-7: Ace(14) is HIGH → sorts last (worst)
                 const order = [...cards.keys()].sort((a, b) => dVal(cards[a]) - dVal(cards[b]));
                 const seenR = new Set<number>();
                 for (const i of order) {
                   if (keep.size >= 5) break;
+                  if (cards[i].rank > 8) continue;
                   if (!seenR.has(cards[i].rank)) { keep.add(i); seenR.add(cards[i].rank); }
+                }
+                if (keep.size === 5) {
+                  const kept = [...keep].map((i) => cards[i]);
+                  const ranks = kept.map((c: any) => c.rank);
+                  const straight = Math.max(...ranks) - Math.min(...ranks) === 4;
+                  const flush = kept.every((c: any) => c.suit === kept[0].suit);
+                  if (straight || flush) {
+                    const highest = [...keep].reduce((h, i) => (cards[i].rank > cards[h].rank ? i : h));
+                    keep.delete(highest);
+                  }
                 }
               } else {
                 // High draw (five-card draw): keep pairs/trips/quads, else the two
@@ -5554,11 +5626,15 @@ function scheduleAIAction(tableId: string): void {
                   [...cards.keys()].sort((a, b) => cards[b].rank - cards[a].rank).slice(0, 2).forEach((i) => keep.add(i));
                 }
               }
-              const indices: number[] = [...cards.keys()].filter((i) => !keep.has(i)).slice(0, 3);
+              // F116 — 2-7 draws up to five (the old cap of 3 applied to every variant).
+              const maxDiscard = isLowball && !isBadugi ? 5 : 3;
+              const indices: number[] = [...cards.keys()].filter((i) => !keep.has(i)).slice(0, maxDiscard);
               drawTable.playerDraw(seat.seatIndex, indices);
               broadcastGameState(tableId);
-              // After all draws, the table will advance and we need to schedule next AI action
-              if (drawTable.currentPhase !== GamePhase.Draw1 && drawTable.currentPhase !== GamePhase.Draw2 && drawTable.currentPhase !== GamePhase.Draw3) {
+              // After all draws, the table will advance and we need to schedule
+              // next AI action — F44: also when it went straight into the NEXT
+              // draw round (the betting round between was skipped).
+              if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) {
                 scheduleAIAction(tableId);
               }
             }, delay);
@@ -5572,26 +5648,32 @@ function scheduleAIAction(tableId: string): void {
     // scheduleAIAction re-entries don't stack timers; on fire, stand-pat
     // (draw 0) any non-AI player who hasn't drawn so the phase completes
     // instead of hanging forever on an unresponsive human.
-    const armedHand = drawTable.handNumber;
-    const dphase = drawTable.currentPhase;
     const existingDraw = drawTimers.get(tableId);
     const sameDraw = !!existingDraw && existingDraw.handNumber === armedHand && existingDraw.phase === dphase;
     if (!sameDraw) {
       if (existingDraw) clearTimeout(existingDraw.timeout);
+      // G169 (2026-10-21) — the deadline the players are shown: drawStartedAt
+      // (the state's) + TURN_TIMEOUT_MS, not 30s from whenever this ran.
+      const drawStartedAt = drawClockStart(tableId, drawTable);
+      const drawDelay = Math.max(0, TURN_TIMEOUT_MS - (Date.now() - drawStartedAt));
       const drawTimeout = setTimeout(() => {
         const t = tableManager.getTable(tableId);
         if (!(t instanceof FiveCardDrawTable)) return;
         if (t.handNumber !== armedHand || t.currentPhase !== dphase) return; // stale: phase/hand moved on
         let forced = false;
         for (const s of t.seats) {
-          if (!s.isAI && s.state === 'occupied' && !s.folded && !s.allIn && !s.eliminated && !t.drawsCompleted.has(s.seatIndex)) {
+          // The last stand-pat can complete the round — and (F44) open the
+          // next draw round at once: never stand anyone pat in THAT one.
+          if (t.handNumber !== armedHand || t.currentPhase !== dphase) break;
+          // F27 (2026-10-21) — an all-in human who has not drawn is stood pat too.
+          if (!s.isAI && s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0 && !t.drawsCompleted.has(s.seatIndex)) {
             t.playerDraw(s.seatIndex, []); // stand pat — timed out
             forced = true;
           }
         }
         if (forced) broadcastGameState(tableId);
         scheduleAIAction(tableId);
-      }, TURN_TIMEOUT_MS);
+      }, drawDelay);
       drawTimers.set(tableId, { timeout: drawTimeout, handNumber: armedHand, phase: dphase });
     }
     return;
@@ -8106,6 +8188,8 @@ function endTableViewsAndTimers(tableId: string): void {
   insuranceCashouts.delete(tableId);
   lastInsuranceSettlement.delete(tableId);   // G165
   clearInsuranceOffer(tableId);
+  clearPineappleDiscardHold(tableId);   // F16
+  drawStartedAtMap.delete(tableId);     // G169
 }
 
 /** C12 — every minute: a private table with no human seat for PRIVATE_TABLE_IDLE_MS is removed. */
@@ -8259,6 +8343,10 @@ function ensureInsuranceHoldWired(tableId: string, table: PokerTable): void {
   if (wiredInsuranceHold.has(table)) return;
   wiredInsuranceHold.add(table);
   table.runoutHoldDecider = (t: PokerTable) => decideInsuranceHold(tableId, t);
+  // F16 (2026-10-21) — a Crazy Pineapple table's all-in discard window.
+  if ('discardHoldDecider' in table) {
+    (table as unknown as PineappleTable).discardHoldDecider = (t: PineappleTable) => decidePineappleDiscardHold(tableId, t);
+  }
 }
 
 function clearInsuranceOffer(tableId: string): void {
@@ -8292,6 +8380,65 @@ function releaseInsuranceHoldIfDecided(tableId: string, handNumber: number): voi
   if (!offer || offer.handNumber !== handNumber) return;
   for (const seatIndex of offer.quotes.keys()) if (!offer.decided.has(seatIndex)) return;
   releaseInsuranceHold(tableId, handNumber, 'decided');
+}
+
+/**
+ * 2026-10-21 (gameplay F16) — the Crazy Pineapple DISCARD WINDOW of an all-in
+ * runout. The discard comes after the flop; a hand all-in before the flop used
+ * to run out flop, turn and river in one tick, so no player ever got to pick
+ * (the server dropped each lowest card — breaking sets). PineappleTable holds
+ * such a runout on the flop (no actor) when this decider says so: some player
+ * still holding 3 cards is a human with a live session (a bot or an absent
+ * player gets the server's board-aware pick). The window ends when every such
+ * player has picked (selectPineappleDiscard) or after
+ * PINEAPPLE_DISCARD_WINDOW_MS; the wedge watchdog's fallback releases it too.
+ * The client's picker opens by itself (phase Flop, 3 cards: the state's
+ * pineappleDiscardActive).
+ */
+const PINEAPPLE_DISCARD_WINDOW_MS = 10000;
+const pineappleDiscardHolds = new Map<string, { handNumber: number; timer: ReturnType<typeof setTimeout> }>();
+
+/** F16 — the seats the discard window waits for: still holding 3 cards, human, with a live session. */
+function pineappleDiscardWaitsFor(tableId: string, table: PineappleTable): number[] {
+  return table.seatsAwaitingDiscard().filter((i) => !table.seats[i].isAI && seatHasAnySession(tableId, i));
+}
+
+/** F16 — PineappleTable.discardHoldDecider: hold the all-in runout on the flop for the discard? */
+function decidePineappleDiscardHold(tableId: string, table: PineappleTable): boolean {
+  if (pineappleDiscardWaitsFor(tableId, table).length === 0) return false;
+  clearPineappleDiscardHold(tableId);
+  const handNumber = table.handNumber;
+  const timer = setTimeout(() => releasePineappleDiscardHold(tableId, handNumber), PINEAPPLE_DISCARD_WINDOW_MS);
+  (timer as any)?.unref?.();
+  pineappleDiscardHolds.set(tableId, { handNumber, timer });
+  log.info(`[pineapple] ${JSON.stringify({ event: 'discard_window_open', tableId, handNumber, seats: pineappleDiscardWaitsFor(tableId, table) })}`);
+  return true;
+}
+
+function clearPineappleDiscardHold(tableId: string): void {
+  const hold = pineappleDiscardHolds.get(tableId);
+  if (!hold) return;
+  clearTimeout(hold.timer);
+  pineappleDiscardHolds.delete(tableId);
+}
+
+/** F16 — end the discard window of `handNumber`: discard, run out the board, settle, schedule the next hand. */
+function releasePineappleDiscardHold(tableId: string, handNumber: number): void {
+  const hold = pineappleDiscardHolds.get(tableId);
+  if (hold && hold.handNumber === handNumber) clearPineappleDiscardHold(tableId);
+  const table = tableManager.getTable(tableId) as unknown as PineappleTable | undefined;
+  if (!table || table.handNumber !== handNumber || typeof table.isDiscardHeld !== 'function' || !table.isDiscardHeld()) return;
+  table.releaseDiscardHold();
+  broadcastGameState(tableId);
+  if (table.currentPhase === GamePhase.HandComplete) scheduleAutoStart(tableId, 3000);
+  else scheduleAIAction(tableId);
+}
+
+/** F16 — every player the discard window waits for has picked: no reason to keep the table waiting. */
+function releasePineappleDiscardHoldIfDecided(tableId: string, handNumber: number): void {
+  const table = tableManager.getTable(tableId) as unknown as PineappleTable | undefined;
+  if (!table || table.handNumber !== handNumber || typeof table.isDiscardHeld !== 'function' || !table.isDiscardHeld()) return;
+  if (pineappleDiscardWaitsFor(tableId, table).every((i) => table.hasDiscardChoice(i))) releasePineappleDiscardHold(tableId, handNumber);
 }
 
 /**
@@ -15301,17 +15448,33 @@ Give feedback in this JSON format:
   // Pineapple / Crazy Pineapple manual discard. Player picks which of their 3
   // hole cards to throw away. If they don't pick before the deadline, the
   // server auto-discards their weakest card.
-  socket.on('selectPineappleDiscard', (data: { cardIndex: number }) => {
-    const session = playerSessions.get(socket.id);
-    if (!session) { socket.emit('error', { message: 'Not at a table' }); return; }
+  // 2026-10-21 (gameplay F34) — `{ cardIndex, tableId? }`: an optional tableId
+  // picks the seat at THAT table (an extra multi-table seat too — F156
+  // seatSessionFor); without one, the main seat as before. A tableId he holds
+  // no seat at is refused (`not_at_table`), never applied to his main seat.
+  // The ack names the table: `pineappleDiscardAck { success, cardIndex, tableId }`.
+  socket.on('selectPineappleDiscard', (data: { cardIndex: number; tableId?: string }) => {
+    const session = seatSessionFor(data?.tableId);
+    if (!session) {
+      if (typeof data?.tableId === 'string' && data.tableId) {
+        socket.emit('error', { message: 'You are not seated at that table.', code: 'not_at_table', tableId: data.tableId });
+      } else {
+        socket.emit('error', { message: 'Not at a table' });
+      }
+      return;
+    }
     const table = tableManager.getTable(session.tableId) as any;
     if (!table || typeof table.selectPineappleDiscard !== 'function') {
       socket.emit('error', { message: 'Table does not support discard' });
       return;
     }
     const ok = table.selectPineappleDiscard(session.seatIndex, data?.cardIndex);
-    socket.emit('pineappleDiscardAck', { success: !!ok, cardIndex: data?.cardIndex });
-    if (ok) broadcastGameState(session.tableId);
+    socket.emit('pineappleDiscardAck', { success: !!ok, cardIndex: data?.cardIndex, tableId: session.tableId });
+    if (ok) {
+      broadcastGameState(session.tableId);
+      // F16 — an all-in runout held for the discard goes on once everyone it waits for has picked.
+      releasePineappleDiscardHoldIfDecided(session.tableId, table.handNumber);
+    }
   });
 
   // Top-up / rebuy — client calls this when their auto-rebuy fires (or a
@@ -15681,6 +15844,15 @@ Give feedback in this JSON format:
         if (underThreshold >= intervals.length * 0.8) {
           console.warn(`[AntiCheat] Possible bot detected: socket ${socket.id} — ${underThreshold}/${intervals.length} actions under 200ms`);
         }
+      }
+
+      // 2026-10-21 (gameplay F28 / F29) — a draw round has no betting. The
+      // seat that closed the betting before it is still activeSeatIndex, and
+      // its call / raise / all-in / fold (a hotkey, a tap on the felt) used to
+      // be accepted mid-draw. The engine refuses it too (isValidAction).
+      if (DrawPhases.includes(table.currentPhase)) {
+        socket.emit('error', { message: 'This is a draw round: choose cards to draw or stand pat.', code: 'draw_round' });
+        return;
       }
 
       // Validate it's this player's turn
@@ -16326,7 +16498,19 @@ Give feedback in this JSON format:
     // out of the hand).
     if (session.sittingOut) {
       const table = tableManager.getTable(session.tableId);
-      if (table && table.activeSeatIndex === session.seatIndex) {
+      if (table && DrawPhases.includes(table.currentPhase)) {
+        // 2026-10-21 (gameplay F29) — a draw round has no turn (the seat that
+        // closed the betting is still activeSeatIndex, a stale value): the
+        // fold below used to take that seat out with nothing completing the
+        // draw round — the hand froze for good. A seat that sits out during a
+        // draw is stood pat now if it has not drawn (never folded: it keeps
+        // its hand and its chips in the pot); its next betting turn is acted
+        // for like any sitting-out seat's.
+        if ((table as FiveCardDrawTable).playerDraw(session.seatIndex, [])) {
+          broadcastGameState(session.tableId);
+          scheduleAIAction(session.tableId);
+        }
+      } else if (table && table.activeSeatIndex === session.seatIndex) {
         if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);
         else table.playerFold(session.seatIndex);
         broadcastGameState(session.tableId);
@@ -16352,7 +16536,13 @@ Give feedback in this JSON format:
     // Auto-fold if it's currently their turn (P-j: a tournament seat is acted
     // for as ABSENT — check, or fold).
     const table = tableManager.getTable(session.tableId);
-    if (table && table.activeSeatIndex === session.seatIndex) {
+    if (table && DrawPhases.includes(table.currentPhase)) {
+      // F29 (2026-10-21) — as 'sitOut': in a draw round stand pat, never fold.
+      if ((table as FiveCardDrawTable).playerDraw(session.seatIndex, [])) {
+        broadcastGameState(session.tableId);
+        scheduleAIAction(session.tableId);
+      }
+    } else if (table && table.activeSeatIndex === session.seatIndex) {
       if (isTournamentTable(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);
       else table.playerFold(session.seatIndex);
       broadcastGameState(session.tableId);
@@ -17317,11 +17507,18 @@ Give feedback in this JSON format:
   // `error { message, code }` with a stable code: insurance_not_seated /
   // insurance_stale_hand (no / another handNumber — an old client) /
   // insurance_already_accepted / insurance_unavailable.
-  const insuranceSessionFor = (tableId: unknown): PlayerSession | undefined => {
+  // 2026-10-21 (F156 contract, first used by F34 selectPineappleDiscard) — THE
+  // socket-scoped seat resolver for a handler's optional `tableId`: none (not a
+  // non-empty string) = the main session exactly as before (may be undefined);
+  // the main session's table = the main session; else this socket's extra
+  // (multi-table) session at that table, or undefined — a caller must then
+  // refuse, never fall back to the main seat.
+  const seatSessionFor = (tableId: unknown): PlayerSession | undefined => {
     const main = playerSessions.get(socket.id);
     if (typeof tableId !== 'string' || !tableId || main?.tableId === tableId) return main;
     return (multiTableSessions.get(socket.id) || []).find((s) => s && s.tableId === tableId);
   };
+  const insuranceSessionFor = (tableId: unknown): PlayerSession | undefined => seatSessionFor(tableId);
   socket.on('acceptInsurance', (data: { tableId?: string; handNumber?: number } = {}) => {
     const refuse = (code: string, message: string): void => {
       insuranceStats.refused++;

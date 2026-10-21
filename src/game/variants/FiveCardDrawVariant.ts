@@ -98,10 +98,11 @@ export class FiveCardDrawVariant implements PokerVariant {
     phase: VariantPhase
   ): number {
     if (this.bettingStructure === 'fixed-limit') {
-      // Fixed limit: small bet ONLY on Bet1 (before first draw); big bet on
-      // every round after the first draw (Bet2/Bet3/Bet4). This matches
-      // 2-7 Triple Draw house rules.
-      const isLateRound = ['Bet2', 'Bet3', 'Bet4'].includes(phase);
+      // Fixed limit: small bet on Bet1 and Bet2 (before the draw and after
+      // the first draw); big bet after the second and third draws (Bet3 /
+      // Bet4) — limit 2-7 Triple Draw. 2026-10-21 (gameplay F39): this used
+      // to say Bet2 too (mirror of FiveCardDrawTable.getFixedLimitBetSize).
+      const isLateRound = ['Bet3', 'Bet4'].includes(phase);
       const betSize = isLateRound ? bigBlind * 2 : bigBlind;
       return Math.min(currentBet + betSize, playerChips);
     }

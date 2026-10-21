@@ -1353,7 +1353,7 @@ export class PokerTable extends EventEmitter {
   canRaise(seatIndex: number): boolean {
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
     if (!this.isHandInProgress() || this.currentPhase === GamePhase.Showdown) return false;
-    if (NO_BETTING_PHASES.includes(this.currentPhase) || this._runoutHeld) return false;
+    if (NO_BETTING_PHASES.includes(this.currentPhase) || this.isRunoutHeld()) return false;
     const seat = this.seats[seatIndex];
     if (!seat || seat.state !== 'occupied' || seat.folded || seat.allIn || seat.eliminated) return false;
     if (this.raiseLockedFor(seat)) return false;
@@ -2250,7 +2250,7 @@ export class PokerTable extends EventEmitter {
     // 2026-10-21 (gameplay F91 / F30) — the street's opening bet / raise size:
     // the big blind the HAND was dealt at (a mid-hand level-up applies from the
     // next hand); fixed limit: that street's bet size (the big bet on Stud
-    // 5th-7th and Triple Draw / Badugi after the first draw — it was always the
+    // 5th-7th and Triple Draw / Badugi after the second draw (F39) — it was always the
     // small bet, so half-size and odd-size bets and raises were accepted there).
     this.lastRaiseAmount = this.bettingStructure === 'fixed-limit' ? this.getFixedLimitBetSize() : this.handBB();
     this.raisesThisStreet = 0;      // GAME-9
@@ -2809,6 +2809,13 @@ export class PokerTable extends EventEmitter {
     if (this.currentPhase === GamePhase.WaitingForPlayers) return false;
     if (this.currentPhase === GamePhase.HandComplete) return false;
     if (this.currentPhase === GamePhase.Showdown) return false;
+    // 2026-10-21 (gameplay F28 / F29) — a draw round has no betting: the seat
+    // that closed the betting round before it stays activeSeatIndex through the
+    // draw, and its call / raise / all-in / fold used to be accepted there
+    // (chips into the pot mid-draw, a phantom turn, a fold that wedged the
+    // round). Draws go through FiveCardDrawTable.playerDraw; a leaver through
+    // forceFoldSeat.
+    if (NO_BETTING_PHASES.includes(this.currentPhase)) return false;
 
     const seat = this.seats[seatIndex];
     if (seat.state !== 'occupied') return false;

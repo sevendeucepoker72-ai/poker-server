@@ -69,7 +69,8 @@ const playOut = (t: PokerTable) => {
   while (t.isHandInProgress() && g++ < 200) {
     if (DRAWS.includes(t.currentPhase)) {
       const d = t as FiveCardDrawTable;
-      for (const s of d.seats) if (s.state === 'occupied' && !s.folded && !s.allIn && s.holeCards.length > 0 && !d.drawsCompleted.has(s.seatIndex)) d.playerDraw(s.seatIndex, []);
+      // gameplay S3 F27 (2026-10-21): an all-in seat draws too (the engine waits for it).
+      for (const s of d.seats) if (s.state === 'occupied' && !s.folded && s.holeCards.length > 0 && !d.drawsCompleted.has(s.seatIndex)) d.playerDraw(s.seatIndex, []);
       continue;
     }
     const a = t.activeSeatIndex;

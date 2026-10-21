@@ -32,7 +32,8 @@ const key = (c: Card) => c.suit * 16 + c.rank;
 
 const INSURANCE_BLOCK = slice('// ========== Table kind (R1 contract #2, 2026-10-11) ==========',
   '  broadcastGameState(tableId); // reflect the adjusted stack to all clients\n}\n');
-const HANDLERS = slice('  const insuranceSessionFor = ', '  // ========== Straddle ==========').replace('  // ========== Straddle ==========', '');
+// F34 (2026-10-21): insuranceSessionFor delegates to the socket-scoped seatSessionFor (F156), declared just before it.
+const HANDLERS = slice('  const seatSessionFor = ', '  // ========== Straddle ==========').replace('  // ========== Straddle ==========', '');
 const STATE = fnSrc('function getVariantInfo(') + fnSrc('function getGameStateForPlayer(');
 // G165 (2026-10-21) — the REAL 'handHistory' listener (emit + recordHand of each seat's copy).
 const HISTORY_LISTENER = slice("  table.on('handHistory', (history: HandHistoryRecord) => {", '\n  });\n');
