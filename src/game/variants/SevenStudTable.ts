@@ -193,6 +193,41 @@ export class SevenStudTable extends PokerTable {
   }
 
   /**
+   * 2026-10-21 (gameplay F38) — Stud / Razz / Stud 8 have NO blinds, so a
+   * player who sits out misses none: no missed-blind debt accrues here. The
+   * base marked the would-be SB / BB seats anyway (from the button) and this
+   * game never collects it (postBlinds above posts antes only): every state
+   * then carried a permanent "Post Blinds: N" debt, and tapping it moved N of
+   * his chips into the pot as dead money.
+   */
+  protected markSittingOutBlinds(): void {
+    /* ante + bring-in game: nothing is ever owed for sitting out */
+  }
+
+  /** F38 — nothing is owed in a game without blinds: any stray debt is cleared, never charged. */
+  postOwedBlindsNow(seatIndex: number): { ok: boolean; amount?: number; reason?: string } {
+    if (seatIndex < 0 || seatIndex >= this.seats.length || this.seats[seatIndex].state === 'empty') {
+      return { ok: false, reason: 'invalid_seat' };
+    }
+    this.clearDeadBlind(seatIndex);
+    return { ok: false, reason: 'no_debt' };
+  }
+
+  /** F22 (2026-10-21) — on Third Street the bring-in is the forced bet a leaver's fold never takes away. */
+  protected forcedBetOfRound(): number {
+    return this.currentPhase === GamePhase.ThirdStreet ? this.getBringInAmount() : 0;
+  }
+
+  /** F22 — facing only the bring-in again, the one raise is the completion (as postBringIn sets it). */
+  protected raiseIncrementAfterLoweredBet(toMatch: number): number {
+    const complete = this.getCompleteAmount();
+    if (this.currentPhase === GamePhase.ThirdStreet && toMatch > 0 && toMatch < complete) {
+      return Math.max(1, complete - toMatch);
+    }
+    return super.raiseIncrementAfterLoweredBet(toMatch);
+  }
+
+  /**
    * Override: use stud/razz evaluation.
    */
   protected evaluatePlayerHand(holeCards: Card[], communityCards: Card[]): HandResult {

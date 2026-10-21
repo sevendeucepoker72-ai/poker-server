@@ -60,6 +60,17 @@ export const SEAT_IDENTITY_SRC: string = [
   fnSrc('function seatBoughtInBy('),
 ].join('\n');
 
+/**
+ * 2026-10-21 (gameplay G165) — the insurance-settlement record the
+ * 'handHistory' listener (ensureTableProgressListener) builds its player rows
+ * through: lastInsuranceSettlement + withInsuranceSettlement. A harness that
+ * slices that listener appends this (they sit in the insurance block).
+ */
+export const INSURANCE_HISTORY_SRC: string = [
+  slice('const lastInsuranceSettlement = ', ';\n'),
+  fnSrc('function withInsuranceSettlement<'),
+].join('\n');
+
 /** The `socket.on('<event>', …)` registration (either layout), through `endNeedle`. */
 export function handlerSrc(event: string, endNeedle: string): string {
   let at = SRC.indexOf(`socket.on('${event}'`);

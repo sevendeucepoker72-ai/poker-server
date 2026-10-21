@@ -1246,3 +1246,26 @@ sameNetworkSeats
 # before the results POST.
 playing_in_tournament
 QUALIFIER_RESULTS_RECORDED
+
+# 2026-10-21 gameplay S1 (pots, dead blinds, money conservation). F1/F2: a dead
+# blind is main-pot money, never a bet (tiers from the LIVE investment); a live
+# seat that is not all-in contests every tier; an orphan tier goes to the
+# deepest live seat, never a shorter all-in. F4: no Post Blinds from a seat
+# dealt into the hand. F5: the live big blind settles the debt. F6: one set at
+# most. F14: a bomb pot gives a dead blind back as debt. F22: a leaver's
+# unmatched top bet is dead money, not a bet to call. F38: Stud / Razz / Stud 8
+# owe no blinds. G165: an insured seat's hand-history row carries the settlement.
+deadMoneyThisHand
+deadMoney: s.deadMoneyThisHand,
+.filter(s => !s.allIn || liveOf(s) >= currentLevel)
+const heirs = contenders.filter(s => liveOf(s) === most)
+reason: 'in_hand'
+missedBlindSetChips(
+restoreRefundedDeadBlind(
+lowerBetAfterOutOfTurnFold(
+forcedBetOfRound()
+s.state === 'occupied' && !s.folded && s.currentBet > this.currentBetToMatch
+ante + bring-in game: nothing is ever owed for sitting out
+withInsuranceSettlement(
+insuranceDelta: Math.round(s.delta)
+lastInsuranceSettlement.delete(tableId);

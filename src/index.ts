@@ -5239,10 +5239,11 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     const serializedHistory = {
       ...history,
       communityCards: history.communityCards.map(serializeCard),
-      players: history.players.map((p) => ({
+      // G165 (2026-10-21) — an insured seat's row carries insuranceDelta / insuranceCashout.
+      players: withInsuranceSettlement(tableId, history.handNumber, history.players.map((p) => ({
         ...p,
         holeCards: p.holeCards ? p.holeCards.map(serializeCard) : null,
-      })),
+      }))),
     };
 
     for (const [socketId, session] of playerSessions) {
@@ -8075,6 +8076,7 @@ function endTableViewsAndTimers(tableId: string): void {
   const pa = pendingAutoStartTimers.get(tableId); if (pa) { clearTimeout(pa); pendingAutoStartTimers.delete(tableId); }
   const ai = aiTimeouts.get(tableId); if (ai) { clearTimeout(ai.handle); aiTimeouts.delete(tableId); }
   insuranceCashouts.delete(tableId);
+  lastInsuranceSettlement.delete(tableId);   // G165
   clearInsuranceOffer(tableId);
 }
 
@@ -8281,6 +8283,36 @@ function insuranceQuoteForSeat(tableId: string, table: PokerTable, seatIndex: nu
 }
 
 /**
+ * 2026-10-21 (gameplay G165) — the insurance settled at the end of a table's
+ * last hand: per seat, the change it APPLIED to the live stack (+ the house
+ * paid, - it collected; after the 0 clamp) and the locked cashout. Written by
+ * settleInsuranceForHand ('handResult', which the engine emits BEFORE
+ * 'handHistory' of the same hand, synchronously), read once by the
+ * 'handHistory' listener (withInsuranceSettlement), cleared with the table.
+ */
+const lastInsuranceSettlement = new Map<string, { handNumber: number; bySeat: Map<number, { delta: number; cashout: number }> }>();
+
+/**
+ * G165 — a hand-history record's player rows, each insured seat's row with two
+ * additive integer fields: `insuranceDelta` (the settlement's applied change:
+ * endChips - startChips + insuranceDelta = the real result of the hand) and
+ * `insuranceCashout`. `endChips` keeps its meaning (the engine's post-pot
+ * stack); it is never re-read from the seat (a leaver may be stood up by then).
+ * Rows of other seats, and every row of a hand without a settlement, are
+ * returned unchanged. Consumes the table's entry.
+ */
+function withInsuranceSettlement<T extends { seatIndex: number }>(tableId: string, handNumber: number, players: T[]): T[] {
+  const rec = lastInsuranceSettlement.get(tableId);
+  if (!rec) return players;
+  lastInsuranceSettlement.delete(tableId);
+  if (rec.handNumber !== handNumber) return players;
+  return players.map((p) => {
+    const s = rec.bySeat.get(p.seatIndex);
+    return s ? { ...p, insuranceDelta: Math.round(s.delta), insuranceCashout: Math.round(s.cashout) } : p;
+  });
+}
+
+/**
  * At hand complete (handleHandComplete, BEFORE bust removal): every insured
  * seat ends the hand with EXACTLY its cashout — the engine already credited
  * its pot winnings, the delta is (cashout - won): > 0 the house pays an
@@ -8294,6 +8326,8 @@ function settleInsuranceForHand(tableId: string, table: PokerTable, totalWonPerS
   const insCashouts = insuranceCashouts.get(tableId);
   if (!insCashouts || insCashouts.length === 0) return;
   insuranceCashouts.delete(tableId);
+  // G165 — what each settlement did to the stack, for this hand's history record.
+  const settledBySeat = new Map<number, { delta: number; cashout: number }>();
   for (const co of insCashouts) {
     const iseat = table.seats[co.seatIndex];
     const voidReason = co.handNumber !== table.handNumber ? 'other_hand'
@@ -8309,7 +8343,10 @@ function settleInsuranceForHand(tableId: string, table: PokerTable, totalWonPerS
     // ends with its cashout PLUS the pots only it could win (never netted away).
     const exclusive = Math.max(0, Math.round(Number(co.exclusive) || 0));
     const delta = insuranceSettlementDelta(co.cashout + exclusive, actualWon);
+    const stackBefore = iseat!.chipCount;
     iseat!.chipCount = Math.max(0, iseat!.chipCount + delta);
+    // G165 — the APPLIED change (after the clamp), keyed to this hand.
+    settledBySeat.set(co.seatIndex, { delta: iseat!.chipCount - stackBefore, cashout: co.cashout });
     insuranceStats.settled++;
     auditLog(co.playerId, delta >= 0 ? 'INSURANCE_PAYOUT' : 'INSURANCE_COLLECT',
       { tableId, seatIndex: co.seatIndex, handNumber: co.handNumber, cashout: co.cashout, equityPct: co.equityPct, pot: co.pot, exclusive, actualWon, delta, newStack: iseat!.chipCount });
@@ -8320,6 +8357,7 @@ function settleInsuranceForHand(tableId: string, table: PokerTable, totalWonPerS
       }
     }
   }
+  if (settledBySeat.size > 0) lastInsuranceSettlement.set(tableId, { handNumber: table.handNumber, bySeat: settledBySeat });
   broadcastGameState(tableId); // reflect the adjusted stack to all clients
 }
 
@@ -16357,6 +16395,8 @@ Give feedback in this JSON format:
         insufficient_chips: 'Not enough chips to post the owed blinds. Rebuy first.',
         invalid_seat: 'Invalid seat.',
         not_in_hand: 'Your owed blinds will be posted automatically when the next hand starts.',
+        // F4 (2026-10-21) — refused while dealt into the hand (collected at a later deal).
+        in_hand: 'Your owed blinds will be collected automatically at the start of a later hand.',
       };
       socket.emit('missedBlindsError', {
         code: result.reason,

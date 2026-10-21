@@ -124,6 +124,7 @@ export class OmahaTable extends PokerTable {
         allIn: s.allIn,
         holeCards: s.holeCards,
         state: s.state,
+        deadMoney: s.deadMoneyThisHand,   // F1/F2 (2026-10-21) — dead blinds go to the main pot
       }));
 
     const nonFolded = seatInfos.filter(s => !s.folded);
@@ -426,6 +427,7 @@ export class OmahaTable extends PokerTable {
     // Reset totalInvestedThisHand
     for (const seat of this.seats) {
       seat.totalInvestedThisHand = 0;
+      seat.deadMoneyThisHand = 0;
     }
 
     this.currentPhase = GamePhase.HandComplete;

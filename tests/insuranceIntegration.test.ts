@@ -34,6 +34,8 @@ const INSURANCE_BLOCK = slice('// ========== Table kind (R1 contract #2, 2026-10
   '  broadcastGameState(tableId); // reflect the adjusted stack to all clients\n}\n');
 const HANDLERS = slice('  const insuranceSessionFor = ', '  // ========== Straddle ==========').replace('  // ========== Straddle ==========', '');
 const STATE = fnSrc('function getVariantInfo(') + fnSrc('function getGameStateForPlayer(');
+// G165 (2026-10-21) — the REAL 'handHistory' listener (emit + recordHand of each seat's copy).
+const HISTORY_LISTENER = slice("  table.on('handHistory', (history: HandHistoryRecord) => {", '\n  });\n');
 
 interface Socket { id: string; emitted: Array<[string, any]>; handlers: Record<string, (d?: any) => void>; emit: (ev: string, d: any) => void; on: (ev: string, fn: any) => void }
 
@@ -47,7 +49,9 @@ function world() {
   const broadcasts: string[] = [];
   const autoStarts: Array<[string, number]> = [];
   const sockets = new Map<string, Socket>();
+  const recorded: Array<{ userId: number; handId: string; rec: any }> = [];
   const scope: Record<string, unknown> = {
+    recordHand: (userId: number, handId: string, rec: any) => { recorded.push({ userId, handId, rec }); return Promise.resolve(); },
     tableManager: { getTable: (id: string) => tables.get(id) },
     playerSessions, multiTableSessions, authSessions,
     isTournamentTable: (id: string) => tournamentIds.has(id),
@@ -67,11 +71,12 @@ function world() {
     bombPotActive: new Map(), dealersChoiceState: new Map(), DEALERS_CHOICE_VARIANTS: [],
   };
   const code = INSURANCE_BLOCK + fnSrc('function seatHasLiveSession(') + STATE
-    + `\nfunction registerInsurance(socket) {\n${HANDLERS}\n}\n`;
+    + `\nfunction registerInsurance(socket) {\n${HANDLERS}\n}\n`
+    + `\nfunction wireHandHistory(tableId, table) {\n${HISTORY_LISTENER}\n}\n`;
   const { exports: m, stubbed } = load(code, scope, `{
     tableKindOf, rebuyAllowedAt, rebuyRefusalAt, insuranceCandidates, ensureInsuranceHoldWired, insuranceQuoteForSeat,
-    releaseInsuranceHold, settleInsuranceForHand, getGameStateForPlayer, registerInsurance,
-    insuranceOffers, insuranceStats, privateTableIds, clubTableIds, INSURANCE_DECISION_MS }`);
+    releaseInsuranceHold, settleInsuranceForHand, getGameStateForPlayer, registerInsurance, wireHandHistory,
+    insuranceOffers, insuranceStats, privateTableIds, clubTableIds, INSURANCE_DECISION_MS, lastInsuranceSettlement }`);
 
   const mkSocket = (id: string): Socket => {
     const s: Socket = {
@@ -137,7 +142,7 @@ function world() {
     }
   };
 
-  return { m, stubbed, scope, tables, playerSessions, multiTableSessions, authSessions, tournamentIds, audits, broadcasts, autoStarts, mkTable, mkSocket, rig, play };
+  return { m, stubbed, scope, tables, playerSessions, multiTableSessions, authSessions, tournamentIds, audits, broadcasts, autoStarts, recorded, mkTable, mkSocket, rig, play };
 }
 
 beforeEach(() => { jest.useFakeTimers(); });
@@ -497,4 +502,69 @@ describe('R1REV-MONEY-1 — an insured seat keeps the side pot only it can win',
       expect(after - before).toBe(settled.delta);
     });
   }
+});
+
+describe('G165 (2026-10-21) — the hand-history record of an insured hand carries the settlement', () => {
+  const histories = (s: any) => s.emitted.filter(([ev]: [string]) => ev === 'handHistory').map(([, d]: [string, any]) => d);
+  const rowOf = (h: any, seat: number) => h.players.find((p: any) => p.seatIndex === seat);
+  /** endChips - startChips + insuranceDelta must be the real change of the live stack (old: the delta was missing). */
+  const realNet = (row: any) => row.endChips - row.startChips + (row.insuranceDelta ?? 0);
+
+  for (const [name, board, endChips] of [
+    ['OUTDRAWN (QQ holds): record 1000 -> 0, the house paid the cashout', '2c 7d 9s 3h 4c', 0],
+    ['HERO WINS the runout: record 1000 -> 2000, the house collected the margin', 'Ac 7d 9s 3h 4c', 2000],
+  ] as const) {
+    it(name, () => {
+      const w = world();
+      const { t, hero } = w.mkTable();
+      w.m.wireHandHistory('T1', t);
+      t.startNewHand();
+      w.rig(t, 'Ah Kh', 'Qs Qd', board);
+      w.play(t);
+      const q = w.m.insuranceQuoteForSeat('T1', t, 0);
+      hero.handlers.acceptInsurance({ tableId: 'T1', handNumber: t.handNumber });
+      expect(t.currentPhase).toBe(GamePhase.HandComplete);
+      expect(t.seats[0].chipCount).toBe(q.cashout);
+      const [h] = histories(hero);
+      const row = rowOf(h, 0);
+      expect(row).toMatchObject({ startChips: 1000, endChips, insuranceCashout: q.cashout, insuranceDelta: q.cashout - endChips });
+      expect(realNet(row)).toBe(t.seats[0].chipCount - 1000);      // was endChips - startChips: -1000 / +1000
+      expect(rowOf(h, 1)).not.toHaveProperty('insuranceDelta');   // the uninsured seat is unchanged
+      // The stored copy (Recent Hands / bankroll after a reload) carries it too.
+      expect(w.recorded).toHaveLength(1);
+      expect(rowOf(w.recorded[0].rec, 0)).toMatchObject({ insuranceDelta: row.insuranceDelta, insuranceCashout: q.cashout });
+      // Consumed: the next hand's record has nothing.
+      expect(w.m.lastInsuranceSettlement.size).toBe(0);
+      expect(t.startNewHand()).toBe(true);
+      for (let g = 0; g < 5 && t.isHandInProgress(); g++) t.playerFold(t.activeSeatIndex);
+      const second = histories(hero)[1];
+      expect(second.players.some((p: any) => 'insuranceDelta' in p)).toBe(false);
+    });
+  }
+
+  it('CHOP with both seats insured: each row nets to its own live stack change', () => {
+    const w = world();
+    const { t, hero, villain } = w.mkTable({ heroStack: 1000, villainStack: 1000, villainHuman: true });
+    w.m.wireHandHistory('T1', t);
+    t.startNewHand();
+    w.rig(t, 'Ah Kh', 'Ad Kd', '2c 7s 9s 3h 4c');                 // same hand: the pot is split
+    for (let g = 0; g < 10 && t.isHandInProgress() && !t.isRunoutHeld(); g++) expect(t.playerAllIn(t.activeSeatIndex)).toBe(true);
+    expect(t.isRunoutHeld()).toBe(true);
+    const qh = w.m.insuranceQuoteForSeat('T1', t, 0);
+    const qv = w.m.insuranceQuoteForSeat('T1', t, 1);
+    hero.handlers.acceptInsurance({ tableId: 'T1', handNumber: t.handNumber });
+    villain!.handlers.acceptInsurance({ tableId: 'T1', handNumber: t.handNumber });
+    expect(t.currentPhase).toBe(GamePhase.HandComplete);
+    const [h] = histories(hero);
+    expect(rowOf(h, 0)).toMatchObject({ endChips: 1000, insuranceCashout: qh.cashout, insuranceDelta: qh.cashout - 1000 });
+    expect(rowOf(h, 1)).toMatchObject({ endChips: 1000, insuranceCashout: qv.cashout, insuranceDelta: qv.cashout - 1000 });
+    expect(realNet(rowOf(h, 0))).toBe(t.seats[0].chipCount - 1000);
+    expect(realNet(rowOf(h, 1))).toBe(t.seats[1].chipCount - 1000);
+    expect(histories(villain)[0].players).toEqual(h.players);
+  });
+
+  it('wiring: the live listener builds its rows through withInsuranceSettlement; the table teardown clears the entry', () => {
+    expect(HISTORY_LISTENER).toContain('players: withInsuranceSettlement(tableId, history.handNumber, history.players.map(');
+    expect(fnSrc('function endTableViewsAndTimers(')).toContain('lastInsuranceSettlement.delete(tableId);');
+  });
 });

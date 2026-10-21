@@ -13,6 +13,12 @@ export interface SeatInfo {
   allIn: boolean;
   holeCards: Card[];
   state: 'empty' | 'occupied' | 'sitting_out';
+  /**
+   * 2026-10-21 (gameplay F1/F2) — the part of totalInvestedThisHand that is a
+   * DEAD blind (missed-blind debt posted at the deal or by Post Blinds): it is
+   * in the pot but is not a bet. Optional (absent = 0). See calculatePots.
+   */
+  deadMoney?: number;
 }
 
 export interface Pot {
@@ -55,6 +61,23 @@ export class SidePotManager {
    * highest invested amount among non-folded players (the top of the live
    * action). Folded players contribute their chips to whichever tier their
    * total investment falls into, but never create a new tier themselves.
+   *
+   * 2026-10-21 (gameplay F1/F2) — three rules fixed:
+   *  - ELIGIBILITY: a live seat that is NOT all-in is never capped — it has
+   *    matched every bet (or can still), so it contests EVERY tier, including
+   *    one built only from a folded seat's chips above it. Only an all-in seat
+   *    is capped at its own amount. The old test (`invested >= tier level`,
+   *    and only for a seat that put chips INTO that tier) made a returning
+   *    player whose dead blind lifted his total above everyone else's the ONLY
+   *    eligible seat of the top (= only) tier: he won every showdown unseen.
+   *  - DEAD BLINDS (`deadMoney`) are not bets: tiers, caps and eligibility are
+   *    built from each seat's LIVE investment (total - dead), and all dead
+   *    money forms a first pot every non-folded seat contests (the "main pot"
+   *    convention — it was in the middle before anyone went all-in). It
+   *    merges into the main pot whenever the eligible sets agree.
+   *  - ORPHAN tier (nobody eligible = every live seat is all-in below it):
+   *    only the live seat(s) that invested the most inherit it, never a short
+   *    all-in that never covered it (it used to go to EVERY live seat).
    */
   calculatePots(seats: SeatInfo[], dealerSeat?: number): Pot[] {
     const investedSeats = seats.filter(
@@ -63,23 +86,38 @@ export class SidePotManager {
 
     if (investedSeats.length === 0) return [];
 
+    // F1/F2 — the dead part of a seat's investment (never more than it put in).
+    const deadOf = (s: SeatInfo): number =>
+      Math.max(0, Math.min(s.totalInvestedThisHand, Math.floor(Number(s.deadMoney) || 0)));
+    const liveOf = (s: SeatInfo): number => s.totalInvestedThisHand - deadOf(s);
+    // Every seat still contesting the pot (not only the ones that invested).
+    const contenders = seats.filter(s => s.state === 'occupied' && !s.folded);
+    const deadTotal = investedSeats.reduce((sum, s) => sum + deadOf(s), 0);
+
     // Cap levels come from all-in (non-folded) players + the highest non-folded
     // investment. Folded players DO NOT create cap levels.
     const allInCaps = investedSeats
       .filter(s => s.allIn && !s.folded)
-      .map(s => s.totalInvestedThisHand);
-
-    const nonFolded = investedSeats.filter(s => !s.folded);
+      .map(s => liveOf(s));
 
     // topCap must cover ALL invested chips — including folded players' dead money.
     // A folded player who raised 114 then folded still has 114 chips in the pot
     // that need a tier to flow into. Using only non-folded max would lose those chips.
-    const topCap = Math.max(...investedSeats.map(s => s.totalInvestedThisHand));
+    const topCap = Math.max(...investedSeats.map(s => liveOf(s)));
 
     const capLevels = [...new Set([...allInCaps, topCap])].sort((a, b) => a - b);
 
     const pots: Pot[] = [];
     let previousLevel = 0;
+
+    // F1/F2 — dead blinds: one pot, contested by every seat still in the hand.
+    if (deadTotal > 0) {
+      pots.push({
+        amount: deadTotal,
+        eligibleSeatIndices: contenders.map(s => s.seatIndex),
+        name: 'Main Pot',
+      });
+    }
 
     for (let i = 0; i < capLevels.length; i++) {
       const currentLevel = capLevels[i];
@@ -88,46 +126,39 @@ export class SidePotManager {
       if (increment <= 0) continue;
 
       let potAmount = 0;
-      const eligible: number[] = [];
 
       for (const seat of investedSeats) {
         // Each seat contributes up to 'increment' for this tier (capped by
-        // their actual investment minus what they've already put into lower
-        // tiers).
+        // their actual LIVE investment minus what they've already put into
+        // lower tiers).
         const seatContribution = Math.min(
-          Math.max(0, seat.totalInvestedThisHand - previousLevel),
+          Math.max(0, liveOf(seat) - previousLevel),
           increment
         );
-        if (seatContribution > 0) {
-          potAmount += seatContribution;
-          // Only non-folded players are eligible to win.
-          // A player is also only eligible for tiers they actually filled —
-          // i.e., their totalInvestedThisHand >= currentLevel.
-          if (!seat.folded && seat.totalInvestedThisHand >= currentLevel) {
-            eligible.push(seat.seatIndex);
-          }
-        }
+        if (seatContribution > 0) potAmount += seatContribution;
       }
 
-      // If no one is eligible (all contributors folded), award the dead money
-      // to the non-folded players still in the hand — they inherit it.
+      // F1 — only non-folded players are eligible to win; an ALL-IN one only
+      // for tiers it filled (live investment >= this level); a live seat that
+      // is not all-in for every tier (whether or not it put chips into it).
+      const eligible: number[] = contenders
+        .filter(s => !s.allIn || liveOf(s) >= currentLevel)
+        .map(s => s.seatIndex);
+
+      // If no one is eligible (every live seat is all-in below this level —
+      // its chips came from seats that folded), the live seat(s) that invested
+      // the MOST inherit it (F2: never a shorter all-in that did not cover it).
       // TDA Rule 43: orphan / odd chip goes clockwise from dealer. Order the
       // candidates clockwise so a single effectively-eligible player gets the
       // pot outright, and multi-candidate inheritance lists are consistently
       // ordered for downstream split math.
-      if (potAmount > 0 && eligible.length === 0) {
-        const nonFoldedInHand = investedSeats
-          .filter(s => !s.folded)
-          .map(s => s.seatIndex);
+      if (potAmount > 0 && eligible.length === 0 && contenders.length > 0) {
+        const most = Math.max(...contenders.map(s => liveOf(s)));
+        const heirs = contenders.filter(s => liveOf(s) === most).map(s => s.seatIndex);
         const ordered = dealerSeat !== undefined
-          ? SidePotManager.orderClockwiseFromDealer(nonFoldedInHand, dealerSeat, TABLE_SEAT_COUNT)
-          : nonFoldedInHand;
-        if (ordered.length === 1) {
-          // Single effectively-eligible player — they get the orphan pot.
-          eligible.push(ordered[0]);
-        } else {
-          eligible.push(...ordered);
-        }
+          ? SidePotManager.orderClockwiseFromDealer(heirs, dealerSeat, TABLE_SEAT_COUNT)
+          : heirs;
+        eligible.push(...ordered);
       }
 
       if (potAmount > 0) {

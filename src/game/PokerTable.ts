@@ -38,6 +38,9 @@ export enum GamePhase {
   SeventhStreet = 'SeventhStreet',
 }
 
+/** F22 (2026-10-21) — a draw round has no bet to lower (its bets were rolled into the pot). */
+const NO_BETTING_PHASES: readonly GamePhase[] = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
+
 export enum PlayerAction {
   None = 'None',
   Fold = 'Fold',
@@ -73,6 +76,15 @@ export interface Seat {
    * successful post.
    */
   deadBlindOwedChips: number;
+  /**
+   * 2026-10-21 (gameplay F1/F2/F14) — the chips of totalInvestedThisHand this
+   * seat posted THIS HAND as a dead blind (its missed-blind debt, collected at
+   * the deal or by Post Blinds). Dead money is in the pot but is not a bet:
+   * SidePotManager builds tiers and eligibility from the live part only and
+   * puts the dead part in the main pot. A bomb pot gives it back AS DEBT.
+   * Reset every deal.
+   */
+  deadMoneyThisHand: number;
 }
 
 export interface TableConfig {
@@ -175,6 +187,7 @@ function createEmptySeat(index: number): Seat {
     timeBankRemaining: 30,
     missedBlind: 'none',
     deadBlindOwedChips: 0,
+    deadMoneyThisHand: 0,
   };
 }
 
@@ -404,6 +417,7 @@ export class PokerTable extends EventEmitter {
     // dead-blind debt on their first hand.
     seat.missedBlind = 'none';
     seat.deadBlindOwedChips = 0;
+    seat.deadMoneyThisHand = 0;
     // Also drop the seat from the sitting-out set if it was still in
     // there — the new occupant is not sitting out.
     this._sittingOutSeats.delete(seatIndex);
@@ -429,9 +443,14 @@ export class PokerTable extends EventEmitter {
 
   /**
    * TDA Rule 6-9: Mark a seat as having missed their blind obligation.
-   * Updates the status flag (`missedBlind`) AND accumulates the chip debt
-   * (`deadBlindOwedChips`) so a seat that sits out multiple rotations
-   * correctly owes multiple BB+SB rather than a single BB.
+   * Updates the status flag (`missedBlind`) AND the chip debt
+   * (`deadBlindOwedChips`).
+   *
+   * 2026-10-21 (gameplay F6) — the debt is ONE set at most, however long the
+   * player was away (the standard missed-blind rule): a missed small blind
+   * owes the SB, a missed big blind the BB, both the SB + BB. It used to add a
+   * SB + BB for every orbit sat out (225 after 12 hands at 25/50; a short
+   * stack back from a long sit-out was put all-in on dead money unseen).
    *
    * Accepts seats in any state — including `sitting_out` — because the
    * whole point is that a sitting-out player is the one who owes. Was
@@ -453,9 +472,17 @@ export class PokerTable extends EventEmitter {
     ) {
       seat.missedBlind = 'both';
     }
-    // Accumulate chip debt. Small = smallBlind, Big = bigBlind.
+    // Accumulate chip debt. Small = smallBlind, Big = bigBlind — capped at
+    // the one set the flag names (F6).
     const delta = blindType === 'big' ? this.config.bigBlind : this.config.smallBlind;
-    seat.deadBlindOwedChips = (seat.deadBlindOwedChips || 0) + delta;
+    seat.deadBlindOwedChips = Math.min(this.missedBlindSetChips(seat.missedBlind), (seat.deadBlindOwedChips || 0) + delta);
+  }
+
+  /** F6 — the most a missed-blind flag can owe: the one SB / BB / SB + BB it names. */
+  protected missedBlindSetChips(flag: Seat['missedBlind']): number {
+    const sb = this.config.smallBlind;
+    const bb = this.config.bigBlind;
+    return flag === 'both' ? sb + bb : flag === 'big' ? bb : flag === 'small' ? sb : 0;
   }
 
   /**
@@ -548,6 +575,7 @@ export class PokerTable extends EventEmitter {
    * Returns:
    *   { ok: true, amount } — chips deducted, debt cleared, pot incremented
    *   { ok: false, reason } — 'no_debt' | 'insufficient_chips' | 'invalid_seat'
+   *                           | 'not_in_hand' | 'in_hand' (F4: dealt into this hand)
    *
    * The deducted chips go into the pot as DEAD money: they increment
    * `totalInvestedThisHand` but NOT `currentBet`, so they don't count
@@ -563,12 +591,20 @@ export class PokerTable extends EventEmitter {
     // Leave the debt intact (don't clearDeadBlind); it's collected
     // automatically when the next hand deals. 2026-07-01 audit #8.
     if (!this.isHandInProgress()) return { ok: false, reason: 'not_in_hand' };
+    // 2026-10-21 (gameplay F4) — never from a seat DEALT INTO this hand: a live
+    // player could pick the hand (after seeing his cards) to add dead money,
+    // and a stack equal to the debt went "all-in" on the clock without
+    // calling, freezing the hand until the watchdog. His debt stays on the
+    // seat and is collected at a later deal (postBlinds). A seat sitting this
+    // hand out (folded, no cards) may still post — the Post Blinds flow.
+    if (!seat.folded && seat.holeCards.length > 0) return { ok: false, reason: 'in_hand' };
     const owed = seat.deadBlindOwedChips || 0;
     if (owed <= 0) return { ok: false, reason: 'no_debt' };
     if (seat.chipCount < owed) return { ok: false, reason: 'insufficient_chips' };
 
     seat.chipCount -= owed;
     seat.totalInvestedThisHand += owed;
+    seat.deadMoneyThisHand = (seat.deadMoneyThisHand || 0) + owed;   // F1 — dead, not a bet
     // No currentBet change — dead money doesn't count toward the call.
     if (seat.chipCount === 0) seat.allIn = true;
     this.clearDeadBlind(seatIndex);
@@ -722,6 +758,7 @@ export class PokerTable extends EventEmitter {
       if (seat.state === 'occupied') {
         seat.currentBet = 0;
         seat.totalInvestedThisHand = 0;
+        seat.deadMoneyThisHand = 0;
         seat.holeCards = [];
         seat.lastAction = PlayerAction.None;
         // 2026-06-11 audit C11/C12 (full exclusion): a sitting-out player is
@@ -932,6 +969,16 @@ export class PokerTable extends EventEmitter {
       bbSeat = -1;
     }
 
+    // 2026-10-21 (gameplay F5) — a player back in time for his BIG BLIND owes
+    // nothing more (standard rule: post the missed blinds, OR wait for the big
+    // blind): the live BB he posts below settles the debt. It used to be kept
+    // (this hand was only skipped below) and taken as dead money two hands
+    // later. bbSeat is already -1 for a big blind that is still sitting out,
+    // so a debt that is still growing is never wiped here.
+    if (bbSeat !== -1 && (this.seats[bbSeat].deadBlindOwedChips || 0) > 0) {
+      this.clearDeadBlind(bbSeat);
+    }
+
     // TDA Rule 6-9: Handle missed blinds — players returning with debt
     // auto-pay from their stack at the start of the hand (if they have
     // enough). Uses `deadBlindOwedChips` as the authoritative amount
@@ -950,6 +997,7 @@ export class PokerTable extends EventEmitter {
         if (postAmount > 0) {
           seat.chipCount -= postAmount;
           seat.totalInvestedThisHand += postAmount;
+          seat.deadMoneyThisHand = (seat.deadMoneyThisHand || 0) + postAmount;   // F1 — dead, not a bet
           // Dead blind doesn't count toward currentBet — it's dead money
           if (seat.chipCount === 0) seat.allIn = true;
           this.emit('blindPosted', { seatIndex: seatIdx, amount: postAmount, type: 'dead' });
@@ -1299,7 +1347,50 @@ export class PokerTable extends EventEmitter {
       street: this.currentPhase,
     });
     this.emit('playerAction', { seatIndex, action: PlayerAction.Fold, amount: 0 });
+    this.lowerBetAfterOutOfTurnFold(seat);
     return true;
+  }
+
+  /**
+   * 2026-10-21 (gameplay F22) — a seat folded OUT OF TURN (its player left)
+   * that held the TOP bet nobody still in the hand has matched: that bet is
+   * dead money now (it stays in the pot, layered by SidePotManager), not a bet
+   * anyone faces. The bet to match drops to the highest bet still live, so the
+   * player on the clock may check instead of calling a hand that no longer
+   * exists — before, a check was refused, and folding (also the turn timer's
+   * answer to a bet) handed a short all-in the leaver's chips and the main pot.
+   * The round's FORCED bet stays the bet (the big blind pre-flop, as postBlinds
+   * keeps it for a dead BB; Stud's bring-in). The min-raise follows. A seat
+   * the leaver's raise had reopened still gets its turn (owes()). The decision
+   * point changed, so stateVersion moves (a stale "call" is refused).
+   */
+  private lowerBetAfterOutOfTurnFold(folded: Seat): void {
+    if (!this.isHandInProgress() || this.currentPhase === GamePhase.Showdown) return;
+    if (NO_BETTING_PHASES.includes(this.currentPhase)) return;
+    const top = this.currentBetToMatch;
+    if (top <= 0 || folded.currentBet < top) return;
+    const live = this.playersInHand();
+    if (live.length === 0) return;
+    const floor = Math.min(top, this.forcedBetOfRound());
+    const highestLive = Math.max(floor, ...live.map(s => s.currentBet));
+    if (highestLive >= top) return;
+    this.currentBetToMatch = highestLive;
+    this.lastRaiseAmount = this.raiseIncrementAfterLoweredBet(highestLive);
+    if (this.raisesThisStreet > 0) this.raisesThisStreet--;
+    this.betLevelsThisStreet = highestLive > 0 ? Math.max(0, this.betLevelsThisStreet - 1) : 0;
+    if (this.lastAggressorSeat === folded.seatIndex) this.lastAggressorSeat = -1;
+    this.stateVersion++;
+  }
+
+  /** F22 — the forced bet of this betting round no fold can take away: the big blind pre-flop (Stud overrides: the bring-in). */
+  protected forcedBetOfRound(): number {
+    return this.currentPhase === GamePhase.PreFlop ? (this.handBigBlind || this.config.bigBlind) : 0;
+  }
+
+  /** F22 — the min-raise increment once the bet to match was lowered to `toMatch`: never above the live bet, never under a big blind. */
+  protected raiseIncrementAfterLoweredBet(toMatch: number): number {
+    const bb = this.handBigBlind || this.config.bigBlind;
+    return Math.max(bb, Math.min(this.lastRaiseAmount, toMatch));
   }
 
   /**
@@ -1572,6 +1663,11 @@ export class PokerTable extends EventEmitter {
     if (!Number.isFinite(ante) || ante <= 0) return false;
     for (const seat of this.seats) {
       if (seat.state !== 'occupied' || seat.eliminated) continue;
+      // 2026-10-21 (gameplay F14) — a dead blind returned with the rest is
+      // still OWED: restore it as debt (collected at the next normal deal).
+      // It used to be refunded with the debt already cleared — the missed
+      // blinds of a player whose first hand back was a bomb pot were forgiven.
+      this.restoreRefundedDeadBlind(seat);
       // Return what was posted this hand (blinds, antes, a dead blind).
       seat.chipCount += seat.totalInvestedThisHand;
       seat.totalInvestedThisHand = 0;
@@ -1597,6 +1693,24 @@ export class PokerTable extends EventEmitter {
       this.runOutBoard();
     }
     return true;
+  }
+
+  /**
+   * F14 (2026-10-21) — the dead blind a seat posted this hand goes back on its
+   * debt (the caller refunds the chips with the rest of what was posted), and
+   * its 'posted dead blind N' log line goes too: that post never counted.
+   */
+  private restoreRefundedDeadBlind(seat: Seat): void {
+    const dead = seat.deadMoneyThisHand || 0;
+    seat.deadMoneyThisHand = 0;
+    if (dead <= 0) return;
+    seat.deadBlindOwedChips = (seat.deadBlindOwedChips || 0) + dead;
+    if (seat.missedBlind === 'none') {
+      const { smallBlind: sb, bigBlind: bb } = this.config;
+      seat.missedBlind = seat.deadBlindOwedChips >= sb + bb ? 'both' : seat.deadBlindOwedChips >= bb ? 'big' : 'small';
+    }
+    const at = this.actionLog.findIndex(a => a.seatIndex === seat.seatIndex && a.action.startsWith('posted dead blind '));
+    if (at >= 0) this.actionLog.splice(at, 1);
   }
 
   /**
@@ -1788,9 +1902,11 @@ export class PokerTable extends EventEmitter {
         problems.push(`activeSeatIndex ${this.activeSeatIndex} cannot act while round is open`);
       }
     }
-    // No occupied seat may be "over" the current bet-to-match.
+    // No occupied seat still in the hand may be "over" the current bet-to-match
+    // (F22, 2026-10-21: a seat folded out of turn can be — its bet is dead
+    // money once nobody live faces it, see lowerBetAfterOutOfTurnFold).
     for (const s of this.seats) {
-      if (s.state === 'occupied' && s.currentBet > this.currentBetToMatch) {
+      if (s.state === 'occupied' && !s.folded && s.currentBet > this.currentBetToMatch) {
         problems.push(`seat ${s.seatIndex} currentBet ${s.currentBet} > toMatch ${this.currentBetToMatch}`);
       }
     }
@@ -2121,6 +2237,7 @@ export class PokerTable extends EventEmitter {
         allIn: s.allIn,
         holeCards: s.holeCards,
         state: s.state,
+        deadMoney: s.deadMoneyThisHand,   // F1/F2 — dead blinds go to the main pot
       }));
 
     // Check if only one player remains (everyone else folded)
@@ -2396,6 +2513,7 @@ export class PokerTable extends EventEmitter {
     // Reset totalInvestedThisHand
     for (const seat of this.seats) {
       seat.totalInvestedThisHand = 0;
+      seat.deadMoneyThisHand = 0;
     }
 
     this.currentPhase = GamePhase.HandComplete;
@@ -2503,6 +2621,7 @@ export class PokerTable extends EventEmitter {
         allIn: s.allIn,
         holeCards: s.holeCards,
         state: s.state,
+        deadMoney: s.deadMoneyThisHand,   // F1/F2
       }));
 
     // Only split into side pots when at least one player is actually all-in.
@@ -2692,6 +2811,7 @@ export class PokerTable extends EventEmitter {
         timeBankRemaining: s.timeBankRemaining,
         missedBlind: s.missedBlind,
         deadBlindOwedChips: s.deadBlindOwedChips,
+        deadMoneyThisHand: s.deadMoneyThisHand,
       })),
       sittingOutSeats: Array.from(this._sittingOutSeats),
       deck: this.deck.serialize(),
@@ -2782,6 +2902,8 @@ export interface PokerTableSnapshot {
     timeBankRemaining: number;
     missedBlind: 'none' | 'small' | 'big' | 'both';
     deadBlindOwedChips: number;
+    /** F1 (2026-10-21) — optional: older snapshots lack it (rehydrate keeps the seat's 0). */
+    deadMoneyThisHand?: number;
   }>;
   sittingOutSeats: number[];
   deck: { commitment: { seed: string; hash: string; handNumber: number } | null; currentIndex: number };

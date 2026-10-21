@@ -27,7 +27,7 @@ jest.mock('../src/auth/authManager', () => ({
   addChipsToUser: jest.fn(async () => true), addStarsToUser: jest.fn(async () => true), mergeUserStats: jest.fn(async () => {}),
 }));
 
-import { fnSrc, load, flush, SEAT_IDENTITY_SRC } from './helpers/indexSource';
+import { fnSrc, load, flush, SEAT_IDENTITY_SRC, INSURANCE_HISTORY_SRC } from './helpers/indexSource';
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
 import { HandRank } from '../src/game/HandEvaluator';
 import { ProgressionManager } from '../src/progression/ProgressionManager';
@@ -41,6 +41,7 @@ const HAND_COMPLETE = fnSrc('async function handleHandComplete(');
 const R3_HELPERS = [
   fnSrc('function chipsWonSeatsOfHand('), fnSrc('function dealtInSeatAccount('), fnSrc('function handHistoryViewerOf('), SEAT_IDENTITY_SRC,
   fnSrc('function seatPlayedByAnotherAccount('),
+  INSURANCE_HISTORY_SRC,   // G165 — the listener's player rows go through withInsuranceSettlement
 ].join('\n');
 
 function world(opts: { tableKind?: string; humanName?: string } = {}) {
