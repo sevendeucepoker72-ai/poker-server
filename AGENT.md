@@ -220,7 +220,22 @@ credits and each entry consume a credit". Each rule is ONE constant in
 - Lobby item: `reEntriesLeft` = his unused credits of the tier from the CACHED
   credit list (never awaited by the 10 s lobby poll), plus `creditsHeld`,
   `maxReEntries`, `reEntries` (CONTRACTS.md). Rig: scratchpad
-  `qrig/scenario-latere.js`.
+  `qrig/scenario-latere.js`. The cached list follows every consume / refund /
+  issued credit this server makes at once (`noteQualifierCreditChange`, called
+  from the three master-credit transport helpers — a new credit path must go
+  through them), and a list read in flight across such a change is never
+  cached as fresh (`qualifierCacheGen`).
+- **Ships only with mono `d01522e6`** (the master's consume: `FOR UPDATE` +
+  `redeemed_at IS NULL`). The older API answers two concurrent consumes for one
+  player with the SAME credit id; `qualifierCreditHeldByConcurrentEntry` then
+  keeps that credit (no refund, the second call refused) when the other call
+  has already recorded it, but only the API fix closes every ordering.
+- Known limit (pre-existing, owner to decide): a qualifier still ENDS the
+  moment one entrant is left, even before 2 PM (`TournamentManager`
+  `alivePlayers.length <= 1` → `finishTournament`); later late entries and
+  re-entries are then refused `registration_closed`. And a consume the master
+  commits after the 6 s abort is lost (`credit_error`, no id to refund) —
+  needs a master idempotency key.
 
 ### Recovering a qualifier's finish order (the results POST never landed)
 

@@ -25,7 +25,7 @@ import {
   QUALIFIER_BASE_STACK, QUALIFIER_LATE_REG_MS, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft,
 } from '../src/game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from '../src/game/qualifierNoShow';
-import { SRC, slice, fnSrc, handlerSrc, load, flush } from './helpers/indexSource';
+import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
 
 // The master's REAL answer (captured from prod 2026-10-11, read-only): one weekly event + a TOC with no time.
 const MASTER_BODY = {
@@ -193,7 +193,7 @@ function world(opts: { now?: number } = {}) {
   const { exports: m } = load(`${CODE}\nfunction wire(socket) {\n  ${HANDLERS}\n}`, scope, `{
     wire, applyQualifierSchedule, qualifierList, qualifierEventFor, markQualifierFinished, emitTournamentFinishedToEntrants,
     tickQualifierAutoStart, postQualifierResults, cancelQualifierEvent, qualifierLateEntries, qualifierResultPosts,
-    qualifierNoShows, tellQualifierNoShowReleases,
+    qualifierNoShows, tellQualifierNoShowReleases, qualifierCreditHeldByConcurrentEntry,
   }`);
   const emitted: Array<[string, string, any]> = [];
   const mkSocket = (id: string, userId: number | null, master: string | null, name = 'Player') => {
@@ -747,6 +747,140 @@ describe('2026-10-22 (owner: "late entries until 2pm, re entries if they have mo
     expect(w.audits.find((x) => x.action === 'QUALIFIER_REENTRY_CREDIT_REFUND')?.d).toMatchObject({ creditId: 'credit-3', reason: 'already_reentered' });
   });
 
+  // ── Review fix-up of 7dad8e0 ──────────────────────────────────────────────
+  /** The master BEFORE mono d01522e6: two concurrent consumes for one player both answer the SAME credit row. */
+  function sharedCreditMaster(w: any) {
+    let n = 0;
+    let pendingShared: string | null = null;
+    w.scope.consumeQualifierCreditOnMaster = async (masterId: string, tier: string, _q: string, label: string) => {
+      w.consumed.push({ masterId, tier, label });
+      // A second call while the first's credit is "in flight" gets the same id.
+      const id = pendingShared ?? `shared-${++n}`;
+      pendingShared = id;
+      await Promise.resolve();
+      setImmediate(() => { pendingShared = null; });
+      return { consumed: true, creditId: id };
+    };
+  }
+
+  it('review fix-up — the OLD master gives two concurrent re-entries the SAME credit: one seat, that credit KEPT (it used to be refunded: a free re-entry)', async () => {
+    const { w, tid, t, qt } = field(10 * MIN);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);                                                            // credit-1, the first entry
+    bust(w, tid, t, 'user-101');
+    sharedCreditMaster(w);
+    const a2 = w.mkSocket('SA2', ALICE, 'm-alice', 'Alice');
+    await Promise.all([enter(a), enter(a2)]);
+    await flush();
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 're-entry', 're-entry']);
+    const entry = qt.players.find((p: any) => p.masterPlayerId === 'm-alice');
+    const shared = entry.reentryCreditIds[0];
+    expect(entry).toMatchObject({ reEntries: 1, reentryCreditIds: [shared] });
+    expect(liveSeatsOf(t, 'user-101')).toHaveLength(1);
+    expect(w.creditRefunds).toEqual([]);                                       // the one credit redeemed pays for the one seat
+    const results = [...w.of('SA', 'qualifierRegistrationResult').slice(1), ...w.of('SA2', 'qualifierRegistrationResult')];
+    expect(results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ success: true, reentry: true }),
+      expect.objectContaining({ success: false, code: 'already_registered', registered: true }),
+    ]));
+    expect(w.m.qualifierLateEntries.sharedCreditKept).toBe(1);
+    expect(w.audits.filter((x) => x.action === 'QUALIFIER_REENTRY_CREDIT_SHARED_KEPT').map((x) => x.d)).toEqual([{ qualifierId: WEEKLY, creditId: shared }]);
+    expect(w.audits.some((x) => x.action === 'QUALIFIER_REENTRY_CREDIT_REFUND')).toBe(false);
+
+    // A double tap on ONE socket (it would have been refused seated_elsewhere — and refunded) is kept too.
+    bust(w, tid, t, 'user-101');
+    await Promise.all([enter(a), enter(a)]);
+    await flush();
+    expect(liveSeatsOf(t, 'user-101')).toHaveLength(1);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.m.qualifierLateEntries.sharedCreditKept).toBe(2);
+    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-alice').reEntries).toBe(2);
+  });
+
+  it('review fix-up — the OLD master gives two concurrent FIRST entries the same credit: one entry, that credit kept (not refunded)', async () => {
+    const w = world();
+    w.sync(Date.now() + H);
+    sharedCreditMaster(w);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    const a2 = w.mkSocket('SA2', ALICE, 'm-alice', 'Alice');
+    await Promise.all([enter(a), enter(a2)]);
+    await flush();
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    expect(qt.players).toHaveLength(1);
+    expect(w.consumed).toHaveLength(2);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.audits.filter((x) => x.action === 'QUALIFIER_ENTRY_CREDIT_SHARED_KEPT').map((x) => x.d)).toEqual([{ qualifierId: WEEKLY, creditId: qt.players[0].consumedCreditId }]);
+    expect([...w.of('SA', 'qualifierRegistrationResult'), ...w.of('SA2', 'qualifierRegistrationResult')]).toEqual(expect.arrayContaining([
+      expect.objectContaining({ success: true, registered: true }),
+      expect.objectContaining({ success: false, code: 'already_registered' }),
+    ]));
+  });
+
+  it('review fix-up — the shared-credit test: only an id the SAME account\'s entry recorded during this call (not one it held before)', () => {
+    const held = world().m.qualifierCreditHeldByConcurrentEntry;
+    expect(held({ consumedCreditId: 'c1' }, 'c1')).toBe(true);
+    expect(held({ consumedCreditId: 'c1', reentryCreditIds: ['c2'] }, 'c2')).toBe(true);
+    expect(held({ consumedCreditId: 'c1', reentryCreditIds: ['c2'] }, 'c3')).toBe(false);   // the NEW master: distinct ids
+    expect(held({ consumedCreditId: 'c1' }, 'c1', new Set(['c1']))).toBe(false);             // he held it before this call
+    expect(held(undefined, 'c1')).toBe(false);
+    expect(held({ consumedCreditId: 'c1' }, null)).toBe(false);
+  });
+
+  /** Two re-entries of one account in flight: the first answered at once, the second when `release` is called. */
+  function overlappingReentries(w: any) {
+    const gate = deferred();
+    let n = 1;
+    w.scope.consumeQualifierCreditOnMaster = async (masterId: string, tier: string, _q: string, label: string) => {
+      w.consumed.push({ masterId, tier, label });
+      const id = `credit-${++n}`;
+      if (n === 3) await gate.p;
+      return { consumed: true, creditId: id };
+    };
+    return gate;
+  }
+
+  it('review fix-up — overlapping re-entries with a bust in between: BOTH count (reEntries 2, not prior + 1), two credits, one live seat', async () => {
+    const { w, tid, t, qt } = field(10 * MIN);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);                                                            // credit-1
+    bust(w, tid, t, 'user-101');
+    const gate = overlappingReentries(w);
+    const a2 = w.mkSocket('SA2', ALICE, 'm-alice', 'Alice');
+    const p1 = enter(a);
+    const p2 = enter(a2);
+    await p1;                                                                  // re-entry 1 (credit-2) seated
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: true, reentry: true }));
+    bust(w, tid, t, 'user-101');                                               // out again before re-entry 2 is answered
+    gate.resolve();
+    await p2;                                                                  // re-entry 2 (credit-3): a real, second re-entry
+    expect(last(w, 'SA2')).toEqual(expect.objectContaining({ success: true, reentry: true }));
+    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-alice')).toMatchObject({ reEntries: 2, reentryCreditIds: ['credit-2', 'credit-3'] });
+    expect(liveSeatsOf(t, 'user-101')).toHaveLength(1);
+    expect(w.creditRefunds).toEqual([]);
+  });
+
+  it('review fix-up — a per-event cap is re-read after the consume: the overlapping re-entry made meanwhile counts (refused reentry_limit, its credit refunded)', async () => {
+    const { w, tid, t, qt } = field(10 * MIN);
+    qt.maxReEntries = 1;
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);
+    bust(w, tid, t, 'user-101');
+    const gate = overlappingReentries(w);
+    const a2 = w.mkSocket('SA2', ALICE, 'm-alice', 'Alice');
+    const p1 = enter(a);
+    const p2 = enter(a2);
+    await p1;
+    bust(w, tid, t, 'user-101');
+    gate.resolve();
+    await p2;
+    expect(last(w, 'SA2')).toEqual(expect.objectContaining({ success: false, code: 'reentry_limit' }));
+    expect(w.creditRefunds).toEqual(['credit-3']);
+    expect(w.audits.find((x) => x.action === 'QUALIFIER_REENTRY_CREDIT_REFUND')?.d).toMatchObject({ creditId: 'credit-3', reason: 'reentry_limit' });
+    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-alice')).toMatchObject({ reEntries: 1, reentryCreditIds: ['credit-2'] });
+    expect(liveSeatsOf(t, 'user-101')).toEqual([]);
+    expect(entrant(w, tid, 'user-101')!.eliminated).toBe(true);
+  });
+
   it('the late window closes DURING the re-entry\'s credit consume: refused registration_closed, the credit refunded, not seated', async () => {
     const { w, tid, t } = field(2 * H + 59 * MIN);
     const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
@@ -1185,6 +1319,149 @@ describe('2026-10-20 — the credit list (the entry gate) survives a master blip
   it('never read and the master is down → not qualified (the consume on the master stays the real gate)', async () => {
     const { g } = gate(['throw'], () => []);
     expect(await g.isPlayerQualified('m1', 'weekly')).toBe(false);
+  });
+});
+
+describe('review fix-up (7dad8e0) — the cached credit list follows every consume / refund this server makes (the lobby item reads it synchronously)', () => {
+  // Sliced per test (an index.ts without these helpers fails each test, not the whole file).
+  const cacheSrc = () => [
+    slice('const qualifiedPlayers = new Map<string, QualifiedPlayer[]>();', '\n  return false;\n}\n'),
+    slice('const qualifierCreditOwners = new Map', ';\n'),
+    fnSrc('async function consumeQualifierCreditOnMaster('),
+    fnSrc('async function refundQualifierCreditOnMaster('),
+    fnSrc('async function issueQualifierCreditOnMaster('),
+  ].join('\n');
+  /** A fake master: `credits` = its UNUSED credits; a list read answers what it held when the read STARTED. */
+  function master(initial: Array<{ id: string; player_id: string; tier: string }>) {
+    const credits = initial.map((c) => ({ ...c }));
+    const redeemed = new Map<string, { id: string; player_id: string; tier: string }>();
+    const reads: string[] = [];
+    const held: Array<() => void> = [];
+    const ctl = { holdReads: false };
+    let issued = 0;
+    const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body });
+    const scope: Record<string, unknown> = {
+      process: { env: { MASTER_API_URL: 'https://master.test', INTERNAL_NOTIFY_TOKEN: 't' } },
+      console: { log() {}, warn() {}, error() {} },
+      fetch: async (url: string, init: any) => {
+        if (url.includes('/qualifier-credits?')) {
+          reads.push(url);
+          const snapshot = credits.map((c) => ({ ...c }));
+          if (ctl.holdReads) await new Promise<void>((r) => held.push(r));
+          return ok({ success: true, credits: snapshot });
+        }
+        const body = JSON.parse(init.body);
+        if (url.endsWith('/consume/internal')) {
+          const i = credits.findIndex((c) => c.player_id === body.playerId && c.tier === body.tier);
+          if (i < 0) return ok({ consumed: false });
+          const [c] = credits.splice(i, 1);
+          redeemed.set(c.id, c);
+          return ok({ consumed: true, creditId: c.id });
+        }
+        if (url.endsWith('/refund/internal')) {
+          const c = redeemed.get(body.creditId);
+          if (!c) return ok({ refunded: body.creditId === 'from-an-earlier-process' });
+          redeemed.delete(body.creditId);
+          credits.push(c);
+          return ok({ refunded: true });
+        }
+        if (url.endsWith('/issue/internal')) {
+          const c = { id: `issued-${++issued}`, player_id: body.playerId, tier: body.tier };
+          credits.push(c);
+          return ok({ issued: true, creditId: c.id });
+        }
+        return { ok: false, status: 404, json: async () => ({}) };
+      },
+    };
+    const { exports: m } = load(cacheSrc(), scope, `{
+      getQualifiedPlayers, isPlayerQualified, consumeQualifierCreditOnMaster, refundQualifierCreditOnMaster,
+      issueQualifierCreditOnMaster, qualifiedPlayers, state: () => ({ lastQualifierFetch, qualifierCacheGen }),
+    }`);
+    const count = (id: string, tier = 'weekly') => {
+      const list = m.qualifiedPlayers.get(tier);
+      return list ? (list.find((p: any) => p.playerId === id)?.creditCount ?? 0) : null;
+    };
+    return { m, reads, held, ctl, count };
+  }
+  let clock = 0;
+  const realNow = Date.now;
+  beforeEach(() => { clock = Date.parse('2026-10-25T18:05:00Z'); Date.now = () => clock; });
+  afterEach(() => { Date.now = realNow; });
+
+  it('a consume takes his credit off the cached count AT ONCE (it stayed until something re-read: an old lobby offered Re-enter after his last credit); a refund gives it back; no extra read', async () => {
+    const f = master([
+      { id: 'a1', player_id: 'm1', tier: 'weekly' }, { id: 'a2', player_id: 'm1', tier: 'weekly' }, { id: 'b1', player_id: 'm2', tier: 'weekly' },
+      { id: 'c1', player_id: 'm1', tier: 'monthly' },
+    ]);
+    await f.m.getQualifiedPlayers('weekly');
+    expect([f.count('m1'), f.count('m2')]).toEqual([2, 1]);
+    expect(f.reads).toHaveLength(1);
+
+    expect(await f.m.consumeQualifierCreditOnMaster('m1', 'weekly', 'q', 're-entry')).toEqual({ consumed: true, creditId: 'a1' });
+    expect(f.count('m1')).toBe(1);                                          // was still 2 until a re-read
+    expect(f.m.state().lastQualifierFetch).toBe(0);                         // and the list is stale
+    await f.m.consumeQualifierCreditOnMaster('m2', 'weekly', 'q', 'entry');
+    expect(f.m.qualifiedPlayers.get('weekly').some((p: any) => p.playerId === 'm2')).toBe(false);   // at 0: off the list, as a read lists him
+    expect(await f.m.consumeQualifierCreditOnMaster('m2', 'weekly', 'q', 're-entry')).toEqual({ consumed: false, creditId: undefined });
+    expect(f.count('m2')).toBe(0);
+
+    expect(await f.m.refundQualifierCreditOnMaster('a1')).toBe(true);       // a refused entry: his credit back
+    expect(f.count('m1')).toBe(2);
+    expect(await f.m.refundQualifierCreditOnMaster('b1')).toBe(true);
+    expect(f.count('m2')).toBe(1);                                          // back on the list
+    expect(await f.m.issueQualifierCreditOnMaster('m3', 'weekly', '[entry-code:X]')).toMatchObject({ issued: true });
+    expect(f.count('m3')).toBe(1);
+    // A credit an EARLIER process consumed (its owner unknown here): the list is only marked stale.
+    const before = f.m.qualifiedPlayers.get('weekly').map((p: any) => [p.playerId, p.creditCount]);
+    expect(await f.m.refundQualifierCreditOnMaster('from-an-earlier-process')).toBe(true);
+    expect(f.m.qualifiedPlayers.get('weekly').map((p: any) => [p.playerId, p.creditCount])).toEqual(before);
+    // A tier never read stays unknown (null), not invented.
+    expect(await f.m.consumeQualifierCreditOnMaster('m1', 'monthly', 'q', 'entry')).toEqual({ consumed: true, creditId: 'c1' });
+    expect(f.m.qualifiedPlayers.has('monthly')).toBe(false);
+    expect(f.reads).toHaveLength(1);                                        // none of this read the 1.6 MB list
+    // The next read is the master's word again (and matches).
+    await f.m.getQualifiedPlayers('weekly');
+    expect([f.count('m1'), f.count('m2'), f.count('m3')]).toEqual([2, 1, 1]);
+  });
+
+  it('a list read IN FLIGHT across a consume is not cached as fresh (it was, for 5 minutes, with the pre-consume count): it serves its caller; the next caller reads again', async () => {
+    const f = master([{ id: 'a1', player_id: 'm1', tier: 'weekly' }, { id: 'a2', player_id: 'm1', tier: 'weekly' }]);
+    await f.m.getQualifiedPlayers('weekly');
+    clock += 6 * 60_000;                                                    // the cache expired
+    f.ctl.holdReads = true;
+    const inFlight = f.m.getQualifiedPlayers('weekly');                     // reads the master's 2 credits ...
+    await flush();
+    await f.m.consumeQualifierCreditOnMaster('m1', 'weekly', 'q', 'entry'); // ... while one is consumed
+    expect(f.count('m1')).toBe(1);
+    f.ctl.holdReads = false;
+    f.held.splice(0).forEach((r) => r());
+    const answer = await inFlight;
+    expect(answer.find((p: any) => p.playerId === 'm1').creditCount).toBe(2);   // its caller gets the master's (older) word
+    expect(f.count('m1')).toBe(1);                                          // the cache keeps the consume
+    expect(f.m.state().lastQualifierFetch).toBe(0);                         // and stays stale
+    await f.m.getQualifiedPlayers('weekly');                                // so the next caller reads again
+    expect(f.reads).toHaveLength(3);
+    expect(f.count('m1')).toBe(1);
+    // CONTROL — a read with no change during it is cached fresh: no read for the next 5 minutes.
+    clock += 60_000;
+    await f.m.getQualifiedPlayers('weekly');
+    expect(f.reads).toHaveLength(3);
+  });
+
+  it('a tier never read: a read across a change is still cached (better than nothing), but stale', async () => {
+    const f = master([{ id: 'a1', player_id: 'm1', tier: 'weekly' }]);
+    f.ctl.holdReads = true;
+    const inFlight = f.m.getQualifiedPlayers('weekly');
+    await flush();
+    await f.m.issueQualifierCreditOnMaster('m2', 'weekly', '[entry-code:Y]');
+    f.ctl.holdReads = false;
+    f.held.splice(0).forEach((r) => r());
+    await inFlight;
+    expect(f.count('m1')).toBe(1);
+    expect(f.m.state().lastQualifierFetch).toBe(0);
+    await f.m.getQualifiedPlayers('weekly');
+    expect([f.count('m1'), f.count('m2')]).toEqual([1, 1]);
+    expect(f.reads).toHaveLength(2);
   });
 });
 

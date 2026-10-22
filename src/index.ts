@@ -3136,6 +3136,11 @@ interface QualifiedPlayer {
 // In-memory cache of qualified players, keyed by tier
 const qualifiedPlayers = new Map<string, QualifiedPlayer[]>();
 let lastQualifierFetch = 0;
+// 2026-10-22 review fix-up — moves on every credit change THIS server makes on
+// the master (a consume, a refund, an issued credit: noteQualifierCreditChange).
+// A list read in flight across a move may predate that change, so it is never
+// cached as fresh (getQualifiedPlayers).
+let qualifierCacheGen = 0;
 const QUALIFIER_CACHE_MS = 5 * 60 * 1000; // 5-minute cache
 // 2026-10-20 — a credit-list read gives up after this (a registration awaits it).
 const QUALIFIER_FETCH_TIMEOUT_MS = 8000;
@@ -3222,15 +3227,64 @@ async function getQualifiedPlayers(tier: string): Promise<QualifiedPlayer[]> {
   const now = Date.now();
   if ((now - lastQualifierFetch > QUALIFIER_CACHE_MS || !qualifiedPlayers.has(tier))
       && now - lastQualifierFetchFailedAt > QUALIFIER_FETCH_RETRY_MS) {
+    // 2026-10-22 review fix-up — a consume / refund / issue that THIS server
+    // made while the read was in flight (qualifierCacheGen moved) may be
+    // missing from its answer. The answer still serves this caller (the
+    // master's freshest word for the gate), but it is not cached: the cached
+    // list already carries that change (noteQualifierCreditChange) and stays
+    // stale, so the next caller reads again. It used to be cached as FRESH
+    // (`now` is from before the await): a pre-consume list served for 5 more
+    // minutes. A tier never read is cached anyway (still stale).
+    const gen = qualifierCacheGen;
     const players = await fetchQualifiersFromMaster(tier);
     if (players) {
-      qualifiedPlayers.set(tier, players);
-      lastQualifierFetch = now;
-    } else {
-      lastQualifierFetchFailedAt = now;   // keep the last good list (empty only if never read)
+      if (gen === qualifierCacheGen) {
+        qualifiedPlayers.set(tier, players);
+        lastQualifierFetch = now;
+      } else if (!qualifiedPlayers.has(tier)) {
+        qualifiedPlayers.set(tier, players);
+      }
+      return players;
     }
+    lastQualifierFetchFailedAt = now;   // keep the last good list (empty only if never read)
   }
   return qualifiedPlayers.get(tier) || [];
+}
+
+/**
+ * 2026-10-22 review fix-up — the cached credit list follows a credit change
+ * THIS server just made on the master: `delta` -1 = a consume (one credit fewer
+ * for that account and tier; dropped from the list at 0, as a read never lists
+ * him), +1 = a refund or an issued credit. Then the list is marked stale (the
+ * next gate / getQualifications reads the master again) and qualifierCacheGen
+ * moves (a read in flight may predate the change). Why: the lobby item reads
+ * this list SYNCHRONOUSLY (qualifierListItem: creditsHeld / reEntriesLeft), and
+ * `lastQualifierFetch = 0` alone left the pre-consume count there until
+ * something re-read it — an old client offered Re-enter after the last credit
+ * was spent (refused, nothing lost). A tier never read is left alone (unknown).
+ * Display / cache only: the master's atomic consume stays the gate. Never throws.
+ */
+function noteQualifierCreditChange(masterId: string | null | undefined, tier: string | null | undefined, delta: -1 | 1): void {
+  lastQualifierFetch = 0;
+  qualifierCacheGen++;
+  try {
+    if (!masterId || !tier) return;
+    const list = qualifiedPlayers.get(tier);
+    if (!list) return;
+    const id = String(masterId);
+    const i = list.findIndex((p) => String(p.playerId) === id);
+    const next = list.slice();
+    if (i >= 0) {
+      const n = Math.max(0, Math.floor(Number(next[i].creditCount) || 0) + delta);
+      if (n > 0) next[i] = { ...next[i], creditCount: n };
+      else next.splice(i, 1);
+    } else if (delta > 0) {
+      next.push({ playerId: id, firstName: '', lastName: '', tier, creditCount: 1 });
+    } else {
+      return;
+    }
+    qualifiedPlayers.set(tier, next);
+  } catch { /* the cache only — the next read corrects it */ }
 }
 
 // 2026-06-19 audit fix — server-authoritative qualifier-entry gate.
@@ -3343,6 +3397,15 @@ const qualifierTournaments = new Map<string, QualifierTournamentReg>();
 // `error` (transport) so a DB blip doesn't look like "no credit".
 // Earned 2026-07-01 .online audit.
 // ────────────────────────────────────────────────────────────────────────
+/**
+ * 2026-10-22 review fix-up — whose credit (master id + tier) each credit this
+ * process consumed is: the master's refund answer names neither, and a refund
+ * gives that account's cached count its credit back (noteQualifierCreditChange).
+ * A credit consumed by an earlier process is not here: its refund only marks
+ * the list stale.
+ */
+const qualifierCreditOwners = new Map<string, { masterId: string; tier: string }>();
+
 async function consumeQualifierCreditOnMaster(
   masterId: string,
   tier: string,
@@ -3362,7 +3425,13 @@ async function consumeQualifierCreditOnMaster(
     });
     if (!res.ok) return { consumed: false, error: `http_${res.status}` };
     const data: any = await res.json().catch(() => ({}));
-    return { consumed: !!data.consumed, creditId: data.creditId };
+    const consumed = !!data.consumed;
+    if (consumed) {
+      // 2026-10-22 review fix-up — one credit fewer in the cached list NOW (the lobby reads it synchronously).
+      if (data.creditId) qualifierCreditOwners.set(String(data.creditId), { masterId, tier });
+      noteQualifierCreditChange(masterId, tier, -1);
+    }
+    return { consumed, creditId: data.creditId };
   } catch (e: any) {
     return { consumed: false, error: e?.name === 'AbortError' ? 'timeout' : String(e?.message || e) };
   } finally {
@@ -3384,7 +3453,15 @@ async function refundQualifierCreditOnMaster(creditId: string): Promise<boolean>
     });
     if (!res.ok) return false;
     const data: any = await res.json().catch(() => ({}));
-    return !!data.refunded;
+    const refunded = !!data.refunded;
+    if (refunded) {
+      // 2026-10-22 review fix-up — usable again: his cached count gets it back
+      // (when this process consumed it; else the list is only marked stale).
+      const owner = qualifierCreditOwners.get(String(creditId));
+      qualifierCreditOwners.delete(String(creditId));
+      noteQualifierCreditChange(owner?.masterId, owner?.tier, 1);
+    }
+    return refunded;
   } catch {
     return false;
   } finally {
@@ -3411,6 +3488,8 @@ async function issueQualifierCreditOnMaster(masterId: string, tier: string, note
     const data: any = await res.json().catch(() => ({}));
     // issued:false WITHOUT an error = the master's note-dedup already has this
     // credit (idempotent). Surface it so the caller treats a retry as success.
+    // 2026-10-22 review fix-up — a NEW credit: in his cached count now.
+    if (data.issued) noteQualifierCreditChange(masterId, tier, 1);
     return { issued: !!data.issued, alreadyIssued: data.issued === false, creditId: data.creditId };
   } catch (e: any) {
     return { issued: false, error: e?.name === 'AbortError' ? 'timeout' : String(e?.message || e) };
@@ -3533,9 +3612,11 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
   const seatsForTop = seatsForTopWith(qt.qualifierType, qt.seatPackage);
   // 2026-10-22 (owner: "re entries if they have more credits") — the asking
   // account's UNUSED credits of this event's tier, read SYNCHRONOUSLY from the
-  // cached credit list (5-minute cache, dropped by every entry / re-entry
-  // consume and every refund; never awaited here: lobbies poll every 10 s and
-  // the list is ~1.6 MB). Each re-entry consumes one, so they are his
+  // cached credit list (5-minute cache; never awaited here: lobbies poll every
+  // 10 s and the list is ~1.6 MB). Review fix-up: every consume / refund /
+  // issued credit this server makes adjusts that account's cached count at once
+  // and marks the list stale (noteQualifierCreditChange); the next read
+  // (getQualifications, a registration) replaces it. Each re-entry consumes one, so they are his
   // re-entries left (within a cap, if one is ever set). null = anonymous, or the
   // list was never read. The master's atomic consume stays the real gate: a
   // stale count only ever means a refusal, never a free entry.
@@ -3645,7 +3726,8 @@ function socketsOfMaster(masterId: string | undefined): Socket[] {
 const QUALIFIER_LEAVE_TABLE_FIRST = 'Leave your current table first, then enter the qualifier.';
 // 2026-10-22 — + re-entries seated on a busted seat (no never-used seat left)
 // and second re-entries of an account that was already back in (refunded).
-const qualifierLateEntries = { seated: 0, refundedNoSeat: 0, reentrySeatedOnBustedSeat: 0, reentryRefusedAlreadyBack: 0 };
+// Review fix-up — + entries refused on a credit the master gave to two calls at once (kept, not refunded).
+const qualifierLateEntries = { seated: 0, refundedNoSeat: 0, reentrySeatedOnBustedSeat: 0, reentryRefusedAlreadyBack: 0, sharedCreditKept: 0 };
 
 /** R2 — the master's registration row for this event (so the master knows who entered). Fire-and-forget. */
 function persistQualifierRegistration(qt: QualifierTournamentReg, masterId: string): void {
@@ -3692,6 +3774,25 @@ async function refundQualifierReentryCharges(
     if (refunded) lastQualifierFetch = 0;   // 2026-10-22 — usable again: the cached credit list re-reads
     auditLog(username, refunded ? 'QUALIFIER_REENTRY_CREDIT_REFUND' : 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId, reason });
   }
+}
+
+/**
+ * 2026-10-22 review fix-up — true when `creditId` (what THIS registration
+ * call's consume answered) is already held by `entry`, the same account's
+ * registration, recorded by ANOTHER call while this one awaited the master.
+ * The master before mono d01522e6 answered two CONCURRENT consumes for one
+ * player with the SAME credit row (one credit redeemed, both told
+ * consumed:true). That credit pays for the other call's entry: refunding it
+ * un-redeems the credit a live entry stands on (a free entry), and seating on
+ * it is an entry for no credit. `heldBefore` = the entry's credit ids when this
+ * call began (an id it held then is not this race). With d01522e6 live the ids
+ * never coincide and this is never true.
+ */
+function qualifierCreditHeldByConcurrentEntry(
+  entry: QualifierRegistrant | undefined, creditId: string | null, heldBefore?: ReadonlySet<string>,
+): boolean {
+  if (!entry || !creditId || (heldBefore && heldBefore.has(creditId))) return false;
+  return entry.consumedCreditId === creditId || (entry.reentryCreditIds || []).includes(creditId);
 }
 
 /**
@@ -10886,6 +10987,28 @@ io.on('connection', (socket: Socket) => {
         // this user and stamps it; if none are available we refund the
         // buy-in and abort.
         let consumedCreditId: string | null = null;
+        // Review fix-up — his entry's credit ids BEFORE this consume (qualifierCreditHeldByConcurrentEntry).
+        const creditIdsBefore = new Set<string>(
+          [existingEntry.consumedCreditId, ...(existingEntry.reentryCreditIds || [])].filter((x): x is string => !!x),
+        );
+        // Review fix-up — the master (before mono d01522e6) answered this call
+        // with the SAME credit as a concurrent re-entry of his that has since
+        // recorded it (qualifierCreditHeldByConcurrentEntry): this call took no
+        // credit of its own. Refused, its chip buy-in returned, and that credit
+        // KEPT — it pays for the other re-entry (refunding it made that
+        // re-entry free; seating on it, a re-entry for no credit).
+        const refuseReentryOnSharedCredit = async (): Promise<void> => {
+          qualifierLateEntries.sharedCreditKept++;
+          auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_SHARED_KEPT', { qualifierId: qualId, creditId: consumedCreditId });
+          await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, null, 'credit_shared');
+          const back = tournament.players.find((p) => p.playerId === existingEntry.playerId);
+          if (back && !back.eliminated) {
+            qualifierLateEntries.reentryRefusedAlreadyBack++;
+            refuseQualifier('already_registered', 'Already registered and still playing', { registered: true });
+          } else {
+            refuseQualifier('credit_error', 'Server error consuming qualifier credit — please try again.');
+          }
+        };
         if (qt.requiresQualifierCredit) {
           // Consume a credit via the master API (see consumeQualifierCreditOnMaster).
           // qualifier_credits lives only in the master DB — poker-server can't
@@ -10932,7 +11055,11 @@ io.on('connection', (socket: Socket) => {
           if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'credit_consume', buyIn > 0 ? {
             userId: auth.userId, username: auth.username, amount: buyIn, action: 'QUALIFIER_REENTRY_BUYIN_REFUND',
           } : undefined, reentryState)) {
-            if (consumedCreditId) {
+            if (qualifierCreditHeldByConcurrentEntry(existingEntry, consumedCreditId, creditIdsBefore)) {
+              // Review fix-up — that credit pays for his other re-entry: kept (the buy-in went back above).
+              qualifierLateEntries.sharedCreditKept++;
+              auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_SHARED_KEPT', { qualifierId: qualId, creditId: consumedCreditId });
+            } else if (consumedCreditId) {
               const refunded = await refundQualifierCreditOnMaster(consumedCreditId);
               if (refunded) lastQualifierFetch = 0;   // 2026-10-22 — usable again: the cached credit list re-reads
               auditLog(
@@ -10944,6 +11071,14 @@ io.on('connection', (socket: Socket) => {
             }
             return;
           }
+        }
+
+        // Review fix-up — after the LAST await: a credit the master also gave
+        // his concurrent re-entry (refuseReentryOnSharedCredit). Synchronous
+        // from here until he is seated, so the checks below cannot go stale.
+        if (qualifierCreditHeldByConcurrentEntry(existingEntry, consumedCreditId, creditIdsBefore)) {
+          await refuseReentryOnSharedCredit();
+          return;
         }
 
         // R2 (TOURNEY-9) — re-checked after the awaits: a socket that sat down
@@ -10973,6 +11108,14 @@ io.on('connection', (socket: Socket) => {
             || Date.now() > windows.lateRegUntil) {
           await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'registration_closed');
           refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
+          return;
+        }
+        // Review fix-up — a per-event cap re-read here too: an overlapping
+        // re-entry may have been made (seated, and busted again) during this
+        // call's awaits; the check above (a) used the count from before them.
+        if (typeof maxReEntries === 'number' && (existingEntry.reEntries || 0) >= maxReEntries) {
+          await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'reentry_limit');
+          refuseQualifier('reentry_limit', `Re-entry limit reached (${maxReEntries})`);
           return;
         }
 
@@ -11057,8 +11200,10 @@ io.on('connection', (socket: Socket) => {
           return;
         }
         // Bump in-memory re-entry counter — survives until the qt is
-        // garbage-collected on tournament finish.
-        (existingEntry as any).reEntries = priorReEntries + 1;
+        // garbage-collected on tournament finish. Review fix-up: from the
+        // CURRENT count (one made by an overlapping re-entry during this call's
+        // awaits counts too), not the value read before them.
+        existingEntry.reEntries = (existingEntry.reEntries || 0) + 1;
         if (consumedCreditId) (existingEntry.reentryCreditIds ||= []).push(consumedCreditId);   // R2 — refundable by the shutdown flush
         // R2 — the table he now sits at (it used to broadcast the FIRST table, wherever he was seated).
         const reentryTableId = playerSessions.get(socket.id)?.tableId || tournament.tableIds[0];
@@ -11129,7 +11274,14 @@ io.on('connection', (socket: Socket) => {
     const dupe = qt.players.find((p) => p.masterPlayerId === masterId);
     const lateNow = qt.status === 'running' && !!qt.tournamentId && Date.now() <= windows.lateRegUntil;
     if (qualifierTournaments.get(qualId) !== qt || dupe || (qt.status !== 'registering' && !lateNow)) {
-      if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, dupe ? 'already_registered' : 'registration_closed');
+      // Review fix-up — the master (before mono d01522e6) gave the concurrent
+      // registration that won the SAME credit: it pays for that entry and is
+      // KEPT (refunding it made that entry free).
+      const sharedCredit = qualifierCreditHeldByConcurrentEntry(dupe, entryCreditId);
+      if (sharedCredit) {
+        qualifierLateEntries.sharedCreditKept++;
+        auditLog(auth.username, 'QUALIFIER_ENTRY_CREDIT_SHARED_KEPT', { qualifierId: qualId, creditId: entryCreditId });
+      } else if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, dupe ? 'already_registered' : 'registration_closed');
       if (dupe) refuseQualifier('already_registered', 'You are already registered for this qualifier.', { registered: true });
       else refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
       return;

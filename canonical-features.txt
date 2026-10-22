@@ -1619,3 +1619,17 @@ reentryRefusedAlreadyBack
 'already_reentered'
 reEntries: mine ? (mine.reEntries || 0) : null
 creditsHeld,
+
+# 2026-10-22 review fix-up of 7dad8e0. A credit the OLD master gave two
+# concurrent entries of one account is KEPT, not refunded (refunding it made the
+# other entry free); re-entries count from the current value and a per-event cap
+# is re-read after the consume; the cached credit list follows every consume /
+# refund / issued credit at once, and a read in flight across one is never
+# cached as fresh.
+qualifierCreditHeldByConcurrentEntry(existingEntry, consumedCreditId, creditIdsBefore)
+'QUALIFIER_REENTRY_CREDIT_SHARED_KEPT'
+'QUALIFIER_ENTRY_CREDIT_SHARED_KEPT'
+sharedCreditKept
+existingEntry.reEntries = (existingEntry.reEntries || 0) + 1
+noteQualifierCreditChange(masterId, tier, -1)
+if (gen === qualifierCacheGen) {
