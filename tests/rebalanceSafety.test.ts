@@ -94,6 +94,8 @@ const P = {
   // Round 6 (2026-10-10): spectateNextTable (pe5 X5 — a busted player's dead seat) and banUser (P-k).
   spectateNextTable: handlerSrc('spectateNextTable', '\n  });\n'),
   banUser: handlerSrc('banUser', '\n  });\n'),
+  // S8 fix-up (2026-10-21): 'stopSpectating' (Back to Lobby from a busted seat ends its dead session).
+  stopSpectating: handlerSrc('stopSpectating', '\n  });\n'),
   // R3 (K1-6): restoreAbsentTournamentSeat gives the session its fast-mode choice back and tells the socket.
   fastModeRestore: fnSrc('function restoreFastModeOnSeatRestore('),
   // Z1 (2026-10-10): the main (last-registered) disconnect handler — its seat reserve runs after the save await.
@@ -191,6 +193,7 @@ ${SEAT_SESSION_FOR_SRC}
   ${p.adminIPBan}
   ${p.spectateNextTable}
   ${p.banUser}
+  ${p.stopSpectating}
   ${p.disconnect}
 }`;
 }
@@ -3915,6 +3918,141 @@ describe('G186 — a broken table\'s watchers (busted players, lobby spectators)
     expect(P.rebalance).toContain(REHOME);
     expect(P.rebalance.indexOf(REHOME)).toBeLessThan(P.rebalance.indexOf('    tableManager.removeTable(breakTableId);'));
     expect(P.rebalance.indexOf(REHOME)).toBeGreaterThan(P.rebalance.indexOf('noteBrokenTournamentTable(breakTableId, tournamentId);'));
+  });
+});
+
+describe('S8 fix-up (F98 / F160) — Back to Lobby (stopSpectating) from his busted table ends the dead-seat session: that seat\'s frames stop', () => {
+  const STOP_END = "    endDeadTournamentSeatSession(socket, 'stopSpectating');\n";
+  /** a5 busts live on TA (TA's spectator, dead-seat session kept), then taps Back to Lobby: the real 'stopSpectating'. */
+  async function backToLobby(over: Partial<typeof P> = {}) {
+    const { w, s5, TA } = await bustA5Live(over);
+    w.wireSocket('S-a5').handlers.stopSpectating();
+    return { w, s5, TA };
+  }
+
+  it('his dead-seat session ends with the spectating (no room, no spectator set); broadcasts send that lobby socket NOTHING; the seat is untouched', async () => {
+    expect(P.stopSpectating).toContain(STOP_END);
+    const { w, s5, TA } = await backToLobby();
+    expect(w.playerSessions.has('S-a5')).toBe(false);
+    expect(w.spectators.get('TA')?.has('S-a5') ?? false).toBe(false);
+    expect([...s5.rooms]).toEqual([]);
+    expect(s5.emitted.filter(([ev]: [string]) => ev === 'gameState').map(([, d]: [string, any]) => d.state)).toEqual([null]);
+    const { bc, got } = realBroadcastS8(w);
+    bc('TA');
+    bc('TA');
+    expect(got.filter((g) => g.sid === 'S-a5')).toEqual([]);
+    expect(TA.seats[5]).toMatchObject({ state: 'occupied', eliminated: true, chipCount: 0, playerId: 'a5' });
+    expect(w.m.tableViewDetaches.deadSeatSessionsEndedSilently).toBe(1);
+  });
+
+  it('CONTROL — the pre-fix stopSpectating (spectator set + room only): the lobby socket keeps getting his DEAD seat\'s player view on every broadcast', async () => {
+    const { w, s5 } = await backToLobby({ stopSpectating: P.stopSpectating.replace(STOP_END, '') });
+    expect(w.playerSessions.get('S-a5')).toMatchObject({ tableId: 'TA', seatIndex: 5 });
+    expect([...s5.rooms]).toEqual([]);
+    const { bc, got } = realBroadcastS8(w);
+    bc('TA');
+    expect(got.filter((g) => g.sid === 'S-a5')).toEqual([{ sid: 'S-a5', tableId: 'TA', yourSeat: 5 }]);
+  });
+
+  it('a LIVE seat is never ended by stopSpectating: a0 keeps his session, his room and his own seat\'s view', async () => {
+    const { w } = await bustA5Live();
+    const s0 = w.seatLive('S-a0', 'TA', 0, 100, 'm-a0');
+    w.wireSocket('S-a0').handlers.stopSpectating();
+    expect(w.playerSessions.get('S-a0')).toMatchObject({ tableId: 'TA', seatIndex: 0 });
+    expect(s0.rooms.has('table:TA')).toBe(true);
+    const { bc, got } = realBroadcastS8(w);
+    bc('TA');
+    expect(got.filter((g) => g.sid === 'S-a0')).toEqual([{ sid: 'S-a0', tableId: 'TA', yourSeat: 0 }]);
+    expect(w.m.tableViewDetaches.deadSeatSessionsEndedSilently).toBe(0);
+  });
+});
+
+describe('S8 fix-up (G186) — a break re-homes only sockets WATCHING the broken table: a lobby socket\'s dead-seat session just ends', () => {
+  const WATCH_TEST = 'if (liveSeatHere || !watching || socketHoldsPlayerSessionElsewhere(sid, breakTableId)) {';
+  const PRE_WATCH_TEST = 'if (liveSeatHere || socketHoldsPlayerSessionElsewhere(sid, breakTableId)) {';
+  /**
+   * a5 busts live on TA, then leaves the table view (`how`): 'old' = exactly what the pre-fix
+   * stopSpectating did (spectator set + room only — the dead-seat session kept), 'real' = the
+   * real handler. Then a4 busts: TA (4 left) is broken into TB; 6s later the re-home runs.
+   */
+  async function lobbyThenBreak(how: 'old' | 'real', over: Partial<typeof P> = {}) {
+    const frames: Array<{ sid: string; state: any }> = [];
+    const { w, s5, TA } = await bustA5Live(over, { emitGameState: (sock: any, state: any) => frames.push({ sid: sock.id, state }) });
+    if (how === 'old') {
+      w.spectators.get('TA')!.delete('S-a5');
+      s5.leave('table:TA');
+      expect(w.playerSessions.get('S-a5')).toMatchObject({ tableId: 'TA', seatIndex: 5 });
+    } else {
+      w.wireSocket('S-a5').handlers.stopSpectating();
+    }
+    TA.seats[0].chipCount += TA.seats[4].chipCount;
+    TA.seats[4].chipCount = 0;
+    (TA as any).currentPhase = GamePhase.HandComplete;
+    await w.m.handleHandComplete('TA', [{ seatIndex: 0, amount: 5000 }]);
+    await flush();
+    expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TB']);
+    s5.emitted.length = 0;
+    frames.length = 0;
+    jest.advanceTimersByTime(6000);
+    expect(w.tables.has('TA')).toBe(false);
+    return { w, s5, frames };
+  }
+
+  it('a dead-seat session left on a lobby socket: the break ends it SILENTLY — not TB\'s spectator, in no room, no spectatingTournament / tableClosed / frame', async () => {
+    expect(P.helpers).toContain(WATCH_TEST);
+    const { w, s5, frames } = await lobbyThenBreak('old');
+    expect(w.spectators.get('TB')?.has('S-a5') ?? false).toBe(false);
+    expect([...s5.rooms]).toEqual([]);
+    expect(s5.emitted).toEqual([]);
+    expect(frames.filter((f) => f.sid === 'S-a5')).toEqual([]);
+    expect(w.playerSessions.has('S-a5')).toBe(false);
+    expect(w.m.tableViewDetaches.deadSeatSessionsEndedSilently).toBe(1);
+  });
+
+  it('CONTROL — the pre-fix re-home (every dead-seat session is a watcher): the lobby socket is made TB\'s spectator, joins its room, gets its frame and spectatingTournament', async () => {
+    const { w, s5, frames } = await lobbyThenBreak('old', { helpers: P.helpers.replace(WATCH_TEST, PRE_WATCH_TEST) });
+    expect(w.spectators.get('TB')?.has('S-a5')).toBe(true);
+    expect([...s5.rooms]).toEqual(['table:TB']);
+    expect(s5.emitted.map(([ev]: [string]) => ev)).toEqual(['spectatingTournament']);
+    expect(frames.filter((f) => f.sid === 'S-a5').map((f) => f.state.isSpectator)).toEqual([true]);
+  });
+
+  it('end to end (the real stopSpectating, then the break): nothing of TB reaches the lobby socket', async () => {
+    const { w, s5, frames } = await lobbyThenBreak('real');
+    expect(w.spectators.get('TB')?.has('S-a5') ?? false).toBe(false);
+    expect([...s5.rooms]).toEqual([]);
+    expect(s5.emitted).toEqual([]);
+    expect(frames.filter((f) => f.sid === 'S-a5')).toEqual([]);
+    expect(w.playerSessions.has('S-a5')).toBe(false);
+  });
+
+  it('a busted seat whose socket also plays an EXTRA table elsewhere (P-e: never a spectator): the break ends its dead session and leaves the broken room — never TB\'s spectator', async () => {
+    const frames: Array<{ sid: string; state: any }> = [];
+    const w = world({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 5, 5000, 200) }, scope: { ...persistenceScope(null), emitGameState: (sock: any, state: any) => frames.push({ sid: sock.id, state }) } });
+    const TA = w.tables.get('TA')!;
+    const s5 = w.seatLive('S-a5', 'TA', 5, 105, 'm-a5');
+    w.multiTableSessions.set('S-a5', [{ socketId: 'S-a5', tableId: 'TX', seatIndex: 0, playerName: 'a5', playerId: 'a5' }]);
+    s5.join('table:TX');
+    for (const [busted, cleared] of [[5, true], [4, false]] as Array<[number, boolean]>) {
+      TA.seats[0].chipCount += TA.seats[busted].chipCount;
+      TA.seats[busted].chipCount = 0;
+      (TA as any).currentPhase = GamePhase.HandComplete;
+      await w.m.handleHandComplete('TA', [{ seatIndex: 0, amount: 5000 }]);
+      await flush();
+      if (cleared) {
+        expect(s5.emitted.map(([ev]: [string]) => ev)).not.toContain('eliminatedToSpectator');   // P-e: seated elsewhere
+        expect(w.playerSessions.get('S-a5')).toMatchObject({ tableId: 'TA', seatIndex: 5 });
+      }
+    }
+    expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TB']);
+    s5.emitted.length = 0;
+    jest.advanceTimersByTime(6000);
+    expect(w.playerSessions.has('S-a5')).toBe(false);
+    expect([...s5.rooms]).toEqual(['table:TX']);                                     // his extra table's room is kept
+    expect(w.multiTableSessions.get('S-a5')).toEqual([expect.objectContaining({ tableId: 'TX' })]);
+    expect(w.spectators.get('TB')?.has('S-a5') ?? false).toBe(false);
+    expect(s5.emitted).toEqual([]);
+    expect(frames.filter((f) => f.sid === 'S-a5')).toEqual([]);
   });
 });
 

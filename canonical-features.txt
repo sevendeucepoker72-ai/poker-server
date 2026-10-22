@@ -1567,3 +1567,12 @@ cashOutAdditionalSeatsOnDeparture(socket, authSessions.get(socket.id) ?? authSes
 return !(t.isHandInProgress() && (s.totalInvestedThisHand || 0) > 0);
 seatReservationRestores.inviteRejoins++;
 takeOverOwnSeatOnRejoin(socket, rjAuth.userId, tableId, undefined, 'joinByInviteCode')
+
+# 2026-10-21 gameplay S8 fix-up. F98 (F160 variant): Back to Lobby from a
+# busted tournament seat (stopSpectating) ends the DEAD seat's session, so the
+# lobby socket stops getting that seat's player view. G186: a table break
+# re-homes only sockets watching it (spectator set or room); a lobby socket's
+# dead-seat session just ends, silently (endDeadTournamentSeatSession).
+endDeadTournamentSeatSession(socket, 'stopSpectating');
+if (liveSeatHere || !watching || socketHoldsPlayerSessionElsewhere(sid, breakTableId))
+dead_tournament_seat_session_ended

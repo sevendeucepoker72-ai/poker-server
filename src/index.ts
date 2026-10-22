@@ -3000,7 +3000,9 @@ app.get('/api/health', async (_req, res) => {
         // tournament notices (room broadcasts; tournamentFinishedForEntrant
         // to entrants' sockets outside those rooms — P-h', round 6). Round 6:
         // deadSeatSessionsEnded = busted tournament seats' sessions a detach
-        // ended (pe5 X5).
+        // ended (pe5 X5). deadSeatSessionsEndedSilently (S8 fix-up) = the same
+        // ended by stopSpectating (Back to Lobby) or a table break whose socket
+        // no longer watched it (endDeadTournamentSeatSession).
         tableViewDetaches: { ...tableViewDetaches },
         tournamentFinishedNotices: { ...tournamentFinishedNotices },
       },
@@ -18411,6 +18413,10 @@ Give feedback in this JSON format:
         if (specs.size === 0) spectators.delete(tableId);
       }
     }
+    // S8 fix-up (F98 / F160) — a busted player's Back to Lobby: his session on
+    // the DEAD tournament seat ends too (a live seat is never touched), or the
+    // lobby socket kept getting that seat's player view on every broadcast.
+    endDeadTournamentSeatSession(socket, 'stopSpectating');
     // Null state clears client — send as full reset and clear tracking
     socket.emit('gameState', { full: true, state: null });
     lastSentState.delete(socket.id); lastSentJson.delete(socket.id);
@@ -21185,7 +21191,7 @@ function noticeTournamentEliminationToEntrant(
  * got his OLD table's frames interleaved with the new one's. The seat itself
  * is not touched (the bust check / rebalance own it).
  */
-const tableViewDetaches = { calls: 0, spectatorViewsEnded: 0, roomsLeft: 0, deadSeatSessionsEnded: 0 };
+const tableViewDetaches = { calls: 0, spectatorViewsEnded: 0, roomsLeft: 0, deadSeatSessionsEnded: 0, deadSeatSessionsEndedSilently: 0 };
 function detachSocketFromOtherTables(
   socket: Socket, tableId: string | null, kind: 'seat' | 'spectate', via: string,
 ): void {
@@ -21232,6 +21238,43 @@ function detachSocketFromOtherTables(
     event: 'table_view_detached', via, kind, tableId, spectating: ended, rooms: left,
     ...(deadSeatEnded ? { deadSeatSessionEnded: deadSeatEnded } : {}),
   })}`);
+}
+
+/**
+ * 2026-10-21 (gameplay S8 fix-up: F98's Back to Lobby variant, G186) — END a
+ * socket's main session that sits on a DEAD tournament seat, SILENTLY: the same
+ * test as the round-6 dead-seat detach above (busted / eliminated, stood up, or
+ * its table gone); no spectator switch, no room join, no frame, no notice. The
+ * seat itself is not touched (the bust check / rebalance own it). Its table's
+ * room is left (unless the socket holds an extra-table seat there) and the
+ * per-socket delta baseline is dropped (it was that table's). A LIVE seat is
+ * never ended here. Callers:
+ *  - 'stopSpectating' — Back to Lobby from his own busted table (F98 always
+ *    makes the busted player a spectator, so this is the normal exit). It left
+ *    only the spectator set and the room: the dead session stayed, and every
+ *    broadcastGameState sent the LOBBY socket the dead seat's player view
+ *    (watchesFromDeadTournamentSeat is false once he no longer spectates).
+ *  - rehomeBrokenTableWatchers — a dead-seat session whose socket does not
+ *    watch the broken table (in neither its spectator set nor its room) is not
+ *    re-homed: it used to be made a spectator of the target table, so the
+ *    lobby socket got that table's frames, blind-up / elimination toasts and
+ *    'tableBroken' (P-e': a lobby socket is never made a spectator / room member).
+ * Returns the table id whose session ended, or null.
+ */
+function endDeadTournamentSeatSession(socket: Socket, via: string): string | null {
+  const main = playerSessions.get(socket.id);
+  if (!main) return null;
+  const t = tableManager.getTable(main.tableId);
+  const s = t?.seats[main.seatIndex];
+  if (t && !(isTournamentTable(main.tableId) && (!s || s.state !== 'occupied' || s.eliminated))) return null;
+  playerSessions.delete(socket.id);
+  releaseSeatedSlot(socket.id, main.tableId);
+  if (!(multiTableSessions.get(socket.id) || []).some((ms) => ms.tableId === main.tableId)) socket.leave(`table:${main.tableId}`);
+  lastSentState.delete(socket.id);
+  lastSentJson.delete(socket.id);
+  tableViewDetaches.deadSeatSessionsEndedSilently++;
+  console.log(`[Tables] ${JSON.stringify({ event: 'dead_tournament_seat_session_ended', via, tableId: main.tableId, seatIndex: main.seatIndex })}`);
+  return main.tableId;
 }
 
 /**
@@ -23999,6 +24042,9 @@ function tournamentDealHoldReason(tableId: string, tournamentId: string, table: 
  * meanwhile): 'tableClosed { tableId, reason: 'tournament_table_broken' }'.
  * A session on a LIVE seat there (a mover's on a socket that is gone, another
  * account's) is never touched — its disconnect / reconnect path owns it.
+ * S8 fix-up: a dead-seat session counts as a watcher only while its socket is
+ * in the broken table's spectator set or room; otherwise (a lobby socket — Back
+ * to Lobby left both) the session just ends (endDeadTournamentSeatSession).
  * Called by handleTableRebalance just before the broken table is removed.
  */
 const brokenTableWatchersRehomed = { watchers: 0, closed: 0 };
@@ -24032,9 +24078,15 @@ function rehomeBrokenTableWatchers(tournamentId: string, breakTableId: string): 
     const main = playerSessions.get(sid);
     const mainSeat = main?.tableId === breakTableId ? breakTable?.seats[main.seatIndex] : undefined;
     const liveSeatHere = !!mainSeat && mainSeat.state === 'occupied' && !mainSeat.eliminated;
-    if (liveSeatHere || socketHoldsPlayerSessionElsewhere(sid, breakTableId)) {
+    // S8 fix-up (G186) — only a socket WATCHING the broken table (its spectator,
+    // or in its room) is re-homed. A dead-seat session on a socket that watches
+    // neither (Back to Lobby: stopSpectating left both) ends silently below —
+    // never a spectator switch, a room join, a frame or a tableClosed (P-e').
+    const watching = !!specs?.has(sid) || !!sock.rooms?.has(room);
+    if (liveSeatHere || !watching || socketHoldsPlayerSessionElsewhere(sid, breakTableId)) {
       if (specs?.delete(sid) && specs.size === 0) spectators.delete(breakTableId);
       if (main?.tableId !== breakTableId) sock.leave(room);
+      else if (!liveSeatHere) endDeadTournamentSeatSession(sock, 'tournament_table_broken');
       continue;
     }
     const targetTable = target ? tableManager.getTable(target) : undefined;
