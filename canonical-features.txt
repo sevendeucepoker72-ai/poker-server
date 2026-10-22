@@ -1525,3 +1525,12 @@ this.deadSmallBlind = !playsSeat(sbSlot);
 dealtOut: table.isDealtOut(seat.seatIndex)
 table.deadSmallBlind ? -1 : table.smallBlindSeat
 deadButton: table.deadButton,
+
+# 2026-10-21 gameplay S3 fix-up (review of F27). A draw round never sits out
+# the 30s draw clock for a seat nobody plays: an all-in leaver's kept hand, an
+# orphan or a sitting-out seat (no playing session, no live reservation) is
+# stood pat 500ms into the round, an absent tournament seat (sitting out / past
+# its hand limit) on the 3s short clock; a played or reserved seat keeps 30s.
+function standPatAbsentDrawers(
+armAbsentDrawerStandPat(tableId);
+absent_drawer_stood_pat

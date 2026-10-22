@@ -5846,6 +5846,94 @@ function restoreFastModeOnSeatRestore(socket: { id: string; emit: (ev: string, d
   socket.emit('fastModeSet', { enabled: session.fastMode });
 }
 
+// ===== Absent drawers (gameplay S3 fix-up, 2026-10-21) =====
+/**
+ * 2026-10-21 (gameplay S3 fix-up, review of F27) — a draw round no longer sits
+ * out the whole 30s draw clock for a seat nobody plays. Since F27 an ALL-IN
+ * seat draws too (it used to be stood pat the moment the round opened), so the
+ * round waits for it — and when nobody plays that seat it waited the full
+ * clock in EVERY draw round: up to 90s of dead table per hand in Triple Draw /
+ * Badugi, 30s in Five Card Draw, where the old pre-mark cost nothing. Such a
+ * seat: an all-in leaver's kept hand (teardownSeat, leaverKeepsAllInHand), a
+ * departure's kept hand (F85), an orphan, a seat whose player sits out. The
+ * 500ms orphan auto-act (broadcastGameState) never runs in a draw round; this
+ * is its draw-round counterpart, with the betting turn's rules (that auto-act
+ * plus armTurnTimer's short clock):
+ *  - a session PLAYS the seat (main or extra-table, not sitting out) → he
+ *    draws himself, on the 30s draw clock;
+ *  - an absent TOURNAMENT seat past its reservation's hand limit, or one whose
+ *    player sits out (U4 / P-j: armTurnTimer's shortClock test) → stood pat
+ *    ABSENT_TOURNAMENT_SEAT_TURN_MS into the round;
+ *  - a LIVE reservation (a disconnect: he may be reconnecting) → the 30s clock;
+ *  - otherwise → stood pat ABSENT_DRAWER_STAND_PAT_MS into the round (or that
+ *    long after a mid-round leave).
+ * Standing pat (`playerDraw(seat, [])`) is never a fold: the seat keeps its
+ * hand and its chips in the pot; no chip moves. Decided when the check FIRES,
+ * never when it is armed: a leave tears the seat down (teardownSeat →
+ * scheduleAIAction) BEFORE handlePlayerLeave deletes the session, and a player
+ * back (or sat back in) inside the window is spared. One pending check per
+ * table (the earliest one due), armed by every scheduleAIAction call in a draw
+ * round; a stand-pat that completes the round never acts in the next one
+ * (F44) — its own scheduleAIAction call arms that round's check.
+ */
+const ABSENT_DRAWER_STAND_PAT_MS = 500;
+const absentDrawerChecks = new Map<string, { timeout: ReturnType<typeof setTimeout>; dueAt: number }>();
+
+/** How long into the draw round this seat's player gets before the server stands it pat; null = the 30s draw clock (see above). */
+function absentDrawerWaitMs(tableId: string, seatIndex: number): number | null {
+  if (seatHasAnyPlayingSession(tableId, seatIndex)) return null;
+  if (isAbsentTournamentSeatPastHandLimit(tableId, seatIndex) || tournamentSeatSitsOut(tableId, seatIndex)) return ABSENT_TOURNAMENT_SEAT_TURN_MS;
+  const now = Date.now();
+  for (const r of reservedSeats.values()) {
+    if (r.tableId === tableId && r.seatIndex === seatIndex && r.expiresAt > now) return null;
+  }
+  return ABSENT_DRAWER_STAND_PAT_MS;
+}
+
+function armAbsentDrawerStandPat(tableId: string, delayMs: number = ABSENT_DRAWER_STAND_PAT_MS): void {
+  const wait = Math.max(0, delayMs);
+  const dueAt = Date.now() + wait;
+  const pending = absentDrawerChecks.get(tableId);
+  if (pending && pending.dueAt <= dueAt) return;
+  if (pending) clearTimeout(pending.timeout);
+  const timeout = setTimeout(() => {
+    if (absentDrawerChecks.get(tableId)?.timeout === timeout) absentDrawerChecks.delete(tableId);
+    standPatAbsentDrawers(tableId);
+  }, wait);
+  absentDrawerChecks.set(tableId, { timeout, dueAt });
+}
+
+function standPatAbsentDrawers(tableId: string): void {
+  const t = tableManager.getTable(tableId);
+  if (!(t instanceof FiveCardDrawTable) || !DrawPhases.includes(t.currentPhase)) return;
+  const hand = t.handNumber;
+  const phase = t.currentPhase;
+  const roundStart = drawClockStart(tableId, t);
+  const stood: number[] = [];
+  let nextDue = Infinity;
+  for (const s of t.seats) {
+    // The stand-pat that completes the round can open the next draw round at
+    // once (F44): never stand anyone pat in THAT one from this pass.
+    if (t.handNumber !== hand || t.currentPhase !== phase) break;
+    if (s.isAI || s.state !== 'occupied' || s.folded || s.eliminated || s.holeCards.length === 0) continue;
+    if (t.drawsCompleted.has(s.seatIndex)) continue;
+    const wait = absentDrawerWaitMs(tableId, s.seatIndex);
+    if (wait === null) continue;
+    const dueAt = roundStart + wait;
+    if (Date.now() < dueAt) { nextDue = Math.min(nextDue, dueAt); continue; }
+    if (t.playerDraw(s.seatIndex, [])) stood.push(s.seatIndex);
+  }
+  // A short-clock seat not due yet: check again at its deadline (same round only).
+  if (nextDue !== Infinity && t.handNumber === hand && t.currentPhase === phase) {
+    armAbsentDrawerStandPat(tableId, nextDue - Date.now());
+  }
+  if (stood.length === 0) return;
+  console.log(`[draw] ${JSON.stringify({ event: 'absent_drawer_stood_pat', tableId, handNumber: hand, phase, seats: stood })}`);
+  broadcastGameState(tableId);
+  scheduleAIAction(tableId);
+}
+// ===== end absent drawers =====
+
 function scheduleAIAction(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) { console.log('[AI] No table found'); return; }
@@ -5987,6 +6075,13 @@ function scheduleAIAction(tableId: string): void {
       }, drawDelay);
       drawTimers.set(tableId, { timeout: drawTimeout, handNumber: armedHand, phase: dphase });
     }
+    // S3 fix-up (2026-10-21, review of F27) — a human seat nobody plays (an
+    // all-in leaver's kept hand, an orphan, a sitting-out player; no live
+    // reservation) is stood pat 500ms into the round (an absent tournament
+    // seat: the 3s short clock), not at the 30s clock. Armed on EVERY call here
+    // (a leave's teardownSeat calls in mid-round), after the round's clock
+    // start is set above; decided when it fires.
+    armAbsentDrawerStandPat(tableId);
     return;
   }
 

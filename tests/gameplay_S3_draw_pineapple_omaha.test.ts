@@ -780,3 +780,167 @@ describe('F20 — Omaha hi-lo pot lists name their winners (main + side pot)', (
     expect(pots[1]).toMatchObject({ amount: 200, winners: [1], winnerAmounts: [{ seatIndex: 1, amount: 200 }] });
   });
 });
+
+// ---------------------------------------------------------------- S3 fix-up: absent drawers ----
+
+describe('S3 fix-up — a draw round never sits out the 30s clock for a seat nobody plays (review of F27)', () => {
+  beforeEach(() => { jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] }); jest.setSystemTime(1_000_000); });
+  afterEach(() => { jest.clearAllTimers(); jest.useRealTimers(); });
+
+  /** The real draw-round scheduling: scheduleAIAction, the absent-drawer block and the seat / reservation tests it reads. */
+  const absentSrc = () => [
+    slice('const ABSENT_TOURNAMENT_SEAT_TURN_MS = ', ';\n'),
+    slice('const drawStartedAtMap = ', '\n}\n'),
+    fnSrc('function seatHasLiveSession('),
+    fnSrc('function isAbsentTournamentSeatPastHandLimit('),
+    fnSrc('function seatHasPlayingSession('),
+    fnSrc('function tournamentSeatSitsOut('),
+    fnSrc('function seatHasAnyPlayingSession('),
+    slice('// ===== Absent drawers', '// ===== end absent drawers =====\n'),
+    fnSrc('function scheduleAIAction('),
+  ].join('\n');
+
+  /** `t` driven by the real code; every accepted draw is recorded as [seat, round, ms since the world was built]. */
+  function world(t: FiveCardDrawTable, opts: { bots?: boolean; tournament?: boolean } = {}) {
+    const playerSessions = new Map<string, any>();
+    const multiTableSessions = new Map<string, any[]>();
+    const reservedSeats = new Map<number, any>();
+    const drew: Array<[number, GamePhase, number]> = [];
+    const logs: string[] = [];
+    const t0 = Date.now();
+    const real = t.playerDraw.bind(t);
+    t.playerDraw = (seat: number, idx: number[]) => { const ph = t.currentPhase; const ok = real(seat, idx); if (ok) drew.push([seat, ph, Date.now() - t0]); return ok; };
+    const { exports: schedule, stubbed } = load(absentSrc(), {
+      tableManager: { getTable: (id: string) => (id === T ? t : undefined) }, GamePhase, DrawPhases: DRAWS, FiveCardDrawTable, MAX_SEATS,
+      drawTimers: new Map(), aiProfiles: new Map(opts.bots ? [[T, new Map()]] : []), TURN_TIMEOUT_MS: 30000,
+      playerSessions, multiTableSessions, reservedSeats, broadcastGameState() {},
+      isTournamentTable: () => !!opts.tournament, isTournamentReservation: (r: any) => !!r.tournament,
+      console: { log: (s: unknown) => logs.push(String(s)), warn() {}, error() {} },
+    }, 'scheduleAIAction');
+    const pending = (seat: number) => !t.drawsCompleted.has(seat);
+    const at = (seat: number) => drew.filter(([s]) => s === seat).map(([, , ms]) => ms);
+    return { schedule, stubbed, playerSessions, multiTableSessions, reservedSeats, drew, logs, pending, at };
+  }
+
+  const VARIANTS: Array<[string, () => FiveCardDrawTable, number]> = [
+    ['2-7 Triple Draw', () => new FiveCardDrawTable(cfg(), true), 3],
+    ['Badugi', () => new BadugiTable(cfg()), 3],
+    ['Five Card Draw', () => new FiveCardDrawTable(cfg(), false), 1],
+  ];
+  for (const [name, mk, rounds] of VARIANTS) {
+    it(`${name}: a bot vs an all-in leaver whose hand is kept (no session, no reservation) — stood pat 500ms into every draw round, never folded, chips conserved (old: ${rounds} x 30s of dead table)`, () => {
+      const t = mk();
+      t.sitDown(0, 'Bot', 5000, 'ai-0', true, true);
+      t.sitDown(1, 'Leaver', 60, 'p1', false, true);
+      const w = world(t, { bots: true });
+      const before = tableChips(t);
+      t.startNewHand();
+      shoveAndCall(t, 1);
+      expect(t.currentPhase).toBe(GamePhase.Draw1);
+      expect(t.seats[1].allIn).toBe(true);
+      const dealt = [...t.seats[1].holeCards];
+      w.schedule(T);                                         // the action that closed the betting schedules the next actor
+      jest.advanceTimersByTime(499);
+      expect(w.pending(1)).toBe(true);
+      jest.advanceTimersByTime(1);
+      expect(w.pending(1)).toBe(false);                      // old: waited for the 30s draw clock
+      jest.advanceTimersByTime(rounds * 1500 + 1000);
+      expect(t.currentPhase).toBe(GamePhase.HandComplete);   // old: still Draw1 here (the hand took rounds x 30s)
+      expect(w.drew.filter(([s]) => s === 1).map(([, ph]) => ph)).toEqual(DRAWS.slice(0, rounds));   // once per round
+      expect(w.drew.filter(([s]) => s === 0)).toHaveLength(rounds);   // the bot drew every round
+      // Each round: 500ms after it opened (= that round's last draw before it), never in the same pass.
+      const leaver = w.at(1);
+      expect(leaver[0]).toBe(500);
+      for (let k = 1; k < rounds; k++) {
+        const opened = Math.max(...w.drew.filter(([, ph]) => ph === DRAWS[k - 1]).map(([, , ms]) => ms));
+        expect(leaver[k]).toBe(opened + 500);
+      }
+      expect(same(t.seats[1].holeCards, dealt)).toBe(true);  // stood pat: his dealt hand
+      expect(t.seats[1].folded).toBe(false);                 // never folded: his hand and his pot stay live
+      expect(tableChips(t)).toBe(before);
+      expect(w.logs.some((l) => l.includes('"event":"absent_drawer_stood_pat"'))).toBe(true);
+      expect([...w.stubbed]).toEqual([]);                    // every helper it ran is the real one
+    });
+  }
+
+  it('cash: who is stood pat (no session / a sitting-out session / an expired reservation) and who keeps the 30s clock (a playing main or extra-table session, a live reservation)', () => {
+    const t = new FiveCardDrawTable(cfg(), false);
+    for (const i of [0, 1, 2, 3, 4, 5]) t.sitDown(i, `P${i}`, 5000, `p${i}`, false, true);
+    const w = world(t);
+    w.playerSessions.set('s0', { tableId: T, seatIndex: 0, sittingOut: false });   // plays his seat
+    w.playerSessions.set('s1', { tableId: T, seatIndex: 1, sittingOut: true });    // sits out
+    w.reservedSeats.set(22, { tableId: T, seatIndex: 2, expiresAt: Date.now() + 60_000, handsRemaining: 3 });   // reconnecting
+    w.multiTableSessions.set('sx', [{ tableId: T, seatIndex: 3, sittingOut: false }]);   // an extra-table seat, played
+    // seat 4: nobody (an orphan)
+    w.reservedSeats.set(55, { tableId: T, seatIndex: 5, expiresAt: Date.now() - 1, handsRemaining: 3 });     // expired
+    toDraw1(t);
+    const start = Date.now();
+    w.schedule(T);
+    jest.advanceTimersByTime(500);
+    expect([0, 1, 2, 3, 4, 5].filter(w.pending)).toEqual([0, 2, 3]);   // old: all six waited for the clock
+    expect(t.currentPhase).toBe(GamePhase.Draw1);
+    jest.advanceTimersByTime(30_000 - 501);
+    expect(t.currentPhase).toBe(GamePhase.Draw1);          // the present / reconnecting seats keep the full draw clock
+    jest.advanceTimersByTime(1);
+    expect(Date.now()).toBe(start + 30_000);
+    expect(t.currentPhase).toBe(GamePhase.Bet2);           // the clock stood them pat
+    expect(t.seats.filter((s) => s.folded)).toHaveLength(0);
+    expect([...w.stubbed]).toEqual([]);
+  });
+
+  it("tournament: a sitting-out seat / an absent seat past its hand limit get the 3s short clock (armTurnTimer's rule); a mid-round leave is stood pat 500ms later (the earliest check wins); sitting back in spares him", () => {
+    const t = new FiveCardDrawTable(cfg(), true);
+    for (const i of [0, 1, 2, 3, 4, 5]) t.sitDown(i, `P${i}`, 5000, `p${i}`, false, true);
+    const w = world(t, { tournament: true });
+    w.playerSessions.set('s0', { tableId: T, seatIndex: 0, sittingOut: false });   // plays; leaves at 1s
+    w.playerSessions.set('s1', { tableId: T, seatIndex: 1, sittingOut: true });    // sits out
+    w.reservedSeats.set(22, { tableId: T, seatIndex: 2, expiresAt: Date.now() + 60_000, handsRemaining: 3, tournament: true });   // reconnecting
+    w.reservedSeats.set(33, { tableId: T, seatIndex: 3, expiresAt: Date.now() + 60_000, handsRemaining: 0, tournament: true });   // past the hand limit
+    // seat 4: nobody (an orphan)
+    w.playerSessions.set('s5', { tableId: T, seatIndex: 5, sittingOut: true });    // sits out; back at 2s
+    toDraw1(t);
+    w.schedule(T);
+    jest.advanceTimersByTime(1000);
+    expect(w.at(4)).toEqual([500]);                        // the orphan: 500ms
+    expect([0, 1, 2, 3, 5].filter(w.pending)).toEqual([0, 1, 2, 3, 5]);
+    // handlePlayerLeave: teardownSeat (keeps the hand) -> scheduleAIAction, THEN playerSessions.delete.
+    w.schedule(T);
+    w.playerSessions.delete('s0');
+    jest.advanceTimersByTime(1000);
+    expect(w.at(0)).toEqual([1500]);                       // 500ms after the leave (not at the pending 3s check)
+    w.playerSessions.get('s5').sittingOut = false;         // sits back in at 2s
+    jest.advanceTimersByTime(999);
+    expect([1, 3].filter(w.pending)).toEqual([1, 3]);
+    jest.advanceTimersByTime(1);
+    expect(w.at(1)).toEqual([3000]);                       // the short clock (old: 30s)
+    expect(w.at(3)).toEqual([3000]);
+    expect([2, 5].filter(w.pending)).toEqual([2, 5]);      // reconnecting / back: the full clock
+    jest.advanceTimersByTime(26_999);
+    expect(t.currentPhase).toBe(GamePhase.Draw1);
+    jest.advanceTimersByTime(1);
+    expect(t.currentPhase).toBe(GamePhase.Bet2);
+    expect(t.seats.filter((s) => s.folded)).toHaveLength(0);
+    expect([...w.stubbed]).toEqual([]);
+  });
+
+  it('decided when the check fires: a player back inside the 500ms window is spared and draws himself', () => {
+    const t = new FiveCardDrawTable(cfg(), true);
+    for (const i of [0, 1, 2]) t.sitDown(i, `P${i}`, 5000, `p${i}`, false, true);
+    const w = world(t);
+    for (const i of [0, 1, 2]) w.playerSessions.set(`s${i}`, { tableId: T, seatIndex: i, sittingOut: false });
+    toDraw1(t);
+    w.schedule(T);                                         // the round opens: everyone plays his seat
+    jest.advanceTimersByTime(2000);
+    expect([0, 1, 2].filter(w.pending)).toEqual([0, 1, 2]);
+    // Seat 2 drops (no reservation) and is back 300ms later: spared.
+    w.playerSessions.delete('s2');
+    w.schedule(T);
+    jest.advanceTimersByTime(300);
+    w.playerSessions.set('s2b', { tableId: T, seatIndex: 2, sittingOut: false });
+    jest.advanceTimersByTime(1000);
+    expect([0, 1, 2].filter(w.pending)).toEqual([0, 1, 2]);
+    expect(t.playerDraw(2, [0, 1])).toBe(true);            // he draws himself
+    expect(w.drew).toEqual([[2, GamePhase.Draw1, 3300]]);
+    expect([...w.stubbed]).toEqual([]);
+  });
+});
