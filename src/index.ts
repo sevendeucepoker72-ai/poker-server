@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -3531,6 +3531,19 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
   const myResult = viewerMasterId && qt.results ? qt.results.find((r) => r.masterUserId === viewerMasterId) : undefined;
   // 2026-10-21 — an event with a seat package: seats down to its last place.
   const seatsForTop = seatsForTopWith(qt.qualifierType, qt.seatPackage);
+  // 2026-10-22 (owner: "re entries if they have more credits") — the asking
+  // account's UNUSED credits of this event's tier, read SYNCHRONOUSLY from the
+  // cached credit list (5-minute cache, dropped by every entry / re-entry
+  // consume and every refund; never awaited here: lobbies poll every 10 s and
+  // the list is ~1.6 MB). Each re-entry consumes one, so they are his
+  // re-entries left (within a cap, if one is ever set). null = anonymous, or the
+  // list was never read. The master's atomic consume stays the real gate: a
+  // stale count only ever means a refusal, never a free entry.
+  const tierCredits = viewerMasterId ? qualifiedPlayers.get(qt.qualifierType) : undefined;
+  const creditsHeld = Array.isArray(tierCredits)
+    ? Math.max(0, Math.floor(Number(tierCredits.find((p) => String(p.playerId) === viewerMasterId)?.creditCount) || 0))
+    : null;
+  const reEntryCap = qt.maxReEntries ?? QUALIFIER_MAX_REENTRIES;
   return {
     qualifierId: id,
     masterQualifierId: qt.masterQualifierId ?? id,
@@ -3550,7 +3563,14 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     // re-entry during late registration could never be reached.
     eliminated: !!(mine && qt.tournamentId
       && tournamentManager.getTournament(qt.tournamentId)?.players.find((p) => p.playerId === mine.playerId)?.eliminated),
-    reEntriesLeft: mine ? Math.max(0, (qt.maxReEntries ?? 3) - (mine.reEntries || 0)) : null,
+    // 2026-10-22 — his credits of this tier (was a fixed 3 minus re-entries made); null = not registered.
+    reEntriesLeft: mine ? qualifierReEntriesLeft(creditsHeld, reEntryCap, mine.reEntries || 0) : null,
+    // 2026-10-22 — additive: his unused credits of this tier (null = anonymous / not known yet), the
+    // per-event re-entry cap (null = none: one credit per entry is the only limit), and the
+    // re-entries he has made (null = not registered).
+    creditsHeld,
+    maxReEntries: reEntryCap,
+    reEntries: mine ? (mine.reEntries || 0) : null,
     players: qt.players.length,
     structure: qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK),
     seatsForTop,
@@ -3623,7 +3643,9 @@ function socketsOfMaster(masterId: string | undefined): Socket[] {
 
 /** R2 (TOURNEY-9) — the answer when a qualifier seat would take over a socket that plays a live seat elsewhere. */
 const QUALIFIER_LEAVE_TABLE_FIRST = 'Leave your current table first, then enter the qualifier.';
-const qualifierLateEntries = { seated: 0, refundedNoSeat: 0 };
+// 2026-10-22 — + re-entries seated on a busted seat (no never-used seat left)
+// and second re-entries of an account that was already back in (refunded).
+const qualifierLateEntries = { seated: 0, refundedNoSeat: 0, reentrySeatedOnBustedSeat: 0, reentryRefusedAlreadyBack: 0 };
 
 /** R2 — the master's registration row for this event (so the master knows who entered). Fire-and-forget. */
 function persistQualifierRegistration(qt: QualifierTournamentReg, masterId: string): void {
@@ -3649,6 +3671,7 @@ function broadcastQualifierUpdate(qualId: string, qt: QualifierTournamentReg): v
 async function refundQualifierEntryCredit(actor: string, qualId: string, creditId: string, reason: string): Promise<boolean> {
   let refunded = false;
   try { refunded = await refundQualifierCreditOnMaster(creditId); } catch { refunded = false; }
+  if (refunded) lastQualifierFetch = 0;   // 2026-10-22 — usable again: the cached credit list re-reads
   if (reason === 'no_seat') qualifierLateEntries.refundedNoSeat++;
   auditLog(actor, refunded ? 'QUALIFIER_ENTRY_CREDIT_REFUND' : 'QUALIFIER_ENTRY_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId, reason });
   return refunded;
@@ -3666,6 +3689,7 @@ async function refundQualifierReentryCharges(
   if (creditId) {
     let refunded = false;
     try { refunded = await refundQualifierCreditOnMaster(creditId); } catch { refunded = false; }
+    if (refunded) lastQualifierFetch = 0;   // 2026-10-22 — usable again: the cached credit list re-reads
     auditLog(username, refunded ? 'QUALIFIER_REENTRY_CREDIT_REFUND' : 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED', { qualifierId: qualId, creditId, reason });
   }
 }
@@ -3732,6 +3756,67 @@ function seatQualifierLateEntrant(socket: Socket, qt: QualifierTournamentReg, re
       scheduleDealAfterTournamentSeat(tid);   // F95
       return { tableId: tid, seatIndex: s };
     }
+  }
+  return null;
+}
+
+/**
+ * 2026-10-22 (owner: "re entries if they have more credits") — a busted
+ * entrant's RE-ENTRY when no never-used seat is left (the re-entry block tries
+ * those first): a BUSTED seat, by the rule late entry and the rebalance use
+ * (tournamentSeatIsPlaceable; stood up first, vacateBustedTournamentSeat). His
+ * OWN dead seat first (no dead seat with his playerId is left behind), else the
+ * fewest-alive table's. Seated with the starting stack and reinstated
+ * (reinstateForReentry — places stay 1..N), this socket's session bound to it
+ * (P-g detach first). Before, re-entry looked at EMPTY seats only: once the
+ * field had filled its tables (and after every rebalance) a re-entry was
+ * refunded no_seat although busted seats were free. null = none either: the
+ * caller refunds the credit. Synchronous — the caller re-checked after its last
+ * await that he is still out, so he is never seated twice.
+ */
+function seatQualifierReentrantOnBustedSeat(
+  socket: Socket, qt: QualifierTournamentReg, tournament: NonNullable<ReturnType<TournamentManager['getTournament']>>,
+  entry: QualifierRegistrant, stack: number,
+): { tableId: string; seatIndex: number } | null {
+  const tournamentId = qt.tournamentId;
+  if (!tournamentId || tournament.status !== 'running') return null;
+  const tables = tournament.tableIds
+    .map((tid) => ({ tid, table: tableManager.getTable(tid), alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length }))
+    .filter((x): x is { tid: string; table: PokerTable; alive: number } => !!x.table)
+    .sort((a, b) => a.alive - b.alive);
+  const candidates: Array<{ tid: string; table: PokerTable; s: number; own: boolean }> = [];
+  for (const own of [true, false]) {
+    for (const { tid, table } of tables) {
+      for (let s = 0; s < table.seats.length; s++) {
+        const seat = table.seats[s];
+        if (!seat || seat.state !== 'occupied' || !seat.eliminated) continue;   // busted seats only
+        if ((seat.playerId === entry.playerId) !== own) continue;
+        candidates.push({ tid, table, s, own });
+      }
+    }
+  }
+  for (const { tid, table, s, own } of candidates) {
+    if (!tournamentSeatIsPlaceable(tournamentId, table, s)) continue;
+    vacateBustedTournamentSeat(table, tid, s);
+    if (!table.sitDown(s, entry.playerName, stack, entry.playerId, false)) continue;
+    if (!tournamentManager.reinstateForReentry(tournamentId, entry.playerId, stack)) {
+      table.standUp(s);   // he is not out (the caller re-checked; defensive): never a second live seat
+      return null;
+    }
+    tournamentManager.setPlayerTable(tournamentId, entry.playerId, tid);
+    // P-g — one table view per socket: no other table's spectating / rooms (a
+    // main session on his dead seat at another table ends here).
+    detachSocketFromOtherTables(socket, tid, 'seat', 'qualifierReentryBustedSeat');
+    playerSessions.set(socket.id, {
+      socketId: socket.id, tableId: tid, seatIndex: s, playerName: entry.playerName, playerId: entry.playerId,
+      trainingEnabled: false, sittingOut: false,
+    });
+    for (const ttid of tournament.tableIds) spectators.get(ttid)?.delete(socket.id);
+    socket.join(`table:${tid}`);
+    qualifierLateEntries.reentrySeatedOnBustedSeat++;
+    console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_reentry_busted_seat', tournamentId, tableId: tid, seatIndex: s, ownSeat: own })}`);
+    scheduleDealAfterTournamentSeat(tid);   // F95 — an idle table deals again
+    return { tableId: tid, seatIndex: s };
   }
   return null;
 }
@@ -10679,7 +10764,8 @@ io.on('connection', (socket: Socket) => {
       socket.emit('qualifierRegistrationResult', { success: false, code, error, qualifierId: qualId, ...extra });
 
     // Signup window (qualifierWindows): opens 3 hours before the start; closes
-    // — late registration included — 90 minutes after it.
+    // — late entry and re-entry included — QUALIFIER_LATE_REG_MS after it
+    // (2026-10-22 owner: 3 hours, 11:00 AM start → 2:00 PM Denver; was 90 min).
     const scheduledTime = new Date(qt.scheduledAt).getTime();
     const now = Date.now();
     const windows = qualifierWindows(scheduledTime);
@@ -10743,13 +10829,15 @@ io.on('connection', (socket: Socket) => {
       // server-authoritative chip-mutations rule (CLAUDE.md). All gates
       // now run BEFORE sitDown; on any failure we bail without re-seating.
       if (isLateReg && tournament) {
-        // (a) Max re-entry quota. Defensive default of 3 until a
-        // games-backed schema with a per-tournament max_re_entries
-        // column exists. TODO referenced on the interface above.
-        const MAX_RE_ENTRIES_DEFAULT = 3;
-        const maxReEntries = qt.maxReEntries ?? MAX_RE_ENTRIES_DEFAULT;
+        // (a) Re-entry cap. 2026-10-22 (owner: "re entries if they have more
+        // credits and each entry consume a credit") — none by default
+        // (QUALIFIER_MAX_REENTRIES null; was a hard-coded 3): he re-enters as
+        // often as he holds a credit of this tier, each re-entry consuming one
+        // (step (c) — the master's atomic consume is the limit). A per-event
+        // qt.maxReEntries, or a number in QUALIFIER_MAX_REENTRIES, still caps.
+        const maxReEntries = qt.maxReEntries ?? QUALIFIER_MAX_REENTRIES;
         const priorReEntries = (existingEntry as any).reEntries || 0;
-        if (priorReEntries >= maxReEntries) {
+        if (typeof maxReEntries === 'number' && priorReEntries >= maxReEntries) {
           refuseQualifier('reentry_limit', `Re-entry limit reached (${maxReEntries})`);
           return;
         }
@@ -10824,12 +10912,19 @@ io.on('connection', (socket: Socket) => {
             if (consumeRes.error) console.error('[QualifierReEntry] credit consume failed:', consumeRes.error);
             socket.emit('qualifierRegistrationResult', {
               success: false,
+              // 2026-10-22 — additive: the same codes as a first entry (the lobby can match them).
+              code: consumeRes.error ? 'credit_error' : 'no_credit',
+              qualifierId: qualId,
               error: consumeRes.error ? 'Server error consuming qualifier credit — please try again.' : 'No qualifier credits available for re-entry',
             });
             return;
           }
           consumedCreditId = consumeRes.creditId || null;
           auditLog(auth.username, 'QUALIFIER_REENTRY_CREDIT_CONSUME', { qualifierId: qualId, creditId: consumedCreditId });
+          // 2026-10-22 — one credit fewer: drop the cached credit list (as a
+          // first entry does), so his lobby's creditsHeld / reEntriesLeft and
+          // the next gate read the master again.
+          lastQualifierFetch = 0;
           // F3 (2026-10-10) — dropped during the credit consume: give BOTH back
           // (the chip buy-in once, through the additive path; the credit through
           // the master) and seat nothing — a re-entry seat on a dead socket has
@@ -10839,6 +10934,7 @@ io.on('connection', (socket: Socket) => {
           } : undefined, reentryState)) {
             if (consumedCreditId) {
               const refunded = await refundQualifierCreditOnMaster(consumedCreditId);
+              if (refunded) lastQualifierFetch = 0;   // 2026-10-22 — usable again: the cached credit list re-reads
               auditLog(
                 auth.username,
                 refunded ? 'QUALIFIER_REENTRY_CREDIT_REFUND' : 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED',
@@ -10855,6 +10951,28 @@ io.on('connection', (socket: Socket) => {
         if (socketPlaysLiveSeatElsewhere(socket.id, '')) {
           await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'seated_elsewhere');
           refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
+          return;
+        }
+
+        // 2026-10-22 — RE-CHECKED after the LAST await (the credit consume);
+        // nothing below awaits until he is reinstated. A second re-entry of the
+        // same account (another tab, a double tap) passed the "eliminated" check
+        // while the first was still consuming: it is refused HERE and its credit
+        // given back. It used to seat him a SECOND time — two live stacks for
+        // two credits (reinstateForReentry refused it, and the fallback below
+        // un-eliminated him anyway). Likewise an event that finished, or whose
+        // late window closed, during the consume.
+        const reentrant = tournament.players.find((p) => p.playerId === existingEntry.playerId);
+        if (reentrant && !reentrant.eliminated) {
+          qualifierLateEntries.reentryRefusedAlreadyBack++;
+          await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'already_reentered');
+          refuseQualifier('already_registered', 'Already registered and still playing', { registered: true });
+          return;
+        }
+        if (!reentrant || qualifierTournaments.get(qualId) !== qt || qt.status !== 'running' || tournament.status !== 'running'
+            || Date.now() > windows.lateRegUntil) {
+          await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'registration_closed');
+          refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
           return;
         }
 
@@ -10909,6 +11027,9 @@ io.on('connection', (socket: Socket) => {
           }
           if (seated) break;
         }
+        // 2026-10-22 (owner: "re entries if they have more credits") — no
+        // never-used seat left: a BUSTED seat, his own dead one first.
+        if (!seated && seatQualifierReentrantOnBustedSeat(socket, qt, tournament, existingEntry, startingStack)) seated = true;
         if (!seated) {
           // Roll back every charge so the player isn't billed for a
           // seat they never got. Mirrors the BUY_IN_REFUND path at
@@ -10923,6 +11044,7 @@ io.on('connection', (socket: Socket) => {
           }
           if (consumedCreditId) {
             const refunded = await refundQualifierCreditOnMaster(consumedCreditId);
+            if (refunded) lastQualifierFetch = 0;   // 2026-10-22 — usable again: the cached credit list re-reads
             auditLog(
               auth.username,
               refunded ? 'QUALIFIER_REENTRY_CREDIT_REFUND' : 'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED',
@@ -10931,7 +11053,7 @@ io.on('connection', (socket: Socket) => {
           }
           // 2026-10-20 — say the credit came back (it did, just above), and a
           // code the lobby can match, like a first entry's no_seat.
-          socket.emit('qualifierRegistrationResult', { success: false, code: 'no_seat', error: 'No seat is free for a re-entry right now — your qualifier credit was returned. Try again when a table breaks.' });
+          socket.emit('qualifierRegistrationResult', { success: false, code: 'no_seat', qualifierId: qualId, error: 'No seat is free for a re-entry right now — your qualifier credit was returned. Try again in a minute.' });
           return;
         }
         // Bump in-memory re-entry counter — survives until the qt is

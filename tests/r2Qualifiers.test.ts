@@ -22,7 +22,7 @@ import { TournamentManager } from '../src/game/TournamentManager';
 import {
   parseMasterSchedule, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels,
   parseSeatPackage, seatsForTopWith, seatsWonAt,
-  QUALIFIER_BASE_STACK,
+  QUALIFIER_BASE_STACK, QUALIFIER_LATE_REG_MS, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft,
 } from '../src/game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from '../src/game/qualifierNoShow';
 import { SRC, slice, fnSrc, handlerSrc, load, flush } from './helpers/indexSource';
@@ -39,6 +39,8 @@ const MASTER_BODY = {
 };
 const WEEKLY = '0e10e632-5a4c-4d0d-a5e9-b785266149fb';
 const H = 3600_000;
+/** 2026-10-22 (owner: "late entries until 2pm") — the late window: 3 hours (11:00 AM start → 2:00 PM). */
+const LATE = QUALIFIER_LATE_REG_MS;
 
 describe('qualifierSchedule (pure)', () => {
   it('reads the master\'s REAL shape (data.schedule); an event with no time is not playable online', () => {
@@ -55,9 +57,9 @@ describe('qualifierSchedule (pure)', () => {
     expect((MASTER_BODY as any).schedule).toBeUndefined();
   });
 
-  it('windows: signup opens 3h before, closes (late registration included) 90 min after; status from them', () => {
+  it('windows: signup opens 3h before, closes (late registration included) QUALIFIER_LATE_REG_MS after; status from them', () => {
     const at = Date.parse('2026-10-11T12:00:00.000Z');
-    expect(qualifierWindows(at)).toEqual({ signupOpensAt: at - 3 * H, signupClosesAt: at + 1.5 * H, lateRegUntil: at + 1.5 * H });
+    expect(qualifierWindows(at)).toEqual({ signupOpensAt: at - 3 * H, signupClosesAt: at + LATE, lateRegUntil: at + LATE });
     expect(qualifierStatusOf('pending', at, at - 4 * H)).toBe('scheduled');
     expect(qualifierStatusOf('pending', at, at - 2 * H)).toBe('registering');
     expect(qualifierStatusOf('running', at, at + H)).toBe('running');
@@ -108,6 +110,8 @@ const CODE = [
   fnSrc('function tournamentLiveSeatOf('),
   fnSrc('function tournamentSeatIsPlaceable('),
   fnSrc('function vacateBustedTournamentSeat('),
+  // 2026-10-22 — a re-entry takes a busted seat when no never-used seat is left.
+  fnSrc('function seatQualifierReentrantOnBustedSeat('),
 ].join('\n');
 const HANDLERS = ['registerQualifierTournament', 'unregisterQualifierTournament', 'getQualifierTournaments', 'spectateTournament']
   .map((ev) => handlerSrc(ev, '\n  });\n')).join('\n  ');
@@ -136,6 +140,8 @@ function world(opts: { now?: number } = {}) {
   const wallet = new Map<number, number>([[ALICE, 100_000], [BOB, 100_000]]);
   const tournamentTables = new Map<string, string>();
   const leaves: string[] = [];
+  // 2026-10-22 — the cached credit list (tier → [{playerId, creditCount}]); empty = never read.
+  const qualifiedPlayers = new Map<string, Array<{ playerId: string; creditCount: number }>>();
   let creditN = 0;
   const scope: Record<string, unknown> = {
     qualifierTournaments, tournamentManager: tm, authSessions, playerSessions, multiTableSessions, spectators,
@@ -147,6 +153,7 @@ function world(opts: { now?: number } = {}) {
     },
     qualifierSyncStats: { syncs: 0, failures: 0, lastSyncAt: null, listed: 0, cancelledOffSchedule: 0 },
     qualifierWindows, qualifierStatusOf, seatsForTopOf, seatsForTopWith, seatsWonAt, qualifierStructure, QUALIFIER_BASE_STACK,
+    QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers,
     samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS,
     assertPlayable: async () => null,
     isPlayerQualified: async () => true,
@@ -212,6 +219,7 @@ function world(opts: { now?: number } = {}) {
   return {
     m, tm, tables, scope, qualifierTournaments, authSessions, playerSessions, sockets, emitted, globalEmits, roomEmits, audits,
     consumed, creditRefunds, fetches, postAnswers, progress, started, wallet, mkSocket, of, sync, tournamentTables, leaves,
+    qualifiedPlayers,
   };
 }
 
@@ -234,8 +242,8 @@ describe('C3 — the registry is the master schedule (one entry per master quali
     const [item] = w.m.qualifierList(null);
     expect(item).toMatchObject({
       qualifierId: WEEKLY, masterQualifierId: WEEKLY, type: 'weekly', scheduledAt: new Date(at).toISOString(),
-      signupOpensAt: new Date(at - 3 * H).toISOString(), signupClosesAt: new Date(at + 1.5 * H).toISOString(),
-      lateRegUntil: new Date(at + 1.5 * H).toISOString(), status: 'registering', registered: false, players: 0,
+      signupOpensAt: new Date(at - 3 * H).toISOString(), signupClosesAt: new Date(at + LATE).toISOString(),
+      lateRegUntil: new Date(at + LATE).toISOString(), status: 'registering', registered: false, players: 0,
       structure: qualifierStructure(50_000), seatsForTop: 3, myResult: null,
     });
     w.sync(Date.now() + 5 * H);
@@ -257,8 +265,11 @@ describe('C3 — the registry is the master schedule (one entry per master quali
 
   it('a brand-new event whose late registration already ended is not opened', () => {
     const w = world();
-    w.sync(Date.now() - 2 * H);
+    w.sync(Date.now() - LATE - 60_000);
     expect(w.qualifierTournaments.size).toBe(0);
+    // 2026-10-22 — 2 hours after its start it is still inside its late window (until 2 PM): opened.
+    w.sync(Date.now() - 2 * H);
+    expect(w.qualifierTournaments.size).toBe(1);
   });
 });
 
@@ -537,16 +548,18 @@ describe('F142 (2026-10-21) — a busted entrant is told he is OUT (and his re-e
     return { w, tid, qt, t };
   }
 
-  it('the list item, per viewer: his busted entry → registered + eliminated, 3 re-entries left; a live entrant → not eliminated; no entry → reEntriesLeft null', () => {
+  it('the list item, per viewer: his busted entry → registered + eliminated, re-entries left = his unused credits (2026-10-22, was a fixed 3); a live entrant → not eliminated; no entry → reEntriesLeft null', () => {
     const { w } = bustedAlice();
+    w.qualifiedPlayers.set('weekly', [{ playerId: 'm-alice', creditCount: 3 }, { playerId: 'm-201', creditCount: 1 }]);
     expect(w.m.qualifierList('m-alice')[0]).toMatchObject({ status: 'running', registered: true, eliminated: true, reEntriesLeft: 3 });
-    expect(w.m.qualifierList('m-201')[0]).toMatchObject({ registered: true, eliminated: false, reEntriesLeft: 3 });
+    expect(w.m.qualifierList('m-201')[0]).toMatchObject({ registered: true, eliminated: false, reEntriesLeft: 1 });
     expect(w.m.qualifierList('m-nobody')[0]).toMatchObject({ registered: false, eliminated: false, reEntriesLeft: null });
     expect(w.m.qualifierList(null)[0]).toMatchObject({ registered: false, eliminated: false, reEntriesLeft: null });
   });
 
   it('his re-entry seats him AND tells him like a late entry (qualifierTournamentStarted {reentry, lateEntry, tableId}); the list then says 2 left, not out', async () => {
     const { w, tid, t } = bustedAlice();
+    w.qualifiedPlayers.set('weekly', [{ playerId: 'm-alice', creditCount: 3 }]);
     const before = w.globalEmits.length;
     const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
     await a.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
@@ -559,7 +572,268 @@ describe('F142 (2026-10-21) — a busted entrant is told he is OUT (and his re-e
     // The lobby list everyone sees follows (broadcastQualifierUpdate).
     expect(w.globalEmits.slice(before).filter(([ev]) => ev === 'qualifierTournamentUpdate').map(([, d]) => d))
       .toEqual([expect.objectContaining({ qualifierId: WEEKLY, status: 'running', tournamentId: tid })]);
-    expect(w.m.qualifierList('m-alice')[0]).toMatchObject({ registered: true, eliminated: false, reEntriesLeft: 2 });
+    // 2026-10-22 — the consume dropped the cached credit list (re-read on the next gate / qualifications);
+    // the master now holds one credit fewer for her.
+    expect(w.scope.lastQualifierFetch).toBe(0);
+    w.qualifiedPlayers.set('weekly', [{ playerId: 'm-alice', creditCount: 2 }]);
+    expect(w.m.qualifierList('m-alice')[0]).toMatchObject({ registered: true, eliminated: false, reEntriesLeft: 2, creditsHeld: 2, reEntries: 1 });
+  });
+});
+
+describe('2026-10-22 (owner: "late entries until 2pm, re entries if they have more credits and each entry consume a credit")', () => {
+  const MIN = 60_000;
+  const SUNDAY_11AM_DENVER = Date.parse('2026-10-25T17:00:00.000Z');   // the weekly, 7a8dd4a8 (MDT)
+  const MONTHLY_11AM_DENVER = Date.parse('2026-11-21T18:00:00.000Z');  // the monthly, 3rd Saturday (MST)
+  const enter = (s: any) => s.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'x' });
+  const last = (w: any, sid: string) => w.of(sid, 'qualifierRegistrationResult').slice(-1)[0];
+
+  /** A RUNNING qualifier that started `ago` ms ago: Bob (seat 0) + Carl (seat 1) at Q1, `usable` seats there. */
+  function field(ago: number, usable = 9) {
+    const w = world();
+    w.sync(Date.now() - ago);
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    expect(qt).toBeTruthy();                                                   // listed (inside its late window)
+    const tid = w.tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: qualifierBlindLevels(50_000), startingChips: 50_000 } as any);
+    w.tm.registerPlayer(tid, 'user-201', 'Bob', 'sb', undefined, 'm-201');
+    w.tm.registerPlayer(tid, 'user-202', 'Carl', 'sc', undefined, 'm-202');
+    w.tm.startTournament(tid);
+    const t = new PokerTable({ tableId: 'Q1', tableName: 'Q1', smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+    t.maxOccupiableSeats = usable;
+    t.sitDown(0, 'Bob', 50_000, 'user-201', false, true);
+    t.sitDown(1, 'Carl', 50_000, 'user-202', false, true);
+    w.tables.set('Q1', t);
+    w.tournamentTables.set('Q1', tid);
+    w.tm.setTableIds(tid, ['Q1']);
+    w.tm.setPlayerTable(tid, 'user-201', 'Q1');
+    w.tm.setPlayerTable(tid, 'user-202', 'Q1');
+    Object.assign(qt, { status: 'running', tournamentId: tid, players: [
+      { playerId: 'user-201', masterPlayerId: 'm-201', playerName: 'Bob', phone: '', socketId: 'sb' },
+      { playerId: 'user-202', masterPlayerId: 'm-202', playerName: 'Carl', phone: '', socketId: 'sc' },
+    ] });
+    return { w, qt, tid, t };
+  }
+  /** The bust check ran on `pid`'s LIVE seat: 0 chips, eliminated, the seat left occupied (as handleHandComplete leaves it). */
+  function bust(w: any, tid: string, t: PokerTable, pid: string): number {
+    const i = t.seats.findIndex((s) => s.state === 'occupied' && !s.eliminated && s.playerId === pid);
+    expect(i).toBeGreaterThanOrEqual(0);
+    t.seats[i].chipCount = 0;
+    (t.seats[i] as any).eliminated = true;
+    w.tm.eliminatePlayer(tid, pid);
+    return i;
+  }
+  const liveSeatsOf = (t: PokerTable, pid: string) => t.seats.filter((s) => s.state === 'occupied' && !s.eliminated && s.playerId === pid);
+  const entrant = (w: any, tid: string, pid: string) => w.tm.getTournament(tid)!.players.find((p: any) => p.playerId === pid);
+
+  it('ONE constant: late registration closes 3 hours after the start = 2:00 PM Denver, for the weekly AND the monthly (both start at 11:00 AM)', () => {
+    expect(LATE).toBe(3 * H);
+    expect(new Date(qualifierWindows(SUNDAY_11AM_DENVER).lateRegUntil).toISOString()).toBe('2026-10-25T20:00:00.000Z');   // 2:00 PM MDT
+    expect(qualifierWindows(SUNDAY_11AM_DENVER).signupClosesAt).toBe(qualifierWindows(SUNDAY_11AM_DENVER).lateRegUntil);
+    expect(new Date(qualifierWindows(MONTHLY_11AM_DENVER).lateRegUntil).toISOString()).toBe('2026-11-21T21:00:00.000Z');  // 2:00 PM MST
+    expect(SRC).not.toMatch(/MAX_RE_ENTRIES_DEFAULT\s*=\s*3/);
+  });
+
+  it('the re-entries left: his unused credits (each re-entry consumes one), within a cap only if one is set; no cap by default', () => {
+    expect(QUALIFIER_MAX_REENTRIES).toBeNull();
+    expect(qualifierReEntriesLeft(4, null, 0)).toBe(4);
+    expect(qualifierReEntriesLeft(4, null, 7)).toBe(4);                 // re-entries made do not count; credits do
+    expect(qualifierReEntriesLeft(0, null, 2)).toBe(0);
+    expect(qualifierReEntriesLeft(null, null, 2)).toBeNull();           // never read: unknown
+    expect(qualifierReEntriesLeft(4, 3, 1)).toBe(2);
+    expect(qualifierReEntriesLeft(1, 3, 1)).toBe(1);
+    expect(qualifierReEntriesLeft(null, 3, 1)).toBe(2);
+    expect(qualifierReEntriesLeft(5, 3, 4)).toBe(0);
+  });
+
+  it('LATE ENTRY at 1:50 PM (2h50 after the start) is seated with ONE credit (refused after 12:30 before); after 2:00 PM → signup_closed, no credit touched', async () => {
+    const { w, t } = field(2 * H + 50 * MIN);
+    expect(w.m.qualifierList(null)[0]).toMatchObject({ status: 'running', signupOpen: true });
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: true, lateEntry: true, tableId: 'Q1' }));
+    expect(liveSeatsOf(t, 'user-101')).toEqual([expect.objectContaining({ chipCount: 50_000 })]);
+    expect(w.consumed).toEqual([{ masterId: 'm-alice', tier: 'weekly', label: 'entry' }]);
+    expect(w.creditRefunds).toEqual([]);
+
+    const { w: w2 } = field(2 * H + 50 * MIN);
+    const b = w2.mkSocket('SB', BOB, 'm-bob', 'Bob');
+    const realNow = Date.now;
+    const after2pm = realNow() + 11 * MIN;                                    // 3h01 after the start
+    Date.now = () => after2pm;
+    try {
+      await enter(b);
+    } finally { Date.now = realNow; }
+    expect(last(w2, 'SB')).toEqual(expect.objectContaining({ success: false, code: 'signup_closed' }));
+    expect(w2.consumed).toEqual([]);
+    expect(w2.m.qualifierList(null, after2pm)[0]).toMatchObject({ status: 'running', signupOpen: false });
+  });
+
+  it('RE-ENTRY while she holds credits: every entry consumes exactly ONE credit and there is no cap of 3; out of credits → no_credit, still out, nothing seated', async () => {
+    const { w, tid, t, qt } = field(10 * MIN);
+    let held = 5;                                                              // 5 weekly credits
+    const kept: string[] = [];
+    w.scope.consumeQualifierCreditOnMaster = async (masterId: string, tier: string, _q: string, label: string) => {
+      w.consumed.push({ masterId, tier, label });
+      if (held <= 0) return { consumed: false };
+      held--;
+      kept.push(`credit-${kept.length + 1}`);
+      return { consumed: true, creditId: kept[kept.length - 1] };
+    };
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);                                                            // the first entry: credit 1
+    for (let n = 1; n <= 4; n++) {                                             // re-entries 1..4 (the 4th was 'reentry_limit')
+      bust(w, tid, t, 'user-101');
+      await enter(a);
+      expect({ n, result: last(w, 'SA') }).toEqual({ n, result: expect.objectContaining({ success: true, reentry: true, tableId: 'Q1' }) });
+      expect(liveSeatsOf(t, 'user-101')).toEqual([expect.objectContaining({ chipCount: 50_000 })]);
+      expect(entrant(w, tid, 'user-101')).toMatchObject({ eliminated: false, chips: 50_000, finishPosition: 0 });
+    }
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 're-entry', 're-entry', 're-entry', 're-entry']);
+    expect(held).toBe(0);
+    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-alice')).toMatchObject({
+      consumedCreditId: 'credit-1', reEntries: 4, reentryCreditIds: ['credit-2', 'credit-3', 'credit-4', 'credit-5'],
+    });
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.tm.getTournament(tid)!.players).toHaveLength(3);                  // re-entries never add entrants
+
+    // Out of credits: the master says no — refused (no_credit), still out, nothing seated or refunded.
+    bust(w, tid, t, 'user-101');
+    await enter(a);
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: false, code: 'no_credit', qualifierId: WEEKLY }));
+    expect(w.consumed).toHaveLength(6);
+    expect(entrant(w, tid, 'user-101')!.eliminated).toBe(true);
+    expect(liveSeatsOf(t, 'user-101')).toEqual([]);
+    expect(w.creditRefunds).toEqual([]);
+  });
+
+  it('the lobby item: reEntriesLeft = her unused credits of the event\'s tier (+ creditsHeld, maxReEntries null, reEntries); never read → null; anonymous → null', async () => {
+    const { w, tid, t, qt } = field(10 * MIN);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);
+    bust(w, tid, t, 'user-101');
+    expect(w.m.qualifierList('m-alice')[0]).toMatchObject({ registered: true, eliminated: true, reEntriesLeft: null, creditsHeld: null, maxReEntries: null, reEntries: 0 });
+    w.qualifiedPlayers.set('weekly', [{ playerId: 'm-alice', creditCount: 7 }, { playerId: 'm-201', creditCount: 2 }]);
+    w.qualifiedPlayers.set('monthly', [{ playerId: 'm-alice', creditCount: 1 }]);
+    expect(w.m.qualifierList('m-alice')[0]).toMatchObject({ eliminated: true, reEntriesLeft: 7, creditsHeld: 7, maxReEntries: null, reEntries: 0 });
+    expect(w.m.qualifierList('m-201')[0]).toMatchObject({ registered: true, eliminated: false, reEntriesLeft: 2, creditsHeld: 2 });
+    expect(w.m.qualifierList('m-202')[0]).toMatchObject({ registered: true, reEntriesLeft: 0, creditsHeld: 0 });   // read, holds none
+    expect(w.m.qualifierList('m-nobody')[0]).toMatchObject({ registered: false, reEntriesLeft: null, creditsHeld: 0, reEntries: null });
+    expect(w.m.qualifierList(null)[0]).toMatchObject({ registered: false, reEntriesLeft: null, creditsHeld: null, reEntries: null, maxReEntries: null });
+    // A per-event cap still caps: cap - re-entries made, within her credits.
+    qt.maxReEntries = 2;
+    qt.players.find((p: any) => p.masterPlayerId === 'm-alice').reEntries = 1;
+    expect(w.m.qualifierList('m-alice')[0]).toMatchObject({ reEntriesLeft: 1, maxReEntries: 2, reEntries: 1, creditsHeld: 7 });
+  });
+
+  it('two re-entries of ONE account at once (two tabs): one seat, one credit kept — the second is refused already_registered and its credit refunded', async () => {
+    const { w, tid, t, qt } = field(10 * MIN);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);
+    bust(w, tid, t, 'user-101');
+    const a2 = w.mkSocket('SA2', ALICE, 'm-alice', 'Alice');
+    await Promise.all([enter(a), enter(a2)]);
+    await flush();
+    expect(liveSeatsOf(t, 'user-101')).toHaveLength(1);
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 're-entry', 're-entry']);
+    expect(w.creditRefunds).toEqual(['credit-3']);
+    const results = [...w.of('SA', 'qualifierRegistrationResult').slice(1), ...w.of('SA2', 'qualifierRegistrationResult')];
+    expect(results).toHaveLength(2);
+    expect(results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ success: true, reentry: true }),
+      expect.objectContaining({ success: false, code: 'already_registered', registered: true }),
+    ]));
+    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-alice')).toMatchObject({ reEntries: 1, reentryCreditIds: ['credit-2'] });
+    expect(entrant(w, tid, 'user-101')).toMatchObject({ eliminated: false, chips: 50_000 });
+    expect(w.m.qualifierLateEntries.reentryRefusedAlreadyBack).toBe(1);
+    expect(w.audits.find((x) => x.action === 'QUALIFIER_REENTRY_CREDIT_REFUND')?.d).toMatchObject({ creditId: 'credit-3', reason: 'already_reentered' });
+  });
+
+  it('the late window closes DURING the re-entry\'s credit consume: refused registration_closed, the credit refunded, not seated', async () => {
+    const { w, tid, t } = field(2 * H + 59 * MIN);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);
+    bust(w, tid, t, 'user-101');
+    const realNow = Date.now;
+    const base = w.scope.consumeQualifierCreditOnMaster as (...x: any[]) => Promise<any>;
+    w.scope.consumeQualifierCreditOnMaster = async (...x: any[]) => {
+      const r = await base(...x);
+      const later = realNow() + 2 * MIN;                                       // 2:01 PM when the master answers
+      Date.now = () => later;
+      return r;
+    };
+    try {
+      await enter(a);
+    } finally { Date.now = realNow; }
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: false, code: 'registration_closed' }));
+    expect(w.creditRefunds).toEqual(['credit-2']);
+    expect(liveSeatsOf(t, 'user-101')).toEqual([]);
+    expect(entrant(w, tid, 'user-101')!.eliminated).toBe(true);
+  });
+
+  it('no never-used seat left: the re-entry takes her OWN busted seat (it was refunded no_seat) — one credit, her session bound, places stay 1..N', async () => {
+    const { w, tid, t } = field(10 * MIN, 3);                                 // 3 usable seats: the table is full
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);
+    expect(t.seats[2]).toMatchObject({ state: 'occupied', playerId: 'user-101' });
+    expect(bust(w, tid, t, 'user-101')).toBe(2);
+    expect(w.playerSessions.get('SA')).toMatchObject({ tableId: 'Q1', seatIndex: 2 });   // still on her dead seat
+    await enter(a);
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: true, reentry: true, tableId: 'Q1' }));
+    expect(w.of('SA', 'qualifierTournamentStarted').slice(-1)[0]).toEqual(expect.objectContaining({ tableId: 'Q1', lateEntry: true, reentry: true }));
+    expect(t.seats[2]).toMatchObject({ state: 'occupied', playerId: 'user-101', chipCount: 50_000, eliminated: false });
+    expect(t.seats.filter((s) => s.state === 'occupied' && s.playerId === 'user-101')).toHaveLength(1);   // no dead seat of hers left
+    expect(w.playerSessions.get('SA')).toMatchObject({ tableId: 'Q1', seatIndex: 2, playerId: 'user-101' });
+    expect(a.rooms.has('table:Q1')).toBe(true);
+    expect([...((w.scope.spectators as Map<string, Set<string>>).get('Q1') || [])]).not.toContain('SA');
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 're-entry']);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.m.qualifierLateEntries.reentrySeatedOnBustedSeat).toBe(1);
+    expect(entrant(w, tid, 'user-101')).toMatchObject({ eliminated: false, finishPosition: 0, chips: 50_000 });
+    bust(w, tid, t, 'user-202');
+    expect(entrant(w, tid, 'user-202')!.finishPosition).toBe(3);               // 3 entrants: the next bust is 3rd
+  });
+
+  it('her own dead seat was taken (a late entrant): every seat alive → no_seat, the credit returned; once another seat busts she takes THAT one', async () => {
+    const { w, tid, t } = field(10 * MIN, 3);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);                                                            // Alice: seat 2, credit-1
+    bust(w, tid, t, 'user-101');
+    const d = w.mkSocket('SD', 103, 'm-dan', 'Dan');
+    await enter(d);                                                            // Dan takes her busted seat 2, credit-2
+    expect(t.seats[2]).toMatchObject({ playerId: 'user-103', eliminated: false });
+
+    await enter(a);                                                            // credit-3 consumed, then returned
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: false, code: 'no_seat', qualifierId: WEEKLY }));
+    expect(w.creditRefunds).toEqual(['credit-3']);
+    expect(entrant(w, tid, 'user-101')!.eliminated).toBe(true);
+
+    bust(w, tid, t, 'user-202');                                               // Carl busts at seat 1
+    await enter(a);                                                            // credit-4
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: true, reentry: true }));
+    expect(t.seats[1]).toMatchObject({ state: 'occupied', playerId: 'user-101', chipCount: 50_000, eliminated: false });
+    expect(w.creditRefunds).toEqual(['credit-3']);
+    // 4 entrants (Bob, Carl, Alice, Dan): Carl is out 4th, the three alive hold no place.
+    expect(w.tm.getTournament(tid)!.players.map((p: any) => [p.playerId, p.eliminated, p.finishPosition]).sort()).toEqual([
+      ['user-101', false, 0], ['user-103', false, 0], ['user-201', false, 0], ['user-202', true, 4],
+    ]);
+  });
+
+  it('a re-entry is open until 2 PM too: 2h50 after the start she re-enters (one credit); after 2 PM → signup_closed, nothing consumed', async () => {
+    const { w, tid, t } = field(2 * H + 50 * MIN);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);
+    bust(w, tid, t, 'user-101');
+    await enter(a);
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: true, reentry: true }));
+    bust(w, tid, t, 'user-101');
+    const realNow = Date.now;
+    const after2pm = realNow() + 11 * MIN;
+    Date.now = () => after2pm;
+    try {
+      await enter(a);
+    } finally { Date.now = realNow; }
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: false, code: 'signup_closed' }));
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 're-entry']);
+    expect(liveSeatsOf(t, 'user-101')).toEqual([]);
   });
 });
 
@@ -572,7 +846,12 @@ describe('the qualifier lifecycle — started, cancelled for too few players, fi
     await a.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
     w.m.tickQualifierAutoStart(at + 60_000);
     expect(w.qualifierTournaments.get(WEEKLY).status).toBe('registering');
+    // 2026-10-22 — late registration now runs until 2 PM: still waiting at the OLD close (start + 90 min).
     w.m.tickQualifierAutoStart(at + 1.5 * H + 1);
+    await flush();
+    expect(w.qualifierTournaments.get(WEEKLY).status).toBe('registering');
+    expect(w.creditRefunds).toEqual([]);
+    w.m.tickQualifierAutoStart(at + LATE + 1);
     await flush();
     expect(w.qualifierTournaments.get(WEEKLY)).toMatchObject({ status: 'finished', cancelled: true });
     expect(w.creditRefunds).toEqual(['credit-1']);
@@ -806,7 +1085,7 @@ describe('2026-10-20 (owner: "Remove + refund at start") — no-shows are releas
     const { at, b, c } = await three(w);
     offline(w, b); offline(w, c);
     w.m.tickQualifierAutoStart(at);
-    w.m.tickQualifierAutoStart(at + 1.5 * H + 1);
+    w.m.tickQualifierAutoStart(at + LATE + 1);
     await flush();
     expect(w.qualifierTournaments.get(WEEKLY)).toMatchObject({ status: 'finished', cancelled: true });
     expect(w.creditRefunds.sort()).toEqual(['credit-1', 'credit-2', 'credit-3']);
@@ -826,7 +1105,7 @@ describe('2026-10-20 (owner: "Remove + refund at start") — no-shows are releas
       expect(w.m.tellQualifierNoShowReleases(back, w.authSessions.get('SC3'), 'test')).toBe(1);
       expect(w.of('SC3', 'qualifierCancelled')).toEqual([{
         qualifierId: WEEKLY, reason: 'absent_at_start', qualifierName: expect.any(String),
-        lateRegUntil: new Date(at + 1.5 * H).toISOString(), lateRegOpen: true, creditRefunded: true,
+        lateRegUntil: new Date(at + LATE).toISOString(), lateRegOpen: true, creditRefunded: true,
       }]);
       expect(w.m.tellQualifierNoShowReleases(back, w.authSessions.get('SC3'), 'test')).toBe(0);   // once
       // Nobody else is told anything.

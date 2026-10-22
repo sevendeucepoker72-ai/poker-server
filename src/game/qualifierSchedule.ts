@@ -88,9 +88,43 @@ export function parseMasterSchedule(body: unknown): MasterScheduleEntry[] {
   return out;
 }
 
-/** Signup opens 3h before the start; registration (late included) closes 90 minutes after it. */
+/**
+ * Signup opens 3h before the start; registration (late entry and re-entry
+ * included) closes QUALIFIER_LATE_REG_MS after it.
+ * 2026-10-22 (owner: "There should be late entries until 2pm") — 3 hours (was
+ * 90 minutes = 12:30): the weekly (Sunday) and the monthly (3rd Saturday) both
+ * start at 11:00 AM Denver, so 11:00 + 3h = 2:00 PM Denver. The ONE late-entry
+ * constant: the register window, the late seat, the re-entry window, the
+ * too-few-players cancel, the no-show notice and the lobby's lateRegUntil /
+ * signupClosesAt all follow it. Owner-correctable here.
+ */
 export const QUALIFIER_SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000;
-export const QUALIFIER_LATE_REG_MS = 90 * 60 * 1000;
+export const QUALIFIER_LATE_REG_MS = 180 * 60 * 1000;
+
+/**
+ * 2026-10-22 (owner: "re entries if they have more credits and each entry
+ * consume a credit") — the per-event re-entry cap. null = NO cap: a busted
+ * entrant may re-enter (until QUALIFIER_LATE_REG_MS) as often as he holds an
+ * unused credit of the event's tier, and every entry — the first and each
+ * re-entry — consumes exactly one (the master's atomic consume is the limit).
+ * Was a hard-coded 3. A number here caps every event (a per-event
+ * `maxReEntries` still overrides it). Owner-correctable here.
+ */
+export const QUALIFIER_MAX_REENTRIES: number | null = null;
+
+/**
+ * 2026-10-22 — the re-entries a busted (or still-playing) entrant may still
+ * make: his unused credits of the tier (`creditsHeld`, each re-entry consumes
+ * one), within the cap if one is set (`cap - used`). null = not known (the
+ * credit list was never read and there is no cap) — the lobby then relies on
+ * the player's qualifications.
+ */
+export function qualifierReEntriesLeft(creditsHeld: number | null, cap: number | null | undefined, used: number): number | null {
+  const capLeft = cap === null || cap === undefined || !Number.isFinite(cap) ? null : Math.max(0, Math.floor(cap) - Math.max(0, Math.floor(used || 0)));
+  const held = creditsHeld === null || !Number.isFinite(creditsHeld) ? null : Math.max(0, Math.floor(creditsHeld));
+  if (held === null) return capLeft;
+  return capLeft === null ? held : Math.min(capLeft, held);
+}
 
 export function qualifierWindows(scheduledAt: number): { signupOpensAt: number; signupClosesAt: number; lateRegUntil: number } {
   return {

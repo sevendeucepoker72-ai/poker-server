@@ -191,6 +191,37 @@ git checkout <prior-sha> && railway up --service poker-server
    that gives a tournament seat back runs `bannedAccountRefusal` after
    `assertPlayable` (P-k)
 
+### Online qualifier late entry / re-entry rules (owner 2026-10-22)
+
+Owner: "There should be late entries until 2pm, re entries if they have more
+credits and each entry consume a credit". Each rule is ONE constant in
+`src/game/qualifierSchedule.ts` — change it there, nowhere else:
+
+- `QUALIFIER_LATE_REG_MS` (3 hours): late entry AND re-entry close this long
+  after the start. Weekly (Sunday) and monthly (3rd Saturday) both start at
+  11:00 AM Denver, so they close at 2:00 PM. It drives the register window,
+  the late seat, the re-entry window, the too-few-players cancel, the no-show
+  notice and the lobby's `lateRegUntil` / `signupClosesAt`. The master's
+  `/qualifiers/schedule` must keep listing an open event for at least that
+  long after its start, or an event still waiting for 2 players is cancelled
+  `removed_from_schedule` early (a RUNNING event is never affected).
+- `QUALIFIER_MAX_REENTRIES` (null = no cap): a busted entrant re-enters as
+  often as he holds an unused credit of the tier. Every entry (the first and
+  each re-entry) consumes exactly ONE credit through the master's atomic
+  consume; a refused / failed entry refunds it. A per-event `qt.maxReEntries`
+  still caps.
+- The re-entry re-checks, after its LAST await, that he is still out and the
+  window still open (a second tab's re-entry is refused `already_registered`
+  and refunded — it used to seat him twice). With no never-used seat left it
+  takes a BUSTED seat, his own first (`seatQualifierReentrantOnBustedSeat`,
+  log `qualifier_reentry_busted_seat`). No new table is ever opened: when
+  every seat is alive a late entry / re-entry is refused `no_seat` with the
+  credit returned. Health: `r2Play.qualifiers.lateEntries`.
+- Lobby item: `reEntriesLeft` = his unused credits of the tier from the CACHED
+  credit list (never awaited by the 10 s lobby poll), plus `creditsHeld`,
+  `maxReEntries`, `reEntries` (CONTRACTS.md). Rig: scratchpad
+  `qrig/scenario-latere.js`.
+
 ### Recovering a qualifier's finish order (the results POST never landed)
 
 Since 2026-10-22 (owner: "Save finish order to DB") `postQualifierResults`

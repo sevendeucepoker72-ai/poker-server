@@ -1600,3 +1600,22 @@ const careerCtx = careerAuth ? await ensureHydrated(socket) : null;
 # fences every audit so it can never delay, stop or re-send the results POST.
 'QUALIFIER_RESULTS_RECORDED', 'QUALIFIER_RESULTS_POSTED', 'QUALIFIER_RESULTS_POST_FAILED',
 [QualifierResults] audit failed (the POST is unaffected):
+
+# 2026-10-22 (owner: "There should be late entries until 2pm, re entries if
+# they have more credits and each entry consume a credit"). Online qualifiers:
+# late registration (late entry AND re-entry) runs 3 hours after the start
+# (11:00 AM -> 2:00 PM Denver), ONE constant; no per-event re-entry cap: a
+# busted entrant re-enters while he holds a credit of the tier, every entry
+# consuming exactly one; a second re-entry of an account already back in is
+# refused and refunded; a re-entry with no never-used seat left takes a BUSTED
+# seat (his own first); the lobby item carries creditsHeld / maxReEntries /
+# reEntries and reEntriesLeft = his credits.
+QUALIFIER_LATE_REG_MS = 180 * 60 * 1000
+QUALIFIER_MAX_REENTRIES = null
+seatQualifierReentrantOnBustedSeat(socket, qt, tournament, existingEntry, startingStack)
+qualifier_reentry_busted_seat
+reentrySeatedOnBustedSeat
+reentryRefusedAlreadyBack
+'already_reentered'
+reEntries: mine ? (mine.reEntries || 0) : null
+creditsHeld,
