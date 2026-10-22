@@ -6552,9 +6552,14 @@ function autoStartNextHand(tableId: string): void {
     // save, replaced the seat it had captured, and the handler then reserved
     // nothing — the moved seat was left with no session, no reservation and no
     // cash-out, blinded every orbit. The queued move is dropped; the seat stays
-    // where the disconnect reserves it.
+    // where the disconnect reserves it. (S6 fix-up: logged under its own event
+    // name — canonical-features.txt locks this layer by it.)
     const moveIfLive = (sid: string, session: PlayerSession): void => {
-      if (!io.sockets.sockets.get(sid)) { delete session.pendingSeatIndex; return; }
+      if (!io.sockets.sockets.get(sid)) {
+        delete session.pendingSeatIndex;
+        console.log(`[MoveSeat] ${JSON.stringify({ event: 'queued_seat_move_dropped_socket_gone', tableId, seatIndex: session.seatIndex })}`);
+        return;
+      }
       if (executePendingMove(tableId, session)) movedSockets.push(sid);
     };
     for (const [sid, session] of playerSessions) {
@@ -7136,9 +7141,14 @@ function sendProgressToPlayer(socketId: string, opts: { fresh?: boolean } = {}):
  * another account's live session plays is never touched. A table that is gone
  * pays the reservation's snapshot (as before). Returns the chips credited now
  * (0 when deferred to the hand's end). The caller has already removed the
- * reservation from reservedSeats and cleared its timer.
+ * reservation from reservedSeats and cleared its timer. `teardownOpts` goes to
+ * teardownSeat (F77 fix-up: a displaced SECONDARY reservation keeps its hand —
+ * keepHandOnDeparture).
  */
-function endCashReservation(userId: number, username: string, reserved: ReservedSeat, reason: string): number {
+function endCashReservation(
+  userId: number, username: string, reserved: ReservedSeat, reason: string,
+  teardownOpts: { keepHandOnDeparture?: boolean } = {},
+): number {
   const t = tableManager.getTable(reserved.tableId);
   if (!t) {
     const chips = reserved.chips ?? 0;
@@ -7154,7 +7164,7 @@ function endCashReservation(userId: number, username: string, reserved: Reserved
     return 0;
   }
   const chips = seatNow.chipCount;
-  const outcome = teardownSeat(reserved.tableId, t, reserved.seatIndex, { userId, username }, reason);
+  const outcome = teardownSeat(reserved.tableId, t, reserved.seatIndex, { userId, username }, reason, teardownOpts);
   syncSitOutToTable(reserved.tableId);
   broadcastGameState(reserved.tableId);
   return outcome === 'stood_up' ? chips : 0;
@@ -10511,7 +10521,11 @@ io.on('connection', (socket: Socket) => {
   // hand. force=true sends a complete frame, not a delta. Read-only + per-socket.
   // F155 (2026-10-21) — `{ tableId?, wasSeated? }` (it took no payload; a bare
   // requestState is answered exactly as before), answered by resyncTableView.
-  socket.on('requestState', (data?: { tableId?: string; wasSeated?: boolean }) => {
+  // S6 fix-up — the payload is a DEFAULT parameter (`= {}`), never `data?`: the
+  // compiled listener must declare no parameter (length 0), or socketGuard's
+  // payload check refuses the bare `requestState` every live client sends
+  // (visibility resume, TableErrorBoundary) as [socket-payload-rejected].
+  socket.on('requestState', (data: { tableId?: string; wasSeated?: boolean } = {}) => {
     try {
       resyncTableView(data, 'requestState');
     } catch { /* best-effort resync */ }
@@ -14039,6 +14053,26 @@ Give feedback in this JSON format:
           const rejoin = restoreSeatReservation(socket, rjAuth.userId, 'joinTable', { clearGhosts: true, allowSecondary: true, onlyTableId: tableId });
           if (rejoin.outcome === 'restored') {
             seatReservationRestores.joinTableRejoins++;
+            sendProgressToPlayer(socket.id);
+            scheduleAIAction(tableId);
+            return;
+          }
+        }
+      }
+      // F82 fix-up (2026-10-21) — the HALF-OPEN rejoin: no reservation yet,
+      // because the server still holds his OLD socket (same account) on its
+      // seat here until its ping timeout (or another tab of his plays it). The
+      // seat MOVES to this socket (takeOverOwnSeatOnRejoin) — it used to fall
+      // to the ghost-seat clear below, which FOLDED his live hand, then bought
+      // him in again at another seat. A join naming another seat is unchanged.
+      {
+        const toAuth = authSessions.get(socket.id);
+        if (toAuth && !playerSessions.has(socket.id)
+            && [...playerSessions].some(([sid, s]) => sid !== socket.id && s.tableId === tableId && authSessions.get(sid)?.userId === toAuth.userId)) {
+          const takenOver = takeOverOwnSeatOnRejoin(socket, toAuth.userId, tableId, seatIndex, 'joinTable');
+          if (takenOver) {
+            if (!ipSeatedSlots.has(clientIp)) ipSeatedSlots.set(clientIp, new Set());
+            ipSeatedSlots.get(clientIp)!.add(`${socket.id}:${tableId}`);
             sendProgressToPlayer(socket.id);
             scheduleAIAction(tableId);
             return;
@@ -19700,9 +19734,16 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
     // the save await below: a hand boundary inside that await ran the move on
     // the dead socket's session (stand up, sit at the target), the seat captured
     // below was no longer his and nothing was reserved — the moved seat was
-    // blinded with no reservation and no cash-out.
-    if (session) delete session.pendingSeatIndex;
-    for (const ms of multiTableSessions.get(socket.id) || []) if (ms) delete ms.pendingSeatIndex;
+    // blinded with no reservation and no cash-out. (S6 fix-up: logged under its
+    // own event name — canonical-features.txt locks this layer by it.)
+    let queuedMovesDropped = 0;
+    if (session && session.pendingSeatIndex != null) { delete session.pendingSeatIndex; queuedMovesDropped++; }
+    for (const ms of multiTableSessions.get(socket.id) || []) {
+      if (ms && ms.pendingSeatIndex != null) { delete ms.pendingSeatIndex; queuedMovesDropped++; }
+    }
+    if (queuedMovesDropped > 0) {
+      console.log(`[MoveSeat] ${JSON.stringify({ event: 'queued_seat_moves_dropped_on_disconnect', count: queuedMovesDropped })}`);
+    }
 
     // Auto-save progress on disconnect
     if (authSession && session) {
@@ -19793,8 +19834,11 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
           // F80 (2026-10-21) — the account is ALREADY back on another socket
           // (a half-open reconnect: the new socket signed in while this one was
           // still held open until its ping timeout, so its sign-in restored
-          // nothing): the reservation just made goes to that socket now.
-          if (reservedNow) adoptReservationByPendingClaim(authSession.userId);
+          // nothing): the reservation just made goes to that socket now — only
+          // when THIS socket is the one the claim waits for (S6 fix-up: a
+          // Multi-Table View socket or another device reaped first used the
+          // claim up and stranded him).
+          if (reservedNow) adoptReservationByPendingClaim(authSession.userId, socket.id, session.tableId, session.seatIndex);
           return;
         }
       }
@@ -19963,8 +20007,18 @@ function reserveSeatForDeparture(
     if (isTournamentReservation(existing)) {
       noteTournamentReservationNotCashed(authSession.userId, authSession.username, existing, 'reserve_displaced');
     } else {
-      const returned = endCashReservation(authSession.userId, authSession.username, existing, 'reserve_displaced');
-      console.log(`[Reserve] ${JSON.stringify({ event: 'reservation_displaced_settled', userId: authSession.userId, tableId: existing.tableId, seatIndex: existing.seatIndex, returned })}`);
+      // F77 fix-up (2026-10-21) — a SECONDARY (Multi-Table View) reservation
+      // displaced by the primary's departure (a whole-device blip, the
+      // secondary socket reaped FIRST) is settled exactly as the other order
+      // settles it (the secondary departure's teardown above): a hand in
+      // progress with his chips in it is KEPT (acted for on the clock, check
+      // when free) and his final stack credited at the hand's end. It used to
+      // be folded out of turn — the result depended on which socket dropped
+      // first.
+      const keepHand = existing.secondary === true;
+      const returned = endCashReservation(authSession.userId, authSession.username, existing, 'reserve_displaced',
+        keepHand ? { keepHandOnDeparture: true } : {});
+      console.log(`[Reserve] ${JSON.stringify({ event: 'reservation_displaced_settled', userId: authSession.userId, tableId: existing.tableId, seatIndex: existing.seatIndex, returned, ...(keepHand ? { secondaryHandKept: true } : {}) })}`);
     }
   }
 
@@ -20180,6 +20234,21 @@ function restoreSeatReservation(
       };
     }
     seatReservationRestores.droppedGone++;
+    // G183 fix-up (2026-10-21) — a TOURNAMENT reservation whose table or seat
+    // is gone (a broken / removed table, a seat no longer occupied): the
+    // tournament is still known (tournamentIdOfTable reads the broken-table
+    // registry), so the caller tells him his result too
+    // (tellDeadTournamentSeat says nothing to an entrant still alive; (c)
+    // restores his live seat by account). He used to be told nothing.
+    if (isTournamentReservation(reserved)) {
+      return {
+        outcome: 'dropped',
+        dead: {
+          tableId: reserved.tableId, ...reconnectTournamentFields(reserved),
+          ...(reserved.playerId ? { playerId: reserved.playerId } : {}), playerName: reserved.playerName,
+        },
+      };
+    }
     return { outcome: 'dropped' };
   }
   // Guarantee EXACTLY ONE seat: clear any OTHER seats this user holds on this
@@ -20261,44 +20330,76 @@ function tellDeadTournamentSeat(socket: Socket, auth: SocketAuthSession, dead: D
  * socket at once (adoptReservationByPendingClaim) — gated like a sign-in
  * restore (refuseSeatRestoreIfBarred), only while the claim socket is live,
  * still this account and still unseated. A claim lives two ping cycles.
+ * S6 fix-up (2026-10-21) — the claim records the sockets it WAITS FOR
+ * (`heldBy`: every primary socket of the account holding a seat when it was
+ * noted, with that seat). Only the reap of one of THOSE sockets, and only the
+ * reservation that reap just made, is adopted; any other reap of the account
+ * (its Multi-Table View socket — never a holder —, a socket that sat down
+ * later) leaves the claim untouched. The claim used to be used up by the FIRST
+ * reservation-producing reap of any socket of the account: a Multi-Table View
+ * user whose phone changed networks (both sockets half-open, the secondary
+ * reaped first) was stranded again. A holder whose reap reserves nothing
+ * adoptable just leaves the list. (Residual: with two devices both seated, the
+ * claim cannot tell which device signed in again — the first holder reaped
+ * inside the window wins.)
  */
 const PENDING_SEAT_CLAIM_MS = 2 * (20_000 + 45_000);
-const pendingSeatClaims = new Map<number, { socketId: string; until: number }>();
-const pendingSeatClaimStats = { noted: 0, adopted: 0, expired: 0, refused: 0 };
+type PendingSeatClaim = { socketId: string; until: number; heldBy: Array<{ socketId: string; tableId: string; seatIndex: number }> };
+const pendingSeatClaims = new Map<number, PendingSeatClaim>();
+const pendingSeatClaimStats = { noted: 0, adopted: 0, expired: 0, refused: 0, otherSocketReaped: 0 };
 function noteHeldSeatClaim(socket: Socket, userId: number, via: string): boolean {
   if (playerSessions.has(socket.id)) return false;
+  const heldBy: PendingSeatClaim['heldBy'] = [];
   for (const [sid, s] of playerSessions) {
     if (sid === socket.id) continue;
     const a = authSessions.get(sid);
     if (!a || a.userId !== userId || a.secondary) continue;   // F77 — never a Multi-Table View socket's seat
     const seat = tableManager.getTable(s.tableId)?.seats[s.seatIndex];
     if (!seat || seat.state !== 'occupied' || seat.isAI) continue;
-    pendingSeatClaims.set(userId, { socketId: socket.id, until: Date.now() + PENDING_SEAT_CLAIM_MS });
-    pendingSeatClaimStats.noted++;
-    console.log(`[Reserve] ${JSON.stringify({ event: 'pending_seat_claim_noted', via, userId, tableId: s.tableId, seatIndex: s.seatIndex, heldBy: sid })}`);
-    return true;
+    heldBy.push({ socketId: sid, tableId: s.tableId, seatIndex: s.seatIndex });
   }
-  return false;
+  if (heldBy.length === 0) return false;
+  pendingSeatClaims.set(userId, { socketId: socket.id, until: Date.now() + PENDING_SEAT_CLAIM_MS, heldBy });
+  pendingSeatClaimStats.noted++;
+  console.log(`[Reserve] ${JSON.stringify({ event: 'pending_seat_claim_noted', via, userId, tableId: heldBy[0].tableId, seatIndex: heldBy[0].seatIndex, heldBy: heldBy.map((h) => h.socketId) })}`);
+  return true;
 }
 function dropPendingSeatClaimsOf(socketId: string): void {
   for (const [uid, c] of [...pendingSeatClaims]) if (c.socketId === socketId) pendingSeatClaims.delete(uid);
 }
-function adoptReservationByPendingClaim(userId: number): void {
+/**
+ * The 'disconnect' handler, right after `reapedSocketId`'s departure reserved
+ * its seat (`tableId`, `seatIndex`): hand that reservation to the account's
+ * claiming socket — only when the claim waits for THIS socket and the
+ * reservation is the one just made for its seat.
+ */
+function adoptReservationByPendingClaim(userId: number, reapedSocketId: string, tableId: string, seatIndex: number): void {
   const claim = pendingSeatClaims.get(userId);
   if (!claim) return;
+  if (!(claim.until > Date.now())) { pendingSeatClaims.delete(userId); pendingSeatClaimStats.expired++; return; }
+  const held = claim.heldBy.find((h) => h.socketId === reapedSocketId);
+  if (!held) {
+    // Another socket of his (never a holder): the claim keeps waiting for its own.
+    pendingSeatClaimStats.otherSocketReaped++;
+    return;
+  }
+  const r = reservedSeats.get(userId);
+  if (!r || r.voluntary || r.secondary || r.tableId !== tableId || r.seatIndex !== seatIndex) {
+    // Nothing of this holder's to adopt: it leaves the list; the claim waits for the others.
+    claim.heldBy = claim.heldBy.filter((h) => h !== held);
+    if (claim.heldBy.length === 0) pendingSeatClaims.delete(userId);
+    return;
+  }
   pendingSeatClaims.delete(userId);
-  if (!(claim.until > Date.now())) { pendingSeatClaimStats.expired++; return; }
   const sock = io.sockets.sockets.get(claim.socketId);
   const auth = authSessions.get(claim.socketId);
   if (!sock || !sock.connected || !auth || auth.userId !== userId || auth.secondary || playerSessions.has(claim.socketId)) return;
-  const r = reservedSeats.get(userId);
-  if (!r || r.voluntary || r.secondary) return;
   void (async () => {
     // The seat-restore play gate (suspension / ban), as every sign-in's.
     const refusal = await refuseSeatRestoreIfBarred(sock, userId, auth.username, 'reaped_claim', auth);
     if (!sock.connected || authSessions.get(claim.socketId) !== auth || playerSessions.has(claim.socketId)) return;
     if (refusal) { pendingSeatClaimStats.refused++; emitPlayRefusal(sock, refusal); return; }
-    const res = restoreSeatReservation(sock, userId, 'reaped_claim', { clearGhosts: true });
+    const res = restoreSeatReservation(sock, userId, 'reaped_claim', { clearGhosts: true, onlyTableId: tableId });
     if (res.outcome === 'restored') {
       pendingSeatClaimStats.adopted++;
       return;
@@ -20306,6 +20407,78 @@ function adoptReservationByPendingClaim(userId: number): void {
     if (res.dead) tellDeadTournamentSeat(sock, auth, res.dead);
     restoreAbsentTournamentSeat(sock, auth, 'reaped_claim');
   })().catch((e: any) => console.warn(`[Reserve] reaped-claim restore failed (user ${userId}):`, e?.message || e));
+}
+
+/**
+ * F82 fix-up (2026-10-21) — the HALF-OPEN rejoin. joinTable on a socket with no
+ * seat, at a CASH table where ANOTHER socket signed in as the SAME account
+ * holds a main session on a seat — the Multi-Table View's socket rejoining its
+ * table after a network change while the server still holds the old socket
+ * open until its ping timeout (so no reservation exists yet), or another tab /
+ * device of his. The seat MOVES to this socket (latest connection wins, as a
+ * tournament Return's P-c'' takeover): same seat, same stack, his hand kept,
+ * his Sit Out (tracker, owed blinds, sat-out count) and fast mode kept,
+ * nothing bought or credited. The old socket's session ends, it leaves the
+ * table room, its delta baseline and seated slot go, a queued seat move ends
+ * (moveSeatCancelled), and it is told seatVacated {reason:'joined_new_seat'}
+ * (F88's contract); its later disconnect finds no session and reserves
+ * nothing. The new socket is answered like a restore: reconnectedToTable
+ * {tableId, seatIndex, sittingOut} (+ sitOutToggled 'restored' when sitting
+ * out), fastModeSet, a full state. It used to fall to the ghost-seat clear:
+ * his live hand FOLDED and he was bought in again at another seat. A join
+ * naming ANOTHER seat is a seat change (the ghost clear, as before).
+ */
+const seatRejoinTakeOvers = { count: 0 };
+function takeOverOwnSeatOnRejoin(
+  socket: Socket, userId: number, tableId: string, wantedSeat: unknown, via: string,
+): { seatIndex: number } | null {
+  if (playerSessions.has(socket.id) || isTournamentTable(tableId)) return null;
+  if ((multiTableSessions.get(socket.id) || []).some((s) => s && s.tableId === tableId)) return null;
+  const table = tableManager.getTable(tableId);
+  if (!table) return null;
+  const named = typeof wantedSeat === 'number' && Number.isInteger(wantedSeat) && wantedSeat >= 0;
+  for (const [sid, old] of [...playerSessions]) {
+    if (sid === socket.id || old.tableId !== tableId) continue;
+    if (authSessions.get(sid)?.userId !== userId) continue;
+    if (named && wantedSeat !== old.seatIndex) continue;
+    const seat = table.seats[old.seatIndex];
+    if (!seat || seat.state !== 'occupied' || seat.isAI || !sessionHoldsSeat(old, seat)) continue;
+    if (pendingSeatRemovalAfterHand.get(tableId)?.has(old.seatIndex)) continue;   // already leaving at the hand's end
+    const seatIndex = old.seatIndex;
+    // The old socket's hold ends.
+    playerSessions.delete(sid);
+    releaseSeatedSlot(sid, tableId);
+    lastSentState.delete(sid);
+    lastSentJson.delete(sid);
+    const oldSock = io.sockets.sockets.get(sid);
+    if (oldSock) {
+      if (old.pendingSeatIndex != null) oldSock.emit('moveSeatCancelled', { tableId, reason: 'cancelled' });
+      oldSock.leave(`table:${tableId}`);
+      oldSock.emit('seatVacated', { tableId, seatIndex, reason: 'joined_new_seat' });
+    }
+    // …and moves to this socket (everything but a queued move).
+    detachSocketFromOtherTables(socket, tableId, 'seat', via);
+    const session: PlayerSession = { ...old, socketId: socket.id };
+    delete session.pendingSeatIndex;
+    playerSessions.set(socket.id, session);
+    socket.join(`table:${tableId}`);
+    dropPendingSeatClaimsOf(socket.id);   // F80 — seated now: nothing left to claim
+    const sittingOut = session.sittingOut === true;
+    socket.emit('reconnectedToTable', { tableId, seatIndex, sittingOut });
+    if (sittingOut) socket.emit('sitOutToggled', { sittingOut: true, reason: 'restored', tableId });
+    restoreFastModeOnSeatRestore(socket, old);
+    const full: any = getGameStateForPlayer(table, seatIndex, session.trainingEnabled || false);
+    full.sittingOut = sittingOut;
+    full.fastMode = session.fastMode === true;
+    lastSentState.delete(socket.id);
+    lastSentJson.delete(socket.id);
+    emitGameState(socket, full, true);
+    broadcastGameState(tableId);
+    seatRejoinTakeOvers.count++;
+    console.log(`[Reserve] ${JSON.stringify({ event: 'seat_taken_over_on_rejoin', via, userId, tableId, seatIndex, fromSocket: sid, oldSocketLive: !!oldSock?.connected, sittingOut })}`);
+    return { seatIndex };
+  }
+  return null;
 }
 // ===== end seat reservation restore =====
 

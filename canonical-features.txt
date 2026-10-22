@@ -1423,7 +1423,17 @@ code: 'invalid_target_seat'
 reason: 'cancelled'
 reason: 'unchanged'
 reason: 'restored'
-delete session.pendingSeatIndex;
+# S6 fix-up: G189 is locked by its two layers' own event names (the old line,
+# `delete session.pendingSeatIndex;`, also matched the move / cancel paths).
+# F155: requestState declares no parameter (socketGuard lets a bare one in).
+# F80: a claim adopts only its holder's reap. F82: a half-open rejoin takes
+# over the account's own seat. F77: a displaced secondary keeps its hand.
+queued_seat_move_dropped_socket_gone
+queued_seat_moves_dropped_on_disconnect
+socket.on('requestState', (data = {}) =>
+claim.heldBy.find((h) => h.socketId === reapedSocketId)
+seat_taken_over_on_rejoin
+secondaryHandKept: true
 
 # 2026-10-21 gameplay S7 (seat lifecycle: join, invite, move, force-close, buy-in limits).
 # F100: no seat move at a fixed-roster table (quick formats, club challenges).

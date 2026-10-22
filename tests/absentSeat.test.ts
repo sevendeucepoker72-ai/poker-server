@@ -273,6 +273,8 @@ function world(opts: WorldOpts = {}) {
     syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {}, cleanupQuickTable() {},
     // R2 (S1): the Spin & Go (prize format) helpers the leave / reservation paths ask.
     isPrizeFormatTable: () => false, leavePrizeFormatSeat: () => false, quickGameEndCheck: () => false,
+    // S6 fix-up: leaverKeepsAllInHand (a departure that keeps a live hand) asks it — no quick tables here.
+    isFixedRosterQuickTable: () => false,
     emitGameState() {},
     settleDecidedQuickGame: () => false,   // R3 (S1-4) — no quick game decided here
     shutdownFlushActive: () => false,   // R2 (item 1) — the shutdown flush is not running
@@ -2300,6 +2302,68 @@ describe('S6 — reconnect, restore and reservations (gameplay 2026-10-21)', () 
       expect(w.table.seats[0].state).toBe('empty');
     });
 
+    // S6 fix-up — the claim waits for the socket(s) that HOLD the seat, never any reap of the account.
+    describe('Multi-Table View user, phone changes networks: BOTH sockets half-open; the secondary SX is reaped FIRST', () => {
+      const NEW_ADOPT = slice('function adoptReservationByPendingClaim(', '\n}\n');
+      // The S6 text (541161d): the claim was used up by the first reservation-producing reap.
+      const OLD_ADOPT = `function adoptReservationByPendingClaim(userId) {
+  const claim = pendingSeatClaims.get(userId);
+  if (!claim) return;
+  pendingSeatClaims.delete(userId);
+  if (!(claim.until > Date.now())) { pendingSeatClaimStats.expired++; return; }
+  const sock = io.sockets.sockets.get(claim.socketId);
+  const auth = authSessions.get(claim.socketId);
+  if (!sock || !sock.connected || !auth || auth.userId !== userId || auth.secondary || playerSessions.has(claim.socketId)) return;
+  const r = reservedSeats.get(userId);
+  if (!r || r.voluntary || r.secondary) return;
+  void (async () => {
+    const refusal = await refuseSeatRestoreIfBarred(sock, userId, auth.username, 'reaped_claim', auth);
+    if (!sock.connected || authSessions.get(claim.socketId) !== auth || playerSessions.has(claim.socketId)) return;
+    if (refusal) { pendingSeatClaimStats.refused++; emitPlayRefusal(sock, refusal); return; }
+    const res = restoreSeatReservation(sock, userId, 'reaped_claim', { clearGhosts: true });
+    if (res.outcome === 'restored') { pendingSeatClaimStats.adopted++; return; }
+    if (res.dead) tellDeadTournamentSeat(sock, auth, res.dead);
+    restoreAbsentTournamentSeat(sock, auth, 'reaped_claim');
+  })().catch(() => {});
+}
+`;
+      async function mtvHandoff(over: Partial<typeof P> = {}) {
+        const w = world({ over });
+        const t2 = w.mkTable('t2');
+        expect(t2.sitDown(4, 'Alice', 3000, 'player-x', false, true)).toBe(true);
+        const s1 = w.seatLive('S1', ALICE, 0);                              // primary: t1 seat 0, 7000
+        const sx = seatAt(w, 'SX', ALICE, 't2', 4, { secondary: true });    // Multi-Table View socket: t2 seat 4, 3000
+        w.playerSessions.get('SX').playerId = 'player-x';
+        const s2 = w.mkSocket('S2');
+        await s2.handlers.oauthLogin({ accessToken: 'oidc-alice' });     // the phone's new primary socket
+        await flush();
+        expect(w.playerSessions.has('S2')).toBe(false);
+        await w.drop(sx);                                                   // reaped first
+        await flush();
+        await w.drop(s1);
+        await flush();
+        return { w, t2 };
+      }
+
+      it('SX\'s reap leaves the claim alone; S1\'s reap hands HIS seat to S2 at once (reconnectedToTable); the secondary seat is settled (3,000 credited) — nothing lost', async () => {
+        const { w, t2 } = await mtvHandoff();
+        expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
+        expect(payloadOf(w, 'S2', 'reconnectedToTable')).toEqual({ tableId: 't1', seatIndex: 0, sittingOut: false });
+        expect(w.reservedSeats.has(ALICE)).toBe(false);
+        expect(w.table.seats[0]).toMatchObject({ state: 'occupied', chipCount: 7000 });
+        expect(t2.seats[4].state).toBe('empty');
+        expect(w.credits).toEqual([{ uid: ALICE, amount: 3000 }]);
+      });
+
+      it('CONTROL — the S6 adoption (claim used up by ANY reap): SX\'s secondary reservation burns the claim; S1\'s seat is reserved and S2 is told nothing (the original strand)', async () => {
+        expect(P.seatRestore).toContain(NEW_ADOPT);
+        const { w } = await mtvHandoff({ seatRestore: P.seatRestore.replace(NEW_ADOPT, OLD_ADOPT) });
+        expect(w.playerSessions.has('S2')).toBe(false);
+        expect(w.reservedSeats.get(ALICE)).toMatchObject({ tableId: 't1', seatIndex: 0 });
+        expect(evNames(w, 'S2')).toEqual(['loginResult']);
+      });
+    });
+
     it('a Multi-Table View (secondary) socket never claims: its sign-in skips recovery', async () => {
       const w = world();
       const s1 = w.seatLive('S1', ALICE, 0);
@@ -2457,6 +2521,40 @@ describe('S6 — reconnect, restore and reservations (gameplay 2026-10-21)', () 
       expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
     });
 
+    // S6 fix-up — the OTHER order of the same blip, with a hand in progress at t2.
+    describe('one blip drops both, the SECONDARY FIRST, his chips in a live hand at t2', () => {
+      const KEEP = 'keepHand ? { keepHandOnDeparture: true } : {}';
+      async function secondaryFirst(over: Partial<typeof P> = {}) {
+        const { w, t2, sp, sx } = twoSockets(over);
+        expect(t2.sitDown(5, 'Yan', 5000, 'p-yan', false, true)).toBe(true);
+        expect(t2.startNewHand()).toBe(true);
+        for (let g = 0; g < 4 && t2.activeSeatIndex === 4; g++) t2.playerCall(4);
+        expect(t2.activeSeatIndex).not.toBe(4);
+        expect(t2.seats[4].totalInvestedThisHand).toBeGreaterThan(0);
+        await w.drop(sx);
+        expect(w.reservedSeats.get(ALICE)).toMatchObject({ tableId: 't2', seatIndex: 4, secondary: true });
+        await w.drop(sp);                                                   // displaces the secondary reservation
+        await flush();
+        return { w, t2 };
+      }
+
+      it('settled like the primary-first order: the t2 hand is KEPT (not folded), the stand-up and credit wait for the hand\'s end; the PRIMARY seat is reserved', async () => {
+        const { w, t2 } = await secondaryFirst();
+        expect(w.reservedSeats.get(ALICE)).toMatchObject({ tableId: 't1', seatIndex: 0 });
+        expect(w.table.seats[0]).toMatchObject({ state: 'occupied', chipCount: 7000 });
+        expect(t2.seats[4]).toMatchObject({ state: 'occupied', folded: false });
+        expect(t2.isHandInProgress()).toBe(true);
+        expect((w.g.pendingSeatRemovalAfterHand as Map<string, Map<number, any>>).get('t2')?.get(4)).toMatchObject({ userId: ALICE });
+        expect(w.credits).toEqual([]);                                      // credited at the hand's end, once
+      });
+
+      it('CONTROL — the S6 displacement (endCashReservation with no keep): his live t2 hand is FOLDED out of turn', async () => {
+        expect(P.departure).toContain(KEEP);
+        const { t2 } = await secondaryFirst({ departure: P.departure.replace(KEEP, '{}') });
+        expect(t2.seats[4].folded).toBe(true);
+      });
+    });
+
     it('CONTROL — pre-F77: the secondary drop DISPLACES the primary reservation — t1 cashed out and stood up, and the primary sign-in lands on t2', async () => {
       expect(P.departure).toContain(SECONDARY);
       const { w, sp, sx } = twoSockets({ departure: P.departure.replace(SECONDARY, 'if (false && existing'), seatRestore: P.seatRestore.replace(SKIP, '') });
@@ -2541,6 +2639,47 @@ describe('S6 — reconnect, restore and reservations (gameplay 2026-10-21)', () 
       expect(w.playerSessions.get('S2')).toMatchObject({ tableId: 't1', seatIndex: 0 });
       expect(evNames(w, 'S2')).toContain('reconnectedToTable');
       expect(evNames(w, 'S2')).not.toContain('playerEliminated');
+    });
+
+    // S6 fix-up — the reservation's TABLE is gone (broken / removed) by the time he signs in.
+    describe('his tournament table is GONE (a table break / removal) when he signs in', () => {
+      const GONE = slice('    // G183 fix-up (2026-10-21) — a TOURNAMENT reservation whose table or seat', '\n    }\n');
+      async function tableGone(busted: boolean, over: Partial<typeof P> = {}) {
+        const w = world({ tournament: true, over });
+        w.tm!.setTableId(w.tid, 't1');
+        const s1 = w.seatLive('S1', ALICE, 0);
+        await w.drop(s1);
+        expect(w.reservedSeats.get(ALICE)).toMatchObject({ tableId: 't1', seatIndex: 0, tournament: true, playerId: 'user_101' });
+        if (busted) expect(w.tm!.eliminatePlayer(w.tid, 'user_101')).toMatchObject({ position: 3 });
+        w.tables.delete('t1');
+        const s2 = w.mkSocket('S2');
+        await s2.handlers.oauthLogin({ accessToken: 'oidc-alice' });
+        await flush();
+        return w;
+      }
+
+      it('busted meanwhile: the reservation is dropped and he is TOLD his place after loginResult (playerEliminated)', async () => {
+        const w = await tableGone(true);
+        expect(w.playerSessions.has('S2')).toBe(false);
+        expect(w.reservedSeats.has(ALICE)).toBe(false);
+        const evs = evNames(w, 'S2');
+        expect(evs.indexOf('playerEliminated')).toBeGreaterThan(evs.indexOf('loginResult'));
+        expect(payloadOf(w, 'S2', 'playerEliminated')).toEqual({ tournamentId: w.tid, playerId: 'user_101', playerName: 'Alice', position: 3 });
+      });
+
+      it('still ALIVE (not eliminated): told nothing — no false elimination notice', async () => {
+        const w = await tableGone(false);
+        expect(w.reservedSeats.has(ALICE)).toBe(false);
+        expect(evNames(w, 'S2')).not.toContain('playerEliminated');
+        expect(evNames(w, 'S2')).not.toContain('tournamentFinishedForEntrant');
+      });
+
+      it('CONTROL — the S6 text (`dead` only with the seat still there): the busted player is told NOTHING', async () => {
+        expect(P.seatRestore).toContain(GONE);
+        const w = await tableGone(true, { seatRestore: P.seatRestore.replace(GONE, '') });
+        expect(w.reservedSeats.has(ALICE)).toBe(false);
+        expect(evNames(w, 'S2')).toEqual(['loginResult']);
+      });
     });
 
     it('a CASH seat at 0 chips (flagged eliminated until a rebuy) is still restored — he can rebuy', async () => {

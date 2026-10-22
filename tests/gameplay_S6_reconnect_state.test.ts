@@ -20,6 +20,8 @@
  * boots a server on import) against the REAL PokerTable engine; each fix has a
  * CONTROL that runs the pre-fix text and shows the defect.
  */
+import fs from 'fs';
+import path from 'path';
 import { PokerTable, GamePhase, MAX_SEATS } from '../src/game/PokerTable';
 import { FiveCardDrawTable } from '../src/game/variants/FiveCardDrawTable';
 import { OmahaTable } from '../src/game/variants/OmahaTable';
@@ -30,8 +32,9 @@ import {
   SRC, slice, fnSrc, handlerSrc, load, flush, deferred,
   SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, SEAT_RESTORE_SRC, MUCK_SHOWS_SRC, JOIN_PRECHECK_SRC,
 } from './helpers/indexSource';
+import { installSocketListenerGuard, socketGuardStats } from '../src/socketGuard';
 
-const quiet = { log() {}, warn() {}, error() {} };
+const quiet ={ log() {}, warn() {}, error() {} };
 const DRAWS = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
 const cfg = (tableId: string, over: Record<string, unknown> = {}) =>
   ({ tableId, tableName: tableId, smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 1000, maxPlayers: 9, ...over } as any);
@@ -195,7 +198,7 @@ describe('F155 — a resync (syncTableState / requestState) never leaves a froze
     slice('function shallowDiff(', '\n}\n'), slice('const ALWAYS_EMIT_KEYS = [', '];\n'),
     fnSrc('function pickAlwaysEmit('), fnSrc('function emitGameState('),
   ].join('\n');
-  function world(sync = H.sync) {
+  function world(sync = H.sync, wOpts: { request?: string; guard?: boolean } = {}) {
     const table = new PokerTable(cfg('A'));
     for (let i = 0; i < 3; i++) expect(table.sitDown(i, `P${i}`, 5000, `p${i}`, false)).toBe(true);
     const B = new PokerTable(cfg('B'));
@@ -215,9 +218,16 @@ describe('F155 — a resync (syncTableState / requestState) never leaves a froze
       releaseSeatedSlot() {}, isTournamentTable: () => false, tableViewDetaches: { calls: 0, spectatorViewsEnded: 0, roomsLeft: 0, deadSeatSessionsEnded: 0 },
       console: quiet,
     };
-    const code = `${EMIT_SRC}\n${fnSrc('function detachSocketFromOtherTables(')}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${sync}\n${H.request}\n}`;
+    const code = `${EMIT_SRC}\n${fnSrc('function detachSocketFromOtherTables(')}\nfunction wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${sync}\n${wOpts.request ?? H.request}\n}`;
     const { exports: m, stubbed } = load(code, scope, '{ wire }');
-    const mk = (id: string) => { const s = fakeSocket(id); sockets.set(id, s); m.wire(s); return s; };
+    const mk = (id: string) => {
+      const s = fakeSocket(id);
+      sockets.set(id, s);
+      // S6 fix-up — the REAL listener guard index.ts installs first on every connection.
+      if (wOpts.guard) installSocketListenerGuard(s, { log: () => {} });
+      m.wire(s);
+      return s;
+    };
     return { table, B, m, stubbed, mk, playerSessions, multiTableSessions, authSessions, reservedSeats, spectators, lastSentState, sockets };
   }
 
@@ -290,6 +300,40 @@ describe('F155 — a resync (syncTableState / requestState) never leaves a froze
     expect(events(s, 'gameState')[0].state.isSpectator).toBeUndefined();
     s.handlers.syncTableState({ tableId: 'old-uuid' });
     expect(events(s, 'tableClosed')).toEqual([]);
+  });
+
+  // S6 fix-up — every LIVE client emits requestState BARE (visibility resume,
+  // TableErrorBoundary). Through the REAL socket listener guard.
+  describe('through the socket listener guard (installSocketListenerGuard), as index.ts registers it', () => {
+    const OPTIONAL = "socket.on('requestState', (data?: { tableId?: string; wasSeated?: boolean }) => {";
+    const DEFAULTED = "socket.on('requestState', (data: { tableId?: string; wasSeated?: boolean } = {}) => {";
+
+    it('a BARE requestState on a seated socket passes the guard and is answered with his seat\'s full state (nothing rejected)', () => {
+      const w = world(H.sync, { guard: true });
+      const s = w.mk('SH');
+      w.playerSessions.set('SH', { socketId: 'SH', tableId: 'A', seatIndex: 1, sittingOut: false, trainingEnabled: false });
+      const rejectedBefore = socketGuardStats.payloadsRejected;
+      s.handlers.requestState();
+      s.handlers.requestState({ tableId: 'A' });
+      expect(socketGuardStats.payloadsRejected).toBe(rejectedBefore);
+      expect(events(s, 'gameState').map((f) => [f.full, f.state.tableId, f.state.yourSeat])).toEqual([[true, 'A', 1], [true, 'A', 1]]);
+    });
+
+    it('CONTROL — the S6 text `(data?: …)` (one declared parameter): the guard REJECTS the bare requestState — no frame, [socket-payload-rejected]', () => {
+      expect(H.request).toContain(DEFAULTED);
+      const w = world(H.sync, { guard: true, request: H.request.replace(DEFAULTED, OPTIONAL) });
+      const s = w.mk('SH');
+      w.playerSessions.set('SH', { socketId: 'SH', tableId: 'A', seatIndex: 1, sittingOut: false, trainingEnabled: false });
+      const rejectedBefore = socketGuardStats.payloadsRejected;
+      s.handlers.requestState();
+      expect(socketGuardStats.payloadsRejected).toBe(rejectedBefore + 1);
+      expect(events(s, 'gameState')).toEqual([]);
+    });
+
+    it('no socket listener in index.ts declares an OPTIONAL first parameter (`x?:` — compiled to one declared parameter, the guard refuses a bare emit); a payload-optional listener uses a default (`= {}`)', () => {
+      const optional = SRC.match(/socket\.on\(\s*'[A-Za-z]+',\s*(?:trackLogin\([^)]*?,\s*)?(?:async\s*)?\(\s*[A-Za-z_$][\w$]*\?\s*:/g) || [];
+      expect(optional).toEqual([]);
+    });
   });
 
   describe('broadcastGameState — a socket SEATED at the table is never also its spectator', () => {
@@ -740,10 +784,96 @@ describe('F82 — a rejoin (joinTable) RESTORES the account\'s reservation at th
     expect(events(x2, 'reconnectedToTable')).toEqual([]);
     expect(w.deducts).toEqual([{ uid: ALICE, amount: 1000 }]);
   });
+
+  // ── S6 fix-up: the HALF-OPEN variant — X is not reaped yet (the server holds it
+  // open until its ping timeout), so there is NO reservation when X2 rejoins.
+  describe('half-open: X2 rejoins while the server still holds X on the seat (no reservation yet)', () => {
+    const TAKEOVER = slice('      // F82 fix-up (2026-10-21) — the HALF-OPEN rejoin', '      // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.\n');
+    async function halfOpenRejoin(over: { join?: string } = {}, payload: Record<string, unknown> = { seatIndex: -1 }, prep?: (w: ReturnType<typeof seatWorld>) => void) {
+      const w = seatWorld(over);
+      expect(w.T1.startNewHand()).toBe(true);
+      for (let g = 0; g < 4 && w.T1.activeSeatIndex === 4; g++) w.T1.playerCall(4);
+      expect(w.T1.activeSeatIndex).not.toBe(4);
+      expect(w.T1.seats[4].totalInvestedThisHand).toBeGreaterThan(0);   // his chips are in the pot
+      const stackBefore = w.T1.seats[4].chipCount;
+      w.x.rooms.add('table:T1');
+      prep?.(w);
+      const x2 = w.mk('X2');
+      w.authSessions.set('X2', { userId: ALICE, username: 'alice', masterUserId: 'm-alice', secondary: true });
+      await x2.handlers.joinTable({ tableId: 'T1', playerName: 'Alice', buyIn: 1000, ...payload });
+      await flush();
+      return { w, x2, stackBefore };
+    }
+
+    it('the seat MOVES to X2: unfolded, same stack, no deduct, no credit; X2 told reconnectedToTable; X told seatVacated {joined_new_seat} and out of the room', async () => {
+      const { w, x2, stackBefore } = await halfOpenRejoin();
+      expect(w.playerSessions.get('X2')).toMatchObject({ socketId: 'X2', tableId: 'T1', seatIndex: 4, playerId: 'player-x1' });
+      expect(w.playerSessions.has('X')).toBe(false);
+      expect(w.T1.seats[4]).toMatchObject({ state: 'occupied', folded: false, chipCount: stackBefore, playerId: 'player-x1' });
+      expect(w.T1.isHandInProgress()).toBe(true);
+      expect(w.deducts).toEqual([]);
+      expect(w.credits).toEqual([]);
+      expect(events(x2, 'reconnectedToTable')).toEqual([{ tableId: 'T1', seatIndex: 4, sittingOut: false }]);
+      expect(events(x2, 'fastModeSet')).toEqual([{ enabled: false }]);
+      expect(x2.rooms.has('table:T1')).toBe(true);
+      expect(events(w.x, 'seatVacated')).toEqual([{ tableId: 'T1', seatIndex: 4, reason: 'joined_new_seat' }]);
+      expect(w.x.rooms.has('table:T1')).toBe(false);
+      expect([...w.stubbed].filter((n) => /takeOver|restore|Reserv|Ghost|seat|Seat|detach/.test(n) && !n.includes('.'))).toEqual([]);
+    });
+
+    it('…X is reaped later: nothing reserved, nothing credited — X2 keeps playing the seat', async () => {
+      const { w } = await halfOpenRejoin();
+      await w.drop(w.x);
+      await flush();
+      expect(w.reservedSeats.has(ALICE)).toBe(false);
+      expect(w.credits).toEqual([]);
+      expect(w.playerSessions.get('X2')).toMatchObject({ tableId: 'T1', seatIndex: 4 });
+      expect(w.T1.seats[4]).toMatchObject({ state: 'occupied', folded: false });
+    });
+
+    it('his Sit Out and fast mode move with the seat (tracker kept, sitOutToggled restored); a queued seat move ends (moveSeatCancelled to X)', async () => {
+      const { w, x2 } = await halfOpenRejoin({}, { seatIndex: 4 }, (wd) => {
+        Object.assign(wd.playerSessions.get('X'), { sittingOut: true, sitOutHands: 3, fastMode: true, pendingSeatIndex: 2 });
+        (wd.scope.sitOutTracker as Map<string, Set<number>>).set('T1', new Set([4]));
+      });
+      expect(w.playerSessions.get('X2')).toMatchObject({ seatIndex: 4, sittingOut: true, sitOutHands: 3, fastMode: true });
+      expect(w.playerSessions.get('X2').pendingSeatIndex).toBeUndefined();
+      expect((w.scope.sitOutTracker as Map<string, Set<number>>).get('T1')?.has(4)).toBe(true);
+      expect(events(x2, 'reconnectedToTable')).toEqual([{ tableId: 'T1', seatIndex: 4, sittingOut: true }]);
+      expect(events(x2, 'sitOutToggled')).toEqual([{ sittingOut: true, reason: 'restored', tableId: 'T1' }]);
+      expect(events(x2, 'fastModeSet')).toEqual([{ enabled: true }]);
+      expect(events(w.x, 'moveSeatCancelled')).toEqual([{ tableId: 'T1', reason: 'cancelled' }]);
+    });
+
+    it('a join naming ANOTHER seat is a seat change, as before (the ghost clear, a buy-in); another ACCOUNT\'s seat is never taken over', async () => {
+      const { w, x2 } = await halfOpenRejoin({}, { seatIndex: 2 });
+      expect(events(x2, 'reconnectedToTable')).toEqual([]);
+      expect(w.deducts).toEqual([{ uid: ALICE, amount: 1000 }]);
+      const w2 = seatWorld();
+      const bob2 = w2.mk('B2');
+      w2.authSessions.set('B2', { userId: 77, username: 'mallory' });
+      await bob2.handlers.joinTable({ tableId: 'T1', playerName: 'Mallory', seatIndex: -1, buyIn: 1000 });
+      await flush();
+      expect(w2.playerSessions.get('X')).toMatchObject({ seatIndex: 4 });
+      expect(w2.playerSessions.get('B2')?.seatIndex).not.toBe(4);
+      expect(events(bob2, 'reconnectedToTable')).toEqual([]);
+    });
+
+    it('CONTROL — pre-fix-up (no takeover): the ghost clear FOLDS his live hand and buys him in again at another seat', async () => {
+      const NEXT = '      // 2026-05-12 round-5 audit P1: spectator dual-membership scrub.\n';
+      const { w } = await halfOpenRejoin({ join: without(JOIN, TAKEOVER, NEXT) });
+      expect(w.T1.seats[4].folded).toBe(true);
+      expect(w.deducts).toEqual([{ uid: ALICE, amount: 1000 }]);
+      expect(w.playerSessions.get('X2')?.seatIndex).not.toBe(4);
+    });
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════ G189 ══
 describe('G189 — a socket that drops with a seat move queued: the move never runs on the dead socket; the seat he holds is reserved', () => {
+  // The two layers, sliced from the CURRENT source (the CONTROLs remove them).
+  const CLEAR = slice('    let queuedMovesDropped = 0;\n', "count: queuedMovesDropped })}`);\n    }\n");
+  const SKIP = slice('      if (!io.sockets.sockets.get(sid)) {\n', '        return;\n      }\n');
   async function dropDuringSaveWithMove(over: { disconnect?: string; autoStart?: string } = {}) {
     const w = seatWorld(over);
     expect(w.T1.startNewHand()).toBe(true);
@@ -769,8 +899,6 @@ describe('G189 — a socket that drops with a seat move queued: the move never r
   });
 
   it('either layer alone is enough: the disconnect drops the queued move before its await; the hand boundary skips a gone socket\'s move', async () => {
-    const CLEAR = '    if (session) delete session.pendingSeatIndex;\n    for (const ms of multiTableSessions.get(socket.id) || []) if (ms) delete ms.pendingSeatIndex;\n';
-    const SKIP = '      if (!io.sockets.sockets.get(sid)) { delete session.pendingSeatIndex; return; }\n';
     const onlyAutoStart = await dropDuringSaveWithMove({ disconnect: without(DISCONNECT, CLEAR, '') });
     expect(onlyAutoStart.reservedSeats.get(ALICE)).toMatchObject({ tableId: 'T1', seatIndex: 4 });
     const onlyDisconnect = await dropDuringSaveWithMove({ autoStart: without(AUTO_START, SKIP, '') });
@@ -778,12 +906,25 @@ describe('G189 — a socket that drops with a seat move queued: the move never r
   });
 
   it('CONTROL — pre-G189: the move runs on the dead socket during the save; the moved seat has no session, no reservation, no cash-out', async () => {
-    const CLEAR = '    if (session) delete session.pendingSeatIndex;\n    for (const ms of multiTableSessions.get(socket.id) || []) if (ms) delete ms.pendingSeatIndex;\n';
-    const SKIP = '      if (!io.sockets.sockets.get(sid)) { delete session.pendingSeatIndex; return; }\n';
     const w = await dropDuringSaveWithMove({ disconnect: without(DISCONNECT, CLEAR, ''), autoStart: without(AUTO_START, SKIP, '') });
     expect(w.T1.seats[2]).toMatchObject({ state: 'occupied', playerName: 'Alice' });
     expect(w.reservedSeats.has(ALICE)).toBe(false);
     expect(w.playerSessions.has('X')).toBe(false);
+  });
+
+  it('canonical-features.txt locks EACH layer by a literal only that layer produces: removing either layer from the source removes its lock token (the CI grep then fails)', () => {
+    const manifest = fs.readFileSync(path.join(__dirname, '..', 'canonical-features.txt'), 'utf8').split(/\r?\n/)
+      .map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+    for (const layer of [CLEAR, SKIP]) {
+      const lockedHere = manifest.filter((t) => layer.includes(t));
+      expect(lockedHere.length).toBeGreaterThan(0);
+      const srcWithout = without(SRC, layer, '');
+      // At least one of the layer's tokens appears NOWHERE else (a token shared with
+      // the move / cancel paths — the old `delete session.pendingSeatIndex;` — locks nothing).
+      expect(lockedHere.filter((t) => !srcWithout.includes(t)).length).toBeGreaterThan(0);
+    }
+    expect(manifest).toContain('queued_seat_move_dropped_socket_gone');
+    expect(manifest).toContain('queued_seat_moves_dropped_on_disconnect');
   });
 });
 
