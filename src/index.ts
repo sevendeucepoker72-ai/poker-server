@@ -5260,6 +5260,18 @@ async function settlePredictionsForHand(
  */
 const SIT_OUT_HANDS_LIMIT = 30;
 const SIT_OUT_LIMIT_MESSAGE = 'You were sitting out for a while, so your seat was released and your chips went back to your balance.';
+/**
+ * S5 fix-up (F156, 2026-10-21) — an EXTRA-table seat's stand-up is NOT the main
+ * seat's `sit_out_limit` (that code means "now watching this table"): its own
+ * code, and a sentence that names the table and says nothing about watching.
+ */
+const EXTRA_SEAT_SIT_OUT_LIMIT_CODE = 'extra_seat_sit_out_limit';
+const extraSeatSitOutLimitMessage = (table: PokerTable): string => {
+  const name = typeof table?.config?.tableName === 'string' ? table.config.tableName.trim() : '';
+  return name
+    ? `You were sitting out for a while at ${name}, so that seat was released and its chips went back to your balance.`
+    : 'You were sitting out for a while at one of your tables, so that seat was released and its chips went back to your balance.';
+};
 const sitOutLimitStats = { stoodUp: 0 };
 function standUpSeatsPastSitOutLimit(tableId: string, table: PokerTable): void {
   const kind = tableKindOf(tableId);
@@ -5324,8 +5336,15 @@ function standUpSeatsPastSitOutLimit(tableId: string, table: PokerTable): void {
       if (keep.length) multiTableSessions.set(sid, keep); else multiTableSessions.delete(sid);
       if (playerSessions.get(sid)?.tableId !== tableId) sock.leave(`table:${tableId}`);
       sock.emit('seatVacated', { tableId, seatIndex: ms.seatIndex, reason: 'sit_out_limit' });
-      sock.emit('sitOutToggled', { sittingOut: false, reason: 'sit_out_limit', stoodUp: true, tableId });
-      sock.emit('error', { message: SIT_OUT_LIMIT_MESSAGE, code: 'sit_out_limit', tableId });
+      // S5 fix-up (F156) — NOT the main seat's `sit_out_limit` frame: a client
+      // answers that code with "You are watching the table now" (the main seat
+      // is made a spectator above), read against the table ON SCREEN — false
+      // for an extra seat (only its room is left; nothing is watched) and
+      // possibly about another table. Its own code + a sentence naming the
+      // table, so any client's generic toast is right; `extraSeat: true` (also
+      // on sitOutToggled) lets a client fold it into the seatVacated notice.
+      sock.emit('sitOutToggled', { sittingOut: false, reason: 'sit_out_limit', stoodUp: true, tableId, extraSeat: true });
+      sock.emit('error', { message: extraSeatSitOutLimitMessage(table), code: EXTRA_SEAT_SIT_OUT_LIMIT_CODE, tableId, extraSeat: true });
       sitOutLimitStats.stoodUp++;
       console.log(`[sit-out] ${JSON.stringify({ event: 'sit_out_limit_stood_up', tableId, seatIndex: ms.seatIndex, hands: SIT_OUT_HANDS_LIMIT, extraSeat: true, localUserId: auth?.userId ?? null })}`);
       extraStoodUp = true;
@@ -16046,7 +16065,16 @@ Give feedback in this JSON format:
           failWaitlist('handler_exception', 'No tables available', { stage: 'no_tables' });
           return;
         }
-        const bestTable = holdem[0];
+        // S5 fix-up (F62) — never a table this socket already plays an EXTRA
+        // seat at (its main seat, if any, was left above; the ghost clear
+        // below skips this socket): one socket, one seat per table — the same
+        // skip as quickPlay. Picked before any AI stand-up or buy-in.
+        const wlCandidates = holdem.filter((t) => !socketHasSessionAt(socket.id, t.tableId));
+        if (wlCandidates.length === 0) {
+          failWaitlist('handler_exception', 'You already have a seat at this table.', { stage: 'already_seated' });
+          return;
+        }
+        const bestTable = wlCandidates[0];
         const table = tableManager.getTable(bestTable.tableId);
         if (!table) {
           failWaitlist('handler_exception', 'Table not found', { stage: 'table_missing' });
@@ -16090,8 +16118,10 @@ Give feedback in this JSON format:
         if (authNow) {
           // P3 — still this account, still no seat on this socket, still this
           // live table; a live socket is answered on the deep link's channel.
+          // S5 fix-up (F62) — and still no seat of this socket at that table
+          // (an extra seat bought during the awaits cancels and refunds).
           const wlState: BuyInExpectation = {
-            userId: authNow.userId, mainSession: null, table: { tableId: bestTable.tableId, table },
+            userId: authNow.userId, mainSession: null, notSeatedAt: bestTable.tableId, table: { tableId: bestTable.tableId, table },
             answer: (reason) => failWaitlist('handler_exception', WAITLIST_BUY_IN_CANCELLED_MESSAGE, { stage: 'state_changed', reason }, { cancelCode: WAITLIST_BUY_IN_CANCEL_CODE }),
           };
           const dbChips = await ensureChipsForBuyIn(authNow.userId, authNow.username, waitlistBuyIn);
@@ -19732,8 +19762,15 @@ Keep it direct and encouraging. No headers, just 3 paragraphs separated by newli
           if (currentSession !== session || !seatStillHis || playedElsewhere) {
             if (currentSession === session) playerSessions.delete(socket.id);
             else if (seatStillHis && !playedElsewhere) reserveSeatForDeparture(authSession, session, table, seat);
-            if (currentSession && currentSession !== session) handlePlayerLeave(socket, 'kept');
-            else cashOutAdditionalSeatsOnDeparture(socket, authSession, 'additional_table_disconnect');
+            if (currentSession && currentSession !== session) {
+              // S5 fix-up (F85) — the extra seats FIRST, as a departure (a live
+              // hand is kept: Z6 on the clock, credited at the hand's end), to
+              // the account handlePlayerLeave's own loop would have credited;
+              // that loop (a leave: it folded the hand out of turn) then finds
+              // nothing.
+              cashOutAdditionalSeatsOnDeparture(socket, authSessions.get(socket.id) ?? authSession, 'additional_table_disconnect');
+              handlePlayerLeave(socket, 'kept');
+            } else cashOutAdditionalSeatsOnDeparture(socket, authSession, 'additional_table_disconnect');
             authSessions.delete(socket.id);
             lastSentState.delete(socket.id); lastSentJson.delete(socket.id);
             console.log(`[disconnect] ${JSON.stringify({
@@ -20320,6 +20357,10 @@ function releaseSocketForAccountSwitch(socket: Socket, nextUserId: number, via: 
     // previous account here (or nobody, for an anonymous seat). S2: an
     // account switch is not the player leaving — a tournament seat is kept
     // absent, unflagged (P-b: his next sign-in restores it).
+    // S5 fix-up (F85) — the extra seats first, as a departure (cashed out to
+    // the previous account; a live hand is kept, never folded out of turn by
+    // handlePlayerLeave's leave loop, which then finds nothing).
+    if (hasExtra) cashOutAdditionalSeatsOnDeparture(socket, prev, 'additional_table_account_switch');
     handlePlayerLeave(socket, 'kept');
     mainSeat = 'left';
     if (prev) socketAccountSwitches.seatsLeft++;

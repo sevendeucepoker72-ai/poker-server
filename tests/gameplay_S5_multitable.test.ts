@@ -578,9 +578,39 @@ describe('F156 — an EXTRA seat that sits out SIT_OUT_HANDS_LIMIT hands is stoo
     expect(w.sock.rooms.has('table:B')).toBe(false);
     expect(w.sock.emitted).toEqual(expect.arrayContaining([
       ['seatVacated', { tableId: 'B', seatIndex: 0, reason: 'sit_out_limit' }],
-      ['sitOutToggled', expect.objectContaining({ sittingOut: false, reason: 'sit_out_limit', stoodUp: true, tableId: 'B' })],
-      ['error', expect.objectContaining({ code: 'sit_out_limit', tableId: 'B' })],
+      ['sitOutToggled', expect.objectContaining({ sittingOut: false, reason: 'sit_out_limit', stoodUp: true, tableId: 'B', extraSeat: true })],
+      ['error', expect.objectContaining({ code: 'extra_seat_sit_out_limit', tableId: 'B', extraSeat: true })],
     ]));
+  });
+
+  // S5 fix-up (F156): the main seat's `sit_out_limit` code means "you are now
+  // watching this table" (the client appends that sentence, read against the
+  // table ON SCREEN). An extra seat is only taken out of its room — never made
+  // a spectator — so its frame must not carry that code.
+  it('the extra seat\'s notice is its OWN code naming the table — never the main seat\'s "now watching" sit_out_limit; he is not made a spectator', () => {
+    const w = world();
+    for (let h = 0; h < 30; h++) w.hand();
+    expect(w.B.seats[0].state).toBe('empty');
+    const errors = events(w.sock, 'error');
+    expect(errors).toEqual([{
+      message: 'You were sitting out for a while at B, so that seat was released and its chips went back to your balance.',
+      code: 'extra_seat_sit_out_limit', tableId: 'B', extraSeat: true,
+    }]);
+    expect(errors.some((e) => e.code === 'sit_out_limit')).toBe(false);
+    expect(errors[0].message).not.toMatch(/watching/i);
+    expect(events(w.sock, 'spectating')).toEqual([]);
+    expect(events(w.sock, 'seatVacated')).toEqual([{ tableId: 'B', seatIndex: 0, reason: 'sit_out_limit' }]);
+  });
+
+  it('CONTROL — pre-fix-up text: the extra seat got the main seat\'s sit_out_limit code (the client then said "You are watching the table now")', () => {
+    const OLD = without(without(CODE,
+      "sock.emit('error', { message: extraSeatSitOutLimitMessage(table), code: EXTRA_SEAT_SIT_OUT_LIMIT_CODE, tableId, extraSeat: true });",
+      "sock.emit('error', { message: SIT_OUT_LIMIT_MESSAGE, code: 'sit_out_limit', tableId });"),
+    "stoodUp: true, tableId, extraSeat: true });", 'stoodUp: true, tableId });');
+    const w = world(OLD);
+    for (let h = 0; h < 30; h++) w.hand();
+    expect(events(w.sock, 'error')).toEqual([expect.objectContaining({ code: 'sit_out_limit', tableId: 'B' })]);
+    expect(events(w.sock, 'spectating')).toEqual([]);   // yet nothing made him a spectator
   });
 
   it('CONTROL — without the extra-seat loop the sitting-out extra seat holds its seat forever', () => {
@@ -596,7 +626,7 @@ describe('F156 — an EXTRA seat that sits out SIT_OUT_HANDS_LIMIT hands is stoo
 const DISCONNECT = slice("socket.on('disconnect', async () => {", '\n  });', SRC.lastIndexOf("socket.on('disconnect', async () => {"));
 const DEPARTURE = fnSrc('function cashOutAdditionalSeatsOnDeparture(');
 
-function departureWorld(code: string) {
+function departureWorld(code: string, extra: Record<string, unknown> = {}, exportsExpr = '{ wire, cashOutAdditionalSeatsOnDeparture, processPendingSeatRemovals }') {
   const B = new PokerTable(cfg('B'));
   for (let i = 0; i < 3; i++) expect(B.sitDown(i, `P${i}`, 5000, `b${i}`, false)).toBe(true);
   const sock = fakeSocket('SH');
@@ -615,11 +645,12 @@ function departureWorld(code: string) {
     creditSeatStackToWallet: (userId: number, _u: string, _t: string, seat: any, reason: string) => credits.push({ userId, chips: seat.chipCount, reason }),
     scheduleAIAction() {}, syncSitOutToTable() {}, broadcastGameState() {}, releaseSeatedSlot() {},
     DrawPhases: DRAWS, FiveCardDrawTable, GamePhase, MAX_SEATS, console: quiet,
+    ...extra,   // S5 fix-up: a harness may add / override fakes
   };
-  const { exports: m } = load(code, scope, '{ wire, cashOutAdditionalSeatsOnDeparture, processPendingSeatRemovals }');
+  const { exports: m } = load(code, scope, exportsExpr);
   B.on('handResult', () => m.processPendingSeatRemovals('B'));
   m.wire(sock);
-  return { B, sock, m, credits, pendingSeatRemovalAfterHand, multiTableSessions, authSessions };
+  return { B, sock, m, credits, pendingSeatRemovalAfterHand, multiTableSessions, authSessions, playerSessions };
 }
 const DEPARTURE_CODE = (disconnect = DISCONNECT, departure = DEPARTURE) => [
   fnSrc('function handlePlayerLeave(socket: Socket, tournamentSeat: TournamentSeatLeaveKind'),
@@ -707,6 +738,146 @@ describe('F85 — a dropped socket keeps its extra seat\'s LIVE hand (it is no l
     w.m.cashOutAdditionalSeatsOnDeparture(w.sock, w.authSessions.get('SH'), 'additional_table_disconnect');
     expect(w.B.seats[bb].folded).toBe(false);
     expect(w.B.currentPhase).toBe(GamePhase.Flop);
+  });
+});
+
+// ═══════════════════════════════════════════════════════ S5 fix-up F85 ══
+/**
+ * S5 fix-up (reviewers, 2026-10-21) — two rarer departures still sent the
+ * socket's extra seats through handlePlayerLeave's multi-table loop (a LEAVE:
+ * teardownSeat without keepHandOnDeparture), so a live hand there was folded
+ * out of turn: (1) the disconnect whose socket got a DIFFERENT session during
+ * the save await, (2) an account switch on a socket whose main seat is not
+ * reservable. Both now cash the extra seats out as a departure first.
+ */
+describe('S5 fix-up F85 — the remaining departure paths keep an extra seat\'s live hand too', () => {
+  function heroInPotOffClock(B: PokerTable) {
+    expect(B.startNewHand()).toBe(true);
+    for (let g = 0; g < 6 && B.activeSeatIndex !== 0; g++) B.playerCall(B.activeSeatIndex);
+    expect(B.activeSeatIndex).toBe(0);
+    expect(B.playerCall(0)).toBe(true);
+    expect(B.activeSeatIndex).not.toBe(0);
+    expect(B.seats[0].totalInvestedThisHand).toBeGreaterThan(0);
+  }
+  const playOut = (t: PokerTable) => {
+    for (let g = 0; g < 200 && t.isHandInProgress(); g++) {
+      const a = t.activeSeatIndex;
+      if (a === 0) { if (!t.playerCheck(0)) t.playerFold(0); continue; }
+      if (!(t.playerCheck(a) || t.playerCall(a))) t.playerFold(a);
+    }
+  };
+  const chipsOf = (w: ReturnType<typeof departureWorld>) =>
+    w.B.seats.reduce((s, x) => s + (x.state === 'occupied' ? x.chipCount + (w.B.isHandInProgress() ? x.totalInvestedThisHand : 0) : 0), 0)
+    + w.credits.reduce((s, c) => s + c.chips, 0);
+
+  // (1) the disconnect: his MAIN seat at A, his extra seat at B in a live hand;
+  // during the save await a different session lands on the dead socket.
+  const FIXED_BRANCH = "            if (currentSession && currentSession !== session) {\n"
+    + '              // S5 fix-up (F85)';
+  const replacedBranch = (src: string) => {
+    const at = src.indexOf(FIXED_BRANCH);
+    expect(at).toBeGreaterThan(-1);
+    const end = src.indexOf("            } else cashOutAdditionalSeatsOnDeparture(socket, authSession, 'additional_table_disconnect');", at);
+    expect(end).toBeGreaterThan(at);
+    return src.slice(0, at)
+      + "            if (currentSession && currentSession !== session) handlePlayerLeave(socket, 'kept');\n"
+      + "            else cashOutAdditionalSeatsOnDeparture(socket, authSession, 'additional_table_disconnect');"
+      + src.slice(end + "            } else cashOutAdditionalSeatsOnDeparture(socket, authSession, 'additional_table_disconnect');".length);
+  };
+  function replacedDuringSaveWorld(disconnect = DISCONNECT) {
+    const A = new PokerTable(cfg('A'));
+    expect(A.sitDown(3, 'Hero', 5000, 'hero-a', false)).toBe(true);
+    const save = deferred();
+    const reserves: Array<{ tableId: string; seatIndex: number }> = [];
+    const w: ReturnType<typeof departureWorld> = departureWorld(DEPARTURE_CODE(disconnect), {
+      tableManager: { getTable: (id: string) => (id === 'A' ? A : id === 'B' ? w.B : undefined) },
+      progressionManager: { getClientProgress: () => ({ hydrated: true, xp: 0, level: 1, achievements: [] }) },
+      saveProgress: async () => { await save.p; },
+      sessionHoldsSeat: () => true, otherSessionHoldsSeat: () => false,
+      brokenTournamentTables: new Map(), tournamentTables: new Map(),
+      reserveSeatForDeparture: (_a: any, s: any) => { reserves.push({ tableId: s.tableId, seatIndex: s.seatIndex }); return true; },
+      dropPendingSeatClaimsOf() {}, adoptReservationByPendingClaim() {},
+    });
+    w.playerSessions.set('SH', { socketId: 'SH', tableId: 'A', seatIndex: 3, playerName: 'Hero', playerId: 'hero-a' });
+    return { w, A, save, reserves };
+  }
+  async function dropWithSessionReplaced(x: ReturnType<typeof replacedDuringSaveWorld>) {
+    heroInPotOffClock(x.w.B);
+    x.w.sock.connected = false;
+    const done = x.w.sock.handlers.disconnect();
+    await flush();
+    // A different session lands on the dead socket while the save awaits.
+    x.w.playerSessions.set('SH', { socketId: 'SH', tableId: 'Z', seatIndex: 1, playerName: 'Hero', playerId: 'hero-z' });
+    x.save.resolve();
+    await done;
+    await flush();
+  }
+
+  it('disconnect, session replaced during the save: the extra seat\'s live hand is NOT folded; his final stack is credited once at the hand\'s end; no chip created or lost', async () => {
+    const y = replacedDuringSaveWorld();
+    await dropWithSessionReplaced(y);
+    const start = chipsOf(y.w);
+    expect(start).toBe(15_000);                                       // three 5,000 stacks, all still on the table
+    expect(y.reserves).toEqual([{ tableId: 'A', seatIndex: 3 }]);   // the OLD main seat is reserved, as before
+    expect(y.w.B.seats[0].folded).toBe(false);
+    expect(y.w.B.seats[0].state).toBe('occupied');
+    expect(y.w.pendingSeatRemovalAfterHand.get('B')?.has(0)).toBe(true);
+    expect(y.w.multiTableSessions.has('SH')).toBe(false);
+    expect(y.w.playerSessions.has('SH')).toBe(false);
+    expect(y.w.sock.rooms.has('table:B')).toBe(false);
+    playOut(y.w.B);
+    expect(y.w.B.currentPhase).toBe(GamePhase.HandComplete);
+    expect(y.w.B.seats[0].state).toBe('empty');
+    expect(y.w.credits).toHaveLength(1);
+    expect(y.w.credits[0]).toMatchObject({ userId: 101, reason: 'leave_after_hand' });
+    expect(chipsOf(y.w)).toBe(start);
+  });
+
+  it('CONTROL — pre-fix-up branch (handlePlayerLeave\'s leave loop): the extra seat is folded out of turn at once', async () => {
+    const x = replacedDuringSaveWorld(replacedBranch(DISCONNECT));
+    await dropWithSessionReplaced(x);
+    expect(x.w.B.seats[0].folded).toBe(true);
+  });
+
+  // (2) an account switch on a socket whose main seat cannot be reserved (its
+  // table is gone) — releaseSocketForAccountSwitch's `else if (session)` branch.
+  const SWITCH = slice('const socketAccountSwitches = {', '\n}\n');
+  const SWITCH_FIX = "    if (hasExtra) cashOutAdditionalSeatsOnDeparture(socket, prev, 'additional_table_account_switch');\n    handlePlayerLeave(socket, 'kept');\n    mainSeat = 'left';";
+  function switchWorld(sw = SWITCH) {
+    const reserves: unknown[] = [];
+    const w = departureWorld(`${DEPARTURE_CODE()}\n${sw}`, {
+      reserveSeatForDeparture: (...a: unknown[]) => { reserves.push(a); return true; },
+      detachTournamentEntrantSockets() {},
+    }, '{ wire, cashOutAdditionalSeatsOnDeparture, processPendingSeatRemovals, releaseSocketForAccountSwitch, socketAccountSwitches }');
+    w.playerSessions.set('SH', { socketId: 'SH', tableId: 'Z', seatIndex: 1, playerName: 'Hero', playerId: 'hero-z' });   // table Z is gone
+    w.sock.join('table:B');
+    heroInPotOffClock(w.B);
+    return { w, reserves };
+  }
+
+  it('account switch, main seat not reservable: the extra seat\'s live hand is kept and its final stack goes to the PREVIOUS account once', () => {
+    const { w, reserves } = switchWorld();
+    const start = chipsOf(w);
+    w.m.releaseSocketForAccountSwitch(w.sock, 202, 'oauthLogin');
+    expect(reserves).toEqual([]);
+    expect(w.m.socketAccountSwitches).toMatchObject({ switches: 1, seatsLeft: 1 });
+    expect(w.B.seats[0].folded).toBe(false);
+    expect(w.pendingSeatRemovalAfterHand.get('B')?.has(0)).toBe(true);
+    expect(w.multiTableSessions.has('SH')).toBe(false);
+    expect(w.playerSessions.has('SH')).toBe(false);
+    expect(w.authSessions.has('SH')).toBe(false);
+    expect(w.sock.rooms.has('table:B')).toBe(false);
+    playOut(w.B);
+    expect(w.B.seats[0].state).toBe('empty');
+    expect(w.credits).toHaveLength(1);
+    expect(w.credits[0]).toMatchObject({ userId: 101, reason: 'leave_after_hand' });   // never the new account (202)
+    expect(chipsOf(w)).toBe(start);
+  });
+
+  it('CONTROL — pre-fix-up branch (handlePlayerLeave alone): the extra seat is folded out of turn at once', () => {
+    const { w } = switchWorld(without(SWITCH, SWITCH_FIX, "    handlePlayerLeave(socket, 'kept');\n    mainSeat = 'left';"));
+    w.m.releaseSocketForAccountSwitch(w.sock, 202, 'oauthLogin');
+    expect(w.B.seats[0].folded).toBe(true);
   });
 });
 

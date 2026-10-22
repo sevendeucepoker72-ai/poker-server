@@ -1534,3 +1534,15 @@ deadButton: table.deadButton,
 function standPatAbsentDrawers(
 armAbsentDrawerStandPat(tableId);
 absent_drawer_stood_pat
+
+# 2026-10-21 gameplay S5 fix-up. F156: an extra seat's sit-out stand-up has
+# its own error code naming the table (never the main seat's "now watching"
+# sit_out_limit). F62: the waitlist link skips a table the socket already
+# plays an extra seat at, and a racing extra seat cancels its buy-in. F85: a
+# disconnect replaced during its save and an account switch cash the extra
+# seats out as a departure (live hand kept) before handlePlayerLeave (the
+# account-switch call compiles onto two lines: pinned by its jest test).
+extra_seat_sit_out_limit
+const wlCandidates = holdem.filter((t) => !socketHasSessionAt(socket.id, t.tableId));
+notSeatedAt: bestTable.tableId
+cashOutAdditionalSeatsOnDeparture(socket, authSessions.get(socket.id) ?? authSession, 'additional_table_disconnect');

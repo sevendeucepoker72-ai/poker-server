@@ -928,3 +928,102 @@ describe('pe3 minor — the waitlist link\'s buy-in cancellation says so on BOTH
     ]);
   });
 });
+
+// ── S5 fix-up (F62, 2026-10-21) — the waitlist link: one socket, one seat per table ──
+/**
+ * The waitlist deep link picks the lowest-stakes Hold'em cash table. A socket
+ * with NO main seat but an EXTRA (joinAdditionalTable) seat at that table was
+ * seated there a second time: handlePlayerLeave is skipped without a main
+ * session, the ghost clear skips the caller's own socket, and its buy-in
+ * expectation had no `notSeatedAt`. Now the pick skips such a table (as
+ * quickPlay does) and a racing extra seat cancels + refunds the buy-in.
+ */
+describe('S5 fix-up F62 — the waitlist link never gives a socket a second seat at a table it already plays an EXTRA seat at', () => {
+  const link = PATHS.find((x) => (x.event as string) === 'waitlist')!;
+  const PICK_FIX = "        const wlCandidates = holdem.filter((t) => !socketHasSessionAt(socket.id, t.tableId));";
+  const preFixPick = (src: string) => {
+    const at = src.indexOf(PICK_FIX);
+    expect(at).toBeGreaterThan(-1);
+    const endNeedle = '        const bestTable = wlCandidates[0];';
+    const end = src.indexOf(endNeedle, at);
+    expect(end).toBeGreaterThan(at);
+    return src.slice(0, at) + '        const bestTable = holdem[0];' + src.slice(end + endNeedle.length);
+  };
+  /** Alice's socket S1: no main seat, an EXTRA seat at cash1 (the lowest stakes). */
+  function withExtraSeatAtCash1(w: ReturnType<typeof world>, s: any) {
+    expect(w.cash.sitDown(4, 'Alice', 2000, 'p-alice-x', false)).toBe(true);
+    w.multiTableSessions.set(s.id, [{ socketId: s.id, tableId: 'cash1', seatIndex: 4, playerName: 'Alice', playerId: 'p-alice-x', sittingOut: false }]);
+  }
+  const aliceAt = (w: ReturnType<typeof world>, tableId: string) =>
+    w.tables.get(tableId)!.seats.filter((x) => x.state === 'occupied' && !x.isAI && x.playerName === 'Alice').length;
+
+  it('the next-lowest Hold\'em table is picked instead: seated there once, charged its buy-in once; cash1 keeps ONE Alice seat', async () => {
+    const w = world();
+    const cash2 = w.mkTable('cash2', 2000);
+    (cash2.config as any).smallBlind = 25;
+    const s = w.mkSocket('S1');
+    withExtraSeatAtCash1(w, s);
+    await run(w, link, s);
+    expect(w.playerSessions.get('S1')).toMatchObject({ tableId: 'cash2' });
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 2000 }]);
+    expect(w.credits).toEqual([]);
+    expect(aliceAt(w, 'cash1')).toBe(1);
+    expect(aliceAt(w, 'cash2')).toBe(1);
+    expect(w.multiTableSessions.get('S1')).toEqual([expect.objectContaining({ tableId: 'cash1', seatIndex: 4 })]);
+  });
+
+  it('no other Hold\'em table: refused (already_seated) — nothing deducted, nothing seated', async () => {
+    const w = world();
+    const s = w.mkSocket('S1');
+    withExtraSeatAtCash1(w, s);
+    await run(w, link, s);
+    expect(w.emitted).toContainEqual(['error', { message: 'You already have a seat at this table.', code: 'handler_exception' }]);
+    expect(w.emitted).toContainEqual(['loginResult', expect.objectContaining({ success: false, code: 'handler_exception' })]);
+    expect(w.deductions).toEqual([]);
+    expect(w.playerSessions.has('S1')).toBe(false);
+    expect(aliceAt(w, 'cash1')).toBe(1);
+  });
+
+  it('CONTROL — pre-fix-up pick (holdem[0]): Alice is seated at cash1 a SECOND time and charged for it (two hands at one table)', async () => {
+    // The whole pre-fix-up text: holdem[0], and no notSeatedAt on the buy-in expectation.
+    const OLD = preFixPick(H.waitlist).split('mainSession: null, notSeatedAt: bestTable.tableId, table:').join('mainSession: null, table:');
+    const w = world({ handlers: { waitlist: OLD } as any });
+    const s = w.mkSocket('S1');
+    withExtraSeatAtCash1(w, s);
+    await run(w, link, s);
+    expect(w.playerSessions.get('S1')).toMatchObject({ tableId: 'cash1' });
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);
+    expect(aliceAt(w, 'cash1')).toBe(2);
+  });
+
+  it('an extra seat at the picked table bought DURING the deduct cancels the link\'s buy-in: refunded once, not seated (BuyInExpectation.notSeatedAt)', async () => {
+    const w = world();
+    const s = w.mkSocket('S1');
+    const gate = deferred();
+    w.gates.deduct = gate.p;
+    await run(w, link, s);
+    withExtraSeatAtCash1(w, s);                          // joinAdditionalTable on this socket won the race
+    gate.resolve();
+    await flush();
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);
+    expect(w.credits).toEqual([{ uid: ALICE, amount: 1000 }]);
+    expect(w.playerSessions.has('S1')).toBe(false);
+    expect(aliceAt(w, 'cash1')).toBe(1);
+    expect(w.m.buyInsOnStaleState).toMatchObject({ refunded: 1 });
+  });
+
+  it('CONTROL — without notSeatedAt the racing buy-in seats a second Alice at cash1', async () => {
+    const OLD = H.waitlist.split('mainSession: null, notSeatedAt: bestTable.tableId, table:').join('mainSession: null, table:');
+    expect(OLD).not.toBe(H.waitlist);
+    const w = world({ handlers: { waitlist: OLD } as any });
+    const s = w.mkSocket('S1');
+    const gate = deferred();
+    w.gates.deduct = gate.p;
+    await run(w, link, s);
+    withExtraSeatAtCash1(w, s);
+    gate.resolve();
+    await flush();
+    expect(w.credits).toEqual([]);
+    expect(aliceAt(w, 'cash1')).toBe(2);
+  });
+});
