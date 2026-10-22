@@ -387,6 +387,43 @@ describe('F102 — a club challenge deals a sitting-out seat in: the freezeout e
     expect(w.table.startNewHand()).toBe(false);
   });
 
+  // F102 fix-up (review) — the Sit Out tapped while still ALONE at the challenge
+  // (inside CHALLENGE_JOIN_GRACE_MS, before the opponent sits). No join path
+  // re-ran the sync, so the engine kept her seat sitting out and the opponent's
+  // join dealt nothing: the table rested at WaitingForPlayers for good.
+  const PRE_FIXUP_SYNC = without(SYNC,
+    `  const challengeSeated = table.seats.filter((s) => s.state === 'occupied' && !s.eliminated);
+  const challengeDealsIn = challengeTables.has(tableId)
+    && !(challengeSeated.length >= 2 && challengeSeated.every((s) => set.has(s.seatIndex)));`,
+    `  const challengeDealsIn = challengeTables.has(tableId)
+    && table.seats.some((s) => s.state === 'occupied' && !s.eliminated && !set.has(s.seatIndex));`);
+
+  function aloneThenJoin(src: string) {
+    const table = new PokerTable(cfg('c1', { smallBlind: 20, bigBlind: 40, minBuyIn: 2000 }));
+    expect(table.sitDown(0, 'Alice', 2000, 'user_1', false, true)).toBe(true);
+    const sitOutTracker = new Map<string, Set<number>>([['c1', new Set([0])]]);   // Alice taps Sit Out, alone
+    const { exports: syncSitOutToTable } = load(src, {
+      tableManager: { getTable: () => table }, sitOutTracker,
+      challengeTables: new Map([['c1', { challengeId: 4, challengerId: 1, challengedId: 2 }]]), isTournamentTable: () => false,
+    }, 'syncSitOutToTable');
+    syncSitOutToTable('c1');
+    expect(table.sitDown(1, 'Bob', 2000, 'user_2', false, true)).toBe(true);    // Bob sits (no re-sync on this path)
+    return table;
+  }
+
+  it('fix-up — Alice taps Sit Out while still ALONE, then Bob sits: the first hand is dealt and Alice is in it', () => {
+    const table = aloneThenJoin(SYNC);
+    expect(table.startNewHand()).toBe(true);
+    expect(table.seats[0].holeCards).toHaveLength(2);
+    expect(table.seats[1].holeCards).toHaveLength(2);
+  });
+
+  it('CONTROL — pre-fix-up rule ("someone else there still plays"): with Alice alone her seat stayed out, Bob\'s join dealt nothing', () => {
+    const table = aloneThenJoin(PRE_FIXUP_SYNC);
+    expect(table.startNewHand()).toBe(false);
+    expect(table.currentPhase).toBe(GamePhase.WaitingForPlayers);
+  });
+
   it('played out: Alice sitting out is acted for (check / fold) and blinded out — the challenge is decided for BOB (it went to Alice when Bob had to leave)', () => {
     const w = world({ challenge: true });
     w.sitOut(0);

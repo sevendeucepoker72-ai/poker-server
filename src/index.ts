@@ -2531,8 +2531,15 @@ function syncSitOutToTable(tableId: string): void {
   // challenge) and the opponent's only way out — leaving — recorded the player
   // who stalled as the winner. When EVERY seat sits out nothing is dealt (no
   // endless blind swap) until one of them comes back or leaves.
+  // F102 fix-up — "every seat" means at least TWO seated players, all sitting
+  // out. A player who taps Sit Out while still ALONE at the challenge (inside
+  // CHALLENGE_JOIN_GRACE_MS, before the opponent sits) is dealt in too: the join
+  // never re-runs this sync, so the engine kept his seat sitting out, the
+  // opponent's join dealt nothing, the table rested at WaitingForPlayers and the
+  // opponent's only way out (leaving) still named the sitter the winner.
+  const challengeSeated = table.seats.filter((s) => s.state === 'occupied' && !s.eliminated);
   const challengeDealsIn = challengeTables.has(tableId)
-    && table.seats.some((s) => s.state === 'occupied' && !s.eliminated && !set.has(s.seatIndex));
+    && !(challengeSeated.length >= 2 && challengeSeated.every((s) => set.has(s.seatIndex)));
   table.setSittingOutSeats(isTournamentTable(tableId) || challengeDealsIn ? [] : set);
 }
 
@@ -3860,7 +3867,31 @@ async function createClubRuntimeTable(clubId: number, cfg: { tableName: string; 
  * (inactive) table or an invalid stored config gets none.
  */
 const clubTablesRecreating = new Map<number, Promise<string | null>>();
-const clubTableRuntimeStats = { recreated: 0, refusedInvalid: 0 };
+const clubTableRuntimeStats = { recreated: 0, refusedInvalid: 0, closedUnbound: 0 };
+/**
+ * 2026-10-21 (gameplay F104 fix-up) — a runtime table made for a club table
+ * whose row could NOT be pointed at it (updateClubTableId threw: a DB error) is
+ * closed at once. No row leads to it, so no member could ever sit there (the
+ * only member path is joinClubTable through the row, and a join racing the
+ * creation awaits this same job and gets its error); the ring heartbeat filled
+ * it with bots for good, and the next listing / join made a second one. Its
+ * seats are bots only (house chips) — a table with a human seat is never closed
+ * here. true = closed.
+ */
+function closeUnboundClubRuntimeTable(tableId: string): boolean {
+  const table = tableManager.getTable(tableId);
+  if (table && tableHasHumanSeat(table)) return false;
+  endTableViewsAndTimers(tableId);
+  if (table) for (const s of table.seats) if (s.state === 'occupied') table.standUp(s.seatIndex);
+  tableManager.removeTable(tableId);
+  tableProgressListeners.delete(tableId);
+  clubTableIds.delete(tableId);
+  clubIdByTable.delete(tableId);
+  bombPotPending.delete(tableId);
+  clubTableRuntimeStats.closedUnbound++;
+  console.warn(`[Clubs] ${JSON.stringify({ event: 'club_table_runtime_unbound_closed', tableId })}`);
+  return true;
+}
 async function ensureClubRuntimeTable(ct: {
   id: number; clubId: number; tableName: string; variant: string; smallBlind: number; bigBlind: number;
   minBuyIn: number; maxBuyIn?: number; maxSeats?: number; isActive: boolean; tableId?: string;
@@ -3881,7 +3912,13 @@ async function ensureClubRuntimeTable(ct: {
     }
     const tableId = await createClubRuntimeTable(ct.clubId, check.config);
     if (!tableId) return null;
-    await updateClubTableId(ct.id, tableId);
+    try {
+      await updateClubTableId(ct.id, tableId);
+    } catch (e) {
+      // F104 fix-up — the row still points at no live table: this one could never be reached.
+      closeUnboundClubRuntimeTable(tableId);
+      throw e;
+    }
     ct.tableId = tableId;
     clubTableRuntimeStats.recreated++;
     console.log(`[Clubs] ${JSON.stringify({ event: 'club_table_runtime_recreated', clubTableId: ct.id, clubId: ct.clubId, tableId })}`);
@@ -3905,14 +3942,24 @@ function validateScheduledTableConfig(cfg: unknown) {
  * runtime table with no row: never listed, never joinable (joinTable refuses a
  * club table without joinClubTable's grant), dealt bots-only by the heartbeat
  * for good — one more per recurrence. Returns the runtime table id, or null.
+ *
+ * F104 fix-up — `out.reason` (optional) says why it is null: 'invalid_config'
+ * (the settings can never make a table; the claimed row stays 'active', as
+ * before) or 'retry' (a DB error making the club table row OR pointing it at
+ * its runtime table: the claimed row is put back to 'scheduled' — the next
+ * sweep / an Activate retries it, a recurring series keeps going — and a
+ * runtime table no row points at is closed, ensureClubRuntimeTable).
  */
-async function createTableFromScheduledConfig(scheduled: { id: number; clubId: number }, cfg: any): Promise<string | null> {
+async function createTableFromScheduledConfig(
+  scheduled: { id: number; clubId: number }, cfg: any, out?: { reason?: 'invalid_config' | 'retry' },
+): Promise<string | null> {
   const clubId = scheduled.clubId;
   // 2026-10-11 (R1, AUTH-4) — validated again here: the row may predate the
   // scheduleClubTable check. An invalid config creates NO table (null).
   const check = validateScheduledTableConfig(cfg);
   if (!check.ok) {
     console.warn(`[ClubSweep] ${JSON.stringify({ event: 'scheduled_table_config_refused', clubId, error: check.error })}`);
+    if (out) out.reason = 'invalid_config';
     return null;
   }
   const c = check.config;
@@ -3929,10 +3976,24 @@ async function createTableFromScheduledConfig(scheduled: { id: number; clubId: n
   if (!row) {
     // A DB error: the claimed row goes back to 'scheduled' — the next sweep (or Activate) retries it.
     await releaseScheduledActivation(scheduled.id).catch(() => {});
+    if (out) out.reason = 'retry';
     return null;
   }
-  const tableId = await ensureClubRuntimeTable(row);
+  // F104 fix-up — the runtime table step fails the same way (updateClubTableId
+  // can throw): it used to reject past every caller, leaving the claimed row
+  // 'active' (the occurrence lost, a recurring series ended — the sweep's
+  // per-row catch skipped rescheduleRecurring) and an unlisted bots-only table.
+  let tableId: string | null;
+  try {
+    tableId = await ensureClubRuntimeTable(row);
+  } catch (e: any) {
+    console.warn(`[ClubSweep] ${JSON.stringify({ event: 'scheduled_table_runtime_failed', scheduledId: scheduled.id, clubId, clubTableId: row.id, error: e?.message || String(e) })}`);
+    await releaseScheduledActivation(scheduled.id).catch(() => {});
+    if (out) out.reason = 'retry';
+    return null;
+  }
   if (tableId) console.log(`[ClubSweep] ${JSON.stringify({ event: 'scheduled_table_club_table', scheduledId: scheduled.id, clubId, clubTableId: row.id, tableId })}`);
+  else if (out) out.reason = 'invalid_config';   // the club rules refused the stored numbers (club_table_recreate_refused)
   return tableId;
 }
 
@@ -10274,6 +10335,23 @@ function sweepQuickTables(): void {
       && !pendingAutoStartTimers.has(tableId) && !table.isCompletingHand()) {
       scheduleAutoStart(tableId);
     }
+    // F102 fix-up — the same for one that never dealt (it rests at
+    // WaitingForPlayers: a seat sat out before the opponent sat, or both sat
+    // out before the first deal and one came back). autoStartNextHand deals
+    // only from HandComplete, so this deals the way the ring heartbeat does
+    // (ensureCashTableRunning), after re-applying the challenge deal-in rule
+    // to the seats there NOW.
+    else if (qg && qg.format === 'challenge' && qg.started && !qg.ended && table.currentPhase === GamePhase.WaitingForPlayers
+      && !pendingAutoStartTimers.has(tableId) && table.getOccupiedSeatCount() >= 2) {
+      ensureTableProgressListener(table, tableId);
+      syncSitOutToTable(tableId);
+      if (table.startNewHand()) {
+        activateBombPotIfPending(tableId, table);
+        broadcastGameState(tableId);
+        scheduleAIAction(tableId);
+        console.log(`[QuickGame] ${JSON.stringify({ event: 'club_challenge_waiting_dealt', tableId, challengeId: qg.challengeId ?? null })}`);
+      }
+    }
   }
 }
 setInterval(() => {
@@ -13695,8 +13773,15 @@ Give feedback in this JSON format:
       // F104 (2026-10-21) — for the scheduled ROW's club (the one the role
       // check used); the client's data.clubId named the table and its stats.
       const clubId = Number.isInteger(result.clubId) ? (result.clubId as number) : data.clubId;
-      const tableId = await createTableFromScheduledConfig({ id: data.id, clubId }, result.tableConfig);
-      if (!tableId) { socket.emit('error', { message: 'Invalid table settings for this scheduled table', code: 'invalid_table_config' }); return; }
+      const made: { reason?: 'invalid_config' | 'retry' } = {};
+      const tableId = await createTableFromScheduledConfig({ id: data.id, clubId }, result.tableConfig, made);
+      if (!tableId) {
+        // F104 fix-up — a DB failure is not "invalid settings": the row was put
+        // back to 'scheduled' (Activate again, or it fires at its time).
+        if (made.reason === 'retry') socket.emit('error', { message: 'Could not open the table right now — please try again.', code: 'scheduled_table_retry' });
+        else socket.emit('error', { message: 'Invalid table settings for this scheduled table', code: 'invalid_table_config' });
+        return;
+      }
       socket.emit('scheduledClubTableActivated', { success: true, tableId, clubId });
     } else {
       socket.emit('error', { message: result.error });
@@ -14359,6 +14444,10 @@ Give feedback in this JSON format:
       // (a club challenge is joined through here: its second seat is the
       // opponent's, never a bot's).
       if (!isFixedRosterTable(tableId)) fillWithAI(table, tableId);
+
+      // F102 fix-up — a club challenge's deal-in rule is re-applied to the
+      // roster it has NOW (the opponent may have sat out while alone there).
+      if (challengeTables.has(tableId)) syncSitOutToTable(tableId);
 
       // Auto-start hand if not in progress — F50 (2026-10-21): from
       // WaitingForPlayers only; at a hand end the hand-boundary step deals.
@@ -18153,12 +18242,25 @@ Give feedback in this JSON format:
       socket.emit('error', { message: 'Invalid venue' });
       return;
     }
-    const careerAuth = authSessions.get(socket.id);
-    const careerProgress = careerAuth ? progressionManager.userRecord(careerAuth.userId) : undefined;
+    // F109 fix-up — the level is read from the account's HYDRATED record:
+    // ensureHydrated awaits the load (as every economy handler does), so a
+    // real high-level player always gets his real level, and a record that
+    // cannot be loaded is refused progress_loading (it used to be let through —
+    // right after sign-in, or for the whole session when the read failed). A
+    // level-1 venue needs no level (nothing awaited).
     const careerLevelNeeded = CAREER_VENUE_LEVELS[venue] ?? 1;
-    if (careerProgress?.hydrated === true && (Number(careerProgress.level) || 1) < careerLevelNeeded) {
-      socket.emit('error', { message: `${venueConfigs[venue].name} unlocks at level ${careerLevelNeeded}.`, code: 'career_venue_locked', venue, level: careerLevelNeeded });
-      return;
+    if (careerLevelNeeded > 1) {
+      const careerAuth = authSessions.get(socket.id);
+      const careerCtx = careerAuth ? await ensureHydrated(socket) : null;
+      // Nothing left or deducted yet: a socket gone / an account switch during the read just stops here.
+      if (careerAuth && await buyInSocketGone(socket, 'startCareerGame', 'level_read', undefined, { userId: careerAuth.userId })) return;
+      if (!careerCtx) { socket.emit('error', { message: 'Sign in to play Career mode.', code: 'login_required' }); return; }
+      if (!careerCtx.hydrated) { socket.emit('error', { message: economyMessage('progress_loading'), code: 'progress_loading' }); return; }
+      const careerLevel = Number(progressionManager.userRecord(careerCtx.userId)?.level) || 1;
+      if (careerLevel < careerLevelNeeded) {
+        socket.emit('error', { message: `${venueConfigs[venue].name} unlocks at level ${careerLevelNeeded}.`, code: 'career_venue_locked', venue, level: careerLevelNeeded });
+        return;
+      }
     }
 
     const existingSession = playerSessions.get(socket.id);

@@ -170,9 +170,12 @@ function world() {
     // club tables
     tableManager: {
       getTable: (id: string) => runtime.get(id),
-      createTable: (cfg: any) => { const id = `rt${++n}`; created.push(cfg); runtime.set(id, { maxOccupiableSeats: 9 }); return id; },
-      createVariantTable: (cfg: any) => { const id = `rv${++n}`; created.push(cfg); runtime.set(id, { maxOccupiableSeats: 9 }); return id; },
+      createTable: (cfg: any) => { const id = `rt${++n}`; created.push(cfg); runtime.set(id, { maxOccupiableSeats: 9, seats: [] }); return id; },
+      createVariantTable: (cfg: any) => { const id = `rv${++n}`; created.push(cfg); runtime.set(id, { maxOccupiableSeats: 9, seats: [] }); return id; },
+      // F104 fix-up: a runtime table no club_tables row points at is closed.
+      removeTable: (id: string) => runtime.delete(id),
     },
+    tableHasHumanSeat: (t: any) => t.seats.some((s: any) => s.state === 'occupied' && !s.isAI),
     clubTableIds, clubIdByTable, validateTableConfig, clubJoinGrants: new WeakSet(),
     assertPlayable: async () => null, emitPlayRefusal: (s: any, r: any) => s.emit('error', r),
     console: { log() {}, warn() {}, error() {} },
@@ -509,5 +512,67 @@ describe('F104 — a scheduled club table fires as a REAL club table members can
     await w.m.sweepScheduledClubTables();
     expect(w.d.clubTables.size).toBe(1);
     expect(w.d.scheduledTables.get(sid)!.status).toBe('active');
+  });
+
+  // F104 fix-up (review) — the SECOND step (pointing the row at its runtime
+  // table, updateClubTableId) failed past every caller: the claimed row stayed
+  // 'active', a recurring series stopped, an unlisted bots-only runtime table
+  // was left behind, and Activate answered nothing (the handler rejected).
+  const RETRY = { message: 'Could not open the table right now — please try again.', code: 'scheduled_table_retry' };
+
+  it('fix-up — a DB error POINTING the row at its runtime table (Activate): "try again" (not invalid settings), the row is put back, the unreachable table is closed; Activate again makes ONE table', async () => {
+    const w = world();
+    const owner = w.mkSocket('SO', OWNER);
+    await owner.handlers.scheduleClubTable({ clubId: 7, config: { tableName: 'Blip', smallBlind: 25, bigBlind: 50, minBuyIn: 1000 }, scheduledTime: past(), recurring: false });
+    const sid = w.of('SO', 'clubTableScheduled')[0].scheduledTable.id as number;
+    w.d.failNext(/UPDATE club_tables SET tableId/);
+    await owner.handlers.activateScheduledClubTable({ id: sid, clubId: 7 });   // pre-fix-up: rejected — no answer at all
+    expect(w.of('SO', 'error')).toEqual([RETRY]);
+    expect(w.d.scheduledTables.get(sid)!.status).toBe('scheduled');      // pre-fix-up: stuck 'active'
+    expect(w.created).toHaveLength(1);
+    expect(w.runtime.size).toBe(0);                                       // pre-fix-up: an unlisted bots-only table kept dealing
+    expect(w.clubTableIds.size).toBe(0);
+    expect(w.clubIdByTable.size).toBe(0);
+    expect(w.m.clubTableRuntimeStats.closedUnbound).toBe(1);
+    await owner.handlers.activateScheduledClubTable({ id: sid, clubId: 7 });
+    const act = w.of('SO', 'scheduledClubTableActivated')[0];
+    expect(act).toMatchObject({ success: true, clubId: 7 });
+    expect(w.d.clubTables.size).toBe(1);                                  // the row made the first time is reused
+    expect([...w.d.clubTables.values()][0].tableid).toBe(act.tableId);
+    expect([...w.runtime.keys()]).toEqual([act.tableId]);
+  });
+
+  it('fix-up — the same DB error at the AUTO-FIRE: the row goes back to scheduled, the next sweep fires it and the RECURRING series keeps going', async () => {
+    const w = world();
+    const owner = w.mkSocket('SO', OWNER);
+    await owner.handlers.scheduleClubTable({ clubId: 7, config: { tableName: 'Daily', smallBlind: 25, bigBlind: 50, minBuyIn: 1000 }, scheduledTime: past(), recurring: true, recurrencePattern: 'daily' });
+    const sid = w.of('SO', 'clubTableScheduled')[0].scheduledTable.id as number;
+    w.d.failNext(/UPDATE club_tables SET tableId/);
+    await w.m.sweepScheduledClubTables();
+    expect(w.d.scheduledTables.get(sid)!.status).toBe('scheduled');      // pre-fix-up: 'active' and no next occurrence — the series ended
+    expect(w.d.scheduledTables.size).toBe(1);
+    expect(w.runtime.size).toBe(0);
+    expect(w.globalEmits.filter(([ev]) => ev === 'scheduledClubTableActivated')).toEqual([]);
+    await w.m.sweepScheduledClubTables();
+    expect(w.d.scheduledTables.get(sid)!.status).toBe('active');
+    expect([...w.d.scheduledTables.values()].filter((t) => t.status === 'scheduled')).toHaveLength(1);   // the next occurrence
+    expect(w.d.clubTables.size).toBe(1);
+    expect(w.runtime.size).toBe(1);
+  });
+
+  it('fix-up — Activate tells a DB failure making the club table row ("try again") from settings that can never make a table ("Invalid table settings")', async () => {
+    const w = world();
+    const owner = w.mkSocket('SO', OWNER);
+    await owner.handlers.scheduleClubTable({ clubId: 7, config: { tableName: 'Blip', smallBlind: 25, bigBlind: 50, minBuyIn: 1000 }, scheduledTime: past(), recurring: false });
+    const sid = w.of('SO', 'clubTableScheduled')[0].scheduledTable.id as number;
+    w.d.failNext(/INSERT INTO club_tables/);
+    await owner.handlers.activateScheduledClubTable({ id: sid, clubId: 7 });
+    expect(w.of('SO', 'error')).toEqual([RETRY]);                        // pre-fix-up: 'Invalid table settings…' (invalid_table_config)
+    expect(w.d.scheduledTables.get(sid)!.status).toBe('scheduled');
+    // A stored config that can never make a table (older than the schedule-time check) keeps its answer.
+    w.d.scheduledTables.get(sid)!.tableconfig = JSON.stringify({ tableName: 'Bad', smallBlind: 25, bigBlind: 50, minBuyIn: -1_000_000 });
+    await owner.handlers.activateScheduledClubTable({ id: sid, clubId: 7 });
+    expect(w.of('SO', 'error')[1]).toEqual({ message: 'Invalid table settings for this scheduled table', code: 'invalid_table_config' });
+    expect(w.runtime.size).toBe(0);
   });
 });

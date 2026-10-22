@@ -1576,3 +1576,20 @@ takeOverOwnSeatOnRejoin(socket, rjAuth.userId, tableId, undefined, 'joinByInvite
 endDeadTournamentSeatSession(socket, 'stopSpectating');
 if (liveSeatHere || !watching || socketHoldsPlayerSessionElsewhere(sid, breakTableId))
 dead_tournament_seat_session_ended
+
+# 2026-10-21 gameplay S9 fix-up (review of F102 / F104 / F109). F102: a club
+# challenge seat that sat out while ALONE is dealt in when the opponent sits
+# (only two or more seated, all sitting out, deal nothing); a joinTable at a
+# challenge re-applies the rule; the quick sweep deals a started challenge
+# resting at WaitingForPlayers. F104: a DB error pointing the club table row
+# at its runtime table puts the scheduled row back (retry; a recurring series
+# keeps going), closes the unreachable runtime table, and Activate answers
+# scheduled_table_retry (not "invalid settings"). F109: the career level is
+# read from the HYDRATED record (ensureHydrated); unloadable = progress_loading.
+&& !(challengeSeated.length >= 2 && challengeSeated.every((s) => set.has(s.seatIndex)));
+club_challenge_waiting_dealt
+function closeUnboundClubRuntimeTable(
+club_table_runtime_unbound_closed
+scheduled_table_runtime_failed
+scheduled_table_retry
+const careerCtx = careerAuth ? await ensureHydrated(socket) : null;

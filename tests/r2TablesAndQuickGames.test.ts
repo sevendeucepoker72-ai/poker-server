@@ -59,6 +59,8 @@ const BOT_STACKS = slice('const BOT_STACK_CAP_BUYINS = 3;', '  return isFixedRos
 const IS_TOURNAMENT_RESERVATION = fnSrc('function isTournamentReservation(');
 // R2 (CLUBS-4): joinClubTable finds (or re-creates) the club table's runtime table.
 const CLUB_RUNTIME = slice('const clubTablesRecreating = new Map', '\n  return job;\n}\n');
+// F109 fix-up (2026-10-21): startCareerGame answers a record that cannot load with the economy's progress_loading text.
+const ECONOMY_MESSAGE = fnSrc('function economyMessage(');
 
 function world(opts: { wallets?: Record<number, number> } = {}) {
   const db = createFakeLedgerDb(opts.wallets ?? { [ALICE]: 1_000_000, [BOB]: 1_000_000 });
@@ -112,8 +114,13 @@ function world(opts: { wallets?: Record<number, number> } = {}) {
     keepTournamentSeatOnLeave: () => false, activateBombPotIfPending() {}, executePendingMove: () => false, trimExcessAI() {},
     fillWithAI() {}, tournamentDealWaitsForBustCheck: () => false,
     emitGameState() {}, getGameStateForPlayer: () => ({}), sanitizeSeatAvatar: () => undefined,
-    // F109 (2026-10-21): startCareerGame reads the account's level (none loaded here = not refused).
+    // F109 (2026-10-21): startCareerGame reads the account's level (none loaded here = level 1).
     progressionManager: { getOrCreateProgress() {}, getClientProgress: () => null, userRecord: () => undefined },
+    // F109 fix-up: ...from the HYDRATED record — ensureHydrated (connection-scoped in index.ts) awaits the load.
+    ensureHydrated: async (s: any) => {
+      const a = authSessions.get(s.id);
+      return a ? { userId: a.userId, playerId: `user-${a.userId}`, username: a.username, hydrated: true } : null;
+    },
     assertPlayable: async () => null, emitPlayRefusal: (s: any, r: any) => s.emit('error', { code: r.code }),
     isUserBanned: async () => false, buyInSocketGone: async () => false, blockedByMaintenance: () => false,
     quickPlayRateLimited: () => false, refuseCashJoinAtTournamentTable: (s: any) => s.emit('error', { code: 'tournament_table' }),
@@ -153,6 +160,7 @@ ${QUICK}
 ${RETIRE}
 ${IS_TOURNAMENT_RESERVATION}
 ${CLUB_RUNTIME}
+${ECONOMY_MESSAGE}
 ${LEAVE}
 ${BOT_STACKS}
 ${AUTOSTART}
@@ -698,6 +706,79 @@ describe('quick games END — heads-up / all-in-or-fold / career cash out once; 
       w.m.sweepQuickTables();
       expect(kicks).toEqual(['chal']);
     });
+
+    // F102 fix-up (review) — a Sit Out tapped while ALONE at the challenge, and
+    // a challenge that never dealt. The REAL syncSitOutToTable replaces the stub.
+    const withRealSitOutSync = (w: ReturnType<typeof world>) => {
+      const { exports: sync } = load(fnSrc('function syncSitOutToTable('), {
+        tableManager: w.scope.tableManager, sitOutTracker: w.scope.sitOutTracker, challengeTables: w.scope.challengeTables,
+        isTournamentTable: () => false,
+      }, 'syncSitOutToTable');
+      w.scope.syncSitOutToTable = sync;
+      return sync as (id: string) => void;
+    };
+    const sitOutAt = (w: ReturnType<typeof world>, seats: number[]) => {   // the 'sitOut' handler's tracker write + sync
+      (w.scope.sitOutTracker as Map<string, Set<number>>).set('chal', new Set(seats));
+      (w.scope.syncSitOutToTable as (id: string) => void)('chal');
+    };
+
+    it("F102 fix-up — Alice sits out while ALONE (before Bob sits): Bob's join deals the first hand, and she is dealt in", async () => {
+      const { w, t } = challengeWorld();
+      withRealSitOutSync(w);
+      // joinTable's inline deal is the REAL dealAfterJoin (F50) here, not the harness stub.
+      w.scope.dealAfterJoin = load(fnSrc('function dealAfterJoin('), {
+        GamePhase, pendingAutoStartTimers: w.scope.pendingAutoStartTimers, activateBombPotIfPending() {}, scheduleAutoStart() {},
+      }, 'dealAfterJoin').exports;
+      (w.m as any).quickGames.set('chal', { format: 'challenge', ownerUserId: null, ownerName: 'Club Challenge', entryFee: 0, challengeId: 4, ended: false, settlement: 'open', createdAt: Date.now(), started: false });
+      const a = w.mkSocket('SA', ALICE, 'Alice');
+      await a.handlers.joinTable({ tableId: 'chal', playerName: 'Alice', seatIndex: -1, buyIn: 2000 });
+      const seatA = w.playerSessions.get('SA').seatIndex as number;
+      sitOutAt(w, [seatA]);                                                 // inside CHALLENGE_JOIN_GRACE_MS, Bob not there yet
+      const b = w.mkSocket('SB', BOB, 'Bob');
+      w.scope.clientIp = '198.51.100.7';
+      await b.handlers.joinTable({ tableId: 'chal', playerName: 'Bob', seatIndex: -1, buyIn: 2000 });
+      expect(t.isHandInProgress()).toBe(true);                              // pre-fix-up: WaitingForPlayers for good
+      expect(t.seats[seatA].holeCards).toHaveLength(2);
+      expect(t.seats[seatA].folded).toBe(false);                            // dealt in (acted for while away), not pre-folded
+    });
+
+    it('F102 fix-up — a started challenge that never dealt (both sat out first) is dealt by the sweep once one comes back; while both sit out nothing is dealt', () => {
+      const { w, t } = challengeWorld();
+      withRealSitOutSync(w);
+      const dealt: string[] = [];
+      w.scope.broadcastGameState = (id: string) => dealt.push(id);
+      (w.m as any).quickGames.set('chal', { format: 'challenge', ownerUserId: null, ownerName: 'Club Challenge', entryFee: 0, challengeId: 4, ended: false, settlement: 'open', createdAt: Date.now(), started: false });
+      t.sitDown(0, 'Alice', 2000, 'user_101', false);
+      t.sitDown(1, 'Bob', 2000, 'user_102', false);
+      sitOutAt(w, [0, 1]);                                                  // both away before the first deal
+      w.m.sweepQuickTables();
+      expect(w.m.quickGames.get('chal').started).toBe(true);
+      expect(t.currentPhase).toBe(GamePhase.WaitingForPlayers);            // no endless blind swap
+      expect(dealt).toEqual([]);
+      sitOutAt(w, [0]);                                                     // Bob comes back: that path deals nothing itself
+      expect(t.currentPhase).toBe(GamePhase.WaitingForPlayers);
+      (w.scope.pendingAutoStartTimers as Map<string, any>).set('chal', 1);  // a deal already scheduled: left alone
+      w.m.sweepQuickTables();
+      expect(t.currentPhase).toBe(GamePhase.WaitingForPlayers);
+      (w.scope.pendingAutoStartTimers as Map<string, any>).delete('chal');
+      w.m.sweepQuickTables();
+      expect(t.isHandInProgress()).toBe(true);                              // pre-fix-up: the sweep re-kicked HandComplete only
+      expect(t.seats[0].holeCards).toHaveLength(2);                         // Alice (still away) is dealt in and blinded
+      expect(dealt).toEqual(['chal']);
+    });
+
+    it('F102 fix-up — the sweep re-applies the deal-in rule first: a sit-out set left on the engine by an older sync does not block the deal', () => {
+      const { w, t } = challengeWorld();
+      withRealSitOutSync(w);
+      (w.m as any).quickGames.set('chal', { format: 'challenge', ownerUserId: null, ownerName: 'Club Challenge', entryFee: 0, challengeId: 4, ended: false, settlement: 'open', createdAt: Date.now(), started: true });
+      t.sitDown(0, 'Alice', 2000, 'user_101', false);
+      t.sitDown(1, 'Bob', 2000, 'user_102', false);
+      (w.scope.sitOutTracker as Map<string, Set<number>>).set('chal', new Set([0]));
+      t.setSittingOutSeats([0]);                                            // what the pre-fix-up sync left (Alice alone)
+      expect(t.startNewHand()).toBe(false);
+      w.m.sweepQuickTables();
+      expect(t.isHandInProgress()).toBe(true);
+    });
   });
 
   it('quickGameOutcome (pure)', () => {
@@ -848,7 +929,7 @@ describe('S9 — quick-game results and the career entry', () => {
     expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);         // only the first (valid) start paid
   });
 
-  it("F109 — the venue's LEVEL unlock is the server's too: a level-1 account cannot start the WSOP; level 50 can; a level not loaded yet is not refused", async () => {
+  it("F109 — the venue's LEVEL unlock is the server's too: a level-1 account cannot start the WSOP; level 50 can", async () => {
     const w = world();
     const s = w.mkSocket('S1');
     let level: { hydrated: boolean; level: number } | undefined = { hydrated: true, level: 1 };
@@ -860,9 +941,53 @@ describe('S9 — quick-game results and the career entry', () => {
     level = { hydrated: true, level: 50 };
     await s.handlers.startCareerGame({ venue: 5, stage: 2 });
     expect(w.deductions).toEqual([{ uid: ALICE, amount: 500_000 }]);
-    const s2 = w.mkSocket('S2', BOB, 'Bob');
-    level = { hydrated: false, level: 1 };                                // not hydrated yet: the client shows the same record
-    await s2.handlers.startCareerGame({ venue: 1, stage: 0 });
-    expect(w.deductions).toContainEqual({ uid: BOB, amount: 5000 });
+  });
+
+  // F109 fix-up (review) — the gate used to be skipped whenever the record was
+  // not hydrated yet: a level-1 account could start a locked venue right after
+  // sign-in (oauthLogin hydrates fire-and-forget), or for a whole session when
+  // the hydrate read failed.
+  it('F109 fix-up — the level comes from the HYDRATED record: a record still loading is loaded first (its real level decides); one that cannot load is refused progress_loading, never let through', async () => {
+    const w = world();
+    // The account's record as index.ts keeps it: un-hydrated right after sign-in, filled by the load ensureHydrated awaits.
+    const rec = { hydrated: false, level: 1 };
+    let dbLevel = 1;
+    let loadOk = true;
+    const loads: number[] = [];
+    w.scope.progressionManager = { getOrCreateProgress() {}, getClientProgress: () => null, userRecord: () => rec };
+    w.scope.ensureHydrated = async (sock: any) => {
+      const a = w.authSessions.get(sock.id);
+      if (!a) return null;
+      loads.push(a.userId);
+      if (!rec.hydrated && loadOk) { rec.hydrated = true; rec.level = dbLevel; }
+      return { userId: a.userId, playerId: `user-${a.userId}`, username: a.username, hydrated: rec.hydrated };
+    };
+    const s = w.mkSocket('S1');
+    await s.handlers.startCareerGame({ venue: 0, stage: 0 });              // a level-1 venue: no level read at all
+    expect(loads).toEqual([]);
+    const homeTable = w.playerSessions.get('S1').tableId;
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);
+
+    // 1) A level-1 account right after sign-in (record still loading): the load lands first, then he is refused.
+    await s.handlers.startCareerGame({ venue: 5, stage: 2 });
+    expect(w.errorsOf('S1')).toEqual([{ message: 'WSOP Main Event unlocks at level 50.', code: 'career_venue_locked', venue: 5, level: 50 }]);
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);          // pre-fix-up: + 500,000 — the WSOP boss stage was his
+    expect(w.playerSessions.get('S1')?.tableId).toBe(homeTable);           // his seat was never left
+
+    // 2) The read FAILS (hydrated stays false): refused progress_loading — no leave, no deduct.
+    rec.hydrated = false;
+    loadOk = false;
+    await s.handlers.startCareerGame({ venue: 5, stage: 2 });
+    expect(w.errorsOf('S1')[1]).toEqual({ message: 'Your progress is still loading — try again in a moment.', code: 'progress_loading' });
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);
+    expect(w.playerSessions.get('S1')?.tableId).toBe(homeTable);
+
+    // 3) A real level-50 player right after sign-in: the load gives his REAL level — never refused wrongly.
+    loadOk = true;
+    dbLevel = 50;
+    await s.handlers.startCareerGame({ venue: 5, stage: 2 });
+    expect(w.errorsOf('S1')).toHaveLength(2);
+    expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }, { uid: ALICE, amount: 500_000 }]);
+    expect(loads).toEqual([ALICE, ALICE, ALICE]);
   });
 });
