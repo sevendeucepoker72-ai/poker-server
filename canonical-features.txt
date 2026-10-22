@@ -1556,3 +1556,14 @@ extra_seat_sit_out_limit
 const wlCandidates = holdem.filter((t) => !socketHasSessionAt(socket.id, t.tableId));
 notSeatedAt: bestTable.tableId
 cashOutAdditionalSeatsOnDeparture(socket, authSessions.get(socket.id) ?? authSession, 'additional_table_disconnect');
+
+# 2026-10-21 gameplay S7 fix-up (review of F72 / F143). A join counts a seat of
+# the account at the target table as freed only when its teardown stands it up
+# AT ONCE (never one with chips in the live pot, never one already leaving at
+# the hand's end): a full table is refused before anything is left or folded.
+# The invite join of an unseated socket rejoins the account's own seat at the
+# home game, as joinTable's F82 blocks: its live reservation is restored, its
+# other socket's seat is taken over (hand and stack kept, nothing bought).
+return !(t.isHandInProgress() && (s.totalInvestedThisHand || 0) > 0);
+seatReservationRestores.inviteRejoins++;
+takeOverOwnSeatOnRejoin(socket, rjAuth.userId, tableId, undefined, 'joinByInviteCode')

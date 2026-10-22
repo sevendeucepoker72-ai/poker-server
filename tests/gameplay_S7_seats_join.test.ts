@@ -34,7 +34,7 @@ import { createWindowRateLimiter } from '../src/auth/rateLimit';
 import { accountDisplayName } from '../src/auth/displayName';
 import {
   SRC, slice, fnSrc, handlerSrc, load, flush, deferred,
-  SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, JOIN_PRECHECK_SRC,
+  SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, JOIN_PRECHECK_SRC, SEAT_RESTORE_SRC,
 } from './helpers/indexSource';
 
 const quiet = { log() {}, warn() {}, error() {} };
@@ -506,7 +506,13 @@ const PRE_SEAT = cut(JOIN, '      {\n        let seatFound = false;', '         
 const PRE_CHIPS = cut(JOIN, '      if (authAtJoin) {\n        // P3 — priced against', '          return;\n        }\n      }\n');
 const JOIN_PRE_F143 = JOIN.replace(PRE_SEAT, '').replace(PRE_CHIPS, '');
 
-function joinWorld(opts: { join?: string; invite?: string; wallets?: Record<number, number> } = {}) {
+/**
+ * `precheck`: the join pre-check block text (a CONTROL swaps in a pre-fix one);
+ * `extra`: more real source appended before the handlers (the S7 fix-up tests
+ * add the seat-reservation restore block — restoreSeatReservation and
+ * takeOverOwnSeatOnRejoin — that the invite rejoin calls).
+ */
+function joinWorld(opts: { join?: string; invite?: string; wallets?: Record<number, number>; precheck?: string; extra?: string } = {}) {
   const tables = new Map<string, PokerTable>();
   const sockets = new Map<string, FakeSocket>();
   const authSessions = new Map<string, any>();
@@ -548,7 +554,8 @@ function joinWorld(opts: { join?: string; invite?: string; wallets?: Record<numb
     log: { debug() {}, info() {}, warn() {} }, console: quiet,
   };
   const code = [
-    BROKEN, WHO, BUY_IN_GONE, GHOSTS, SYNC, SEAT_TEARDOWN_SRC, CREDIT_SEAT, LEAVE, JOIN_PRECHECK_SRC, CLUB_TABLE,
+    BROKEN, WHO, BUY_IN_GONE, GHOSTS, SYNC, SEAT_TEARDOWN_SRC, CREDIT_SEAT, LEAVE, opts.precheck ?? JOIN_PRECHECK_SRC, CLUB_TABLE,
+    opts.extra ?? '',
     `function wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${opts.join ?? JOIN}\n${opts.invite ?? INVITE}\n${REBUY}\n}`,
   ].join('\n');
   const { exports: m, stubbed } = load(code, scope, '{ wire, privateTableIds, clubTableIds, clubJoinGrants, createClubRuntimeTable }');
@@ -843,6 +850,258 @@ describe('F110 — a club table\'s Max Buy-In caps the join, the rebuy and the s
     await memberJoin(w, tableId, 2000);
     expect(w.deductions).toEqual([{ uid: ALICE, amount: 2000 }]);
     expect(t.seats.find((s) => s.playerName === 'Alice')?.chipCount).toBe(2000);
+  });
+});
+
+// ═══════════════════════════════════════════════════════ S7 fix-up (review) ══
+/**
+ * S7 fix-up (2026-10-21) — the reviewers of 958e190:
+ *   F72 / F143  accountHoldsSeatAt let a join skip the pre-leave "no seat"
+ *               refusal whenever the account held ANY seat at the target — one
+ *               with chips in the live pot too, which the leave / ghost clear
+ *               only folds and frees at the hand's end. A full table then left
+ *               the player's seat (or ghost-cleared the other device — its hand
+ *               folded) and refused afterwards: seatless everywhere.
+ *   F72 (P3)    the invite join had no rejoin: the F72 ghost clear FOLDED the
+ *               account's own reserved / other-socket seat at the home game and
+ *               bought him in again, where joinTable's F82 blocks keep the hand.
+ */
+describe('S7 fix-up — an account seat in the live pot frees nothing for a join; an invite join rejoins the account\'s own seat', () => {
+  const HOME = 'abcdef12-0000-4000-8000-000000000000';
+  const REAL_HOLDS = fnSrc('function accountHoldsSeatAt(');
+  /** The 958e190 text: any seat of the account at the target counted. */
+  const OLD_HOLDS = [
+    'function accountHoldsSeatAt(socketId: string, userId: number | undefined, tableId: string): boolean {',
+    '  if (playerSessions.get(socketId)?.tableId === tableId) return true;',
+    '  if (userId === undefined) return false;',
+    '  for (const [sid, s] of playerSessions) {',
+    '    if (s.tableId === tableId && authSessions.get(sid)?.userId === userId) return true;',
+    '  }',
+    '  for (const [sid, list] of multiTableSessions) {',
+    '    if (!Array.isArray(list) || authSessions.get(sid)?.userId !== userId) continue;',
+    '    if (list.some((ms) => ms && ms.tableId === tableId)) return true;',
+    '  }',
+    '  if (reservedSeats.get(userId)?.tableId === tableId) return true;',
+    '  const t = tableManager.getTable(tableId);',
+    '  const stamp = `user_${userId}`;',
+    "  return !!t && t.seats.some((s) => s.state === 'occupied' && !s.isAI && s.playerId === stamp);",
+    '}\n',
+  ].join('\n');
+  const oldPrecheck = () => without(JOIN_PRECHECK_SRC, REAL_HOLDS, OLD_HOLDS);
+  const RESTORE = `${SEAT_RESTORE_SRC}\n${fnSrc('function restoreFastModeOnSeatRestore(')}`;
+  const NEXT = "    // R3 (S1-1 / XL-1 / K3-1) — the seat is one BELOW the home game's cap";
+  const inviteWithoutRejoin = () => without(INVITE, cut(INVITE, '    // S7 fix-up (2026-10-21, gameplay F72 / F82) — a REJOIN through the invite', NEXT), NEXT);
+  const pending = (w: ReturnType<typeof joinWorld>) => (w.scope.pendingSeatRemovalAfterHand as Map<string, Map<number, any>>);
+
+  /** Alice's socket `holderId` plays `tableId` seat 0 with chips in the hand in progress; with `full`, seats 1-8 are other players. */
+  function aliceInPot(w: ReturnType<typeof joinWorld>, tableId: string, holderId: string, o: { full?: boolean; home?: boolean } = {}) {
+    const t = w.mkTable(tableId);
+    if (o.home) w.m.privateTableIds.add(tableId);
+    const holder = w.mkSocket(holderId, ALICE, 'Alice');
+    w.seatAt(holder, tableId, 0, 'Alice', 5000);
+    const others = o.full ? MAX_SEATS - 1 : 2;
+    for (let i = 1; i <= others; i++) expect(t.sitDown(i, `P${i}`, 5000, `px${i}`, false)).toBe(true);
+    expect(t.startNewHand()).toBe(true);
+    for (let g = 0; g < 20 && (t.seats[0].totalInvestedThisHand || 0) === 0; g++) {
+      const a = t.activeSeatIndex;
+      if (!(t.playerCall(a) || t.playerCheck(a))) break;
+    }
+    expect(t.isHandInProgress()).toBe(true);
+    expect(t.seats[0].totalInvestedThisHand).toBeGreaterThan(0);
+    expect(t.seats[0].folded).toBe(false);
+    return { t, holder, stack: t.seats[0].chipCount, invested: t.seats[0].totalInvestedThisHand };
+  }
+  /** The account's seat at `t` seat 0 is untouched: still played by `holderId`, unfolded, its chips in the pot, not leaving. */
+  const untouched = (w: ReturnType<typeof joinWorld>, t: PokerTable, holderId: string, invested: number) => {
+    expect(w.playerSessions.get(holderId)).toMatchObject({ tableId: t.config.tableId, seatIndex: 0 });
+    expect(t.seats[0]).toMatchObject({ state: 'occupied', playerName: 'Alice', folded: false, totalInvestedThisHand: invested });
+    expect(pending(w).get(t.config.tableId)?.has(0) ?? false).toBe(false);
+  };
+
+  describe('F143 / F72 — a full table is refused BEFORE the leave when the account\'s seat there is in the live pot', () => {
+    it('joinTable from table A: the account\'s other device plays full table T with chips in the pot → No seats available; A kept, T\'s hand untouched', async () => {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 } });
+      const A = w.mkTable('A');
+      const { t: T, holder, invested } = aliceInPot(w, 'T', 'SP', { full: true });
+      const sa = w.mkSocket('SA', ALICE, 'Alice');
+      w.seatAt(sa, 'A', 3, 'Alice', 5000);
+      await sa.handlers.joinTable({ tableId: 'T', playerName: 'Alice', seatIndex: -1, buyIn: 1000 });
+      await flush();
+      expect(events(sa, 'error')).toEqual([{ message: 'No seats available', code: 'no_seat_available' }]);
+      expect(w.playerSessions.get('SA')).toMatchObject({ tableId: 'A', seatIndex: 3 });
+      expect(A.seats[3]).toMatchObject({ state: 'occupied', playerName: 'Alice', chipCount: 5000 });
+      expect(sa.rooms.has('table:A')).toBe(true);
+      untouched(w, T, 'SP', invested);
+      expect(events(holder, 'seatVacated')).toEqual([]);
+      expect(w.deductions).toEqual([]);
+      expect(w.credits).toEqual([]);
+    });
+
+    it('joinTable seat change at the SAME full table, his own chips in the pot → No seats available; his seat and hand untouched', async () => {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 } });
+      const { t: T, holder, invested } = aliceInPot(w, 'T', 'SA', { full: true });
+      await holder.handlers.joinTable({ tableId: 'T', playerName: 'Alice', seatIndex: -1, buyIn: 1000 });
+      await flush();
+      expect(events(holder, 'error')).toEqual([{ message: 'No seats available', code: 'no_seat_available' }]);
+      untouched(w, T, 'SA', invested);
+      expect(w.deductions).toEqual([]);
+    });
+
+    it('joinByInviteCode from a socket seated at A: the laptop plays the full home game in the pot → table_full on joinError; A kept, the laptop\'s hand untouched', async () => {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 }, extra: RESTORE });
+      w.mkTable('A');
+      const { t: H, holder, invested } = aliceInPot(w, HOME, 'SL', { full: true, home: true });
+      const sa = w.mkSocket('SA', ALICE, 'Alice');
+      w.seatAt(sa, 'A', 3, 'Alice', 5000);
+      await sa.handlers.joinByInviteCode({ inviteCode: 'abcdef12', playerName: 'Alice', buyIn: 1000 });
+      await flush();
+      expect(events(sa, 'joinError')).toEqual([{ message: 'Table is full.', code: 'table_full' }]);
+      expect(w.playerSessions.get('SA')).toMatchObject({ tableId: 'A', seatIndex: 3 });
+      untouched(w, H, 'SL', invested);
+      expect(events(holder, 'seatVacated')).toEqual([]);
+      expect(w.deductions).toEqual([]);
+      expect(w.credits).toEqual([]);
+    });
+
+    it('a seat of the account that the leave frees AT ONCE (between hands) still counts: the seat change at a full table goes through', async () => {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 } });
+      const T = w.mkTable('T');
+      const sa = w.mkSocket('SA', ALICE, 'Alice');
+      w.seatAt(sa, 'T', 0, 'Alice', 5000);
+      for (let i = 1; i < MAX_SEATS; i++) expect(T.sitDown(i, `P${i}`, 5000, `px${i}`, false)).toBe(true);
+      await sa.handlers.joinTable({ tableId: 'T', playerName: 'Alice', seatIndex: -1, buyIn: 1000 });
+      await flush();
+      expect(events(sa, 'error')).toEqual([]);
+      expect(w.playerSessions.get('SA')).toMatchObject({ tableId: 'T', seatIndex: 0 });
+      expect(T.seats[0]).toMatchObject({ playerName: 'Alice', chipCount: 1000 });
+      expect(w.wallet.get(ALICE)).toBe(100_000 + 5000 - 1000);
+    });
+
+    it('CONTROL — the 958e190 accountHoldsSeatAt: joinTable leaves A, folds the other device\'s T hand, THEN refuses (leftTableId A) — seatless everywhere', async () => {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 }, precheck: oldPrecheck() });
+      w.mkTable('A');
+      const { t: T, holder } = aliceInPot(w, 'T', 'SP', { full: true });
+      const sa = w.mkSocket('SA', ALICE, 'Alice');
+      w.seatAt(sa, 'A', 3, 'Alice', 5000);
+      await sa.handlers.joinTable({ tableId: 'T', playerName: 'Alice', seatIndex: -1, buyIn: 1000 });
+      await flush();
+      expect(events(sa, 'error')).toEqual([{ message: 'No seats available', code: 'no_seat_available', leftTableId: 'A' }]);
+      expect(w.playerSessions.has('SA')).toBe(false);
+      expect(w.playerSessions.has('SP')).toBe(false);
+      expect(T.seats[0]).toMatchObject({ state: 'occupied', folded: true });
+      expect(pending(w).get('T')?.has(0)).toBe(true);
+      expect(events(holder, 'seatVacated')).toEqual([expect.objectContaining({ tableId: 'T', seatIndex: 0, reason: 'joined_new_seat' })]);
+    });
+
+    it('CONTROL — the 958e190 accountHoldsSeatAt: the invite join from A leaves A, folds the laptop\'s hand, THEN refuses table_full (leftTableId A)', async () => {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 }, precheck: oldPrecheck(), extra: RESTORE });
+      w.mkTable('A');
+      const { t: H, holder } = aliceInPot(w, HOME, 'SL', { full: true, home: true });
+      const sa = w.mkSocket('SA', ALICE, 'Alice');
+      w.seatAt(sa, 'A', 3, 'Alice', 5000);
+      await sa.handlers.joinByInviteCode({ inviteCode: 'abcdef12', playerName: 'Alice', buyIn: 1000 });
+      await flush();
+      expect(events(sa, 'joinError')).toEqual([{ message: 'Table is full.', code: 'table_full', leftTableId: 'A' }]);
+      expect(w.playerSessions.has('SA')).toBe(false);
+      expect(w.playerSessions.has('SL')).toBe(false);
+      expect(H.seats[0].folded).toBe(true);
+      expect(events(holder, 'seatVacated')).toEqual([expect.objectContaining({ seatIndex: 0, reason: 'joined_new_seat' })]);
+    });
+  });
+
+  describe('F72 (P2 / P3) — the invite join of a socket with no seat rejoins the account\'s own seat at the home game (as joinTable\'s F82)', () => {
+    it('the laptop plays the FULL home game with chips in the pot, the phone taps the invite: the seat MOVES to the phone — hand, stack kept; nothing bought, nothing credited', async () => {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 }, extra: RESTORE });
+      const { t: H, holder, stack, invested } = aliceInPot(w, HOME, 'SL', { full: true, home: true });
+      const phone = w.mkSocket('SP', ALICE, 'Alice');
+      await phone.handlers.joinByInviteCode({ inviteCode: 'abcdef12', playerName: 'Alice', buyIn: 1000 });
+      await flush();
+      expect(events(phone, 'joinError')).toEqual([]);
+      expect(w.playerSessions.get('SP')).toMatchObject({ socketId: 'SP', tableId: HOME, seatIndex: 0, playerId: 'seat-SL' });
+      expect(w.playerSessions.has('SL')).toBe(false);
+      expect(H.seats[0]).toMatchObject({ state: 'occupied', folded: false, chipCount: stack, totalInvestedThisHand: invested });
+      expect(H.isHandInProgress()).toBe(true);
+      expect(pending(w).get(HOME)?.has(0) ?? false).toBe(false);
+      expect(events(phone, 'reconnectedToTable')).toEqual([{ tableId: HOME, seatIndex: 0, sittingOut: false }]);
+      expect(events(holder, 'seatVacated')).toEqual([{ tableId: HOME, seatIndex: 0, reason: 'joined_new_seat' }]);
+      expect(w.deductions).toEqual([]);
+      expect(w.credits).toEqual([]);
+      expect([...w.stubbed].filter((n) => /takeOver|restore|Reserv|Ghost|accountHolds/.test(n) && !n.includes('.'))).toEqual([]);
+    });
+
+    it('…without that rejoin, the pre-check alone already refuses BEFORE the ghost clear (table_full): the laptop keeps its seat and hand', async () => {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 }, invite: inviteWithoutRejoin(), extra: RESTORE });
+      const { t: H, holder, invested } = aliceInPot(w, HOME, 'SL', { full: true, home: true });
+      const phone = w.mkSocket('SP', ALICE, 'Alice');
+      await phone.handlers.joinByInviteCode({ inviteCode: 'abcdef12', playerName: 'Alice', buyIn: 1000 });
+      await flush();
+      expect(events(phone, 'joinError')).toEqual([{ message: 'Table is full.', code: 'table_full' }]);
+      expect(w.playerSessions.has('SP')).toBe(false);
+      untouched(w, H, 'SL', invested);
+      expect(events(holder, 'seatVacated')).toEqual([]);
+      expect(w.deductions).toEqual([]);
+    });
+
+    it('CONTROL — 958e190 (no rejoin, the old accountHoldsSeatAt): the laptop\'s hand is folded, its session ended, and the phone is STILL refused table_full', async () => {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 }, invite: inviteWithoutRejoin(), precheck: oldPrecheck(), extra: RESTORE });
+      const { t: H, holder } = aliceInPot(w, HOME, 'SL', { full: true, home: true });
+      const phone = w.mkSocket('SP', ALICE, 'Alice');
+      await phone.handlers.joinByInviteCode({ inviteCode: 'abcdef12', playerName: 'Alice', buyIn: 1000 });
+      await flush();
+      expect(events(phone, 'joinError')).toEqual([{ message: 'Table is full.', code: 'table_full' }]);
+      expect(events(holder, 'seatVacated')).toEqual([expect.objectContaining({ seatIndex: 0, reason: 'joined_new_seat' })]);
+      expect(w.playerSessions.has('SL')).toBe(false);
+      expect(w.playerSessions.has('SP')).toBe(false);
+      expect(H.seats[0]).toMatchObject({ state: 'occupied', folded: true });
+      expect(pending(w).get(HOME)?.has(0)).toBe(true);
+      expect(w.deductions).toEqual([]);
+    });
+
+    /** The phone dropped mid-hand with its chips in the pot: its seat is RESERVED (no session); the laptop taps the invite. */
+    async function reservedThenInvite(invite?: string) {
+      const w = joinWorld({ wallets: { [ALICE]: 100_000 }, invite, extra: RESTORE });
+      const { t: H, stack, invested } = aliceInPot(w, HOME, 'SP', { home: true });
+      w.playerSessions.delete('SP');
+      (w.scope.reservedSeats as Map<number, any>).set(ALICE, {
+        tableId: HOME, seatIndex: 0, playerName: 'Alice', chips: stack, sittingOut: false,
+        expiresAt: Date.now() + 6 * 3600_000, cleanupTimer: undefined, handsRemaining: 20, playerId: 'seat-SP', tournament: false,
+      });
+      const laptop = w.mkSocket('SL', ALICE, 'Alice');
+      await laptop.handlers.joinByInviteCode({ inviteCode: 'abcdef12', playerName: 'Alice', buyIn: 1000 });
+      await flush();
+      return { w, H, laptop, stack, invested };
+    }
+
+    it('a live reservation at the home game is RESTORED onto the laptop: same seat, unfolded, same stack; no deduct, no credit; the reservation consumed', async () => {
+      const { w, H, laptop, stack, invested } = await reservedThenInvite();
+      expect(events(laptop, 'joinError')).toEqual([]);
+      expect(w.playerSessions.get('SL')).toMatchObject({ tableId: HOME, seatIndex: 0, playerId: `user_${ALICE}`, seatPlayerId: 'seat-SP' });
+      expect(H.seats[0]).toMatchObject({ state: 'occupied', folded: false, chipCount: stack, totalInvestedThisHand: invested });
+      expect(pending(w).get(HOME)?.has(0) ?? false).toBe(false);
+      expect((w.scope.reservedSeats as Map<number, any>).has(ALICE)).toBe(false);
+      expect(events(laptop, 'reconnectedToTable')).toEqual([{ tableId: HOME, seatIndex: 0, sittingOut: false }]);
+      expect(H.seats.filter((s) => s.state === 'occupied' && s.playerName === 'Alice')).toHaveLength(1);
+      expect(w.deductions).toEqual([]);
+      expect(w.credits).toEqual([]);
+    });
+
+    it('CONTROL — no invite rejoin: the F72 clear FOLDS the reserved hand and buys the laptop in again at another seat', async () => {
+      const { w, H } = await reservedThenInvite(inviteWithoutRejoin());
+      expect(H.seats[0].folded).toBe(true);
+      expect(pending(w).get(HOME)?.has(0)).toBe(true);
+      expect(w.deductions).toEqual([{ uid: ALICE, amount: 1000 }]);
+      expect(w.playerSessions.get('SL')?.seatIndex).not.toBe(0);
+    });
+
+    it('wiring: the invite rejoin runs before the seat pre-check, the leave and the F72 ghost clear', () => {
+      const at = INVITE.indexOf('takeOverOwnSeatOnRejoin(socket, rjAuth.userId, tableId, undefined, \'joinByInviteCode\')');
+      const restoreAt = INVITE.indexOf("restoreSeatReservation(socket, rjAuth.userId, 'joinByInviteCode'");
+      expect(restoreAt).toBeGreaterThan(-1);
+      expect(at).toBeGreaterThan(restoreAt);
+      expect(at).toBeLessThan(INVITE.indexOf('!accountHoldsSeatAt(socket.id, authAtInvite?.userId, tableId)'));
+      expect(at).toBeLessThan(INVITE.indexOf('if (playerSessions.get(socket.id)) handlePlayerLeave(socket);'));
+      expect(at).toBeLessThan(INVITE.indexOf('if (authAtInvite) clearGhostSeatsForUser(authAtInvite.userId, tableId, socket.id);'));
+    });
   });
 });
 

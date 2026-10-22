@@ -7677,24 +7677,44 @@ const FINISH_HAND_FIRST_MESSAGE = 'Your chips are in a hand at your current tabl
 
 /**
  * F143 — does this socket, or (signed in) this account, hold a seat at
- * `tableId` that a join's leave / ghost-seat clear frees (his own seat — a seat
- * change —, another socket's seat of his account, his reservation there, a seat
- * stamped with his account)? A full table is then decided after those, as before.
+ * `tableId` that a join's leave / ghost-seat clear frees AT ONCE (his own seat
+ * — a seat change —, another socket's seat of his account, his reservation
+ * there, a seat stamped with his account)? A full table is then decided after
+ * those, as before.
+ * S7 fix-up (2026-10-21) — only a seat that teardownSeat stands up AT ONCE
+ * counts: the same test as projectedJoinCredits (not already leaving at the
+ * hand's end — pendingSeatRemovalAfterHand —, and no chips in a live pot). A
+ * seat whose chips are in the hand being played is only FOLDED and marked for
+ * removal; it stays occupied until that hand ends, so it frees nothing for this
+ * join. It used to count: a join to a full table left the player's seat (or
+ * ghost-cleared the account's other device — its live hand folded) and only
+ * THEN was refused, seatless everywhere.
  */
 function accountHoldsSeatAt(socketId: string, userId: number | undefined, tableId: string): boolean {
-  if (playerSessions.get(socketId)?.tableId === tableId) return true;
+  const t = tableManager.getTable(tableId);
+  if (!t) return false;
+  const freedNow = (seatIndex: number): boolean => {
+    const s = t.seats[seatIndex];
+    if (!s || s.state !== 'occupied' || s.isAI) return false;
+    if (pendingSeatRemovalAfterHand.get(tableId)?.has(seatIndex)) return false;
+    return !(t.isHandInProgress() && (s.totalInvestedThisHand || 0) > 0);
+  };
+  const own = playerSessions.get(socketId);
+  if (own?.tableId === tableId && freedNow(own.seatIndex)) return true;
   if (userId === undefined) return false;
   for (const [sid, s] of playerSessions) {
-    if (s.tableId === tableId && authSessions.get(sid)?.userId === userId) return true;
+    if (s.tableId === tableId && authSessions.get(sid)?.userId === userId && freedNow(s.seatIndex)) return true;
   }
   for (const [sid, list] of multiTableSessions) {
     if (!Array.isArray(list) || authSessions.get(sid)?.userId !== userId) continue;
-    if (list.some((ms) => ms && ms.tableId === tableId)) return true;
+    if (list.some((ms) => ms && ms.tableId === tableId && freedNow(ms.seatIndex))) return true;
   }
-  if (reservedSeats.get(userId)?.tableId === tableId) return true;
-  const t = tableManager.getTable(tableId);
+  const r = reservedSeats.get(userId);
+  if (r && r.tableId === tableId && freedNow(r.seatIndex)
+      && t.seats[r.seatIndex].playerName === r.playerName
+      && !seatPlayedByAnotherAccount(userId, tableId, r.seatIndex)) return true;
   const stamp = `user_${userId}`;
-  return !!t && t.seats.some((s) => s.state === 'occupied' && !s.isAI && s.playerId === stamp);
+  return t.seats.some((s, i) => s.state === 'occupied' && !s.isAI && s.playerId === stamp && freedNow(i));
 }
 
 /**
@@ -14103,8 +14123,10 @@ Give feedback in this JSON format:
       //   (a) a seat the join can take — an empty seat below the cap, or a bot
       //       not in the hand (a pure lookup: the bot is stood up only after the
       //       leave). A seat of HIS at this table (a seat change, a ghost seat)
-      //       is freed by the leave / ghost clear: then the search after them
-      //       decides, as before;
+      //       that the leave / ghost clear frees AT ONCE: then the search after
+      //       them decides, as before. S7 fix-up — one with chips in the live
+      //       pot is only folded and freed at the hand's end (accountHoldsSeatAt
+      //       no longer counts it): refused here, nothing left or folded;
       //   (b) the buy-in against his wallet plus what the leave credits AT ONCE
       //       (projectedJoinCredits). Chips still in a live pot come back only
       //       when that hand ends: refused `finish_hand_first` (never folded).
@@ -19468,6 +19490,49 @@ Give feedback in this JSON format:
       return;
     }
 
+    // S7 fix-up (2026-10-21, gameplay F72 / F82) — a REJOIN through the invite
+    // link, exactly as joinTable's F82 blocks (a home game is entered ONLY by
+    // its invite code — joinTable refuses it —, so this is its rejoin path):
+    // this socket has no seat and its account
+    //   (a) holds a live, non-voluntary reservation at THIS home game that is
+    //       still its own seat → restored onto this socket (same seat, same
+    //       stack, his hand kept; the buy-in is ignored, nothing deducted);
+    //   (b) still plays its seat here on ANOTHER socket (the half-open rejoin
+    //       before the old socket is reaped, or another device) → the seat
+    //       MOVES to this socket (takeOverOwnSeatOnRejoin: hand, stack, Sit Out
+    //       and fast mode kept; the old socket is told seatVacated).
+    // The F72 ghost-seat clear below used to end that seat — his live hand
+    // FOLDED — and buy him in again at another seat. It stays the fallback.
+    {
+      const rjAuth = authSessions.get(socket.id);
+      if (rjAuth && !playerSessions.has(socket.id)) {
+        const rj = reservedSeats.get(rjAuth.userId);
+        const rjSeat = rj ? table.seats[rj.seatIndex] : undefined;
+        if (rj && rjSeat && rj.tableId === tableId && !rj.voluntary && rj.expiresAt > Date.now()
+            && rjSeat.state === 'occupied' && !rjSeat.isAI && rjSeat.playerName === rj.playerName
+            && !seatPlayedByAnotherAccount(rjAuth.userId, tableId, rj.seatIndex)
+            && !seatReservedByOtherAccount(rjAuth.userId, tableId, rj.seatIndex)
+            && !pendingSeatRemovalAfterHand.get(tableId)?.has(rj.seatIndex)
+            && !otherSessionHoldsSeat(socket.id, tableId, rj.seatIndex)) {
+          const rejoin = restoreSeatReservation(socket, rjAuth.userId, 'joinByInviteCode', { clearGhosts: true, allowSecondary: true, onlyTableId: tableId });
+          if (rejoin.outcome === 'restored') {
+            seatReservationRestores.inviteRejoins++;
+            sendProgressToPlayer(socket.id);
+            scheduleAIAction(tableId);
+            return;
+          }
+        }
+        if ([...playerSessions].some(([sid, s]) => sid !== socket.id && s.tableId === tableId && authSessions.get(sid)?.userId === rjAuth.userId)) {
+          const takenOver = takeOverOwnSeatOnRejoin(socket, rjAuth.userId, tableId, undefined, 'joinByInviteCode');
+          if (takenOver) {
+            sendProgressToPlayer(socket.id);
+            scheduleAIAction(tableId);
+            return;
+          }
+        }
+      }
+    }
+
     // R3 (S1-1 / XL-1 / K3-1) — the seat is one BELOW the home game's cap
     // (maxSeats), decided BEFORE any chip moves (the pick itself is after the
     // leave below).
@@ -19480,8 +19545,10 @@ Give feedback in this JSON format:
     // up only after the leave below) and the buy-in are decided BEFORE the
     // socket leaves its seat: a refusal after the leave ("Insufficient chips
     // for this table.") cost him his seat and hand at his current table. A seat
-    // of HIS at this table (freed by the leave / the ghost clear) defers the
-    // seat decision to after them.
+    // of HIS at this table that the leave / the ghost clear frees AT ONCE
+    // defers the seat decision to after them (S7 fix-up: never one with chips
+    // in the live pot — it stays occupied until the hand ends; the clear used
+    // to fold the other device's hand and then refuse).
     const authAtInvite = authSessions.get(socket.id);
     if (!table.seats.some((s, i) => i < inviteSeatCap && (s.state === 'empty' || aiSeatTakeableNow(table, i)))
         && !accountHoldsSeatAt(socket.id, authAtInvite?.userId, tableId)) {
@@ -20186,7 +20253,7 @@ function isDeadTournamentSeat(tableId: string, seat: Seat | undefined, tournamen
 /** A dead tournament reservation a restore dropped (G183): what to tell the player. */
 interface DeadTournamentReservation { tableId: string; tournamentId?: string; playerId?: string; playerName: string }
 type ReservationRestoreOutcome = { outcome: 'restored' | 'dropped' | 'none'; dead?: DeadTournamentReservation };
-const seatReservationRestores = { restored: 0, keptSittingOut: 0, droppedGone: 0, droppedDeadTournamentSeat: 0, joinTableRejoins: 0 };
+const seatReservationRestores = { restored: 0, keptSittingOut: 0, droppedGone: 0, droppedDeadTournamentSeat: 0, joinTableRejoins: 0, inviteRejoins: 0 };
 
 /**
  * THE restore of a departure's seat reservation onto `socket` — step (b) of
@@ -20427,6 +20494,8 @@ function adoptReservationByPendingClaim(userId: number, reapedSocketId: string, 
  * out), fastModeSet, a full state. It used to fall to the ghost-seat clear:
  * his live hand FOLDED and he was bought in again at another seat. A join
  * naming ANOTHER seat is a seat change (the ghost clear, as before).
+ * S7 fix-up (2026-10-21) — joinByInviteCode calls it too (wantedSeat
+ * undefined): a home game's rejoin goes through its invite code.
  */
 const seatRejoinTakeOvers = { count: 0 };
 function takeOverOwnSeatOnRejoin(
