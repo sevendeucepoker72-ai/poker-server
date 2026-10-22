@@ -1593,3 +1593,10 @@ club_table_runtime_unbound_closed
 scheduled_table_runtime_failed
 scheduled_table_retry
 const careerCtx = careerAuth ? await ensureHydrated(socket) : null;
+
+# 2026-10-22 (owner: "Save finish order to DB"). A qualifier's finish order is
+# a DURABLE audit_log row, not only a stdout line: QUALIFIER_RESULTS_RECORDED /
+# _POSTED / _POST_FAILED are in DURABLE_AUDIT_ACTIONS, and postQualifierResults
+# fences every audit so it can never delay, stop or re-send the results POST.
+'QUALIFIER_RESULTS_RECORDED', 'QUALIFIER_RESULTS_POSTED', 'QUALIFIER_RESULTS_POST_FAILED',
+[QualifierResults] audit failed (the POST is unaffected):

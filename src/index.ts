@@ -1226,6 +1226,14 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // (registration, unregister, cancel): a few per hour, money in and out of
   // the wallet, so a durable trail (the cancel refund's own row is in prize_payouts).
   'TOURNAMENT_ENTRY_DEDUCT', 'TOURNAMENT_ENTRY_REFUND', 'TOURNAMENT_ENTRY_REFUND_FAILED',
+  // 2026-10-22 (owner: "Save finish order to DB") — a qualifier's results POST
+  // to the master is what awards the championship seats. The FULL finish order
+  // (master player ids + places: the exact `results` body of the master's admin
+  // replay POST /qualifiers/:id/results) used to reach Railway stdout only, so a
+  // restart / lost log made it unrecoverable. One row per qualifier: recorded
+  // (as the POST goes out, with the order), posted (the master took it), or
+  // post failed for good (with the order again). Recovery recipe: AGENT.md.
+  'QUALIFIER_RESULTS_RECORDED', 'QUALIFIER_RESULTS_POSTED', 'QUALIFIER_RESULTS_POST_FAILED',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -1278,7 +1286,7 @@ function auditLog(actorUsername: string, action: string, details: Record<string,
       );
     } catch (e: any) {
       try { if (Sentry) Sentry.captureException(e, { tags: { area: 'auditLog' }, extra: { action } }); } catch (_) {}
-      try { console.warn('[AUDIT] durable write failed (non-fatal):', e?.message); } catch (_) {}
+      try { console.warn('[AUDIT] durable write failed (non-fatal):', action, e?.message); } catch (_) {}
     }
   })();
 }
@@ -22955,10 +22963,23 @@ function postQualifierResults(tournamentId: string, data: { results?: Array<{ pl
     })
     .filter(r => r.playerId); // only players we can map to master DB
   if (mappedResults.length === 0) return;
+  // 2026-10-22 (owner: "Save finish order to DB") — the three audit rows below
+  // are DURABLE (DURABLE_AUDIT_ACTIONS: a row in poker-server's audit_log
+  // table, not only a stdout line). auditLog's DB write is fire-and-forget (a
+  // DB error is logged, never thrown), and every call is fenced here too, so
+  // nothing about the audit — a slow or failing DB, a throw — can delay, stop
+  // or re-send the POST.
+  const audit = (action: string, details: Record<string, unknown>): void => {
+    try { auditLog('SYSTEM', action, details); } catch (e: any) {
+      try { console.error('[QualifierResults] audit failed (the POST is unaffected):', action, e?.message); } catch (_) { /* never */ }
+    }
+  };
   // 2026-10-20 — the FULL finish order is written to the audit log before the
   // POST, so a POST that never lands can be replayed (admin POST
   // /qualifiers/:id/results) instead of the order being lost with the process.
-  auditLog('SYSTEM', 'QUALIFIER_RESULTS_RECORDED', { tournamentId, masterQualifierId, finishOrder: mappedResults });
+  // `finishOrder` IS the POST's `results` (master player id, place, points):
+  // the replay body is { "results": <finishOrder> } (recipe: AGENT.md).
+  audit('QUALIFIER_RESULTS_RECORDED', { tournamentId, masterQualifierId, finishOrder: mappedResults });
   // R2 (TOURNEY-3) — this POST is what awards the championship seats: a
   // failure (or a non-2xx answer) is RETRIED with backoff (the master upserts
   // results, so a retry is safe) and audited when it finally fails — it used
@@ -22972,6 +22993,9 @@ function postQualifierResults(tournamentId: string, data: { results?: Array<{ pl
     }).then((res: any) => {
       if (res && res.ok === false) throw new Error(`http_${res.status}`);
       qualifierResultPosts.posted++;
+      // 2026-10-22 — the durable "the master took it" row: a RECORDED row with
+      // no POSTED row after it means the seats may not have been awarded.
+      audit('QUALIFIER_RESULTS_POSTED', { tournamentId, masterQualifierId, results: mappedResults.length, attempts: attempt + 1 });
     }).catch((e: any) => {
       // 2026-10-20 — 7 retries (5s … 320s, ~10 minutes in all; was 4, ~75s),
       // so a short master outage at the end of a qualifier is ridden out.
@@ -22983,7 +23007,7 @@ function postQualifierResults(tournamentId: string, data: { results?: Array<{ pl
       }
       qualifierResultPosts.failed++;
       console.error('[QualifierResults] post failed for good:', e?.message);
-      auditLog('SYSTEM', 'QUALIFIER_RESULTS_POST_FAILED', { tournamentId, masterQualifierId, results: mappedResults.length, finishOrder: mappedResults, error: String(e?.message || e) });
+      audit('QUALIFIER_RESULTS_POST_FAILED', { tournamentId, masterQualifierId, results: mappedResults.length, finishOrder: mappedResults, error: String(e?.message || e) });
     });
   };
   post(0);

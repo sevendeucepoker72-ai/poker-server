@@ -191,6 +191,44 @@ git checkout <prior-sha> && railway up --service poker-server
    that gives a tournament seat back runs `bannedAccountRefusal` after
    `assertPlayable` (P-k)
 
+### Recovering a qualifier's finish order (the results POST never landed)
+
+Since 2026-10-22 (owner: "Save finish order to DB") `postQualifierResults`
+writes three DURABLE rows to poker-server's `audit_log` table (Postgres-dCcH,
+`details` is JSONB): `QUALIFIER_RESULTS_RECORDED` (as the POST goes out, with
+`finishOrder` = the exact `results` array it POSTs: master player id, place,
+points), `QUALIFIER_RESULTS_POSTED` (the master answered 2xx) and
+`QUALIFIER_RESULTS_POST_FAILED` (8 attempts over ~10 minutes all failed; with
+`finishOrder` again). The write is fire-and-forget and never delays, stops or
+re-sends the POST (`tests/qualifierResultsDurable.test.ts`).
+
+1. Did the master get it? `GET <master>/qualifiers/<masterQualifierId>` (public)
+   lists `data.results`. Railway dashboard → Postgres-dCcH → Database → Data →
+   query box:
+   ```sql
+   SELECT ts, action, jsonb_array_length(details->'finishOrder') AS players_saved,
+          details->>'attempts' AS attempts, details->>'error' AS error
+     FROM audit_log
+    WHERE action IN ('QUALIFIER_RESULTS_RECORDED', 'QUALIFIER_RESULTS_POSTED', 'QUALIFIER_RESULTS_POST_FAILED')
+      AND details->>'masterQualifierId' = '<masterQualifierId>'
+    ORDER BY ts;
+   ```
+   RECORDED followed by POSTED = landed, nothing to do. RECORDED with no
+   POSTED (a POST_FAILED row, or a restart inside the retry window) = replay.
+2. The replay body, ready to send:
+   ```sql
+   SELECT jsonb_array_length(details->'finishOrder') AS players,
+          jsonb_build_object('results', details->'finishOrder')::text AS replay_body
+     FROM audit_log
+    WHERE action = 'QUALIFIER_RESULTS_RECORDED'
+      AND details->>'masterQualifierId' = '<masterQualifierId>'
+    ORDER BY ts DESC LIMIT 1;
+   ```
+3. Send it as `POST <master>/qualifiers/<masterQualifierId>/results` (adminAuth;
+   or `/results/internal` with `X-Internal-Token`). A re-send is safe: results
+   are upserted, a seat package re-post mints nothing, monthly entries / credits
+   are insert-if-absent.
+
 ## Gotchas
 
 - **There is no SQLite (corrected 2026-10-11, CLUBS-P3-1).** Clubs (and
