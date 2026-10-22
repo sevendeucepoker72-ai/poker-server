@@ -224,10 +224,84 @@ re-sends the POST (`tests/qualifierResultsDurable.test.ts`).
       AND details->>'masterQualifierId' = '<masterQualifierId>'
     ORDER BY ts DESC LIMIT 1;
    ```
-3. Send it as `POST <master>/qualifiers/<masterQualifierId>/results` (adminAuth;
-   or `/results/internal` with `X-Internal-Token`). A re-send is safe: results
-   are upserted, a seat package re-post mints nothing, monthly entries / credits
-   are insert-if-absent.
+3. Send it as `POST <master>/qualifiers/<masterQualifierId>/results`. A re-send
+   is safe: results are upserted, a seat package re-post mints nothing, monthly
+   entries / credits are insert-if-absent.
+
+   **No admin page has a button for this** (poker-admin's
+   `qualifiersApi.recordResults` is defined, but no page calls it). The route
+   is `adminAuth`: `X-Admin-User-Id` plus a Bearer token of that same user (the
+   API refuses a mismatch). The admin site already holds both, so send it from
+   the browser Console of an admin tab:
+   - Use a computer where YOU are signed in to https://admin.americanpub.poker
+     (the normal sign-in, not a kiosk tablet's "Admin Login": that one has no
+     token of yours). Open the admin site, press F12, open **Console**. The
+     first time, Chrome asks you to type `allow pasting`.
+   - Copy the snippet below into a text editor and fill in its three
+     `PASTE_…` values: the qualifier id, step 2's `players`, and step 2's
+     `replay_body` exactly as copied (no quotes around it). Then paste the
+     whole snippet into the Console and press Enter.
+   - It checks everything first and prints `NOT SENT: <why>` instead of
+     sending: the id, the player count against step 2 (a `replay_body` that was
+     cut off while copying fails here, or does not parse at all, so a partial
+     order never goes out), that every row has a player and a place, and that
+     the tab's token is yours and not about to expire.
+   - After the POST it prints `SENT` with what the master recorded, then
+     re-reads `GET /qualifiers/<id>`. The results count it prints must equal
+     `players`. `REFUSED (HTTP 401)`: reload the tab, sign in again, paste
+     again. `403`: that account is not an admin. Nothing is awarded on a
+     refusal.
+   - `/results/internal` (the route poker-server itself uses) takes the
+     `INTERNAL_NOTIFY_TOKEN` secret instead. Do not copy that secret by hand
+     for a replay; use the admin Console.
+   - It awards seats, so an agent runs it in the owner's admin tab only with
+     the owner's OK.
+
+   `tests/qualifierResultsDurable.test.ts` runs this exact snippet, taken from
+   this file, against the body that step 2 builds from a real
+   `QUALIFIER_RESULTS_RECORDED` row.
+   ```js
+   // qualifier-results-replay (poker-server AGENT.md): paste into the Console of an admin.americanpub.poker tab.
+   (async () => {
+     const QID = 'PASTE_QUALIFIER_ID_HERE';   // e.g. 7a8dd4a8-cc63-4c91-8da6-dacc8a58da38 (Sun 2026-10-25)
+     const PLAYERS = PASTE_PLAYERS_HERE;      // step 2's `players` (a number)
+     let body = PASTE_REPLAY_BODY_HERE;       // step 2's `replay_body`, as copied (no quotes)
+     const API = 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+     const stop = (why) => { console.error('NOT SENT: ' + why); return 'not sent'; };
+     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(QID)) return stop('QID is not a qualifier id.');
+     if (typeof body === 'string') { try { body = JSON.parse(body); } catch (_) { return stop('replay_body is not complete JSON (copy it again, whole).'); } }
+     const results = Array.isArray(body) ? body : body && body.results;
+     if (!Array.isArray(results) || results.length === 0) return stop('replay_body has no results.');
+     if (results.length !== PLAYERS) return stop('replay_body has ' + results.length + ' players, step 2 said ' + PLAYERS + ' (copy it again, whole).');
+     if (!results.every((r) => r && typeof r.playerId === 'string' && r.playerId && Number.isInteger(r.finishPosition) && r.finishPosition > 0)) return stop('a row has no playerId or no place.');
+     let me = null;
+     try { const s = JSON.parse(localStorage.getItem('poker_admin_session') || 'null'); me = (s && ((s.user && s.user.id) || s.userId || s.id)) || null; } catch (_) { me = null; }
+     if (!me) return stop('this tab is not signed in to admin. Sign in, then paste again.');
+     const isJwt = (t) => typeof t === 'string' && t.split('.').length === 3;
+     const at = localStorage.getItem('oauth_access_token');
+     const idt = localStorage.getItem('oauth_id_token');
+     const token = isJwt(at) ? at : isJwt(idt) ? idt : null;
+     let claims = null;
+     try { const b64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'); claims = JSON.parse(atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4))); } catch (_) { claims = null; }
+     if (!claims || claims.sub == null || String(claims.sub).toLowerCase() !== String(me).toLowerCase()) return stop('this tab has no sign-in token of your own (a kiosk "Admin Login" has none). Sign in to admin as yourself, then paste again.');
+     if (!(Number(claims.exp) * 1000 > Date.now() + 60000)) return stop('your sign-in token is about to expire. Reload this tab, wait 10 seconds, then paste again.');
+     let res;
+     try {
+       res = await fetch(API + '/qualifiers/' + QID + '/results', {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json', 'X-Admin-User-Id': String(me), Authorization: 'Bearer ' + token },
+         body: JSON.stringify({ results }),
+       });
+     } catch (e) { console.error('NO ANSWER (' + (e && e.message) + '). It is safe to paste again.'); return 'no answer'; }
+     const out = await res.json().catch(() => ({}));
+     if (!res.ok) { console.error('REFUSED (HTTP ' + res.status + '): ' + (out.message || '') + '. Nothing was awarded. 401: reload this tab, sign in again, paste again. 403: this account is not an admin.'); return 'refused'; }
+     console.log('SENT. The master recorded ' + (out.data && out.data.recorded) + ' results. Seats and monthly entries: ' + JSON.stringify(out.data && out.data.advanced));
+     const check = await fetch(API + '/qualifiers/' + QID).then((r) => r.json()).catch(() => null);
+     const saved = check && check.data && Array.isArray(check.data.results) ? check.data.results.length : null;
+     console.log('Results now on the master: ' + (saved == null ? '(could not read; open GET /qualifiers/' + QID + ')' : saved) + ' (must be ' + PLAYERS + ').');
+     return 'sent';
+   })();
+   ```
 
 ## Gotchas
 

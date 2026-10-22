@@ -15,6 +15,9 @@
  * Runs the REAL src/index.ts source (DURABLE_AUDIT_ACTIONS, _ensureAuditTable,
  * auditLog, postQualifierResults) against a fake pg pool and a fake master.
  */
+import fs from 'fs';
+import path from 'path';
+import vm from 'vm';
 import { slice, fnSrc, load, flush } from './helpers/indexSource';
 
 const AUDIT_SRC = [
@@ -193,5 +196,195 @@ describe('the durable write never blocks, stops or re-sends the results POST', (
     expect(w.posts).toEqual([]);
     expect(w.queries).toEqual([]);
     expect(w.lines).toEqual([]);
+  });
+});
+
+// ── 2026-10-22 review fix-up — AGENT.md's recovery recipe, step 3. No admin
+// page calls the replay route (poker-admin's qualifiersApi.recordResults is
+// never used), so the recipe gives the owner a snippet to paste into the
+// Console of a signed-in admin tab. These tests run THAT snippet, read from
+// AGENT.md, in a fake admin tab, against the body step 2's SQL builds from a
+// REAL QUALIFIER_RESULTS_RECORDED row.
+const AGENT_MD = fs.readFileSync(path.join(__dirname, '..', 'AGENT.md'), 'utf8');
+const ADMIN = '0b9a6f3e-6c7d-4f0e-9a51-2f4c1d7e8a90';
+const KIOSK = '5d2c8e11-3b4a-4c6f-8e7d-9a0b1c2d3e4f';
+/** The master poker-server itself posts to (its MASTER_API_URL default). */
+const MASTER = (POST_SRC.match(/process\.env\.MASTER_API_URL \|\| '([^']+)'/) || [])[1];
+
+function replaySnippet(): string {
+  const m = AGENT_MD.match(/```js\n([ \t]*\/\/ qualifier-results-replay[\s\S]*?)\n[ \t]*```/);
+  if (!m) throw new Error('AGENT.md has no qualifier-results-replay snippet');
+  return m[1];
+}
+
+/** How Postgres prints jsonb as text: keys by length, then bytes; ", " and ": ". */
+function pgJsonbText(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(pgJsonbText).join(', ')}]`;
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    const keys = Object.keys(o).sort((a, b) => (a.length - b.length) || (a < b ? -1 : a > b ? 1 : 0));
+    return `{${keys.map((k) => `${JSON.stringify(k)}: ${pgJsonbText(o[k])}`).join(', ')}}`;
+  }
+  return JSON.stringify(v);
+}
+
+function jwt(claims: Record<string, unknown>): string {
+  const b64u = (o: unknown): string => Buffer.from(JSON.stringify(o)).toString('base64url');
+  return `${b64u({ alg: 'RS256', typ: 'JWT' })}.${b64u(claims)}.signature`;
+}
+
+type FinishRow = { playerId: string; finishPosition: number | null; pointsAwarded: number };
+interface StepTwo { players: number; finishOrder: FinishRow[]; replayBody: string; sentByServer: { url: string; headers: any; body: any } }
+
+/** Step 2's output (`players`, `replay_body`) for a real RECORDED row, and the POST poker-server sent. */
+async function stepTwo(n: number): Promise<StepTwo> {
+  const w = world({ n });
+  w.m.postQualifierResults('TQ', w.data);
+  await flush();
+  const recorded = w.rows().find((r) => r.action === 'QUALIFIER_RESULTS_RECORDED')!;
+  const finishOrder = recorded.details.finishOrder as FinishRow[];
+  return { players: finishOrder.length, finishOrder, replayBody: pgJsonbText({ results: finishOrder }), sentByServer: w.posts[0] };
+}
+
+type Answer = { ok: boolean; status: number; json: unknown };
+interface Tab { storage?: Record<string, string | null>; answer?: Answer; fetchThrows?: boolean }
+interface Req { url: string; method: string; headers: Record<string, string>; body: any }
+
+/** Fill the snippet's three PASTE_ values and run it in a fake admin.americanpub.poker tab. */
+async function pasteInAdminTab(fill: { qid: string; players: string; body: string }, tab: Tab = {}) {
+  const nowS = Math.floor(Date.now() / 1000);
+  const storage: Record<string, string | null> = {
+    poker_admin_session: JSON.stringify({ user: { id: ADMIN, roles: ['siteAdmin'] }, timestamp: Date.now() }),
+    oauth_access_token: jwt({ sub: ADMIN, exp: nowS + 900 }),
+    oauth_id_token: jwt({ sub: ADMIN, exp: nowS + 3600 }),
+    ...tab.storage,
+  };
+  const requests: Req[] = [];
+  const logs: string[] = [];
+  const errs: string[] = [];
+  const fetchFake = async (url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) => {
+    const method = init.method || 'GET';
+    requests.push({ url, method, headers: init.headers || {}, body: init.body === undefined ? undefined : JSON.parse(init.body) });
+    if (tab.fetchThrows) throw new TypeError('Failed to fetch');
+    if (method === 'POST') {
+      const a = tab.answer ?? { ok: true, status: 200, json: { success: true, data: { recorded: requests[0].body.results.length, advanced: { yearly: 16, monthly: 65 } } } };
+      return { ok: a.ok, status: a.status, json: async () => a.json };
+    }
+    return { ok: true, status: 200, json: async () => ({ success: true, data: { results: requests[0].body.results } }) };
+  };
+  const code = replaySnippet()
+    .replace("'PASTE_QUALIFIER_ID_HERE'", () => `'${fill.qid}'`)
+    .replace('PASTE_PLAYERS_HERE', () => fill.players)
+    .replace('PASTE_REPLAY_BODY_HERE', () => fill.body);
+  const ctx = vm.createContext({
+    localStorage: { getItem: (k: string) => (k in storage ? storage[k] : null) },
+    fetch: fetchFake,
+    atob: (s: string) => Buffer.from(s, 'base64').toString('binary'),
+    console: {
+      log: (...a: unknown[]) => { logs.push(a.map(String).join(' ')); },
+      error: (...a: unknown[]) => { errs.push(a.map(String).join(' ')); },
+    },
+  });
+  let outcome: unknown;
+  let thrown: any = null;
+  try { outcome = await vm.runInContext(code, ctx); } catch (e) { thrown = e; }
+  return { outcome, thrown, requests, logs, errs, storage };
+}
+
+describe('the replay recipe (AGENT.md step 3): the snippet the owner pastes into an admin tab', () => {
+  it('is in AGENT.md with each PASTE_ value once, and posts to the master poker-server posts to', () => {
+    const s = replaySnippet();
+    for (const p of ["'PASTE_QUALIFIER_ID_HERE'", 'PASTE_PLAYERS_HERE', 'PASTE_REPLAY_BODY_HERE']) expect(s.split(p)).toHaveLength(2);
+    expect(MASTER).toBe('https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api');
+    expect(s).toContain(`const API = '${MASTER}';`);
+  });
+
+  it('sends step 2\'s body as the admin replay: the exact results poker-server POSTed, the admin header + his own Bearer', async () => {
+    const two = await stepTwo(650);
+    const r = await pasteInAdminTab({ qid: QID, players: String(two.players), body: two.replayBody });
+    expect(r.thrown).toBeNull();
+    expect(r.errs).toEqual([]);
+    expect(r.outcome).toBe('sent');
+    expect(r.requests).toHaveLength(2);
+    const [post, check] = r.requests;
+    expect(post.url).toBe(`${MASTER}/qualifiers/${QID}/results`);
+    expect(post.method).toBe('POST');
+    expect(post.headers).toEqual({
+      'Content-Type': 'application/json',
+      'X-Admin-User-Id': ADMIN,
+      Authorization: `Bearer ${r.storage.oauth_access_token}`,
+    });
+    // Byte-for-byte the results array poker-server sent to /results/internal.
+    expect(post.body).toEqual(two.sentByServer.body);
+    expect(post.body.results).toHaveLength(650);
+    // Then it re-reads the public qualifier and prints the count.
+    expect(check).toEqual({ url: `${MASTER}/qualifiers/${QID}`, method: 'GET', headers: {}, body: undefined });
+    expect(r.logs.join('\n')).toContain('SENT. The master recorded 650 results. Seats and monthly entries: {"yearly":16,"monthly":65}');
+    expect(r.logs.join('\n')).toContain('Results now on the master: 650 (must be 650).');
+  });
+
+  it.each<[string, (t: StepTwo) => string]>([
+    ['in quotes (a string)', (t) => JSON.stringify(t.replayBody)],
+    ['as finishOrder alone (the array)', (t) => pgJsonbText(t.finishOrder)],
+  ])('the body pasted %s sends the same POST', async (_label, paste) => {
+    const two = await stepTwo(12);
+    const r = await pasteInAdminTab({ qid: QID, players: String(two.players), body: paste(two) });
+    expect(r.outcome).toBe('sent');
+    expect(r.requests[0].body).toEqual(two.sentByServer.body);
+  });
+
+  it('an opaque access token: the id_token is the Bearer (the admin app\'s own choice)', async () => {
+    const two = await stepTwo(4);
+    const idt = jwt({ sub: ADMIN, exp: Math.floor(Date.now() / 1000) + 3600 });
+    const r = await pasteInAdminTab({ qid: QID, players: '4', body: two.replayBody }, { storage: { oauth_access_token: 'opaqueAccessToken', oauth_id_token: idt } });
+    expect(r.outcome).toBe('sent');
+    expect(r.requests[0].headers.Authorization).toBe(`Bearer ${idt}`);
+  });
+
+  const soon = (): number => Math.floor(Date.now() / 1000) + 30;
+  it.each<[string, (t: StepTwo) => { qid?: string; players?: string; body?: string; tab?: Tab }, RegExp]>([
+    ['the id was not filled in', () => ({ qid: 'PASTE_QUALIFIER_ID_HERE' }), /QID is not a qualifier id/],
+    ['the copied replay_body was cut off (pasted in quotes)', (t) => ({ body: JSON.stringify(t.replayBody.slice(0, -300)) }), /not complete JSON/],
+    ['the player count is not step 2\'s', (t) => ({ players: String(t.players - 1) }), /has 650 players, step 2 said 649/],
+    ['a row has no place', (t) => ({ body: pgJsonbText({ results: t.finishOrder.map((r, i) => (i === 7 ? { ...r, finishPosition: null } : r)) }) }), /no playerId or no place/],
+    ['the tab is not signed in to admin', () => ({ tab: { storage: { poker_admin_session: null } } }), /not signed in to admin/],
+    ['a kiosk "Admin Login" (the token is the kiosk\'s)', () => ({ tab: { storage: { oauth_access_token: jwt({ sub: KIOSK, exp: soon() + 900 }), oauth_id_token: jwt({ sub: KIOSK, exp: soon() + 900 }) } } }), /no sign-in token of your own/],
+    ['no token at all', () => ({ tab: { storage: { oauth_access_token: null, oauth_id_token: null } } }), /no sign-in token of your own/],
+    ['the token is about to expire', () => ({ tab: { storage: { oauth_access_token: jwt({ sub: ADMIN, exp: soon() }) } } }), /about to expire/],
+  ])('NOT SENT when %s: nothing goes to the master', async (_label, make, why) => {
+    const two = await stepTwo(650);
+    const f = make(two);
+    const r = await pasteInAdminTab({ qid: f.qid ?? QID, players: f.players ?? String(two.players), body: f.body ?? two.replayBody }, f.tab);
+    expect(r.thrown).toBeNull();
+    expect(r.outcome).toBe('not sent');
+    expect(r.requests).toEqual([]);
+    expect(r.errs).toHaveLength(1);
+    expect(r.errs[0]).toMatch(/^NOT SENT: /);
+    expect(r.errs[0]).toMatch(why);
+  });
+
+  it('a cut-off replay_body pasted without quotes does not even run: nothing goes out', async () => {
+    const two = await stepTwo(650);
+    const r = await pasteInAdminTab({ qid: QID, players: String(two.players), body: two.replayBody.slice(0, -300) });
+    expect(r.thrown).not.toBeNull();
+    expect(r.thrown.name).toBe('SyntaxError');
+    expect(r.requests).toEqual([]);
+  });
+
+  it('the master refuses (401): REFUSED is printed, nothing is re-read', async () => {
+    const two = await stepTwo(4);
+    const r = await pasteInAdminTab({ qid: QID, players: '4', body: two.replayBody }, { answer: { ok: false, status: 401, json: { success: false, message: 'identity_mismatch' } } });
+    expect(r.outcome).toBe('refused');
+    expect(r.requests).toHaveLength(1);
+    expect(r.errs.join('\n')).toContain('REFUSED (HTTP 401): identity_mismatch. Nothing was awarded.');
+    expect(r.logs).toEqual([]);
+  });
+
+  it('no answer (network): it says a re-paste is safe', async () => {
+    const two = await stepTwo(4);
+    const r = await pasteInAdminTab({ qid: QID, players: '4', body: two.replayBody }, { fetchThrows: true });
+    expect(r.outcome).toBe('no answer');
+    expect(r.requests).toHaveLength(1);
+    expect(r.errs.join('\n')).toContain('It is safe to paste again.');
   });
 });
