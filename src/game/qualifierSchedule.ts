@@ -113,6 +113,32 @@ export const QUALIFIER_LATE_REG_MS = 180 * 60 * 1000;
 export const QUALIFIER_MAX_REENTRIES: number | null = null;
 
 /**
+ * 2026-10-22 (owner: "Build it for Sunday") — OVERFLOW tables. When a late
+ * entrant or a re-entrant finds every seat of a RUNNING qualifier alive (no
+ * empty seat, no busted one), index.ts opens a new table for him instead of
+ * refusing `no_seat` (openQualifierOverflowTable). A new table opens only when
+ * every seat of every table — earlier overflow tables included — is alive, so
+ * at most one table is ever under-filled; this cap is the blast-radius guard:
+ * at most this many overflow tables of one event in play at once (6 = 54
+ * extra seats). Reached → the next arrival gets the old no_seat refund.
+ * Railway env `QUALIFIER_OVERFLOW_TABLES_MAX` overrides it (read at boot, so
+ * changing it restarts the server — only before the Sunday freeze); 0 = OFF
+ * (the kill switch: exactly the behaviour before overflow tables).
+ */
+export const QUALIFIER_OVERFLOW_TABLES_MAX = 6;
+const QUALIFIER_OVERFLOW_TABLES_HARD_MAX = 20;
+
+/** The overflow-table cap from the env value: unset / blank / not a number → 6; else floored and clamped to 0..20 (0 = off). */
+export function qualifierOverflowTablesCap(raw: string | undefined): number {
+  if (raw === undefined || raw === null) return QUALIFIER_OVERFLOW_TABLES_MAX;
+  const text = String(raw).trim();
+  if (text === '') return QUALIFIER_OVERFLOW_TABLES_MAX;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return QUALIFIER_OVERFLOW_TABLES_MAX;
+  return Math.min(QUALIFIER_OVERFLOW_TABLES_HARD_MAX, Math.max(0, Math.floor(n)));
+}
+
+/**
  * 2026-10-22 — the re-entries a busted (or still-playing) entrant may still
  * make: his unused credits of the tier (`creditsHeld`, each re-entry consumes
  * one), within the cap if one is set (`cap - used`). null = not known (the

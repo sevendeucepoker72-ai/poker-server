@@ -1633,3 +1633,23 @@ sharedCreditKept
 existingEntry.reEntries = (existingEntry.reEntries || 0) + 1
 noteQualifierCreditChange(masterId, tier, -1)
 if (gen === qualifierCacheGen) {
+
+# 2026-10-22 (owner: "Build it for Sunday") — qualifier OVERFLOW tables. A late
+# entrant or re-entrant who finds every seat of a running qualifier alive gets
+# a NEW table (it used to be refused no_seat and refunded): capped at
+# QUALIFIER_OVERFLOW_TABLES_MAX (6; env override, 0 = off), opened at the
+# current level, registered with the tournament's live tableIds (never a second
+# event listener); a lone entrant there is fed the player due the big blind at
+# the fullest table's hand boundary, and its first hand is dealt once two are
+# alive (seat hook, feed, 5s sweep backstop). Frames gain overflowTable /
+# waitingForPlayers. Health: r2Play.qualifiers.overflow.
+qualifier_overflow_table_opened
+qualifier_overflow_fed
+qualifier_overflow_first_deal
+qualifier_overflow_cap_reached
+serviceQualifierOverflowTables();
+feedLoneQualifierTable(tId, tableId, table);
+seatQualifierLateEntrantOnOverflowTable(socket, qt, registrant)
+seatQualifierReentrantOnOverflowTable(socket, qt, tournament, existingEntry, startingStack)
+QUALIFIER_OVERFLOW_TABLES_MAX = 6
+overflowTable: true

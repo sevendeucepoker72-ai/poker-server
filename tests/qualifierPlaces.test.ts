@@ -103,3 +103,84 @@ describe('qualifier places with late entries and re-entries', () => {
     expect(tm.reinstateForReentry(id, 'p1', 50_000)).toBe(false);
   });
 });
+
+/**
+ * 2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW table: when a
+ * late entrant or a re-entrant finds every seat alive, index.ts opens a new
+ * table and registers it with TournamentManager.addTable. It used to be
+ * impossible: TournamentManager only ever REMOVED tables (removeTable), so the
+ * entry was refused no_seat and the credit refunded.
+ */
+describe('qualifier overflow tables — TournamentManager.addTable + checkRebalance', () => {
+  afterEach(() => { jest.clearAllTimers(); });
+
+  it('A1 — addTable: a table opened in a RUNNING tournament joins its live tableIds once (copy-on-write); refused while registering, finished, or already listed', () => {
+    const tm = new TournamentManager();
+    const id = tm.createTournament({
+      name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 4, startInterval: 0,
+      blindLevels: qualifierBlindLevelsForTest(), startingChips: 50_000,
+    } as any);
+    tm.registerPlayer(id, 'p1', 'P1', 's1', undefined, 'm1');
+    tm.registerPlayer(id, 'p2', 'P2', 's2', undefined, 'm2');
+    expect(tm.addTable(id, 'T-early')).toBe(false);                     // registering: nothing to add to
+    tm.startTournament(id);
+    tm.setTableIds(id, ['T1']);
+    const before = tm.getTournament(id)!.tableIds;
+    expect(tm.addTable(id, 'T2')).toBe(true);
+    expect(tm.getTournament(id)!.tableIds).toEqual(['T1', 'T2']);
+    expect(before).toEqual(['T1']);                                     // a copy, never mutated in place (like removeTable)
+    expect(tm.addTable(id, 'T2')).toBe(false);                          // listed once
+    expect(tm.addTable(id, '')).toBe(false);
+    expect(tm.addTable('no-such-tournament', 'T3')).toBe(false);
+    expect(tm.getTournament(id)!.tableIds).toEqual(['T1', 'T2']);
+    expect(tm.getActiveTableCount(id)).toBe(2);
+    tm.eliminatePlayer(id, 'p1');                                       // one left: finished
+    expect(tm.getTournament(id)!.status).toBe('finished');
+    expect(tm.addTable(id, 'T3')).toBe(false);
+    expect(tm.getTournament(id)!.tableIds).toEqual(['T1', 'T2']);
+  });
+
+  it('A2 — checkRebalance with an added table: two full tables + a lone added table → nothing (no room); one bust elsewhere → Rule 1 breaks the added table; a 4-alive table whose seats cannot take a mover fits into the added table → Rule 2 breaks it', () => {
+    const tm = new TournamentManager();
+    const id = tm.createTournament({
+      name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 30, startInterval: 0,
+      blindLevels: qualifierBlindLevelsForTest(), startingChips: 50_000,
+    } as any);
+    for (let i = 1; i <= 18; i++) tm.registerPlayer(id, `p${i}`, `P${i}`, `s${i}`, undefined, `m${i}`);
+    tm.startTournament(id);
+    tm.setTableIds(id, ['TA', 'TB']);
+    for (let i = 1; i <= 18; i++) tm.setPlayerTable(id, `p${i}`, i <= 9 ? 'TA' : 'TB');
+    // Every seat alive: the late entrant gets a NEW table.
+    tm.addLateEntrant(id, 'late', 'Late', 'sL', 50_000, { masterUserId: 'mL' });
+    expect(tm.addTable(id, 'TL')).toBe(true);
+    tm.setPlayerTable(id, 'late', 'TL');
+    // index.ts's capacity: the seats a mover could take (empty + busted) — 9 minus the alive mapped there.
+    const free = (tid: string) => 9 - tm.getAlivePlayersOnTable(id, tid).length;
+    expect(tm.checkRebalance(id, free)).toBeNull();                     // 19 alive > 18; TL's one player has no room elsewhere
+    expect(tm.checkRebalance(id)).toBeNull();
+    tm.eliminatePlayer(id, 'p3');                                       // a bust at TA: 18 alive fit two tables
+    expect(tm.checkRebalance(id, free)).toEqual({ breakTableId: 'TL', playersToMove: [{ playerId: 'late', playerName: 'Late' }] });
+
+    // A full table, a 4-alive table whose other seats cannot take a mover (they
+    // hold busts still being settled), and an added table with 8 seats free.
+    const tm2 = new TournamentManager();
+    const id2 = tm2.createTournament({
+      name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 30, startInterval: 0,
+      blindLevels: qualifierBlindLevelsForTest(), startingChips: 50_000,
+    } as any);
+    for (let i = 1; i <= 13; i++) tm2.registerPlayer(id2, `q${i}`, `Q${i}`, `s${i}`, undefined, `n${i}`);
+    tm2.startTournament(id2);
+    tm2.setTableIds(id2, ['TA', 'TB']);
+    for (let i = 1; i <= 13; i++) tm2.setPlayerTable(id2, `q${i}`, i <= 9 ? 'TA' : 'TB');
+    tm2.addLateEntrant(id2, 'late', 'Late', 'sL', 50_000, { masterUserId: 'mL' });
+    expect(tm2.addTable(id2, 'TL')).toBe(true);
+    tm2.setPlayerTable(id2, 'late', 'TL');
+    const free2 = (tid: string) => ({ TA: 0, TB: 0, TL: 8 } as Record<string, number>)[tid];
+    // Rule 1 (14 alive fit two tables) cannot break TL (nobody has room for its player);
+    // Rule 2 breaks TB: its 4 players fit into TL's 8 free seats.
+    expect(tm2.checkRebalance(id2, free2)).toEqual({
+      breakTableId: 'TB',
+      playersToMove: ['q10', 'q11', 'q12', 'q13'].map((p) => ({ playerId: p, playerName: p.toUpperCase() })),
+    });
+  });
+});

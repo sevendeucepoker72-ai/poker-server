@@ -23,6 +23,7 @@ import {
   parseMasterSchedule, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels,
   parseSeatPackage, seatsForTopWith, seatsWonAt,
   QUALIFIER_BASE_STACK, QUALIFIER_LATE_REG_MS, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft,
+  QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap,
 } from '../src/game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from '../src/game/qualifierNoShow';
 import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
@@ -112,6 +113,19 @@ const CODE = [
   fnSrc('function vacateBustedTournamentSeat('),
   // 2026-10-22 — a re-entry takes a busted seat when no never-used seat is left.
   fnSrc('function seatQualifierReentrantOnBustedSeat('),
+  // 2026-10-22 (owner: "Build it for Sunday") — every seat alive: an OVERFLOW table
+  // (its state + the helpers it shares with the rebalance block, the REAL source).
+  slice('const qualifierOverflowTables = new Map', ';\n'),
+  slice('const qualifierOverflow = {', ';\n'),
+  slice('const qualifierOverflowTableNumbers = new Map', ';\n'),
+  fnSrc('function tournamentFreeSeats('),
+  fnSrc('function nextQualifierTableNumber('),
+  fnSrc('function openQualifierOverflowTable('),
+  fnSrc('function closeUnusedQualifierOverflowTable('),
+  fnSrc('function seatQualifierLateEntrantOnOverflowTable('),
+  fnSrc('function seatQualifierReentrantOnOverflowTable('),
+  fnSrc('function qualifierOverflowSeatFlags('),
+  fnSrc('function startFreshTournamentTable('),
 ].join('\n');
 const HANDLERS = ['registerQualifierTournament', 'unregisterQualifierTournament', 'getQualifierTournaments', 'spectateTournament']
   .map((ev) => handlerSrc(ev, '\n  });\n')).join('\n  ');
@@ -119,7 +133,19 @@ const HANDLERS = ['registerQualifierTournament', 'unregisterQualifierTournament'
 const ALICE = 101;
 const BOB = 102;
 
-function world(opts: { now?: number } = {}) {
+function world(opts: {
+  now?: number;
+  /**
+   * 2026-10-22 — QUALIFIER_OVERFLOW_TABLES_MAX for this world. Default 0 = the
+   * kill switch: every test written before overflow tables keeps its meaning
+   * (every seat alive → no_seat, the credit returned).
+   */
+  overflowMax?: number;
+  /** The new table cannot seat anyone ('zeroSeats') or cannot be created ('throw'). */
+  overflowCreate?: 'zeroSeats' | 'throw';
+  /** The new table's usable seats (default 9). */
+  overflowSeats?: number;
+} = {}) {
   const qualifierTournaments = new Map<string, any>();
   const tm = new TournamentManager();
   const tables = new Map<string, PokerTable>();
@@ -143,9 +169,28 @@ function world(opts: { now?: number } = {}) {
   // 2026-10-22 — the cached credit list (tier → [{playerId, creditCount}]); empty = never read.
   const qualifiedPlayers = new Map<string, Array<{ playerId: string; creditCount: number }>>();
   let creditN = 0;
+  // 2026-10-22 — overflow tables: the tables it creates (a REAL PokerTable each), listeners, AI kicks.
+  const overflowCreates: Array<{ name: string; max: number; sb: number; bb: number; minBuyIn: number; variant: unknown; ante: number }> = [];
+  const tableProgressListeners = new Set<string>();
+  const progressListeners: string[] = [];
+  const aiKicks: string[] = [];
+  let overflowN = 0;
   const scope: Record<string, unknown> = {
     qualifierTournaments, tournamentManager: tm, authSessions, playerSessions, multiTableSessions, spectators,
-    tableManager: { getTable: (id: string) => tables.get(id) },
+    tableManager: {
+      getTable: (id: string) => tables.get(id),
+      createQuickTable: (name: string, max: number, sb: number, bb: number, minBuyIn: number, variant?: unknown, ante = 0) => {
+        overflowCreates.push({ name, max, sb, bb, minBuyIn, variant, ante });
+        if (opts.overflowCreate === 'throw') throw new Error('createQuickTable failed');
+        const id = `OV${++overflowN}`;
+        const t = new PokerTable({ tableId: id, tableName: name, smallBlind: sb, bigBlind: bb, ante, minBuyIn, maxBuyIn: minBuyIn * 10, maxPlayers: max } as any);
+        if (opts.overflowCreate === 'zeroSeats') t.maxOccupiableSeats = 0;
+        else if (opts.overflowSeats !== undefined) t.maxOccupiableSeats = opts.overflowSeats;
+        tables.set(id, t);
+        return id;
+      },
+      removeTable: (id: string) => tables.delete(id),
+    },
     io: {
       emit: (ev: string, d: any) => globalEmits.push([ev, d]),
       to: (room: string) => ({ emit: (ev: string, d: any) => roomEmits.push([room, ev, d]) }),
@@ -189,11 +234,18 @@ function world(opts: { now?: number } = {}) {
     syncSitOutToTable() {}, tournamentHandStartSafety: { bustedSeatsVacated: 0 }, tournamentTables,
     handlePlayerLeave: (sock: any) => { leaves.push(sock.id); },
     getGameStateForPlayer: () => ({}), emitGameState() {},
+    // 2026-10-22 — overflow tables (the cap; the table's wiring; its first deal's gate).
+    qualifierOverflowTablesMax: opts.overflowMax ?? 0,
+    fastModeTables: new Map(), tableProgressListeners, GamePhase,
+    ensureTableProgressListener: (_t: unknown, id: string) => { progressListeners.push(id); tableProgressListeners.add(id); },
+    scheduleAIAction: (id: string) => { aiKicks.push(id); },
+    tournamentDealHoldReason: () => null,
   };
   const { exports: m } = load(`${CODE}\nfunction wire(socket) {\n  ${HANDLERS}\n}`, scope, `{
     wire, applyQualifierSchedule, qualifierList, qualifierEventFor, markQualifierFinished, emitTournamentFinishedToEntrants,
     tickQualifierAutoStart, postQualifierResults, cancelQualifierEvent, qualifierLateEntries, qualifierResultPosts,
     qualifierNoShows, tellQualifierNoShowReleases, qualifierCreditHeldByConcurrentEntry,
+    qualifierOverflow, qualifierOverflowTables, openQualifierOverflowTable, startFreshTournamentTable,
   }`);
   const emitted: Array<[string, string, any]> = [];
   const mkSocket = (id: string, userId: number | null, master: string | null, name = 'Player') => {
@@ -219,7 +271,7 @@ function world(opts: { now?: number } = {}) {
   return {
     m, tm, tables, scope, qualifierTournaments, authSessions, playerSessions, sockets, emitted, globalEmits, roomEmits, audits,
     consumed, creditRefunds, fetches, postAnswers, progress, started, wallet, mkSocket, of, sync, tournamentTables, leaves,
-    qualifiedPlayers,
+    qualifiedPlayers, overflowCreates, tableProgressListeners, progressListeners, aiKicks,
   };
 }
 
@@ -411,10 +463,15 @@ describe('late entry into a RUNNING qualifier — seated at once or the credit g
     expect(w.m.qualifierLateEntries.seated).toBe(1);
   });
 
-  it('no seat free → the consumed credit goes back (no_seat) and he is NOT in the field', async () => {
+  // 2026-10-22 — B6: this world runs with QUALIFIER_OVERFLOW_TABLES_MAX = 0 (the
+  // kill switch): exactly the behaviour before overflow tables.
+  it('B6 CONTROL / kill switch (QUALIFIER_OVERFLOW_TABLES_MAX=0) — no seat free → the consumed credit goes back (no_seat) and he is NOT in the field; no table is opened', async () => {
     const { w, tid, qt } = running(false);
     const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
     await a.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
+    expect(w.overflowCreates).toEqual([]);
+    expect(w.m.qualifierOverflow).toMatchObject({ opened: 0, refusedCap: 0, openFailed: 0 });
+    expect(w.tm.getTournament(tid)!.tableIds).toEqual(['Q1']);
     expect(w.creditRefunds).toEqual(['credit-1']);
     expect(qt.players).toHaveLength(2);
     expect(w.tm.getTournament(tid)!.players).toHaveLength(2);
@@ -926,6 +983,7 @@ describe('2026-10-22 (owner: "late entries until 2pm, re entries if they have mo
     expect(entrant(w, tid, 'user-202')!.finishPosition).toBe(3);               // 3 entrants: the next bust is 3rd
   });
 
+  // 2026-10-22 — this world runs with the overflow kill switch (QUALIFIER_OVERFLOW_TABLES_MAX = 0); B8 is the same with overflow tables on.
   it('her own dead seat was taken (a late entrant): every seat alive → no_seat, the credit returned; once another seat busts she takes THAT one', async () => {
     const { w, tid, t } = field(10 * MIN, 3);
     const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
@@ -1620,5 +1678,252 @@ describe('F95 (2026-10-21) — a late entry or re-entry seated at an IDLE table 
     clearTimeout(pending);
     expect(already.t.seats[1]).toMatchObject({ playerId: 'user-101' });
     expect(already.scheduled).toEqual([]);
+  });
+});
+
+// ───────────── 2026-10-22 (owner: "Build it for Sunday") — OVERFLOW tables ─────────────
+describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late entry / re-entry opens an OVERFLOW table instead of a no_seat refund', () => {
+  const MIN = 60_000;
+  const enter = (s: any) => s.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'x' });
+  const last = (w: any, sid: string, ev = 'qualifierRegistrationResult') => w.of(sid, ev).slice(-1)[0];
+
+  /**
+   * A RUNNING qualifier started 10 minutes ago: Bob (seat 0) + Carl (seat 1) at
+   * 'Qualifier Table 1', `usable` seats there (2 = every seat taken), overflow
+   * tables ON (cap 6) unless `overflowMax` says otherwise.
+   */
+  function full(o: { overflowMax?: number; usable?: number; overflowCreate?: 'zeroSeats' | 'throw'; overflowSeats?: number } = {}) {
+    const w = world({ overflowMax: o.overflowMax ?? 6, overflowCreate: o.overflowCreate, overflowSeats: o.overflowSeats });
+    w.sync(Date.now() - 10 * MIN);
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    expect(qt).toBeTruthy();
+    const tid = w.tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 2, startInterval: 0, blindLevels: qualifierBlindLevels(50_000), startingChips: 50_000 } as any);
+    w.tm.registerPlayer(tid, 'user-201', 'Bob', 'sb', undefined, 'm-201');
+    w.tm.registerPlayer(tid, 'user-202', 'Carl', 'sc', undefined, 'm-202');
+    w.tm.startTournament(tid);
+    const t = new PokerTable({ tableId: 'Q1', tableName: 'Qualifier Table 1', smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+    t.maxOccupiableSeats = o.usable ?? 2;
+    t.sitDown(0, 'Bob', 50_000, 'user-201', false, true);
+    t.sitDown(1, 'Carl', 50_000, 'user-202', false, true);
+    w.tables.set('Q1', t);
+    w.tournamentTables.set('Q1', tid);
+    w.tm.setTableIds(tid, ['Q1']);
+    w.tm.setPlayerTable(tid, 'user-201', 'Q1');
+    w.tm.setPlayerTable(tid, 'user-202', 'Q1');
+    Object.assign(qt, { status: 'running', tournamentId: tid, players: [
+      { playerId: 'user-201', masterPlayerId: 'm-201', playerName: 'Bob', phone: '', socketId: 'sb' },
+      { playerId: 'user-202', masterPlayerId: 'm-202', playerName: 'Carl', phone: '', socketId: 'sc' },
+    ] });
+    return { w, qt, tid, t };
+  }
+  /** The bust check ran on `pid`'s LIVE seat at `t`: 0 chips, eliminated, the seat left occupied. */
+  function bust(w: any, tid: string, t: PokerTable, pid: string): number {
+    const i = t.seats.findIndex((s) => s.state === 'occupied' && !s.eliminated && s.playerId === pid);
+    expect(i).toBeGreaterThanOrEqual(0);
+    t.seats[i].chipCount = 0;
+    (t.seats[i] as any).eliminated = true;
+    w.tm.eliminatePlayer(tid, pid);
+    return i;
+  }
+  /** `pid`'s live seats on every table of the world. */
+  const liveSeats = (w: any, pid: string): string[] => [...(w.tables as Map<string, PokerTable>).entries()].flatMap(([id, t]) =>
+    t.seats.filter((s) => s.state === 'occupied' && !s.eliminated && s.playerId === pid).map((s) => `${id}:${s.seatIndex}`));
+  const entrant = (w: any, tid: string, pid: string) => w.tm.getTournament(tid)!.players.find((p: any) => p.playerId === pid);
+
+  it('B1 — the cap: QUALIFIER_OVERFLOW_TABLES_MAX = 6; the env override is clamped to 0..20 (0 = off), garbage → 6', () => {
+    expect(QUALIFIER_OVERFLOW_TABLES_MAX).toBe(6);
+    expect([undefined, '', '  ', 'x', 'NaN', 'Infinity'].map((v) => qualifierOverflowTablesCap(v))).toEqual([6, 6, 6, 6, 6, 6]);
+    expect(['0', '3', '2.7', '99', '-2', ' 4 '].map((v) => qualifierOverflowTablesCap(v))).toEqual([0, 3, 2, 20, 0, 4]);
+  });
+
+  it('B2 — a late entry with every seat alive: a NEW table at the CURRENT level, he is seated there (one credit, kept), told overflowTable + waitingForPlayers; the one bootstrap listener is not re-registered', async () => {
+    const { w, qt, tid } = full();
+    w.tm.advanceLevel(tid);
+    w.tm.advanceLevel(tid);                                                   // level 3: 75/150, ante 25
+    const onEvent = jest.spyOn(w.tm, 'onEvent');
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);
+    // Old: no_seat, credit-1 refunded.
+    expect(w.overflowCreates).toEqual([{ name: 'Qualifier Table 2', max: 9, sb: 75, bb: 150, minBuyIn: 50_000, variant: undefined, ante: 25 }]);
+    expect(w.tm.getTournament(tid)!.tableIds).toEqual(['Q1', 'OV1']);
+    expect(w.tournamentTables.get('OV1')).toBe(tid);
+    expect(w.m.qualifierOverflowTables.get('OV1')).toBe(tid);
+    expect(w.progressListeners).toEqual(['OV1']);                             // its progress listener (bust check, hand results)
+    expect(onEvent).not.toHaveBeenCalled();                                   // never a second tournament listener
+    const OV = w.tables.get('OV1')!;
+    expect(OV.config).toMatchObject({ smallBlind: 75, bigBlind: 150, ante: 25, minBuyIn: 50_000 });
+    expect(OV.seats[0]).toMatchObject({ state: 'occupied', playerId: 'user-101', chipCount: 50_000 });
+    expect(entrant(w, tid, 'user-101')).toMatchObject({ eliminated: false, masterUserId: 'm-alice' });
+    expect(w.tm.getTournament(tid)!.playerTableMap.get('user-101')).toBe('OV1');
+    expect(w.playerSessions.get('SA')).toMatchObject({ tableId: 'OV1', seatIndex: 0, playerId: 'user-101' });
+    expect(a.rooms.has('table:OV1')).toBe(true);
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry']);
+    expect(w.creditRefunds).toEqual([]);
+    expect(qt.players.map((p: any) => p.playerId)).toEqual(['user-201', 'user-202', 'user-101']);
+    expect(w.of('SA', 'qualifierRegistrationResult')).toEqual([expect.objectContaining({
+      success: true, lateEntry: true, tableId: 'OV1', tournamentId: tid, overflowTable: true, waitingForPlayers: true,
+    })]);
+    expect(w.of('SA', 'qualifierTournamentStarted')).toEqual([expect.objectContaining({
+      tableId: 'OV1', tableCount: 2, lateEntry: true, overflowTable: true, waitingForPlayers: true,
+    })]);
+    expect(OV.currentPhase).toBe(GamePhase.WaitingForPlayers);                // alone: no hand, no blinds
+    expect(OV.handNumber).toBe(0);
+    expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, lateEntriesSeated: 1, firstDeals: 0, refusedCap: 0, openFailed: 0, closedUnused: 0 });
+    expect(w.m.qualifierLateEntries).toMatchObject({ seated: 1, refundedNoSeat: 0 });
+    expect(w.audits.find((x) => x.action === 'QUALIFIER_LATE_ENTRY_SEATED')?.d).toMatchObject({ tableId: 'OV1', overflowTable: true });
+  });
+
+  it('B3 — a second late entrant joins THAT table (no second table): its FIRST hand is dealt at once, both dealt in; he is not told "waiting"', async () => {
+    const { w } = full();
+    await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+    await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
+    expect(w.overflowCreates).toHaveLength(1);
+    const OV = w.tables.get('OV1')!;
+    expect(OV.seats[1]).toMatchObject({ state: 'occupied', playerId: 'user-103' });
+    expect(OV.handNumber).toBe(1);
+    expect(OV.currentPhase).toBe(GamePhase.PreFlop);
+    expect(OV.seats.filter((s) => s.state === 'occupied' && s.holeCards.length === 2)).toHaveLength(2);
+    expect(w.aiKicks).toEqual(['OV1']);
+    const res = last(w, 'SD');
+    expect(res).toEqual(expect.objectContaining({ success: true, lateEntry: true, tableId: 'OV1', overflowTable: true }));
+    expect(res.waitingForPlayers).toBeUndefined();
+    const started = last(w, 'SD', 'qualifierTournamentStarted');
+    expect(started).toEqual(expect.objectContaining({ tableId: 'OV1', tableCount: 2, overflowTable: true }));
+    expect(started.waitingForPlayers).toBeUndefined();
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, firstDeals: 1, lateEntriesSeated: 1 });
+  });
+
+  it('B4 CONTROL — a free seat anywhere (an empty one, or a busted one) → no table is opened; that seat is used', async () => {
+    const empty = full({ usable: 3 });
+    await enter(empty.w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+    expect(empty.t.seats[2]).toMatchObject({ playerId: 'user-101' });
+    expect(empty.w.overflowCreates).toEqual([]);
+    expect(empty.w.of('SA', 'qualifierRegistrationResult')[0].overflowTable).toBeUndefined();
+
+    const busted = full({ usable: 3 });
+    await enter(busted.w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+    bust(busted.w, busted.tid, busted.t, 'user-202');                         // Carl's seat 1: busted
+    await enter(busted.w.mkSocket('SD', 103, 'm-dan', 'Dan'));
+    expect(busted.t.seats[1]).toMatchObject({ playerId: 'user-103', chipCount: 50_000, eliminated: false });
+    expect(busted.w.overflowCreates).toEqual([]);
+    expect(busted.w.m.qualifierOverflow.opened).toBe(0);
+    expect(busted.w.creditRefunds).toEqual([]);
+  });
+
+  it('B5 — the cap reached (cap 1, its table full) → no_seat: the credit refunded exactly once, not in the field, no table created', async () => {
+    const { w, tid, qt } = full({ overflowMax: 1, overflowSeats: 1 });
+    await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));                // opens OV1 (1 usable seat) — now full
+    await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
+    expect(last(w, 'SD')).toEqual(expect.objectContaining({ success: false, code: 'no_seat' }));
+    expect(w.creditRefunds).toEqual(['credit-2']);
+    expect(w.overflowCreates).toHaveLength(1);
+    expect(w.tm.getTournament(tid)!.players.map((p: any) => p.playerId)).not.toContain('user-103');
+    expect(qt.players.map((p: any) => p.playerId)).not.toContain('user-103');
+    expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, refusedCap: 1 });
+    expect(w.m.qualifierLateEntries.refundedNoSeat).toBe(1);
+  });
+
+  it('B6 CONTROL / kill switch — cap 0 (QUALIFIER_OVERFLOW_TABLES_MAX=0): exactly the pre-overflow no_seat with one refund', async () => {
+    const { w, tid, qt } = full({ overflowMax: 0 });
+    await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: false, code: 'no_seat' }));
+    expect(w.creditRefunds).toEqual(['credit-1']);
+    expect(w.overflowCreates).toEqual([]);
+    expect(w.tm.getTournament(tid)!.tableIds).toEqual(['Q1']);
+    expect(qt.players).toHaveLength(2);
+    expect(w.m.qualifierOverflow).toMatchObject({ opened: 0, refusedCap: 0 });
+  });
+
+  it('B7 — the new table cannot seat him (no usable seat) or cannot be created (throws): it is gone again, the credit refunded once, no_seat', async () => {
+    for (const mode of ['zeroSeats', 'throw'] as const) {
+      const { w, tid, qt } = full({ overflowCreate: mode });
+      await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+      expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: false, code: 'no_seat' }));
+      expect(w.creditRefunds).toEqual(['credit-1']);
+      expect(w.tm.getTournament(tid)!.tableIds).toEqual(['Q1']);
+      expect(w.tournamentTables.has('OV1')).toBe(false);
+      expect(w.m.qualifierOverflowTables.has('OV1')).toBe(false);
+      expect(w.tables.has('OV1')).toBe(false);
+      expect(w.tableProgressListeners.has('OV1')).toBe(false);
+      expect(w.tm.getTournament(tid)!.players.map((p: any) => p.playerId)).not.toContain('user-101');
+      expect(qt.players).toHaveLength(2);
+      expect(w.playerSessions.has('SA')).toBe(false);
+      if (mode === 'zeroSeats') expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, closedUnused: 1, openFailed: 0 });
+      else expect(w.m.qualifierOverflow).toMatchObject({ opened: 0, openFailed: 1 });
+    }
+  });
+
+  it('B8 — a RE-ENTRY with every seat alive (her dead seat taken by a late entrant) → a NEW table: reinstated (places stay 1..N), one credit kept, told overflowTable + waitingForPlayers', async () => {
+    const { w, tid, t, qt } = full({ usable: 3 });
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);                                                           // Alice: seat 2, credit-1
+    expect(bust(w, tid, t, 'user-101')).toBe(2);
+    await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));                       // Dan takes her busted seat 2, credit-2
+    expect(t.seats[2]).toMatchObject({ playerId: 'user-103', eliminated: false });
+    await enter(a);                                                           // credit-3 — old: no_seat, refunded
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: true, reentry: true, tableId: 'OV1', overflowTable: true, waitingForPlayers: true }));
+    expect(last(w, 'SA', 'qualifierTournamentStarted')).toEqual(expect.objectContaining({
+      tableId: 'OV1', tableCount: 2, lateEntry: true, reentry: true, overflowTable: true, waitingForPlayers: true,
+    }));
+    expect(w.tables.get('OV1')!.seats[0]).toMatchObject({ state: 'occupied', playerId: 'user-101', chipCount: 50_000, eliminated: false });
+    expect(liveSeats(w, 'user-101')).toEqual(['OV1:0']);
+    expect(entrant(w, tid, 'user-101')).toMatchObject({ eliminated: false, finishPosition: 0, chips: 50_000 });
+    expect(w.tm.getTournament(tid)!.playerTableMap.get('user-101')).toBe('OV1');
+    expect(w.playerSessions.get('SA')).toMatchObject({ tableId: 'OV1', seatIndex: 0, playerId: 'user-101' });
+    expect(a.rooms.has('table:OV1')).toBe(true);
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 'entry', 're-entry']);
+    expect(w.creditRefunds).toEqual([]);
+    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-alice')).toMatchObject({ reEntries: 1, reentryCreditIds: ['credit-3'] });
+    expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, reentriesSeated: 1 });
+    bust(w, tid, t, 'user-202');                                              // 4 entrants: Carl is out 4th
+    expect(entrant(w, tid, 'user-202')!.finishPosition).toBe(4);
+  });
+
+  it('B9 — two tabs re-enter at once with every seat alive: ONE live seat on ONE new table; the second tab is refused already_registered and its credit refunded', async () => {
+    const { w, tid, t } = full({ usable: 3 });
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(a);
+    bust(w, tid, t, 'user-101');
+    await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
+    const a2 = w.mkSocket('SA2', ALICE, 'm-alice', 'Alice');
+    await Promise.all([enter(a), enter(a2)]);
+    await flush();
+    expect(w.overflowCreates).toHaveLength(1);
+    expect(w.tm.getTournament(tid)!.tableIds).toEqual(['Q1', 'OV1']);
+    expect(liveSeats(w, 'user-101')).toEqual(['OV1:0']);
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 'entry', 're-entry', 're-entry']);
+    expect(w.creditRefunds).toHaveLength(1);
+    const results = [...w.of('SA', 'qualifierRegistrationResult').slice(1), ...w.of('SA2', 'qualifierRegistrationResult')];
+    expect(results).toHaveLength(2);
+    expect(results).toEqual(expect.arrayContaining([
+      expect.objectContaining({ success: true, reentry: true, tableId: 'OV1', overflowTable: true }),
+      expect.objectContaining({ success: false, code: 'already_registered' }),
+    ]));
+  });
+
+  it('B10 — an overflow-seated late entrant is a tournament entrant like any other: a cancelled event refunds his credit once; the table is a tournament table', async () => {
+    const { w, qt, tid } = full();
+    await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+    expect(w.tournamentTables.get('OV1')).toBe(tid);                          // never cashed out (isTournamentTable)
+    await w.m.cancelQualifierEvent(WEEKLY, qt, 'test_cancel');
+    await flush();
+    expect(w.creditRefunds).toEqual(['credit-1']);
+  });
+
+  it('wiring — the overflow helpers sit OUTSIDE the late-entry slice; the handler falls back to them after the existing seat searches', () => {
+    const lateSlice = slice('/** R2 (TOURNEY-9) — the answer when a qualifier seat would take over', '\n  return null;\n}\n');
+    expect(lateSlice).toContain('function seatQualifierLateEntrant(');
+    expect(lateSlice).not.toContain('function openQualifierOverflowTable(');
+    expect(lateSlice).toContain('if (table.currentPhase === GamePhase.WaitingForPlayers) { startFreshTournamentTable(tableId); return; }');
+    const h = handlerSrc('registerQualifierTournament', '\n  });\n');
+    const late = h.indexOf('let seat = seatQualifierLateEntrant(socket, qt, registrant);');
+    expect(late).toBeGreaterThan(0);
+    expect(h.indexOf('if (!seat) seat = seatQualifierLateEntrantOnOverflowTable(socket, qt, registrant);')).toBeGreaterThan(late);
+    const busted = h.indexOf('if (!seated && seatQualifierReentrantOnBustedSeat(socket, qt, tournament, existingEntry, startingStack)) seated = true;');
+    expect(busted).toBeGreaterThan(0);
+    expect(h.indexOf('if (!seated && seatQualifierReentrantOnOverflowTable(socket, qt, tournament, existingEntry, startingStack)) seated = true;')).toBeGreaterThan(busted);
+    expect(fnSrc('function openQualifierOverflowTable(')).not.toContain('bootstrapTournamentTables(');
+    expect(fnSrc('function openQualifierOverflowTable(')).not.toContain('tournamentManager.onEvent(');
   });
 });

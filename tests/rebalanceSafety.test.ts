@@ -49,6 +49,9 @@ import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE
 import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
 import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_SESSION_FOR_SRC, SEAT_RESTORE_SRC, JOIN_PRECHECK_SRC } from './helpers/indexSource';
+// 2026-10-22 — the overflow-table manifest lock (C9).
+import fs from 'fs';
+import path from 'path';
 
 const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
@@ -286,6 +289,7 @@ function world(opts: {
     leaveTournamentSeatOnAdminRemoval, tellKeptTournamentSeats, voluntarilyAbsentTournamentEntrants,
     detachSocketFromOtherTables, tableViewDetaches, disqualifyAwayTournamentEntriesOnAdminRemoval,
     finishedTournamentRecords, tournamentFinishedNotices,
+    qualifierOverflowTables, qualifierOverflow, serviceQualifierOverflowTables, startFreshTournamentTable, feedLoneQualifierTable,
   }`);
   m.registerEvents(tid);
   for (const [id, t] of tables) {
@@ -4073,5 +4077,331 @@ describe('F99 — a busted human leaving a tournament table with bots never stri
     expect(TA.seats.filter((s) => s.state === 'occupied' && s.isAI).map((s) => [s.playerId, s.chipCount]))
       .toEqual([['a1', 10000], ['a2', 5000], ['a3', 5000], ['a4', 5000]]);
     expect(w.tm.getAliveCount(w.tid)).toBe(4);
+  });
+});
+
+// ───────────── 2026-10-22 (owner: "Build it for Sunday") — qualifier OVERFLOW tables ─────────────
+describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW table: fed from the fullest table, broken back when room appears, dealt once two are alive', () => {
+  /** Every entrant seated at `tables` (default: all) on a live socket signed in as HIM (his own userId), except `skip`. */
+  function seatAllLive(w: ReturnType<typeof world>, skip: string[] = []) {
+    const players = w.tm.getTournament(w.tid)!.players;
+    for (const [id, t] of w.tables) {
+      t.seats.forEach((s, i) => {
+        if (s.state !== 'occupied' || s.eliminated || skip.includes(s.playerId)) return;
+        const tp = players.find((p) => p.playerId === s.playerId)!;
+        w.seatLive(`S-${s.playerId}`, id, i, tp.userId!, `m-${s.playerId}`);
+      });
+    }
+  }
+  /**
+   * TA 9 / TB 9 (every seat alive) + TL, the OVERFLOW table a late entrant
+   * opened: l0 alone there, never dealt (WaitingForPlayers). Everyone on a live
+   * socket unless listed in `absent`.
+   */
+  function lone(o: {
+    layout?: Record<string, Entrant[]>; absent?: string[]; over?: Partial<typeof P>; scope?: Record<string, unknown>;
+    config?: Record<string, unknown>; seatCaps?: Record<string, number>; overflow?: boolean;
+  } = {}) {
+    const sitOutTracker = new Map<string, Set<number>>();
+    const pendingSeatRemovalAfterHand = new Map<string, Map<number, any>>();
+    const w = world({
+      layout: o.layout ?? { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 1, 5000, 300) },
+      over: o.over, config: o.config, scope: { sitOutTracker, pendingSeatRemovalAfterHand, ...(o.scope || {}) },
+    });
+    for (const [id, cap] of Object.entries(o.seatCaps || {})) w.tables.get(id)!.maxOccupiableSeats = cap;
+    if (o.overflow !== false) w.m.qualifierOverflowTables.set('TL', w.tid);
+    seatAllLive(w, o.absent);
+    return { w, sitOutTracker, pendingSeatRemovalAfterHand, TA: w.tables.get('TA')!, TB: w.tables.get('TB')!, TL: w.tables.get('TL')! };
+  }
+  /** One real hand on `t` (dealer seat 0, small blind 1, big blind 2 on a fresh table), folded to its end: its hand boundary. */
+  function handOn(t: PokerTable) {
+    expect(t.startNewHand()).toBe(true);
+    foldOut(t);
+    expect(t.currentPhase).toBe(GamePhase.HandComplete);
+  }
+  const dealt = (t: PokerTable) => t.seats.filter((s) => s.state === 'occupied' && !s.eliminated && s.holeCards.length === 2).length;
+
+  it('C1 — the lone entrant is FED at the fullest table\'s hand boundary: the player due the big blind moves (TDA), his stack exact, every pointer follows him; TL deals its first hand, TA deals 8-handed', () => {
+    const x = lone();
+    const { w, TA, TL } = x;
+    handOn(TA);
+    expect(TA.previousBigBlindSeat).toBe(2);                                  // a3 is due the big blind next
+    const a3Stack = TA.seats[3].chipCount;
+    const total = w.chipsInPlay();
+    // Stale pointers at TA:3 that are not his: another account's reservation, a dead socket's extra-table session.
+    w.reservedSeats.set(999, { tableId: 'TA', seatIndex: 3, playerName: 'ghost', chips: 0, expiresAt: Date.now() + 3600e3, cleanupTimer: setTimeout(() => {}, 1e9), handsRemaining: 20, tournament: true });
+    w.multiTableSessions.set('S-dead', [{ socketId: 'S-dead', tableId: 'TA', seatIndex: 3, playerName: 'a3', playerId: 'a3', sittingOut: false }]);
+
+    w.m.autoStartNextHand('TA');
+
+    expect(TA.seats[3].state).toBe('empty');
+    expect(TL.seats[1]).toMatchObject({ state: 'occupied', playerId: 'a3', isAI: false });
+    expect(TL.seats[1].chipCount + TL.seats[1].totalInvestedThisHand).toBe(a3Stack);
+    expect(w.chipsInPlay()).toBe(total);                                      // nothing minted, nothing lost
+    const sock = w.live.get('S-a3');
+    expect(w.playerSessions.get('S-a3')).toMatchObject({ tableId: 'TL', seatIndex: 1 });
+    expect(sock.rooms.has('table:TL')).toBe(true);
+    expect(sock.rooms.has('table:TA')).toBe(false);
+    expect(sock.emitted.filter(([ev]: [string]) => ev === 'playerMoved')).toEqual([['playerMoved', { fromTable: 'TA', toTable: 'TL', toSeat: 1, tableId: 'TL' }]]);
+    // Nothing points at TA:3 any more (a seat a later mover or late entrant takes).
+    expect([...w.playerSessions.values()].filter((s) => s.tableId === 'TA' && s.seatIndex === 3)).toEqual([]);
+    expect([...w.multiTableSessions.values()].flat().filter((s) => s.tableId === 'TA' && s.seatIndex === 3)).toEqual([]);
+    expect([...w.reservedSeats.values()].filter((r) => r.tableId === 'TA' && r.seatIndex === 3)).toEqual([]);
+    expect(x.sitOutTracker.get('TA')?.has(3) ?? false).toBe(false);
+    expect(x.pendingSeatRemovalAfterHand.get('TA')?.has(3) ?? false).toBe(false);
+    expect(w.tm.getTournament(w.tid)!.playerTableMap.get('a3')).toBe('TL');
+    // TL's first hand, heads-up: l0 the button / small blind, a3 the big blind (TDA: the worst position).
+    expect(TL.handNumber).toBe(1);
+    expect(TL.dealerButtonSeat).toBe(0);
+    expect(TL.previousBigBlindSeat).toBe(1);
+    expect(dealt(TL)).toBe(2);
+    expect(TA.handNumber).toBe(2);
+    expect(dealt(TA)).toBe(8);
+    expect(w.m.qualifierOverflow).toMatchObject({ feeds: 1, firstDeals: 1, feedErrors: 0 });
+    expect(w.seatless()).toEqual([]);
+    expect(w.couldNotPlace()).toEqual([]);
+    expect(w.logs.filter((l) => l.includes('"event":"qualifier_overflow_fed"'))).toHaveLength(1);
+    expect(w.logs.filter((l) => l.includes('"event":"qualifier_overflow_first_deal"'))).toHaveLength(1);
+    // Stable: at the next boundaries nobody else is fed (TL has 2).
+    foldOut(TA);
+    w.m.autoStartNextHand('TA');
+    expect(w.m.qualifierOverflow.feeds).toBe(1);
+  });
+
+  it('C2 (a) — no feed when the lone entrant has no live session (an absent seat is dealt in on the clock: feeding him only gives chips away)', () => {
+    const { w, TA, TL } = lone({ absent: ['l0'] });
+    handOn(TA);
+    w.m.autoStartNextHand('TA');
+    expect(w.m.qualifierOverflow.feeds).toBe(0);
+    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(1);
+    expect(TL.handNumber).toBe(0);
+    expect(dealt(TA)).toBe(9);
+  });
+
+  it('C2 (b) — no feed while a free seat exists elsewhere (empty or busted): Rule 1 breaks TL instead and the lone entrant takes that seat', () => {
+    for (const kind of ['empty', 'busted'] as const) {
+      const layout = { TA: field('a', 9, 5000, 100), TB: field('b', kind === 'empty' ? 8 : 9, 5000, 200), TL: field('l', 1, 5000, 300) };
+      const { w, TA, TB, TL } = lone({ layout });
+      if (kind === 'busted') bust(w, 'TB', [4]);
+      handOn(TA);
+      w.m.autoStartNextHand('TA');
+      expect(w.m.qualifierOverflow.feeds).toBe(0);
+      expect(dealt(TA)).toBe(9);
+      w.m.handleTableRebalance(w.tid);                                        // the 5s sweep / the bust's own rebalance
+      expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TA', 'TB']);
+      expect(TB.seats[kind === 'empty' ? 8 : 4]).toMatchObject({ state: 'occupied', playerId: 'l0', chipCount: 5000 });
+      expect(TL.handNumber).toBe(0);
+      expect(w.seatless()).toEqual([]);
+      expect(w.couldNotPlace()).toEqual([]);
+    }
+  });
+
+  it('C2 (c) — the source keeps at least 5: a 6-alive source feeds, a 5-alive one does not; only the FULLEST table feeds', () => {
+    const six = lone({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 6, 5000, 200), TL: field('l', 1, 5000, 300) }, seatCaps: { TA: 6, TB: 6 } });
+    handOn(six.TA);
+    six.w.m.autoStartNextHand('TA');
+    expect(six.w.m.qualifierOverflow.feeds).toBe(1);
+    expect(six.TL.seats[1]).toMatchObject({ playerId: 'a3' });
+    expect(dealt(six.TA)).toBe(5);
+
+    const five = lone({ layout: { TA: field('a', 5, 5000, 100), TB: field('b', 5, 5000, 200), TL: field('l', 1, 5000, 300) }, seatCaps: { TA: 5, TB: 5 } });
+    handOn(five.TA);
+    five.w.m.autoStartNextHand('TA');
+    expect(five.w.m.qualifierOverflow.feeds).toBe(0);
+    expect(dealt(five.TA)).toBe(5);
+
+    const notFullest = lone({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 1, 5000, 300) }, seatCaps: { TA: 6 } });
+    handOn(notFullest.TA);
+    notFullest.w.m.autoStartNextHand('TA');
+    expect(notFullest.w.m.qualifierOverflow.feeds).toBe(0);                   // TB has more
+    handOn(notFullest.TB);
+    notFullest.w.m.autoStartNextHand('TB');
+    expect(notFullest.w.m.qualifierOverflow.feeds).toBe(1);
+    expect(notFullest.TL.seats[1]).toMatchObject({ playerId: 'b3' });
+  });
+
+  it('C2 (d) — no feed for a table that is not an overflow table (a lone ORIGINAL table is left as before)', () => {
+    const { w, TA, TL } = lone({ overflow: false });
+    handOn(TA);
+    w.m.autoStartNextHand('TA');
+    expect(w.m.qualifierOverflow.feeds).toBe(0);
+    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(1);
+  });
+
+  it('C2 (e) — no feed while TL is mid-hand or has a break pending', () => {
+    const mid = lone();
+    (mid.TL as any).currentPhase = GamePhase.PreFlop;
+    handOn(mid.TA);
+    mid.w.m.autoStartNextHand('TA');
+    expect(mid.w.m.qualifierOverflow.feeds).toBe(0);
+
+    const pending = lone();
+    pending.w.m.tournamentBreaksAwaitingHandEnd.set('TL', pending.w.tid);
+    handOn(pending.TA);
+    pending.w.m.autoStartNextHand('TA');
+    expect(pending.w.m.qualifierOverflow.feeds).toBe(0);
+    expect(dealt(pending.TA)).toBe(9);
+  });
+
+  it('C2 (f) — no feed while the director has paused the tournament', () => {
+    const { w, TA, TL } = lone();
+    handOn(TA);
+    expect(w.tm.pauseTournament(w.tid, true)).toBe(true);
+    w.m.autoStartNextHand('TA');
+    expect(w.m.feedLoneQualifierTable(w.tid, 'TA', TA)).toBe(false);
+    expect(w.m.qualifierOverflow.feeds).toBe(0);
+    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(1);
+    expect(TA.currentPhase).toBe(GamePhase.HandComplete);                     // held at its boundary, as before
+  });
+
+  it('C3 — a fed (heads-up) TL and one bust at TB: Rule 1 breaks TL — deferred while TL is mid-hand, run at TL\'s own boundary; both placed, chips conserved; the sweep forgets TL', () => {
+    const { w, TA, TB, TL } = lone();
+    handOn(TA);
+    w.m.autoStartNextHand('TA');                                              // a3 fed to TL; TL and TA mid-hand
+    expect(w.m.qualifierOverflow.feeds).toBe(1);
+    bust(w, 'TB', [4]);
+    const total = w.chipsInPlay();
+    w.m.handleTableRebalance(w.tid);
+    expect(w.m.tournamentBreaksAwaitingHandEnd.get('TL')).toBe(w.tid);      // never mid-hand
+    expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TA', 'TB', 'TL']);
+    foldOut(TL);
+    w.m.autoStartNextHand('TL');                                              // its hand boundary: the break runs
+    expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TA', 'TB']);
+    expect(w.tournamentTables.has('TL')).toBe(false);
+    expect(TA.seats[3]).toMatchObject({ state: 'occupied', playerId: 'a3' });
+    expect(TB.seats[4]).toMatchObject({ state: 'occupied', playerId: 'l0' });
+    expect(w.chipsInPlay()).toBe(total);
+    expect(w.seatless()).toEqual([]);
+    expect(w.couldNotPlace()).toEqual([]);
+    expect(w.m.qualifierOverflowTables.has('TL')).toBe(true);
+    w.m.serviceQualifierOverflowTables();
+    expect(w.m.qualifierOverflowTables.has('TL')).toBe(false);
+  });
+
+  it('C4 — a lone TL and one bust elsewhere: TL (never dealt) is broken at once, the lone entrant takes the busted seat; no feed afterwards', () => {
+    const { w, TA, TB } = lone();
+    TB.seats[4].chipCount = 0;
+    TB.seats[4].eliminated = true;
+    w.tm.eliminatePlayer(w.tid, 'b4');                                        // its rebalance (the tournament listener)
+    expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TA', 'TB']);
+    expect(TB.seats[4]).toMatchObject({ state: 'occupied', playerId: 'l0', chipCount: 5000 });
+    expect(w.playerSessions.get('S-l0')).toMatchObject({ tableId: 'TB', seatIndex: 4 });
+    handOn(TA);
+    w.m.autoStartNextHand('TA');
+    expect(w.m.qualifierOverflow.feeds).toBe(0);
+    expect(dealt(TA)).toBe(9);
+    expect(w.seatless()).toEqual([]);
+  });
+
+  it('C5 — TL filled while the director paused (its first deal held): on resume a 4-alive original table is broken INTO TL\'s empty seats and the rebalance tail deals TL\'s first hand', () => {
+    const { w, TB, TL } = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 5, 5000, 300) } });
+    bust(w, 'TB', [4, 5, 6, 7, 8]);
+    expect(w.tm.pauseTournament(w.tid, true)).toBe(true);
+    w.m.serviceQualifierOverflowTables();
+    expect(TL.handNumber).toBe(0);                                            // never dealt while paused
+    expect(w.tm.pauseTournament(w.tid, false)).toBe(true);
+    w.m.handleTableRebalance(w.tid);
+    expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TA', 'TL']);
+    expect(TL.seats.filter((s) => s.state === 'occupied').map((s) => s.playerId).sort()).toEqual(['b0', 'b1', 'b2', 'b3', 'l0', 'l1', 'l2', 'l3', 'l4']);
+    expect(TL.handNumber).toBe(1);
+    expect(dealt(TL)).toBe(9);
+    expect(w.seatless()).toEqual([]);
+    expect(TB.seats.filter((s) => s.state === 'occupied' && !s.eliminated)).toHaveLength(4);   // the broken table, removed 5s later
+  });
+
+  it('C6 — the 5s sweep backstop deals an overflow table once 2 are alive and nothing holds it; never a non-overflow table, never paused, never alone', () => {
+    const two = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 2, 5000, 300) } });
+    two.w.m.serviceQualifierOverflowTables();
+    expect(two.TL.handNumber).toBe(1);
+    expect(dealt(two.TL)).toBe(2);
+    two.w.m.serviceQualifierOverflowTables();
+    expect(two.TL.handNumber).toBe(1);                                        // once: it is in its hand now
+    expect(two.TB.handNumber).toBe(0);                                        // an ORIGINAL waiting table is not the backstop's
+    expect(two.w.m.qualifierOverflow.firstDeals).toBe(1);
+
+    const notOverflow = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 2, 5000, 300) }, overflow: false });
+    notOverflow.w.m.serviceQualifierOverflowTables();
+    expect(notOverflow.TL.handNumber).toBe(0);
+
+    const paused = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 2, 5000, 300) } });
+    paused.w.tm.pauseTournament(paused.w.tid, true);
+    paused.w.m.serviceQualifierOverflowTables();
+    expect(paused.TL.handNumber).toBe(0);
+
+    const alone = lone();
+    alone.w.m.serviceQualifierOverflowTables();
+    expect(alone.TL.handNumber).toBe(0);
+    expect(alone.w.m.qualifierOverflow.firstDeals).toBe(0);
+  });
+
+  it('C7 — the ONE bootstrap listener serves an added table: its blinds follow the clock; the finish posts the results exactly once', () => {
+    const posts: unknown[] = [];
+    const w = world({
+      layout: { TA: field('a', 2, 5000, 100) },
+      config: { blindLevels: [{ sb: SB, bb: BB, ante: 0, duration: 600 }, { sb: 200, bb: 400, ante: 50, duration: 600 }] },
+      scope: { postQualifierResults: (...a: unknown[]) => { posts.push(a); } },
+    });
+    const TL = new PokerTable({ tableId: 'TL', tableName: 'Qualifier Table 2', smallBlind: SB, bigBlind: BB, minBuyIn: 5000, maxBuyIn: 50000, maxPlayers: 9 } as any);
+    w.tables.set('TL', TL);
+    w.tournamentTables.set('TL', w.tid);
+    expect(w.tm.addTable(w.tid, 'TL')).toBe(true);
+    w.m.qualifierOverflowTables.set('TL', w.tid);
+    w.tm.advanceLevel(w.tid);
+    expect(TL.config).toMatchObject({ smallBlind: 200, bigBlind: 400, ante: 50 });
+    w.tm.eliminatePlayer(w.tid, 'a0');                                        // one left: finished
+    expect(w.tm.getTournament(w.tid)!.status).toBe('finished');
+    expect(posts).toHaveLength(1);
+    const open = fnSrc('function openQualifierOverflowTable(');
+    expect(open).not.toContain('bootstrapTournamentTables(');
+    expect(open).not.toContain('tournamentManager.onEvent(');
+  });
+
+  it('C8 — a feed that throws never stops the source\'s deal and never leaves a second seat: the stack stays where it was', () => {
+    const NAME = 'function moveTournamentSeatPointers(';
+    expect(P.helpers.split(NAME)).toHaveLength(2);
+    const over = { helpers: `${P.helpers.replace(NAME, 'function moveTournamentSeatPointersReal(')}\nfunction moveTournamentSeatPointers() { throw new Error('feed boom'); }\n` };
+    const { w, TA, TL } = lone({ over });
+    handOn(TA);
+    const a3Stack = TA.seats[3].chipCount;
+    const total = w.chipsInPlay();
+    w.m.autoStartNextHand('TA');
+    expect(w.m.qualifierOverflow).toMatchObject({ feedErrors: 1, feeds: 0 });
+    expect(TA.handNumber).toBe(2);
+    expect(dealt(TA)).toBe(9);
+    expect(TA.seats[3]).toMatchObject({ state: 'occupied', playerId: 'a3' });
+    expect(TA.seats[3].chipCount + TA.seats[3].totalInvestedThisHand).toBe(a3Stack);
+    expect(TL.seats[1].state).toBe('empty');
+    expect(w.tm.getTournament(w.tid)!.playerTableMap.get('a3')).toBe('TA');
+    expect(w.playerSessions.get('S-a3')).toMatchObject({ tableId: 'TA', seatIndex: 3 });
+    expect(TL.handNumber).toBe(0);
+    expect(w.chipsInPlay()).toBe(total);
+    expect(w.logs.some((l) => l.includes('qualifier_overflow_feed_failed'))).toBe(true);
+  });
+
+  it('C9 — wiring + locks: the feed runs after the under-5 wait and before the deal; the sweep services overflow tables; the F95 lock stands; every token is in the manifest', () => {
+    const auto = P.autoStart;
+    const under5 = auto.indexOf('aliveOnTable < 5 && planTournamentRebalance(tId)');
+    const feed = auto.indexOf('feedLoneQualifierTable(tId, tableId, table);');
+    const deal = auto.indexOf('const started = table.startNewHand();');
+    expect(under5).toBeGreaterThan(0);
+    expect(feed).toBeGreaterThan(under5);
+    expect(deal).toBeGreaterThan(feed);
+    expect(auto.split('feedLoneQualifierTable(').length).toBe(2);             // once
+    expect(fnSrc('function sweepTournamentRebalances(')).toContain('serviceQualifierOverflowTables();');
+    expect(SRC).toContain('scheduleDealAfterTournamentSeat(tid);   // F95');
+    const root = path.join(__dirname, '..');
+    const schedule = fs.readFileSync(path.join(root, 'src', 'game', 'qualifierSchedule.ts'), 'utf8');
+    const manifest = fs.readFileSync(path.join(root, 'canonical-features.txt'), 'utf8').split('\n').map((l) => l.trim());
+    const TOKENS = [
+      'qualifier_overflow_table_opened', 'qualifier_overflow_fed', 'qualifier_overflow_first_deal', 'qualifier_overflow_cap_reached',
+      'serviceQualifierOverflowTables();', 'feedLoneQualifierTable(tId, tableId, table);',
+      'seatQualifierLateEntrantOnOverflowTable(socket, qt, registrant)',
+      'seatQualifierReentrantOnOverflowTable(socket, qt, tournament, existingEntry, startingStack)',
+      'QUALIFIER_OVERFLOW_TABLES_MAX = 6', 'overflowTable: true',
+    ];
+    for (const tok of TOKENS) {
+      expect({ tok, inSource: (SRC + schedule).includes(tok) }).toEqual({ tok, inSource: true });
+      expect({ tok, inManifest: manifest.includes(tok) }).toEqual({ tok, inManifest: true });
+    }
   });
 });

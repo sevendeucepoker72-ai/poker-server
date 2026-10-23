@@ -1075,6 +1075,23 @@ export class TournamentManager {
     }
   }
 
+  /**
+   * 2026-10-22 (owner: "Build it for Sunday") — a table OPENED in a running
+   * tournament (index.ts openQualifierOverflowTable: a qualifier late entrant
+   * or re-entrant found every seat alive). Appended to the LIVE tableIds — a
+   * new array, like removeTable — only while the tournament is running and only
+   * once; the tournament's one event listener (blind-ups, eliminations, the
+   * finish, the table retirement) reads the live tableIds, so the table follows
+   * it with no second listener. Before, tables were only ever removed.
+   * false = not added.
+   */
+  addTable(tournamentId: string, tableId: string): boolean {
+    const t = this.tournaments.get(tournamentId);
+    if (!t || t.status !== 'running' || !tableId || t.tableIds.includes(tableId)) return false;
+    t.tableIds = [...t.tableIds, tableId];
+    return true;
+  }
+
   /** Get alive (non-eliminated) player count */
   getAliveCount(tournamentId: string): number {
     const t = this.tournaments.get(tournamentId);
