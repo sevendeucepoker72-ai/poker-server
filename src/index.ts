@@ -57,7 +57,7 @@ import { validateTableConfig, validateChallengeStakes } from './game/tableConfig
 import { createWindowRateLimiter } from './auth/rateLimit';
 import { createTicketReplayGuard, initUsedPlayTicketsTable, ticketReplayStats } from './auth/ticketReplay';
 import { publicNameOf, PUBLIC_NAME_FALLBACK, isPublicDisplayName, LISTABLE_USER_SQL } from './social/publicIdentity';
-import { createHash, timingSafeEqual } from 'crypto';
+import { createHash, randomInt, timingSafeEqual } from 'crypto';
 import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
@@ -1234,6 +1234,22 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // (as the POST goes out, with the order), posted (the master took it), or
   // post failed for good (with the order again). Recovery recipe: AGENT.md.
   'QUALIFIER_RESULTS_RECORDED', 'QUALIFIER_RESULTS_POSTED', 'QUALIFIER_RESULTS_POST_FAILED',
+  // 2026-10-23 (qualifier lifecycle S1) — a qualifier credit the master did NOT
+  // give back (the refund call failed or answered refunded:false) used to reach
+  // Railway stdout only: after a restart nobody could find the player whose
+  // credit stayed used. FAILURES and anomalies only — the successful consume /
+  // refund rows stay stdout (high volume on a Sunday). Each carries qualifierId
+  // + creditId (the buy-in one: buyIn). Reconciliation recipe: AGENT.md
+  // "Recovering a qualifier's finish order", step 4. No retry is added here.
+  'QUALIFIER_CREDIT_REFUND_FAILED', 'QUALIFIER_ENTRY_CREDIT_REFUND_FAILED',
+  'QUALIFIER_REENTRY_CREDIT_REFUND_FAILED', 'QUALIFIER_REENTRY_BUYIN_REFUND_FAILED',
+  'QUALIFIER_SUSPENDED_CREDIT_REFUND_FAILED',
+  // A credit the master answered to two calls at once, KEPT on purpose (the
+  // other entry stands on it) — the trail that says "do not refund this one".
+  'QUALIFIER_ENTRY_CREDIT_SHARED_KEPT', 'QUALIFIER_REENTRY_CREDIT_SHARED_KEPT',
+  // Operator / director switches during a live event: the overflow-table cap
+  // (POST /api/qualifiers/overflow) and a tournament pause / resume.
+  'QUALIFIER_OVERFLOW_CAP_SET', 'TOURNAMENT_PAUSE',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -3071,11 +3087,17 @@ app.get('/api/health', async (_req, res) => {
       // prizeLedger.pending > 0 = settlements waiting for their retry (a DB
       // blip); qualifiers.resultPosts.failed > 0 = a results POST the master
       // never took (audited QUALIFIER_RESULTS_POST_FAILED — seats NOT awarded).
+      // qualifiers.sync.retries (2026-10-23, S1) = failed syncs that armed the
+      // 30 s retry (registry still empty).
       r2Play: {
         prizeLedger: { ...prizeLedgerStats },
         tournamentPrizes: { ...tournamentPrizeStats },
         tournamentCancelledNotices: { ...tournamentCancelledNotices },
         tournamentStartsKeptAbsent: tournamentStartsKeptAbsent.seats,
+        // 2026-10-23 (qualifier lifecycle S1) — tournament tables whose start
+        // (listener / first deal / broadcast / AI kick) threw and were skipped
+        // (log `tournament_table_bootstrap_failed`). Should stay 0.
+        tournamentBootstrap: { ...tournamentBootstrapStats },
         staking: { ...stakingStats, openOffers: stakingOffers.size },
         qualifiers: {
           sync: { ...qualifierSyncStats }, registry: qualifierTournaments.size, cancellations: { ...qualifierCancellations },
@@ -3511,20 +3533,48 @@ async function issueQualifierCreditOnMaster(masterId: string, tier: string, note
 // keyed by its master id; its time / name / type follow the master until it
 // starts; an event that disappears from the schedule before it starts is
 // cancelled (every consumed credit refunded). Nothing is ever invented.
-const qualifierSyncStats = { syncs: 0, failures: 0, lastSyncAt: null as string | null, listed: 0, cancelledOffSchedule: 0 };
+const qualifierSyncStats = { syncs: 0, failures: 0, lastSyncAt: null as string | null, listed: 0, cancelledOffSchedule: 0, retries: 0 };
+/**
+ * 2026-10-23 (qualifier lifecycle S1) — a failed sync with an EMPTY registry
+ * retries in 30 s instead of waiting for the 10-minute interval. Before, a boot
+ * sync that failed (a master blip during a Railway redeploy) left the lobby card
+ * empty and every Register answered qualifier_not_found for 10 minutes. ONE
+ * retry at a time (the flag): a retry that fails again arms the next one while
+ * the registry is still empty; a non-empty registry arms nothing (the interval
+ * keeps it fresh). The fetch is bounded at 10 s (it had no timeout). Only the
+ * failure path changed; health `r2Play.qualifiers.sync.retries`.
+ */
+const QUALIFIER_SYNC_TIMEOUT_MS = 10_000;
+const QUALIFIER_SYNC_RETRY_MS = 30_000;
+let qualifierSyncRetryArmed = false;
+function armQualifierSyncRetry(): void {
+  if (qualifierSyncRetryArmed || qualifierTournaments.size !== 0) return;
+  qualifierSyncRetryArmed = true;
+  qualifierSyncStats.retries++;
+  setTimeout(() => {
+    qualifierSyncRetryArmed = false;
+    void syncQualifierSchedule();
+  }, QUALIFIER_SYNC_RETRY_MS).unref?.();
+}
 async function syncQualifierSchedule(): Promise<void> {
   const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
   if (!tok) return; // no token configured — skip
   const base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), QUALIFIER_SYNC_TIMEOUT_MS);
   try {
     const resp = await fetch(`${base}/qualifiers/schedule`, {
       headers: { 'X-Internal-Token': tok },
+      signal: ac.signal,
     });
-    if (!resp.ok) { qualifierSyncStats.failures++; console.warn('[QualifierSync] schedule fetch failed:', resp.status); return; }
+    if (!resp.ok) { qualifierSyncStats.failures++; console.warn('[QualifierSync] schedule fetch failed:', resp.status); armQualifierSyncRetry(); return; }
     applyQualifierSchedule(parseMasterSchedule(await resp.json()), Date.now());
   } catch (err: any) {
     qualifierSyncStats.failures++;
-    console.warn('[QualifierSync] error:', err?.message);
+    console.warn('[QualifierSync] error:', err?.name === 'AbortError' ? 'timeout' : err?.message);
+    armQualifierSyncRetry();
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -4570,8 +4620,21 @@ function tellQualifierNoShowReleases(socket: Socket, auth: SocketAuthSession, vi
 }
 
 /**
+ * 2026-10-23 (qualifier lifecycle S1) — the start lands ON the scheduled
+ * second. The 30 s interval below is phased from the process boot, so the
+ * start used to land anywhere up to 30 s after 11:00:00. A tick inside the last
+ * QUALIFIER_START_TIMER_LEAD_MS arms ONE timer per event + start time (key
+ * `<qualifierId>|<scheduledAt>`) that re-runs the tick 250 ms after the start
+ * second; the key is dropped when it fires. A second run is harmless: the
+ * status leaves 'registering' synchronously in the tick. A moved start gets its
+ * own key; an old timer just runs a tick that finds nothing due.
+ */
+const QUALIFIER_START_TIMER_LEAD_MS = 30_000;
+const qualifierStartTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+/**
  * Auto-start qualifier tournaments when scheduled time arrives.
- * Runs every 30 seconds.
+ * Runs every 30 seconds (+ the on-time start timer above).
  * R2 (TOURNEY-3) — a qualifier still without two players when its late
  * registration ends is CANCELLED (every consumed credit refunded) — it used to
  * wait forever with the credits gone; finished ones leave after a day.
@@ -4583,6 +4646,19 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
     const scheduledTime = new Date(qt.scheduledAt).getTime();
     // 2026-10-20 — who is online, sampled every tick from 15 min before the start.
     if (now >= scheduledTime - QUALIFIER_PRESENCE_LEAD_MS) samplePresence(qt.players, qualifierRegistrantOnline, now);
+    // 2026-10-23 (S1) — the start lands on the scheduled second (qualifierStartTimers).
+    const untilStart = scheduledTime - now;
+    if (untilStart > 0 && untilStart <= QUALIFIER_START_TIMER_LEAD_MS) {
+      const startKey = `${qualId}|${qt.scheduledAt}`;
+      if (!qualifierStartTimers.has(startKey)) {
+        const startTimer = setTimeout(() => {
+          qualifierStartTimers.delete(startKey);
+          tickQualifierAutoStart();
+        }, untilStart + 250);
+        startTimer.unref?.();
+        qualifierStartTimers.set(startKey, startTimer);
+      }
+    }
     if (now < scheduledTime) continue;
     // 2026-10-20 (owner) — it starts with the registrants who are HERE; the
     // others are released (credit refunded) just before the seating. Fewer
@@ -23154,12 +23230,24 @@ function startQualifierTournament(
 
   tournamentManager.setTableIds(tournamentId, tableIds);
 
-  // Seat all players round-robin — no AI
-  for (let i = 0; i < players.length; i++) {
-    const p = players[i];
-    const tableIdx = i % tableCount;
+  // Seat all players round-robin — no AI.
+  // 2026-10-23 (qualifier lifecycle S1) — by a RANDOM DRAW. `players` arrives in
+  // registration order, so the first registrants always shared Table 1 (and
+  // seat 0 there, which is also the hand-1 button: PokerTable takes the first
+  // occupied seat). A Fisher-Yates shuffle of the seating order (crypto
+  // randomInt) decides each table and seat; the deal stays round-robin, so the
+  // tables are still within one player of each other and every seat index is
+  // below 9. tournament.players (registerPlayer above) keeps INPUT order.
+  const drawOrder = players.map((_, i) => i);
+  for (let i = drawOrder.length - 1; i > 0; i--) {
+    const j = randomInt(i + 1);
+    [drawOrder[i], drawOrder[j]] = [drawOrder[j], drawOrder[i]];
+  }
+  for (let k = 0; k < drawOrder.length; k++) {
+    const p = players[drawOrder[k]];
+    const tableIdx = k % tableCount;
     const tid = tableIds[tableIdx];
-    const seatIdx = Math.floor(i / tableCount);
+    const seatIdx = Math.floor(k / tableCount);
     const table = tableManager.getTable(tid);
     if (!table || seatIdx >= seatsPerTable) continue;
 
@@ -23207,15 +23295,34 @@ function startQualifierTournament(
 // listener / scheduling AI / wiring tournament events, so every qualifier
 // tournament froze at WaitingForPlayers forever. Both start paths now call this
 // one helper so the two can never diverge again.
+//
+// 2026-10-23 (qualifier lifecycle S1) — each table is set up on its OWN: a
+// throw at one table (its listener, its first deal, its broadcast, its AI kick)
+// is logged `tournament_table_bootstrap_failed` {tournamentId, tableId, error},
+// counted (health `r2Play.tournamentBootstrap.tableFailures`, should stay 0)
+// and the next table is still dealt. Before, one table's throw at 11:00 escaped
+// the 30 s tick as an uncaughtException: the crash flush voided the WHOLE event
+// and refunded every entrant. The tournament's ONE onEvent listener below stays
+// outside the loop and is registered exactly once (a second one would post the
+// results twice). A table that failed keeps its seated stacks and waits
+// un-dealt (nothing re-deals a WaitingForPlayers tournament table except a
+// rebalance break) — the log + counter are the signal to act.
+const tournamentBootstrapStats = { tableFailures: 0 };
 function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): void {
   // Set up each table: listeners, start hands
   for (const tid of tableIds) {
     const table = tableManager.getTable(tid);
     if (!table) continue;
-    ensureTableProgressListener(table, tid);
-    table.startNewHand();
-    broadcastGameState(tid);
-    scheduleAIAction(tid);
+    try {
+      ensureTableProgressListener(table, tid);
+      table.startNewHand();
+      broadcastGameState(tid);
+      scheduleAIAction(tid);
+    } catch (e: any) {
+      tournamentBootstrapStats.tableFailures++;
+      console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_table_bootstrap_failed', tournamentId, tableId: tid, error: String(e?.message || e) })}`);
+      try { if (Sentry) Sentry.captureException(e, { tags: { area: 'tournamentBootstrap' }, extra: { tournamentId, tableId: tid } }); } catch (_) { /* never rethrow */ }
+    }
   }
 
   // Listen for blind level changes → apply to ALL tables

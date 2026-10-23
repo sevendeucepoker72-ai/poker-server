@@ -52,6 +52,8 @@ import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC
 // 2026-10-22 — the overflow-table manifest lock (C9).
 import fs from 'fs';
 import path from 'path';
+// 2026-10-23 (qualifier lifecycle S1) — startQualifierTournament's seat draw (crypto randomInt).
+import { randomInt } from 'crypto';
 
 const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
@@ -1157,6 +1159,7 @@ describe('minor (2026-10-10) — a tournament start binds a registrant\'s seat o
       },
       notifyPlayer: async () => {}, ensureTableProgressListener() {}, broadcastGameState() {}, scheduleAIAction() {},
       bootstrapTournamentTables() {}, console: { log() {}, warn() {}, error() {} },
+      randomInt,   // 2026-10-23 (S1) — the qualifier seat draw
     }, '{ startTournamentGame: typeof startTournamentGame !== "undefined" ? startTournamentGame : null, startQualifierTournament: typeof startQualifierTournament !== "undefined" ? startQualifierTournament : null, registrantBindings }');
     return { tm, tables, authSessions, playerSessions, mkSocket, m: exports };
   }

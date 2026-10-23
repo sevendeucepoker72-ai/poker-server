@@ -1665,3 +1665,13 @@ qualifier_overflow_cap_set
 qualifier_overflow_feed_followup_failed
 qualifier_overflow_first_deal_failed
 setImmediate(() => startFreshTournamentTable(tableId))
+
+# 2026-10-23 qualifier lifecycle S1 (owner 2026-10-22: "start the game on time
+# ... anything else a tournament would need"): one table's throw at the start
+# is logged + counted and the other tables still deal (it used to void the whole
+# event); the seats are a random draw; the start lands on the scheduled second;
+# a failed schedule sync with an empty registry retries in 30 s.
+tournament_table_bootstrap_failed
+players[drawOrder[k]]
+qualifierStartTimers.set(startKey, startTimer);
+armQualifierSyncRetry();

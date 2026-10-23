@@ -32,6 +32,8 @@ import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentM
 import { qualifierBlindLevels } from '../src/game/qualifierSchedule';
 import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE_MAX_STATUS_AGE_MS } from '../src/auth/playGate';
 import { SRC, slice, fnSrc, load, flush } from './helpers/indexSource';
+// 2026-10-23 (qualifier lifecycle S1) — startQualifierTournament's seat draw (crypto randomInt).
+import { randomInt } from 'crypto';
 
 const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
@@ -180,6 +182,7 @@ function world(opts: {
     getGameStateForPlayer: () => ({}), emitGameState() {}, notifyPlayer: async () => {}, userIdForSeat: () => undefined,
     playGateRefusals: { player_suspended: 0 }, PLAYER_SUSPENDED_MESSAGE: 'SUSPENDED', SEAT_RESERVE_MS: 6 * 3600_000, MAX_SEATS: 9,
     Sentry: null,
+    randomInt,   // 2026-10-23 (S1) — the qualifier seat draw
     console: {
       log: (...a: any[]) => logs.push(a.join(' ')), warn: (...a: any[]) => logs.push(a.join(' ')), error: (...a: any[]) => logs.push(`ERR ${a.join(' ')}`),
     },

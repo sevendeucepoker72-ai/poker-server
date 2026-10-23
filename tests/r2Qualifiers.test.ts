@@ -102,6 +102,9 @@ const CODE = [
   fnSrc('function pruneFinishedQualifiers('),
   // 2026-10-20 — no-shows released at the start + their sign-in notice.
   slice('const qualifierNoShows = { released: 0, toldOnSignIn: 0 };', '\n    return 0;\n  }\n}\n'),
+  // 2026-10-23 (qualifier lifecycle S1) — the on-time start timer's state.
+  slice('const QUALIFIER_START_TIMER_LEAD_MS', ';\n'),
+  slice('const qualifierStartTimers = new Map', ';\n'),
   fnSrc('function tickQualifierAutoStart('),
   slice('const postedQualifierResults = new Set<string>();', '\n}\n'),
   fnSrc('function emitTournamentFinishedToEntrants('),
@@ -277,6 +280,7 @@ function world(opts: {
     tickQualifierAutoStart, postQualifierResults, cancelQualifierEvent, qualifierLateEntries, qualifierResultPosts,
     qualifierNoShows, tellQualifierNoShowReleases, qualifierCreditHeldByConcurrentEntry,
     qualifierOverflow, qualifierOverflowTables, openQualifierOverflowTable, startFreshTournamentTable, tournamentDealHoldReason,
+    qualifierStartTimers,
   }`);
   /** POST /api/qualifiers/overflow through the REAL route: {status, body}. */
   const postOverflowCap = (body: unknown, token?: string) => {
@@ -1608,6 +1612,62 @@ describe('2026-10-21 (owner) — a SEAT PACKAGE: 1st 3 seats, 2nd-4th 2, 5th-10t
     expect(w.of('S1x', 'qualifierResults')[0].results.map((r: any) => r.seats)).toEqual([3, 2, 2, 2, 1, 1, 1, 1, 1, 1, 0, 0]);
     expect(w.m.qualifierList('m-4')[0]).toMatchObject({ myResult: { place: 4, wonSeat: true, seats: 2 } });
     void s1; void s2; void s11;
+  });
+});
+
+describe('S1 (2026-10-23) — the start lands ON the scheduled second (it could be up to 30 s late)', () => {
+  afterEach(() => { jest.clearAllTimers(); jest.useRealTimers(); });
+
+  /** Alice + Bob registered an hour before an 11:00:00 MDT start; the clock is jest's. */
+  async function registered() {
+    jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] });
+    const at = Date.parse('2026-10-25T17:00:00.000Z');
+    jest.setSystemTime(at - H);
+    const w = world();
+    w.sync(at);
+    await w.mkSocket('SA', ALICE, 'm-alice', 'Alice').handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Alice' });
+    await w.mkSocket('SB', BOB, 'm-bob', 'Bob').handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'Bob' });
+    expect(w.qualifierTournaments.get(WEEKLY).players).toHaveLength(2);
+    const startedAt: number[] = [];
+    const stub = w.scope.startQualifierTournament as (players: any[], stack: number) => unknown;
+    w.scope.startQualifierTournament = (players: any[], stack: number) => { startedAt.push(Date.now()); return stub(players, stack); };
+    return { w, at, startedAt };
+  }
+
+  it('a tick 20 s before arms exactly ONE timer and a second tick arms none; the timer starts the event between 11:00:00 and 11:00:01', async () => {
+    const { w, at, startedAt } = await registered();
+    jest.setSystemTime(at - 20_000);
+    const before = jest.getTimerCount();
+    w.m.tickQualifierAutoStart(at - 60_000);                       // outside the last 30 s: nothing armed
+    expect(jest.getTimerCount()).toBe(before);
+    w.m.tickQualifierAutoStart(at - 20_000);
+    expect(jest.getTimerCount()).toBe(before + 1);
+    expect([...w.m.qualifierStartTimers.keys()]).toEqual([`${WEEKLY}|${new Date(at).toISOString()}`]);
+    w.m.tickQualifierAutoStart(at - 15_000);                       // the next 30 s tick could land here too
+    expect(jest.getTimerCount()).toBe(before + 1);
+    expect(w.qualifierTournaments.get(WEEKLY).status).toBe('registering');
+    expect(startedAt).toEqual([]);
+    jest.advanceTimersByTime(20_000 + 250);                        // the clock reaches 11:00:00.250
+    expect(startedAt).toHaveLength(1);
+    expect(startedAt[0]).toBeGreaterThanOrEqual(at);
+    expect(startedAt[0]).toBeLessThanOrEqual(at + 1000);
+    expect(w.started).toHaveLength(1);
+    expect(w.qualifierTournaments.get(WEEKLY)).toMatchObject({ status: 'running', tournamentId: 'TQ' });
+    expect(w.m.qualifierStartTimers.size).toBe(0);                 // the key is dropped when it fires
+    // A late 30 s tick right after it is harmless: the event already left 'registering'.
+    w.m.tickQualifierAutoStart(at + 9_000);
+    expect(w.started).toHaveLength(1);
+  });
+
+  it('a start the master MOVES gets its own timer; the old one only runs a tick that finds nothing due', async () => {
+    const { w, at, startedAt } = await registered();
+    jest.setSystemTime(at - 20_000);
+    w.m.tickQualifierAutoStart(at - 20_000);
+    w.sync(at + 60 * 60_000, at - 19_000);                          // moved one hour later, before it started
+    jest.advanceTimersByTime(20_250);
+    expect(startedAt).toEqual([]);
+    expect(w.qualifierTournaments.get(WEEKLY).status).toBe('registering');
+    expect(w.m.qualifierStartTimers.size).toBe(0);
   });
 });
 

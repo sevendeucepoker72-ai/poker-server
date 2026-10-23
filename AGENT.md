@@ -394,6 +394,86 @@ table at 9 free), so a first-hour wave of late arrivals was turned away. Now:
   .online 48e42a6 shows `QUALIFIER_WAITING_FOR_PLAYERS_TEXT`; the live 8bc056e
   ignores the flags (a bare "Waiting for Players" table).
 
+### Online qualifier START: seat draw, on-time start, table guard, sync retry (2026-10-23, lifecycle S1)
+
+Owner 2026-10-22: "So this tournament will fully run with no issues? ... start
+the game on time ...". Four small changes to the start path, on top of the
+overflow tables (3769903). No runtime switch: they are ordering, logging and
+one-shot timers; no chip or credit path changed. Rollback = do not push this
+SHA (or push the previous one) before the Sunday freeze.
+
+- **Random seat draw** (`startQualifierTournament`). The registrants arrive in
+  registration order, so the earliest registrants always shared Table 1, and
+  seat 0 there is also the hand-1 button (PokerTable takes the first occupied
+  seat). The seating order is now a Fisher-Yates shuffle with crypto
+  `randomInt` (`drawOrder`). The k-th drawn player still sits round-robin:
+  table `k % tableCount`, seat `floor(k / tableCount)`. So the tables stay
+  within one player of each other and every seat index is below 9.
+  `tournament.players` (the `registerPlayer` loop) keeps INPUT order
+  (`handStartRebalance.test.ts` asserts it).
+  - A harness that slices `startQualifierTournament` must put `randomInt` in
+    its scope (the slicer stubs unknown names).
+- **On the scheduled second** (`tickQualifierAutoStart`). The 30 s interval is
+  phased from the process boot, so the start landed anywhere up to 30 s after
+  11:00:00.
+  - A tick inside the last `QUALIFIER_START_TIMER_LEAD_MS` (30 s) arms ONE
+    unref'd timer per event + start time (`qualifierStartTimers`, key
+    `<qualifierId>|<scheduledAt>`). It re-runs the tick 250 ms after the start
+    second and drops its key when it fires.
+  - A double run is harmless: the status leaves 'registering' synchronously.
+  - A moved start gets a new key; the old timer just runs a tick that finds
+    nothing due.
+  - Everything else at the start is unchanged: the no-show release, fewer than
+    2 present = wait, the cancel at the late close. The 30 s tick still runs
+    as before and still starts the event if the timer never fires.
+- **Per-table bootstrap guard** (`bootstrapTournamentTables`).
+  - Each table's listener / first deal / broadcast / AI kick is in its OWN
+    try/catch. A throw is logged `tournament_table_bootstrap_failed`
+    {tournamentId, tableId, error}, counted in health
+    `r2Play.tournamentBootstrap.tableFailures` (should stay 0) and sent to
+    Sentry; the other tables still deal.
+  - Before, one table's throw at 11:00 escaped the tick as an
+    uncaughtException, and the crash flush voided the WHOLE event and refunded
+    every entrant.
+  - The tournament's ONE `onEvent` listener stays outside the loop, registered
+    exactly once.
+  - A table that failed keeps its seated stacks and waits un-dealt. Nothing
+    re-deals a WaitingForPlayers tournament table except a rebalance break
+    (`restartWaitingTournamentTables` with `startWaiting`). The log line is the
+    signal to look at that table.
+- **Schedule-sync retry** (`syncQualifierSchedule`).
+  - The `/qualifiers/schedule` fetch is bounded at 10 s (AbortController; it had
+    no timeout).
+  - On either failure branch (transport error / timeout, or a non-2xx), with an
+    EMPTY registry, ONE retry is armed in 30 s (`armQualifierSyncRetry`, unref'd;
+    the `qualifierSyncRetryArmed` flag prevents stacking). A retry that fails
+    again arms the next one while the registry is still empty.
+  - A non-empty registry arms nothing (the 10-minute interval keeps it fresh).
+    Health: `r2Play.qualifiers.sync.retries`.
+  - Before, a boot sync that failed left the lobby card empty and every
+    Register answered `qualifier_not_found` for 10 minutes.
+- **Credit-failure audit trail.** The refund FAILURE / anomaly rows are now
+  DURABLE (`DURABLE_AUDIT_ACTIONS`): `QUALIFIER_CREDIT_REFUND_FAILED`,
+  `QUALIFIER_ENTRY_CREDIT_REFUND_FAILED`, `QUALIFIER_REENTRY_CREDIT_REFUND_FAILED`,
+  `QUALIFIER_REENTRY_BUYIN_REFUND_FAILED`, `QUALIFIER_SUSPENDED_CREDIT_REFUND_FAILED`,
+  `QUALIFIER_ENTRY_CREDIT_SHARED_KEPT`, `QUALIFIER_REENTRY_CREDIT_SHARED_KEPT`,
+  plus the operator switches `QUALIFIER_OVERFLOW_CAP_SET` and `TOURNAMENT_PAUSE`.
+  - The successful consume / refund rows stay stdout only (volume).
+  - No retry was added: a failed refund is reconciled by hand, see step 4 of
+    the next section.
+- **Tests:** `tests/qualifierLifecycleS1.test.ts` covers (a) the draw, (c) the
+  durable names, (d) the guard and (e) the retry. `tests/r2Qualifiers.test.ts`
+  "S1 (2026-10-23)" covers (b) the start timer. Full jest 2134 passed
+  (baseline 2116 at 3769903, +18).
+- **Rig (2026-10-23, scratchpad `qrig/s1-rig.sh`, on this dist):**
+  - `scenario-full` passed 28/28; the event started 281 ms after its scheduled
+    second (the check allows 31 s).
+  - `scenario-edge` passed 14/14 with `QUALIFIER_OVERFLOW_TABLES_MAX=0`.
+  - `s1-syncretry.js`: a boot with the master down showed `sync.failures` 1 and
+    `retries` 1 with an empty registry. With the master back, the retry listed
+    the event 30 s later (it used to take 10 minutes).
+  - `tournamentBootstrap.tableFailures` stayed 0.
+
 ### Recovering a qualifier's finish order (the results POST never landed)
 
 Since 2026-10-22 (owner: "Save finish order to DB") `postQualifierResults`
@@ -505,6 +585,52 @@ re-sends the POST (`tests/qualifierResultsDurable.test.ts`).
      return 'sent';
    })();
    ```
+4. **Credits the master did not give back** (2026-10-23, lifecycle S1). Every
+   refund of a qualifier credit (a no-show released at the start, a withdraw,
+   a cancel, a `no_seat` / refused late entry or re-entry, a suspended
+   registrant, the shutdown flush) that the master did not confirm leaves a
+   DURABLE `audit_log` row: `QUALIFIER_*_REFUND_FAILED` with `qualifierId` (the
+   master qualifier id) and `creditId`. There is no automatic retry; reconcile
+   after the event:
+   ```sql
+   SELECT ts, action, actor, details->>'creditId' AS credit_id, details->>'reason' AS reason, details
+     FROM audit_log
+    WHERE (action LIKE 'QUALIFIER_%REFUND_FAILED' OR action LIKE 'QUALIFIER_%SHARED_KEPT')
+      AND details->>'qualifierId' = '<masterQualifierId>'
+    ORDER BY ts;
+   ```
+   - `*_SHARED_KEPT` rows: the credit was KEPT on purpose (two calls got the
+     same credit and the other entry stands on it). Never refund those.
+   - `QUALIFIER_REENTRY_BUYIN_REFUND_FAILED` carries `buyIn` (chips), not a
+     credit. A qualifier's buy-in is 0, so it should never appear. If one does,
+     return the chips with the admin chip grant (`adminGrantChips`, audited).
+   - For each `credit_id`, read the credit on the MASTER database (Cloud SQL,
+     not Railway):
+     ```sql
+     SELECT id, player_id, tier, redeemed_at, notes FROM qualifier_credits WHERE id IN ('<credit_id>', '<credit_id>');
+     ```
+     A consume appends ` [entry:<qid>]` or ` [re-entry:<qid>]` to `notes`, and
+     a refund clears `redeemed_at` but keeps `notes`. Decide per row:
+     - `redeemed_at` IS NULL → it was already given back (the master answers
+       `refunded:false` for a credit that is not redeemed). Nothing to do.
+     - Still redeemed, this event's tag appears ONCE, and `redeemed_at` is
+       before the FAILED row's `ts` → the entry it paid for never happened, and
+       no live entry stands on it. Refund it.
+     - Still redeemed with this event's tag TWICE, or `redeemed_at` after the
+       FAILED row → it was consumed again by a later entry or re-entry, which
+       stands on it. Leave it.
+   - The refund: no admin page can un-redeem a credit (admin Championship only
+     lists and redeems). Use the same idempotent call poker-server makes, with
+     the token taken from the environment (never pasted into a chat or a form).
+     It only flips a redeemed credit back:
+     `curl -s -X POST https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api/qualifier-credits/refund/internal -H 'Content-Type: application/json' -H "X-Internal-Token: $INTERNAL_NOTIFY_TOKEN" -d '{"creditId":"<credit_id>"}'`
+     → `{"success":true,"refunded":true}`. `refunded:false` = it was not
+     redeemed (nothing changed).
+   - It gives a credit back to a player, so an agent runs it only with the
+     owner's OK.
+   - A row written during a SIGTERM / crash flush can be lost if the process
+     exits before the insert lands. The `SHUTDOWN_FLUSH` row's
+     `qualifierRegistrationsReleased` says how many refunds that flush started.
 
 ## Gotchas
 
