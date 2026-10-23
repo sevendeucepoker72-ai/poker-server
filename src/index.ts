@@ -4075,8 +4075,10 @@ app.post('/api/qualifiers/overflow', (req, res) => {
 /**
  * 2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — the TDA
  * table-balance switch at runtime (balanceQualifierTables / the pre-deal pass;
- * the state lives in the rebalance helpers). OFF = exactly the old behaviour:
- * only the lone-overflow feed and the Rule 1 / Rule 2 breaks. Players already
+ * the state lives in the rebalance helpers). OFF stops every balance move: only
+ * the lone-overflow feed and the Rule 1 / Rule 2 breaks move anyone. The
+ * fewest-alive placement of late entries / re-entries stays (it never reads the
+ * switch: an ordering only). Players already
  * moved stay where they are (their stacks moved whole). Lasts until the next
  * boot, which reads Railway env QUALIFIER_TABLE_BALANCE again ('0' = off).
  * Logged + audited (`qualifier_balance_set`, QUALIFIER_BALANCE_SET, durable).
@@ -25315,9 +25317,11 @@ function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sou
  * The balance's runtime switch. Railway env QUALIFIER_TABLE_BALANCE at boot:
  * '0' = OFF, unset (or anything else) = ON. Changeable while the server runs
  * (setQualifierTableBalance, POST /api/qualifiers/balance) — changing the env
- * restarts the process, and a restart cancels a running qualifier. OFF is
- * exactly the behaviour before S2: only the lone-overflow feed and the Rule 1 /
- * Rule 2 breaks move anyone.
+ * restarts the process, and a restart cancels a running qualifier. OFF stops
+ * every balance move (hand end and pre-deal): only the lone-overflow feed and
+ * the Rule 1 / Rule 2 breaks move anyone. It is NOT a full revert of S2: the
+ * fewest-alive / break-pending-last PLACEMENT of late entries and re-entries
+ * never reads it (an ordering only; every candidate seat is still tried).
  */
 let qualifierBalanceOn = process.env.QUALIFIER_TABLE_BALANCE !== '0';
 /**
@@ -25325,14 +25329,23 @@ let qualifierBalanceOn = process.env.QUALIFIER_TABLE_BALANCE !== '0';
  * (balanceQualifierTables); preDealMoves = moves made by the pre-deal pass
  * (balanceQualifierTablesNow); each move is counted in exactly one of the two.
  * skippedAbsentTarget = times a lone target was passed over because its only
- * player is absent. errors = a balance that failed and MOVED NOTHING (a check
- * threw, or the guarded move rolled itself back); followUpErrors = a move that
+ * player is absent. skippedAbsentMover = times a SHORT target (<= 2 alive)
+ * passed over an absent big-blind-due seat (a present entrant after him moved
+ * instead or, none present, the target was skipped). errors = a balance that
+ * failed and MOVED NOTHING (a check threw, or the guarded move rolled itself
+ * back); followUpErrors = a move that
  * STANDS whose follow-up (the clean-up, a broadcast, the deal hook) threw.
  * errors / followUpErrors should stay 0.
  */
-const qualifierBalance = { moves: 0, preDealMoves: 0, skippedAbsentTarget: 0, errors: 0, followUpErrors: 0 };
+const qualifierBalance = { moves: 0, preDealMoves: 0, skippedAbsentTarget: 0, skippedAbsentMover: 0, errors: 0, followUpErrors: 0 };
 /** The pre-deal pass makes at most this many moves (each move strictly evens the tables, so it ends long before). */
 const QUALIFIER_BALANCE_PRE_DEAL_MAX_MOVES = 60;
+/**
+ * Review fix-up (2026-10-23) — a balance target with at most this many alive
+ * (the mover would play there heads-up or 3-handed) takes only a PRESENT mover
+ * (planQualifierBalanceMove).
+ */
+const QUALIFIER_BALANCE_SHORT_TARGET_MAX = 2;
 
 /** One planned balance move: the player due the big blind at src:from goes to the first placeable seat dst:to. */
 interface QualifierBalanceMove {
@@ -25367,7 +25380,12 @@ interface QualifierBalanceMove {
  *  - The mover is the seat due the big blind next (getNextOccupiedSeat from the
  *    last big blind + 1): the first live, alive, human entrant of the source from
  *    there. His presence is NOT required (TDA: whoever is due the big blind
- *    moves; an absent seat's reservation and notice follow it).
+ *    moves; an absent seat's reservation and notice follow it) — EXCEPT into a
+ *    short target (<= QUALIFIER_BALANCE_SHORT_TARGET_MAX = 2 alive, review
+ *    fix-up): there an absent stack is blinded off heads-up / 3-handed to the
+ *    present player's benefit, so the first PRESENT entrant from the
+ *    big-blind seat on moves (skippedAbsentMover); none present → that target
+ *    is skipped.
  */
 function planQualifierBalanceMove(
   tournamentId: string, preDeal: boolean, source?: { tid: string; table: PokerTable },
@@ -25406,29 +25424,12 @@ function planQualifierBalanceMove(
   // fire (see the invariant at balanceQualifierTables).
   if (planTournamentRebalance(tournamentId)) return null;
   if (tournamentManager.getAliveCount(tournamentId) <= (t.tableIds.length - 1) * 9) return null;
-  let dst: { tid: string; table: PokerTable; alive: number } | undefined;
-  let to = -1;
-  const others = tables.filter((x) => x !== src).sort((a, b) => a.alive - b.alive);
-  for (const x of others) {
-    if (x.alive > src.alive - 2) break;                    // sorted: no later table evens anything either
-    if (x.alive < 1 || !settled(x)) continue;
-    let seat = -1;
-    for (let i = 0; i < MAX_SEATS; i++) if (tournamentSeatIsPlaceable(tournamentId, x.table, i)) { seat = i; break; }
-    if (seat < 0) continue;
-    if (x.alive === 1) {
-      const lone = tournamentManager.getAlivePlayersOnTable(tournamentId, x.tid)[0];
-      const loneSeat = lone ? tournamentLiveSeatIndex(x.table, lone.playerId) : -1;
-      if (loneSeat < 0 || !liveSessionAt(x.tid, loneSeat)) { qualifierBalance.skippedAbsentTarget++; continue; }
-    }
-    dst = x;
-    to = seat;
-    break;
-  }
-  if (!dst || to < 0) return null;
-  // The mover: the player due the big blind next (clockwise from the last big
-  // blind), the first live human entrant of the source from there.
+  // The mover candidates in big-blind order: the player due the big blind next
+  // (clockwise from the last big blind) first, then every other live human
+  // entrant of the source after him.
   const first = src.table.getNextOccupiedSeat(src.table.previousBigBlindSeat + 1);
   if (first < 0) return null;
+  const movers: Array<{ i: number; tp: TournamentPlayer }> = [];
   for (let k = 0; k < MAX_SEATS; k++) {
     const i = (first + k) % MAX_SEATS;
     const seat = src.table.seats[i];
@@ -25436,9 +25437,40 @@ function planQualifierBalanceMove(
     const tp = t.players.find((p) => p.playerId === seat.playerId);
     if (!tp || tp.eliminated || t.playerTableMap.get(tp.playerId) !== src.tid) continue;
     if (tournamentLiveSeatIndex(src.table, tp.playerId) !== i) continue;
+    movers.push({ i, tp });
+  }
+  if (movers.length === 0) return null;
+  const others = tables.filter((x) => x !== src).sort((a, b) => a.alive - b.alive);
+  for (const x of others) {
+    if (x.alive > src.alive - 2) break;                    // sorted: no later table evens anything either
+    if (x.alive < 1 || !settled(x)) continue;
+    let to = -1;
+    for (let i = 0; i < MAX_SEATS; i++) if (tournamentSeatIsPlaceable(tournamentId, x.table, i)) { to = i; break; }
+    if (to < 0) continue;
+    if (x.alive === 1) {
+      const lone = tournamentManager.getAlivePlayersOnTable(tournamentId, x.tid)[0];
+      const loneSeat = lone ? tournamentLiveSeatIndex(x.table, lone.playerId) : -1;
+      if (loneSeat < 0 || !liveSessionAt(x.tid, loneSeat)) { qualifierBalance.skippedAbsentTarget++; continue; }
+    }
+    // Review fix-up (2026-10-23) — the mirror of the absent-target rule: a SHORT
+    // target (<= QUALIFIER_BALANCE_SHORT_TARGET_MAX alive: he would play there
+    // heads-up or 3-handed) takes only a PRESENT mover, as the feed does. An
+    // absent stack there posts a blind every hand or two and is checked or
+    // folded for — chips given to whoever is present. So the big-blind-due seat
+    // moves only if he is present; else the first present entrant after him;
+    // none present → this target is skipped (skippedAbsentMover) and the next
+    // fewest-alive one may take the move. A bigger target takes the
+    // big-blind-due seat present or not (TDA: an absent seat is moved too).
+    let mover = movers[0];
+    if (x.alive <= QUALIFIER_BALANCE_SHORT_TARGET_MAX && !liveSessionAt(src.tid, mover.i)) {
+      qualifierBalance.skippedAbsentMover++;
+      const present = movers.find((m) => !!liveSessionAt(src.tid, m.i));
+      if (!present) continue;
+      mover = present;
+    }
     return {
-      srcTid: src.tid, src: src.table, from: i, mover: tp, srcAlive: src.alive,
-      dstTid: dst.tid, dst: dst.table, to, dstAlive: dst.alive,
+      srcTid: src.tid, src: src.table, from: mover.i, mover: mover.tp, srcAlive: src.alive,
+      dstTid: x.tid, dst: x.table, to, dstAlive: x.alive,
     };
   }
   return null;

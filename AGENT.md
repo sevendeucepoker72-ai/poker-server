@@ -126,7 +126,7 @@ See `src/index.ts`. Key events:
 | `SENTRY_DSN` | Optional | Exception capture |
 | `INTERNAL_NOTIFY_TOKEN` | **Required in prod** | `X-Internal-Token` for the master's internalAuth routes: qualifier-credit consume/refund/issue, qualifier schedule/register/results, and (2026-10-07) the play gate's `/users/:id/play-status/internal`. Unset = suspension checks FAIL OPEN (visible as `playGate.internalTokenConfigured:false` on `/api/health`) |
 | `QUALIFIER_OVERFLOW_TABLES_MAX` | Optional (default 6) | Online qualifier overflow tables in play per event (owner 2026-10-22). Clamped 0..20, garbage → 6; **0 = OFF** (every-seat-alive late entry / re-entry refused `no_seat`, credit refunded, as before). This is only the value AT BOOT (changing a Railway var restarts the process, and a restart cancels a running qualifier). While the server runs, change it with **`POST /api/qualifiers/overflow` `{"max": N}`** + header `X-Internal-Token` (= `INTERNAL_NOTIFY_TOKEN`; no token configured → always 403). No restart is needed, and the value lasts until the next boot. Shown as `r2Play.qualifiers.overflow.cap` on `/api/health` |
-| `QUALIFIER_TABLE_BALANCE` | Optional (unset = ON) | Online qualifier TDA table balancing (2026-10-23, lifecycle S2; section "Online qualifier TABLE BALANCING"). **`0` = OFF** = exactly the behaviour before S2 (only the lone-overflow feed and the Rule 1 / Rule 2 breaks move anyone); anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs, switch it with **`POST /api/qualifiers/balance` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403). Shown as `r2Play.qualifiers.balance.on` on `/api/health` |
+| `QUALIFIER_TABLE_BALANCE` | Optional (unset = ON) | Online qualifier TDA table balancing (2026-10-23, lifecycle S2; section "Online qualifier TABLE BALANCING"). **`0` = OFF** = no balance move at all, hand end or pre-deal (only the lone-overflow feed and the Rule 1 / Rule 2 breaks move anyone); the fewest-alive placement of late entries / re-entries STAYS (it never reads the switch: an ordering only), so OFF is not a full revert of S2; anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs, switch it with **`POST /api/qualifiers/balance` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403). Shown as `r2Play.qualifiers.balance.on` on `/api/health` |
 | `ONLINE_GUEST_PLAY_ENABLED` | **Leave unset** | EMERGENCY ROLLBACK ONLY. `1` re-allows guest `register` and no-account play, against the 2026-10-07 owner rule "nobody plays .online without an American Pub Poker account". Suspended players stay blocked either way. Shown as `playGate.guestPlayEnabled` on `/api/health` |
 
 ## Deploy pre-flight
@@ -359,6 +359,18 @@ table at 9 free), so a first-hour wave of late arrivals was turned away. Now:
   anywhere lets Rule 1 break the (smallest) overflow table into the freed seats
   (deferred while it is mid-hand, as every break). Churn (open → break → open)
   is correct, just noisy.
+  - **Since S2 each cycle relocates more (review, 2026-10-23; by design).** The
+    balance spreads an overflow table out before the next bust breaks one:
+    [9,9,9,1] → feed + 5 balance moves → [7,7,7,7] (28 alive, 4 tables), then
+    the next bust (27 <= 3 x 9) lets Rule 1 break a 6-7 player table: about
+    12-13 relocations per open → break cycle, against about 3 before S2 (the
+    feed's 1, then the 2-player table broken). This is what a live room does
+    during late registration (a new table is balanced, then broken when the
+    field drops); no chips move, each moved player may sit out one hand
+    (folded into a mid-hand target, or the F13 dead zone). If it proves too
+    noisy on the day: `POST /api/qualifiers/balance {"on":0}` (section "Online
+    qualifier TABLE BALANCING") — the overflow tables then play heads-up as
+    before.
 - **Health:** `r2Play.qualifiers.overflow` = { opened, closedUnused, refusedCap,
   openFailed, lateEntriesSeated, reentriesSeated, feeds, feedErrors,
   feedFollowUpErrors, firstDeals, firstDealErrors, capChanges, live, cap }
@@ -541,7 +553,18 @@ of `src/index.ts`, qualifiers only):
   - The mover is the seat due THIS table's big blind next
     (`getNextOccupiedSeat(previousBigBlindSeat + 1)`, the first live alive human
     entrant from there). Presence is NOT required (TDA: whoever is due the big
-    blind moves; an absent seat's reservation and V4 notice follow it).
+    blind moves; an absent seat's reservation and V4 notice follow it) —
+    EXCEPT into a SHORT target (<= 2 alive, `QUALIFIER_BALANCE_SHORT_TARGET_MAX`;
+    review fix-up 2026-10-23, the mirror of the absent-target rule): there an
+    absent stack would play heads-up or 3-handed, post a blind every hand or two
+    and be checked / folded for — chips handed to the present player. So into
+    a short target the first PRESENT entrant from the big-blind seat on moves
+    (as the feed has always done); none present → that target is skipped
+    (`skippedAbsentMover` counts each time an absent big-blind-due seat was
+    passed over). The usual short target is an overflow table the feed has
+    just made 2-handed; a LONE one is reached only when the feed moved nobody
+    (the overflow cap at 0 with the balance on, a regular table down to 1
+    alive, or no present entrant at the source).
   - One move per hand boundary. Repeated, the tables end within one player:
     [9,2] → [6,5] (3 moves), [9,9,5] → [8,8,7], [9,9,9,1] → [7,7,7,7].
   - Known limit (by the spec, not changed): he takes the target's FIRST
@@ -589,9 +612,13 @@ of `src/index.ts`, qualifiers only):
   follow-up threw. A refused sit-down changes nothing (log
   `qualifier_table_balance_refused`). The pre-deal pass also logs
   `qualifier_tables_balanced_pre_deal` {moves}.
-- **Kill switch — two controls.** OFF is exactly the old behaviour (only the
-  lone-overflow feed and the Rule 1 / 2 breaks); players already moved stay
-  where they are (their stacks moved whole).
+- **Kill switch — two controls.** OFF stops every balance MOVE, hand end and
+  pre-deal (only the lone-overflow feed and the Rule 1 / 2 breaks move anyone);
+  players already moved stay where they are (their stacks moved whole). It is
+  NOT a full revert of S2: the fewest-alive / break-pending-last placement of
+  late entries and re-entries (previous bullet) never reads the switch and
+  stays (review fix-up 2026-10-23; the docs used to say "exactly the old
+  behaviour").
   - Railway env `QUALIFIER_TABLE_BALANCE=0` at boot (unset = on). Changing it
     restarts the process — never during an event.
   - During the event, NO restart:
@@ -605,8 +632,9 @@ of `src/index.ts`, qualifiers only):
     overflow tables and the FEED, not the balance. To stop every move into a
     lone overflow table, turn both off.
 - **Health:** `r2Play.qualifiers.balance` = { on, moves, preDealMoves,
-  skippedAbsentTarget, errors, followUpErrors } (`errors` / `followUpErrors`
-  should stay 0).
+  skippedAbsentTarget, skippedAbsentMover, errors, followUpErrors } (`errors` /
+  `followUpErrors` should stay 0; `skippedAbsentMover` is additive, review
+  fix-up 2026-10-23).
 - **Contract:** no new frame; the moved player gets the same `'playerMoved'`
   {fromTable, toTable, toSeat, tableId} as a break or the feed sends
   (CONTRACTS.md). Manifest tokens `qualifier_table_balanced`,
@@ -618,6 +646,14 @@ of `src/index.ts`, qualifiers only):
   caps TB at its 3 seats: the fewest-alive re-entry would otherwise seat a5 at
   TB instead of the TA seat 6 the test is built on. Full jest 2156 passed
   (baseline 2142 at 272a23c, +14).
+  - Review fix-up (2026-10-23): S2-15 (a short target takes only a present
+    mover: the first present one after an absent big-blind-due seat; none
+    present → no move, hand end and pre-deal; CONTROL a 3-alive target takes
+    the absent seat — fails on e3df1cf) and S2-16 (the switch OFF stops every
+    move but not the fewest-alive placement; no placement path reads the
+    switch). S2-5 now uses a 3-alive target. Full jest 2158 passed (+2), 0
+    failed; `npm run lint` and `npm run build` clean; manifest 768 tokens, 0
+    missing from `dist/`.
 - **Rig (2026-10-23, scratchpad `qrig/s2-rig.sh`, on this dist).**
   `restart-server.sh` passes `QUALIFIER_TABLE_BALANCE` through.
   - NEW `qrig/scenario-balance.js` passed 37/37 three times (and a smoke run).

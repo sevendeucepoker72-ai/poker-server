@@ -4681,8 +4681,9 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
     expect(x.w.chipsInPlay()).toBe(total);
   });
 
-  it('S2-5 — the mover is the seat due the big blind even when he is ABSENT (presence is not required): his reservation follows the stack', async () => {
-    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) }, absent: ['a3'] });
+  it('S2-5 — the mover is the seat due the big blind even when he is ABSENT (presence is not required into a target of 3+ alive): his reservation follows the stack', async () => {
+    // (Review fix-up: TB has 3 alive — a target of <= 2 takes only a PRESENT mover, S2-15.)
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 3, 5000, 200) }, absent: ['a3'] });
     handOn(x.t('TA'));
     handOn(x.t('TB'));
     expect(x.due('TA')).toEqual({ seat: 3, playerId: 'a3' });
@@ -4691,9 +4692,10 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
       handsRemaining: 20, tournament: true, masterUserId: 'm-a3',
     });
     await boundary(x, 'TA');
-    expect(x.t('TB').seats[2]).toMatchObject({ state: 'occupied', playerId: 'a3' });
-    expect(x.w.reservedSeats.get(103)).toMatchObject({ tableId: 'TB', seatIndex: 2 });
+    expect(x.t('TB').seats[3]).toMatchObject({ state: 'occupied', playerId: 'a3' });
+    expect(x.w.reservedSeats.get(103)).toMatchObject({ tableId: 'TB', seatIndex: 3 });
     expect(x.balanced()).toHaveLength(1);
+    expect(x.s2x.stats).toMatchObject({ moves: 1, skippedAbsentMover: 0 });
   });
 
   it('S2-6 — a LONE target whose only player is ABSENT is skipped (feeding an absent seat gives chips away); CONTROL: the same lone table with him present gets the mover', async () => {
@@ -4727,7 +4729,7 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
     invariants(x, ['TA', 'TB'], total);
   });
 
-  it('S2-8 — the switch OFF (Railway env QUALIFIER_TABLE_BALANCE=0 at boot) → zero moves, exactly the old behaviour; not a qualifier → zero moves', async () => {
+  it('S2-8 — the switch OFF (Railway env QUALIFIER_TABLE_BALANCE=0 at boot) → zero balance moves (hand end and pre-deal); not a qualifier → zero moves', async () => {
     for (const o of [{ env: { QUALIFIER_TABLE_BALANCE: '0' } }, { qualifier: false }]) {
       const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) }, ...o });
       handOn(x.t('TA'));
@@ -4903,5 +4905,86 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
       expect({ tok, inSource: SRC.includes(tok) }).toEqual({ tok, inSource: true });
       expect({ tok, inManifest: manifest.includes(tok) }).toEqual({ tok, inManifest: true });
     }
+  });
+
+  // Review fix-up (2026-10-23): the mirror of S2-6. Before it, the balance moved an
+  // ABSENT big-blind-due seat into a lone PRESENT table (or a 2-alive one): heads-up /
+  // 3-handed his stack posts a blind every hand or two and is checked or folded for —
+  // chips handed to the present player. The feed has always required a present mover.
+  it('S2-15 — a SHORT target (<= 2 alive) takes only a PRESENT mover: the first present entrant after the absent big-blind-due seat moves; none present → no move; CONTROL: a 3-alive target still takes the absent big-blind-due seat', async () => {
+    /** One TA hand end; the mover the balance picked (null = nobody moved). */
+    const run = async (layout: Record<string, Entrant[]>, absent: string[], dealt: string[]) => {
+      const x = bal({ layout, absent });
+      for (const id of dealt) handOn(x.t(id));
+      const total = x.w.chipsInPlay();
+      expect(x.due('TA')).toEqual({ seat: 3, playerId: 'a3' });
+      await boundary(x, 'TA');
+      expect(x.w.chipsInPlay()).toBe(total);
+      expect(x.w.seatless()).toEqual([]);
+      expect(x.t('TA').handNumber).toBe(2);                                    // the source still deals its own hand
+      const b = x.balanced();
+      return { x, mover: b.length ? b[0] : null };
+    };
+    // (a) A LONE present target that is not an overflow table (the feed never touches it):
+    //     a3 (due TA's big blind) is absent → a4 moves, a3 stays.
+    {
+      const { x, mover } = await run({ TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 1, 5000, 300) }, ['a3'], ['TA']);
+      expect(mover).toMatchObject({ fromTableId: 'TA', toTableId: 'TL', fromSeat: 4, toSeat: 1 });
+      expect(x.t('TL').seats[1]).toMatchObject({ state: 'occupied', playerId: 'a4' });
+      expect(x.t('TA').seats[3]).toMatchObject({ state: 'occupied', playerId: 'a3' });
+      expect(x.counts()).toEqual([8, 9, 2]);
+      expect(x.s2x.stats).toMatchObject({ moves: 1, skippedAbsentMover: 1, errors: 0 });
+      expect(x.w.m.qualifierOverflow.feeds).toBe(0);
+    }
+    // (b) A 2-alive target: a3 AND a4 absent → a5, the first PRESENT entrant from the big-blind seat on.
+    {
+      const { x, mover } = await run({ TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) }, ['a3', 'a4'], ['TA', 'TB']);
+      expect(mover).toMatchObject({ fromTableId: 'TA', toTableId: 'TB', fromSeat: 5, toSeat: 2 });
+      expect(x.t('TB').seats[2]).toMatchObject({ state: 'occupied', playerId: 'a5' });
+      expect(x.w.playerSessions.get('S-a5')).toMatchObject({ tableId: 'TB', seatIndex: 2 });
+      expect(x.counts()).toEqual([8, 3]);
+      expect(x.s2x.stats).toMatchObject({ moves: 1, skippedAbsentMover: 1 });
+    }
+    // (c) Nobody at TA is present → no move into the 2-alive table (hand end AND pre-deal pass).
+    {
+      const all = Array.from({ length: 9 }, (_, i) => `a${i}`);
+      const { x, mover } = await run({ TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) }, all, ['TA', 'TB']);
+      expect(mover).toBeNull();
+      expect(x.counts()).toEqual([9, 2]);
+      expect(x.s2x.stats.moves).toBe(0);
+      expect(x.s2x.stats.skippedAbsentMover).toBeGreaterThanOrEqual(1);
+      expect(x.s2x.balanceNow(x.w.tid)).toBe(0);
+      expect(x.counts()).toEqual([9, 2]);
+    }
+    // CONTROL: the same all-absent TA, a 3-alive target → the absent big-blind-due seat moves (TDA; S2-5).
+    {
+      const all = Array.from({ length: 9 }, (_, i) => `a${i}`);
+      const { x, mover } = await run({ TA: field('a', 9, 5000, 100), TB: field('b', 3, 5000, 200) }, all, ['TA', 'TB']);
+      expect(mover).toMatchObject({ fromTableId: 'TA', toTableId: 'TB', fromSeat: 3, toSeat: 3 });
+      expect(x.counts()).toEqual([8, 4]);
+      expect(x.s2x.stats).toMatchObject({ moves: 1, skippedAbsentMover: 0 });
+    }
+  });
+
+  // Review fix-up (2026-10-23): the docs said the switch OFF is "exactly the behaviour
+  // before S2"; it stops every balance MOVE, but the fewest-alive placement stays.
+  it('S2-16 — the switch OFF stops every balance MOVE, not the placement: late entry and the busted-seat re-entry still take the fewest-alive table; no placement path reads the switch', async () => {
+    const off = { QUALIFIER_TABLE_BALANCE: '0' };
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 6, 5000, 200), TC: field('c', 4, 5000, 300) }, env: off });
+    bust(x.w, 'TA', [8]);
+    const late = x.s2x.late(x.w.mkSocket('S-late'), { tournamentId: x.w.tid, startingStack: 5000 }, { playerId: 'late1', playerName: 'late1', masterPlayerId: 'm-late1' });
+    expect(late && late.tableId).toBe('TC');
+    expect(x.s2x.balanceNow(x.w.tid)).toBe(0);
+    handOn(x.t('TA'));
+    await boundary(x, 'TA');
+    expect(x.s2x.stats.moves).toBe(0);
+    const y = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200) }, env: off });
+    bust(y.w, 'TA', [6, 7, 8]);
+    bust(y.w, 'TB', [5, 6, 7, 8]);
+    y.t('TA').standUp(8);
+    const busted = y.s2x.busted(y.w.mkSocket('S-a8c'), { tournamentId: y.w.tid, startingStack: 5000 }, y.w.tm.getTournament(y.w.tid)!, { playerId: 'a8', playerName: 'a8' }, 5000);
+    expect(busted && busted.tableId).toBe('TB');
+    for (const src of [LATE_SEAT, BUSTED_SEAT, REENTRY]) expect(src).not.toContain('qualifierBalanceOn');
+    expect(REENTRY).toContain('reentryTables');
   });
 });
