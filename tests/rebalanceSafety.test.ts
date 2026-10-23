@@ -279,6 +279,8 @@ function world(opts: {
       log: (...a: any[]) => logs.push(a.join(' ')), warn: (...a: any[]) => logs.push(a.join(' ')), error: (...a: any[]) => logs.push(`ERR ${a.join(' ')}`),
     },
     process: { env: {} },
+    // Review fix-up (ff9a1cb) — the overflow cap in force (the feed is off at 0: the runtime kill switch).
+    qualifierOverflowTablesMax: 6,
     ...(opts.scope || {}),
   };
   const { exports: m, stubbed } = load(compile(opts.over), scope, `{
@@ -4376,6 +4378,72 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     expect(TL.handNumber).toBe(0);
     expect(w.chipsInPlay()).toBe(total);
     expect(w.logs.some((l) => l.includes('qualifier_overflow_feed_failed'))).toBe(true);
+    // Review fix-up (ff9a1cb) — a failed feed says it moved nothing, and is never a follow-up error.
+    expect(w.logs.find((l) => l.includes('qualifier_overflow_feed_failed'))).toContain('"moved":false');
+    expect(w.m.qualifierOverflow.feedFollowUpErrors).toBe(0);
+  });
+
+  it('C10 — review fix-up: the feed MOVED him, then a follow-up threw (the lone table\'s broadcast) — counted as a feed + feedFollowUpErrors, never as a failed feed; the move stands, chips conserved, nothing points at the old seat; the 5s sweep deals TL', () => {
+    let armed = true;
+    const { w, TA, TL } = lone({ scope: { broadcastGameState: (id: string) => { if (armed && id === 'TL') throw new Error('broadcast boom'); } } });
+    handOn(TA);
+    const a3Stack = TA.seats[3].chipCount;
+    const total = w.chipsInPlay();
+    w.m.autoStartNextHand('TA');
+    // ff9a1cb: feeds 1 AND feedErrors 1 + 'qualifier_overflow_feed_failed' — read as "rolled back" while he had moved.
+    expect(w.m.qualifierOverflow).toMatchObject({ feeds: 1, feedErrors: 0, feedFollowUpErrors: 1, firstDeals: 0 });
+    expect(TA.seats[3].state).toBe('empty');
+    expect(TL.seats[1]).toMatchObject({ state: 'occupied', playerId: 'a3', chipCount: a3Stack });
+    expect(w.chipsInPlay()).toBe(total);
+    expect(w.playerSessions.get('S-a3')).toMatchObject({ tableId: 'TL', seatIndex: 1 });
+    expect(w.tm.getTournament(w.tid)!.playerTableMap.get('a3')).toBe('TL');
+    expect([...w.playerSessions.values()].filter((s) => s.tableId === 'TA' && s.seatIndex === 3)).toEqual([]);
+    expect(TA.handNumber).toBe(2);                                            // the source still deals
+    expect(dealt(TA)).toBe(8);
+    expect(TL.handNumber).toBe(0);                                            // its first deal never ran
+    const followUp = w.logs.filter((l) => l.includes('qualifier_overflow_feed_followup_failed'));
+    expect(followUp).toHaveLength(1);
+    expect(followUp[0]).toContain('"moved":true');
+    expect(w.logs.some((l) => l.includes('qualifier_overflow_feed_failed'))).toBe(false);
+    armed = false;
+    w.m.serviceQualifierOverflowTables();                                     // the backstop
+    expect(TL.handNumber).toBe(1);
+    expect(dealt(TL)).toBe(2);
+    expect(w.m.qualifierOverflow).toMatchObject({ firstDeals: 1, feeds: 1 });
+  });
+
+  it('C11 — review fix-up: the runtime kill switch (cap 0) stops the feed too: the lone entrant waits as before, the source deals 9-handed', () => {
+    const { w, TA, TL } = lone({ scope: { qualifierOverflowTablesMax: 0 } });
+    handOn(TA);
+    w.m.autoStartNextHand('TA');
+    expect(w.m.qualifierOverflow).toMatchObject({ feeds: 0, feedErrors: 0, feedFollowUpErrors: 0 });
+    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(1);
+    expect(TL.handNumber).toBe(0);
+    expect(dealt(TA)).toBe(9);
+  });
+
+  it('C12 — pins the documented heads-up (review): the FINAL table full (9 alive, nothing busted) + a lone overflow entrant → the feed moves the player due its big blind and TL plays HEADS-UP until the next bust anywhere; then Rule 1 merges TL back (at TL\'s hand end); chips conserved', () => {
+    const { w, TA, TL } = lone({ layout: { TA: field('a', 9, 5000, 100), TL: field('l', 1, 5000, 300) } });
+    handOn(TA);
+    w.m.autoStartNextHand('TA');
+    expect(w.m.qualifierOverflow.feeds).toBe(1);
+    expect(TL.seats.filter((s) => s.state === 'occupied' && !s.eliminated).map((s) => s.playerId).sort()).toEqual(['a3', 'l0']);
+    expect(TL.handNumber).toBe(1);
+    expect(dealt(TL)).toBe(2);                                                // heads-up
+    expect(dealt(TA)).toBe(8);
+    foldOut(TA);
+    bust(w, 'TA', [4]);                                                       // the next bust: 7 + 2 = 9 alive fit one table
+    const total = w.chipsInPlay();
+    w.m.handleTableRebalance(w.tid);
+    expect(w.m.tournamentBreaksAwaitingHandEnd.get('TL')).toBe(w.tid);      // never mid-hand
+    foldOut(TL);
+    w.m.autoStartNextHand('TL');
+    expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TA']);
+    expect(TA.seats.filter((s) => s.state === 'occupied' && !s.eliminated).map((s) => s.playerId).sort())
+      .toEqual(['a0', 'a1', 'a2', 'a3', 'a5', 'a6', 'a7', 'a8', 'l0']);
+    expect(w.chipsInPlay()).toBe(total);
+    expect(w.seatless()).toEqual([]);
+    expect(w.couldNotPlace()).toEqual([]);
   });
 
   it('C9 — wiring + locks: the feed runs after the under-5 wait and before the deal; the sweep services overflow tables; the F95 lock stands; every token is in the manifest', () => {
@@ -4398,6 +4466,9 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
       'seatQualifierLateEntrantOnOverflowTable(socket, qt, registrant)',
       'seatQualifierReentrantOnOverflowTable(socket, qt, tournament, existingEntry, startingStack)',
       'QUALIFIER_OVERFLOW_TABLES_MAX = 6', 'overflowTable: true',
+      // Review fix-up (ff9a1cb): the runtime kill switch, the honest feed / first-deal error logs, the deferred first deal.
+      '/api/qualifiers/overflow', 'qualifier_overflow_cap_set', 'qualifier_overflow_feed_followup_failed',
+      'qualifier_overflow_first_deal_failed', 'setImmediate(() => startFreshTournamentTable(tableId))',
     ];
     for (const tok of TOKENS) {
       expect({ tok, inSource: (SRC + schedule).includes(tok) }).toEqual({ tok, inSource: true });

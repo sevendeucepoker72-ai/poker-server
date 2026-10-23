@@ -125,7 +125,7 @@ See `src/index.ts`. Key events:
 | `JWT_SECRET` | Required for legacy HS256 login **and resume tokens** | If unset in prod, legacy HS256 token auth is DISABLED (forgery guard, `src/auth/authManager.ts:19-28`) — OAuth login unaffected. Since 2026-10-09 it also derives the resume-token key (`getScopedSigningKey`); unset in prod = resume tokens OFF (`/api/health` `resumeSessions.enabled:false`) and the guest carry-over cannot verify guest tokens. Rotating it revokes every resume token and makes old guest tokens unclaimable. |
 | `SENTRY_DSN` | Optional | Exception capture |
 | `INTERNAL_NOTIFY_TOKEN` | **Required in prod** | `X-Internal-Token` for the master's internalAuth routes: qualifier-credit consume/refund/issue, qualifier schedule/register/results, and (2026-10-07) the play gate's `/users/:id/play-status/internal`. Unset = suspension checks FAIL OPEN (visible as `playGate.internalTokenConfigured:false` on `/api/health`) |
-| `QUALIFIER_OVERFLOW_TABLES_MAX` | Optional (default 6) | Online qualifier overflow tables in play per event (owner 2026-10-22). Clamped 0..20, garbage → 6; **0 = OFF** (every-seat-alive late entry / re-entry refused `no_seat`, credit refunded, as before). Read at boot — set it only before the Sunday freeze. Shown as `r2Play.qualifiers.overflow.cap` on `/api/health` |
+| `QUALIFIER_OVERFLOW_TABLES_MAX` | Optional (default 6) | Online qualifier overflow tables in play per event (owner 2026-10-22). Clamped 0..20, garbage → 6; **0 = OFF** (every-seat-alive late entry / re-entry refused `no_seat`, credit refunded, as before). This is only the value AT BOOT (changing a Railway var restarts the process, and a restart cancels a running qualifier). While the server runs, change it with **`POST /api/qualifiers/overflow` `{"max": N}`** + header `X-Internal-Token` (= `INTERNAL_NOTIFY_TOKEN`; no token configured → always 403). No restart is needed, and the value lasts until the next boot. Shown as `r2Play.qualifiers.overflow.cap` on `/api/health` |
 | `ONLINE_GUEST_PLAY_ENABLED` | **Leave unset** | EMERGENCY ROLLBACK ONLY. `1` re-allows guest `register` and no-account play, against the 2026-10-07 owner rule "nobody plays .online without an American Pub Poker account". Suspended players stay blocked either way. Shown as `playGate.guestPlayEnabled` on `/api/health` |
 
 ## Deploy pre-flight
@@ -261,10 +261,27 @@ table at 9 free), so a first-hour wave of late arrivals was turned away. Now:
 - **Cap + kill switch.** `QUALIFIER_OVERFLOW_TABLES_MAX` in
   `src/game/qualifierSchedule.ts` (6 = 54 extra seats) counts overflow tables of
   the event still in play; Railway env `QUALIFIER_OVERFLOW_TABLES_MAX` overrides
-  it (clamped 0..20, garbage → 6) and **0 = OFF** — exactly the old `no_seat`
-  refund. Read at boot: changing it restarts the server, so only before the
-  Sunday 07:45 MT freeze. Cap reached → `no_seat` refund, log
+  it at boot (clamped 0..20, garbage → 6) and **0 = OFF** — exactly the old
+  `no_seat` refund. Cap reached → `no_seat` refund, log
   `qualifier_overflow_cap_reached`.
+- **Runtime kill switch (review fix-up — use THIS during the event).** Changing
+  the Railway var restarts the process, and a restart CANCELS a running
+  qualifier: the shutdown flush releases and refunds every entrant. So during
+  the Sunday freeze the cap is changed live, with no restart:
+  `curl -s -X POST https://poker-server-production-60c0.up.railway.app/api/qualifiers/overflow -H 'Content-Type: application/json' -H "X-Internal-Token: $INTERNAL_NOTIFY_TOKEN" -d '{"max":0}'`
+  (`setQualifierOverflowTablesMax`). Use the token from the environment and
+  never paste it into a chat or a web form. It is the same value poker-server's
+  Railway env and the master share.
+  - Answers `{success, previous, cap, live}`. A missing or wrong token gets 403,
+    and so does every request when no token is configured (fails closed). A
+    non-numeric `max` gets 400 and nothing changes.
+  - **0 = OFF:** no new overflow table, and no feed into a lone one. Overflow
+    tables already in play are NOT closed: they hold live stacks, so they play
+    on and the rebalance breaks them as usual.
+  - Raising the cap again re-opens the path at once. The value lasts until the
+    next boot, which reads the env again.
+  - Logged and audited as `qualifier_overflow_cap_set`. Health shows
+    `overflow.cap` (the value in force) and `capChanges`.
 - **Every refusal refunds exactly once.** Kill switch, cap, a create / addTable
   throw, a seat that cannot be taken, a refused reinstatement: the empty table
   is closed again (`closeUnusedQualifierOverflowTable`) and null goes back into
@@ -281,7 +298,13 @@ table at 9 free), so a first-hour wave of late arrivals was turned away. Now:
   new WaitingForPlayers branch — the second arrival), the feed, and the 5 s
   sweep (`serviceQualifierOverflowTables`, the backstop after a pause / a
   pending rebalance; it also forgets broken / retired overflow tables). Log
-  `qualifier_overflow_first_deal`.
+  `qualifier_overflow_first_deal`. Review fix-up: the seat hook's call is
+  DEFERRED (`setImmediate`), never made inside the registration that seated him.
+  The deal follows `qt.players.push` / the re-entry's `reentryCreditIds` (what
+  the shutdown flush and the cancel refund from) and the result frames. And
+  `startFreshTournamentTable` never throws: a throw is counted in
+  `firstDealErrors` (log `qualifier_overflow_first_deal_failed`), and the sweep
+  retries the deal while the table still waits.
 - **Feed (TDA balancing).** At every tournament table's hand boundary
   (`autoStartNextHand`, after the under-5 wait, before the deal):
   `feedLoneQualifierTable` moves the player due that table's BIG BLIND to a
@@ -293,24 +316,81 @@ table at 9 free), so a first-hour wave of late arrivals was turned away. Now:
   the mover is present too. The stack moves whole (`sitDown` allowBelowMin),
   every pointer follows (`moveTournamentSeatPointers`, 'playerMoved'), nothing is
   left pointing at the emptied seat; on the overflow table's first hand he posts
-  the big blind. Fully try/caught (`feedErrors`): a failed move is rolled back
-  and never stops the source's deal. Stable: after it the lone table has 2 and
-  still no room elsewhere. Log `qualifier_overflow_fed`.
+  the big blind. It never throws and never stops the source's deal. Each counter
+  says what actually happened (review fix-up):
+  - `feedErrors` (log `qualifier_overflow_feed_failed`, `moved:false`): NOTHING
+    moved. Either a check threw, or the guarded move (sit-down → pointers →
+    source seat stood up) failed and was rolled back, leaving the stack on its
+    seat.
+  - `feeds` (log `qualifier_overflow_fed`): the stack sits at the lone table and
+    the source seat is empty. This counts whatever follows.
+  - `feedFollowUpErrors` (log `qualifier_overflow_feed_followup_failed`,
+    `moved:true`): the move STANDS but a follow-up threw (the stale-pointer
+    clean-up, a broadcast, or the lone table's first deal). Chips are conserved,
+    and the 5 s sweep deals the lone table.
+
+  Off while the runtime cap is 0. Stable: after it the lone table has 2 and
+  still no room elsewhere.
+- **Heads-up — by design, an owner call (review).** The feed fills a LONE
+  overflow table to exactly 2. Those two play heads-up while every other table
+  is full, until the next bust anywhere or another late arrival. Busts are rare
+  in the first hour. A bust lets Rule 1 / Rule 2 break the overflow table back
+  (`rebalanceSafety` C3 / C12).
+  - Nothing checks how many tables the tournament has left. When the FINAL
+    table is full (9 alive, nothing busted) at a late entry or re-entry, a
+    second table opens again and the feed pulls a final-table player into
+    heads-up against the fresh 50,000 stack, until the next bust merges them
+    back.
+  - No chips or credits are at stake.
+  - Full TDA balancing (keep feeding until tables are within one player) or
+    refusing overflow at the final table would be a separate change.
 - **Breaks.** Overflow tables are ordinary tables to the rebalance: the next bust
   anywhere lets Rule 1 break the (smallest) overflow table into the freed seats
   (deferred while it is mid-hand, as every break). Churn (open → break → open)
   is correct, just noisy.
 - **Health:** `r2Play.qualifiers.overflow` = { opened, closedUnused, refusedCap,
-  openFailed, lateEntriesSeated, reentriesSeated, feeds, feedErrors, firstDeals,
-  live, cap } (`feedErrors` / `openFailed` should stay 0).
-- **Tests / rig:** `tests/r2Qualifiers.test.ts` (B1-B10; its world runs with the
-  kill switch by default so the older no_seat tests keep their meaning),
-  `tests/rebalanceSafety.test.ts` (C1-C9), `tests/qualifierPlaces.test.ts`
-  (A1-A2); rig scenario scratchpad `qrig/scenario-overflow.js`.
-- **Ships only after ca2035a** (late entry until 2 PM + re-entry per credit);
-  ca2035a ships fine without it. CONTRACTS.md (workspace root) row "No new
-  table is opened" must be updated when this ships, with the additive
-  `overflowTable` / `waitingForPlayers` frame fields. Client: no change needed —
+  openFailed, lateEntriesSeated, reentriesSeated, feeds, feedErrors,
+  feedFollowUpErrors, firstDeals, firstDealErrors, capChanges, live, cap }
+  (`feedErrors` / `feedFollowUpErrors` / `firstDealErrors` / `openFailed`
+  should stay 0; `cap` is the value IN FORCE, runtime changes included).
+- **Tests / rig:**
+  - `tests/r2Qualifiers.test.ts`, B1-B13. Its world runs with the kill switch by
+    default, so the older no_seat tests keep their meaning. Since the review
+    fix-up, B3, B11 and B12 run a production-shaped world: a 9-seat table with
+    every seat alive and the REAL `tournamentDealHoldReason` (it used to be a
+    stub that always allowed the deal). The B3 CONTROL shows the old 2-seat toy
+    world holds `rebalance_pending` under the real hold. B13 covers the runtime
+    route.
+  - `tests/rebalanceSafety.test.ts`, C1-C12.
+  - `tests/qualifierPlaces.test.ts`, A1-A2.
+  - Rig scenario: scratchpad `qrig/scenario-overflow.js` (+ `.report.json`).
+    It runs the real dist with socket bots: the runtime kill switch and cap, a
+    late entry opening a table, the feed, the first deal, late entries filling
+    the tables, a re-entry opening a second table, the finish, one results
+    POST, places 1..N, the credit ledger, and chip conservation (the winner ends
+    with exactly 50,000 x entries).
+  - Rig results on 2026-10-22, on the review fix-up's dist:
+    - `scenario-overflow` passed 31/31 twice. The first run's single miss was
+      the script reading `qualifierTournamentStarted` before it arrived; the
+      script now waits for it.
+    - On the same dist: `scenario-reentry` 32/32 and `scenario-full` 28/28
+      (after a rig fix: its "seat kept" check used a bot that had already
+      busted).
+    - `scenario-edge` passed 14/14 with `QUALIFIER_OVERFLOW_TABLES_MAX=0`. With
+      overflow ON it fails 3 checks, all by design: its "every table full →
+      no_seat refund" late entrant is now seated on an overflow table.
+  - To recreate the rig's Postgres:
+    `docker run -d --name qtest-pg -p 55432:5432 -e POSTGRES_PASSWORD=pg -e POSTGRES_DB=poker postgres:16-alpine`.
+    Then run `node mock.js` and `bash restart-server.sh <tag>`.
+- **Ships only after ca2035a** (late entry until 2 PM + re-entry per credit).
+  ca2035a has been on origin/main since 2026-10-22 19:17 MDT (pushed by the
+  `push-server-ca2035a.sh` watcher). CONTRACTS.md (workspace root, not in this
+  repo) must be updated in the ship step:
+  - its row "No new table is opened";
+  - the additive `overflowTable` / `waitingForPlayers` frame fields;
+  - the new internal route `POST /api/qualifiers/overflow`.
+
+  Client: no change needed —
   .online 48e42a6 shows `QUALIFIER_WAITING_FOR_PLAYERS_TEXT`; the live 8bc056e
   ignores the flags (a bare "Waiting for Players" table).
 

@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -57,7 +57,7 @@ import { validateTableConfig, validateChallengeStakes } from './game/tableConfig
 import { createWindowRateLimiter } from './auth/rateLimit';
 import { createTicketReplayGuard, initUsedPlayTicketsTable, ticketReplayStats } from './auth/ticketReplay';
 import { publicNameOf, PUBLIC_NAME_FALLBACK, isPublicDisplayName, LISTABLE_USER_SQL } from './social/publicIdentity';
-import { createHash } from 'crypto';
+import { createHash, timingSafeEqual } from 'crypto';
 import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
@@ -3815,7 +3815,12 @@ function scheduleDealAfterTournamentSeat(tableId: string): void {
   // 2026-10-22 (owner: "Build it for Sunday") — a table that never dealt: an
   // OVERFLOW table's first hand once two are alive there (startFreshTournamentTable
   // acts on overflow tables only, through every tournament deal hold).
-  if (table.currentPhase === GamePhase.WaitingForPlayers) { startFreshTournamentTable(tableId); return; }
+  // Review fix-up: DEFERRED (setImmediate), never inline — the caller is a
+  // registration that still has to record the entry (qt.players, the re-entry
+  // credit ids the shutdown flush refunds) and send its result frames; the deal
+  // follows them, like the HandComplete path's timer. startFreshTournamentTable
+  // never throws, and the 5s sweep retries a deal that did not happen.
+  if (table.currentPhase === GamePhase.WaitingForPlayers) { setImmediate(() => startFreshTournamentTable(tableId)); return; }
   if (table.currentPhase !== GamePhase.HandComplete) return;
   if (pendingAutoStartTimers.has(tableId)) return;
   scheduleAutoStart(tableId);
@@ -3948,8 +3953,59 @@ function seatQualifierReentrantOnBustedSeat(
 // refund (exactly once); an overflow seat keeps the one credit consumed.
 // Health: r2Play.qualifiers.overflow.
 
-/** The cap in force (read at boot: Railway env QUALIFIER_OVERFLOW_TABLES_MAX; unset → 6, 0 = off). */
-const qualifierOverflowTablesMax = qualifierOverflowTablesCap(process.env.QUALIFIER_OVERFLOW_TABLES_MAX);
+/**
+ * The cap in force: Railway env QUALIFIER_OVERFLOW_TABLES_MAX at boot (unset → 6,
+ * 0 = off). Review fix-up: changeable WHILE THE SERVER RUNS
+ * (setQualifierOverflowTablesMax, POST /api/qualifiers/overflow) — changing the
+ * env restarts the process, and a restart cancels a running qualifier (the
+ * shutdown flush releases and refunds every entrant), so the env alone left no
+ * remedy during the Sunday freeze but killing the event.
+ */
+let qualifierOverflowTablesMax = qualifierOverflowTablesCap(process.env.QUALIFIER_OVERFLOW_TABLES_MAX);
+
+/**
+ * Review fix-up (2026-10-22) — the runtime kill switch / cap. 0 = OFF: no new
+ * overflow table (every-seat-alive late entry / re-entry → the old no_seat
+ * refund) AND no feed into a lone one. Overflow tables already in play are
+ * NOT closed — they hold live stacks; they play on and the rebalance breaks
+ * them like any table (their first deal still happens once two are alive).
+ * Raising it again re-opens the path at once. Lasts until the next restart
+ * (which reads the env again). Logged + audited (`qualifier_overflow_cap_set`).
+ */
+function setQualifierOverflowTablesMax(next: number, actor: string): { previous: number; cap: number; live: number } {
+  const previous = qualifierOverflowTablesMax;
+  qualifierOverflowTablesMax = next;
+  qualifierOverflow.capChanges++;
+  const live = qualifierOverflowTables.size;
+  console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_cap_set', previous, cap: next, live, actor })}`);
+  auditLog(actor, 'QUALIFIER_OVERFLOW_CAP_SET', { previous, cap: next, live });
+  return { previous, cap: next, live };
+}
+
+/** Constant-time X-Internal-Token check (hashes first: equal lengths for timingSafeEqual). An unset token never matches. */
+function internalTokenMatches(given: unknown, expected: string): boolean {
+  if (!expected || typeof given !== 'string' || !given) return false;
+  return timingSafeEqual(createHash('sha256').update(given).digest(), createHash('sha256').update(expected).digest());
+}
+
+// Review fix-up (2026-10-22) — the overflow cap / kill switch at runtime, no
+// restart: POST {max: 0..20} with X-Internal-Token (the INTERNAL_NOTIFY_TOKEN
+// this server and the master share). FAILS CLOSED: no token configured → 403
+// (unlike /api/tournament/simulate). Answers {success, previous, cap, live};
+// GET /api/health r2Play.qualifiers.overflow.cap shows the value in force.
+app.post('/api/qualifiers/overflow', (req, res) => {
+  const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
+  if (!internalTokenMatches(req.headers['x-internal-token'], tok)) {
+    res.status(403).json({ success: false, error: 'forbidden' });
+    return;
+  }
+  const next = parseQualifierOverflowCapUpdate(req.body?.max);
+  if (next === null) {
+    res.status(400).json({ success: false, error: 'max must be a number 0..20 (0 = off)', cap: qualifierOverflowTablesMax });
+    return;
+  }
+  res.json({ success: true, ...setQualifierOverflowTablesMax(next, 'internal:overflow_cap') });
+});
 
 /**
  * The next "Qualifier Table N" number of this tournament: above every number
@@ -24729,8 +24785,19 @@ function rehomeBrokenTableWatchers(tournamentId: string, breakTableId: string): 
 // slices this block gets the real, empty state.
 /** Overflow table id → its tournament id (an entry whose table left tournamentTables is pruned by the 5s sweep). */
 const qualifierOverflowTables = new Map<string, string>();
-/** Health r2Play.qualifiers.overflow (feedErrors / openFailed should stay 0). */
-const qualifierOverflow = { opened: 0, closedUnused: 0, refusedCap: 0, openFailed: 0, lateEntriesSeated: 0, reentriesSeated: 0, feeds: 0, feedErrors: 0, firstDeals: 0 };
+/**
+ * Health r2Play.qualifiers.overflow (feedErrors / feedFollowUpErrors /
+ * firstDealErrors / openFailed should stay 0). feedErrors = a feed that failed
+ * and MOVED NOTHING (rolled back); feedFollowUpErrors = a feed that MOVED the
+ * player (counted in feeds) whose follow-up (a broadcast, the lone table's
+ * first deal) threw — the move stands, the 5s sweep retries the deal;
+ * firstDealErrors = a first deal that threw (retried by the sweep);
+ * capChanges = runtime cap changes (POST /api/qualifiers/overflow).
+ */
+const qualifierOverflow = {
+  opened: 0, closedUnused: 0, refusedCap: 0, openFailed: 0, lateEntriesSeated: 0, reentriesSeated: 0,
+  feeds: 0, feedErrors: 0, feedFollowUpErrors: 0, firstDeals: 0, firstDealErrors: 0, capChanges: 0,
+};
 /** Tournament id → the highest "Qualifier Table N" number an overflow table of it has taken (nextQualifierTableNumber). */
 const qualifierOverflowTableNumbers = new Map<string, number>();
 /** The feed moves a player only off a table with at least this many alive: it never drops below 5. */
@@ -24763,24 +24830,35 @@ function closeUnusedQualifierOverflowTable(tournamentId: string, tableId: string
  * overflow table of its tournament that never dealt, is not starting / completing
  * a hand, has at least 2 alive, and no tournament deal hold applies
  * (tournamentDealHoldReason: paused, bust check pending, closed, break pending,
- * rebalance pending). Called by the seat hook, the feed and the 5s sweep
- * (backstop). true = dealt.
+ * rebalance pending). Called by the seat hook (deferred), the feed and the 5s
+ * sweep (backstop). true = dealt. Review fix-up: NEVER throws — a throw
+ * (firstDealErrors, log `qualifier_overflow_first_deal_failed`) is retried by
+ * the 5s sweep while the table still waits; it can never unwind a caller (a
+ * registration's bookkeeping, the source table's deal in the feed).
  */
 function startFreshTournamentTable(tableId: string): boolean {
   const tournamentId = qualifierOverflowTables.get(tableId);
   if (!tournamentId || tournamentTables.get(tableId) !== tournamentId) return false;
-  const table = tableManager.getTable(tableId);
-  if (!table || table.currentPhase !== GamePhase.WaitingForPlayers) return false;
-  if (table.isStartingHand() || table.isCompletingHand()) return false;
-  if (tournamentManager.getAlivePlayersOnTable(tournamentId, tableId).length < 2) return false;
-  if (tournamentDealHoldReason(tableId, tournamentId, table) !== null) return false;
-  ensureTableProgressListener(table, tableId);
-  if (!table.startNewHand()) return false;
-  qualifierOverflow.firstDeals++;
-  console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_first_deal', tournamentId, tableId, handNumber: table.handNumber })}`);
-  broadcastGameState(tableId);
-  scheduleAIAction(tableId);
-  return true;
+  let dealt = false;
+  try {
+    const table = tableManager.getTable(tableId);
+    if (!table || table.currentPhase !== GamePhase.WaitingForPlayers) return false;
+    if (table.isStartingHand() || table.isCompletingHand()) return false;
+    if (tournamentManager.getAlivePlayersOnTable(tournamentId, tableId).length < 2) return false;
+    if (tournamentDealHoldReason(tableId, tournamentId, table) !== null) return false;
+    ensureTableProgressListener(table, tableId);
+    if (!table.startNewHand()) return false;
+    dealt = true;
+    qualifierOverflow.firstDeals++;
+    console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_first_deal', tournamentId, tableId, handNumber: table.handNumber })}`);
+    broadcastGameState(tableId);
+    scheduleAIAction(tableId);
+    return true;
+  } catch (e: any) {
+    qualifierOverflow.firstDealErrors++;
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_first_deal_failed', tournamentId, tableId, dealt, error: String(e?.message || e) })}`);
+    return dealt;
+  }
 }
 
 /**
@@ -24840,16 +24918,31 @@ function liveSessionAt(tableId: string, seatIndex: number): string | null {
  * (sitDown allowBelowMin — a relocation) and every pointer follows it
  * (moveTournamentSeatPointers: sessions, extra-table sessions, reservation,
  * 'playerMoved'); nothing is left pointing at the emptied source seat. Never
- * throws (feedErrors) — a failed move is rolled back: the stack stays on its seat.
+ * throws. Review fix-up — each phase is counted for what it actually did:
+ *  - the checks and the MOVE (the sit-down there, the pointers, the source seat
+ *    stood up): a throw before the move is complete is rolled back — the stack
+ *    stays on its seat, nothing points at the new one — feedErrors, log
+ *    `qualifier_overflow_feed_failed` (moved:false);
+ *  - once the stack sits at the lone table and the source seat is empty the
+ *    feed COUNTS (feeds), whatever follows;
+ *  - its follow-ups (the stale-pointer clean-up, both broadcasts, the lone
+ *    table's first deal): a throw there is feedFollowUpErrors, log
+ *    `qualifier_overflow_feed_followup_failed` (moved:true) — the move stands,
+ *    chips are conserved, and the 5s sweep deals the lone table if it still waits.
+ * Off with the runtime kill switch (qualifierOverflowTablesMax 0).
  */
 function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sourceTable: PokerTable): boolean {
   if (qualifierOverflowTables.size === 0) return false;
+  if (qualifierOverflowTablesMax <= 0) return false;   // the runtime kill switch: no feeding either
+  let moved = false;
+  let loneTableId: string | null = null;
+  let lone: PokerTable | undefined;
+  let from = -1;
+  let to = -1;
   try {
     const t = tournamentManager.getTournament(tournamentId);
     if (!t || t.status !== 'running' || t.paused || t.tableIds.length <= 1) return false;
     // (1) + (2) — the lone overflow table and its PRESENT entrant.
-    let loneTableId: string | null = null;
-    let lone: PokerTable | undefined;
     for (const [tid, owner] of qualifierOverflowTables) {
       if (owner !== tournamentId || tid === sourceTableId || tournamentTables.get(tid) !== tournamentId || !t.tableIds.includes(tid)) continue;
       const table = tableManager.getTable(tid);
@@ -24878,7 +24971,6 @@ function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sou
     // blind), the first present live entrant of this table from there.
     const first = sourceTable.getNextOccupiedSeat(sourceTable.previousBigBlindSeat + 1);
     if (first < 0) return false;
-    let from = -1;
     let mover: TournamentPlayer | undefined;
     for (let k = 0; k < MAX_SEATS; k++) {
       const i = (first + k) % MAX_SEATS;
@@ -24892,20 +24984,20 @@ function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sou
       break;
     }
     if (from < 0 || !mover) return false;
-    let to = -1;
     for (let i = 0; i < MAX_SEATS; i++) {
       if (tournamentSeatIsPlaceable(tournamentId, lone, i)) { to = i; break; }
     }
     if (to < 0) return false;
     const src = sourceTable.seats[from];
     const chips = src.chipCount;
-    if (lone.seats[to].state !== 'empty') vacateBustedTournamentSeat(lone, loneTableId, to);
-    // A RELOCATION (allowBelowMin): the stack is below the starting stack more often than not.
-    if (!lone.sitDown(to, src.playerName, chips, src.playerId, false, true)) return false;
-    // What points at the source seat now (restored if the move fails half-way).
+    // What points at the source seat now (restored if the move fails half-way) —
+    // read BEFORE the sit-down, so nothing unguarded runs between it and the move.
     const sessionsAtSource = [...playerSessions].filter(([, s]) => s.tableId === sourceTableId && s.seatIndex === from);
     const extrasAtSource = [...multiTableSessions.values()].flat().filter((ms) => ms.tableId === sourceTableId && ms.seatIndex === from);
     const reservationsAtSource = [...reservedSeats.values()].filter((r) => r.tableId === sourceTableId && r.seatIndex === from);
+    if (lone.seats[to].state !== 'empty') vacateBustedTournamentSeat(lone, loneTableId, to);
+    // A RELOCATION (allowBelowMin): the stack is below the starting stack more often than not.
+    if (!lone.sitDown(to, src.playerName, chips, src.playerId, false, true)) return false;
     try {
       tournamentManager.setPlayerTable(tournamentId, mover.playerId, loneTableId);
       moveTournamentSeatPointers(mover, sourceTableId, from, loneTableId, to, tournamentId);
@@ -24928,6 +25020,27 @@ function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sou
       if (lone.seats[to].state === 'occupied' && lone.seats[to].playerId === mover.playerId) lone.standUp(to);
       throw e;
     }
+    // The move is complete the moment the source seat is EMPTY: its stack sits
+    // at the lone table now (no wallet side effect). Counted from here on.
+    sourceTable.standUp(from);
+    moved = true;
+    qualifierOverflow.feeds++;
+    console.log(`[Qualifier] ${JSON.stringify({
+      event: 'qualifier_overflow_fed', tournamentId, fromTableId: sourceTableId, fromSeat: from, toTableId: loneTableId, seat: to,
+    })}`);
+  } catch (e: any) {
+    if (!moved) {
+      // Nothing moved: a check threw, or the guarded move rolled itself back.
+      qualifierOverflow.feedErrors++;
+      console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_feed_failed', tournamentId, tableId: sourceTableId, moved: false, error: String(e?.message || e) })}`);
+      return false;
+    }
+    // (Only the log line can throw here: the move stands.)
+    qualifierOverflow.feedFollowUpErrors++;
+  }
+  if (!loneTableId || !lone) return moved;
+  // Follow-ups: the move stands whatever happens here.
+  try {
     // The source seat is EMPTY now (a later mover or late entrant takes it):
     // nothing may point at it — a stale session there would act on that player.
     for (const [sid, s] of [...playerSessions]) if (s.tableId === sourceTableId && s.seatIndex === from) playerSessions.delete(sid);
@@ -24942,22 +25055,18 @@ function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sou
     pendingSeatRemovalAfterHand.get(sourceTableId)?.delete(from);
     sitOutTracker.get(sourceTableId)?.delete(from);
     aiProfiles.get(sourceTableId)?.delete(from);
-    sourceTable.standUp(from);   // its stack sits at the lone table now (no wallet side effect)
     syncSitOutToTable(sourceTableId);
-    qualifierOverflow.feeds++;
-    console.log(`[Qualifier] ${JSON.stringify({
-      event: 'qualifier_overflow_fed', tournamentId, fromTableId: sourceTableId, fromSeat: from, toTableId: loneTableId, seat: to,
-    })}`);
     broadcastGameState(sourceTableId);
     broadcastGameState(loneTableId);
     if (lone.currentPhase === GamePhase.WaitingForPlayers) startFreshTournamentTable(loneTableId);
     else if (lone.currentPhase === GamePhase.HandComplete && !pendingAutoStartTimers.has(loneTableId)) scheduleAutoStart(loneTableId);
-    return true;
   } catch (e: any) {
-    qualifierOverflow.feedErrors++;
-    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_feed_failed', tournamentId, tableId: sourceTableId, error: String(e?.message || e) })}`);
-    return false;
+    qualifierOverflow.feedFollowUpErrors++;
+    console.error(`[Qualifier] ${JSON.stringify({
+      event: 'qualifier_overflow_feed_followup_failed', tournamentId, fromTableId: sourceTableId, toTableId: loneTableId, moved: true, error: String(e?.message || e),
+    })}`);
   }
+  return true;
 }
 // ===== end tournament rebalance helpers =====
 

@@ -1653,3 +1653,15 @@ seatQualifierLateEntrantOnOverflowTable(socket, qt, registrant)
 seatQualifierReentrantOnOverflowTable(socket, qt, tournament, existingEntry, startingStack)
 QUALIFIER_OVERFLOW_TABLES_MAX = 6
 overflowTable: true
+
+# 2026-10-22 review fix-up of the overflow tables: a RUNTIME kill switch / cap
+# (POST /api/qualifiers/overflow with X-Internal-Token — a restart cancels a
+# running qualifier, so the env alone left no remedy during the Sunday freeze;
+# 0 also stops the feed), honest feed / first-deal error logs (a feed that moved
+# him is never logged as a failed feed), and the first deal of an overflow table
+# deferred until the seating registration has recorded and told the entrant.
+/api/qualifiers/overflow
+qualifier_overflow_cap_set
+qualifier_overflow_feed_followup_failed
+qualifier_overflow_first_deal_failed
+setImmediate(() => startFreshTournamentTable(tableId))

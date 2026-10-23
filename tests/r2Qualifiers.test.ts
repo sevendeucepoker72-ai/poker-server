@@ -23,10 +23,12 @@ import {
   parseMasterSchedule, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels,
   parseSeatPackage, seatsForTopWith, seatsWonAt,
   QUALIFIER_BASE_STACK, QUALIFIER_LATE_REG_MS, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft,
-  QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap,
+  QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate,
 } from '../src/game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from '../src/game/qualifierNoShow';
 import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
+// Review fix-up (ff9a1cb) — the runtime overflow cap's X-Internal-Token check.
+import { createHash, timingSafeEqual } from 'crypto';
 
 // The master's REAL answer (captured from prod 2026-10-11, read-only): one weekly event + a TOC with no time.
 const MASTER_BODY = {
@@ -126,6 +128,23 @@ const CODE = [
   fnSrc('function seatQualifierReentrantOnOverflowTable('),
   fnSrc('function qualifierOverflowSeatFlags('),
   fnSrc('function startFreshTournamentTable('),
+  // Review fix-up (ff9a1cb) — the runtime cap / kill switch: its setter, the
+  // token check and the REAL route (registered on the world's fake `app`).
+  fnSrc('function setQualifierOverflowTablesMax('),
+  fnSrc('function internalTokenMatches('),
+  slice("app.post('/api/qualifiers/overflow'", '\n});\n'),
+].join('\n');
+/**
+ * Review fix-up (ff9a1cb) — the REAL tournament deal hold (it used to be a stub
+ * that always allowed the deal) and what it reads: the rebalance plan, the
+ * bust-check wait. Appended only for worlds built with `realDealHold`.
+ */
+const REAL_DEAL_HOLD = [
+  fnSrc('function tournamentDealHoldReason('),
+  fnSrc('function tournamentDealWaitsForBustCheck('),
+  fnSrc('function tournamentUnsettledBustSeat('),
+  fnSrc('function tournamentEntrantHasLiveSeat('),
+  fnSrc('function planTournamentRebalance('),
 ].join('\n');
 const HANDLERS = ['registerQualifierTournament', 'unregisterQualifierTournament', 'getQualifierTournaments', 'spectateTournament']
   .map((ev) => handlerSrc(ev, '\n  });\n')).join('\n  ');
@@ -145,6 +164,11 @@ function world(opts: {
   overflowCreate?: 'zeroSeats' | 'throw';
   /** The new table's usable seats (default 9). */
   overflowSeats?: number;
+  /**
+   * Review fix-up (ff9a1cb) — run the REAL tournamentDealHoldReason (+ the
+   * rebalance plan it asks). Default: the old stub that always allows the deal.
+   */
+  realDealHold?: boolean;
 } = {}) {
   const qualifierTournaments = new Map<string, any>();
   const tm = new TournamentManager();
@@ -239,14 +263,28 @@ function world(opts: {
     fastModeTables: new Map(), tableProgressListeners, GamePhase,
     ensureTableProgressListener: (_t: unknown, id: string) => { progressListeners.push(id); tableProgressListeners.add(id); },
     scheduleAIAction: (id: string) => { aiKicks.push(id); },
-    tournamentDealHoldReason: () => null,
+    // Review fix-up (ff9a1cb) — the REAL deal hold's state when `realDealHold` (else the old always-deal stub).
+    ...(opts.realDealHold
+      ? { tournamentBustChecksPending: new Map(), tournamentBreaksAwaitingHandEnd: new Map(), TOURNAMENT_BUST_CHECK_STALE_MS: 30_000, runTournamentBustCheck() {} }
+      : { tournamentDealHoldReason: () => null }),
+    // Review fix-up (ff9a1cb) — the runtime cap route registers on this fake express app.
+    app: { post: (p: string, fn: (req: any, res: any) => void) => { routes.set(p, fn); } },
+    createHash, timingSafeEqual, parseQualifierOverflowCapUpdate,
   };
-  const { exports: m } = load(`${CODE}\nfunction wire(socket) {\n  ${HANDLERS}\n}`, scope, `{
+  const routes = new Map<string, (req: any, res: any) => void>();
+  const { exports: m } = load(`${CODE}\n${opts.realDealHold ? REAL_DEAL_HOLD : ''}\nfunction wire(socket) {\n  ${HANDLERS}\n}`, scope, `{
     wire, applyQualifierSchedule, qualifierList, qualifierEventFor, markQualifierFinished, emitTournamentFinishedToEntrants,
     tickQualifierAutoStart, postQualifierResults, cancelQualifierEvent, qualifierLateEntries, qualifierResultPosts,
     qualifierNoShows, tellQualifierNoShowReleases, qualifierCreditHeldByConcurrentEntry,
-    qualifierOverflow, qualifierOverflowTables, openQualifierOverflowTable, startFreshTournamentTable,
+    qualifierOverflow, qualifierOverflowTables, openQualifierOverflowTable, startFreshTournamentTable, tournamentDealHoldReason,
   }`);
+  /** POST /api/qualifiers/overflow through the REAL route: {status, body}. */
+  const postOverflowCap = (body: unknown, token?: string) => {
+    const out: { status: number; body: any } = { status: 200, body: null };
+    const res = { status(c: number) { out.status = c; return res; }, json(b: unknown) { out.body = b; return res; } };
+    routes.get('/api/qualifiers/overflow')!({ headers: token === undefined ? {} : { 'x-internal-token': token }, body }, res);
+    return out;
+  };
   const emitted: Array<[string, string, any]> = [];
   const mkSocket = (id: string, userId: number | null, master: string | null, name = 'Player') => {
     const handlers: Record<string, (...a: any[]) => any> = {};
@@ -271,7 +309,7 @@ function world(opts: {
   return {
     m, tm, tables, scope, qualifierTournaments, authSessions, playerSessions, sockets, emitted, globalEmits, roomEmits, audits,
     consumed, creditRefunds, fetches, postAnswers, progress, started, wallet, mkSocket, of, sync, tournamentTables, leaves,
-    qualifiedPlayers, overflowCreates, tableProgressListeners, progressListeners, aiKicks,
+    qualifiedPlayers, overflowCreates, tableProgressListeners, progressListeners, aiKicks, postOverflowCap,
   };
 }
 
@@ -1692,8 +1730,8 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
    * 'Qualifier Table 1', `usable` seats there (2 = every seat taken), overflow
    * tables ON (cap 6) unless `overflowMax` says otherwise.
    */
-  function full(o: { overflowMax?: number; usable?: number; overflowCreate?: 'zeroSeats' | 'throw'; overflowSeats?: number } = {}) {
-    const w = world({ overflowMax: o.overflowMax ?? 6, overflowCreate: o.overflowCreate, overflowSeats: o.overflowSeats });
+  function full(o: { overflowMax?: number; usable?: number; overflowCreate?: 'zeroSeats' | 'throw'; overflowSeats?: number; realDealHold?: boolean } = {}) {
+    const w = world({ overflowMax: o.overflowMax ?? 6, overflowCreate: o.overflowCreate, overflowSeats: o.overflowSeats, realDealHold: o.realDealHold });
     w.sync(Date.now() - 10 * MIN);
     const qt = w.qualifierTournaments.get(WEEKLY);
     expect(qt).toBeTruthy();
@@ -1716,6 +1754,34 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     ] });
     return { w, qt, tid, t };
   }
+  /**
+   * Review fix-up (ff9a1cb) — the PRODUCTION shape: Q1 a real 9-seat table with
+   * every seat alive (P201 … P209, user-201 … user-209, masters m-201 … m-209)
+   * and the REAL tournament deal hold (no stub).
+   */
+  const NINE = [201, 202, 203, 204, 205, 206, 207, 208, 209];
+  function fullNine(o: { overflowMax?: number } = {}) {
+    const w = world({ overflowMax: o.overflowMax ?? 6, realDealHold: true });
+    w.sync(Date.now() - 10 * MIN);
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    expect(qt).toBeTruthy();
+    const tid = w.tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: qualifierBlindLevels(50_000), startingChips: 50_000 } as any);
+    for (const n of NINE) w.tm.registerPlayer(tid, `user-${n}`, `P${n}`, `s${n}`, undefined, `m-${n}`);
+    w.tm.startTournament(tid);
+    const t = new PokerTable({ tableId: 'Q1', tableName: 'Qualifier Table 1', smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+    NINE.forEach((n, i) => {
+      expect(t.sitDown(i, `P${n}`, 50_000, `user-${n}`, false, true)).toBe(true);
+      w.tm.setPlayerTable(tid, `user-${n}`, 'Q1');
+    });
+    w.tables.set('Q1', t);
+    w.tournamentTables.set('Q1', tid);
+    w.tm.setTableIds(tid, ['Q1']);
+    Object.assign(qt, {
+      status: 'running', tournamentId: tid,
+      players: NINE.map((n) => ({ playerId: `user-${n}`, masterPlayerId: `m-${n}`, playerName: `P${n}`, phone: '', socketId: `s${n}` })),
+    });
+    return { w, qt, tid, t };
+  }
   /** The bust check ran on `pid`'s LIVE seat at `t`: 0 chips, eliminated, the seat left occupied. */
   function bust(w: any, tid: string, t: PokerTable, pid: string): number {
     const i = t.seats.findIndex((s) => s.state === 'occupied' && !s.eliminated && s.playerId === pid);
@@ -1734,6 +1800,9 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     expect(QUALIFIER_OVERFLOW_TABLES_MAX).toBe(6);
     expect([undefined, '', '  ', 'x', 'NaN', 'Infinity'].map((v) => qualifierOverflowTablesCap(v))).toEqual([6, 6, 6, 6, 6, 6]);
     expect(['0', '3', '2.7', '99', '-2', ' 4 '].map((v) => qualifierOverflowTablesCap(v))).toEqual([0, 3, 2, 20, 0, 4]);
+    // Review fix-up (ff9a1cb) — the RUNTIME value (POST /api/qualifiers/overflow): garbage is refused (null), never "6".
+    expect([0, 3, '2', 2.7, 99, -1, ' 4 '].map((v) => parseQualifierOverflowCapUpdate(v))).toEqual([0, 3, 2, 2, 20, 0, 4]);
+    expect([undefined, null, '', ' ', 'x', 'NaN', 'Infinity', Infinity, NaN, true, {}, [1]].map((v) => parseQualifierOverflowCapUpdate(v))).toEqual(Array(12).fill(null));
   });
 
   it('B2 — a late entry with every seat alive: a NEW table at the CURRENT level, he is seated there (one credit, kept), told overflowTable + waitingForPlayers; the one bootstrap listener is not re-registered', async () => {
@@ -1773,25 +1842,133 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     expect(w.audits.find((x) => x.action === 'QUALIFIER_LATE_ENTRY_SEATED')?.d).toMatchObject({ tableId: 'OV1', overflowTable: true });
   });
 
-  it('B3 — a second late entrant joins THAT table (no second table): its FIRST hand is dealt at once, both dealt in; he is not told "waiting"', async () => {
-    const { w } = full();
+  it('B3 — a second late entrant joins THAT table (no second table): its FIRST hand is dealt through the REAL deal hold, right AFTER his registration is recorded and told; he is not told "waiting"', async () => {
+    // Review fix-up (ff9a1cb): production-shaped (9-seat Q1, every seat alive) with the REAL
+    // tournamentDealHoldReason — this test used to run against a stub that always allowed the deal.
+    const { w, tid, qt } = fullNine();
     await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
     await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
     expect(w.overflowCreates).toHaveLength(1);
     const OV = w.tables.get('OV1')!;
     expect(OV.seats[1]).toMatchObject({ state: 'occupied', playerId: 'user-103' });
-    expect(OV.handNumber).toBe(1);
-    expect(OV.currentPhase).toBe(GamePhase.PreFlop);
-    expect(OV.seats.filter((s) => s.state === 'occupied' && s.holeCards.length === 2)).toHaveLength(2);
-    expect(w.aiKicks).toEqual(['OV1']);
+    // His registration is complete before anything is dealt (the first deal is deferred): recorded, told, credit kept.
+    expect(qt.players.map((p: any) => p.playerId)).toContain('user-103');
     const res = last(w, 'SD');
     expect(res).toEqual(expect.objectContaining({ success: true, lateEntry: true, tableId: 'OV1', overflowTable: true }));
     expect(res.waitingForPlayers).toBeUndefined();
     const started = last(w, 'SD', 'qualifierTournamentStarted');
     expect(started).toEqual(expect.objectContaining({ tableId: 'OV1', tableCount: 2, overflowTable: true }));
     expect(started.waitingForPlayers).toBeUndefined();
+    expect(OV.handNumber).toBe(0);                                            // ff9a1cb: dealt INSIDE the handler, before all of the above
+    // The REAL hold lets it deal: 11 alive on 2 tables — Rule 1 (11 > 9) and Rule 2 (Q1 has no room for OV1's 2) plan nothing.
+    expect(w.m.tournamentDealHoldReason('OV1', tid, OV)).toBeNull();
+    await flush();
+    expect(OV.handNumber).toBe(1);
+    expect(OV.currentPhase).toBe(GamePhase.PreFlop);
+    expect(OV.seats.filter((s) => s.state === 'occupied' && s.holeCards.length === 2)).toHaveLength(2);
+    expect(w.aiKicks).toEqual(['OV1']);
     expect(w.creditRefunds).toEqual([]);
-    expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, firstDeals: 1, lateEntriesSeated: 1 });
+    expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, firstDeals: 1, lateEntriesSeated: 1, firstDealErrors: 0 });
+  });
+
+  it('B3 CONTROL — the toy world (Q1 has 2 usable seats) under the REAL hold: 4 alive fit one table, so Rule 1 plans a break and OV1\'s first deal waits for it (rebalance_pending) — the old stub hid this', async () => {
+    const { w, tid } = full({ realDealHold: true });
+    await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+    await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
+    await flush();
+    const OV = w.tables.get('OV1')!;
+    expect(OV.seats.filter((s) => s.state === 'occupied')).toHaveLength(2);
+    expect(w.m.tournamentDealHoldReason('OV1', tid, OV)).toBe('rebalance_pending');
+    expect(OV.handNumber).toBe(0);
+    expect(w.m.qualifierOverflow.firstDeals).toBe(0);
+  });
+
+  it('B11 — a RE-ENTRY onto a lone overflow table (production shape, REAL hold): seated on its empty seat, his re-entry recorded and told FIRST, then the table\'s first hand is dealt', async () => {
+    const { w, tid, t, qt } = fullNine();
+    await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));                // OV1: Alice alone, waiting
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ tableId: 'OV1', waitingForPlayers: true }));
+    bust(w, tid, t, 'user-201');                                              // P201 out at Q1 (his seat busted)
+    const b = w.mkSocket('S201', 201, 'm-201', 'P201');
+    await enter(b);                                                           // the empty-seat search finds OV1 seat 1 first
+    const OV = w.tables.get('OV1')!;
+    expect(OV.seats[1]).toMatchObject({ state: 'occupied', playerId: 'user-201', chipCount: 50_000 });
+    expect(liveSeats(w, 'user-201')).toEqual(['OV1:1']);
+    // Recorded (refundable by the shutdown flush) and told BEFORE the deal.
+    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-201')).toMatchObject({ reEntries: 1, reentryCreditIds: ['credit-2'] });
+    expect(last(w, 'S201')).toEqual(expect.objectContaining({ success: true, reentry: true, tableId: 'OV1', overflowTable: true }));
+    expect(last(w, 'S201').waitingForPlayers).toBeUndefined();
+    expect(last(w, 'S201', 'qualifierTournamentStarted')).toEqual(expect.objectContaining({ tableId: 'OV1', reentry: true, overflowTable: true }));
+    expect(OV.handNumber).toBe(0);
+    expect(w.m.tournamentDealHoldReason('OV1', tid, OV)).toBeNull();          // 8 + 2 alive; Q1's 1 busted seat cannot take OV1's 2
+    await flush();
+    expect(OV.handNumber).toBe(1);
+    expect(OV.seats.filter((s) => s.state === 'occupied' && s.holeCards.length === 2)).toHaveLength(2);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 're-entry']);
+    expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, firstDeals: 1, firstDealErrors: 0 });
+  });
+
+  it('B12 — the first deal THROWS (late entry, then re-entry): the registration is recorded, told and keeps its credit; nothing escapes; firstDealErrors counts it and the 5s sweep deals the table later', async () => {
+    const { w, tid, t, qt } = fullNine();
+    await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+    await flush();                                                            // her own (deferred) seat hook: alone, nothing to deal
+    const OV = w.tables.get('OV1')!;
+    const realStart = OV.startNewHand.bind(OV);
+    OV.startNewHand = () => { throw new Error('deal boom'); };
+    await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
+    await flush();
+    expect(qt.players.map((p: any) => p.playerId)).toContain('user-103');
+    expect(last(w, 'SD')).toEqual(expect.objectContaining({ success: true, lateEntry: true, tableId: 'OV1' }));
+    expect(w.m.qualifierLateEntries.seated).toBe(2);
+    expect(OV.handNumber).toBe(0);
+    expect(w.m.qualifierOverflow).toMatchObject({ firstDeals: 0, firstDealErrors: 1 });
+    // A re-entry whose seat hook hits the same throwing deal: still recorded (the shutdown flush refunds by these ids).
+    bust(w, tid, t, 'user-202');
+    await enter(w.mkSocket('S202', 202, 'm-202', 'P202'));
+    await flush();
+    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-202')).toMatchObject({ reEntries: 1, reentryCreditIds: ['credit-3'] });
+    expect(last(w, 'S202')).toEqual(expect.objectContaining({ success: true, reentry: true, tableId: 'OV1' }));
+    expect(w.m.qualifierOverflow.firstDealErrors).toBe(2);
+    expect(w.creditRefunds).toEqual([]);
+    // The backstop (the 5s sweep calls this) deals it once the deal works again.
+    OV.startNewHand = realStart;
+    expect(w.m.startFreshTournamentTable('OV1')).toBe(true);
+    expect(OV.handNumber).toBe(1);
+    expect(w.m.qualifierOverflow.firstDeals).toBe(1);
+  });
+
+  it('B13 — the runtime kill switch / cap (no restart): POST /api/qualifiers/overflow with the internal token; refused without it (fails closed) or with a bad value; 0 = the old no_seat refund, raised again = a new table', async () => {
+    const { w, tid, qt } = fullNine();
+    const before = w.m.qualifierOverflow.capChanges;
+    // Refused: no token, a wrong one, and (fails closed) any token when none is configured — nothing changes.
+    expect(w.postOverflowCap({ max: 0 })).toEqual({ status: 403, body: { success: false, error: 'forbidden' } });
+    expect(w.postOverflowCap({ max: 0 }, 'wrong')).toMatchObject({ status: 403 });
+    const env = (w.scope.process as any).env;
+    env.INTERNAL_NOTIFY_TOKEN = '';
+    expect(w.postOverflowCap({ max: 0 }, '')).toMatchObject({ status: 403 });
+    env.INTERNAL_NOTIFY_TOKEN = 't';
+    for (const bad of [undefined, null, '', ' ', 'off', 'NaN', {}, [3], true]) {
+      expect(w.postOverflowCap({ max: bad }, 't')).toMatchObject({ status: 400, body: { success: false, cap: 6 } });
+    }
+    expect(w.scope.qualifierOverflowTablesMax).toBe(6);
+    expect(w.m.qualifierOverflow.capChanges).toBe(before);
+    // OFF at runtime: a late entry with every seat alive → exactly the pre-overflow no_seat, one refund, no table.
+    expect(w.postOverflowCap({ max: 0 }, 't')).toEqual({ status: 200, body: { success: true, previous: 6, cap: 0, live: 0 } });
+    expect(w.scope.qualifierOverflowTablesMax).toBe(0);
+    await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+    expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: false, code: 'no_seat' }));
+    expect(w.creditRefunds).toEqual(['credit-1']);
+    expect(w.overflowCreates).toEqual([]);
+    expect(w.tm.getTournament(tid)!.tableIds).toEqual(['Q1']);
+    expect(qt.players).toHaveLength(9);
+    // Back ON (a numeric string, clamped like the env): the next arrival gets a table.
+    expect(w.postOverflowCap({ max: '2' }, 't')).toEqual({ status: 200, body: { success: true, previous: 0, cap: 2, live: 0 } });
+    expect(w.postOverflowCap({ max: 99 }, 't').body).toMatchObject({ cap: 20 });
+    expect(w.postOverflowCap({ max: 2.9 }, 't').body).toMatchObject({ previous: 20, cap: 2 });
+    await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
+    expect(last(w, 'SD')).toEqual(expect.objectContaining({ success: true, lateEntry: true, tableId: 'OV1', overflowTable: true }));
+    expect(w.m.qualifierOverflow.capChanges).toBe(before + 4);
+    expect(w.audits.filter((x) => x.action === 'QUALIFIER_OVERFLOW_CAP_SET').map((x) => [x.d.previous, x.d.cap])).toEqual([[6, 0], [0, 2], [2, 20], [20, 2]]);
   });
 
   it('B4 CONTROL — a free seat anywhere (an empty one, or a busted one) → no table is opened; that seat is used', async () => {
@@ -1915,7 +2092,9 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     const lateSlice = slice('/** R2 (TOURNEY-9) — the answer when a qualifier seat would take over', '\n  return null;\n}\n');
     expect(lateSlice).toContain('function seatQualifierLateEntrant(');
     expect(lateSlice).not.toContain('function openQualifierOverflowTable(');
-    expect(lateSlice).toContain('if (table.currentPhase === GamePhase.WaitingForPlayers) { startFreshTournamentTable(tableId); return; }');
+    // Review fix-up (ff9a1cb) — deferred: never dealt inside the registration that seated him.
+    expect(lateSlice).toContain('if (table.currentPhase === GamePhase.WaitingForPlayers) { setImmediate(() => startFreshTournamentTable(tableId)); return; }');
+    expect(lateSlice).not.toContain('{ startFreshTournamentTable(tableId); return; }');
     const h = handlerSrc('registerQualifierTournament', '\n  });\n');
     const late = h.indexOf('let seat = seatQualifierLateEntrant(socket, qt, registrant);');
     expect(late).toBeGreaterThan(0);

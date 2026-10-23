@@ -121,9 +121,12 @@ export const QUALIFIER_MAX_REENTRIES: number | null = null;
  * at most one table is ever under-filled; this cap is the blast-radius guard:
  * at most this many overflow tables of one event in play at once (6 = 54
  * extra seats). Reached → the next arrival gets the old no_seat refund.
- * Railway env `QUALIFIER_OVERFLOW_TABLES_MAX` overrides it (read at boot, so
- * changing it restarts the server — only before the Sunday freeze); 0 = OFF
- * (the kill switch: exactly the behaviour before overflow tables).
+ * Railway env `QUALIFIER_OVERFLOW_TABLES_MAX` sets it at boot; 0 = OFF (the
+ * kill switch: exactly the behaviour before overflow tables). Review fix-up:
+ * it can ALSO be changed while the server runs, with no restart (a restart
+ * cancels a running qualifier) — POST /api/qualifiers/overflow {max} with the
+ * X-Internal-Token (index.ts setQualifierOverflowTablesMax; 0 also stops the
+ * feed). That value lasts until the next restart, which reads the env again.
  */
 export const QUALIFIER_OVERFLOW_TABLES_MAX = 6;
 const QUALIFIER_OVERFLOW_TABLES_HARD_MAX = 20;
@@ -136,6 +139,22 @@ export function qualifierOverflowTablesCap(raw: string | undefined): number {
   const n = Number(text);
   if (!Number.isFinite(n)) return QUALIFIER_OVERFLOW_TABLES_MAX;
   return Math.min(QUALIFIER_OVERFLOW_TABLES_HARD_MAX, Math.max(0, Math.floor(n)));
+}
+
+/**
+ * Review fix-up (2026-10-22) — the cap an operator asks for WHILE THE SERVER
+ * RUNS (POST /api/qualifiers/overflow {max}). Stricter than the env read: a
+ * missing / blank / non-numeric value is refused (null → 400, nothing changes)
+ * instead of quietly meaning 6. A number (or numeric string) is floored and
+ * clamped to 0..20 like the env value; 0 = OFF.
+ */
+export function parseQualifierOverflowCapUpdate(raw: unknown): number | null {
+  if (typeof raw !== 'number' && typeof raw !== 'string') return null;
+  const text = String(raw).trim();
+  if (text === '') return null;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return null;
+  return qualifierOverflowTablesCap(text);
 }
 
 /**
