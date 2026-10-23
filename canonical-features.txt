@@ -1701,3 +1701,14 @@ qualifier_break_started
 tournamentClock
 /api/qualifiers/breaks
 /api/qualifiers/pause
+
+# 2026-10-23 qualifier lifecycle S4 (owner 2026-10-22: "open the rooms 10 minutes
+# before game start so people can join and then start the game on time"): the
+# tables open QUALIFIER_TABLES_OPEN_BEFORE_MIN (10) minutes early with the online
+# registrants seated and the tournament held ('prestart'); pending registrants
+# sit down as they come online; at the start second the no-shows are released
+# and refunded, the tables broken / balanced and dealt at once. Runtime switch
+# POST /api/qualifiers/tables-open (X-Internal-Token, fails closed).
+qualifier_tables_opened_early
+qualifier_prestart_deal
+/api/qualifiers/tables-open

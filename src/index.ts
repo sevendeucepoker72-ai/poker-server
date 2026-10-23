@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -1259,6 +1259,8 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   'QUALIFIER_BALANCE_SET',
   // 2026-10-23 (qualifier lifecycle S3) — the scheduled-break switch (POST /api/qualifiers/breaks).
   'QUALIFIER_BREAKS_SET',
+  // 2026-10-23 (qualifier lifecycle S4) — the early-rooms lead (POST /api/qualifiers/tables-open).
+  'QUALIFIER_TABLES_OPEN_SET',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -3124,6 +3126,11 @@ app.get('/api/health', async (_req, res) => {
           breaks: { on: tournamentManager.breaksEnabled, everyLevels: QUALIFIER_BREAK_EVERY_LEVELS, minutes: QUALIFIER_BREAK_MINUTES, ...tournamentManager.breakStats },
           // The RIG-ONLY time scale (QUALIFIER_TEST_TIME_SCALE): ALWAYS 1 on Railway / NODE_ENV=production.
           testTimeScale: qualifierTestTimeScale(process.env),
+          // 2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes
+          // before game start") — early rooms: leadMin = the lead in force (0 = off;
+          // POST /api/qualifiers/tables-open); held = events seated and waiting for
+          // their first deal; holdErrors should stay 0.
+          preStart: qualifierPreStartHealth(),
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
@@ -3406,6 +3413,13 @@ interface QualifierTournamentReg {
   results?: Array<{ masterUserId: string | null; playerName: string; place: number; wonSeat: boolean; seats?: number }> | null;
   /** 2026-10-21 — the event's championship SEAT PACKAGE from the master ({place: seats}); null = the standard award. */
   seatPackage?: Record<number, number> | null;
+  /**
+   * 2026-10-23 (qualifier lifecycle S4) — when the last pre-start SUSPENSION
+   * SCREEN that completed began (screenQualifierRegistrants). The early rooms
+   * open only after one that began inside the screen window (every registrant
+   * before it was screened).
+   */
+  lastScreenAt?: number;
 }
 
 /** R2 (TOURNEY-3 / AUTH-9) — a registration is the MASTER account's (masterPlayerId), never a login handle / phone / name. */
@@ -3747,11 +3761,21 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
   };
 }
 
-/** C3 — every listed qualifier (finished ones for a day, for their results), soonest first. */
+/**
+ * C3 — every listed qualifier (finished ones for a day, for their results), soonest first.
+ * 2026-10-23 (qualifier lifecycle S4) — + additive, ONLY while the tables are
+ * open and held before the first deal (the early rooms): tablesOpen: true,
+ * dealsAt (ISO, the start second); absent otherwise (poker-3d reads absent as
+ * false / null). The REST item (/api/qualifier-tournaments/:id) adds the same.
+ */
 function qualifierList(viewerMasterId: string | null, now: number = Date.now()): Array<Record<string, unknown>> {
   return [...qualifierTournaments.entries()]
     .sort((a, b) => new Date(a[1].scheduledAt).getTime() - new Date(b[1].scheduledAt).getTime())
-    .map(([id, qt]) => qualifierListItem(id, qt, now, viewerMasterId));
+    .map(([id, qt]) => ({
+      ...qualifierListItem(id, qt, now, viewerMasterId),
+      // (Held = the 'prestart' pause, which only the early rooms set.)
+      ...((!!qt.tournamentId && tournamentManager.getTournament(qt.tournamentId)?.pauseReason === 'prestart') ? qualifierTablesOpenFields(qt) : {}),
+    }));
 }
 
 /**
@@ -3819,10 +3843,14 @@ function persistQualifierRegistration(qt: QualifierTournamentReg, masterId: stri
 }
 
 /** R2 (C3) — the registration count to every lobby: a NUMBER (`players` / `registeredCount`), never names. */
-function broadcastQualifierUpdate(qualId: string, qt: QualifierTournamentReg): void {
+function broadcastQualifierUpdate(qualId: string, qt: QualifierTournamentReg, extra?: Record<string, unknown>): void {
   const item = qualifierListItem(qualId, qt, Date.now(), null);
   io.emit('qualifierTournamentUpdate', {
     qualifierId: qualId, status: item.status, registeredCount: qt.players.length, players: qt.players.length, tournamentId: qt.tournamentId,
+    // 2026-10-23 (S4) — additive: tablesOpen + dealsAt while the early rooms hold the
+    // first deal (qualifierTablesOpenFields), or what the caller says (the deal: false / null).
+    ...((!!qt.tournamentId && tournamentManager.getTournament(qt.tournamentId)?.pauseReason === 'prestart') ? qualifierTablesOpenFields(qt) : {}),
+    ...(extra || {}),
   });
 }
 
@@ -4766,7 +4794,15 @@ app.get('/api/qualifier-tournaments', (_req, res) => {
 app.get('/api/qualifier-tournaments/:qualifierId', (req, res) => {
   const found = qualifierEventFor(req.params.qualifierId);
   if (!found) return res.json({ success: false, error: 'Not found' });
-  res.json({ success: true, tournament: qualifierListItem(found[0], found[1], Date.now(), null) });
+  // S4 — + tablesOpen / dealsAt while the early rooms hold the first deal (as qualifierList).
+  const heldQt = found[1];
+  res.json({
+    success: true,
+    tournament: {
+      ...qualifierListItem(found[0], heldQt, Date.now(), null),
+      ...((!!heldQt.tournamentId && tournamentManager.getTournament(heldQt.tournamentId)?.pauseReason === 'prestart') ? qualifierTablesOpenFields(heldQt) : {}),
+    },
+  });
 });
 
 /**
@@ -4867,6 +4903,14 @@ const qualifierStartTimers = new Map<string, ReturnType<typeof setTimeout>>();
 function tickQualifierAutoStart(now: number = Date.now()): void {
   pruneFinishedQualifiers(now);
   for (const [qualId, qt] of qualifierTournaments) {
+    // 2026-10-23 (qualifier lifecycle S4) — an event whose tables are OPEN and
+    // held before the first deal (the early rooms): presence is still sampled,
+    // online pending registrants are seated, and at its start second the deal
+    // runs (the backstop of its own timer). serviceQualifierPreStartHold.
+    if (qt.status === 'running' && qt.tournamentId && qualifierPreStartHolds.has(qt.tournamentId)) {
+      serviceQualifierPreStartHold(qualId, qt, now);
+      continue;
+    }
     if (qt.status !== 'registering') continue;
     const scheduledTime = new Date(qt.scheduledAt).getTime();
     // 2026-10-20 — who is online, sampled every tick from 15 min before the start.
@@ -4884,7 +4928,16 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
         qualifierStartTimers.set(startKey, startTimer);
       }
     }
-    if (now < scheduledTime) continue;
+    if (now < scheduledTime) {
+      // 2026-10-23 (S4, owner: "open the rooms 10 minutes before game start") —
+      // inside the early-rooms lead the tables open and the online registrants
+      // sit down, held until the start second (openQualifierTablesEarly; it
+      // retries on the next tick until its conditions hold). Lead 0 = off: the
+      // start below, exactly as before.
+      const openLeadMs = qualifierTablesOpenLeadMs();
+      if (openLeadMs > 0 && now >= scheduledTime - openLeadMs) openQualifierTablesEarly(qualId, qt, scheduledTime, now);
+      continue;
+    }
     // 2026-10-20 (owner) — it starts with the registrants who are HERE; the
     // others are released (credit refunded) just before the seating. Fewer
     // than 2 here: nobody is released, it waits (a registrant who comes back
@@ -4964,6 +5017,586 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
 }
 setInterval(() => tickQualifierAutoStart(), 30000);
 
+// ===== Early rooms (qualifier lifecycle S4, 2026-10-23) =====
+/**
+ * Owner 2026-10-22: "open the rooms 10 minutes before game start so people can
+ * join and then start the game on time". Before, the tables existed only from
+ * the first 30 s tick at / after the start second, and hand 1 was dealt in that
+ * same tick: nobody could sit down before 11:00.
+ *
+ * Now, QUALIFIER_TABLES_OPEN_BEFORE_MIN (10) minutes before the start, once at
+ * least two registrants are online and a suspension screen has completed, the
+ * tables open (openQualifierTablesEarly): sized for EVERY registrant
+ * (ceil(registrants / 9)), the online ones seated by the random draw, the
+ * tournament HELD with the 'prestart' pause — no card, no blind clock. The
+ * event is 'running' (late registration seats a new registrant at once, as
+ * always). A registrant still offline stays PENDING (in qt.players, his credit
+ * held, no entrant yet) and is seated the moment he is back
+ * (seatPendingQualifierRegistrant: the 5 s sweep, Return / "Take your seat",
+ * a Register tap). At the start second (runPreStartDeal, its own timer + the
+ * tick as a backstop) the no-shows are released and refunded EXACTLY as before
+ * (releaseQualifierNoShows: anyone not seen in the last 2 minutes — a seated
+ * one is stood up first), the present pending ones are seated, the empty /
+ * short tables are broken and the rest balanced, the hold ends (the full level
+ * 1 starts now) and every table is dealt at once.
+ *
+ * Kill switch: Railway env QUALIFIER_TABLES_OPEN_BEFORE_MIN (0 = off = the
+ * 11:00 start of before) at boot; while the server runs POST
+ * /api/qualifiers/tables-open {minutes} (X-Internal-Token, fails closed). A
+ * hold already open still deals at its start second (the hold marker drives
+ * it, never the lead). Health r2Play.qualifiers.preStart.
+ */
+let qualifierTablesOpenLeadMin = qualifierTablesOpenBeforeMin(process.env.QUALIFIER_TABLES_OPEN_BEFORE_MIN);
+/** The lead in force in ms (0 = the early rooms are off). */
+function qualifierTablesOpenLeadMs(): number {
+  const n = Number(qualifierTablesOpenLeadMin);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) * 60_000 : 0;
+}
+/** A held event: tournament id → its qualifier, the start second it deals at, its deal timer. */
+interface QualifierPreStartHold { qualId: string; dealsAt: number; timer: ReturnType<typeof setTimeout> | null }
+const qualifierPreStartHolds = new Map<string, QualifierPreStartHold>();
+/**
+ * Health r2Play.qualifiers.preStart: opened (events opened early), seatedAtOpen
+ * (online registrants entered at the open), seatedDuringHold (pending
+ * registrants seated while held), lateEntriesDuringHold (new registrants seated
+ * while held), released (no-shows released at the deal), dealt (holds dealt),
+ * seatFailures (a present pending registrant with no seat at the deal —
+ * released, refunded), backstopDeals (tables the 5 s sweep had to deal), and
+ * holdErrors (should stay 0).
+ */
+const qualifierPreStart = {
+  opened: 0, seatedAtOpen: 0, seatedDuringHold: 0, lateEntriesDuringHold: 0, released: 0, dealt: 0,
+  seatFailures: 0, backstopDeals: 0, holdErrors: 0, leadChanges: 0,
+};
+/** Tournament id → when runPreStartDeal dealt it: the 5 s sweep's backstop deal looks at it for QUALIFIER_PRESTART_BACKSTOP_MS. */
+const qualifierPreStartDealt = new Map<string, number>();
+const QUALIFIER_PRESTART_BACKSTOP_MS = 10 * 60_000;
+/** The deal's table breaks (Rule 1 / Rule 2) run synchronously at most this often; the rebalance's own 500 ms cascade continues past it. */
+const QUALIFIER_PRESTART_MAX_BREAKS = 60;
+
+function qualifierPreStartHealth(): Record<string, unknown> {
+  return {
+    leadMin: qualifierTablesOpenLeadMin,
+    ...qualifierPreStart,
+    held: [...qualifierPreStartHolds].map(([tournamentId, h]) => ({ qualifierId: h.qualId, tournamentId, dealsAt: new Date(h.dealsAt).toISOString() })),
+  };
+}
+
+/** The start second (epoch ms) a held tournament is dealt at; null = not held (the level clock's `dealsAt`). */
+function qualifierPreStartDealsAt(tournamentId: string): number | null {
+  return qualifierPreStartHolds.get(tournamentId)?.dealsAt ?? null;
+}
+
+/** The additive lobby / update fields while `qt`'s tables are open and held: {tablesOpen: true, dealsAt (ISO)}; {} otherwise. */
+function qualifierTablesOpenFields(qt: QualifierTournamentReg): { tablesOpen?: true; dealsAt?: string } {
+  const hold = qt.tournamentId ? qualifierPreStartHolds.get(qt.tournamentId) : undefined;
+  return hold ? { tablesOpen: true, dealsAt: new Date(hold.dealsAt).toISOString() } : {};
+}
+
+/**
+ * The early-rooms lead at runtime (no restart: a restart cancels a running
+ * qualifier). 0 = OFF from the next tick: an event not opened yet starts at its
+ * start second exactly as before S4. A hold ALREADY open is not touched (it
+ * still deals at its start second). Lasts until the next boot (which reads the
+ * env again). Logged + audited (`qualifier_tables_open_set`,
+ * QUALIFIER_TABLES_OPEN_SET, durable).
+ */
+function setQualifierTablesOpenLead(next: number, actor: string): { previous: number; minutes: number; held: number } {
+  const previous = qualifierTablesOpenLeadMin;
+  qualifierTablesOpenLeadMin = next;
+  qualifierPreStart.leadChanges++;
+  const held = qualifierPreStartHolds.size;
+  console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_tables_open_set', previous, minutes: next, held, actor })}`);
+  auditLog(actor, 'QUALIFIER_TABLES_OPEN_SET', { previous, minutes: next, held });
+  return { previous, minutes: next, held };
+}
+
+// S4 — the early-rooms lead at runtime, no restart: POST {minutes: 0..30} with
+// X-Internal-Token. FAILS CLOSED, as /api/qualifiers/overflow: no token
+// configured → 403. A missing / non-numeric `minutes` → 400 and nothing
+// changes. Answers {success, previous, minutes, held}; /api/health
+// r2Play.qualifiers.preStart.leadMin shows the value in force. Send {minutes:0}
+// BEFORE 10:50 MT to stop an early open (an open hold still deals at 11:00).
+app.post('/api/qualifiers/tables-open', (req, res) => {
+  const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
+  if (!internalTokenMatches(req.headers['x-internal-token'], tok)) {
+    res.status(403).json({ success: false, error: 'forbidden' });
+    return;
+  }
+  const next = parseQualifierTablesOpenUpdate(req.body?.minutes);
+  if (next === null) {
+    res.status(400).json({ success: false, error: 'minutes must be a number 0..30 (0 = off)', minutes: qualifierTablesOpenLeadMin });
+    return;
+  }
+  res.json({ success: true, ...setQualifierTablesOpenLead(next, 'internal:tables_open') });
+});
+
+/** A registrant of a STARTED event with no TournamentManager entrant yet (the early rooms' "pending"). */
+function qualifierRegistrantIsPending(tournamentId: string, reg: QualifierRegistrant): boolean {
+  const t = tournamentManager.getTournament(tournamentId);
+  return !!t && !t.players.some((p) => p.playerId === reg.playerId);
+}
+
+/** This registrant's live sockets (his master account's; else the registration socket). */
+function qualifierRegistrantSockets(reg: QualifierRegistrant): Socket[] {
+  if (reg.masterPlayerId) return socketsOfMaster(reg.masterPlayerId);
+  const s = reg.socketId ? io.sockets.sockets.get(reg.socketId) : undefined;
+  return s && s.connected ? [s] : [];
+}
+
+/** One of his live sockets that plays NO live seat elsewhere (TOURNEY-9) — the registration socket first; null = none. */
+function freeSocketOfQualifierRegistrant(reg: QualifierRegistrant): Socket | null {
+  const free = qualifierRegistrantSockets(reg).filter((s) => !socketPlaysLiveSeatElsewhere(s.id, ''));
+  return free.find((s) => s.id === reg.socketId) || free[0] || null;
+}
+
+/**
+ * The early OPEN (the tick, inside the lead, for a 'registering' event). Only
+ * when ALL hold: at least two registrants are online NOW; no suspension screen
+ * is in flight; a screen that began inside the screen window has completed
+ * (qt.lastScreenAt). Otherwise nothing changes and the next tick retries; an
+ * event never opened starts at its start second through the old path.
+ * startQualifierTournament with the ONLINE registrants, tables for ALL of them
+ * and the 'prestart' hold (no deal). null → back to 'registering' (the old
+ * path runs at the start second). true = opened.
+ */
+function openQualifierTablesEarly(qualId: string, qt: QualifierTournamentReg, scheduledTime: number, now: number): boolean {
+  if (qt.status !== 'registering' || qt.tournamentId) return false;
+  const leadMs = qualifierTablesOpenLeadMs();
+  if (!(leadMs > 0) || now < scheduledTime - leadMs || now >= scheduledTime) return false;
+  const online = qt.players.filter((p) => qualifierRegistrantOnline(p));
+  if (online.length < 2) return false;
+  if (qualifierScreensInFlight.has(qualId)) return false;
+  if (!(typeof qt.lastScreenAt === 'number' && qt.lastScreenAt >= scheduledTime - leadMs - QUALIFIER_SCREEN_LEAD_MS)) return false;
+
+  qt.status = 'starting';
+  const humanPlayers = online.map((p) => ({
+    id: p.playerId, name: p.playerName, socketId: p.socketId, masterId: p.masterPlayerId || null,
+  }));
+  const tableCount = Math.max(1, Math.ceil(qt.players.length / 9));
+  const result = startQualifierTournament(humanPlayers, qt.startingStack || 50000, false, { tableCount, hold: true });
+  if (!result) {
+    qt.status = 'registering';   // the old path runs at the start second
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_tables_open_failed', qualifierId: qualId, online: online.length })}`);
+    return false;
+  }
+  qt.status = 'running';
+  qt.tournamentId = result.tournamentId;
+  const dealsAt = scheduledTime;
+  const tournamentId = result.tournamentId;
+  const timer = setTimeout(() => runPreStartDeal(tournamentId), Math.max(0, dealsAt - Date.now()));
+  timer.unref?.();
+  qualifierPreStartHolds.set(tournamentId, { qualId, dealsAt, timer });
+  qualifierPreStart.opened++;
+  qualifierPreStart.seatedAtOpen += online.length;
+  const dealsAtIso = new Date(dealsAt).toISOString();
+
+  // The start's notice (as the old start: on the socket his seat was bound to),
+  // + additive seatIndex, dealsAt and preStart.
+  const startedT = tournamentManager.getTournament(tournamentId);
+  for (const p of online) {
+    const boundSid = startedT?.players.find((x) => x.playerId === p.playerId)?.socketId ?? '';
+    const sock = boundSid ? io.sockets.sockets.get(boundSid) : undefined;
+    if (!sock) continue;
+    const playerTable = tournamentManager.getPlayerTable(tournamentId, p.playerId);
+    const startSess = playerSessions.get(boundSid);
+    const seated = !!startSess && !!playerTable && startSess.tableId === playerTable && startSess.playerId === p.playerId;
+    const seatIndex = playerTable ? tournamentLiveSeatIndex(tableManager.getTable(playerTable), p.playerId) : -1;
+    sock.emit('qualifierTournamentStarted', {
+      qualifierId: qualId, tournamentId, tableId: playerTable || result.tableIds[0], tableCount: result.tableCount,
+      playerCount: qt.players.length, seated, ...(seatIndex >= 0 ? { seatIndex } : {}), dealsAt: dealsAtIso, preStart: true,
+    });
+  }
+  // Every table's state again: its clock now carries dealsAt (the hold is recorded).
+  for (const tid of result.tableIds) broadcastGameState(tid);
+  io.emit('qualifierTournamentUpdate', {
+    qualifierId: qualId, status: 'running', tournamentId, playerCount: qt.players.length, tableCount: result.tableCount,
+    registeredCount: qt.players.length, players: qt.players.length, tablesOpen: true, dealsAt: dealsAtIso,
+  });
+  console.log(`[Qualifier] ${JSON.stringify({
+    event: 'qualifier_tables_opened_early', qualifierId: qualId, tournamentId, tables: result.tableCount,
+    seated: online.length, pending: qt.players.length - online.length, dealsAt: dealsAtIso, leadMin: qualifierTablesOpenLeadMin,
+  })}`);
+  return true;
+}
+
+/**
+ * seatQualifierLateEntrant's placement with an OPTIONAL socket: a NEW entrant
+ * (addLateEntrant — places stay 1..N) on the fewest-alive table's first
+ * placeable seat (a break-pending table last; a busted seat is stood up first),
+ * the starting stack. With a socket: his session bound (P-g detach first), his
+ * room. Without one (null): an ABSENT seat — the entrant and the seat, no
+ * session (his sign-in / Return restores it, as a start's absent seat). null =
+ * no seat (nothing changed). No credit is touched here.
+ */
+function seatQualifierEntrantAt(
+  socket: Socket | null, qt: QualifierTournamentReg, reg: QualifierRegistrant,
+): { tableId: string; seatIndex: number } | null {
+  const tournamentId = qt.tournamentId;
+  const tournament = tournamentId ? tournamentManager.getTournament(tournamentId) : undefined;
+  if (!tournamentId || !tournament || tournament.status !== 'running') return null;
+  const stack = qt.startingStack || QUALIFIER_BASE_STACK;
+  const tables = tournament.tableIds
+    .map((tid) => ({
+      tid, table: tableManager.getTable(tid), alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length,
+      breakPending: tournamentBreaksAwaitingHandEnd.get(tid) === tournamentId,
+    }))
+    .filter((x): x is { tid: string; table: PokerTable; alive: number; breakPending: boolean } => !!x.table)
+    .sort((a, b) => (Number(a.breakPending) - Number(b.breakPending)) || (a.alive - b.alive));
+  for (const { tid, table } of tables) {
+    for (let s = 0; s < table.seats.length; s++) {
+      if (!tournamentSeatIsPlaceable(tournamentId, table, s)) continue;
+      if (table.seats[s].state !== 'empty') vacateBustedTournamentSeat(table, tid, s);
+      if (!tournamentManager.addLateEntrant(tournamentId, reg.playerId, reg.playerName, socket ? socket.id : '', stack, { masterUserId: reg.masterPlayerId })) return null;
+      if (!table.sitDown(s, reg.playerName, stack, reg.playerId, false)) {
+        tournamentManager.removeLateEntrant(tournamentId, reg.playerId);
+        continue;
+      }
+      tournamentManager.setPlayerTable(tournamentId, reg.playerId, tid);
+      if (socket) {
+        detachSocketFromOtherTables(socket, tid, 'seat', 'qualifierPreStartSeat');   // P-g
+        playerSessions.set(socket.id, {
+          socketId: socket.id, tableId: tid, seatIndex: s, playerName: reg.playerName, playerId: reg.playerId,
+          trainingEnabled: false, sittingOut: false,
+        });
+        for (const ttid of tournament.tableIds) spectators.get(ttid)?.delete(socket.id);
+        socket.join(`table:${tid}`);
+      }
+      scheduleDealAfterTournamentSeat(tid);   // F95 (held: nothing deals before the start second)
+      return { tableId: tid, seatIndex: s };
+    }
+  }
+  return null;
+}
+
+/**
+ * A PENDING registrant of a started (held, or just dealt) event takes his seat:
+ * on `socket` (his session bound — the client opens the table), or ABSENT with
+ * null. It consumes NO credit (his entry's credit was consumed when he
+ * registered). Refused (null, he stays pending): the event is not running, he
+ * is not pending (already an entrant), or the socket plays a live seat
+ * elsewhere (TOURNEY-9). No placeable seat: an overflow table, as a late entry
+ * (openQualifierOverflowTable; its cap / kill switch apply). The socket is told
+ * `qualifierTournamentStarted {seated:true, tableId, seatIndex, dealsAt,
+ * preStart}` (dealsAt / preStart while held). Log `qualifier_prestart_seated`.
+ */
+function seatPendingQualifierRegistrant(
+  qualId: string, qt: QualifierTournamentReg, reg: QualifierRegistrant, socket: Socket | null, via: string,
+): { tableId: string; seatIndex: number } | null {
+  const tournamentId = qt.tournamentId;
+  const tournament = tournamentId ? tournamentManager.getTournament(tournamentId) : undefined;
+  if (!tournamentId || !tournament || tournament.status !== 'running' || qt.status !== 'running') return null;
+  if (!qt.players.includes(reg) || !qualifierRegistrantIsPending(tournamentId, reg)) return null;
+  if (socket && (!socket.connected || socketPlaysLiveSeatElsewhere(socket.id, ''))) return null;
+  let seat = seatQualifierEntrantAt(socket, qt, reg);
+  if (!seat) {
+    const overflowTableId = openQualifierOverflowTable(qt);
+    if (overflowTableId) {
+      seat = seatQualifierEntrantAt(socket, qt, reg);
+      if (!seat || seat.tableId !== overflowTableId) {
+        closeUnusedQualifierOverflowTable(tournamentId, overflowTableId, seat ? 'prestart_seated_elsewhere' : 'prestart_not_seated');
+      } else {
+        qualifierOverflow.lateEntriesSeated++;
+      }
+    }
+  }
+  if (!seat) {
+    console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_seat_failed', qualifierId: qualId, tournamentId, via, absent: !socket })}`);
+    return null;
+  }
+  const hold = qualifierPreStartHolds.get(tournamentId);
+  if (hold) qualifierPreStart.seatedDuringHold++;
+  if (socket) {
+    reg.socketId = socket.id;
+    reg.lastOnlineAt = Math.max(reg.lastOnlineAt || 0, Date.now());   // he is here
+  }
+  console.log(`[Qualifier] ${JSON.stringify({
+    event: 'qualifier_prestart_seated', qualifierId: qualId, tournamentId, tableId: seat.tableId, seatIndex: seat.seatIndex,
+    via, absent: !socket, held: !!hold,
+  })}`);
+  if (socket) {
+    socket.emit('qualifierTournamentStarted', {
+      qualifierId: qualId, tournamentId, tableId: seat.tableId, tableCount: tournament.tableIds.length, playerCount: qt.players.length,
+      seated: true, seatIndex: seat.seatIndex,
+      ...(hold ? { dealsAt: new Date(hold.dealsAt).toISOString(), preStart: true } : {}),
+      ...qualifierOverflowSeatFlags(seat.tableId),
+    });
+  }
+  broadcastGameState(seat.tableId);
+  return seat;
+}
+
+/** Every PENDING registrant of a held event with a free live socket sits down on it (the 5 s sweep, the tick). Returns how many. */
+function seatOnlinePendingQualifierRegistrants(qualId: string, qt: QualifierTournamentReg, via: string): number {
+  const tournamentId = qt.tournamentId;
+  if (!tournamentId || qt.status !== 'running') return 0;
+  let n = 0;
+  for (const reg of qt.players.slice()) {
+    if (!qualifierRegistrantIsPending(tournamentId, reg)) continue;
+    const sock = freeSocketOfQualifierRegistrant(reg);
+    if (!sock) continue;
+    try {
+      if (seatPendingQualifierRegistrant(qualId, qt, reg, sock, via)) n++;
+    } catch (e: any) {
+      qualifierPreStart.holdErrors++;
+      console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_seat_error', qualifierId: qualId, tournamentId, via, error: String(e?.message || e) })}`);
+    }
+  }
+  return n;
+}
+
+/**
+ * 'returnToTournamentSeat' {tournamentId} by a PENDING registrant of a held
+ * qualifier (the lobby's "Take your seat"): seated now on `socket` (no credit
+ * consumed — seatPendingQualifierRegistrant) and answered exactly like a
+ * return: `reconnectedToTable {tableId, seatIndex, tournamentId, sittingOut:
+ * false}` + a full gameState; the caller answers {success:true, tournamentId,
+ * tableId, seatIndex}. A session `own` left on a dead seat ends first (as the
+ * handler's own restore does). null = not a pending registrant of a held event,
+ * or no seat: the handler's usual search follows.
+ */
+function returnPendingQualifierRegistrant(
+  socket: Socket, auth: SocketAuthSession, tournamentId: string, own: PlayerSession | undefined,
+): { tournamentId: string; tableId: string; seatIndex: number } | null {
+  if (!qualifierPreStartHolds.has(tournamentId)) return null;
+  const q = qualifierOfTournament(tournamentId);
+  const master = String(auth.masterUserId || auth.statsMasterUserId || '');
+  const reg = q && master ? q.qt.players.find((p) => !!p.masterPlayerId && p.masterPlayerId === master) : undefined;
+  if (!q || !reg || !qualifierRegistrantIsPending(tournamentId, reg)) return null;
+  if (socketPlaysLiveSeatElsewhere(socket.id, '')) return null;   // (the handler refused a live seat elsewhere already)
+  if (own) {
+    playerSessions.delete(socket.id);
+    releaseSeatedSlot(socket.id, own.tableId);
+    socket.leave(`table:${own.tableId}`);
+  }
+  const seat = seatPendingQualifierRegistrant(q.qualId, q.qt, reg, socket, 'return');
+  const table = seat ? tableManager.getTable(seat.tableId) : undefined;
+  if (!seat || !table) return null;
+  tournamentSeatKeep.returned++;
+  socket.emit('reconnectedToTable', { tableId: seat.tableId, seatIndex: seat.seatIndex, tournamentId, sittingOut: false });
+  emitGameState(socket, getGameStateForPlayer(table, seat.seatIndex), true);
+  return { tournamentId, tableId: seat.tableId, seatIndex: seat.seatIndex };
+}
+
+/** The tick's step for a HELD event: presence sampled, online pending registrants seated, the deal at its start second (backstop). */
+function serviceQualifierPreStartHold(qualId: string, qt: QualifierTournamentReg, now: number): void {
+  const tournamentId = qt.tournamentId;
+  const hold = tournamentId ? qualifierPreStartHolds.get(tournamentId) : undefined;
+  if (!tournamentId || !hold) return;
+  samplePresence(qt.players, qualifierRegistrantOnline, now);
+  if (now >= hold.dealsAt) { runPreStartDeal(tournamentId, now); return; }
+  seatOnlinePendingQualifierRegistrants(qualId, qt, 'tick');
+}
+
+/** The 5 s sweep's step: every held event seats its online pending registrants (a hold whose event is gone is forgotten). */
+function serviceQualifierPreStartHolds(): void {
+  for (const [tournamentId, hold] of [...qualifierPreStartHolds]) {
+    const t = tournamentManager.getTournament(tournamentId);
+    if (!t || t.status !== 'running') {
+      if (hold.timer) clearTimeout(hold.timer);
+      qualifierPreStartHolds.delete(tournamentId);
+      continue;
+    }
+    // Its start second passed and its timer did not deal it (a backstop, like the tick's).
+    if (Date.now() >= hold.dealsAt) { runPreStartDeal(tournamentId); continue; }
+    const qt = qualifierTournaments.get(hold.qualId);
+    if (!qt || qt.tournamentId !== tournamentId) continue;
+    seatOnlinePendingQualifierRegistrants(hold.qualId, qt, 'sweep');
+  }
+}
+
+/**
+ * A SEATED registrant released at the deal (a no-show): his seat goes before
+ * the first card — stood up (tournament chips, never a wallet), every pointer
+ * at it dropped (forgetSeatPointers: sessions, reservations, sit-out), his
+ * voluntary-absence mark cleared, and the entrant removed (removeLateEntrant:
+ * nobody has busted, places stay 1..N, `entries` goes back down).
+ */
+function unseatPreStartEntrant(tournamentId: string, reg: QualifierRegistrant): boolean {
+  const t = tournamentManager.getTournament(tournamentId);
+  const tp = t?.players.find((p) => p.playerId === reg.playerId);
+  if (!t || !tp || tp.eliminated) return false;
+  for (const tid of [t.playerTableMap.get(reg.playerId), ...t.tableIds]) {
+    if (!tid) continue;
+    const table = tableManager.getTable(tid);
+    const idx = tournamentLiveSeatIndex(table, reg.playerId);
+    if (idx < 0) continue;
+    table!.standUp(idx);
+    forgetSeatPointers(tid, idx);
+    break;
+  }
+  voluntarilyAbsentTournamentEntrants.delete(voluntaryAbsenceKey(tournamentId, reg.playerId));
+  return tournamentManager.removeLateEntrant(tournamentId, reg.playerId);
+}
+
+/**
+ * A PRESENT pending registrant at the deal: seated on a free live socket, else
+ * absent (his other sockets, which play elsewhere, told `tournamentSeatKept`
+ * as at a start). No seat at all (the overflow cap): released — his credit
+ * refunded, told `qualifierCancelled {reason:'no_seat'}` — never a credit
+ * without a seat. true = seated.
+ */
+function seatPresentPendingAtDeal(qualId: string, qt: QualifierTournamentReg, reg: QualifierRegistrant): boolean {
+  const tournamentId = qt.tournamentId!;
+  const sock = freeSocketOfQualifierRegistrant(reg);
+  let seat = sock ? seatPendingQualifierRegistrant(qualId, qt, reg, sock, 'deal') : null;
+  let absentSeat = false;
+  if (!seat && qualifierRegistrantIsPending(tournamentId, reg)) {
+    seat = seatPendingQualifierRegistrant(qualId, qt, reg, null, 'deal');
+    absentSeat = !!seat;
+  }
+  if (seat && absentSeat) {
+    const chips = tableManager.getTable(seat.tableId)?.seats[seat.seatIndex]?.chipCount ?? (qt.startingStack || QUALIFIER_BASE_STACK);
+    for (const s of qualifierRegistrantSockets(reg)) {
+      s.emit('tournamentSeatKept', {
+        tournamentId, tableId: seat.tableId, seatIndex: seat.seatIndex, chips, atStart: true,
+        tournamentName: tournamentManager.getTournament(tournamentId)?.config.name || 'Tournament',
+      });
+    }
+  }
+  if (seat) return true;
+  qualifierPreStart.seatFailures++;
+  qt.players = qt.players.filter((p) => p !== reg);
+  const creditRefunded = !!reg.consumedCreditId;
+  for (const s of qualifierRegistrantSockets(reg)) s.emit('qualifierCancelled', { qualifierId: qualId, reason: 'no_seat', creditRefunded });
+  void releaseQualifierRegistration(qualId, qt, reg, 'no_seat');
+  console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_no_seat_released', qualifierId: qualId, tournamentId })}`);
+  return false;
+}
+
+/**
+ * THE DEAL at the start second (the hold's timer; the tick and the 5 s sweep as
+ * backstops). Idempotent: the hold marker is checked and deleted FIRST, so a
+ * second call does nothing. In order:
+ *  (1) presence sampled, the field split (partitionByPresence: the 2-minute grace);
+ *  (2) with >= 2 present, EVERY absent registrant is released through the
+ *      unchanged releaseQualifierNoShows (credit refunded, master row dropped,
+ *      told at the next sign-in) — a SEATED one is stood up first
+ *      (unseatPreStartEntrant); with fewer than 2 present only the absent
+ *      PENDING ones go and every seated entrant stays;
+ *  (3) every present pending registrant is seated (seatPresentPendingAtDeal);
+ *  (5) the breaks (Rule 1 / Rule 2: empty and short tables) — no hand is in
+ *      progress, so they run now; (6) the pre-deal balance (S2);
+ *  (7) the hold ends: the FULL level 1 starts now; (8) every table with >= 2
+ *      alive is dealt (restartWaitingTournamentTables startWaiting — overflow
+ *      tables included); (9) the lobby and every table told.
+ * Steps 1-6 are in a try: a throw counts holdErrors and the tournament is
+ * STILL un-held and dealt (7-9 always run) — a held event is never left stuck.
+ */
+function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
+  const hold = qualifierPreStartHolds.get(tournamentId);
+  if (!hold) return;
+  qualifierPreStartHolds.delete(tournamentId);
+  if (hold.timer) clearTimeout(hold.timer);
+  const qualId = hold.qualId;
+  const qt = qualifierTournaments.get(qualId);
+  let seated = 0;
+  let released = 0;
+  let breaks = 0;
+  let balanceMoves = 0;
+  let error: string | null = null;
+  try {
+    const t = tournamentManager.getTournament(tournamentId);
+    if (qt && qt.tournamentId === tournamentId && t && t.status === 'running') {
+      samplePresence(qt.players, qualifierRegistrantOnline, now);
+      const { present, absent } = partitionByPresence(qt.players, now);
+      const release = present.length >= 2 ? absent : absent.filter((p) => qualifierRegistrantIsPending(tournamentId, p));
+      for (const p of release) if (!qualifierRegistrantIsPending(tournamentId, p)) unseatPreStartEntrant(tournamentId, p);
+      if (release.length > 0) releaseQualifierNoShows(qualId, qt, release, now);
+      released = release.length;
+      qualifierPreStart.released += released;
+      for (const p of present) {
+        if (!qt.players.includes(p) || !qualifierRegistrantIsPending(tournamentId, p)) continue;
+        if (seatPresentPendingAtDeal(qualId, qt, p)) seated++;
+      }
+      for (let i = 0; i < QUALIFIER_PRESTART_MAX_BREAKS && planTournamentRebalance(tournamentId); i++) {
+        handleTableRebalance(tournamentId);
+        breaks++;
+      }
+      balanceMoves = balanceQualifierTablesNow(tournamentId);
+      // Every table's progress listener (bust check, hand results) before its first hand.
+      for (const tid of t.tableIds) {
+        const table = tableManager.getTable(tid);
+        if (table) ensureTableProgressListener(table, tid);
+      }
+    }
+  } catch (e: any) {
+    qualifierPreStart.holdErrors++;
+    error = String(e?.message || e);
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: qualId, tournamentId, step: 'prepare', error })}`);
+  }
+  // (7) + (8) ALWAYS: never a held event left stuck.
+  try {
+    tournamentManager.pauseTournament(tournamentId, false, 'prestart');
+  } catch (e: any) {
+    qualifierPreStart.holdErrors++;
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: qualId, tournamentId, step: 'resume', error: String(e?.message || e) })}`);
+  }
+  try {
+    restartWaitingTournamentTables(tournamentId, { startWaiting: true });
+  } catch (e: any) {
+    qualifierPreStart.holdErrors++;
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: qualId, tournamentId, step: 'deal', error: String(e?.message || e) })}`);
+  }
+  qualifierPreStartDealt.set(tournamentId, Date.now());
+  qualifierPreStart.dealt++;
+  // (9)
+  let tables = 0;
+  let dealtTables = 0;
+  try {
+    for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
+      tables++;
+      if (tableManager.getTable(tid)?.isHandInProgress()) dealtTables++;
+      broadcastGameState(tid);
+    }
+    if (qt) broadcastQualifierUpdate(qualId, qt, { tablesOpen: false, dealsAt: null });
+    broadcastTournamentList();
+  } catch (e: any) {
+    qualifierPreStart.holdErrors++;
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: qualId, tournamentId, step: 'notify', error: String(e?.message || e) })}`);
+  }
+  console.log(`[Qualifier] ${JSON.stringify({
+    event: 'qualifier_prestart_deal', qualifierId: qualId, tournamentId, lateByMs: Date.now() - hold.dealsAt, tables, dealtTables,
+    seated, released, breaks, balanceMoves, alive: tournamentManager.getAliveCount(tournamentId), ...(error ? { error } : {}),
+  })}`);
+}
+
+/**
+ * The 5 s sweep's backstop for a JUST-DEALT event (QUALIFIER_PRESTART_BACKSTOP_MS
+ * after its deal): a table of it still WaitingForPlayers with hand 0, >= 2
+ * alive and no deal hold (tournamentDealHoldReason) is dealt now — a table a
+ * break's movers filled after the deal, or one the deal missed. Never throws.
+ */
+function servicePreStartDealBackstop(): void {
+  const now = Date.now();
+  for (const [tournamentId, at] of [...qualifierPreStartDealt]) {
+    const t = tournamentManager.getTournament(tournamentId);
+    if (!t || t.status !== 'running' || now - at > QUALIFIER_PRESTART_BACKSTOP_MS) {
+      qualifierPreStartDealt.delete(tournamentId);
+      continue;
+    }
+    for (const tid of [...t.tableIds]) {
+      try {
+        const table = tableManager.getTable(tid);
+        if (!table || table.currentPhase !== GamePhase.WaitingForPlayers || table.handNumber !== 0) continue;
+        if (table.isStartingHand() || table.isCompletingHand()) continue;
+        if (tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length < 2) continue;
+        if (tournamentDealHoldReason(tid, tournamentId, table) !== null) continue;
+        ensureTableProgressListener(table, tid);
+        if (!table.startNewHand()) continue;
+        qualifierPreStart.backstopDeals++;
+        console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_backstop_deal', tournamentId, tableId: tid })}`);
+        broadcastGameState(tid);
+        scheduleAIAction(tid);
+      } catch (e: any) {
+        qualifierPreStart.holdErrors++;
+        console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_backstop_failed', tournamentId, tableId: tid, error: String(e?.message || e) })}`);
+      }
+    }
+  }
+}
+// ===== end early rooms =====
+
 /**
  * 2026-10-07 — qualifier PRE-START SUSPENSION SCREEN.
  *
@@ -4980,9 +5613,22 @@ setInterval(() => tickQualifierAutoStart(), 30000);
  * Runs on its own timer so the auto-start loop above is untouched.
  */
 const QUALIFIER_SCREEN_LEAD_MS = 5 * 60 * 1000;
+/**
+ * 2026-10-23 (qualifier lifecycle S4) — the screen window opens the early-rooms
+ * lead PLUS QUALIFIER_SCREEN_LEAD_MS before the start (15 minutes with the
+ * default 10), so a screen has completed before the tables open; with the lead
+ * at 0 it is the 5 minutes of before.
+ */
+function qualifierScreenLeadMs(): number {
+  return QUALIFIER_SCREEN_LEAD_MS + qualifierTablesOpenLeadMs();
+}
 const qualifierScreensInFlight = new Set<string>();
 async function screenQualifierRegistrants(qualId: string, qt: QualifierTournamentReg): Promise<void> {
+  const screenStartedAt = Date.now();
   const { suspended } = await partitionSuspendedRegistrants(qt.players.slice(), (id) => playStatusClient.getPlayStatus(id));
+  // S4 — a screen COMPLETED: everyone registered before it began was screened
+  // (the early rooms wait for one — openQualifierTablesEarly).
+  qt.lastScreenAt = Math.max(qt.lastScreenAt || 0, screenStartedAt);
   if (suspended.length === 0) return;
   if (qt.status !== 'registering') {
     console.warn(`[play-gate] ${JSON.stringify({ event: 'qualifier_screen_too_late', qualifierId: qualId, status: qt.status, suspendedCount: suspended.length })}`);
@@ -5015,18 +5661,19 @@ async function screenQualifierRegistrants(qualId: string, qt: QualifierTournamen
   // R2 (C3) — the count as a NUMBER (it listed every registrant's name to every lobby).
   broadcastQualifierUpdate(qualId, qt);
 }
-setInterval(() => {
-  const now = Date.now();
+/** The 20 s screen loop ('registering' events only); S4 — named (its window follows the early-rooms lead). */
+function tickQualifierScreens(now: number = Date.now()): void {
   for (const [qualId, qt] of qualifierTournaments) {
     if (qt.status !== 'registering' || qt.players.length === 0) continue;
-    if (new Date(qt.scheduledAt).getTime() - now > QUALIFIER_SCREEN_LEAD_MS) continue;
+    if (new Date(qt.scheduledAt).getTime() - now > qualifierScreenLeadMs()) continue;
     if (qualifierScreensInFlight.has(qualId)) continue;
     qualifierScreensInFlight.add(qualId);
     screenQualifierRegistrants(qualId, qt)
       .catch((e) => console.error('[play-gate] qualifier screen failed:', e?.message || e))
       .finally(() => qualifierScreensInFlight.delete(qualId));
   }
-}, 20000);
+}
+setInterval(() => tickQualifierScreens(), 20000);
 
 // ========== Helper Functions ==========
 
@@ -5126,7 +5773,8 @@ function tournamentClockStateFor(tournamentId: string): TournamentClockState | n
   const t = tournamentManager.getTournament(tournamentId);
   if (!t) return null;
   const now = Date.now();
-  const sig = `${t.status}|${t.paused}|${t.pauseReason}|${t.currentBlindLevel}|${t.levelEndsAt}|${t.levelRemainingMs}|${t.breakUntil}|${t.entries}`;
+  // S4 — + the early rooms' deal second (dealsAt) while held.
+  const sig = `${t.status}|${t.paused}|${t.pauseReason}|${t.currentBlindLevel}|${t.levelEndsAt}|${t.levelRemainingMs}|${t.breakUntil}|${t.entries}|${t.pauseReason === 'prestart' ? qualifierPreStartDealsAt(tournamentId) : ''}`;
   const hit = tournamentClockMemo.get(tournamentId);
   if (hit && hit.sig === sig && now >= hit.at && now - hit.at < TOURNAMENT_CLOCK_MEMO_MS) return hit.value;
   let value: TournamentClockState | null = null;
@@ -5168,7 +5816,8 @@ function buildTournamentClockState(tournamentId: string, t: Tournament, now: num
       paused: c.paused,
       pauseReason: c.pauseReason,
       breakUntil: c.breakUntil,
-      dealsAt: null,
+      // S4 (the early rooms) — the start second the held tables are dealt at (epoch ms); null otherwise.
+      dealsAt: t.pauseReason === 'prestart' ? (qualifierPreStartDealsAt(tournamentId) ?? null) : null,
       playersLeft: c.alive,
       entries: c.entries,
       avgStack: c.alive > 0 ? Math.round((c.entries * startingChips) / c.alive) : null,
@@ -11554,6 +12203,35 @@ io.on('connection', (socket: Socket) => {
       return;
     }
 
+    // 2026-10-23 (qualifier lifecycle S4, the early rooms) — a PENDING
+    // registrant's Register tap while the tables are open and held: he is
+    // seated now on this socket (seatPendingQualifierRegistrant — NO credit is
+    // consumed: his entry's credit was consumed when he registered). BEFORE the
+    // qualification gate: that credit is already used, so the gate would refuse
+    // him 'not_qualified'. A socket that plays a live seat elsewhere is refused
+    // already_seated (he stays registered).
+    // (Held = the 'prestart' pause, which only the early rooms set.)
+    if (isLateReg && qt.tournamentId && tournamentManager.getTournament(qt.tournamentId)?.pauseReason === 'prestart') {
+      const pendingReg = qt.players.find((p) => !!p.masterPlayerId && p.masterPlayerId === masterId);
+      if (pendingReg && qualifierRegistrantIsPending(qt.tournamentId, pendingReg)) {
+        if (socketPlaysLiveSeatElsewhere(socket.id, '')) {
+          refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST, { registered: true });
+          return;
+        }
+        const pendingSeat = seatPendingQualifierRegistrant(qualId, qt, pendingReg, socket, 'register');
+        if (!pendingSeat) {
+          refuseQualifier('no_seat', 'No seat is free right now — you are still registered. Try again in a minute.', { registered: true });
+          return;
+        }
+        socket.emit('qualifierRegistrationResult', {
+          success: true, qualifierId: qualId, registered: true, preStart: true, tournamentId: qt.tournamentId,
+          tableId: pendingSeat.tableId, seatIndex: pendingSeat.seatIndex, registeredCount: qt.players.length,
+          ...qualifierTablesOpenFields(qt),
+        });
+        return;
+      }
+    }
+
     // 2026-06-19 audit fix (CRITICAL) — server-authoritative qualification gate.
     // Previously NOTHING here verified qualification: the ".online You're
     // Qualified!" button was UX-only, so any logged-in player could emit this
@@ -12009,17 +12687,25 @@ io.on('connection', (socket: Socket) => {
       qualifierLateEntries.seated++;
       // 2026-10-22 — additive: overflowTable (+ waitingForPlayers while he sits there alone).
       const lateSeatFlags = qualifierOverflowSeatFlags(seat.tableId);
-      auditLog(auth.username, 'QUALIFIER_LATE_ENTRY_SEATED', { qualifierId: qualId, tournamentId: qt.tournamentId, tableId: seat.tableId, seatIndex: seat.seatIndex, ...lateSeatFlags });
+      // 2026-10-23 (S4) — registered while the early rooms hold the first deal:
+      // additive preStart (audit + frames) and dealsAt (frames).
+      const preStartHeld = !!qt.tournamentId && tournamentManager.getTournament(qt.tournamentId)?.pauseReason === 'prestart';
+      if (preStartHeld) qualifierPreStart.lateEntriesDuringHold++;
+      const preStartFlags = preStartHeld ? { preStart: true, ...qualifierTablesOpenFields(qt) } : {};
+      auditLog(auth.username, 'QUALIFIER_LATE_ENTRY_SEATED', {
+        qualifierId: qualId, tournamentId: qt.tournamentId, tableId: seat.tableId, seatIndex: seat.seatIndex, ...lateSeatFlags,
+        ...(preStartHeld ? { preStart: true } : {}),
+      });
       socket.emit('qualifierRegistrationResult', {
         success: true, qualifierId: qualId, registered: true, lateEntry: true,
         tournamentId: qt.tournamentId, tableId: seat.tableId, registeredCount: qt.players.length,
-        ...lateSeatFlags,
+        ...lateSeatFlags, ...preStartFlags,
       });
       const lateT = qt.tournamentId ? tournamentManager.getTournament(qt.tournamentId) : undefined;
       socket.emit('qualifierTournamentStarted', {
         qualifierId: qualId, tournamentId: qt.tournamentId, tableId: seat.tableId,
         tableCount: lateT?.tableIds.length ?? 1, playerCount: qt.players.length, lateEntry: true,
-        ...lateSeatFlags,
+        ...lateSeatFlags, ...(preStartHeld ? { seatIndex: seat.seatIndex } : {}), ...preStartFlags,
       });
       broadcastGameState(seat.tableId);
       broadcastQualifierUpdate(qualId, qt);
@@ -20415,6 +21101,15 @@ Give feedback in this JSON format:
       answer({ success: false, code: 'already_seated', error: 'Leave your current table first, then tap Return to tournament.' });
       return;
     }
+    // 2026-10-23 (qualifier lifecycle S4, the early rooms) — the NAMED tournament
+    // is held before its first deal (the 'prestart' pause only the early rooms
+    // set) and this account is a PENDING registrant of it (no seat yet): he is
+    // seated now on this socket (no credit consumed) and answered exactly like a
+    // return — the lobby's "Take your seat" (returnPendingQualifierRegistrant).
+    if (wanted !== undefined && tournamentManager.getTournament(wanted)?.pauseReason === 'prestart') {
+      const pre = returnPendingQualifierRegistrant(socket, auth, wanted, own);
+      if (pre) { answer({ success: true, ...pre }); return; }
+    }
     // Z4 (2026-10-10) — P-c'' takeover only for a NAMED tournament. A Return
     // with no tournamentId is restored to an ABSENT seat of his only (never a
     // seat another tab plays — it used to take the first played seat it met
@@ -23505,10 +24200,17 @@ function startQualifierTournament(
   players: { id: string; name: string; socketId: string; masterId?: string | null }[],
   startingStack: number = 50000,
   turbo: boolean = false,
+  // 2026-10-23 (qualifier lifecycle S4, the early rooms) — `tableCount`: at least
+  // this many tables (sized for EVERY registrant while only the online ones are
+  // seated); `hold`: the tournament is held ('prestart' pause) right after its
+  // start and NO table is dealt (runPreStartDeal deals at the start second).
+  // Defaults: the start of before (ceil(n / 9) tables, dealt at once).
+  opts: { tableCount?: number; hold?: boolean } = {},
 ): { tournamentId: string; tableIds: string[]; tableCount: number } | null {
   if (players.length < 2) return null;
   const seatsPerTable = 9;
-  const tableCount = Math.max(1, Math.ceil(players.length / seatsPerTable));
+  const askedTables = Number.isFinite(opts.tableCount) ? Math.floor(opts.tableCount as number) : 0;
+  const tableCount = Math.max(1, Math.ceil(players.length / seatsPerTable), askedTables);
   // 2026-10-23 (qualifier lifecycle S3) — the RIG-ONLY time scale (always 1 on
   // Railway / NODE_ENV=production): divides the engine's level and break lengths.
   const timeScale = qualifierTestTimeScale(process.env);
@@ -23541,6 +24243,9 @@ function startQualifierTournament(
 
   const startResult = tournamentManager.startTournament(tournamentId);
   if (!startResult) return null;
+  // S4 — the early rooms: held before the first deal (no blind clock; the full
+  // level 1 starts at the 'prestart' resume, runPreStartDeal).
+  if (opts.hold) tournamentManager.pauseTournament(tournamentId, true, 'prestart');
 
   for (const tp of tournament.players) {
     tp.chips = startingStack;
@@ -23617,7 +24322,8 @@ function startQualifierTournament(
   // 2026-07-05 audit P0 fix: deal the first hand + attach the progress listener,
   // AI scheduler, and tournament-event handlers. Without this the qualifier
   // tables sat at WaitingForPlayers forever (no cards, no blinds, no payouts).
-  bootstrapTournamentTables(tournamentId, tableIds);
+  // S4 — held (the early rooms): the listeners and the ONE onEvent, no deal.
+  bootstrapTournamentTables(tournamentId, tableIds, { deal: !opts.hold });
 
   return { tournamentId, tableIds, tableCount };
 }
@@ -23658,7 +24364,16 @@ function startQualifierTournament(
 // `dealt` = a table whose startNewHand() began a hand; one more line,
 // `tournament_bootstrap_no_table_dealt`, says why the process is going down.
 const tournamentBootstrapStats = { tableFailures: 0 };
-function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): void {
+//
+// 2026-10-23 (qualifier lifecycle S4) — `deal: false` (the early rooms' held
+// start): each table gets its listener and its state broadcast, but NO first
+// deal and no AI kick (runPreStartDeal deals every table at the start second);
+// the ONE onEvent listener is registered exactly as before. Nothing is dealt by
+// design, so a held start is never re-thrown for "no table dealt" (the deal
+// re-ensures every listener). The default (deal: true) is unchanged — the
+// multi-table simulation and the start of before.
+function bootstrapTournamentTables(tournamentId: string, tableIds: string[], opts: { deal?: boolean } = {}): void {
+  const deal = opts.deal !== false;
   // Set up each table: listeners, start hands
   let dealtTables = 0;
   let failedTables = 0;
@@ -23668,9 +24383,11 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): vo
     if (!table) continue;
     try {
       ensureTableProgressListener(table, tid);
-      if (table.startNewHand()) dealtTables++;
+      if (deal) {
+        if (table.startNewHand()) dealtTables++;
+      }
       broadcastGameState(tid);
-      scheduleAIAction(tid);
+      if (deal) scheduleAIAction(tid);
     } catch (e: any) {
       tournamentBootstrapStats.tableFailures++;
       if (failedTables === 0) firstFailure = e;
@@ -23680,8 +24397,12 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): vo
     }
   }
   if (failedTables > 0 && dealtTables === 0) {
-    console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_bootstrap_no_table_dealt', tournamentId, tables: tableIds.length, failedTables, outcome: 'rethrown' })}`);
-    throw firstFailure;
+    // S4 — a held start deals nothing here by design: never re-thrown (each
+    // failed table is already logged tournament_table_bootstrap_failed).
+    if (deal) {
+      console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_bootstrap_no_table_dealt', tournamentId, tables: tableIds.length, failedTables, outcome: 'rethrown' })}`);
+      throw firstFailure;
+    }
   }
 
   // Listen for blind level changes → apply to ALL tables
@@ -25404,6 +26125,9 @@ function serviceQualifierOverflowTables(): void {
   for (const tournamentId of [...qualifierOverflowTableNumbers.keys()]) {
     if (tournamentManager.getTournament(tournamentId)?.status !== 'running') qualifierOverflowTableNumbers.delete(tournamentId);
   }
+  // 2026-10-23 (qualifier lifecycle S4) — the early rooms' backstop: a table of a
+  // JUST-DEALT event still waiting for its first hand (>= 2 alive, no deal hold) is dealt.
+  servicePreStartDealBackstop();
 }
 
 /**
@@ -25919,6 +26643,10 @@ function balanceQualifierTablesNow(tournamentId: string): number {
 // ===== end tournament rebalance helpers =====
 
 function handleTableRebalance(tournamentId: string): void {
+  // 2026-10-23 (qualifier lifecycle S4) — never while the early rooms hold the
+  // first deal (the tables are sized for every registrant; runPreStartDeal runs
+  // the breaks once the no-shows are gone).
+  if (qualifierPreStartHolds.has(tournamentId)) return;
   // F1 (2026-10-10) — asked for by an elimination the hand-start gate made
   // INSIDE a startNewHand: held until that gate has stood its suspended seats
   // up, then run (still before that table's deal) — see
@@ -26144,6 +26872,9 @@ function sweepTournamentRebalances(): void {
   pruneBrokenTournamentTables(); // P8 — time-based retention
   // 2026-10-22 — overflow tables: forget broken / retired ones; the first-deal backstop.
   serviceQualifierOverflowTables();
+  // 2026-10-23 (qualifier lifecycle S4) — the early rooms: every held event seats
+  // its online pending registrants (and deals if its start second passed).
+  serviceQualifierPreStartHolds();
   // S1 (2026-10-10) — bounded memory: a removed table's bust-check captures
   // whose handler never came back, and its held-deal mark (a live table's
   // stale capture is run by its own deal guard instead).
@@ -26172,6 +26903,10 @@ function sweepTournamentRebalances(): void {
     const tournament = tournamentManager.getTournament(tournamentId);
     if (!tournament || tournament.status !== 'running') continue;
     if (tournament.tableIds.length <= 1) continue;
+    // S4 — held before its first deal (the early rooms): its tables are sized for
+    // every registrant, so Rule 1 / Rule 2 would break the half-empty ones at
+    // 10:50; the deal runs the breaks (runPreStartDeal).
+    if (qualifierPreStartHolds.has(tournamentId)) continue;
 
     // Check if any table has < 5 players (and the others have room for them)
     const rebalance = planTournamentRebalance(tournamentId);
@@ -26762,9 +27497,17 @@ function claimQuickAndQualifierRefundsForShutdown(entryFees: LedgerCredit[]): Pr
     // RUNNING qualifier's entrants are told by its tournament's own
     // tournamentCancelled (claimTournamentRefundsForShutdown).
     const upcoming = qt.status === 'registering' || qt.status === 'starting';
+    // 2026-10-23 (qualifier lifecycle S4) — an event whose tables are open and
+    // held before the first deal is still UPCOMING to its registrants, and so is
+    // a PENDING registrant (no entrant yet — no tournamentCancelled reaches
+    // him): both are told qualifierCancelled server_restart. Their credits are
+    // refunded by the release below, as for every registration.
+    const heldPreStart = !!qt.tournamentId && qualifierPreStartHolds.has(qt.tournamentId);
+    const startedT = qt.tournamentId ? tournamentManager.getTournament(qt.tournamentId) : undefined;
     for (const p of qt.players) {
       shutdownFlushStats.qualifierRegistrationsReleased++;
-      if (upcoming) {
+      const noEntrant = !!startedT && !startedT.players.some((x) => x.playerId === p.playerId);
+      if (upcoming || heldPreStart || noEntrant) {
         const creditRefunded = !!p.consumedCreditId;
         try {
           for (const s of socketsOfMaster(p.masterPlayerId)) s.emit('qualifierCancelled', { qualifierId: qualId, reason: 'server_restart', creditRefunded });
@@ -26783,6 +27526,12 @@ function claimQuickAndQualifierRefundsForShutdown(entryFees: LedgerCredit[]): Pr
     qt.status = 'finished';
     qt.cancelled = true;
     qt.finishedAt = Date.now();
+    // S4 — a held event never deals now (its tournament was voided): its hold goes.
+    if (heldPreStart && qt.tournamentId) {
+      const h = qualifierPreStartHolds.get(qt.tournamentId);
+      if (h?.timer) clearTimeout(h.timer);
+      qualifierPreStartHolds.delete(qt.tournamentId);
+    }
     // R3 (Q1) — every lobby drops it (cancelQualifierEvent's frame).
     try { io.emit('qualifierTournamentUpdate', { qualifierId: qualId, status: 'finished', cancelled: true, registeredCount: 0, players: 0 }); } catch { /* going anyway */ }
   }

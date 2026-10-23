@@ -158,6 +158,50 @@ export function parseQualifierOverflowCapUpdate(raw: unknown): number | null {
 }
 
 /**
+ * 2026-10-23 (qualifier lifecycle S4, owner 2026-10-22: "open the rooms 10
+ * minutes before game start so people can join and then start the game on
+ * time") — EARLY ROOMS. This many minutes before the start, the tables are
+ * created and every registrant who is online is SEATED (more join as they come
+ * online), but the tournament is held ('prestart' pause): no card and no blind
+ * clock until the scheduled start second, when the no-shows are released and
+ * refunded exactly as before and every table is dealt at once (index.ts
+ * openQualifierTablesEarly / runPreStartDeal). Railway env
+ * QUALIFIER_TABLES_OPEN_BEFORE_MIN sets it at boot (clamped 0..30, garbage →
+ * 10); **0 = OFF** = the 11:00 start of before S4. While the server runs:
+ * POST /api/qualifiers/tables-open {minutes} (X-Internal-Token; a restart
+ * cancels a running qualifier, so never change the env during an event).
+ * Owner-correctable here.
+ */
+export const QUALIFIER_TABLES_OPEN_BEFORE_MIN = 10;
+const QUALIFIER_TABLES_OPEN_BEFORE_HARD_MAX = 30;
+
+/** The early-rooms lead (minutes) from the env value: unset / blank / not a number → 10; else floored and clamped to 0..30 (0 = off). */
+export function qualifierTablesOpenBeforeMin(raw: string | undefined): number {
+  if (raw === undefined || raw === null) return QUALIFIER_TABLES_OPEN_BEFORE_MIN;
+  const text = String(raw).trim();
+  if (text === '') return QUALIFIER_TABLES_OPEN_BEFORE_MIN;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return QUALIFIER_TABLES_OPEN_BEFORE_MIN;
+  return Math.min(QUALIFIER_TABLES_OPEN_BEFORE_HARD_MAX, Math.max(0, Math.floor(n)));
+}
+
+/**
+ * S4 — the lead an operator asks for WHILE THE SERVER RUNS (POST
+ * /api/qualifiers/tables-open {minutes}). Stricter than the env read: a missing
+ * / blank / non-numeric value is refused (null → 400, nothing changes) instead
+ * of quietly meaning 10. A number (or numeric string) is floored and clamped to
+ * 0..30 like the env value; 0 = OFF.
+ */
+export function parseQualifierTablesOpenUpdate(raw: unknown): number | null {
+  if (typeof raw !== 'number' && typeof raw !== 'string') return null;
+  const text = String(raw).trim();
+  if (text === '') return null;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return null;
+  return qualifierTablesOpenBeforeMin(text);
+}
+
+/**
  * 2026-10-22 — the re-entries a busted (or still-playing) entrant may still
  * make: his unused credits of the tier (`creditsHeld`, each re-entry consumes
  * one), within the cap if one is set (`cap - used`). null = not known (the
