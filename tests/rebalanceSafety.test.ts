@@ -5055,6 +5055,8 @@ hx.states = handForHandStates; hx.stats = handForHandStats; hx.tripped = handFor
 hx.holdReason = tournamentDealHoldReason; hx.restartWaiting = restartWaitingTournamentTables;
 hx.serviceAll = serviceAllHandForHand; hx.clock = handForHandClockFields; hx.health = handForHandHealth;
 hx.isOn = () => qualifierHandForHandOn;
+hx.drains = handForHandDrains; hx.pending = handForHandBustPending;
+hx.outcome = tournamentEntryOutcomeOfAccount; hx.tellDead = tellDeadTournamentSeat;
 `;
     const hx: Record<string, any> = {};
     const qualifierTournaments = new Map<string, any>();
@@ -5094,6 +5096,7 @@ hx.isOn = () => qualifierHandForHandOn;
         qualifierWindows: QS.qualifierWindows, seatsForTopWith: QS.seatsForTopWith, qualifierTestTimeScale: QS.qualifierTestTimeScale,
         handForHandApplies: QS.handForHandApplies, qualifierHandForHandOnAtBoot: QS.qualifierHandForHandOnAtBoot,
         qualifierHandForHandWatchdogMs: QS.qualifierHandForHandWatchdogMs, qualifierHandForHandOnText: QS.qualifierHandForHandOnText,
+        qualifierHandForHandHardCapMs: QS.qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS: QS.QUALIFIER_HAND_FOR_HAND_STALL_MS,
         QUALIFIER_HAND_FOR_HAND_TEXT: QS.QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT: QS.QUALIFIER_HAND_FOR_HAND_OFF_TEXT,
         ...qotScope,
         ...(o.scope || {}),
@@ -5370,19 +5373,25 @@ hx.isOn = () => qualifierHandForHandOn;
     expect(playOut(x, 'b0')).toEqual(permutation(11));
   });
 
-  it('H7 — the WATCHDOG fails OPEN: a round stuck 4 minutes (TB never ends its hand) releases every held table (logged, counted, durable audit), trips the event (it deals on at the bubble); {on:1} re-arms it', async () => {
+  it('H7 — the WATCHDOG fails OPEN: a round STUCK (TB never acts again) is checked at 4 minutes, given the 90 s stall window, then releases every held table (logged, counted, durable audit), trips the event (it deals on at the bubble); {on:1} re-arms it', async () => {
     const x = hfh();
     await toRound1(x);
     await endHand(x, 'TA');
     x.w.m.autoStartNextHand('TA');                                           // held; TB stuck mid-hand
     x.w.scheduled.length = 0;
-    jest.advanceTimersByTime(240_000 - 1);
+    jest.advanceTimersByTime(240_000);
+    // Review fix-up — at 4 minutes TB is first SAMPLED (a hand in progress): more time, logged once.
+    expect(x.hx.stats).toMatchObject({ watchdogReleases: 0, watchdogExtensions: 1 });
+    expect(x.lines('qualifier_hand_for_hand_watchdog_extended')).toEqual([expect.objectContaining({ round: 1, heldMs: 240_000, playing: ['TB'], hardCapMs: 600_000, stallMs: 90_000 })]);
+    jest.advanceTimersByTime(90_000 - 1);
     expect(x.hx.stats.watchdogReleases).toBe(0);
     expect(x.w.scheduled).toEqual([]);
-    jest.advanceTimersByTime(1);
-    expect(x.hx.stats).toMatchObject({ watchdogReleases: 1, released: expect.objectContaining({ watchdog: 1 }), errors: 0 });
+    jest.advanceTimersByTime(1);                                             // 90 s with no progress at TB: STALLED
+    expect(x.hx.stats).toMatchObject({ watchdogReleases: 1, watchdogExtensions: 1, released: expect.objectContaining({ watchdog: 1 }), errors: 0 });
+    expect(x.lines('qualifier_hand_for_hand_watchdog_extended')).toHaveLength(1);
     const line = x.lines('qualifier_hand_for_hand_watchdog_released')[0];
-    expect(line).toMatchObject({ tournamentId: x.w.tid, round: 1, heldMs: 240_000, held: ['TA'] });
+    expect(line).toMatchObject({ tournamentId: x.w.tid, round: 1, heldMs: 330_000, cause: 'stalled', stalled: ['TB'], held: ['TA'] });
+    expect(x.hx.health().drains).toEqual([]);                                // no bust recorded, one table in flight: nothing to keep open
     expect(line.waitingOn).toEqual([expect.objectContaining({ tableId: 'TB', handNumber: 1, base: 0, bustCheckPending: false })]);
     expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_HAND_FOR_HAND_WATCHDOG')).toHaveLength(1);
     expect([...x.hx.tripped]).toEqual([x.w.tid]);
@@ -5495,7 +5504,7 @@ hx.isOn = () => qualifierHandForHandOn;
     }
   });
 
-  it('H9 — POST /api/qualifiers/hand-for-hand: 403 without / with a wrong token, 403 with no token configured, 400 for a bad value; {on:0} while engaged releases AT ONCE (the recorded bust placed and told, the held table kicked); {on:1} answers previous:false', async () => {
+  it('H9 — POST /api/qualifiers/hand-for-hand: 403 without / with a wrong token, 403 with no token configured, 400 for a bad value; {on:0} while engaged releases AT ONCE (the held table kicked and dealt; the recorded bust told when TB\'s round hand, still in flight, has ended — the drain); {on:1} answers previous:false', async () => {
     const x = hfh();
     expect(x.post({ on: 0 })).toEqual({ status: 403, body: { success: false, error: 'forbidden' } });
     expect(x.post({ on: 0 }, 'nope')).toEqual({ status: 403, body: { success: false, error: 'forbidden' } });
@@ -5510,12 +5519,23 @@ hx.isOn = () => qualifierHandForHandOn;
     expect(notices(x.w.live.get('S-a1'))).toEqual([]);
     x.w.scheduled.length = 0;
     expect(x.post({ on: 0 }, 'tok')).toEqual({ status: 200, body: { success: true, previous: true, on: false, released: 1, rearmed: 0 } });
-    expect(notices(x.w.live.get('S-a1'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11 })]]);
     expect(x.lines('qualifier_hand_for_hand_ended')).toEqual([expect.objectContaining({ reason: 'switch_off' })]);
     expect(x.lines('qualifier_hand_for_hand_set')).toEqual([expect.objectContaining({ previous: true, on: false, released: 1, actor: 'internal:hand_for_hand' })]);
     expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_HAND_FOR_HAND_SET')).toEqual([{ actor: 'internal:hand_for_hand', action: 'QUALIFIER_HAND_FOR_HAND_SET', d: { previous: true, on: false, released: 1, rearmed: 0 } }]);
     expect(runScheduled(x)).toEqual(['TA']);
-    expect(x.t('TA').handNumber).toBe(2);                                    // dealt at once
+    expect(x.t('TA').handNumber).toBe(2);                                    // dealt at once (never held by the drain)
+    // Review fix-up — TB's round hand is still being played: the round's bust batch stays open (the DRAIN).
+    expect(notices(x.w.live.get('S-a1'))).toEqual([]);
+    expect(x.lines('qualifier_hand_for_hand_drain_open')).toEqual([expect.objectContaining({ round: 1, reason: 'switch_off', waitingOn: ['TB'], busts: ['a1'] })]);
+    expect(x.hx.health().drains).toEqual([expect.objectContaining({ tournamentId: x.w.tid, round: 1, reason: 'switch_off', waiting: ['TB'], busts: 1 })]);
+    expect(x.hx.pending(x.w.tid, 'a1')).toBe(true);
+    await endHand(x, 'TB');                                                  // TB's round hand ends (nobody busts)
+    x.w.m.autoStartNextHand('TB');                                           // its boundary: the drain is checked
+    await flush();
+    expect(notices(x.w.live.get('S-a1'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11 })]]);
+    expect(x.lines('qualifier_hand_for_hand_drain_closed')).toEqual([expect.objectContaining({ round: 1, why: 'settled', busts: 1 })]);
+    expect(x.hx.health()).toMatchObject({ drains: [], drainsOpened: 1, drainsClosed: { settled: 1, cap: 0, tournament_over: 0, replaced: 0 } });
+    expect(x.hx.pending(x.w.tid, 'a1')).toBe(false);
     expect(x.post({ on: 1 }, 'tok').body).toEqual({ success: true, previous: false, on: true, released: 0, rearmed: 0 });
     expect(x.hx.stats.switchChanges).toBe(2);
   });
@@ -5621,8 +5641,185 @@ hx.isOn = () => qualifierHandForHandOn;
     expect(SRC).toContain('let qualifierHandForHandOn = qualifierHandForHandOnAtBoot(process.env.QUALIFIER_HAND_FOR_HAND);');
     expect(SRC).toContain("app.post('/api/qualifiers/hand-for-hand'");
     const manifest = fs.readFileSync(path.join(__dirname, '..', 'canonical-features.txt'), 'utf8').split(/\r?\n/).map((l) => l.trim());
-    for (const tok of ['qualifier_hand_for_hand_engaged', 'qualifier_hand_for_hand_busts_placed', '/api/qualifiers/hand-for-hand']) {
+    // Review fix-up — + the watchdog's extension of a moving round and the drain of a released round.
+    for (const tok of ['qualifier_hand_for_hand_engaged', 'qualifier_hand_for_hand_busts_placed', '/api/qualifiers/hand-for-hand',
+      'qualifier_hand_for_hand_watchdog_extended', 'qualifier_hand_for_hand_drain_open']) {
       expect({ tok, listed: manifest.includes(tok), inSource: SRC.includes(tok) }).toEqual({ tok, listed: true, inSource: true });
     }
+  });
+
+  // ─── Review fix-up (0e6744d) ───
+  /** H4's field: a0 (Table 1) starts the round with 9,000, b0 (Table 2) with 3,000; a6 / a7 out earlier → 11 alive. */
+  const stacked = () => {
+    const layout = { TA: field('a', 8, 5000, 100), TB: field('b', 5, 5000, 200) };
+    layout.TA[0].stack = 9000;
+    layout.TB[0].stack = 3000;
+    return layout;
+  };
+  /** One action at `tableId`'s seat to act — a check, else a call: the hand MOVES without ending. */
+  function act(x: H, tableId: string): void {
+    const t = x.t(tableId);
+    const i = t.activeSeatIndex;
+    expect({ tableId, inHand: t.isHandInProgress(), acting: i >= 0 }).toEqual({ tableId, inHand: true, acting: true });
+    expect(t.playerCheck(i) || t.playerCall(i)).toBe(true);
+  }
+  /** Round 1 dealt; a0 busts at TA (eliminated at once: provisional 11th) and TA holds while TB plays its round hand. */
+  async function a0OutTbPlaying(o: HOpts = {}): Promise<H> {
+    const x = hfh({ layout: stacked(), earlier: { TA: [6, 7] }, ...o });
+    await toRound1(x);
+    await endHand(x, 'TA', ['a0']);
+    expect(x.tp('a0')).toMatchObject({ eliminated: true, finishPosition: 11 });
+    x.w.m.autoStartNextHand('TA');
+    await flush();
+    expect(x.t('TA').handNumber).toBe(1);                                    // held
+    expect(x.t('TB').isHandInProgress()).toBe(true);
+    return x;
+  }
+
+  it('H14 — the watchdog never trips a SLOW but MOVING round: TB acts every 25 s for 5 minutes (past 4:00); more time is given (logged once, counted), nothing released or tripped; b0\'s bust in that same hand is placed with a0\'s by starting stack (a0 10th, b0 11th) — 0e6744d tripped the event at 4:00 and b0 took 10th and the seat', async () => {
+    const x = await a0OutTbPlaying();
+    const total = x.w.chipsInPlay();
+    for (let k = 0; k < 12; k++) {                                           // TB's round hand: one decision every 25 s
+      jest.advanceTimersByTime(25_000);
+      act(x, 'TB');
+    }
+    expect(x.t('TB').isHandInProgress()).toBe(true);
+    expect(x.hx.stats).toMatchObject({ watchdogReleases: 0, watchdogExtensions: 1, errors: 0 });
+    expect(x.lines('qualifier_hand_for_hand_watchdog_extended')).toEqual([expect.objectContaining({
+      tournamentId: x.w.tid, round: 1, heldMs: 240_000, playing: ['TB'], hardCapMs: 600_000, stallMs: 90_000,
+    })]);
+    expect(x.lines('qualifier_hand_for_hand_watchdog_released')).toEqual([]);
+    expect([...x.hx.tripped]).toEqual([]);
+    expect(x.t('TA').handNumber).toBe(1);                                    // still held: one hand per round
+    expect(notices(x.w.live.get('S-a0'))).toEqual([]);
+    await endHand(x, 'TB', ['b0']);                                          // b0 out in the SAME round hand (9 alive → Rule 1)
+    runScheduled(x);
+    await flush();
+    expect([x.tp('a0').finishPosition, x.tp('b0').finishPosition]).toEqual([10, 11]);
+    expect(notices(x.w.live.get('S-a0'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 10 })]]);
+    expect(notices(x.w.live.get('S-b0'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11 })]]);
+    expect(x.lines('qualifier_hand_for_hand_ended')).toEqual([expect.objectContaining({ reason: 'bubble_burst', rounds: 1, alive: 9 })]);
+    expect(x.w.chipsInPlay()).toBe(total);
+    expect(x.w.credits).toEqual([]);
+    expect(playOut(x, 'a1')).toEqual(permutation(13));
+    expect([x.tp('a0').finishPosition, x.tp('b0').finishPosition]).toEqual([10, 11]);
+  });
+
+  it('H15 — a release MID-ROUND keeps the round\'s bust batch OPEN for the tables still in their round hand (the drain): (a) the HARD cap (rig scale 12: watchdog 20 s, cap 50 s) fails a moving round open — TA deals at once, a0 is not told a provisional place, b0\'s bust in TB\'s round hand is placed with his (a0 10th, b0 11th); (b) the same with {on:0}; (c) a drain never waits past its cap: a0 is told 11th then, and b0\'s later bust is an ordinary one', async () => {
+    // (a) the hard cap.
+    {
+      const x = await a0OutTbPlaying({ env: { QUALIFIER_TEST_TIME_SCALE: '12' } });
+      const total = x.w.chipsInPlay();
+      expect(x.hx.health()).toMatchObject({ watchdogMs: 20_000, hardCapMs: 50_000, stallMs: 90_000 });
+      x.w.scheduled.length = 0;
+      for (let k = 0; k < 4; k++) {                                          // TB moves every 10 s
+        jest.advanceTimersByTime(10_000);
+        act(x, 'TB');
+      }
+      expect(x.hx.stats).toMatchObject({ watchdogReleases: 0, watchdogExtensions: 1 });
+      jest.advanceTimersByTime(10_000);                                      // 50 s from the round's start: the HARD cap
+      expect(x.hx.stats).toMatchObject({ watchdogReleases: 1, released: expect.objectContaining({ watchdog: 1 }), errors: 0 });
+      expect(x.lines('qualifier_hand_for_hand_watchdog_released')).toEqual([expect.objectContaining({ round: 1, heldMs: 50_000, cause: 'hard_cap', stalled: [], held: ['TA'] })]);
+      expect([...x.hx.tripped]).toEqual([x.w.tid]);
+      expect(x.lines('qualifier_hand_for_hand_drain_open')).toEqual([{
+        event: 'qualifier_hand_for_hand_drain_open', tournamentId: x.w.tid, round: 1, reason: 'watchdog', waitingOn: ['TB'], busts: ['a0'], capMs: 20_000,
+      }]);
+      expect(notices(x.w.live.get('S-a0'))).toEqual([]);                    // never a provisional place
+      expect(roomBusts(x, 'a0')).toEqual([]);
+      expect(runScheduled(x)).toEqual(['TA']);                               // released: TA deals at once
+      expect(x.t('TA').handNumber).toBe(2);
+      act(x, 'TB');
+      await endHand(x, 'TB', ['b0']);                                        // TB's ROUND hand ends: b0 out (9 alive)
+      expect(notices(x.w.live.get('S-b0'))).toEqual([]);                    // recorded into the drain
+      x.hx.serviceAll();                                                     // the 5 s sweep closes it (TB was broken: no boundary)
+      expect([x.tp('a0').finishPosition, x.tp('b0').finishPosition]).toEqual([10, 11]);   // 0e6744d: a0 11th, b0 10th
+      expect(notices(x.w.live.get('S-a0'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 10 })]]);
+      expect(notices(x.w.live.get('S-b0'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11 })]]);
+      expect(roomBusts(x, 'a0').map((e) => [e.d.position, e.d.handForHand])).toEqual([[10, true]]);
+      expect(x.lines('qualifier_hand_for_hand_busts_placed')).toEqual([expect.objectContaining({
+        round: 1, running: true,
+        busts: [
+          { playerId: 'a0', tableId: 'TA', seatIndex: 0, startStack: 9000, from: 11, to: 10 },
+          { playerId: 'b0', tableId: 'TB', seatIndex: 0, startStack: 3000, from: 10, to: 11 },
+        ],
+      })]);
+      expect(x.lines('qualifier_hand_for_hand_drain_closed')).toEqual([expect.objectContaining({ round: 1, why: 'settled', busts: 2 })]);
+      expect(x.hx.health()).toMatchObject({ drains: [], drainsOpened: 1, drainsClosed: expect.objectContaining({ settled: 1 }) });
+      expect(x.w.seatless()).toEqual([]);
+      expect(x.w.couldNotPlace()).toEqual([]);
+      expect(x.w.chipsInPlay()).toBe(total);
+      expect(x.w.credits).toEqual([]);
+      expect(playOut(x, 'a1')).toEqual(permutation(13));
+    }
+    // (b) the switch turned off between the two busts.
+    {
+      const x = await a0OutTbPlaying();
+      expect(x.post({ on: 0 }, 'tok').body).toMatchObject({ success: true, on: false, released: 1 });
+      expect(notices(x.w.live.get('S-a0'))).toEqual([]);
+      expect(runScheduled(x)).toEqual(['TA']);
+      await endHand(x, 'TB', ['b0']);
+      x.hx.serviceAll();
+      expect([x.tp('a0').finishPosition, x.tp('b0').finishPosition]).toEqual([10, 11]);   // 0e6744d: a0 11th, b0 10th
+      expect(notices(x.w.live.get('S-a0'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 10 })]]);
+      expect(playOut(x, 'a1')).toEqual(permutation(13));
+    }
+    // (c) the drain's cap (the watchdog's length, 4 minutes): notices never wait longer.
+    {
+      const x = await a0OutTbPlaying();
+      x.post({ on: 0 }, 'tok');
+      jest.advanceTimersByTime(240_000 - 1);
+      expect(notices(x.w.live.get('S-a0'))).toEqual([]);
+      jest.advanceTimersByTime(1);
+      expect(notices(x.w.live.get('S-a0'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11 })]]);
+      expect(x.lines('qualifier_hand_for_hand_drain_closed')).toEqual([expect.objectContaining({ why: 'cap', busts: 1 })]);
+      expect(x.hx.health().drains).toEqual([]);
+      await endHand(x, 'TB', ['b0']);                                        // after the cap: an ordinary bust, told at once
+      expect(x.tp('b0').finishPosition).toBe(10);
+      expect(notices(x.w.live.get('S-b0'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 10 })]]);
+      expect(playOut(x, 'a1')).toEqual(permutation(13));
+    }
+  });
+
+  it('H16 — a bust at a table BROKEN mid-round whose removal re-homed his socket (5 s) BEFORE the settle still gets eliminatedToSpectator, on the live table he now watches — 0e6744d sent only the plain toast', async () => {
+    const layout = { TA: field('a', 6, 5000, 100), TB: field('b', 5, 5000, 200) };
+    layout.TA[1].stack = 4000;
+    layout.TA[2].stack = 7000;
+    const x = hfh({ layout });
+    await toRound1(x);
+    await endHand(x, 'TA', ['a1', 'a2']);                                   // 9 alive → TA broken into mid-hand TB
+    expect(x.ids()).toEqual(['TB']);
+    jest.advanceTimersByTime(6_000);                                         // TA removed: its watchers re-homed to TB
+    const evs = (sid: string) => x.w.live.get(sid).emitted
+      .filter(([ev]: [string]) => ['spectatingTournament', 'eliminatedToSpectator', 'playerEliminated'].includes(ev))
+      .map(([ev, d]: [string, any]) => [ev, d.tableId ?? null, d.position ?? null]);
+    expect(evs('S-a1')).toEqual([['spectatingTournament', 'TB', null]]);
+    expect(x.w.playerSessions.has('S-a1')).toBe(false);                    // his dead-seat session ended by the re-home
+    expect(x.w.spectators.get('TB')?.has('S-a1')).toBe(true);
+    await endHand(x, 'TB');
+    x.w.m.autoStartNextHand('TB');
+    await flush();
+    expect(evs('S-a1')).toEqual([['spectatingTournament', 'TB', null], ['eliminatedToSpectator', 'TB', 11]]);
+    expect(evs('S-a2')).toEqual([['spectatingTournament', 'TB', null], ['eliminatedToSpectator', 'TB', 10]]);
+    expect(x.w.spectators.get('TB')?.has('S-a1')).toBe(true);               // still watching TB (never moved)
+    expect(playOut(x, 'b0')).toEqual(permutation(11));
+  });
+
+  it('H17 — while a round bust is not placed yet, a Return / sign-in names NO place (position 0; the dead-seat notice waits for the settle); after the settle his FINAL place, on his other live socket too', async () => {
+    const x = await a0OutTbPlaying();
+    const auth = x.w.authSessions.get('S-a0');
+    expect(x.hx.pending(x.w.tid, 'a0')).toBe(true);
+    expect(x.hx.outcome(auth, x.w.tid)).toEqual({ kind: 'eliminated', position: 0 });   // 0e6744d: 11 (provisional)
+    const phone = x.w.mkSocket('S-a0-phone');
+    x.w.authSessions.set('S-a0-phone', { ...auth });
+    x.hx.tellDead(phone, auth, { tournamentId: x.w.tid, playerId: 'a0', playerName: 'a0' });
+    expect(notices(phone)).toEqual([]);                                      // 0e6744d: playerEliminated position 11
+    await endHand(x, 'TB', ['b0']);
+    runScheduled(x);
+    await flush();
+    expect(x.hx.pending(x.w.tid, 'a0')).toBe(false);
+    expect(x.hx.outcome(auth, x.w.tid)).toEqual({ kind: 'eliminated', position: 10 });
+    expect(notices(phone)).toEqual([['playerEliminated', { tournamentId: x.w.tid, playerId: 'a0', playerName: 'a0', position: 10 }]]);
+    // An ordinary (not hand-for-hand) bust keeps its place in the answer.
+    expect(x.hx.outcome(x.w.authSessions.get('S-b0'), x.w.tid)).toEqual({ kind: 'eliminated', position: 11 });
   });
 });

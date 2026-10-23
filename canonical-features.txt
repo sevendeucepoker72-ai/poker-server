@@ -1731,3 +1731,9 @@ qualifier_tables_open_closed
 qualifier_hand_for_hand_engaged
 qualifier_hand_for_hand_busts_placed
 /api/qualifiers/hand-for-hand
+# Review fix-up (2026-10-24): the watchdog gives a slow but MOVING round more time
+# (every table checked for progress; 90 s with none, or the 10-minute hard cap,
+# fails it open), and a round released mid-round keeps its bust batch open for
+# the tables still in their round hand (the drain).
+qualifier_hand_for_hand_watchdog_extended
+qualifier_hand_for_hand_drain_open

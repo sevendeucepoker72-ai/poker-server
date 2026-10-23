@@ -91,6 +91,8 @@ const BUST_CHECK = [
   // round (handForHandRoundOf → handForHandStates), ASSIGNS the quiet-bust `let`,
   // and tells a bust through the extracted tellTournamentBustNow.
   slice('const handForHandStates = new Map', ';\n'),
+  // Review fix-up: handForHandRoundOf also reads an open DRAIN (a released round still waiting for a round hand).
+  slice('const handForHandDrains = new Map', ';\n'),
   slice('let handForHandQuietBust', ';\n'),
   fnSrc('function handForHandRoundOf('),
   fnSrc('function captureTournamentBustCheck('),

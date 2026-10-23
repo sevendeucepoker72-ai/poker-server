@@ -279,6 +279,9 @@ function world(opts: WorldOpts = {}) {
     settleDecidedQuickGame: () => false,   // R3 (S1-4) — no quick game decided here
     shutdownFlushActive: () => false,   // R2 (item 1) — the shutdown flush is not running
     tellQualifierNoShowReleases: () => 0,   // 2026-10-20 — no qualifier no-show releases here (r2Qualifiers tests them)
+    // 2026-10-24 hand-for-hand review fix-up: a Return / sign-in asks whether a bust's place is still
+    // pending (a hand-for-hand round not settled) — never here (rebalanceSafety "H" tests it).
+    handForHandBustPending: () => false,
     getGameStateForPlayer: () => ({}), scheduleAIAction() {}, log: { debug() {}, info() {} },
     // R2 (2026-10-11): the seat-teardown helper block (SEAT_TEARDOWN_SRC) tests it.
     FiveCardDrawTable: class {},

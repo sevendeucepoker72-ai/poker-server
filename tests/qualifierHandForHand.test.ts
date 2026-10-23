@@ -19,6 +19,8 @@ import {
   qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT,
   QUALIFIER_HAND_FOR_HAND_WATCHDOG_MS, QUALIFIER_HAND_FOR_HAND_MIN_WATCHDOG_MS, QUALIFIER_TABLE_SEATS,
   seatsForTopWith, qualifierWindows,
+  // Review fix-up — the watchdog's hard cap and stall window.
+  qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_HARD_CAP_MS, QUALIFIER_HAND_FOR_HAND_STALL_MS,
 } from '../src/game/qualifierSchedule';
 import { TournamentManager } from '../src/game/TournamentManager';
 
@@ -91,6 +93,20 @@ describe('HP2 — the watchdog length and the boot switch', () => {
     expect(qualifierHandForHandWatchdogMs(qualifierTestTimeScale({ NODE_ENV: 'production', QUALIFIER_TEST_TIME_SCALE: '60' }))).toBe(240_000);
     expect(qualifierHandForHandWatchdogMs(qualifierTestTimeScale({ RAILWAY_ENVIRONMENT: 'production', QUALIFIER_TEST_TIME_SCALE: '60' }))).toBe(240_000);
     expect(qualifierHandForHandWatchdogMs(qualifierTestTimeScale({ QUALIFIER_TEST_TIME_SCALE: '12' }))).toBe(20_000);
+  });
+
+  it('review fix-up — qualifierHandForHandHardCapMs: 10 minutes at real time (a slow but MOVING round may run past the 4-minute watchdog up to it), divided by the rig scale, never under the watchdog; garbage → 10 minutes; production always 10 minutes; the stall window is 90 s and never scaled', () => {
+    expect(QUALIFIER_HAND_FOR_HAND_HARD_CAP_MS).toBe(600_000);
+    expect(qualifierHandForHandHardCapMs()).toBe(600_000);
+    expect(qualifierHandForHandHardCapMs(12)).toBe(50_000);
+    expect(qualifierHandForHandHardCapMs(60)).toBe(10_000);
+    expect(qualifierHandForHandHardCapMs(120)).toBe(5_000);   // = the watchdog's floor, never below it
+    for (const s of [1, 12, 60, 120]) expect(qualifierHandForHandHardCapMs(s)).toBeGreaterThanOrEqual(qualifierHandForHandWatchdogMs(s));
+    for (const g of [NaN, -3, 0, 'x', null, undefined, Infinity]) expect(qualifierHandForHandHardCapMs(g as any)).toBe(600_000);
+    expect(qualifierHandForHandHardCapMs(qualifierTestTimeScale({ NODE_ENV: 'production', QUALIFIER_TEST_TIME_SCALE: '60' }))).toBe(600_000);
+    expect(qualifierHandForHandHardCapMs(qualifierTestTimeScale({ RAILWAY_SERVICE_ID: 'x', QUALIFIER_TEST_TIME_SCALE: '60' }))).toBe(600_000);
+    // 90 s > the longest legitimate gap between two actions (30 s clock + 15 s grace + a 15 s wedge sample).
+    expect(QUALIFIER_HAND_FOR_HAND_STALL_MS).toBe(90_000);
   });
 
   it('qualifierHandForHandOnAtBoot: unset / "1" / anything else → ON; "0" → OFF', () => {

@@ -130,7 +130,7 @@ See `src/index.ts`. Key events:
 | `QUALIFIER_BREAKS` | Optional (unset = ON) | Online qualifier scheduled breaks (2026-10-23, lifecycle S3; section "Online qualifier CLOCK, BREAKS, PAUSE"): a 5-minute break after every 5th level. **`0` = OFF** (levels run back to back, as before S3); anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs: **`POST /api/qualifiers/breaks` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403). Read at each level boundary; turning it off never ends a break already running (`POST /api/qualifiers/pause {"paused":false}` does). Shown as `r2Play.qualifiers.breaks.on` on `/api/health` |
 | `QUALIFIER_TEST_TIME_SCALE` | **Never set on Railway** (rig only) | Divides the qualifier ENGINE's level and break lengths (60 = a 12-minute level runs 12 s, the break 5 s) so the local rig can play a whole event in minutes. Inert by construction in production: `qualifierTestTimeScale` answers 1 whenever `NODE_ENV=production` or ANY Railway runtime variable is set (`RAILWAY_ENVIRONMENT`, `_NAME`, `_ID`, `RAILWAY_PROJECT_ID`, `RAILWAY_SERVICE_ID`, `RAILWAY_DEPLOYMENT_ID` — nixpacks does not set NODE_ENV). Clamped 1..120; the lobby's advertised 12-minute levels never change. Shown as `r2Play.qualifiers.testTimeScale` on `/api/health` (must read 1 in prod) |
 | `QUALIFIER_TABLES_OPEN_BEFORE_MIN` | Optional (default 10) | Online qualifier EARLY ROOMS (2026-10-23, lifecycle S4; section "Online qualifier EARLY ROOMS (T-10)"): this many minutes before the start the tables open, the online registrants sit down and the tournament is HELD (no card, no blind clock) until the start second, when the no-shows are released and refunded as before and every table is dealt. Clamped 0..30, garbage → 10; **`0` = OFF** = the 11:00 start of before (with S1's on-time timer). Only the value AT BOOT (a restart cancels a running qualifier). While the server runs: **`POST /api/qualifiers/tables-open` `{"minutes": 0}`** + header `X-Internal-Token` (no token configured → always 403); send it BEFORE 10:50 MT to stop the early open (a hold already open still deals at 11:00). AFTER the open, **`{"minutes": 0, "closeOpen": true}`** also undoes every open hold (its tables close, nothing was dealt, every registration and credit kept; the event starts at 11:00 the old way) — S4 review fix-up. Shown as `r2Play.qualifiers.preStart.leadMin` |
-| `QUALIFIER_HAND_FOR_HAND` | Optional (unset = ON) | Online qualifier HAND-FOR-HAND at the seat bubble (2026-10-24, owner 2026-10-23; section "Online qualifier HAND-FOR-HAND at the seat bubble"): after the late close, with 2+ tables and alive = the seat package's last paid place + 1 (Sunday: 11), every table plays one hand per round and waits for the others; same-hand busts are placed by starting stack. **`0` = OFF** (every table deals on its own, busts placed by bust order, as before); anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs: **`POST /api/qualifiers/hand-for-hand` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403); OFF releases an engaged event at once, ON also re-arms an event its 4-minute watchdog tripped. Shown as `r2Play.qualifiers.handForHand.on` on `/api/health` |
+| `QUALIFIER_HAND_FOR_HAND` | Optional (unset = ON) | Online qualifier HAND-FOR-HAND at the seat bubble (2026-10-24, owner 2026-10-23; section "Online qualifier HAND-FOR-HAND at the seat bubble"): after the late close, with 2+ tables and alive = the seat package's last paid place + 1 (Sunday: 11), every table plays one hand per round and waits for the others; same-hand busts are placed by starting stack. **`0` = OFF** (every table deals on its own, busts placed by bust order, as before); anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs: **`POST /api/qualifiers/hand-for-hand` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403); OFF releases an engaged event at once, ON also re-arms an event its watchdog tripped (a round stalled 90 s past the 4-minute mark, or past the 10-minute hard cap — a slow round that is still moving is never tripped). Shown as `r2Play.qualifiers.handForHand.on` on `/api/health` |
 | `ONLINE_GUEST_PLAY_ENABLED` | **Leave unset** | EMERGENCY ROLLBACK ONLY. `1` re-allows guest `register` and no-account play, against the 2026-10-07 owner rule "nobody plays .online without an American Pub Poker account". Suspended players stay blocked either way. Shown as `playGate.guestPlayEnabled` on `/api/health` |
 
 ## Deploy pre-flight
@@ -1153,59 +1153,139 @@ hand-for-hand =====`) plus the pure `qualifierSchedule.ts` helpers and
   is told, worst place first, through `tellTournamentBustNow` (the old inline tell
   block, moved verbatim; his socket re-checked: still live, still his account,
   still at that table and not seated elsewhere) plus the room copy
-  'playerEliminated' {…, handForHand:true} (additive). Nobody is ever told a
-  provisional place. Counted `bustsPlaced` / `placesChanged`.
-- **Exact ties (the stated default for the owner):** equal starting stacks share
-  ONE tie group across tables (the existing tie rule: `finishTournament` splits
-  their places' money and marks them `tied` — a qualifier's pool is 0, nothing
-  moves). The distinct numbers the master needs follow the existing in-table
-  rule: the LOWER-numbered seat takes the WORSE place; across tables the lower
-  table in `tableIds` order (Qualifier Table 1 before 2) counts as lower. So at a
-  10th / 11th tie the higher (table, seat) gets 10th.
+  'playerEliminated' {…, handForHand:true} (additive). Counted `bustsPlaced` /
+  `placesChanged`. **What a provisional place can still reach (review fix-up —
+  the old "nobody is ever told a provisional place" was overstated):** no
+  NOTICE carries one — the busted player's own notices and the room copy wait
+  for the settle; a Return (`returnToTournamentSeat`'s `no_tournament_seat`
+  answer) or a sign-in's dead-seat notice (`tellDeadTournamentSeat`) during that
+  window names NO place (`tournamentEntryOutcomeOfAccount` answers position 0
+  while `handForHandBustPending`; the settle tells every live socket of his the
+  FINAL place). But the standings bracket (`tournamentStandings` →
+  `publicTournamentStandings`, read straight from TournamentManager) shows the
+  provisional `finishPosition` (alive + 1 at his elimination) until the settle
+  re-places him — at most one round (or one drain); it corrects itself, and no
+  chips, credits or durable record are touched. Left as is on purpose: the
+  poker-3d bracket treats `finishPosition: null` as ALIVE, so hiding it would
+  show a busted player as still playing.
+- **Broken table + re-homed socket (review fix-up).** A table broken mid-round
+  is removed 5 s later and `rehomeBrokenTableWatchers` ends a busted player's
+  dead-seat session there and makes his socket a spectator of the live table
+  with the most alive ('spectatingTournament'). A round that settles AFTER that
+  (the usual case: the other table's round hand lasts longer than 5 s) still
+  sends him `eliminatedToSpectator` — on the live table he now watches
+  (`tellHandForHandBust` → `tellTournamentBustNow(…, watchingTableId)`). Before
+  the fix he got only the plain 'playerEliminated' toast.
+- **Exact ties (the stated default — OWNER TO CONFIRM before Sunday):** equal
+  starting stacks share ONE tie group across tables (the existing tie rule:
+  `finishTournament` splits their places' money and marks them `tied` — a
+  qualifier's pool is 0, nothing moves, and the poker-3d client ignores `tied`;
+  `markQualifierFinished` / `postQualifierResults` award seats by `position`
+  only, so the tie group is cosmetic for the seat). The distinct numbers follow
+  the existing IN-TABLE rule (`runTournamentBustCheck` sorts equal pre-hand stacks
+  stably by seat index, so the lower seat is eliminated first): the
+  LOWER-numbered seat takes the WORSE place; across tables the lower table in
+  `tableIds` order (Qualifier Table 1 before 2) counts as lower. So at a 10th /
+  11th tie the HIGHER (table, seat) gets 10th and the seat. The owner's words
+  ("share by the existing tie rule or the lower-numbered seat — state which") can
+  also be read as the lower-numbered seat WINNING; if so, the flip is one
+  comparison in `TournamentManager.placeSimultaneousBusts` (`(b.order - a.order)`
+  → `(a.order - b.order)`) plus HP5 / its tests — and it would then differ from
+  the in-table rule.
 - **Ends** (`qualifier_hand_for_hand_ended` {reason, rounds, alive}; the rooms get
   `serverAnnouncement` {kind:'hand_for_hand', on:false} "Hand-for-hand is over:
   normal play resumes." and every held table is kicked): `bubble_burst` (alive <=
   seatsForTop), `one_table`, `switch_off`, `tournament_over`, `watchdog`,
   `error`, `not_bubble` (alive went ABOVE the bubble — a late entry that committed
   just after the close; it re-engages at 11).
-- **Watchdog — fail OPEN.** A round not settled `watchdogMs` (240 000 ms;
+- **Watchdog — fail OPEN, but never on a hand that is still moving (review
+  fix-up).** A round not settled `watchdogMs` (240 000 ms;
   `qualifierHandForHandWatchdogMs(qualifierTestTimeScale)` — the rig scale divides
   it, floor 5 s; always 4 min on Railway) after it STARTED (while gathering:
-  after the first table held) releases every held table: log
-  `qualifier_hand_for_hand_watchdog_released` {round, heldMs, held, waitingOn:
-  [{tableId, phase, handNumber, base, bustCheckPending}]}, audit
-  QUALIFIER_HAND_FOR_HAND_WATCHDOG (durable), `watchdogReleases`++, and the event
-  is TRIPPED: it never re-engages until an operator sends `{"on":1}`. So the worst
-  case is ONE 4-minute delay per event. The paused time never counts: while the
+  after the first table held) is checked for PROGRESS. 0e6744d tripped right
+  there, but 4 minutes is reachable by a legitimate hand: 30 s per decision, no
+  time bank, disconnected seats on the full clock, players tanking at the bubble
+  (8 full-clock decisions = 240 s) — and a hand cannot wedge (the wedge watchdog
+  forces a stuck turn on after ~20-25 s). Each unsettled table
+  (`handForHandUnsettledTables`) is fingerprinted (`handForHandTableFingerprint`:
+  hand, street, seat to act, chips in the hand, pending bust checks, in /
+  starting / completing flags — every action changes it). While EVERY unsettled
+  table changed within `QUALIFIER_HAND_FOR_HAND_STALL_MS` (90 s, never scaled:
+  the 30 s clock + 15 s grace + a 15 s wedge sample are not scaled either; a table
+  is first sampled at the 4-minute mark), the round gets more time — polled every
+  5 s, log `qualifier_hand_for_hand_watchdog_extended` {round, heldMs, playing,
+  hardCapMs, stallMs} once per round, `watchdogExtensions`++ — up to the HARD cap
+  `hardCapMs` (600 000 ms = 10 min from the round's start, 20 full-clock decisions;
+  `qualifierHandForHandHardCapMs`, rig-scaled like the watchdog, never under it).
+  A STALLED table (no change for 90 s — a stuck one is released at 4:00 + 1:30) or
+  the hard cap releases every held table: log
+  `qualifier_hand_for_hand_watchdog_released` {round, heldMs, cause: 'stalled' |
+  'hard_cap', stalled, held, waitingOn: [{tableId, phase, handNumber, base,
+  bustCheckPending}]}, audit QUALIFIER_HAND_FOR_HAND_WATCHDOG (durable),
+  `watchdogReleases`++, and the event is TRIPPED: it never re-engages until an
+  operator sends `{"on":1}` (a stall or a 10-minute round is an anomaly; the worst
+  case is ONE such delay per event). The paused time never counts: while the
   tournament is paused (a break, a director pause) the watchdog polls every 5 s
-  and moves its clock on (and the 5 s sweep does too). An all-absent table (30 s
-  per decision) can need more than 4 minutes for one hand: that trips it (accepted
-  risk).
+  and moves its clock on, its progress samples cleared (and the 5 s sweep does
+  too).
+- **The DRAIN — a release mid-round keeps the round's bust batch open (review
+  fix-up).** A release while some table is still playing its ROUND hand (the
+  watchdog, `{"on":0}`, an error) used to place and tell the busts recorded so
+  far at once; the slower table's busts of that SAME hand-for-hand hand then
+  became ordinary busts placed by elimination order (0e6744d and 5b8ad77 alike:
+  a0 9,000 out at TA, then b0 3,000 out in TB's round hand → a0 11th, b0 10th and
+  the seat). Now `releaseHandForHand` → `openHandForHandDrain`: when a table's
+  round hand is in flight (`handForHandRoundHandInFlight`: its hand is base + 1
+  and still being played, or that hand's bust check is pending) AND it can matter
+  (a bust already recorded, or 2+ tables in flight), the round is kept as a
+  DRAIN (`handForHandDrains`): every held table is released and dealt AT ONCE as
+  before — only NOTICES wait. `handForHandRoundOf` still resolves the round hand
+  of the drain's waiting tables (never a hand dealt after the release: that is an
+  ordinary hand), so their busts join the batch. The drain closes (log
+  `qualifier_hand_for_hand_drain_closed` {round, why, busts, ms}; the batch placed
+  by starting stack and told, as at a settle) when every waiting table has
+  finished its round hand and run its bust check (`why: 'settled'` — checked at
+  every hand boundary of the event, by the 5 s sweep and by the queued service),
+  when the tournament ends (`tournament_over`), when a newer drain replaces it
+  (`replaced`), or at its CAP (`cap`: the watchdog's length, 4 min, from the
+  release — notices never wait longer; a round-hand bust after that is
+  ordinary). Log on open `qualifier_hand_for_hand_drain_open` {round, reason,
+  waitingOn, busts, capMs}. A LATER hand's bust at a released table (it dealt on
+  while the drain was open) is ordinary — placed and told at once by elimination
+  order; the drained busts are re-placed only among their OWN numbers, so places
+  stay a permutation of 1..N.
 - **Interplay.** Breaks / director pause: tables hold on the pause first (never
   the gate); the round's busts are placed and told during the pause; the resume /
   break end re-kicks every table into the gate → one new round. Balance: held
   tables make no moves; round start runs the pre-deal pass. Rebalance: a table
   broken mid-round leaves `tableIds` and is not waited for (its busts were
-  recorded by its bust check). Overflow: no new tables after the close. Absent /
-  disconnected players: their clock runs as before. Restarts: all state in memory
-  (a restart already cancels a running qualifier).
+  recorded by its bust check; their notices go to a re-homed socket's new table,
+  above). Overflow: no new tables after the close. Absent / disconnected players:
+  their clock runs as before (30 s per decision: a slow hand, which the watchdog
+  now waits for while it moves). Restarts: all state in memory (a restart already
+  cancels a running qualifier).
 - **Runtime switch (no restart).** Railway env `QUALIFIER_HAND_FOR_HAND=0` at boot
   (unset = ON). During the event:
   `curl -s -X POST https://poker-server-production-60c0.up.railway.app/api/qualifiers/hand-for-hand -H 'Content-Type: application/json' -H "X-Internal-Token: $INTERNAL_NOTIFY_TOKEN" -d '{"on":0}'`
-  — OFF releases every engaged event AT ONCE (busts recorded so far are placed
-  among themselves and told, held tables dealt). `{"on":1}` turns it back on and
+  — OFF releases every engaged event AT ONCE (held tables dealt; the busts
+  recorded so far are placed among themselves and told — after the round hands
+  still in flight have ended, the drain above). `{"on":1}` turns it back on and
   RE-ARMS a tripped event. 0 / 1 / true / false; anything else → 400, nothing
   changes; missing / wrong token → 403; no token configured → always 403 (fails
   closed). Answers `{success, previous, on, released, rearmed}`. Logged
   `qualifier_hand_for_hand_set`, audited QUALIFIER_HAND_FOR_HAND_SET (durable).
   **Sunday ops: never restart to change it** (a restart cancels the event); use the
   route. Use the token from the environment; never paste it into a chat.
-- **Health:** `r2Play.qualifiers.handForHand` = {on, watchdogMs, engaged:
-  [{tournamentId, qualifierId, round, gathering, held, heldSinceMs}],
-  engagedTotal, rounds, bustsPlaced, placesChanged, watchdogReleases, released:
-  {bubble_burst, one_table, switch_off, watchdog, tournament_over, error,
-  not_bubble}, tripped: [tournamentId], errors, switchChanges}. `errors` and
-  `watchdogReleases` should stay 0; `watchdogMs` must read 240000 in prod.
+- **Health:** `r2Play.qualifiers.handForHand` = {on, watchdogMs, hardCapMs,
+  stallMs, engaged: [{tournamentId, qualifierId, round, gathering, held,
+  heldSinceMs}], engagedTotal, rounds, bustsPlaced, placesChanged,
+  watchdogReleases, watchdogExtensions, released: {bubble_burst, one_table,
+  switch_off, watchdog, tournament_over, error, not_bubble}, tripped:
+  [tournamentId], drains: [{tournamentId, round, reason, waiting, busts,
+  sinceMs}], drainsOpened, drainsClosed: {settled, cap, tournament_over,
+  replaced}, errors, switchChanges}. `errors` and `watchdogReleases` should stay
+  0 (`watchdogExtensions` > 0 is normal: a slow round); `watchdogMs` must read
+  240000, `hardCapMs` 600000 and `stallMs` 90000 in prod.
 - **Contract (additive; CONTRACTS.md at the workspace root must be updated in the
   SHIP step):** the route; `tournamentClock.handForHand` / `handForHandRound`
   (null while gathering) / `handForHandText` (present ONLY while engaged — the S3
@@ -1217,7 +1297,9 @@ hand-for-hand =====`) plus the pure `qualifierSchedule.ts` helpers and
   shipped): poker-3d `utils/tournamentClock.js` could show `handForHandText` as the
   waiting banner.
 - **Manifest tokens:** `qualifier_hand_for_hand_engaged`,
-  `qualifier_hand_for_hand_busts_placed`, `/api/qualifiers/hand-for-hand`.
+  `qualifier_hand_for_hand_busts_placed`, `/api/qualifiers/hand-for-hand`; review
+  fix-up: `qualifier_hand_for_hand_watchdog_extended`,
+  `qualifier_hand_for_hand_drain_open`.
 - **Tests:** `tests/qualifierHandForHand.test.ts` (HP1-HP6: the predicate, the
   watchdog length and boot switch, `placeSimultaneousBusts` incl. cross-table,
   disqualified / unknown / duplicate ids, exact ties, guards);
@@ -1233,10 +1315,21 @@ hand-for-hand =====`) plus the pure `qualifierSchedule.ts` helpers and
   `tellTournamentBustNow`. Full jest 2259 passed, 30 skipped, 0
   failed (baseline 2224 at 5b8ad77, +35); `npm run lint` and `npm run build` clean;
   manifest 781 tokens, 0 missing from `dist/`.
+  Review fix-up: HP2 + the hard cap / stall window; H7 (a STUCK round: extended
+  at 4:00, released at 5:30 as `stalled`), H9 (`{on:0}` with TB's round hand in
+  flight → the drain, a1 told when it ends), H14 (a slow MOVING round past 4:00
+  is not released; a0 10th, b0 11th), H15 (the hard cap at rig scale 12, `{on:0}`
+  between the two busts, and the drain's cap), H16 (a broken table's re-homed
+  socket gets eliminatedToSpectator), H17 (no provisional place in a Return /
+  sign-in answer). Each new / changed test fails on 0e6744d.
+  `tests/absentSeat.test.ts` gives its explicit scope `handForHandBustPending`;
+  `tests/logoutSeatTeardown.test.ts` slices `handForHandDrains`.
 - **Rig (PENDING — the ship gate; not run in this commit):** scenario
   `qrig/scenario-handforhand.js` (the design's R0-R8 at
-  `QUALIFIER_TEST_TIME_SCALE=12`: a 20 s watchdog; a schedule fixture whose late
-  close is ~6 min after setup); `restart-server.sh` passes
+  `QUALIFIER_TEST_TIME_SCALE=12`: a 20 s watchdog and a 50 s hard cap — the 90 s
+  stall window is NOT scaled, so at that scale the hard cap releases a round
+  first, and any rig round hand that runs past 50 s trips the event; a schedule
+  fixture whose late close is ~6 min after setup); `restart-server.sh` passes
   `QUALIFIER_HAND_FOR_HAND` through. Ship gate: 3 consecutive passes + a smoke run
   and every legacy scenario green with ZERO engaged lines (they end inside the
   real 3 h window).

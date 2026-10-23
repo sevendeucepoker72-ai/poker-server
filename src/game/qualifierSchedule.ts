@@ -364,12 +364,31 @@ export function qualifierBreakConfig(timeScale: number = 1): { everyLevels: numb
  * engage. It ends the moment alive <= seatsForTop or one table is left.
  * The WATCHDOG (QUALIFIER_HAND_FOR_HAND_WATCHDOG_MS) releases every held table
  * when a round has not settled in time — fail OPEN; never during a break or a
- * director pause. Railway env QUALIFIER_HAND_FOR_HAND at boot ('0' = off, unset
+ * director pause. Review fix-up: a round still MAKING PROGRESS at that point (a
+ * slow hand: 30 s per decision, players tanking at the bubble) is given more
+ * time, every table checked for progress, until QUALIFIER_HAND_FOR_HAND_HARD_CAP_MS;
+ * a table with no progress for QUALIFIER_HAND_FOR_HAND_STALL_MS fails it open
+ * at once. Railway env QUALIFIER_HAND_FOR_HAND at boot ('0' = off, unset
  * = on); while the server runs: POST /api/qualifiers/hand-for-hand {on}
  * (X-Internal-Token). Owner-correctable here.
  */
 export const QUALIFIER_HAND_FOR_HAND_WATCHDOG_MS = 240_000;
 export const QUALIFIER_HAND_FOR_HAND_MIN_WATCHDOG_MS = 5_000;
+/**
+ * Review fix-up (2026-10-24) — the watchdog's HARD cap from a round's start
+ * (paused time never counts): a round still making progress after the 4-minute
+ * watchdog keeps its tables held, but never past this. 10 minutes = 20 decisions
+ * on the full 30 s clock (a worst-case hand is about 15) plus slack.
+ */
+export const QUALIFIER_HAND_FOR_HAND_HARD_CAP_MS = 600_000;
+/**
+ * Review fix-up (2026-10-24) — a table of an unsettled round with NO progress
+ * (no action, street, hand, bust check or hand-state change) for this long is
+ * STALLED and fails the round open. Never scaled by the rig: the turn clock
+ * (30 s + 15 s grace) and the wedge watchdog (~20-25 s, sampled every 15 s) that
+ * bound a legitimate pause between two actions are not scaled either.
+ */
+export const QUALIFIER_HAND_FOR_HAND_STALL_MS = 90_000;
 /** The seats of a qualifier table (TournamentManager.checkRebalance's own 9). */
 export const QUALIFIER_TABLE_SEATS = 9;
 
@@ -385,6 +404,15 @@ export function qualifierHandForHandOnAtBoot(raw: string | undefined): boolean {
  */
 export function qualifierHandForHandWatchdogMs(timeScale: number = 1): number {
   return Math.max(QUALIFIER_HAND_FOR_HAND_MIN_WATCHDOG_MS, Math.round(QUALIFIER_HAND_FOR_HAND_WATCHDOG_MS / engineTimeScale(timeScale)));
+}
+
+/**
+ * The hard cap's length: 10 minutes, divided by the RIG time scale like the
+ * watchdog (always 1 in production), never under the watchdog itself. Garbage →
+ * 10 minutes.
+ */
+export function qualifierHandForHandHardCapMs(timeScale: number = 1): number {
+  return Math.max(qualifierHandForHandWatchdogMs(timeScale), Math.round(QUALIFIER_HAND_FOR_HAND_HARD_CAP_MS / engineTimeScale(timeScale)));
 }
 
 /** Does hand-for-hand apply right now? Pure; every input must be a real number (an event with no scheduled time never engages). */

@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -22479,6 +22479,9 @@ function tellDeadTournamentSeat(socket: Socket, auth: SocketAuthSession, dead: D
   const why = tournamentEntryOutcomeOfAccount(auth, dead.tournamentId);
   if (!why) return;
   if (why.kind === 'eliminated') {
+    // Hand-for-hand review fix-up — a round bust not placed yet: nothing now; the
+    // settle tells every live socket of his (this one too) his FINAL place.
+    if (dead.playerId && handForHandBustPending(dead.tournamentId, dead.playerId)) return;
     noticeTournamentEliminationToEntrant(dead.tournamentId, dead.playerId || '', [socket.id], dead.playerName, why.position);
   } else {
     socket.emit('tournamentFinishedForEntrant', {
@@ -23502,7 +23505,11 @@ function tournamentEntryOutcomeOfAccount(
   const t = tournamentManager.getTournament(tournamentId);
   const tp = t?.players.find((p) => tournamentEntrantHasAccount(tournamentId, p) && tournamentEntrantIsAccount(tournamentId, p, auth));
   if (t && tp && t.status === 'running') {
-    return tp.eliminated ? { kind: 'eliminated', position: tp.finishPosition || 0 } : null;
+    // Hand-for-hand review fix-up — a round bust whose place is not settled yet
+    // (handForHandBustPending) is answered WITHOUT a place: he is told his final
+    // place when the round settles.
+    if (!tp.eliminated) return null;
+    return { kind: 'eliminated', position: handForHandBustPending(tournamentId, tp.playerId) ? 0 : (tp.finishPosition || 0) };
   }
   if (t && tp && t.status === 'finished') return { kind: 'finished', position: tp.finishPosition || 0 };
   const rec = finishedTournamentRecords.get(tournamentId);
@@ -26217,12 +26224,14 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
  * `toSpectator` — Q1: a table broken meanwhile → one of the tournament's live
  * tables), then the plain 'playerEliminated' + tournamentId to `noticeSids` (his
  * other live sockets; the room's copy skips them). `brokenNow` and the socket
- * are read when it runs.
+ * are read when it runs. `watchingTableId` (hand-for-hand review fix-up): the
+ * live table his socket already watches because a break re-homed it there —
+ * he stays on it.
  */
 function tellTournamentBustNow(
   tournamentId: string, tableId: string, bust: { playerId: string; playerName: string },
   ctx: { sid: string | null; toSpectator: boolean; seatedElsewhere: boolean; playsHere: boolean },
-  bustPosition: number, noticeSids: string[],
+  bustPosition: number, noticeSids: string[], watchingTableId?: string,
 ): void {
   const sid = ctx.sid;
   const sock = sid ? io.sockets.sockets.get(sid) : undefined;
@@ -26239,7 +26248,7 @@ function tellTournamentBustNow(
     // broke is removed within 5s — he watches one of the tournament's
     // live tables instead).
     const specTableId = brokenNow
-      ? (tournamentManager.getTournament(tournamentId)?.tableIds[0] ?? tableId)
+      ? (watchingTableId ?? tournamentManager.getTournament(tournamentId)?.tableIds[0] ?? tableId)
       : tableId;
     // P-g — one socket, one table view (it held this seat, so it is in
     // this table's room; any other spectating / room ends).
@@ -27099,10 +27108,17 @@ function balanceQualifierTablesNow(tournamentId: string, opts: { ignoreSwitch?: 
  * left (one_table), the switch is off (switch_off), the tournament is over
  * (tournament_over) — or at once by the WATCHDOG: a round not settled
  * handForHandWatchdogMsNow() (4 min) after it started — or after the first
- * table held, while gathering — releases every held table (fail OPEN, logged,
- * counted, durable audit) and trips the event: it never re-engages until an
- * operator sends {on:true}. A break or a director pause never trips it (the
- * paused time is not counted). Any throw in here is caught (`errors`, log
+ * table held, while gathering — is checked for PROGRESS (review fix-up): while
+ * every unsettled table keeps moving (an action, a street, its hand end, its bust
+ * check) it gets more time, up to handForHandHardCapMsNow() (10 min); a table
+ * with no progress for QUALIFIER_HAND_FOR_HAND_STALL_MS (90 s), or the hard cap,
+ * releases every held table (fail OPEN, logged, counted, durable audit) and
+ * trips the event: it never re-engages until an operator sends {on:true}. A
+ * break or a director pause never trips it (the paused time is not counted).
+ * A release mid-round (watchdog, switch-off, error) keeps the round's bust
+ * batch OPEN for the tables still playing their round hand (a DRAIN, review
+ * fix-up): their busts of that hand are placed with the rest when it ends —
+ * only notices wait, never a deal. Any throw in here is caught (`errors`, log
  * `qualifier_hand_for_hand_failed`), trips the event and releases it: a deal is
  * never stopped by this code. Runtime switch, no restart: POST
  * /api/qualifiers/hand-for-hand {on} (X-Internal-Token, fails closed). Every
@@ -27158,10 +27174,38 @@ interface HandForHandState {
   /** The watchdog's clock: the round's start, or the first hold while gathering (pushed forward while paused). */
   heldSince: number | null;
   watchdog: ReturnType<typeof setTimeout> | null;
+  /**
+   * Review fix-up — past the 4-minute watchdog: each unsettled table's progress
+   * fingerprint (handForHandTableFingerprint) and when it last CHANGED. Cleared
+   * at each round start and while paused.
+   */
+  progress: Map<string, { fp: string; at: number }>;
+  /** The round (0 = gathering) whose watchdog extension was logged (once per round). */
+  extendedRound: number | null;
 }
+
+/**
+ * Review fix-up — a round released while some tables were still playing their
+ * round hand (watchdog, switch-off, error): its bust batch stays OPEN for those
+ * tables (handForHandRoundOf still resolves their round hand), and is placed and
+ * told when each has finished it and run its bust check — or after the
+ * watchdog's length (the cap: notices never wait longer), or when the
+ * tournament ends. Nothing is held: the tables deal on.
+ */
+interface HandForHandDrain {
+  st: HandForHandState;
+  reason: HandForHandEndReason;
+  /** Tables whose round hand was in flight at the release. */
+  waiting: Set<string>;
+  since: number;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+type HandForHandDrainClose = 'settled' | 'cap' | 'tournament_over' | 'replaced';
 
 /** Engaged events (tournament id → state). */
 const handForHandStates = new Map<string, HandForHandState>();
+/** Open drains (tournament id → the released round still waiting for in-flight round hands). */
+const handForHandDrains = new Map<string, HandForHandDrain>();
 /** Events a watchdog (or an error) released: never re-engaged until POST {on:true}. */
 const handForHandTripped = new Set<string>();
 /** Health r2Play.qualifiers.handForHand (with on / engaged / tripped). errors and watchdogReleases should stay 0. */
@@ -27169,6 +27213,9 @@ const handForHandStats = {
   engagedTotal: 0, rounds: 0, bustsPlaced: 0, placesChanged: 0, watchdogReleases: 0,
   released: { bubble_burst: 0, one_table: 0, switch_off: 0, watchdog: 0, tournament_over: 0, error: 0, not_bubble: 0 } as Record<HandForHandEndReason, number>,
   errors: 0, switchChanges: 0,
+  // Review fix-up — rounds the watchdog gave more time (still progressing), and the drains.
+  watchdogExtensions: 0, drainsOpened: 0,
+  drainsClosed: { settled: 0, cap: 0, tournament_over: 0, replaced: 0 } as Record<HandForHandDrainClose, number>,
 };
 /** Events whose service is queued (setImmediate, one per event). */
 const handForHandServiceQueued = new Set<string>();
@@ -27178,6 +27225,10 @@ let handForHandQuietBust: string | null = null;
 /** The watchdog in force: 4 minutes, divided by the RIG time scale (always 1 in production). */
 function handForHandWatchdogMsNow(): number {
   return qualifierHandForHandWatchdogMs(qualifierTestTimeScale(process.env));
+}
+/** The watchdog's hard cap in force: 10 minutes, divided by the RIG time scale (always 1 in production), never under the watchdog. */
+function handForHandHardCapMsNow(): number {
+  return qualifierHandForHandHardCapMs(qualifierTestTimeScale(process.env));
 }
 
 /** Counted + logged; never throws. */
@@ -27250,7 +27301,7 @@ function tellHandForHandRooms(tournamentId: string, message: string, on: boolean
 function engageHandForHand(tournamentId: string, inputs: NonNullable<ReturnType<typeof handForHandInputs>>): HandForHandState {
   const st: HandForHandState = {
     tournamentId, qualifierId: inputs.qualifierId, engagedAt: Date.now(), rounds: 0, round: null,
-    held: new Set(), heldSince: null, watchdog: null,
+    held: new Set(), heldSince: null, watchdog: null, progress: new Map(), extendedRound: null,
   };
   handForHandStates.set(tournamentId, st);
   handForHandStats.engagedTotal++;
@@ -27274,6 +27325,9 @@ function engageHandForHand(tournamentId: string, inputs: NonNullable<ReturnType<
  */
 function handForHandHoldsDeal(tournamentId: string, tableId: string, table: PokerTable): boolean {
   try {
+    // Review fix-up — an open drain is checked at every hand boundary (a table that
+    // finished its round hand reaches its next one after its bust check ran).
+    if (handForHandDrains.has(tournamentId)) queueHandForHandService(tournamentId);
     if (handForHandTripped.has(tournamentId)) return false;
     let st = handForHandStates.get(tournamentId);
     if (!st) {
@@ -27301,12 +27355,34 @@ function handForHandHoldsDeal(tournamentId: string, tableId: string, table: Poke
   }
 }
 
-/** The round whose hand `handNumber` of `tableId` is (its base + 1), else null — the bust check records that hand's busts into it. */
+/**
+ * The round whose hand `handNumber` of `tableId` is (its base + 1), else null —
+ * the bust check records that hand's busts into it. Review fix-up: also an OPEN
+ * DRAIN's round, for the tables whose round hand was in flight at the release
+ * (never a table that dealt its round hand after the release: that hand is an
+ * ordinary one).
+ */
 function handForHandRoundOf(tournamentId: string, tableId: string, handNumber: number): HandForHandRound | null {
   const r = handForHandStates.get(tournamentId)?.round;
-  if (!r) return null;
-  const base = r.base.get(tableId);
-  return base !== undefined && handNumber === base + 1 ? r : null;
+  if (r) {
+    const base = r.base.get(tableId);
+    if (base !== undefined && handNumber === base + 1) return r;
+  }
+  const d = handForHandDrains.get(tournamentId);
+  const dr = d && d.waiting.has(tableId) ? d.st.round : null;
+  if (!dr) return null;
+  const dBase = dr.base.get(tableId);
+  return dBase !== undefined && handNumber === dBase + 1 ? dr : null;
+}
+
+/**
+ * Review fix-up — is `playerId` a bust of a hand-for-hand round (engaged or
+ * draining) whose place is not settled and not told yet? (A Return / sign-in
+ * then names no place: he is told his FINAL place at the settle.)
+ */
+function handForHandBustPending(tournamentId: string, playerId: string): boolean {
+  const inRound = (r: HandForHandRound | null | undefined): boolean => !!r && r.busts.some((b) => b.playerId === playerId);
+  return inRound(handForHandStates.get(tournamentId)?.round) || inRound(handForHandDrains.get(tournamentId)?.st.round);
 }
 
 /** Is `playerId`'s elimination happening right now as a hand-for-hand round bust (its room notice waits)? */
@@ -27321,30 +27397,74 @@ function queueHandForHandService(tournamentId: string): void {
   setImmediate(() => {
     handForHandServiceQueued.delete(tournamentId);
     serviceHandForHand(tournamentId);
+    serviceHandForHandDrain(tournamentId);
   });
 }
 
 /**
- * Every live table of the event idle (not in, starting or completing a hand;
- * HandComplete / WaitingForPlayers), its bust checks all run, and none still
- * due its round hand. A table broken mid-round has left tableIds: not waited for.
+ * The live tables of the event that keep its round from settling: in, starting
+ * or completing a hand, not at HandComplete / WaitingForPlayers, a bust check
+ * still pending, or still due its round hand. A table broken mid-round has left
+ * tableIds: not waited for.
  */
-function handForHandRoundSettled(st: HandForHandState): boolean {
+function handForHandUnsettledTables(st: HandForHandState): string[] {
   const t = tournamentManager.getTournament(st.tournamentId);
-  if (!t) return true;
+  if (!t) return [];
   const r = st.round;
+  const out: string[] = [];
   for (const tid of t.tableIds) {
     const table = tableManager.getTable(tid);
     if (!table || tournamentTables.get(tid) !== st.tournamentId) continue;
-    if (table.isHandInProgress() || table.isStartingHand() || table.isCompletingHand()) return false;
-    if (table.currentPhase !== GamePhase.HandComplete && table.currentPhase !== GamePhase.WaitingForPlayers) return false;
-    if ((tournamentBustChecksPending.get(tid)?.size || 0) > 0) return false;
+    if (table.isHandInProgress() || table.isStartingHand() || table.isCompletingHand()
+      || (table.currentPhase !== GamePhase.HandComplete && table.currentPhase !== GamePhase.WaitingForPlayers)
+      || (tournamentBustChecksPending.get(tid)?.size || 0) > 0) {
+      out.push(tid);
+      continue;
+    }
     if (r) {
       const base = r.base.get(tid);
-      if (base !== undefined && table.handNumber === base && !r.attempted.has(tid)) return false;   // still due its round hand
+      if (base !== undefined && table.handNumber === base && !r.attempted.has(tid)) out.push(tid);   // still due its round hand
     }
   }
-  return true;
+  return out;
+}
+
+/** Every live table of the event idle, its bust checks all run, and none still due its round hand. */
+function handForHandRoundSettled(st: HandForHandState): boolean {
+  return handForHandUnsettledTables(st).length === 0;
+}
+
+/**
+ * Review fix-up — a table's PROGRESS fingerprint (the watchdog's "is it still
+ * moving?"): its hand, street, the seat to act, the chips in this hand, its
+ * pending bust checks and its in / starting / completing flags. Within a hand
+ * every action changes it (the seat to act, the street or the chips); its end
+ * and its bust check do too.
+ */
+function handForHandTableFingerprint(tableId: string): string {
+  const table = tableManager.getTable(tableId);
+  if (!table) return 'gone';
+  let chips = 0;
+  for (const s of table.seats) chips += ((s && s.totalInvestedThisHand) || 0) + ((s && s.currentBet) || 0);
+  const pend = tournamentBustChecksPending.get(tableId);
+  const flags = `${table.isHandInProgress() ? 1 : 0}${table.isStartingHand() ? 1 : 0}${table.isCompletingHand() ? 1 : 0}`;
+  return `${table.handNumber}|${table.currentPhase}|${table.activeSeatIndex}|${chips}|${pend ? [...pend.keys()].join(',') : ''}|${flags}`;
+}
+
+/**
+ * Review fix-up — of `tables` (the unsettled ones), those STALLED: no change of
+ * their fingerprint for QUALIFIER_HAND_FOR_HAND_STALL_MS. A table first sampled
+ * now (or that changed) counts as moving from now.
+ */
+function handForHandStalledTables(st: HandForHandState, tables: string[], now: number): string[] {
+  const out: string[] = [];
+  for (const tid of tables) {
+    const fp = handForHandTableFingerprint(tid);
+    const prev = st.progress.get(tid);
+    if (!prev || prev.fp !== fp) st.progress.set(tid, { fp, at: now });
+    else if (now - prev.at >= QUALIFIER_HAND_FOR_HAND_STALL_MS) out.push(tid);
+  }
+  return out;
 }
 
 /**
@@ -27373,18 +27493,24 @@ function serviceHandForHand(tournamentId: string): void {
   }
 }
 
-/** The 5 s sweep: every engaged event serviced; the watchdog's clock stands still while paused; trips of finished events forgotten. */
+/** The 5 s sweep: every engaged event serviced; the watchdog's clock stands still while paused; open drains checked; trips of finished events forgotten. */
 function serviceAllHandForHand(): void {
   for (const tournamentId of [...handForHandStates.keys()]) {
     try {
       const st = handForHandStates.get(tournamentId);
       if (!st) continue;
       const t = tournamentManager.getTournament(tournamentId);
-      if (t && t.status === 'running' && t.paused && st.heldSince !== null) st.heldSince = Date.now();
+      if (t && t.status === 'running' && t.paused && st.heldSince !== null) {
+        st.heldSince = Date.now();
+        st.progress.clear();
+      }
       serviceHandForHand(tournamentId);
     } catch (e) {
       handForHandFailed(tournamentId, 'sweep', e);
     }
+  }
+  for (const tournamentId of [...handForHandDrains.keys()]) {
+    try { serviceHandForHandDrain(tournamentId); } catch (e) { handForHandFailed(tournamentId, 'sweep_drain', e); }
   }
   for (const tournamentId of [...handForHandTripped]) {
     if (tournamentManager.getTournament(tournamentId)?.status !== 'running') handForHandTripped.delete(tournamentId);
@@ -27428,6 +27554,7 @@ function startHandForHandRound(st: HandForHandState): void {
   st.held.clear();
   if (st.watchdog) { clearTimeout(st.watchdog); st.watchdog = null; }
   st.heldSince = now;
+  st.progress.clear();
   armHandForHandWatchdog(st);
   console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_hand_for_hand_round', tournamentId, round: r.no, alive: tournamentManager.getAliveCount(tournamentId), tables })}`);
   let waiting = false;
@@ -27475,11 +27602,21 @@ function tellHandForHandBust(tournamentId: string, b: HandForHandBust): void {
   const identified = tp.userId !== undefined || !!(tp.masterUserId || qualifierEntrantMasterId(tournamentId, tp.playerId));
   const liveSid = sid && sock && sock.connected && (!identified || tournamentEntrantIsAccount(tournamentId, tp, authSessions.get(sid))) ? sid : null;
   const seatedElsewhere = !!liveSid && socketHoldsPlayerSessionElsewhere(liveSid, b.tableId);
-  const atTable = !!liveSid && (playerSessions.get(liveSid)?.tableId === b.tableId || !!spectators.get(b.tableId)?.has(liveSid));
+  let atTable = !!liveSid && (playerSessions.get(liveSid)?.tableId === b.tableId || !!spectators.get(b.tableId)?.has(liveSid));
+  // Review fix-up — his table was BROKEN mid-round and, more than 5 s before
+  // this settle, removed: rehomeBrokenTableWatchers already ended his dead-seat
+  // session there and made his socket a spectator of one of the tournament's
+  // live tables ('spectatingTournament'). He is still "at the table": he gets
+  // eliminatedToSpectator on the table he watches now (never moved to another).
+  let specTableId: string | undefined;
+  if (liveSid && !atTable && tournamentTables.get(b.tableId) !== tournamentId) {
+    const watched = t.tableIds.find((tid) => tournamentTables.get(tid) === tournamentId && !!spectators.get(tid)?.has(liveSid));
+    if (watched) { atTable = true; specTableId = watched; }
+  }
   const toSpectator = b.ctx.toSpectator && atTable && !seatedElsewhere;
   const noticeSids = tournamentEliminationNoticeSockets(tournamentId, tp, toSpectator ? liveSid : null);
   tellTournamentBustNow(tournamentId, b.tableId, { playerId: b.playerId, playerName: b.playerName },
-    { sid: liveSid, toSpectator, seatedElsewhere, playsHere: b.ctx.playsHere }, position, noticeSids);
+    { sid: liveSid, toSpectator, seatedElsewhere, playsHere: b.ctx.playsHere }, position, noticeSids, specTableId);
   emitHandForHandRoomBust(tournamentId, { playerId: b.playerId, playerName: b.playerName, position, eliminatorId: b.eliminatorId }, noticeSids);
 }
 
@@ -27528,11 +27665,105 @@ function placeAndTellHandForHandBusts(st: HandForHandState): void {
 }
 
 /**
+ * Review fix-up — is `tableId`'s ROUND hand of `r` still in flight: its hand is
+ * the round hand (base + 1) and it is still being played (in, starting or
+ * completing it, or not yet at HandComplete), or its bust check is pending.
+ */
+function handForHandRoundHandInFlight(tournamentId: string, r: HandForHandRound, tableId: string): boolean {
+  const base = r.base.get(tableId);
+  if (base === undefined) return false;
+  if (tournamentBustChecksPending.get(tableId)?.has(base + 1)) return true;
+  const table = tableManager.getTable(tableId);
+  if (!table || tournamentTables.get(tableId) !== tournamentId || table.handNumber !== base + 1) return false;
+  return table.isHandInProgress() || table.isStartingHand() || table.isCompletingHand()
+    || (table.currentPhase !== GamePhase.HandComplete && table.currentPhase !== GamePhase.WaitingForPlayers);
+}
+
+/**
+ * Review fix-up — at a release (the state is already dropped): when the round's
+ * hand is still being played somewhere and its busts can matter together (some
+ * already recorded, or 2+ tables still in it), the round's bust batch stays OPEN
+ * (a DRAIN) for those tables instead of being placed now. Returns true when a
+ * drain was opened (the caller then does NOT place and tell the busts). An older
+ * drain of the same event is closed first ('replaced'; its notices deferred when
+ * `deferred` — the release runs inside a deal path).
+ */
+function openHandForHandDrain(st: HandForHandState, reason: HandForHandEndReason, deferred = false): boolean {
+  const tournamentId = st.tournamentId;
+  const r = st.round;
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!r || !t || t.status !== 'running') return false;
+  const waiting = [...r.base.keys()].filter((tid) => handForHandRoundHandInFlight(tournamentId, r, tid));
+  if (waiting.length === 0 || (r.busts.length === 0 && waiting.length < 2)) return false;
+  const old = takeHandForHandDrain(tournamentId);
+  if (old) {
+    if (deferred) setImmediate(() => finishHandForHandDrain(tournamentId, old, 'replaced'));
+    else finishHandForHandDrain(tournamentId, old, 'replaced');
+  }
+  const d: HandForHandDrain = { st, reason, waiting: new Set(waiting), since: Date.now(), timer: null };
+  handForHandDrains.set(tournamentId, d);
+  handForHandStats.drainsOpened++;
+  const cap = handForHandWatchdogMsNow();
+  const timer = setTimeout(() => {
+    try { closeHandForHandDrain(tournamentId, 'cap'); } catch (e) { handForHandFailed(tournamentId, 'drain_cap', e); }
+  }, cap);
+  (timer as any)?.unref?.();
+  d.timer = timer;
+  console.log(`[Qualifier] ${JSON.stringify({
+    event: 'qualifier_hand_for_hand_drain_open', tournamentId, round: r.no, reason, waitingOn: waiting,
+    busts: r.busts.map((b) => b.playerId), capMs: cap,
+  })}`);
+  return true;
+}
+
+/** Review fix-up — the event's open drain taken out (its cap timer cleared), or null. */
+function takeHandForHandDrain(tournamentId: string): HandForHandDrain | null {
+  const d = handForHandDrains.get(tournamentId);
+  if (!d) return null;
+  handForHandDrains.delete(tournamentId);
+  if (d.timer) { clearTimeout(d.timer); d.timer = null; }
+  return d;
+}
+/** Review fix-up — the drain ends: its round's busts are placed and told. */
+function closeHandForHandDrain(tournamentId: string, why: HandForHandDrainClose): void {
+  const d = takeHandForHandDrain(tournamentId);
+  if (d) finishHandForHandDrain(tournamentId, d, why);
+}
+/** Logged, counted, then the round's busts placed and told. Never throws (it may run in a timer or a setImmediate). */
+function finishHandForHandDrain(tournamentId: string, d: HandForHandDrain, why: HandForHandDrainClose): void {
+  handForHandStats.drainsClosed[why] = (handForHandStats.drainsClosed[why] || 0) + 1;
+  const busts = d.st.round ? d.st.round.busts.length : 0;
+  try {
+    console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_hand_for_hand_drain_closed', tournamentId, round: d.st.round?.no ?? null, why, busts, ms: Date.now() - d.since })}`);
+  } catch (_) { /* logging only */ }
+  try { placeAndTellHandForHandBusts(d.st); } catch (e) { handForHandFailed(tournamentId, 'drain_tell', e); }
+}
+
+/** Review fix-up — the drain closes once every waiting table has finished its round hand and run its bust check (or the tournament ended). Never throws. */
+function serviceHandForHandDrain(tournamentId: string): void {
+  const d = handForHandDrains.get(tournamentId);
+  if (!d) return;
+  try {
+    const t = tournamentManager.getTournament(tournamentId);
+    if (!t || t.status !== 'running') { closeHandForHandDrain(tournamentId, 'tournament_over'); return; }
+    const r = d.st.round;
+    if (!r) { closeHandForHandDrain(tournamentId, 'settled'); return; }
+    for (const tid of [...d.waiting]) if (!handForHandRoundHandInFlight(tournamentId, r, tid)) d.waiting.delete(tid);
+    if (d.waiting.size === 0) closeHandForHandDrain(tournamentId, 'settled');
+  } catch (e) {
+    handForHandFailed(tournamentId, 'drain', e);
+    try { closeHandForHandDrain(tournamentId, 'settled'); } catch (_) { /* never rethrow */ }
+  }
+}
+
+/**
  * Hand-for-hand ENDS for this event: the state is dropped and its watchdog
  * cleared at once; then (deferred when called from inside a deal path — the
- * gate) the round's recorded busts are placed and told, the rooms told, and
- * every held table kicked (restartWaitingTournamentTables: a held HandComplete
- * table has no pending timer; a waiting one deals — a pause is respected).
+ * gate) the round's recorded busts are placed and told — or, when some table is
+ * still playing its round hand, kept in a DRAIN until it has (review fix-up) —
+ * the rooms told, and every held table kicked (restartWaitingTournamentTables: a
+ * held HandComplete table has no pending timer; a waiting one deals — a pause is
+ * respected).
  */
 function releaseHandForHand(tournamentId: string, reason: HandForHandEndReason, opts: { deferred?: boolean } = {}): void {
   const st = handForHandStates.get(tournamentId);
@@ -27540,9 +27771,14 @@ function releaseHandForHand(tournamentId: string, reason: HandForHandEndReason, 
   handForHandStates.delete(tournamentId);
   if (st.watchdog) { clearTimeout(st.watchdog); st.watchdog = null; }
   handForHandStats.released[reason] = (handForHandStats.released[reason] || 0) + 1;
+  // Review fix-up — decided NOW (a bust check could run before a deferred finish).
+  let drained = false;
+  try { drained = openHandForHandDrain(st, reason, !!opts.deferred); } catch (e) { handForHandFailed(tournamentId, 'drain_open', e); }
   // Never throws (it may run in a setImmediate: a throw there is an uncaughtException).
   const finish = (): void => {
-    try { placeAndTellHandForHandBusts(st); } catch (e) { handForHandFailed(tournamentId, 'release_tell', e); }
+    if (!drained) {
+      try { placeAndTellHandForHandBusts(st); } catch (e) { handForHandFailed(tournamentId, 'release_tell', e); }
+    }
     try {
       const t = tournamentManager.getTournament(tournamentId);
       console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_hand_for_hand_ended', tournamentId, reason, rounds: st.rounds, alive: tournamentManager.getAliveCount(tournamentId) })}`);
@@ -27581,14 +27817,25 @@ function armHandForHandWatchdog(st: HandForHandState, waitMs?: number): void {
   st.watchdog = timer;
 }
 
+/** Review fix-up — past the watchdog, a still-moving round is re-checked this often (its stall clock and the hard cap). */
+const HAND_FOR_HAND_PROGRESS_POLL_MS = 5_000;
 /**
  * The watchdog fired. Paused (a break, a director pause): it polls every
  * HAND_FOR_HAND_PAUSE_POLL_MS and its clock moves on (the paused time never
  * counts — a round still due across a pause gets its full time after the
  * resume). Time left (the clock moved on): re-armed. The round
- * settled meanwhile: serviced. Otherwise FAIL OPEN: logged, counted, audited
- * (durable), the event tripped and released. Never throws (it runs in a timer:
- * a throw would be an uncaughtException, and the crash flush voids the event).
+ * settled meanwhile: serviced. Review fix-up: a round whose every unsettled
+ * table is still MOVING (handForHandStalledTables: a fingerprint change within
+ * QUALIFIER_HAND_FOR_HAND_STALL_MS — a slow hand on the 30 s clock, never a
+ * wedged one: the wedge watchdog forces a stuck turn on) gets more time, polled
+ * every HAND_FOR_HAND_PROGRESS_POLL_MS, up to the HARD cap
+ * (handForHandHardCapMsNow, 10 min) — logged once per round
+ * `qualifier_hand_for_hand_watchdog_extended`, counted watchdogExtensions.
+ * Otherwise (a STALLED table, or the hard cap) FAIL OPEN: logged, counted,
+ * audited (durable), the event tripped and released (the round's bust batch kept
+ * open for the tables still in their round hand — the drain). Never throws (it
+ * runs in a timer: a throw would be an uncaughtException, and the crash flush
+ * voids the event).
  */
 function handForHandWatchdogFired(tournamentId: string): void {
   try {
@@ -27600,14 +27847,32 @@ function handForHandWatchdogFired(tournamentId: string): void {
     if (st.heldSince === null) return;   // nothing is held: the next hold re-arms it
     if (t.paused) {
       st.heldSince = Date.now();
+      st.progress.clear();
       armHandForHandWatchdog(st, Math.min(HAND_FOR_HAND_PAUSE_POLL_MS, handForHandWatchdogMsNow()));
       return;
     }
-    const heldMs = Date.now() - st.heldSince;
+    const now = Date.now();
+    const heldMs = now - st.heldSince;
     if (heldMs < handForHandWatchdogMsNow()) { armHandForHandWatchdog(st); return; }
-    if (handForHandRoundSettled(st)) { serviceHandForHand(tournamentId); return; }
-    handForHandStats.watchdogReleases++;
+    const unsettled = handForHandUnsettledTables(st);
+    if (unsettled.length === 0) { serviceHandForHand(tournamentId); return; }
+    const hardCapMs = handForHandHardCapMsNow();
+    const stalled = handForHandStalledTables(st, unsettled, now);
     const r = st.round;
+    if (stalled.length === 0 && heldMs < hardCapMs) {
+      const roundNo = r ? r.no : 0;
+      if (st.extendedRound !== roundNo) {
+        st.extendedRound = roundNo;
+        handForHandStats.watchdogExtensions++;
+        console.log(`[Qualifier] ${JSON.stringify({
+          event: 'qualifier_hand_for_hand_watchdog_extended', tournamentId, round: r ? r.no : null, heldMs,
+          playing: unsettled, hardCapMs, stallMs: QUALIFIER_HAND_FOR_HAND_STALL_MS,
+        })}`);
+      }
+      armHandForHandWatchdog(st, Math.min(HAND_FOR_HAND_PROGRESS_POLL_MS, hardCapMs - heldMs));
+      return;
+    }
+    handForHandStats.watchdogReleases++;
     const waitingOn = t.tableIds.map((tid) => {
       const table = tableManager.getTable(tid);
       return {
@@ -27615,7 +27880,8 @@ function handForHandWatchdogFired(tournamentId: string): void {
         base: r?.base.get(tid) ?? null, bustCheckPending: (tournamentBustChecksPending.get(tid)?.size || 0) > 0,
       };
     }).filter((x) => !st.held.has(x.tableId));
-    const details = { tournamentId, qualifierId: st.qualifierId, round: r?.no ?? null, heldMs, held: [...st.held], waitingOn };
+    const cause = heldMs >= hardCapMs ? 'hard_cap' : 'stalled';
+    const details = { tournamentId, qualifierId: st.qualifierId, round: r?.no ?? null, heldMs, cause, stalled, held: [...st.held], waitingOn };
     console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_hand_for_hand_watchdog_released', ...details })}`);
     auditLog('SYSTEM', 'QUALIFIER_HAND_FOR_HAND_WATCHDOG', details);
     handForHandTripped.add(tournamentId);
@@ -27647,6 +27913,9 @@ function handForHandHealth(): Record<string, unknown> {
   return {
     on: qualifierHandForHandOn,
     watchdogMs: handForHandWatchdogMsNow(),
+    // Review fix-up — the hard cap and the stall window of a still-moving round.
+    hardCapMs: handForHandHardCapMsNow(),
+    stallMs: QUALIFIER_HAND_FOR_HAND_STALL_MS,
     engaged: [...handForHandStates.values()].map((st) => ({
       tournamentId: st.tournamentId, qualifierId: st.qualifierId, round: st.round ? st.round.no : null, gathering: !st.round,
       held: st.held.size, heldSinceMs: st.heldSince === null ? null : now - st.heldSince,
@@ -27656,8 +27925,16 @@ function handForHandHealth(): Record<string, unknown> {
     bustsPlaced: handForHandStats.bustsPlaced,
     placesChanged: handForHandStats.placesChanged,
     watchdogReleases: handForHandStats.watchdogReleases,
+    watchdogExtensions: handForHandStats.watchdogExtensions,
     released: { ...handForHandStats.released },
     tripped: [...handForHandTripped],
+    // Review fix-up — released rounds still waiting for a round hand in flight (their busts' notices wait).
+    drains: [...handForHandDrains.entries()].map(([tournamentId, d]) => ({
+      tournamentId, round: d.st.round ? d.st.round.no : null, reason: d.reason, waiting: [...d.waiting],
+      busts: d.st.round ? d.st.round.busts.length : 0, sinceMs: now - d.since,
+    })),
+    drainsOpened: handForHandStats.drainsOpened,
+    drainsClosed: { ...handForHandStats.drainsClosed },
     errors: handForHandStats.errors,
     switchChanges: handForHandStats.switchChanges,
   };
