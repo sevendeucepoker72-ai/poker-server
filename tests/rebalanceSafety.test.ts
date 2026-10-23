@@ -53,7 +53,7 @@ import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC
 import fs from 'fs';
 import path from 'path';
 // 2026-10-23 (qualifier lifecycle S1) — startQualifierTournament's seat draw (crypto randomInt).
-import { randomInt } from 'crypto';
+import { randomInt, createHash, timingSafeEqual } from 'crypto';
 
 const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
@@ -981,6 +981,9 @@ describe('Q2 — the rebalance finds a mover by his LIVE seat (a re-entered qual
     // TA: a0-a4 + a5 busted at seat 5, re-entered at seat 6; seats 7, 8 empty. TB: 3 alive.
     // 9 alive ≤ 9 → Rule 1: TB fits only if a5's dead seat counts (2 empty + 1 = 3).
     const w = world({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 3, 5000, 200) } });
+    // 2026-10-23 (S2) — the re-entry now tries the FEWEST-alive table first (TB, 3):
+    // TB is capped at its 3 seats so a5 still re-enters at TA seat 6 (this test's set-up).
+    w.tables.get('TB')!.maxOccupiableSeats = 3;
     bust(w, 'TA', [5]);
     expect(reenter(w, 'a5', w.mkSocket('S-a5'))).toBe(true);
     const TA = w.tables.get('TA')!;
@@ -999,6 +1002,7 @@ describe('Q2 — the rebalance finds a mover by his LIVE seat (a re-entered qual
     const NEW = "  if (!tp || tp.eliminated) return true;\n  // Q2 — alive again (re-entry): placeable only if his LIVE seat is elsewhere.\n  return !!tournamentLiveSeatOf(tournamentId, tp.playerId);\n";
     expect(P.helpers).toContain(NEW);
     const w = world({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 3, 5000, 200) }, over: { helpers: P.helpers.replace(NEW, '  return !tp || !!tp.eliminated;\n') } });
+    w.tables.get('TB')!.maxOccupiableSeats = 3;                              // 2026-10-23 (S2): a5 re-enters at TA seat 6, as above
     bust(w, 'TA', [5]);
     expect(reenter(w, 'a5', w.mkSocket('S-a5'))).toBe(true);
     w.m.handleTableRebalance(w.tid);
@@ -4475,6 +4479,428 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     ];
     for (const tok of TOKENS) {
       expect({ tok, inSource: (SRC + schedule).includes(tok) }).toEqual({ tok, inSource: true });
+      expect({ tok, inManifest: manifest.includes(tok) }).toEqual({ tok, inManifest: true });
+    }
+  });
+});
+
+// ───────────── 2026-10-23 (qualifier lifecycle S2, owner 2026-10-22: "auto balance tables") — TDA table BALANCING ─────────────
+describe('2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — TDA table balancing: the big-blind-due player moves from the fullest table to the shortest; a pre-deal pass; fewest-alive placement', () => {
+  /** The REAL extras these worlds run on top of the rebalance helpers. */
+  const QOT = fnSrc('function qualifierOfTournament(');
+  const DEAL_HOOK = fnSrc('function scheduleDealAfterTournamentSeat(');
+  const LATE_SEAT = slice('function seatQualifierLateEntrant(', '\n  return null;\n}\n');
+  const BUSTED_SEAT = fnSrc('function seatQualifierReentrantOnBustedSeat(');
+  const SWITCH = [
+    fnSrc('function setQualifierTableBalance('),
+    fnSrc('function internalTokenMatches('),
+    slice("app.post('/api/qualifiers/balance'", '\n});\n'),
+  ].join('\n');
+  /** Hands the real functions out through a scope object (the world's export list is left as it is). */
+  const OUT = `
+s2x.balance = balanceQualifierTables; s2x.balanceNow = balanceQualifierTablesNow; s2x.stats = qualifierBalance;
+s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.busted = seatQualifierReentrantOnBustedSeat;
+`;
+  const BALANCED = '"event":"qualifier_table_balanced"';
+
+  function seatAllLive(w: ReturnType<typeof world>, skip: string[] = []) {
+    const players = w.tm.getTournament(w.tid)!.players;
+    for (const [id, t] of w.tables) {
+      t.seats.forEach((s, i) => {
+        if (s.state !== 'occupied' || s.eliminated || skip.includes(s.playerId)) return;
+        const tp = players.find((p) => p.playerId === s.playerId)!;
+        w.seatLive(`S-${s.playerId}`, id, i, tp.userId!, `m-${s.playerId}`);
+      });
+    }
+  }
+  /**
+   * A running QUALIFIER (registered in qualifierTournaments) on 9-seat tables,
+   * the REAL rebalance helpers + autoStartNextHand + tournamentDealHoldReason +
+   * qualifierOfTournament + the F95 deal hook + the runtime switch route.
+   * Everyone on a live socket unless listed in `absent`.
+   */
+  function bal(o: {
+    layout: Record<string, Entrant[]>; absent?: string[]; env?: Record<string, string>; qualifier?: boolean;
+    overflow?: string[]; over?: (helpers: string) => string; scope?: Record<string, unknown>;
+  }) {
+    const qualifierTournaments = new Map<string, any>();
+    const routes = new Map<string, (req: any, res: any) => void>();
+    const s2x: Record<string, any> = {};
+    const proc = { env: { ...(o.env || {}) } as Record<string, string | undefined> };
+    const helpers = `${P.helpers}\n${QOT}\n${DEAL_HOOK}\n${LATE_SEAT}\n${BUSTED_SEAT}\n${SWITCH}\n${OUT}`;
+    const w = world({
+      layout: o.layout,
+      over: { helpers: o.over ? o.over(helpers) : helpers },
+      scope: {
+        qualifierTournaments, s2x, process: proc, sitOutTracker: new Map(), pendingSeatRemovalAfterHand: new Map(),
+        app: { post: (p: string, fn: (req: any, res: any) => void) => { routes.set(p, fn); } }, createHash, timingSafeEqual,
+        qualifierLateEntries: { reentrySeatedOnBustedSeat: 0 }, QUALIFIER_BASE_STACK: 5000,
+        ...(o.scope || {}),
+      },
+    });
+    if (o.qualifier !== false) qualifierTournaments.set('Q-weekly', { tournamentId: w.tid, status: 'running', startingStack: 5000 });
+    for (const id of o.overflow || []) w.m.qualifierOverflowTables.set(id, w.tid);
+    seatAllLive(w, o.absent);
+    /** POST /api/qualifiers/balance through the REAL route: {status, body}. */
+    const post = (body: unknown, token?: string) => {
+      const out: { status: number; body: any } = { status: 200, body: null };
+      const res = { status(c: number) { out.status = c; return res; }, json(b: unknown) { out.body = b; return res; } };
+      routes.get('/api/qualifiers/balance')!({ headers: token === undefined ? {} : { 'x-internal-token': token }, body }, res);
+      return out;
+    };
+    const t = (id: string) => w.tables.get(id)!;
+    const ids = () => [...w.tm.getTournament(w.tid)!.tableIds];
+    const counts = () => ids().map((id) => w.tm.getAlivePlayersOnTable(w.tid, id).length);
+    const balanced = () => w.logs.filter((l) => l.includes(BALANCED)).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    /** The seat due `id`'s big blind next (the mover the balance must pick there). */
+    const due = (id: string) => { const tb = t(id); const i = tb.getNextOccupiedSeat(tb.previousBigBlindSeat + 1); return { seat: i, playerId: tb.seats[i].playerId }; };
+    return { w, s2x, proc, post, t, ids, counts, balanced, due, qualifierTournaments };
+  }
+  type Bal = ReturnType<typeof bal>;
+  /** One real hand on `t`, folded to its end (fresh table: button 0, small blind 1, big blind 2). */
+  function handOn(t: PokerTable) {
+    expect(t.startNewHand()).toBe(true);
+    foldOut(t);
+    expect(t.currentPhase).toBe(GamePhase.HandComplete);
+  }
+  /** `id`'s hand boundary: its live hand folded to its end, then the REAL autoStartNextHand (+ any deferred deal). */
+  async function boundary(x: Bal, id: string) {
+    const tb = x.t(id);
+    if (tb.isHandInProgress()) foldOut(tb);
+    x.w.m.autoStartNextHand(id);
+    await flush();
+  }
+  /** The invariants every scenario keeps after every boundary: no break, nothing seatless, chips conserved. */
+  function invariants(x: Bal, tables: string[], total: number) {
+    expect(x.ids()).toEqual(tables);                                         // no table broken
+    expect(x.s2x.plan(x.w.tid)).toBeNull();                                  // no break became possible
+    expect([...x.w.m.tournamentBreaksAwaitingHandEnd.keys()]).toEqual([]);
+    expect(x.w.logs.filter((l) => /Breaking table|table_break_aborted_no_seats/.test(l))).toEqual([]);
+    expect(x.w.seatless()).toEqual([]);
+    expect(x.w.couldNotPlace()).toEqual([]);
+    expect(x.w.chipsInPlay()).toBe(total);
+  }
+  const dealt = (t: PokerTable) => t.seats.filter((s) => s.state === 'occupied' && !s.eliminated && s.holeCards.length === 2).length;
+
+  it('S2-1 — [9,2] reaches [6,5] after 3 of the source\'s hand ends: each time the player due ITS big blind moves (stack exact, session + playerMoved follow, TB\'s deal kicked — F95); never a break, chips conserved, the source deals its own hand', async () => {
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) } });
+    handOn(x.t('TA'));
+    handOn(x.t('TB'));
+    const total = x.w.chipsInPlay();
+    const movers: string[] = [];
+    for (let k = 0; k < 3; k++) {
+      const d = x.due('TA');
+      const stack = x.t('TA').seats[d.seat].chipCount;
+      x.w.scheduled.length = 0;
+      await boundary(x, 'TA');
+      movers.push(d.playerId);
+      const at = x.t('TB').seats.findIndex((s) => s.state === 'occupied' && s.playerId === d.playerId);
+      expect({ k, moved: d.playerId, at }).toEqual({ k, moved: d.playerId, at: 2 + k });   // TB's first placeable seat
+      expect(x.t('TB').seats[at].chipCount).toBe(stack);
+      expect(x.t('TA').seats[d.seat].state).toBe('empty');
+      expect(x.w.playerSessions.get(`S-${d.playerId}`)).toMatchObject({ tableId: 'TB', seatIndex: at });
+      expect(x.w.live.get(`S-${d.playerId}`).emitted.filter(([ev]: [string]) => ev === 'playerMoved'))
+        .toEqual([['playerMoved', { fromTable: 'TA', toTable: 'TB', toSeat: at, tableId: 'TB' }]]);
+      expect([...x.w.playerSessions.values()].filter((s) => s.tableId === 'TA' && s.seatIndex === d.seat)).toEqual([]);
+      expect(x.w.tm.getTournament(x.w.tid)!.playerTableMap.get(d.playerId)).toBe('TB');
+      expect(x.w.scheduled).toContain('TB');                                 // F95: TB (HandComplete, idle) deals again
+      expect(x.t('TA').handNumber).toBe(2 + k);                               // the source still deals
+      invariants(x, ['TA', 'TB'], total);
+    }
+    expect(x.counts()).toEqual([6, 5]);
+    expect(movers).toEqual(['a3', 'a5', 'a7']);                               // each the seat due TA's big blind
+    expect(x.balanced().map((b) => [b.fromAlive, b.toAlive, b.via])).toEqual([[8, 3, 'hand_end'], [7, 4, 'hand_end'], [6, 5, 'hand_end']]);
+    expect(x.balanced().every((b) => b.fromAlive >= 5)).toBe(true);          // the source never drops below 5
+    // Stable: [6,5] is within one — the next boundaries move nobody.
+    await boundary(x, 'TA');
+    await boundary(x, 'TA');
+    expect(x.counts()).toEqual([6, 5]);
+    expect(x.s2x.stats).toMatchObject({ moves: 3, preDealMoves: 0, errors: 0, followUpErrors: 0 });
+    expect(dealt(x.t('TA'))).toBe(6);
+    invariants(x, ['TA', 'TB'], total);
+  });
+
+  it('S2-2 — [9,9,5] reaches [8,8,7]: only a FULLEST table gives (a tie is fine), each move evens the tables, then nothing moves', async () => {
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TC: field('c', 5, 5000, 300) } });
+    for (const id of ['TA', 'TB', 'TC']) handOn(x.t(id));
+    const total = x.w.chipsInPlay();
+    for (let round = 0; round < 3; round++) {
+      for (const id of ['TC', 'TA', 'TB']) { await boundary(x, id); invariants(x, ['TA', 'TB', 'TC'], total); }
+    }
+    expect(x.counts()).toEqual([8, 8, 7]);
+    expect(x.balanced().map((b) => [b.fromTableId, b.toTableId])).toEqual([['TA', 'TC'], ['TB', 'TC']]);
+    expect(x.s2x.stats.moves).toBe(2);
+  });
+
+  it('S2-3 — [9,9,9,1] (a lone OVERFLOW table, its entrant present) reaches [7,7,7,7]: the feed makes it 2, then the balance — movers into a MID-HAND table sit that hand out; no break ever; chips conserved', async () => {
+    const x = bal({
+      layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TC: field('c', 9, 5000, 300), TD: field('d', 1, 5000, 400) },
+      overflow: ['TD'],
+    });
+    for (const id of ['TA', 'TB', 'TC']) handOn(x.t(id));
+    const total = x.w.chipsInPlay();
+    let sawMidHandMove = false;
+    for (let round = 0; round < 4; round++) {
+      for (const id of ['TA', 'TB', 'TC', 'TD']) {
+        const before = x.balanced().length;
+        const tdMidHand = x.t('TD').isHandInProgress();
+        await boundary(x, id);
+        const now = x.balanced();
+        if (now.length > before && tdMidHand && now[now.length - 1].toTableId === 'TD') {
+          sawMidHandMove = true;
+          const mover = now[now.length - 1];
+          expect(x.t('TD').seats[mover.toSeat]).toMatchObject({ folded: true, holeCards: [] });   // not in TD's live hand
+        }
+        invariants(x, ['TA', 'TB', 'TC', 'TD'], total);
+      }
+    }
+    expect(x.counts()).toEqual([7, 7, 7, 7]);
+    expect(x.w.m.qualifierOverflow.feeds).toBe(1);
+    expect(x.s2x.stats).toMatchObject({ moves: 5, errors: 0, followUpErrors: 0 });
+    expect(sawMidHandMove).toBe(true);
+    expect(x.balanced().every((b) => b.fromAlive >= 5 && b.toTableId === 'TD')).toBe(true);
+  });
+
+  it('S2-4 — a MID-HAND target: the mover sits out its live hand (folded, no cards, his stack untouched) and is dealt the next one', async () => {
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) } });
+    handOn(x.t('TA'));
+    expect(x.t('TB').startNewHand()).toBe(true);                             // TB mid-hand (heads-up)
+    const d = x.due('TA');
+    const stack = x.t('TA').seats[d.seat].chipCount;
+    const total = x.w.chipsInPlay();
+    await boundary(x, 'TA');
+    const TB = x.t('TB');
+    expect(TB.isHandInProgress()).toBe(true);
+    expect(TB.seats[2]).toMatchObject({ state: 'occupied', playerId: d.playerId, chipCount: stack, folded: true, holeCards: [] });
+    expect(dealt(TB)).toBe(2);                                                // the live hand goes on heads-up
+    expect(x.w.chipsInPlay()).toBe(total);
+    await boundary(x, 'TB');                                                  // TB's hand ends; its next deal
+    expect(TB.handNumber).toBe(2);
+    expect(TB.seats[2].holeCards).toHaveLength(2);                           // dealt in (he posts the big blind)
+    expect(TB.previousBigBlindSeat).toBe(2);
+    expect(x.w.chipsInPlay()).toBe(total);
+  });
+
+  it('S2-5 — the mover is the seat due the big blind even when he is ABSENT (presence is not required): his reservation follows the stack', async () => {
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) }, absent: ['a3'] });
+    handOn(x.t('TA'));
+    handOn(x.t('TB'));
+    expect(x.due('TA')).toEqual({ seat: 3, playerId: 'a3' });
+    x.w.reservedSeats.set(103, {
+      tableId: 'TA', seatIndex: 3, playerName: 'a3', chips: 5000, expiresAt: Date.now() + 3600e3, cleanupTimer: setTimeout(() => {}, 1e9),
+      handsRemaining: 20, tournament: true, masterUserId: 'm-a3',
+    });
+    await boundary(x, 'TA');
+    expect(x.t('TB').seats[2]).toMatchObject({ state: 'occupied', playerId: 'a3' });
+    expect(x.w.reservedSeats.get(103)).toMatchObject({ tableId: 'TB', seatIndex: 2 });
+    expect(x.balanced()).toHaveLength(1);
+  });
+
+  it('S2-6 — a LONE target whose only player is ABSENT is skipped (feeding an absent seat gives chips away); CONTROL: the same lone table with him present gets the mover', async () => {
+    for (const overflow of [true, false]) {
+      const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 1, 5000, 300) }, absent: ['l0'], overflow: overflow ? ['TL'] : [] });
+      handOn(x.t('TA'));
+      await boundary(x, 'TA');
+      expect(x.counts()).toEqual([9, 9, 1]);
+      expect(x.s2x.stats.moves).toBe(0);
+      expect(x.s2x.stats.skippedAbsentTarget).toBeGreaterThanOrEqual(1);
+      expect(x.w.m.qualifierOverflow.feeds).toBe(0);
+      expect(dealt(x.t('TA'))).toBe(9);
+    }
+    const ctl = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 1, 5000, 300) } });
+    handOn(ctl.t('TA'));
+    await boundary(ctl, 'TA');
+    expect(ctl.counts()).toEqual([8, 9, 2]);
+    expect(ctl.s2x.stats).toMatchObject({ moves: 1, skippedAbsentTarget: 0 });
+  });
+
+  it('S2-7 — [6,4] → [5,5]: the source keeps at least 5, and a 5-alive table never gives', async () => {
+    const x = bal({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 4, 5000, 200) } });
+    handOn(x.t('TA'));
+    handOn(x.t('TB'));
+    const total = x.w.chipsInPlay();
+    await boundary(x, 'TA');
+    expect(x.counts()).toEqual([5, 5]);
+    for (let k = 0; k < 3; k++) { await boundary(x, 'TA'); await boundary(x, 'TB'); }
+    expect(x.counts()).toEqual([5, 5]);
+    expect(x.s2x.stats.moves).toBe(1);
+    invariants(x, ['TA', 'TB'], total);
+  });
+
+  it('S2-8 — the switch OFF (Railway env QUALIFIER_TABLE_BALANCE=0 at boot) → zero moves, exactly the old behaviour; not a qualifier → zero moves', async () => {
+    for (const o of [{ env: { QUALIFIER_TABLE_BALANCE: '0' } }, { qualifier: false }]) {
+      const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) }, ...o });
+      handOn(x.t('TA'));
+      handOn(x.t('TB'));
+      for (let k = 0; k < 3; k++) await boundary(x, 'TA');
+      expect(x.counts()).toEqual([9, 2]);
+      expect(x.s2x.stats.moves).toBe(0);
+      expect(x.balanced()).toEqual([]);
+      expect(x.t('TA').handNumber).toBe(4);
+      expect(x.s2x.balanceNow(x.w.tid)).toBe(0);                             // the pre-deal pass is off too
+    }
+  });
+
+  it('S2-9 — a break planned (Rule 1: TA 7 alive + 2 busted seats, TB 2) → zero moves: a break always wins', async () => {
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) } });
+    bust(x.w, 'TA', [7, 8]);
+    handOn(x.t('TA'));
+    expect(x.s2x.plan(x.w.tid)).toMatchObject({ breakTableId: 'TB' });
+    await boundary(x, 'TA');
+    expect(x.s2x.stats.moves).toBe(0);
+    expect(x.balanced()).toEqual([]);
+    expect(x.s2x.balanceNow(x.w.tid)).toBe(0);
+  });
+
+  it('S2-10 — the runtime switch (no restart): POST /api/qualifiers/balance — 403 without / with a wrong token / with no token configured (fails closed), 400 on a bad body (nothing changes), 200 {success, previous, on}; OFF stops the next move, ON resumes; audited QUALIFIER_BALANCE_SET', async () => {
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) }, env: { INTERNAL_NOTIFY_TOKEN: 'tok' } });
+    handOn(x.t('TA'));
+    handOn(x.t('TB'));
+    expect(x.post({ on: 0 })).toEqual({ status: 403, body: { success: false, error: 'forbidden' } });
+    expect(x.post({ on: 0 }, 'wrong')).toMatchObject({ status: 403 });
+    for (const bad of [{ on: 'no' }, { on: 2 }, {}, null, { on: '0' }]) {
+      expect(x.post(bad, 'tok')).toMatchObject({ status: 400, body: { success: false, on: true } });
+    }
+    expect(x.post({ on: 0 }, 'tok')).toEqual({ status: 200, body: { success: true, previous: true, on: false } });
+    await boundary(x, 'TA');
+    expect(x.s2x.stats.moves).toBe(0);
+    expect(x.counts()).toEqual([9, 2]);
+    expect(x.post({ on: true }, 'tok')).toEqual({ status: 200, body: { success: true, previous: false, on: true } });
+    await boundary(x, 'TA');
+    expect(x.s2x.stats.moves).toBe(1);
+    expect(x.counts()).toEqual([8, 3]);
+    expect(x.post({ on: false }, 'tok').body).toEqual({ success: true, previous: true, on: false });
+    expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_BALANCE_SET').map((a) => [a.d.previous, a.d.on])).toEqual([[true, false], [false, true], [true, false]]);
+    expect(x.w.logs.filter((l) => l.includes('"event":"qualifier_balance_set"'))).toHaveLength(3);
+    // No token configured on the server: every request is refused, even one carrying a token.
+    delete x.proc.env.INTERNAL_NOTIFY_TOKEN;
+    expect(x.post({ on: 1 }, 'tok')).toMatchObject({ status: 403 });
+    expect(x.post({ on: 1 }, '')).toMatchObject({ status: 403 });
+    expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_BALANCE_SET')).toHaveLength(3);
+  });
+
+  it('S2-11 — the PRE-DEAL pass (break end / 11:00 deal; runs while the tournament is still paused): [9,9,3] → [7,7,7]; the post-break residue [9,9,9,9,2] ends within one; a table in a hand is skipped as source and target', () => {
+    const a = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TC: field('c', 3, 5000, 300) } });
+    expect(a.w.tm.pauseTournament(a.w.tid, true)).toBe(true);
+    const totalA = a.w.chipsInPlay();
+    expect(a.s2x.balanceNow(a.w.tid)).toBe(4);
+    expect(a.counts()).toEqual([7, 7, 7]);
+    expect(a.s2x.stats).toMatchObject({ preDealMoves: 4, moves: 0, errors: 0 });
+    expect(a.balanced().every((b) => b.via === 'pre_deal' && b.fromAlive >= 5)).toBe(true);
+    expect(a.s2x.balanceNow(a.w.tid)).toBe(0);                               // nothing left to even
+    expect(a.w.chipsInPlay()).toBe(totalA);
+    expect(a.w.seatless()).toEqual([]);
+    expect(a.s2x.plan(a.w.tid)).toBeNull();
+
+    const r = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TC: field('c', 9, 5000, 300), TD: field('d', 9, 5000, 400), TE: field('e', 2, 5000, 500) } });
+    for (const id of ['TA', 'TB', 'TC', 'TD', 'TE']) handOn(r.t(id));
+    const totalR = r.w.chipsInPlay();
+    expect(r.w.tm.pauseTournament(r.w.tid, true)).toBe(true);
+    expect(r.s2x.balanceNow(r.w.tid)).toBe(5);
+    const c = r.counts();
+    expect(Math.max(...c) - Math.min(...c)).toBeLessThanOrEqual(1);
+    expect(c.reduce((s, n) => s + n, 0)).toBe(38);
+    expect(r.w.chipsInPlay()).toBe(totalR);
+    expect(r.ids()).toEqual(['TA', 'TB', 'TC', 'TD', 'TE']);
+    expect(r.s2x.plan(r.w.tid)).toBeNull();
+
+    const m = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TC: field('c', 3, 5000, 300) } });
+    expect(m.t('TB').startNewHand()).toBe(true);                             // TB in a hand
+    const tbSeats = m.t('TB').seats.map((s) => `${s.state}:${s.playerId}`);
+    m.s2x.balanceNow(m.w.tid);
+    expect(m.counts()).toEqual([6, 9, 6]);
+    expect(m.t('TB').seats.map((s) => `${s.state}:${s.playerId}`)).toEqual(tbSeats);
+    expect(m.balanced().every((b) => b.fromTableId !== 'TB' && b.toTableId !== 'TB')).toBe(true);
+  });
+
+  it('S2-12 — late entry, re-entry (empty seats) and re-entry (busted seats) pick the FEWEST-alive table and put a table whose break is pending LAST', () => {
+    // TA 8 alive (+ a8 busted), TB 6 alive, TC 4 alive (break pending in "pending").
+    const mk = (pending: boolean) => {
+      const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 6, 5000, 200), TC: field('c', 4, 5000, 300) } });
+      bust(x.w, 'TA', [8]);
+      if (pending) x.w.m.tournamentBreaksAwaitingHandEnd.set('TC', x.w.tid);
+      return x;
+    };
+    const qtOf = (x: Bal) => ({ tournamentId: x.w.tid, startingStack: 5000 });
+    // Late entry (seatQualifierLateEntrant).
+    for (const [pending, want] of [[false, 'TC'], [true, 'TB']] as const) {
+      const x = mk(pending);
+      const sock = x.w.mkSocket('S-late');
+      const seat = x.s2x.late(sock, qtOf(x), { playerId: 'late1', playerName: 'late1', masterPlayerId: 'm-late1' });
+      expect({ pending, tableId: seat && seat.tableId }).toEqual({ pending, tableId: want });
+    }
+    // Re-entry onto an EMPTY seat (the register handler's REAL step (d) loop).
+    const reenterS2 = (x: Bal, pid: string, socket: any) => {
+      const code = `function reenterSeat(tournament, qt, existingEntry, socket) {\n${REENTRY}\n  return seated;\n}`;
+      const f = load(code, {
+        tableManager: { getTable: (id: string) => x.w.tables.get(id) }, tournamentManager: x.w.tm, playerSessions: x.w.playerSessions,
+        spectators: x.w.spectators, tournamentHandStartSafety: x.w.m.tournamentHandStartSafety, console: { log() {} },
+        tournamentBreaksAwaitingHandEnd: x.w.m.tournamentBreaksAwaitingHandEnd,
+      }, '{ reenterSeat }').exports.reenterSeat;
+      return f(x.w.tm.getTournament(x.w.tid)!, qtOf(x), { playerId: pid, playerName: pid }, socket);
+    };
+    for (const [pending, want] of [[false, 'TC'], [true, 'TB']] as const) {
+      const x = mk(pending);
+      expect(reenterS2(x, 'a8', x.w.mkSocket('S-a8b'))).toBe(true);
+      expect({ pending, tableId: x.w.tm.getTournament(x.w.tid)!.playerTableMap.get('a8') }).toEqual({ pending, tableId: want });
+    }
+    // Re-entry onto a BUSTED seat (seatQualifierReentrantOnBustedSeat): TA 6 alive + dead seats 6, 7;
+    // TB 5 alive + dead seats 5-8; the re-entrant (a8) has no dead seat of his own left.
+    for (const [pending, want] of [[false, 'TB'], [true, 'TA']] as const) {
+      const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200) } });
+      bust(x.w, 'TA', [6, 7, 8]);
+      bust(x.w, 'TB', [5, 6, 7, 8]);
+      x.t('TA').standUp(8);
+      if (pending) x.w.m.tournamentBreaksAwaitingHandEnd.set('TB', x.w.tid);
+      const t = x.w.tm.getTournament(x.w.tid)!;
+      const seat = x.s2x.busted(x.w.mkSocket('S-a8c'), qtOf(x), t, { playerId: 'a8', playerName: 'a8' }, 5000);
+      expect({ pending, tableId: seat && seat.tableId }).toEqual({ pending, tableId: want });
+    }
+  });
+
+  it('S2-13 — never throws: a balance whose move throws is rolled back (the stack stays, nothing points at the new seat), counted in errors; the source still deals', async () => {
+    const NAME = 'function moveTournamentSeatPointers(';
+    const x = bal({
+      layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) },
+      over: (h) => `${h.replace(NAME, 'function moveTournamentSeatPointersReal(')}\nfunction moveTournamentSeatPointers() { throw new Error('balance boom'); }\n`,
+    });
+    handOn(x.t('TA'));
+    handOn(x.t('TB'));
+    const total = x.w.chipsInPlay();
+    const d = x.due('TA');
+    await boundary(x, 'TA');
+    expect(x.s2x.stats).toMatchObject({ moves: 0, errors: 1, followUpErrors: 0 });
+    expect(x.t('TA').seats[d.seat]).toMatchObject({ state: 'occupied', playerId: d.playerId });
+    expect(x.t('TB').seats[2].state).toBe('empty');
+    expect(x.w.tm.getTournament(x.w.tid)!.playerTableMap.get(d.playerId)).toBe('TA');
+    expect(x.w.playerSessions.get(`S-${d.playerId}`)).toMatchObject({ tableId: 'TA', seatIndex: d.seat });
+    expect(x.t('TA').handNumber).toBe(2);
+    expect(dealt(x.t('TA'))).toBe(9);
+    expect(x.w.chipsInPlay()).toBe(total);
+    expect(x.w.logs.find((l) => l.includes('qualifier_table_balance_failed'))).toContain('"moved":false');
+  });
+
+  it('S2-14 — wiring + locks: the balance runs only when the feed moved nobody, after every hold and before the deal; the feed shares the guarded move; health, durable audit and manifest tokens', () => {
+    const auto = P.autoStart;
+    const under5 = auto.indexOf('aliveOnTable < 5 && planTournamentRebalance(tId)');
+    const feed = auto.indexOf('const fed = feedLoneQualifierTable(tId, tableId, table);');
+    const bal2 = auto.indexOf('if (!fed) balanceQualifierTables(tId, tableId, table);');
+    const deal = auto.indexOf('const started = table.startNewHand();');
+    expect(under5).toBeGreaterThan(0);
+    expect(feed).toBeGreaterThan(under5);
+    expect(bal2).toBeGreaterThan(feed);
+    expect(deal).toBeGreaterThan(bal2);
+    expect(auto.split('balanceQualifierTables(').length).toBe(2);
+    const feedFn = fnSrc('function feedLoneQualifierTable(');
+    expect(feedFn).toContain('moveTournamentStack(tournamentId, sourceTableId, sourceTable, from, mover, loneTableId, lone, to)');
+    expect(feedFn).toContain('forgetSeatPointers(sourceTableId, from);');
+    expect(SRC).toContain("let qualifierBalanceOn = process.env.QUALIFIER_TABLE_BALANCE !== '0';");
+    expect(SRC).toContain('balance: { on: qualifierBalanceOn, ...qualifierBalance },');
+    expect(slice('const DURABLE_AUDIT_ACTIONS = new Set([', ']);')).toContain("'QUALIFIER_BALANCE_SET'");
+    const root = path.join(__dirname, '..');
+    const manifest = fs.readFileSync(path.join(root, 'canonical-features.txt'), 'utf8').split('\n').map((l) => l.trim());
+    for (const tok of ['qualifier_table_balanced', '/api/qualifiers/balance', 'balanceQualifierTables(tId, tableId, table);']) {
+      expect({ tok, inSource: SRC.includes(tok) }).toEqual({ tok, inSource: true });
       expect({ tok, inManifest: manifest.includes(tok) }).toEqual({ tok, inManifest: true });
     }
   });

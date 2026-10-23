@@ -1250,6 +1250,8 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // Operator / director switches during a live event: the overflow-table cap
   // (POST /api/qualifiers/overflow) and a tournament pause / resume.
   'QUALIFIER_OVERFLOW_CAP_SET', 'TOURNAMENT_PAUSE',
+  // 2026-10-23 (qualifier lifecycle S2) — the table-balance switch (POST /api/qualifiers/balance).
+  'QUALIFIER_BALANCE_SET',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -3105,6 +3107,10 @@ app.get('/api/health', async (_req, res) => {
           // 2026-10-22 (owner: "Build it for Sunday") — overflow tables: opened / fed /
           // first deals; live = open now; cap = QUALIFIER_OVERFLOW_TABLES_MAX in force (0 = off).
           overflow: { ...qualifierOverflow, live: qualifierOverflowTables.size, cap: qualifierOverflowTablesMax },
+          // 2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — TDA
+          // table balancing: on = the switch in force (POST /api/qualifiers/balance);
+          // errors / followUpErrors should stay 0.
+          balance: { on: qualifierBalanceOn, ...qualifierBalance },
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
@@ -3894,10 +3900,15 @@ function seatQualifierLateEntrant(socket: Socket, qt: QualifierTournamentReg, re
   // first, vacateBustedTournamentSeat). Busted seats stay occupied at 0 chips,
   // so late entry used to find only never-used seats: none at all once the
   // field had filled every table (9, 18, 27 … entrants), and the credit went back.
+  // 2026-10-23 (qualifier lifecycle S2) — a table whose BREAK is pending (it
+  // waits for its hand end) sorts LAST: a seat there is broken again at once.
   const tables = tournament.tableIds
-    .map((tid) => ({ tid, table: tableManager.getTable(tid), alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length }))
-    .filter((x): x is { tid: string; table: PokerTable; alive: number } => !!x.table)
-    .sort((a, b) => a.alive - b.alive);
+    .map((tid) => ({
+      tid, table: tableManager.getTable(tid), alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length,
+      breakPending: tournamentBreaksAwaitingHandEnd.get(tid) === tournamentId,
+    }))
+    .filter((x): x is { tid: string; table: PokerTable; alive: number; breakPending: boolean } => !!x.table)
+    .sort((a, b) => (Number(a.breakPending) - Number(b.breakPending)) || (a.alive - b.alive));
   for (const { tid, table } of tables) {
     for (let s = 0; s < table.seats.length; s++) {
       if (!tournamentSeatIsPlaceable(tournamentId, table, s)) continue;
@@ -3944,10 +3955,14 @@ function seatQualifierReentrantOnBustedSeat(
 ): { tableId: string; seatIndex: number } | null {
   const tournamentId = qt.tournamentId;
   if (!tournamentId || tournament.status !== 'running') return null;
+  // 2026-10-23 (qualifier lifecycle S2) — a table whose BREAK is pending sorts LAST (its own dead seat still comes first).
   const tables = tournament.tableIds
-    .map((tid) => ({ tid, table: tableManager.getTable(tid), alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length }))
-    .filter((x): x is { tid: string; table: PokerTable; alive: number } => !!x.table)
-    .sort((a, b) => a.alive - b.alive);
+    .map((tid) => ({
+      tid, table: tableManager.getTable(tid), alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length,
+      breakPending: tournamentBreaksAwaitingHandEnd.get(tid) === tournamentId,
+    }))
+    .filter((x): x is { tid: string; table: PokerTable; alive: number; breakPending: boolean } => !!x.table)
+    .sort((a, b) => (Number(a.breakPending) - Number(b.breakPending)) || (a.alive - b.alive));
   const candidates: Array<{ tid: string; table: PokerTable; s: number; own: boolean }> = [];
   for (const own of [true, false]) {
     for (const { tid, table } of tables) {
@@ -4055,6 +4070,44 @@ app.post('/api/qualifiers/overflow', (req, res) => {
     return;
   }
   res.json({ success: true, ...setQualifierOverflowTablesMax(next, 'internal:overflow_cap') });
+});
+
+/**
+ * 2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — the TDA
+ * table-balance switch at runtime (balanceQualifierTables / the pre-deal pass;
+ * the state lives in the rebalance helpers). OFF = exactly the old behaviour:
+ * only the lone-overflow feed and the Rule 1 / Rule 2 breaks. Players already
+ * moved stay where they are (their stacks moved whole). Lasts until the next
+ * boot, which reads Railway env QUALIFIER_TABLE_BALANCE again ('0' = off).
+ * Logged + audited (`qualifier_balance_set`, QUALIFIER_BALANCE_SET, durable).
+ */
+function setQualifierTableBalance(on: boolean, actor: string): { previous: boolean; on: boolean } {
+  const previous = qualifierBalanceOn;
+  qualifierBalanceOn = on;
+  console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_balance_set', previous, on, actor })}`);
+  auditLog(actor, 'QUALIFIER_BALANCE_SET', { previous, on });
+  return { previous, on };
+}
+
+// 2026-10-23 (qualifier lifecycle S2) — the balance switch at runtime, no
+// restart: POST {on: 0|1|true|false} with X-Internal-Token (the
+// INTERNAL_NOTIFY_TOKEN this server and the master share). FAILS CLOSED, as
+// /api/qualifiers/overflow: no token configured → 403. Any other `on` → 400 and
+// nothing changes. Answers {success, previous, on}; GET /api/health
+// r2Play.qualifiers.balance.on shows the value in force.
+app.post('/api/qualifiers/balance', (req, res) => {
+  const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
+  if (!internalTokenMatches(req.headers['x-internal-token'], tok)) {
+    res.status(403).json({ success: false, error: 'forbidden' });
+    return;
+  }
+  const raw = req.body?.on;
+  const next = raw === true || raw === 1 ? true : raw === false || raw === 0 ? false : null;
+  if (next === null) {
+    res.status(400).json({ success: false, error: 'on must be 0, 1, true or false', on: qualifierBalanceOn });
+    return;
+  }
+  res.json({ success: true, ...setQualifierTableBalance(next, 'internal:table_balance') });
 });
 
 /**
@@ -7234,7 +7287,14 @@ function autoStartNextHand(tableId: string): void {
     // whose one entrant sits alone is fed from the fullest table, here at its
     // hand boundary (TDA balancing: the player due the big blind moves). Never
     // throws; never stops this table's own deal below.
-    feedLoneQualifierTable(tId, tableId, table);
+    const fed = feedLoneQualifierTable(tId, tableId, table);
+    // 2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — when
+    // the feed moved nobody: TDA balancing. If this is the fullest table (>= 6
+    // alive) and another has at least two fewer, the player due THIS table's big
+    // blind moves to the shortest table. Qualifiers only; a possible break always
+    // wins; runtime switch POST /api/qualifiers/balance. Never throws; this
+    // table still deals its own hand below.
+    if (!fed) balanceQualifierTables(tId, tableId, table);
   }
 
   // Start new hand
@@ -11448,8 +11508,17 @@ io.on('connection', (socket: Socket) => {
         // (d) NOW re-seat. Find a table with empty seats.
         const startingStack = qt.startingStack || 50000;
         let seated = false;
-        for (const tid of tournament.tableIds) {
-          const table = tableManager.getTable(tid);
+        // 2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") —
+        // fewest ALIVE first, as late entry (seatQualifierLateEntrant); a table
+        // whose BREAK is pending last (it is broken again at its hand end). It
+        // used to be tableIds order: every re-entry went to Table 1 first.
+        const reentryTables = tournament.tableIds
+          .map((tid) => ({
+            tid, table: tableManager.getTable(tid), alive: tournamentManager.getAlivePlayersOnTable(qt.tournamentId!, tid).length,
+            breakPending: tournamentBreaksAwaitingHandEnd.get(tid) === qt.tournamentId,
+          }))
+          .sort((a, b) => (Number(a.breakPending) - Number(b.breakPending)) || (a.alive - b.alive));
+        for (const { tid, table } of reentryTables) {
           if (!table) continue;
           for (let s = 0; s < 9; s++) {
             if (table.seats[s].state !== 'empty') continue;
@@ -25032,6 +25101,85 @@ function liveSessionAt(tableId: string, seatIndex: number): string | null {
 }
 
 /**
+ * 2026-10-23 (qualifier lifecycle S2) — the GUARDED move of ONE live tournament
+ * stack from (srcTid, from) to (dstTid, to): the lone-table feed and the table
+ * balance share it (it was the feed's own code, unchanged). A busted target seat
+ * is vacated first; the stack is moved whole (sitDown allowBelowMin — a
+ * relocation, never a buy-in); the tournament map and every pointer follow it
+ * (moveTournamentSeatPointers: live sessions on any socket, extra-table sessions,
+ * his reservation, 'playerMoved', the V4 notice for an absent seat); then the
+ * source seat is stood up. true = moved: the stack sits at dst:to and the source
+ * seat is EMPTY (no wallet side effect). false = the sit-down was refused and
+ * nothing changed. A throw before the move is complete is ROLLED BACK — the
+ * stack never left its seat, nothing points at the new one — and re-thrown, so
+ * the caller counts a failure that moved nothing. The caller still clears the
+ * emptied source seat's stale pointers (forgetSeatPointers).
+ */
+function moveTournamentStack(
+  tournamentId: string, srcTid: string, srcTable: PokerTable, from: number, mover: TournamentPlayer,
+  dstTid: string, dst: PokerTable, to: number,
+): boolean {
+  const src = srcTable.seats[from];
+  const chips = src.chipCount;
+  // What points at the source seat now (restored if the move fails half-way) —
+  // read BEFORE the sit-down, so nothing unguarded runs between it and the move.
+  const sessionsAtSource = [...playerSessions].filter(([, s]) => s.tableId === srcTid && s.seatIndex === from);
+  const extrasAtSource = [...multiTableSessions.values()].flat().filter((ms) => ms.tableId === srcTid && ms.seatIndex === from);
+  const reservationsAtSource = [...reservedSeats.values()].filter((r) => r.tableId === srcTid && r.seatIndex === from);
+  if (dst.seats[to].state !== 'empty') vacateBustedTournamentSeat(dst, dstTid, to);
+  // A RELOCATION (allowBelowMin): the stack is below the starting stack more often than not.
+  if (!dst.sitDown(to, src.playerName, chips, src.playerId, false, true)) return false;
+  try {
+    tournamentManager.setPlayerTable(tournamentId, mover.playerId, dstTid);
+    moveTournamentSeatPointers(mover, srcTid, from, dstTid, to, tournamentId);
+  } catch (e) {
+    // Rolled back: the stack never left its seat; nothing points at the new one.
+    for (const [sid, s] of sessionsAtSource) {
+      if (s.tableId !== dstTid || s.seatIndex !== to) continue;
+      s.tableId = srcTid;
+      s.seatIndex = from;
+      const sock = io.sockets.sockets.get(sid);
+      if (sock) {
+        sock.leave(`table:${dstTid}`);
+        sock.join(`table:${srcTid}`);
+        sock.emit('playerMoved', { fromTable: dstTid, toTable: srcTid, toSeat: from, tableId: srcTid });
+      }
+    }
+    for (const ms of extrasAtSource) if (ms.tableId === dstTid && ms.seatIndex === to) { ms.tableId = srcTid; ms.seatIndex = from; }
+    for (const r of reservationsAtSource) if (r.tableId === dstTid && r.seatIndex === to) { r.tableId = srcTid; r.seatIndex = from; }
+    tournamentManager.setPlayerTable(tournamentId, mover.playerId, srcTid);
+    if (dst.seats[to].state === 'occupied' && dst.seats[to].playerId === mover.playerId) dst.standUp(to);
+    throw e;
+  }
+  srcTable.standUp(from);
+  return true;
+}
+
+/**
+ * 2026-10-23 (qualifier lifecycle S2) — a seat a stack was just MOVED off is
+ * empty now (a later mover or late entrant takes it): nothing may point at it —
+ * a stale session there would act on whoever sits there next. Drops every main
+ * and extra-table session at it, its reservations (their expiry timers too), a
+ * pending after-hand removal, the sit-out entry and an AI profile, then syncs
+ * the sit-out set. (The feed's own clean-up, unchanged; the balance shares it.)
+ */
+function forgetSeatPointers(tableId: string, seatIndex: number): void {
+  for (const [sid, s] of [...playerSessions]) if (s.tableId === tableId && s.seatIndex === seatIndex) playerSessions.delete(sid);
+  for (const [, list] of multiTableSessions) {
+    for (let i = list.length - 1; i >= 0; i--) if (list[i].tableId === tableId && list[i].seatIndex === seatIndex) list.splice(i, 1);
+  }
+  for (const [uid, r] of [...reservedSeats]) {
+    if (r.tableId !== tableId || r.seatIndex !== seatIndex) continue;
+    if (r.cleanupTimer) clearTimeout(r.cleanupTimer);
+    reservedSeats.delete(uid);
+  }
+  pendingSeatRemovalAfterHand.get(tableId)?.delete(seatIndex);
+  sitOutTracker.get(tableId)?.delete(seatIndex);
+  aiProfiles.get(tableId)?.delete(seatIndex);
+  syncSitOutToTable(tableId);
+}
+
+/**
  * A LONE overflow table (one alive entrant, present, never or not now in a
  * hand) is FED from `sourceTableId` at the source's hand boundary
  * (autoStartNextHand, just before its deal): the player due the source's BIG
@@ -25117,41 +25265,11 @@ function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sou
       if (tournamentSeatIsPlaceable(tournamentId, lone, i)) { to = i; break; }
     }
     if (to < 0) return false;
-    const src = sourceTable.seats[from];
-    const chips = src.chipCount;
-    // What points at the source seat now (restored if the move fails half-way) —
-    // read BEFORE the sit-down, so nothing unguarded runs between it and the move.
-    const sessionsAtSource = [...playerSessions].filter(([, s]) => s.tableId === sourceTableId && s.seatIndex === from);
-    const extrasAtSource = [...multiTableSessions.values()].flat().filter((ms) => ms.tableId === sourceTableId && ms.seatIndex === from);
-    const reservationsAtSource = [...reservedSeats.values()].filter((r) => r.tableId === sourceTableId && r.seatIndex === from);
-    if (lone.seats[to].state !== 'empty') vacateBustedTournamentSeat(lone, loneTableId, to);
-    // A RELOCATION (allowBelowMin): the stack is below the starting stack more often than not.
-    if (!lone.sitDown(to, src.playerName, chips, src.playerId, false, true)) return false;
-    try {
-      tournamentManager.setPlayerTable(tournamentId, mover.playerId, loneTableId);
-      moveTournamentSeatPointers(mover, sourceTableId, from, loneTableId, to, tournamentId);
-    } catch (e) {
-      // Rolled back: the stack never left its seat; nothing points at the new one.
-      for (const [sid, s] of sessionsAtSource) {
-        if (s.tableId !== loneTableId || s.seatIndex !== to) continue;
-        s.tableId = sourceTableId;
-        s.seatIndex = from;
-        const sock = io.sockets.sockets.get(sid);
-        if (sock) {
-          sock.leave(`table:${loneTableId}`);
-          sock.join(`table:${sourceTableId}`);
-          sock.emit('playerMoved', { fromTable: loneTableId, toTable: sourceTableId, toSeat: from, tableId: sourceTableId });
-        }
-      }
-      for (const ms of extrasAtSource) if (ms.tableId === loneTableId && ms.seatIndex === to) { ms.tableId = sourceTableId; ms.seatIndex = from; }
-      for (const r of reservationsAtSource) if (r.tableId === loneTableId && r.seatIndex === to) { r.tableId = sourceTableId; r.seatIndex = from; }
-      tournamentManager.setPlayerTable(tournamentId, mover.playerId, sourceTableId);
-      if (lone.seats[to].state === 'occupied' && lone.seats[to].playerId === mover.playerId) lone.standUp(to);
-      throw e;
-    }
+    // The guarded move (shared with the table balance): a throw is rolled back
+    // there and re-thrown; false = the sit-down was refused, nothing changed.
+    if (!moveTournamentStack(tournamentId, sourceTableId, sourceTable, from, mover, loneTableId, lone, to)) return false;
     // The move is complete the moment the source seat is EMPTY: its stack sits
     // at the lone table now (no wallet side effect). Counted from here on.
-    sourceTable.standUp(from);
     moved = true;
     qualifierOverflow.feeds++;
     console.log(`[Qualifier] ${JSON.stringify({
@@ -25172,19 +25290,7 @@ function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sou
   try {
     // The source seat is EMPTY now (a later mover or late entrant takes it):
     // nothing may point at it — a stale session there would act on that player.
-    for (const [sid, s] of [...playerSessions]) if (s.tableId === sourceTableId && s.seatIndex === from) playerSessions.delete(sid);
-    for (const [, list] of multiTableSessions) {
-      for (let i = list.length - 1; i >= 0; i--) if (list[i].tableId === sourceTableId && list[i].seatIndex === from) list.splice(i, 1);
-    }
-    for (const [uid, r] of [...reservedSeats]) {
-      if (r.tableId !== sourceTableId || r.seatIndex !== from) continue;
-      if (r.cleanupTimer) clearTimeout(r.cleanupTimer);
-      reservedSeats.delete(uid);
-    }
-    pendingSeatRemovalAfterHand.get(sourceTableId)?.delete(from);
-    sitOutTracker.get(sourceTableId)?.delete(from);
-    aiProfiles.get(sourceTableId)?.delete(from);
-    syncSitOutToTable(sourceTableId);
+    forgetSeatPointers(sourceTableId, from);
     broadcastGameState(sourceTableId);
     broadcastGameState(loneTableId);
     if (lone.currentPhase === GamePhase.WaitingForPlayers) startFreshTournamentTable(loneTableId);
@@ -25196,6 +25302,265 @@ function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sou
     })}`);
   }
   return true;
+}
+
+// ── 2026-10-23 (qualifier lifecycle S2, owner 2026-10-22: "auto balance tables") — TDA table BALANCING ──
+// Before: the rebalance only BROKE tables (TournamentManager.checkRebalance
+// Rule 1 / Rule 2) and the feed filled a lone overflow table to 2. Nothing ever
+// evened [9,2], [9,9,5] or [9,9,9,1]: checkRebalance answers null for all three
+// (no table fits into the others' free seats), so they played on that uneven.
+// Declared HERE (the rebalance helpers block) so every harness that slices this
+// block gets the real, empty state.
+/**
+ * The balance's runtime switch. Railway env QUALIFIER_TABLE_BALANCE at boot:
+ * '0' = OFF, unset (or anything else) = ON. Changeable while the server runs
+ * (setQualifierTableBalance, POST /api/qualifiers/balance) — changing the env
+ * restarts the process, and a restart cancels a running qualifier. OFF is
+ * exactly the behaviour before S2: only the lone-overflow feed and the Rule 1 /
+ * Rule 2 breaks move anyone.
+ */
+let qualifierBalanceOn = process.env.QUALIFIER_TABLE_BALANCE !== '0';
+/**
+ * Health r2Play.qualifiers.balance (with `on`). moves = hand-boundary moves
+ * (balanceQualifierTables); preDealMoves = moves made by the pre-deal pass
+ * (balanceQualifierTablesNow); each move is counted in exactly one of the two.
+ * skippedAbsentTarget = times a lone target was passed over because its only
+ * player is absent. errors = a balance that failed and MOVED NOTHING (a check
+ * threw, or the guarded move rolled itself back); followUpErrors = a move that
+ * STANDS whose follow-up (the clean-up, a broadcast, the deal hook) threw.
+ * errors / followUpErrors should stay 0.
+ */
+const qualifierBalance = { moves: 0, preDealMoves: 0, skippedAbsentTarget: 0, errors: 0, followUpErrors: 0 };
+/** The pre-deal pass makes at most this many moves (each move strictly evens the tables, so it ends long before). */
+const QUALIFIER_BALANCE_PRE_DEAL_MAX_MOVES = 60;
+
+/** One planned balance move: the player due the big blind at src:from goes to the first placeable seat dst:to. */
+interface QualifierBalanceMove {
+  srcTid: string; src: PokerTable; from: number; mover: TournamentPlayer; srcAlive: number;
+  dstTid: string; dst: PokerTable; to: number; dstAlive: number;
+}
+
+/**
+ * The next balance move of the qualifier `tournamentId`, or null. `source` = the
+ * table at its hand boundary (balanceQualifierTables: it gives only if it is the
+ * fullest table, a tie is fine); without it (the pre-deal pass) the fullest
+ * table that may give now is the source. Only when ALL hold:
+ *  - the switch is on; the tournament is running with more than one table, not
+ *    paused (the pre-deal pass runs while its caller's hold is still set, so it
+ *    skips that check); it is a QUALIFIER (qualifierOfTournament);
+ *  - no break is possible (planTournamentRebalance null — a break always wins),
+ *    and not everyone fits in one table fewer (alive > (tables-1) x 9: Rule 1's
+ *    own test — that is the break's business, never the balance's);
+ *  - the source has >= QUALIFIER_OVERFLOW_FEED_MIN_SOURCE (6) alive, so it keeps
+ *    at least 5;
+ *  - the target is the fewest-alive OTHER table (still in tournamentTables and
+ *    tableIds) with targetAlive <= sourceAlive - 2 (every move strictly evens
+ *    the tables, so the balance never oscillates), at least one alive, a
+ *    placeable seat (its first one is taken), no break awaiting its hand end, no
+ *    pending or unsettled bust, not inside startNewHand / a hand completion.
+ *    MID-HAND is fine at a hand boundary: the mover sits out that live hand and
+ *    is dealt the next one, as a late entry is. The pre-deal pass skips every
+ *    table in a hand, as a source and as a target. A LONE target whose only
+ *    player is ABSENT (!liveSessionAt) is skipped (skippedAbsentTarget):
+ *    feeding an absent seat gives chips away. A skipped table lets the next
+ *    fewest-alive one be the target.
+ *  - The mover is the seat due the big blind next (getNextOccupiedSeat from the
+ *    last big blind + 1): the first live, alive, human entrant of the source from
+ *    there. His presence is NOT required (TDA: whoever is due the big blind
+ *    moves; an absent seat's reservation and notice follow it).
+ */
+function planQualifierBalanceMove(
+  tournamentId: string, preDeal: boolean, source?: { tid: string; table: PokerTable },
+): QualifierBalanceMove | null {
+  if (!qualifierBalanceOn) return null;
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t || t.status !== 'running' || t.tableIds.length <= 1) return null;
+  if (!preDeal && t.paused) return null;
+  // Qualifiers only (the owner's ask: the weekly / monthly online qualifier) —
+  // checked first: any other tournament pays nothing at its hand ends.
+  if (!qualifierOfTournament(tournamentId)) return null;
+  const tables: Array<{ tid: string; table: PokerTable; alive: number }> = [];
+  for (const tid of t.tableIds) {
+    const table = tableManager.getTable(tid);
+    if (!table || tournamentTables.get(tid) !== tournamentId) continue;
+    tables.push({ tid, table, alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length });
+  }
+  /** May this table give or take a player right now? */
+  const settled = (x: { tid: string; table: PokerTable }): boolean =>
+    tournamentBreaksAwaitingHandEnd.get(x.tid) !== tournamentId
+    && (tournamentBustChecksPending.get(x.tid)?.size || 0) === 0
+    && tournamentUnsettledBustSeat(tournamentId, x.table) < 0
+    && !x.table.isStartingHand() && !x.table.isCompletingHand()
+    && (!preDeal || !x.table.isHandInProgress());
+  let src: { tid: string; table: PokerTable; alive: number } | undefined;
+  if (source) {
+    src = tables.find((x) => x.tid === source.tid && x.table === source.table);
+    const giving = src?.alive ?? 0;
+    if (tables.some((x) => x.alive > giving)) return null;   // only the FULLEST table gives
+  } else {
+    for (const x of tables) if (settled(x) && (!src || x.alive > src.alive)) src = x;
+  }
+  if (!src || src.alive < QUALIFIER_OVERFLOW_FEED_MIN_SOURCE || !settled(src)) return null;
+  // A break always wins; and Rule 1's own test (everyone fits in one table
+  // fewer) belongs to the break — with it false, a move can never make Rule 1
+  // fire (see the invariant at balanceQualifierTables).
+  if (planTournamentRebalance(tournamentId)) return null;
+  if (tournamentManager.getAliveCount(tournamentId) <= (t.tableIds.length - 1) * 9) return null;
+  let dst: { tid: string; table: PokerTable; alive: number } | undefined;
+  let to = -1;
+  const others = tables.filter((x) => x !== src).sort((a, b) => a.alive - b.alive);
+  for (const x of others) {
+    if (x.alive > src.alive - 2) break;                    // sorted: no later table evens anything either
+    if (x.alive < 1 || !settled(x)) continue;
+    let seat = -1;
+    for (let i = 0; i < MAX_SEATS; i++) if (tournamentSeatIsPlaceable(tournamentId, x.table, i)) { seat = i; break; }
+    if (seat < 0) continue;
+    if (x.alive === 1) {
+      const lone = tournamentManager.getAlivePlayersOnTable(tournamentId, x.tid)[0];
+      const loneSeat = lone ? tournamentLiveSeatIndex(x.table, lone.playerId) : -1;
+      if (loneSeat < 0 || !liveSessionAt(x.tid, loneSeat)) { qualifierBalance.skippedAbsentTarget++; continue; }
+    }
+    dst = x;
+    to = seat;
+    break;
+  }
+  if (!dst || to < 0) return null;
+  // The mover: the player due the big blind next (clockwise from the last big
+  // blind), the first live human entrant of the source from there.
+  const first = src.table.getNextOccupiedSeat(src.table.previousBigBlindSeat + 1);
+  if (first < 0) return null;
+  for (let k = 0; k < MAX_SEATS; k++) {
+    const i = (first + k) % MAX_SEATS;
+    const seat = src.table.seats[i];
+    if (!seat || seat.state !== 'occupied' || seat.eliminated || seat.isAI || !(seat.chipCount > 0)) continue;
+    const tp = t.players.find((p) => p.playerId === seat.playerId);
+    if (!tp || tp.eliminated || t.playerTableMap.get(tp.playerId) !== src.tid) continue;
+    if (tournamentLiveSeatIndex(src.table, tp.playerId) !== i) continue;
+    return {
+      srcTid: src.tid, src: src.table, from: i, mover: tp, srcAlive: src.alive,
+      dstTid: dst.tid, dst: dst.table, to, dstAlive: dst.alive,
+    };
+  }
+  return null;
+}
+
+/**
+ * Carries out one planned balance move (the guarded moveTournamentStack, as the
+ * feed does). Never throws; each counter says what actually happened:
+ *  - a throw before the move is complete is rolled back (the stack stays on its
+ *    seat): errors, log `qualifier_table_balance_failed` (moved:false), false;
+ *  - a refused sit-down changed nothing: log `qualifier_table_balance_refused`, false;
+ *  - the stack sits at the target and the source seat is empty: moves (or
+ *    preDealMoves), log `qualifier_table_balanced` {tournamentId, fromTableId,
+ *    toTableId, fromAlive, toAlive — the counts AFTER the move —, fromSeat,
+ *    toSeat, via}, true — whatever follows;
+ *  - its follow-ups (forgetSeatPointers on the emptied source seat, both
+ *    broadcasts, scheduleDealAfterTournamentSeat on the target — F95 kicks an
+ *    idle target): a throw there is followUpErrors, log
+ *    `qualifier_table_balance_followup_failed` (moved:true) — the move stands,
+ *    chips are conserved.
+ */
+function executeQualifierBalanceMove(tournamentId: string, m: QualifierBalanceMove, via: 'hand_end' | 'pre_deal'): boolean {
+  let moved = false;
+  try {
+    if (!moveTournamentStack(tournamentId, m.srcTid, m.src, m.from, m.mover, m.dstTid, m.dst, m.to)) {
+      console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_table_balance_refused', tournamentId, fromTableId: m.srcTid, toTableId: m.dstTid, toSeat: m.to, via })}`);
+      return false;
+    }
+    moved = true;
+    if (via === 'pre_deal') qualifierBalance.preDealMoves++;
+    else qualifierBalance.moves++;
+    console.log(`[Qualifier] ${JSON.stringify({
+      event: 'qualifier_table_balanced', tournamentId, fromTableId: m.srcTid, toTableId: m.dstTid,
+      fromAlive: m.srcAlive - 1, toAlive: m.dstAlive + 1, fromSeat: m.from, toSeat: m.to, via,
+    })}`);
+  } catch (e: any) {
+    if (!moved) {
+      qualifierBalance.errors++;
+      console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_table_balance_failed', tournamentId, tableId: m.srcTid, toTableId: m.dstTid, moved: false, via, error: String(e?.message || e) })}`);
+      return false;
+    }
+    qualifierBalance.followUpErrors++;   // (only the log line can throw here: the move stands)
+  }
+  try {
+    forgetSeatPointers(m.srcTid, m.from);
+    broadcastGameState(m.srcTid);
+    broadcastGameState(m.dstTid);
+    scheduleDealAfterTournamentSeat(m.dstTid);   // F95 — an idle target deals again
+  } catch (e: any) {
+    qualifierBalance.followUpErrors++;
+    console.error(`[Qualifier] ${JSON.stringify({
+      event: 'qualifier_table_balance_followup_failed', tournamentId, fromTableId: m.srcTid, toTableId: m.dstTid, moved: true, via, error: String(e?.message || e),
+    })}`);
+  }
+  return true;
+}
+
+/**
+ * 2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — TDA table
+ * BALANCING at a qualifier table's hand boundary. autoStartNextHand calls it
+ * after every hold (pause, bust check, deferred break, the under-5 wait) and
+ * only when the lone-overflow feed moved nobody, just before this table's own
+ * deal (which still happens). When this table is the fullest (>= 6 alive) and
+ * another table has at least two fewer, the player due THIS table's big blind
+ * moves to the fewest-alive table's first placeable seat (rules:
+ * planQualifierBalanceMove). One move per hand boundary; repeated at each
+ * boundary, the tables end within one player of each other ([9,2] → [6,5],
+ * [9,9,5] → [8,8,7], [9,9,9,1] → [7,7,7,7]). Never throws (errors /
+ * followUpErrors). true = a player moved.
+ *
+ * INVARIANT — a balance move can never make a break (Rule 1 / Rule 2 of
+ * TournamentManager.checkRebalance) NEWLY fire. A move takes one placeable seat
+ * at the target and frees the mover's seat at the source, so the total of free
+ * seats (tournamentFreeSeats, summed) is CONSERVED; the alive count and the
+ * table count do not change; and the source keeps >= 5 alive.
+ *  - Rule 1 needs alive <= (tables-1) x 9: unchanged by a move, and false before
+ *    it (checked above) — so it stays false.
+ *  - Rule 2 breaks a table under 5 whose players fit the OTHER tables' free
+ *    seats (total free F minus its own f): for the target (c → c+1 alive,
+ *    f → f-1 free) "F - f >= c" and "F - (f-1) >= c+1" are the same test; every
+ *    other table keeps its count and F - f; the source ends with >= 5 (Rule 2
+ *    never looks at it). Nothing that was false before the move is true after it.
+ */
+function balanceQualifierTables(tournamentId: string, sourceTableId: string, sourceTable: PokerTable): boolean {
+  let plan: QualifierBalanceMove | null = null;
+  try {
+    plan = planQualifierBalanceMove(tournamentId, false, { tid: sourceTableId, table: sourceTable });
+  } catch (e: any) {
+    qualifierBalance.errors++;
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_table_balance_failed', tournamentId, tableId: sourceTableId, moved: false, via: 'hand_end', error: String(e?.message || e) })}`);
+    return false;
+  }
+  return plan ? executeQualifierBalanceMove(tournamentId, plan, 'hand_end') : false;
+}
+
+/**
+ * 2026-10-23 (qualifier lifecycle S2) — the PRE-DEAL balancing pass: the same
+ * rules (planQualifierBalanceMove) applied repeatedly, at most
+ * QUALIFIER_BALANCE_PRE_DEAL_MAX_MOVES (60) moves, until no move is left — the
+ * tables end within one player of each other ([9,9,3] → [7,7,7]; a post-break
+ * residue [9,9,9,9,2] → max - min <= 1). Every table in a hand (or inside
+ * startNewHand / a hand completion) is skipped, as a source and as a target. It
+ * does NOT require the tournament to be unpaused: its callers (the break end,
+ * the 11:00 deal) run it while their hold is still set, then resume / deal.
+ * Moves are counted in preDealMoves. Never throws. Returns the moves made.
+ */
+function balanceQualifierTablesNow(tournamentId: string): number {
+  let n = 0;
+  while (n < QUALIFIER_BALANCE_PRE_DEAL_MAX_MOVES) {
+    let plan: QualifierBalanceMove | null = null;
+    try {
+      plan = planQualifierBalanceMove(tournamentId, true);
+    } catch (e: any) {
+      qualifierBalance.errors++;
+      console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_table_balance_failed', tournamentId, moved: false, via: 'pre_deal', error: String(e?.message || e) })}`);
+      break;
+    }
+    if (!plan || !executeQualifierBalanceMove(tournamentId, plan, 'pre_deal')) break;
+    n++;
+  }
+  if (n > 0) console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_tables_balanced_pre_deal', tournamentId, moves: n })}`);
+  return n;
 }
 // ===== end tournament rebalance helpers =====
 

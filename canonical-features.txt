@@ -1680,3 +1680,13 @@ armQualifierSyncRetry();
 # table, or every table) is re-thrown (the crash flush voids the event and
 # refunds every credit), never swallowed into a stuck running event.
 tournament_bootstrap_no_table_dealt
+
+# 2026-10-23 qualifier lifecycle S2 (owner 2026-10-22: "auto balance tables"):
+# TDA table balancing for qualifiers. At the fullest table's hand boundary the
+# player due its big blind moves to the shortest table (>= 2 fewer alive), a
+# pre-deal pass evens the tables at a break end / the start, and late entries /
+# re-entries take the fewest-alive table (a break-pending one last). Runtime
+# switch POST /api/qualifiers/balance (X-Internal-Token, fails closed).
+qualifier_table_balanced
+balanceQualifierTables(tId, tableId, table);
+/api/qualifiers/balance

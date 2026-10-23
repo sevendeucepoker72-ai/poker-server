@@ -126,6 +126,7 @@ See `src/index.ts`. Key events:
 | `SENTRY_DSN` | Optional | Exception capture |
 | `INTERNAL_NOTIFY_TOKEN` | **Required in prod** | `X-Internal-Token` for the master's internalAuth routes: qualifier-credit consume/refund/issue, qualifier schedule/register/results, and (2026-10-07) the play gate's `/users/:id/play-status/internal`. Unset = suspension checks FAIL OPEN (visible as `playGate.internalTokenConfigured:false` on `/api/health`) |
 | `QUALIFIER_OVERFLOW_TABLES_MAX` | Optional (default 6) | Online qualifier overflow tables in play per event (owner 2026-10-22). Clamped 0..20, garbage → 6; **0 = OFF** (every-seat-alive late entry / re-entry refused `no_seat`, credit refunded, as before). This is only the value AT BOOT (changing a Railway var restarts the process, and a restart cancels a running qualifier). While the server runs, change it with **`POST /api/qualifiers/overflow` `{"max": N}`** + header `X-Internal-Token` (= `INTERNAL_NOTIFY_TOKEN`; no token configured → always 403). No restart is needed, and the value lasts until the next boot. Shown as `r2Play.qualifiers.overflow.cap` on `/api/health` |
+| `QUALIFIER_TABLE_BALANCE` | Optional (unset = ON) | Online qualifier TDA table balancing (2026-10-23, lifecycle S2; section "Online qualifier TABLE BALANCING"). **`0` = OFF** = exactly the behaviour before S2 (only the lone-overflow feed and the Rule 1 / Rule 2 breaks move anyone); anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs, switch it with **`POST /api/qualifiers/balance` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403). Shown as `r2Play.qualifiers.balance.on` on `/api/health` |
 | `ONLINE_GUEST_PLAY_ENABLED` | **Leave unset** | EMERGENCY ROLLBACK ONLY. `1` re-allows guest `register` and no-account play, against the 2026-10-07 owner rule "nobody plays .online without an American Pub Poker account". Suspended players stay blocked either way. Shown as `playGate.guestPlayEnabled` on `/api/health` |
 
 ## Deploy pre-flight
@@ -336,14 +337,24 @@ table at 9 free), so a first-hour wave of late arrivals was turned away. Now:
   is full, until the next bust anywhere or another late arrival. Busts are rare
   in the first hour. A bust lets Rule 1 / Rule 2 break the overflow table back
   (`rebalanceSafety` C3 / C12).
+  - **2026-10-23 (lifecycle S2): the TABLE BALANCE now evens an overflow table
+    past 2.** At each hand end of the fullest table (>= 6 alive), when the
+    overflow table has at least two fewer, the player due that table's big
+    blind moves there too, until every table is within one ([9,9,1] → feed →
+    [8,9,2] → … → [7,6,6]). The heads-up stretch lasts about one hand per
+    table. With the balance switch OFF (`QUALIFIER_TABLE_BALANCE=0` or
+    `POST /api/qualifiers/balance {"on":0}`) this bullet's old behaviour is back.
+    See "Online qualifier TABLE BALANCING".
   - Nothing checks how many tables the tournament has left. When the FINAL
     table is full (9 alive, nothing busted) at a late entry or re-entry, a
     second table opens again and the feed pulls a final-table player into
     heads-up against the fresh 50,000 stack, until the next bust merges them
-    back.
+    back. (Since S2, with the balance on, the two tables even out to 5 / 5 over
+    the next few hands; the next bust still merges them — 9 alive fit one table.)
   - No chips or credits are at stake.
-  - Full TDA balancing (keep feeding until tables are within one player) or
-    refusing overflow at the final table would be a separate change.
+  - Full TDA balancing (keep feeding until tables are within one player): DONE
+    2026-10-23 (lifecycle S2, next section but one). Refusing overflow at the
+    final table is still a separate change.
 - **Breaks.** Overflow tables are ordinary tables to the rebalance: the next bust
   anywhere lets Rule 1 break the (smallest) overflow table into the freed seats
   (deferred while it is mid-hand, as every break). Churn (open → break → open)
@@ -494,6 +505,135 @@ SHA (or push the previous one) before the Sunday freeze.
     `retries` 1 with an empty registry. With the master back, the retry listed
     the event 30 s later (it used to take 10 minutes).
   - `tournamentBootstrap.tableFailures` stayed 0.
+
+### Online qualifier TABLE BALANCING (2026-10-23, lifecycle S2)
+
+Owner 2026-10-22: "... auto combine tables when we lost people, only have 9
+players per table, auto balance tables ...". Before: the rebalance only BROKE
+tables (`TournamentManager.checkRebalance` Rule 1 / Rule 2) and the feed filled
+a lone overflow table to 2. Nothing evened [9,2], [9,9,5] or [9,9,9,1]:
+checkRebalance answers null for all three (no table fits into the others' free
+seats), so they played on that uneven. Now (all in the rebalance helpers block
+of `src/index.ts`, qualifiers only):
+
+- **At a hand boundary** (`balanceQualifierTables`, called by
+  `autoStartNextHand` after every hold — pause, bust check, deferred break, the
+  under-5 wait — and ONLY when the lone-overflow feed moved nobody, before this
+  table's own deal, which still happens). When ALL hold
+  (`planQualifierBalanceMove`):
+  - the switch is on; the tournament is running, not paused, has more than one
+    table, and is a qualifier (`qualifierOfTournament`);
+  - no break is possible (`planTournamentRebalance` null: a break always wins)
+    and not everyone fits in one table fewer (alive > (tables-1) x 9, Rule 1's
+    own test — that is the break's business);
+  - THIS table is the fullest (a tie is fine) with >= 6 alive
+    (`QUALIFIER_OVERFLOW_FEED_MIN_SOURCE`, so it keeps >= 5);
+  - the target is the fewest-alive OTHER table with at least two fewer
+    (targetAlive <= sourceAlive - 2, so every move strictly evens the tables and
+    the balance never oscillates), >= 1 alive, a placeable seat (its FIRST one
+    is taken — `tournamentSeatIsPlaceable`, a busted seat is vacated first), no
+    break awaiting its hand end, no pending / unsettled bust, not inside
+    startNewHand or a hand completion. MID-HAND is fine: the mover sits that
+    live hand out (folded, no cards) and is dealt the next one, as a late
+    entry is. A LONE target whose only player is ABSENT is skipped
+    (`skippedAbsentTarget`: feeding an absent seat gives chips away); a skipped
+    table lets the next fewest-alive one be the target.
+  - The mover is the seat due THIS table's big blind next
+    (`getNextOccupiedSeat(previousBigBlindSeat + 1)`, the first live alive human
+    entrant from there). Presence is NOT required (TDA: whoever is due the big
+    blind moves; an absent seat's reservation and V4 notice follow it).
+  - One move per hand boundary. Repeated, the tables end within one player:
+    [9,2] → [6,5] (3 moves), [9,9,5] → [8,8,7], [9,9,9,1] → [7,7,7,7].
+  - Known limit (by the spec, not changed): he takes the target's FIRST
+    placeable seat, not the seat that posts the next big blind. PokerTable's
+    F13 dead zone deals him out for one hand only when that seat is on the
+    button, in the small blind or between them; elsewhere he is dealt in at the
+    next deal and posts only if his seat is that hand's big blind (otherwise he
+    skipped the big blind he was due at the source). No chips are created or
+    lost; it is a blind-position fairness gap.
+- **The move** is the feed's own guarded move, now shared:
+  `moveTournamentStack` (vacate a busted target, `sitDown` allowBelowMin,
+  `setPlayerTable`, `moveTournamentSeatPointers` — sessions on any socket,
+  extra-table sessions, the reservation, `'playerMoved'` —, rolled back and
+  re-thrown on a throw, then the source seat stood up) and `forgetSeatPointers`
+  (the emptied source seat's stale sessions / reservations / sit-out / AI
+  profile). The feed's selection rules, return value and counters are
+  unchanged. After a balance move: both tables broadcast, then
+  `scheduleDealAfterTournamentSeat(target)` (F95 kicks an idle target).
+- **Invariant (in the code comment at `balanceQualifierTables`).** A move takes
+  one placeable seat at the target and frees one at the source: total free seats
+  are CONSERVED; alive and table counts do not change; the source keeps >= 5.
+  So Rule 1 (needs alive <= (tables-1) x 9 — false before, unchanged) and Rule 2
+  ("F - f >= c" for the target is the same test before and after; nothing else
+  changes; the source is >= 5) can never NEWLY fire because of a balance move.
+- **Pre-deal pass** (`balanceQualifierTablesNow(tId): number`, for the break end
+  (S3) and the 11:00 deal (S4)): the same rules, repeated, at most 60 moves
+  (`QUALIFIER_BALANCE_PRE_DEAL_MAX_MOVES`); the source is the fullest table that
+  may give; every table in a hand is skipped as a source and as a target; it
+  does NOT require the tournament to be unpaused (its callers run it while their
+  hold is set, then resume). [9,9,3] → [7,7,7]; the post-break residue
+  [9,9,9,9,2] → within one. Counted in `preDealMoves`. Nothing calls it yet in
+  this commit.
+- **Placement of late entries and re-entries.** The re-entry empty-seat loop in
+  the register handler now walks the tables FEWEST-ALIVE first (it used to walk
+  `tableIds` order: every re-entry went to Table 1 first), like
+  `seatQualifierLateEntrant` and `seatQualifierReentrantOnBustedSeat`. In all
+  three, a table whose break is pending (`tournamentBreaksAwaitingHandEnd`)
+  sorts LAST. No switch: it only reorders the candidate tables.
+- **Never throws.** `errors` (log `qualifier_table_balance_failed`, moved:false)
+  = nothing moved (a check threw, or the guarded move rolled back); `moves` /
+  `preDealMoves` (log `qualifier_table_balanced` {tournamentId, fromTableId,
+  toTableId, fromAlive, toAlive — the counts AFTER the move —, fromSeat, toSeat,
+  via}) = the stack sits at the target; `followUpErrors` (log
+  `qualifier_table_balance_followup_failed`, moved:true) = the move stands, a
+  follow-up threw. A refused sit-down changes nothing (log
+  `qualifier_table_balance_refused`). The pre-deal pass also logs
+  `qualifier_tables_balanced_pre_deal` {moves}.
+- **Kill switch — two controls.** OFF is exactly the old behaviour (only the
+  lone-overflow feed and the Rule 1 / 2 breaks); players already moved stay
+  where they are (their stacks moved whole).
+  - Railway env `QUALIFIER_TABLE_BALANCE=0` at boot (unset = on). Changing it
+    restarts the process — never during an event.
+  - During the event, NO restart:
+    `curl -s -X POST https://poker-server-production-60c0.up.railway.app/api/qualifiers/balance -H 'Content-Type: application/json' -H "X-Internal-Token: $INTERNAL_NOTIFY_TOKEN" -d '{"on":0}'`
+    (`{"on":1}` turns it back on). Accepts 0 / 1 / true / false; anything else
+    → 400, nothing changes. Missing or wrong token → 403, and every request is
+    403 when no token is configured (fails closed). Answers `{success, previous,
+    on}`. Logged `qualifier_balance_set`, audited `QUALIFIER_BALANCE_SET`
+    (durable). Use the token from the environment; never paste it into a chat.
+  - Independent of the overflow switch: the overflow cap at 0 stops new
+    overflow tables and the FEED, not the balance. To stop every move into a
+    lone overflow table, turn both off.
+- **Health:** `r2Play.qualifiers.balance` = { on, moves, preDealMoves,
+  skippedAbsentTarget, errors, followUpErrors } (`errors` / `followUpErrors`
+  should stay 0).
+- **Contract:** no new frame; the moved player gets the same `'playerMoved'`
+  {fromTable, toTable, toSeat, tableId} as a break or the feed sends
+  (CONTRACTS.md). Manifest tokens `qualifier_table_balanced`,
+  `balanceQualifierTables(tId, tableId, table);`, `/api/qualifiers/balance`.
+- **Tests:** `tests/rebalanceSafety.test.ts` "2026-10-23 (qualifier lifecycle
+  S2 …)", S2-1 … S2-14 (real `autoStartNextHand`, real
+  `tournamentDealHoldReason`, 9-seat tables, the real route). The Q2 test "a
+  re-entered player's OLD busted seat is free capacity" (and its CONTROL) now
+  caps TB at its 3 seats: the fewest-alive re-entry would otherwise seat a5 at
+  TB instead of the TA seat 6 the test is built on. Full jest 2156 passed
+  (baseline 2142 at 272a23c, +14).
+- **Rig (2026-10-23, scratchpad `qrig/s2-rig.sh`, on this dist).**
+  `restart-server.sh` passes `QUALIFIER_TABLE_BALANCE` through.
+  - NEW `qrig/scenario-balance.js` passed 37/37 three times (and a smoke run).
+    It covers: the route (403 / 400 / 200); with the switch OFF, 60 s with only
+    the feed's move ([9,8,2]); switched ON, the 3 tables within one in 27-53 s
+    (4 moves, each mover the big-blind-due seat, chips kept); a late fill where
+    every entrant lands on a fewest-alive table; a 4th table evened to 7/7/7/7
+    in 32-34 s (1 feed + 5 moves); a clean server log; then the play-out with
+    one results POST, places 1..28, the winner at exactly 50,000 x 28, and an
+    exact credit ledger.
+  - `scenario-overflow` passed 51/51 three times with `QUALIFIER_TABLE_BALANCE=0`
+    and the cap at 2: the feed path is unchanged, and no
+    `qualifier_table_balanced` line was logged. With the balance ON, that
+    scenario's "exactly ONE bot moved to the overflow table" checks would fail
+    by design.
+  - To recreate the rig Postgres, see the overflow section (`qtest-pg`).
 
 ### Recovering a qualifier's finish order (the results POST never landed)
 
