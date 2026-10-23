@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -58,7 +58,7 @@ import { createWindowRateLimiter } from './auth/rateLimit';
 import { createTicketReplayGuard, initUsedPlayTicketsTable, ticketReplayStats } from './auth/ticketReplay';
 import { publicNameOf, PUBLIC_NAME_FALLBACK, isPublicDisplayName, LISTABLE_USER_SQL } from './social/publicIdentity';
 import { createHash, randomInt, timingSafeEqual } from 'crypto';
-import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer } from './game/TournamentManager';
+import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer, Tournament } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
@@ -830,6 +830,11 @@ function statsStampDurable(columnType: string | null): boolean | null {
 const tableManager = new TableManager();
 const progressionManager = new ProgressionManager();
 const tournamentManager = new TournamentManager();
+// 2026-10-23 (qualifier lifecycle S3, owner: "take breaks") — the scheduled-break
+// switch at boot: Railway env QUALIFIER_BREAKS '0' = off, unset (or anything
+// else) = on. While the server runs: POST /api/qualifiers/breaks {on} (a
+// restart cancels a running qualifier — never change the env during one).
+tournamentManager.breaksEnabled = process.env.QUALIFIER_BREAKS !== '0';
 
 // Track which socket is at which table/seat
 interface PlayerSession {
@@ -1252,6 +1257,8 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   'QUALIFIER_OVERFLOW_CAP_SET', 'TOURNAMENT_PAUSE',
   // 2026-10-23 (qualifier lifecycle S2) — the table-balance switch (POST /api/qualifiers/balance).
   'QUALIFIER_BALANCE_SET',
+  // 2026-10-23 (qualifier lifecycle S3) — the scheduled-break switch (POST /api/qualifiers/breaks).
+  'QUALIFIER_BREAKS_SET',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -3111,6 +3118,12 @@ app.get('/api/health', async (_req, res) => {
           // table balancing: on = the switch in force (POST /api/qualifiers/balance);
           // errors / followUpErrors should stay 0.
           balance: { on: qualifierBalanceOn, ...qualifierBalance },
+          // 2026-10-23 (qualifier lifecycle S3, owner: "take breaks") — scheduled
+          // breaks: on = the switch in force (POST /api/qualifiers/breaks); taken =
+          // breaks started; endedEarly = breaks a director pause / resume interrupted.
+          breaks: { on: tournamentManager.breaksEnabled, everyLevels: QUALIFIER_BREAK_EVERY_LEVELS, minutes: QUALIFIER_BREAK_MINUTES, ...tournamentManager.breakStats },
+          // The RIG-ONLY time scale (QUALIFIER_TEST_TIME_SCALE): ALWAYS 1 on Railway / NODE_ENV=production.
+          testTimeScale: qualifierTestTimeScale(process.env),
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
@@ -4112,6 +4125,145 @@ app.post('/api/qualifiers/balance', (req, res) => {
   res.json({ success: true, ...setQualifierTableBalance(next, 'internal:table_balance') });
 });
 
+// ===== Director pause + scheduled breaks (qualifier lifecycle S3, 2026-10-23) =====
+/**
+ * The director's Pause / Resume of a running tournament — the body of the
+ * admin 'pauseTournament' socket handler, shared with POST /api/qualifiers/pause
+ * (the director's backup when the .online Admin link is not at hand).
+ * TournamentManager.pauseTournament(…, 'director'): Pause stops the blind clock
+ * and keeps the time left in the level; Resume arms exactly that time (it used
+ * to restart the level at full length); a pause during a scheduled BREAK
+ * replaces the break (its Resume starts the next level, full time); the hold
+ * before the first deal ('prestart') is never paused or resumed here —
+ * refused, code `not_started`, 'This tournament has not started yet.', nothing
+ * changed, nobody told. On success: audited
+ * TOURNAMENT_PAUSE (durable), every table room told `tournamentPaused` /
+ * `tournamentResumed` {tournamentId, reason:'director'} (reason additive),
+ * each table's state re-sent (the level clock), and on Resume every table
+ * re-kicked (scheduleAutoStart — a table that reached its hand end while
+ * paused deals again). Never touches chips.
+ */
+function applyDirectorPause(
+  tournamentId: string, paused: boolean, actor: string,
+): { ok: true; paused: boolean; pauseReason: string | null } | { ok: false; code: 'not_running' | 'not_started'; message: string } {
+  const before = tournamentManager.getTournament(tournamentId);
+  // The hold before the first deal is the start's own (only its 'prestart'
+  // resume ends it): a director's Pause there would only tell the tables
+  // "paused by the director", and his Resume is refused by pauseTournament.
+  if (before && before.status === 'running' && before.paused && before.pauseReason === 'prestart') {
+    return { ok: false, code: 'not_started', message: 'This tournament has not started yet.' };
+  }
+  const ok = tournamentManager.pauseTournament(tournamentId, paused, 'director');
+  const tourn = tournamentManager.getTournament(tournamentId);
+  if (!ok) {
+    if (!paused && tourn && tourn.status === 'running' && tourn.paused && tourn.pauseReason === 'prestart') {
+      return { ok: false, code: 'not_started', message: 'This tournament has not started yet.' };
+    }
+    return { ok: false, code: 'not_running', message: 'Tournament not running' };
+  }
+  auditLog(actor, 'TOURNAMENT_PAUSE', { tournamentId, paused });
+  const evt = paused ? 'tournamentPaused' : 'tournamentResumed';
+  // F90 (2026-10-21) — a SINGLE-table tournament (startTournamentGame, 9 or
+  // fewer entrants) records only `tableId`; its `tableIds` stay empty, so
+  // Resume re-kicked no table: one that reached its hand boundary while
+  // paused sat in HandComplete for good while the blind clock ran on (and
+  // its players were never told paused / resumed).
+  const pauseTableIds = tourn?.tableIds?.length ? tourn.tableIds : (tourn?.tableId ? [tourn.tableId] : []);
+  for (const tid of pauseTableIds) {
+    io.to(`table:${tid}`).emit(evt, { tournamentId, reason: 'director' });
+    // On resume, re-kick any table that stalled at the hand boundary while paused.
+    if (!paused) scheduleAutoStart(tid);
+    broadcastGameState(tid);   // S3 — the level clock: frozen, or running again
+  }
+  broadcastTournamentList();
+  return { ok: true, paused: !!tourn?.paused, pauseReason: tourn?.pauseReason ?? null };
+}
+
+/**
+ * S3 — the scheduled-break switch at runtime (TournamentManager.breaksEnabled,
+ * read at each level boundary). OFF: the next level boundary advances with no
+ * break; a break ALREADY running is not ended (POST /api/qualifiers/pause
+ * {paused:false} ends it early). Lasts until the next boot, which reads Railway
+ * env QUALIFIER_BREAKS again ('0' = off). Logged + audited
+ * (`qualifier_breaks_set`, QUALIFIER_BREAKS_SET, durable).
+ */
+function setQualifierBreaks(on: boolean, actor: string): { previous: boolean; on: boolean } {
+  const previous = tournamentManager.breaksEnabled;
+  tournamentManager.breaksEnabled = on;
+  console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_breaks_set', previous, on, actor })}`);
+  auditLog(actor, 'QUALIFIER_BREAKS_SET', { previous, on });
+  return { previous, on };
+}
+
+// S3 — the break switch at runtime, no restart: POST {on: 0|1|true|false} with
+// X-Internal-Token. FAILS CLOSED, as /api/qualifiers/overflow: no token
+// configured → 403. Any other `on` → 400 and nothing changes. Answers
+// {success, previous, on}; /api/health r2Play.qualifiers.breaks.on shows it.
+app.post('/api/qualifiers/breaks', (req, res) => {
+  const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
+  if (!internalTokenMatches(req.headers['x-internal-token'], tok)) {
+    res.status(403).json({ success: false, error: 'forbidden' });
+    return;
+  }
+  const raw = req.body?.on;
+  const next = raw === true || raw === 1 ? true : raw === false || raw === 0 ? false : null;
+  if (next === null) {
+    res.status(400).json({ success: false, error: 'on must be 0, 1, true or false', on: tournamentManager.breaksEnabled });
+    return;
+  }
+  res.json({ success: true, ...setQualifierBreaks(next, 'internal:breaks') });
+});
+
+// S3 — the director's Pause / Resume of a running QUALIFIER, no restart:
+// POST {paused: 0|1|true|false, qualifierId?} with X-Internal-Token (FAILS
+// CLOSED: 403). Without `qualifierId`: the ONE running qualifier (none → 404,
+// several → 409 with their ids). A bad `paused` → 400. applyDirectorPause: a
+// resume during the hold before the first deal → 409 `not_started`.
+// {paused:false} during a scheduled break ends it at once (the next level
+// starts, full time). Answers {success, qualifierId, tournamentId, paused,
+// pauseReason}. Audited TOURNAMENT_PAUSE (actor internal:pause).
+app.post('/api/qualifiers/pause', (req, res) => {
+  const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
+  if (!internalTokenMatches(req.headers['x-internal-token'], tok)) {
+    res.status(403).json({ success: false, error: 'forbidden' });
+    return;
+  }
+  const raw = req.body?.paused;
+  const paused = raw === true || raw === 1 ? true : raw === false || raw === 0 ? false : null;
+  if (paused === null) {
+    res.status(400).json({ success: false, error: 'paused must be 0, 1, true or false' });
+    return;
+  }
+  const wanted = req.body?.qualifierId;
+  let qualId: string | null = null;
+  let tournamentId: string | null = null;
+  if (wanted !== undefined && wanted !== null && String(wanted).trim() !== '') {
+    const qt = qualifierTournaments.get(String(wanted).trim());
+    if (!qt || qt.status !== 'running' || !qt.tournamentId) {
+      res.status(404).json({ success: false, error: 'qualifier_not_running' });
+      return;
+    }
+    qualId = String(wanted).trim();
+    tournamentId = qt.tournamentId;
+  } else {
+    const running = Array.from(qualifierTournaments.entries()).filter(([, qt]) => qt.status === 'running' && !!qt.tournamentId);
+    if (running.length === 0) { res.status(404).json({ success: false, error: 'no_running_qualifier' }); return; }
+    if (running.length > 1) {
+      res.status(409).json({ success: false, error: 'several_running', qualifierIds: running.map(([id]) => id) });
+      return;
+    }
+    qualId = running[0][0];
+    tournamentId = running[0][1].tournamentId;
+  }
+  const r = applyDirectorPause(tournamentId!, paused, 'internal:pause');
+  if (!r.ok) {
+    res.status(409).json({ success: false, error: r.code, message: r.message });
+    return;
+  }
+  res.json({ success: true, qualifierId: qualId, tournamentId, paused: r.paused, pauseReason: r.pauseReason });
+});
+// ===== end director pause + scheduled breaks =====
+
 /**
  * The next "Qualifier Table N" number of this tournament: above every number
  * its live tables show and every number an overflow table of it has used (a
@@ -4929,6 +5081,89 @@ function getVariantInfo(table: PokerTable): { variant: VariantType; variantName:
   };
 }
 
+// ===== Tournament level clock (qualifier lifecycle S3, 2026-10-23) =====
+/**
+ * The level clock every full state of a tournament table carries
+ * (getGameStateForPlayer): the old widget's three keys (blindLevel,
+ * nextBlindIn, blindLevelDuration) and the additive `tournamentClock` object
+ * poker-3d's HUD clock reads. paidPlaces = the places that win seats
+ * (seatsForTopWith) for a qualifier, else null; avgStack = entries x the
+ * starting stack / alive (every entry and re-entry brings one starting stack;
+ * no chips enter or leave a qualifier otherwise).
+ */
+interface TournamentClockState {
+  blindLevel: number;
+  nextBlindIn: number;
+  blindLevelDuration: number;
+  tournamentClock: Record<string, unknown>;
+}
+const TOURNAMENT_CLOCK_MEMO_MS = 500;
+/**
+ * One build per tournament per TOURNAMENT_CLOCK_MEMO_MS (the state builder runs
+ * per socket), keyed ALSO by the clock's own fields: a pause, a break, a level
+ * change or an entry is shown at the very next state, never 500 ms late.
+ */
+const tournamentClockMemo = new Map<string, { at: number; sig: string; value: TournamentClockState | null }>();
+function tournamentClockStateFor(tournamentId: string): TournamentClockState | null {
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t) return null;
+  const now = Date.now();
+  const sig = `${t.status}|${t.paused}|${t.pauseReason}|${t.currentBlindLevel}|${t.levelEndsAt}|${t.levelRemainingMs}|${t.breakUntil}|${t.entries}`;
+  const hit = tournamentClockMemo.get(tournamentId);
+  if (hit && hit.sig === sig && now >= hit.at && now - hit.at < TOURNAMENT_CLOCK_MEMO_MS) return hit.value;
+  let value: TournamentClockState | null = null;
+  try {
+    value = buildTournamentClockState(tournamentId, t, now);
+  } catch (e: any) {
+    // Never throws into the state build: the table plays on without a clock.
+    console.warn(`[Tournament] ${JSON.stringify({ event: 'tournament_clock_build_failed', tournamentId, error: String(e?.message || e) })}`);
+    value = null;
+  }
+  if (tournamentClockMemo.size > 64) {
+    for (const [k, v] of tournamentClockMemo) if (now - v.at > 10_000) tournamentClockMemo.delete(k);
+  }
+  tournamentClockMemo.set(tournamentId, { at: now, sig, value });
+  return value;
+}
+function buildTournamentClockState(tournamentId: string, t: Tournament, now: number): TournamentClockState | null {
+  const c = tournamentManager.getLevelClock(tournamentId);
+  if (!c) return null;
+  const running = t.status === 'running';
+  const atLastLevel = c.next === null;
+  const nextBlindIn = running && !c.paused && !atLastLevel && c.remainingMs !== null
+    ? Math.max(0, Math.ceil(c.remainingMs / 1000)) : 0;
+  const q = qualifierOfTournament(tournamentId);
+  const startingChips = t.config.startingChips || 1000;
+  return {
+    blindLevel: c.level,
+    nextBlindIn,
+    blindLevelDuration: c.durationSec,
+    tournamentClock: {
+      level: c.level,
+      levels: c.levels,
+      sb: c.sb,
+      bb: c.bb,
+      ante: c.ante,
+      next: c.next,
+      levelEndsAt: c.levelEndsAt,
+      serverNow: now,
+      paused: c.paused,
+      pauseReason: c.pauseReason,
+      breakUntil: c.breakUntil,
+      dealsAt: null,
+      playersLeft: c.alive,
+      entries: c.entries,
+      avgStack: c.alive > 0 ? Math.round((c.entries * startingChips) / c.alive) : null,
+      paidPlaces: q ? seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage ?? null) : null,
+      // The names poker-3d's clock also reads (utils/tournamentClock.js):
+      levelDurationMs: c.durationSec * 1000,
+      levelRemainingMs: c.paused ? c.remainingMs : null,   // frozen while paused
+      resumesAt: c.breakUntil,                              // a break: when play resumes
+    },
+  };
+}
+// ===== end tournament level clock =====
+
 function getGameStateForPlayer(
   table: PokerTable,
   playerSeatIndex: number,
@@ -5212,6 +5447,23 @@ function getGameStateForPlayer(
   const stateTournamentId = tournamentIdOfTable(table.config.tableId) ?? null;
   stateObj.isTournament = !!stateTournamentId;
   stateObj.tournamentId = stateTournamentId;
+  // 2026-10-23 (qualifier lifecycle S3, owner: "run the blinds and raise them,
+  // take breaks") — the LEVEL CLOCK, in every full state. ALWAYS present (null
+  // / 0 on a cash table) so the per-socket delta (shallowDiff) clears them
+  // when a socket moves to a cash table:
+  //   blindLevel (1-based | null), nextBlindIn (seconds; 0 while paused, at the
+  //   last level, or on a cash table), blindLevelDuration (seconds | null) —
+  //   the keys poker-3d's existing level widget reads (GameHUD);
+  //   tournamentClock — {level, levels, sb, bb, ante, next, levelEndsAt,
+  //   serverNow, paused, pauseReason, breakUntil, dealsAt, playersLeft,
+  //   entries, avgStack, paidPlaces, levelDurationMs, levelRemainingMs,
+  //   resumesAt} | null (poker-3d utils/tournamentClock.js; additive).
+  // Built once per tournament per 500 ms (tournamentClockStateFor): this runs per socket.
+  const levelClock = stateTournamentId ? tournamentClockStateFor(stateTournamentId) : null;
+  stateObj.blindLevel = levelClock ? levelClock.blindLevel : null;
+  stateObj.nextBlindIn = levelClock ? levelClock.nextBlindIn : 0;
+  stateObj.blindLevelDuration = levelClock ? levelClock.blindLevelDuration : null;
+  stateObj.tournamentClock = levelClock ? levelClock.tournamentClock : null;
 
   // 2026-10-11 (R1 contract #2) — what kind of table this is and whether a
   // rebuy is allowed here, ALWAYS present (the `rebuy` handler refuses with
@@ -19862,26 +20114,16 @@ Give feedback in this JSON format:
   // setTournamentSpeed). Pause/resume freezes the blind clock + holds tables at
   // the next hand boundary; advance forces the next blind level; rebalance kicks
   // the existing table-rebalance flow.
+  // 2026-10-23 (qualifier lifecycle S3) — the body is applyDirectorPause (shared
+  // with POST /api/qualifiers/pause): Resume now keeps the time left in the
+  // level, a pause during a scheduled break replaces the break, and a resume
+  // of the hold before the first deal is refused ('This tournament has not
+  // started yet.').
   socket.on('pauseTournament', async (data: { tournamentId: string; paused: boolean }) => {
     const auth = authSessions.get(socket.id);
     if (!auth || !(await isUserAdmin(auth.userId))) { socket.emit('error', { message: 'Access denied' }); return; }
-    const ok = tournamentManager.pauseTournament(data.tournamentId, !!data.paused);
-    if (!ok) { socket.emit('error', { message: 'Tournament not running' }); return; }
-    const tourn = tournamentManager.getTournament(data.tournamentId);
-    auditLog(auth.username, 'TOURNAMENT_PAUSE', { tournamentId: data.tournamentId, paused: !!data.paused });
-    const evt = data.paused ? 'tournamentPaused' : 'tournamentResumed';
-    // F90 (2026-10-21) — a SINGLE-table tournament (startTournamentGame, 9 or
-    // fewer entrants) records only `tableId`; its `tableIds` stay empty, so
-    // Resume re-kicked no table: one that reached its hand boundary while
-    // paused sat in HandComplete for good while the blind clock ran on (and
-    // its players were never told paused / resumed).
-    const pauseTableIds = tourn?.tableIds?.length ? tourn.tableIds : (tourn?.tableId ? [tourn.tableId] : []);
-    for (const tid of pauseTableIds) {
-      io.to(`table:${tid}`).emit(evt, { tournamentId: data.tournamentId });
-      // On resume, re-kick any table that stalled at the hand boundary while paused.
-      if (!data.paused) scheduleAutoStart(tid);
-    }
-    broadcastTournamentList();
+    const r = applyDirectorPause(data.tournamentId, !!data.paused, auth.username);
+    if (!r.ok) { socket.emit('error', { message: r.message, code: r.code }); return; }
   });
 
   socket.on('advanceTournamentLevel', async (data: { tournamentId: string }) => {
@@ -23249,6 +23491,9 @@ function startQualifierTournament(
   if (players.length < 2) return null;
   const seatsPerTable = 9;
   const tableCount = Math.max(1, Math.ceil(players.length / seatsPerTable));
+  // 2026-10-23 (qualifier lifecycle S3) — the RIG-ONLY time scale (always 1 on
+  // Railway / NODE_ENV=production): divides the engine's level and break lengths.
+  const timeScale = qualifierTestTimeScale(process.env);
 
   const tournamentId = tournamentManager.createTournament({
     name: 'Qualifier Tournament',
@@ -23259,8 +23504,11 @@ function startQualifierTournament(
     // R2 (TOURNEY-13 / C3) — the structure the lobby is shown (qualifierStructure):
     // the advertised 20-minute levels scaled to the real stack, continued until
     // it must end. It ran 10/20 blinds on a 50,000 stack — a qualifier that never ended.
-    blindLevels: qualifierBlindLevels(startingStack),
+    blindLevels: qualifierBlindLevels(startingStack, timeScale),
     startingChips: startingStack,
+    // S3 (owner: "take breaks") — a 5-minute break after every 5th level
+    // (qualifierBreakConfig; switch: tournamentManager.breaksEnabled).
+    breaks: qualifierBreakConfig(timeScale),
   });
 
   const tournament = tournamentManager.getTournament(tournamentId);
@@ -23456,6 +23704,62 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): vo
         } catch (err) {
           console.warn('[notifyPlayer blind_level_up] hook failed:', (err as Error)?.message);
         }
+        // 2026-10-23 (qualifier lifecycle S3) — the level clock in the table's
+        // state follows the new level at once (a hand may run on for a while).
+        try { broadcastGameState(tid); } catch (err) {
+          console.warn('[blindLevelUp] state broadcast failed:', (err as Error)?.message);
+        }
+      }
+    }
+    // 2026-10-23 (qualifier lifecycle S3, owner: "take breaks") — a SCHEDULED
+    // BREAK started (TournamentManager: the tournament is paused, reason
+    // 'break'; every table holds at its next hand boundary exactly as for a
+    // director's pause). Every LIVE table room — overflow tables included — is
+    // told `tournamentPaused` {tournamentId, reason:'break', resumesAt (ISO),
+    // afterLevel} and gets its state (the clock: on break). Never throws (it
+    // runs inside the blind timer).
+    if (event === 'tournamentBreak') {
+      try {
+        const resumesAtMs = Number(data?.resumesAt);
+        const resumesAt = Number.isFinite(resumesAtMs) && resumesAtMs > 0 ? new Date(resumesAtMs).toISOString() : null;
+        const breakTables = tournamentManager.getTournament(tournamentId)?.tableIds || [];
+        for (const tid of breakTables) {
+          try {
+            io.to(`table:${tid}`).emit('tournamentPaused', { tournamentId, reason: 'break', resumesAt, afterLevel: data?.afterLevel ?? null });
+            broadcastGameState(tid);
+          } catch (err) {
+            console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_break_notice_failed', tournamentId, tableId: tid, error: String((err as Error)?.message || err) })}`);
+          }
+        }
+        console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_break_started', tournamentId, afterLevel: data?.afterLevel ?? null, resumesAt, tables: breakTables.length })}`);
+        broadcastTournamentList();
+      } catch (err) {
+        console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_break_notice_failed', tournamentId, error: String((err as Error)?.message || err) })}`);
+      }
+    }
+    // S3 — the break ended on its own timer: the next level is already in
+    // force (blindLevelUp went out, full time). The tables are evened first
+    // (balanceQualifierTablesNow — S2's pre-deal pass, a no-op with its switch
+    // off), then every table room is told `tournamentResumed` {tournamentId,
+    // reason:'break'} and every table re-kicked (scheduleAutoStart — as the
+    // director's resume). Never throws.
+    if (event === 'tournamentBreakEnded') {
+      try {
+        let balanceMoves = 0;
+        try { balanceMoves = balanceQualifierTablesNow(tournamentId); } catch (_) { balanceMoves = 0; }
+        const resumeTables = tournamentManager.getTournament(tournamentId)?.tableIds || [];
+        for (const tid of resumeTables) {
+          try {
+            io.to(`table:${tid}`).emit('tournamentResumed', { tournamentId, reason: 'break' });
+            scheduleAutoStart(tid);
+          } catch (err) {
+            console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_break_resume_failed', tournamentId, tableId: tid, error: String((err as Error)?.message || err) })}`);
+          }
+        }
+        console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_break_ended', tournamentId, level: data?.level ?? null, tables: resumeTables.length, balanceMoves })}`);
+        broadcastTournamentList();
+      } catch (err) {
+        console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_break_resume_failed', tournamentId, error: String((err as Error)?.message || err) })}`);
       }
     }
     if (event === 'playerEliminated') {

@@ -31,6 +31,44 @@ export interface TournamentConfig {
    * entered by the club start, their buy-ins already paid to the club).
    */
   unlisted?: boolean;
+  /**
+   * 2026-10-23 (qualifier lifecycle S3, owner: "take breaks") — a SCHEDULED
+   * break of `seconds` after every `everyLevels`-th level (never after the last
+   * one). Only the online qualifiers set it (index.ts startQualifierTournament);
+   * every other tournament runs its levels back to back, as before.
+   */
+  breaks?: TournamentBreaks;
+}
+
+/** S3 — the break schedule: `seconds` of break after every `everyLevels`-th level. */
+export interface TournamentBreaks {
+  everyLevels: number;
+  seconds: number;
+}
+
+/** S3 — why a running tournament's clock is stopped (null = not paused). */
+export type TournamentPauseReason = 'director' | 'break' | 'prestart';
+
+/**
+ * S3 — the level clock as the tables show it (getLevelClock). `remainingMs` is
+ * live while the clock runs, frozen while paused (null on a break: the level is
+ * over and the next one starts with its full time).
+ */
+export interface TournamentLevelClock {
+  level: number;
+  levels: number;
+  durationSec: number;
+  levelEndsAt: number | null;
+  remainingMs: number | null;
+  paused: boolean;
+  pauseReason: TournamentPauseReason | null;
+  breakUntil: number | null;
+  sb: number;
+  bb: number;
+  ante: number;
+  next: { sb: number; bb: number; ante: number } | null;
+  entries: number;
+  alive: number;
 }
 
 export interface TournamentPlayer {
@@ -103,6 +141,29 @@ export interface Tournament {
   firstRegistrationAt: number | null;
   /** R2 — when it finished / was cancelled (finished non-template tournaments are pruned an hour later). */
   finishedAt: number | null;
+  /**
+   * 2026-10-23 (qualifier lifecycle S3, owner: "run the blinds and raise them,
+   * take breaks") — the level clock. `levelEndsAt` = when the current level
+   * ends (set every time the blind timer is armed; null while paused / on a
+   * break). `levelRemainingMs` = what was left of the level when it was
+   * paused (Resume arms exactly that — it used to restart the level at full
+   * length). `pauseReason` = why `paused` is set: a director's pause, a
+   * scheduled break, or the hold before the first deal ('prestart' — only a
+   * 'prestart' resume ends it). `breakUntil` = when a running break ends.
+   * `advanceOnResume` = the level is OVER (a break, or a director pause that
+   * replaced one): the resume starts the NEXT level with its full time.
+   */
+  levelEndsAt: number | null;
+  levelRemainingMs: number | null;
+  pauseReason: TournamentPauseReason | null;
+  breakUntil: number | null;
+  advanceOnResume: boolean;
+  /**
+   * S3 — every entry made: the field at the start, plus each late entry and
+   * each re-entry (minus a late entry undone). The average stack is
+   * entries x the starting stack / alive.
+   */
+  entries: number;
 }
 
 export const DEFAULT_BLIND_LEVELS: BlindLevel[] = [
@@ -132,6 +193,8 @@ export interface TournamentTemplate {
   minPlayers?: number;
   /** R2 — see TournamentConfig.unlisted (a club tournament). */
   unlisted?: boolean;
+  /** S3 (2026-10-23) — see TournamentConfig.breaks (qualifiers only). */
+  breaks?: TournamentBreaks;
 }
 
 /**
@@ -243,6 +306,20 @@ const TOURNAMENT_TEMPLATES: TournamentTemplate[] = [
 export class TournamentManager {
   private tournaments: Map<string, Tournament> = new Map();
   private eventCallbacks: Map<string, Array<(event: string, data: any) => void>> = new Map();
+  /**
+   * 2026-10-23 (qualifier lifecycle S3) — the scheduled-break switch. Read at
+   * each level boundary: off = the level advances with no break (a break
+   * already running is NOT ended by turning it off — a director resume ends
+   * it). index.ts sets it from Railway env QUALIFIER_BREAKS ('0' = off) at
+   * boot and from POST /api/qualifiers/breaks at runtime.
+   */
+  breaksEnabled = true;
+  /**
+   * S3 — health r2Play.qualifiers.breaks: `taken` = breaks started; `endedEarly`
+   * = breaks a director action interrupted (a pause, which replaces the break,
+   * or a resume, which ends it at once).
+   */
+  readonly breakStats = { taken: 0, endedEarly: 0 };
 
   constructor() {
     this.createTemplateTournaments();
@@ -269,6 +346,7 @@ export class TournamentManager {
       startingChips: template.startingChips || 1000,
       ...(template.minPlayers !== undefined ? { minPlayers: template.minPlayers } : {}),
       ...(template.unlisted ? { unlisted: true } : {}),
+      ...(template.breaks ? { breaks: { everyLevels: template.breaks.everyLevels, seconds: template.breaks.seconds } } : {}),
     };
 
     const now = Date.now();
@@ -290,6 +368,12 @@ export class TournamentManager {
       paused: false,
       firstRegistrationAt: null,
       finishedAt: null,
+      levelEndsAt: null,
+      levelRemainingMs: null,
+      pauseReason: null,
+      breakUntil: null,
+      advanceOnResume: false,
+      entries: 0,
     };
 
     this.tournaments.set(tournamentId, tournament);
@@ -475,6 +559,7 @@ export class TournamentManager {
       entryId: uuidv4(), registeredAt: Date.now(),
     };
     t.players.push(tp);
+    t.entries++;   // S3 — one more entry (the average stack counts it)
     if (t.config.maxPlayers < t.players.length) t.config.maxPlayers = t.players.length;
     // 2026-10-20 — the field grew: everyone already out finished BELOW the new
     // entrant, so each busted place moves down one. A place is fixed at the
@@ -519,6 +604,7 @@ export class TournamentManager {
     p.chips = chips;
     delete p.tieGroup;
     t.eliminationOrder = t.eliminationOrder.filter((id) => id !== playerId);
+    t.entries++;   // S3 — a re-entry is another entry (a fresh starting stack in play)
     return true;
   }
 
@@ -530,7 +616,10 @@ export class TournamentManager {
     t.players = t.players.filter((p) => p.playerId !== playerId || p.eliminated);
     t.playerTableMap.delete(playerId);
     // 2026-10-20 — the field shrank back: undo addLateEntrant's place shift.
-    if (t.players.length < before) this.shiftBustedPlaces(t, null, -1);
+    if (t.players.length < before) {
+      this.shiftBustedPlaces(t, null, -1);
+      t.entries = Math.max(0, t.entries - 1);   // S3 — the entry was undone
+    }
     return t.players.length < before;
   }
 
@@ -680,6 +769,7 @@ export class TournamentManager {
     tournament.status = 'running';
     tournament.startedAt = Date.now();
     tournament.currentBlindLevel = 0;
+    tournament.entries = tournament.players.length;   // S3 — the field at the start
 
     // 2026-07-07 gap-fill [14] — honor a custom starting stack; defaults to 1000
     // (every hardcoded template omits startingChips, so their behavior is unchanged).
@@ -698,7 +788,12 @@ export class TournamentManager {
     return { success: true, startingChips, blinds: firstLevel };
   }
 
-  private scheduleBlindUp(tournamentId: string): void {
+  /**
+   * Arms the blind timer for the CURRENT level: its full duration, or
+   * `durationMs` (S3: what was left of it when it was paused). Sets
+   * `levelEndsAt` (the level clock the tables show). Never while paused.
+   */
+  private scheduleBlindUp(tournamentId: string, durationMs?: number): void {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament || tournament.status !== 'running') return;
     // 2026-07-07 gap-fill [15] — never re-arm the clock while paused.
@@ -713,14 +808,85 @@ export class TournamentManager {
     // the blind level and leaving an untracked timer that pause can't cancel.
     if (tournament.blindTimer) { clearTimeout(tournament.blindTimer); tournament.blindTimer = null; }
 
+    const ms = typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs > 0
+      ? Math.round(durationMs)
+      : currentLevel.duration * 1000;
+    // S3 (2026-10-23) — the level clock: when this level ends.
+    tournament.levelEndsAt = Date.now() + ms;
+    tournament.levelRemainingMs = null;
     tournament.blindTimer = setTimeout(() => {
       this.advanceBlindLevel(tournamentId);
-    }, currentLevel.duration * 1000);
+    }, ms);
     (tournament.blindTimer as any)?.unref?.();   // R2 — a blind clock never holds the process open
   }
 
+  /**
+   * The blind timer fired: the current level is over. S3 (2026-10-23, owner:
+   * "take breaks") — a SCHEDULED BREAK starts instead of the next level when
+   * the tournament has a break schedule (qualifiers only), the switch is on
+   * (`breaksEnabled`), the level that ended is a multiple of `everyLevels` and
+   * it is not the last level. Else the next level starts, as before.
+   */
   private advanceBlindLevel(tournamentId: string): void {
+    if (this.startBreakIfDue(tournamentId)) return;
     this.doAdvanceLevel(tournamentId);
+  }
+
+  /**
+   * S3 — start the break due at the end of the current level (see
+   * advanceBlindLevel). The tournament is PAUSED with reason 'break' (every
+   * table holds at its next hand boundary, exactly as a director's pause), and
+   * the break's end timer is the tournament's `blindTimer`, so finish / void /
+   * a director pause clear it like the level timer. `advanceOnResume`: the
+   * level is over, so the end of the break (or a director's resume) starts the
+   * NEXT level with its full time. Emits 'tournamentBreak' {tournamentId,
+   * afterLevel, resumesAt (ms)}. true = a break started.
+   */
+  private startBreakIfDue(tournamentId: string): boolean {
+    const t = this.tournaments.get(tournamentId);
+    if (!t || t.status !== 'running' || t.paused) return false;
+    const b = t.config.breaks;
+    if (!b || !this.breaksEnabled) return false;
+    const every = Math.floor(Number(b.everyLevels));
+    const seconds = Number(b.seconds);
+    if (!(every >= 1) || !(seconds > 0) || !Number.isFinite(seconds)) return false;
+    const endedLevel = t.currentBlindLevel + 1;                        // 1-based
+    if (endedLevel % every !== 0) return false;
+    if (endedLevel >= t.config.blindLevels.length) return false;       // never after the last level
+    const ms = Math.max(1000, Math.round(seconds * 1000));
+    const now = Date.now();
+    if (t.blindTimer) { clearTimeout(t.blindTimer); t.blindTimer = null; }
+    t.paused = true;
+    t.pauseReason = 'break';
+    t.breakUntil = now + ms;
+    t.levelEndsAt = null;
+    t.levelRemainingMs = null;
+    t.advanceOnResume = true;
+    t.blindTimer = setTimeout(() => { this.endBreak(tournamentId); }, ms);
+    (t.blindTimer as any)?.unref?.();
+    this.breakStats.taken++;
+    this.emitEvent(tournamentId, 'tournamentBreak', { tournamentId, afterLevel: endedLevel, resumesAt: t.breakUntil });
+    return true;
+  }
+
+  /**
+   * S3 — the break's own timer fired. Only while the break is still running
+   * (a director pause replaced it, or a resume ended it: nothing to do). It
+   * un-pauses, then starts the next level (blindLevelUp, full time), then
+   * emits 'tournamentBreakEnded' {tournamentId, level} — index.ts balances the
+   * tables and re-deals them.
+   */
+  private endBreak(tournamentId: string): void {
+    const t = this.tournaments.get(tournamentId);
+    if (!t || t.status !== 'running' || !t.paused || t.pauseReason !== 'break') return;
+    t.blindTimer = null;
+    t.paused = false;
+    t.pauseReason = null;
+    t.breakUntil = null;
+    t.advanceOnResume = false;
+    t.levelRemainingMs = null;
+    this.doAdvanceLevel(tournamentId);
+    this.emitEvent(tournamentId, 'tournamentBreakEnded', { tournamentId, level: t.currentBlindLevel + 1 });
   }
 
   // 2026-07-07 gap-fill [15] — shared blind-up body so BOTH the automatic timer
@@ -742,14 +908,16 @@ export class TournamentManager {
     tournament.currentBlindLevel++;
 
     const newLevel = tournament.config.blindLevels[tournament.currentBlindLevel];
+    // S3 (2026-10-23) — the new level's clock is armed BEFORE the event, so
+    // blindLevelUp carries its `levelEndsAt` (additive).
+    this.scheduleBlindUp(tournamentId);
     this.emitEvent(tournamentId, 'blindLevelUp', {
       level: tournament.currentBlindLevel + 1,
       sb: newLevel.sb,
       bb: newLevel.bb,
       ante: newLevel.ante,
+      levelEndsAt: tournament.levelEndsAt,
     });
-
-    this.scheduleBlindUp(tournamentId);
     return newLevel;
   }
 
@@ -765,27 +933,106 @@ export class TournamentManager {
   }
 
   // 2026-07-07 gap-fill [15] — director pause/resume. Pausing stops the blind
-  // clock; index.ts holds the tables at the next hand boundary. Resuming re-arms
-  // the clock (v1: resets the current level's timer to a full duration — a
-  // precise remaining-time pause would need levelStartedAt tracking). Returns
-  // false if the tournament isn't running.
-  pauseTournament(tournamentId: string, paused: boolean): boolean {
+  // clock; index.ts holds the tables at the next hand boundary. Returns false
+  // if the tournament isn't running.
+  //
+  // 2026-10-23 (qualifier lifecycle S3) — `reason`: 'director' (the default:
+  // the TD's Pause / Resume, POST /api/qualifiers/pause) or 'prestart' (the
+  // hold before the first deal).
+  //   Pause stores what is left of the level (levelRemainingMs, at least 1 s)
+  //   and stops the clock; a 'prestart' hold keeps the FULL first level. A
+  //   pause during a running BREAK replaces the break with a director's pause
+  //   (its end timer stops; the level stays over — advanceOnResume).
+  //   Resume arms exactly the time that was left (it used to restart the level
+  //   at its FULL length); after a break (advanceOnResume) it starts the NEXT
+  //   level with its full time; a 'prestart' resume arms the full first level.
+  //   A 'prestart' hold is ended ONLY by a 'prestart' resume: any other resume
+  //   is refused (false).
+  pauseTournament(tournamentId: string, paused: boolean, reason: 'director' | 'prestart' = 'director'): boolean {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament || tournament.status !== 'running') return false;
+    // S3 — a director's pause during a BREAK: the break becomes his pause.
+    if (paused && tournament.paused && tournament.pauseReason === 'break' && reason === 'director') {
+      if (tournament.blindTimer) { clearTimeout(tournament.blindTimer); tournament.blindTimer = null; }
+      tournament.pauseReason = 'director';
+      tournament.breakUntil = null;
+      this.breakStats.endedEarly++;
+      this.emitEvent(tournamentId, 'tournamentPaused', { tournamentId, reason: 'director' });
+      return true;
+    }
     // 2026-07-07 review fix — no-op if already in the requested state. Without
     // this, a redundant resume (paused already false) would call scheduleBlindUp
     // on a running tournament and (pre-clearTimeout-fix) leak/duplicate the timer.
     if (tournament.paused === paused) return true;
     if (paused) {
+      const level = tournament.config.blindLevels[tournament.currentBlindLevel];
+      const full = level ? level.duration * 1000 : null;
       if (tournament.blindTimer) { clearTimeout(tournament.blindTimer); tournament.blindTimer = null; }
+      tournament.levelRemainingMs = reason === 'prestart'
+        ? full
+        : (tournament.levelEndsAt !== null ? Math.max(1000, tournament.levelEndsAt - Date.now()) : full);
+      tournament.levelEndsAt = null;
       tournament.paused = true;
-      this.emitEvent(tournamentId, 'tournamentPaused', { tournamentId });
+      tournament.pauseReason = reason;
+      tournament.breakUntil = null;
+      this.emitEvent(tournamentId, 'tournamentPaused', { tournamentId, reason });
     } else {
+      // S3 — the hold before the first deal ends only at the start.
+      if (tournament.pauseReason === 'prestart' && reason !== 'prestart') return false;
+      const was = tournament.pauseReason;
+      const remaining = tournament.levelRemainingMs;
+      const advance = tournament.advanceOnResume;
+      if (was === 'break') this.breakStats.endedEarly++;   // a resume ended a break early
+      if (tournament.blindTimer) { clearTimeout(tournament.blindTimer); tournament.blindTimer = null; }
       tournament.paused = false;
-      this.scheduleBlindUp(tournamentId);
-      this.emitEvent(tournamentId, 'tournamentResumed', { tournamentId });
+      tournament.pauseReason = null;
+      tournament.breakUntil = null;
+      tournament.advanceOnResume = false;
+      tournament.levelRemainingMs = null;
+      if (advance) this.doAdvanceLevel(tournamentId);                   // the level was over: the next one, full time
+      else if (was === 'prestart') this.scheduleBlindUp(tournamentId);  // the start: the full first level
+      else this.scheduleBlindUp(tournamentId, remaining ?? undefined);  // what was left of the level
+      this.emitEvent(tournamentId, 'tournamentResumed', { tournamentId, reason });
     }
     return true;
+  }
+
+  /**
+   * S3 (2026-10-23) — the level clock (index.ts puts it in every tournament
+   * table's state). null = no such tournament. `remainingMs`: live while the
+   * clock runs; frozen while paused; null on a break (the level is over) and
+   * once the tournament is no longer running. `next` = the next level's blinds
+   * (null at the last level).
+   */
+  getLevelClock(tournamentId: string): TournamentLevelClock | null {
+    const t = this.tournaments.get(tournamentId);
+    if (!t) return null;
+    const levels = t.config.blindLevels;
+    if (levels.length === 0) return null;
+    const idx = Math.max(0, Math.min(levels.length - 1, t.currentBlindLevel));
+    const cur = levels[idx];
+    const nxt = idx + 1 < levels.length ? levels[idx + 1] : null;
+    const running = t.status === 'running';
+    const paused = running && t.paused;
+    let remainingMs: number | null = null;
+    if (running && !t.paused && t.levelEndsAt !== null) remainingMs = Math.max(0, t.levelEndsAt - Date.now());
+    else if (paused && !t.advanceOnResume) remainingMs = t.levelRemainingMs;
+    return {
+      level: idx + 1,
+      levels: levels.length,
+      durationSec: cur.duration,
+      levelEndsAt: running && !t.paused ? t.levelEndsAt : null,
+      remainingMs,
+      paused,
+      pauseReason: paused ? (t.pauseReason ?? 'director') : null,
+      breakUntil: paused && t.pauseReason === 'break' ? t.breakUntil : null,
+      sb: cur.sb,
+      bb: cur.bb,
+      ante: cur.ante,
+      next: nxt ? { sb: nxt.sb, bb: nxt.bb, ante: nxt.ante } : null,
+      entries: t.entries,
+      alive: this.getAliveCount(tournamentId),
+    };
   }
 
   eliminatePlayer(tournamentId: string, playerId: string, eliminatorId?: string): { finished: boolean; position: number; payout: number; bountyPayout?: number } | null {

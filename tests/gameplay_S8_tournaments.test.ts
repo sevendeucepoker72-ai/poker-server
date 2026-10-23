@@ -57,9 +57,12 @@ afterEach(() => { jest.clearAllTimers(); jest.useRealTimers(); });
 
 // ═════════════════════════════════════════ tournament start + director pause ══
 const START = fnSrc('function startTournamentGame(') + '\n' + fnSrc('function startRegisteredTournamentTables(');
-const PAUSE = handlerSrc('pauseTournament', '\n  });\n');
-const NEW_PAUSE_LOOP = '    const pauseTableIds = tourn?.tableIds?.length ? tourn.tableIds : (tourn?.tableId ? [tourn.tableId] : []);\n    for (const tid of pauseTableIds) {';
-const OLD_PAUSE_LOOP = '    for (const tid of tourn?.tableIds || []) {';
+// 2026-10-23 (qualifier lifecycle S3) — the handler's body is applyDirectorPause
+// (shared with POST /api/qualifiers/pause): the slice carries both, and the
+// F90 loop now sits in the top-level helper (two-space indent).
+const PAUSE = fnSrc('function applyDirectorPause(') + '\n' + handlerSrc('pauseTournament', '\n  });\n');
+const NEW_PAUSE_LOOP = '  const pauseTableIds = tourn?.tableIds?.length ? tourn.tableIds : (tourn?.tableId ? [tourn.tableId] : []);\n  for (const tid of pauseTableIds) {';
+const OLD_PAUSE_LOOP = '  for (const tid of tourn?.tableIds || []) {';
 
 const LEVELS = [{ sb: 10, bb: 20, ante: 0, duration: 600 }, { sb: 20, bb: 40, ante: 0, duration: 600 }];
 

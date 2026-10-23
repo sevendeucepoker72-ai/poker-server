@@ -127,6 +127,8 @@ See `src/index.ts`. Key events:
 | `INTERNAL_NOTIFY_TOKEN` | **Required in prod** | `X-Internal-Token` for the master's internalAuth routes: qualifier-credit consume/refund/issue, qualifier schedule/register/results, and (2026-10-07) the play gate's `/users/:id/play-status/internal`. Unset = suspension checks FAIL OPEN (visible as `playGate.internalTokenConfigured:false` on `/api/health`) |
 | `QUALIFIER_OVERFLOW_TABLES_MAX` | Optional (default 6) | Online qualifier overflow tables in play per event (owner 2026-10-22). Clamped 0..20, garbage → 6; **0 = OFF** (every-seat-alive late entry / re-entry refused `no_seat`, credit refunded, as before). This is only the value AT BOOT (changing a Railway var restarts the process, and a restart cancels a running qualifier). While the server runs, change it with **`POST /api/qualifiers/overflow` `{"max": N}`** + header `X-Internal-Token` (= `INTERNAL_NOTIFY_TOKEN`; no token configured → always 403). No restart is needed, and the value lasts until the next boot. Shown as `r2Play.qualifiers.overflow.cap` on `/api/health` |
 | `QUALIFIER_TABLE_BALANCE` | Optional (unset = ON) | Online qualifier TDA table balancing (2026-10-23, lifecycle S2; section "Online qualifier TABLE BALANCING"). **`0` = OFF** = no balance move at all, hand end or pre-deal (only the lone-overflow feed and the Rule 1 / Rule 2 breaks move anyone); the fewest-alive placement of late entries / re-entries STAYS (it never reads the switch: an ordering only), so OFF is not a full revert of S2; anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs, switch it with **`POST /api/qualifiers/balance` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403). Shown as `r2Play.qualifiers.balance.on` on `/api/health` |
+| `QUALIFIER_BREAKS` | Optional (unset = ON) | Online qualifier scheduled breaks (2026-10-23, lifecycle S3; section "Online qualifier CLOCK, BREAKS, PAUSE"): a 5-minute break after every 5th level. **`0` = OFF** (levels run back to back, as before S3); anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs: **`POST /api/qualifiers/breaks` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403). Read at each level boundary; turning it off never ends a break already running (`POST /api/qualifiers/pause {"paused":false}` does). Shown as `r2Play.qualifiers.breaks.on` on `/api/health` |
+| `QUALIFIER_TEST_TIME_SCALE` | **Never set on Railway** (rig only) | Divides the qualifier ENGINE's level and break lengths (60 = a 12-minute level runs 12 s, the break 5 s) so the local rig can play a whole event in minutes. Inert by construction in production: `qualifierTestTimeScale` answers 1 whenever `NODE_ENV=production` or ANY Railway runtime variable is set (`RAILWAY_ENVIRONMENT`, `_NAME`, `_ID`, `RAILWAY_PROJECT_ID`, `RAILWAY_SERVICE_ID`, `RAILWAY_DEPLOYMENT_ID` — nixpacks does not set NODE_ENV). Clamped 1..120; the lobby's advertised 12-minute levels never change. Shown as `r2Play.qualifiers.testTimeScale` on `/api/health` (must read 1 in prod) |
 | `ONLINE_GUEST_PLAY_ENABLED` | **Leave unset** | EMERGENCY ROLLBACK ONLY. `1` re-allows guest `register` and no-account play, against the 2026-10-07 owner rule "nobody plays .online without an American Pub Poker account". Suspended players stay blocked either way. Shown as `playGate.guestPlayEnabled` on `/api/health` |
 
 ## Deploy pre-flight
@@ -670,6 +672,136 @@ of `src/index.ts`, qualifiers only):
     scenario's "exactly ONE bot moved to the overflow table" checks would fail
     by design.
   - To recreate the rig Postgres, see the overflow section (`qtest-pg`).
+
+### Online qualifier CLOCK, BREAKS, PAUSE (2026-10-23, lifecycle S3)
+
+Owner 2026-10-22: "... run the blinds and raise them, take breaks, and anything
+else a tournament would need". Before: a qualifier ran its 26 levels back to
+back (NO break existed — the '+ Break' rows the .online Admin saves to
+`qualifier_configs` were never read by the engine, and still are not: the
+constants below rule), a director's Resume restarted the level at its FULL
+length, and no state of a tournament table carried the level clock (poker-3d's
+level widget, GameHUD, never showed). Now:
+
+- **The clock** (`TournamentManager`): every armed blind timer sets
+  `levelEndsAt`; `scheduleBlindUp(id, durationMs?)` can arm a partial level.
+  `getLevelClock(id)` = {level, levels, durationSec, levelEndsAt, remainingMs
+  (live; frozen while paused; null on a break), paused, pauseReason,
+  breakUntil, sb, bb, ante, next | null, entries, alive}. `entries` = the field
+  at the start, +1 per late entry (`addLateEntrant`) and re-entry
+  (`reinstateForReentry`), -1 for an undone late entry (`removeLateEntrant`).
+  `blindLevelUp` now carries `levelEndsAt` (additive; the new level's timer is
+  armed BEFORE the event).
+- **In every full state** (`getGameStateForPlayer`, next to `isTournament`),
+  ALWAYS present so the per-socket delta clears them on a cash table:
+  `blindLevel` (1-based | null), `nextBlindIn` (seconds; 0 while paused, at the
+  last level, or on a cash table), `blindLevelDuration` (seconds | null) — the
+  keys the live client's old level widget reads — and the additive
+  `tournamentClock` {level, levels, sb, bb, ante, next, levelEndsAt, serverNow,
+  paused, pauseReason, breakUntil, dealsAt (null — S4 fills it), playersLeft,
+  entries, avgStack (= entries x starting stack / alive), paidPlaces
+  (`seatsForTopWith` for a qualifier, else null), levelDurationMs,
+  levelRemainingMs (frozen while paused), resumesAt (= breakUntil)} | null —
+  the names poker-3d's `utils/tournamentClock.js` reads. Built once per
+  tournament per 500 ms (`tournamentClockStateFor`; the builder runs per socket)
+  and rebuilt at once when the clock's own fields change (a pause, a break, a
+  level, an entry — the memo key includes them). Never throws into the state
+  build (`tournament_clock_build_failed`). The bootstrap listener re-sends each
+  table's state at a level-up (the clock follows mid-hand).
+- **Breaks** (`QUALIFIER_BREAK_EVERY_LEVELS` = 5, `QUALIFIER_BREAK_MINUTES` = 5 in
+  `src/game/qualifierSchedule.ts`; only `startQualifierTournament` sets
+  `config.breaks`, so no other tournament changes). When the level timer fires
+  at the end of level k and k % 5 === 0, k is not the last level, and
+  `tournamentManager.breaksEnabled`: the tournament is PAUSED with reason
+  'break' (`breakUntil`, `advanceOnResume`), the break's end timer is the
+  tournament's `blindTimer` (so finish / void / a director pause clear it), and
+  'tournamentBreak' {afterLevel, resumesAt} is emitted. Every table holds at its
+  next hand boundary exactly as for a director pause (`autoStartNextHand`'s
+  paused check, `tournamentDealHoldReason` 'paused' — overflow first deals, the
+  startHand handler and the balance included); a hand in progress plays out.
+  12-minute levels from 11:00 put the breaks at 12:00, 1:05, 2:10, 3:15 and 4:20
+  MT; none after level 26. Late entries / re-entries during a break are seated
+  and dealt in after it. The lobby's `structure` gains `breaks {everyLevels,
+  minutes}` (additive; the levels and their 12-minute display are unchanged).
+  - The bootstrap listener (the ONE `onEvent`): on 'tournamentBreak' every LIVE
+    table room (overflow tables included) gets `tournamentPaused` {tournamentId,
+    reason:'break', resumesAt (ISO), afterLevel} and its state; log
+    `qualifier_break_started` {afterLevel, resumesAt, tables}. On
+    'tournamentBreakEnded' (its own timer: the next level is already in force —
+    blindLevelUp, full time): `balanceQualifierTablesNow` (S2's pre-deal pass; a
+    no-op with its switch off), then every room `tournamentResumed`
+    {tournamentId, reason:'break'} and `scheduleAutoStart` per table; log
+    `qualifier_break_ended` {level, tables, balanceMoves}. Both handlers run
+    inside the blind timer and NEVER throw (per-table try; a throw there would be
+    an uncaughtException → the crash flush voids the event): failures log
+    `qualifier_break_notice_failed` / `qualifier_break_resume_failed`.
+- **Director pause** (`pauseTournament(id, paused, reason='director'|'prestart')`):
+  Pause stores `levelRemainingMs` (>= 1 s) and stops the clock; Resume arms
+  exactly that time (fixes "Resume restarts the level at full length"). A pause
+  during a running BREAK replaces it (its timer stops; `breakUntil` null; the
+  level stays over — Resume starts the NEXT level with its full time); a resume
+  during a break ends it at once the same way. A 'prestart' hold (the 11:00
+  deal, S4) is ended ONLY by a 'prestart' resume (which arms the full level 1);
+  a director resume there returns false. The idempotence guard stays.
+  - The admin socket `pauseTournament` handler's body is `applyDirectorPause(tId,
+    paused, actor)` (shared with the route): audits TOURNAMENT_PAUSE (durable),
+    tells every table room `tournamentPaused` / `tournamentResumed`
+    {tournamentId, reason:'director'} (reason additive), re-sends each table's
+    state, re-kicks every table on Resume (F90 loop unchanged). During the
+    'prestart' hold BOTH Pause and Resume are refused, nothing changes:
+    'This tournament has not started yet.' (code `not_started`).
+  - **`POST /api/qualifiers/pause`** `{"paused": 0|1|true|false, "qualifierId"?}`
+    + `X-Internal-Token` — the director's backup when the owner's .online Admin
+    link is not at hand. FAILS CLOSED (403; no token configured → always 403);
+    a bad `paused` → 400; no `qualifierId` = the ONE running qualifier (none →
+    404 `no_running_qualifier`, several → 409 `several_running` + their ids;
+    unknown / not running id → 404 `qualifier_not_running`); prestart → 409
+    `not_started`. Answers `{success, qualifierId, tournamentId, paused,
+    pauseReason}`; actor `internal:pause`.
+    `curl -s -X POST https://poker-server-production-60c0.up.railway.app/api/qualifiers/pause -H 'Content-Type: application/json' -H "X-Internal-Token: $INTERNAL_NOTIFY_TOKEN" -d '{"paused":1}'`
+    (`{"paused":0}` resumes — and ends a running break early).
+- **Kill switch (breaks).** Railway env `QUALIFIER_BREAKS=0` at boot (never
+  change it during an event: a restart cancels it). During the event, NO
+  restart: `POST /api/qualifiers/breaks {"on":0}` (+ token; 0 / 1 / true /
+  false, anything else 400; answers `{success, previous, on}`; logged
+  `qualifier_breaks_set`, audited `QUALIFIER_BREAKS_SET`, durable). Read at each
+  level boundary; OFF never ends a break already running — `POST
+  /api/qualifiers/pause {"paused":false}` ends it at once. The clock fields have
+  no switch (additive; an old client ignores them).
+- **Rig knob.** `QUALIFIER_TEST_TIME_SCALE` (env table above) divides ONLY the
+  engine's level and break lengths; inert on Railway / NODE_ENV=production by
+  construction (`qualifierTestTimeScale`).
+- **Health:** `r2Play.qualifiers.breaks` = {on, everyLevels, minutes, taken,
+  endedEarly} (`endedEarly` = breaks a director pause / resume interrupted) and
+  `r2Play.qualifiers.testTimeScale` (must read 1 in prod).
+- **Contract:** CONTRACTS.md (the state fields, the paused / resumed payloads,
+  the two routes). Manifest tokens `qualifier_break_started`, `tournamentClock`,
+  `/api/qualifiers/breaks`, `/api/qualifiers/pause`.
+- **Tests:** `tests/qualifierClockBreaks.test.ts` (real TournamentManager /
+  PokerTable, the REAL bootstrap listener, `autoStartNextHand`, the routes,
+  `getGameStateForPlayer` and `startQualifierTournament`, fake timers).
+  `tests/gameplay_S8_tournaments.test.ts` F90 now slices `applyDirectorPause`
+  with the handler (its loop moved there, two-space indent). Full jest 2193
+  passed, 0 failed (baseline 2158 at 4b13ee8, +35); `npm run lint` and
+  `npm run build` clean; manifest 772 tokens, 0 missing from `dist/`.
+- **Rig** (scratchpad `qrig/scenario-breaks.js`, `qrig/s3-rig.sh`;
+  `restart-server.sh` passes `QUALIFIER_BREAKS` / `QUALIFIER_TEST_TIME_SCALE`
+  through): at scale 60, the clock in every state, levels 12 s apart, break 1
+  after L5 (held, a late entry during it, resumed at L6), a director pause in L7
+  resuming the time left, break 2 replaced by a director pause, the switch OFF
+  at L15 / ON at L20, the play-out with one results POST, places 1..N, chips
+  and the credit ledger exact.
+  - Results on 2026-10-23, on this dist: `scenario-breaks` with
+    `QUALIFIER_TEST_TIME_SCALE=60` passed 47/47 twice (and a smoke run whose one
+    miss was the script: the play-out reached L25's break, which is correct —
+    the check now allows it). Break 1 started 12.0 s after L5 and lasted 5.0 s;
+    both tables were seen held at the hand end with no new hand dealt; L8 came
+    5.9 s after the director resume (the time that was left, not 12 s); the
+    start landed 0.3 s after its scheduled second.
+  - The legacy scenarios with `QUALIFIER_BREAKS=0`: `scenario-full` 28/28,
+    `scenario-edge` 14/14 (overflow cap 0), `scenario-balance` 37/37,
+    `scenario-overflow` 51/51 (balance 0, cap 2); no `qualifier_break_started`
+    line in any of them; health showed `breaks.on:false`, `testTimeScale:1`.
 
 ### Recovering a qualifier's finish order (the results POST never landed)
 

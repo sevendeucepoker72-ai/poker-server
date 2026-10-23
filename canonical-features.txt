@@ -1690,3 +1690,14 @@ tournament_bootstrap_no_table_dealt
 qualifier_table_balanced
 balanceQualifierTables(tId, tableId, table);
 /api/qualifiers/balance
+
+# 2026-10-23 qualifier lifecycle S3 (owner 2026-10-22: "run the blinds and raise
+# them, take breaks"): the level clock in every tournament table's state
+# (tournamentClock + blindLevel / nextBlindIn / blindLevelDuration), a 5-minute
+# break after every 5th qualifier level, a director pause that resumes the time
+# left, and the internal switches POST /api/qualifiers/breaks and
+# POST /api/qualifiers/pause (X-Internal-Token, fail closed).
+qualifier_break_started
+tournamentClock
+/api/qualifiers/breaks
+/api/qualifiers/pause

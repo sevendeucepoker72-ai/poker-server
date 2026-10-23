@@ -218,7 +218,23 @@ const CONTINUATION: Array<[number, number, number]> = [
 ];
 export const QUALIFIER_LEVEL_MINUTES = 12;
 
-export function qualifierStructure(startingStack: number = QUALIFIER_BASE_STACK): { startingStack: number; levels: Array<{ sb: number; bb: number; ante: number; minutes: number }> } {
+/**
+ * 2026-10-23 (qualifier lifecycle S3, owner: "take breaks") — a 5-minute break
+ * after every 5th level (the usual live-room rhythm: about one an hour). With
+ * 12-minute levels from 11:00 the breaks fall at 12:00, 1:05, 2:10, 3:15 and
+ * 4:20 MT; never after the last level. The engine runs it (TournamentManager
+ * `config.breaks`); the lobby shows it (`structure.breaks`, additive). Runtime
+ * switch: POST /api/qualifiers/breaks {on} (index.ts); Railway env
+ * QUALIFIER_BREAKS=0 turns it off at boot. Owner-correctable here.
+ */
+export const QUALIFIER_BREAK_EVERY_LEVELS = 5;
+export const QUALIFIER_BREAK_MINUTES = 5;
+
+export function qualifierStructure(startingStack: number = QUALIFIER_BASE_STACK): {
+  startingStack: number;
+  levels: Array<{ sb: number; bb: number; ante: number; minutes: number }>;
+  breaks: { everyLevels: number; minutes: number };
+} {
   const stack = Number.isFinite(startingStack) && startingStack > 0 ? Math.floor(startingStack) : QUALIFIER_BASE_STACK;
   const k = stack / QUALIFIER_BASE_STACK;
   const scale = (n: number) => (n <= 0 ? 0 : Math.max(1, Math.round(n * k)));
@@ -226,10 +242,51 @@ export function qualifierStructure(startingStack: number = QUALIFIER_BASE_STACK)
     const s = scale(sb);
     return { sb: s, bb: Math.max(s * 2, scale(bb)), ante: scale(ante), minutes: QUALIFIER_LEVEL_MINUTES };
   });
-  return { startingStack: stack, levels };
+  return { startingStack: stack, levels, breaks: { everyLevels: QUALIFIER_BREAK_EVERY_LEVELS, minutes: QUALIFIER_BREAK_MINUTES } };
 }
 
-/** The same structure as TournamentManager BlindLevels (duration in seconds). */
-export function qualifierBlindLevels(startingStack: number = QUALIFIER_BASE_STACK): Array<{ sb: number; bb: number; ante: number; duration: number }> {
-  return qualifierStructure(startingStack).levels.map((l) => ({ sb: l.sb, bb: l.bb, ante: l.ante, duration: l.minutes * 60 }));
+/**
+ * S3 — the RIG-ONLY time scale (env QUALIFIER_TEST_TIME_SCALE): the engine's
+ * level durations and break length are divided by it so a local rig can play
+ * a 12-minute level in 12 s. ALWAYS 1 in production: NODE_ENV=production, or
+ * ANY Railway runtime variable set (Railway's nixpacks build does NOT set
+ * NODE_ENV — authManager.ts JWT guard — so a NODE_ENV-only test would leave the
+ * knob live on Railway). Otherwise the value floored and clamped to 1..120;
+ * unset / blank / not a number → 1. The lobby's advertised 12-minute levels
+ * never change; /api/health r2Play.qualifiers.testTimeScale shows it.
+ */
+const RAILWAY_RUNTIME_VARS = [
+  'RAILWAY_ENVIRONMENT', 'RAILWAY_ENVIRONMENT_NAME', 'RAILWAY_ENVIRONMENT_ID',
+  'RAILWAY_PROJECT_ID', 'RAILWAY_SERVICE_ID', 'RAILWAY_DEPLOYMENT_ID',
+];
+export function qualifierTestTimeScale(env: Record<string, string | undefined> = process.env): number {
+  if (!env) return 1;
+  if (env.NODE_ENV === 'production') return 1;
+  for (const k of RAILWAY_RUNTIME_VARS) if (env[k]) return 1;
+  const raw = env.QUALIFIER_TEST_TIME_SCALE;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return 1;
+  const n = Number(String(raw).trim());
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(120, Math.max(1, Math.floor(n)));
+}
+
+/** A time scale as the engine uses it: a finite number >= 1, else 1. */
+function engineTimeScale(timeScale: unknown): number {
+  return typeof timeScale === 'number' && Number.isFinite(timeScale) && timeScale >= 1 ? timeScale : 1;
+}
+
+/**
+ * The same structure as TournamentManager BlindLevels (duration in seconds).
+ * S3 — `timeScale` (the rig knob, qualifierTestTimeScale; 1 = real time)
+ * divides the duration (at least 1 s). Production always passes 1.
+ */
+export function qualifierBlindLevels(startingStack: number = QUALIFIER_BASE_STACK, timeScale: number = 1): Array<{ sb: number; bb: number; ante: number; duration: number }> {
+  const k = engineTimeScale(timeScale);
+  return qualifierStructure(startingStack).levels.map((l) => ({ sb: l.sb, bb: l.bb, ante: l.ante, duration: Math.max(1, Math.round((l.minutes * 60) / k)) }));
+}
+
+/** S3 — the engine's break schedule (TournamentManager `config.breaks`): every 5th level, 5 minutes (divided by the rig's time scale, at least 1 s). */
+export function qualifierBreakConfig(timeScale: number = 1): { everyLevels: number; seconds: number } {
+  const k = engineTimeScale(timeScale);
+  return { everyLevels: QUALIFIER_BREAK_EVERY_LEVELS, seconds: Math.max(1, Math.round((QUALIFIER_BREAK_MINUTES * 60) / k)) };
 }
