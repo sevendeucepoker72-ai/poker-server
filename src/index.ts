@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -3117,7 +3117,7 @@ app.get('/api/health', async (_req, res) => {
           lateEntries: { ...qualifierLateEntries }, resultPosts: { ...qualifierResultPosts }, noShows: { ...qualifierNoShows },
           // 2026-10-22 (owner: "Build it for Sunday") — overflow tables: opened / fed /
           // first deals; live = open now; cap = QUALIFIER_OVERFLOW_TABLES_MAX in force (0 = off).
-          overflow: { ...qualifierOverflow, live: qualifierOverflowTables.size, cap: qualifierOverflowTablesMax },
+          overflow: { ...qualifierOverflow, live: qualifierOverflowTables.size, cap: qualifierOverflowCapLabel(qualifierOverflowTablesMax) },
           // 2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — TDA
           // table balancing: on = the switch in force (POST /api/qualifiers/balance);
           // errors / followUpErrors should stay 0.
@@ -4085,14 +4085,16 @@ let qualifierOverflowTablesMax = qualifierOverflowTablesCap(process.env.QUALIFIE
  * Raising it again re-opens the path at once. Lasts until the next restart
  * (which reads the env again). Logged + audited (`qualifier_overflow_cap_set`).
  */
-function setQualifierOverflowTablesMax(next: number, actor: string): { previous: number; cap: number; live: number } {
-  const previous = qualifierOverflowTablesMax;
+function setQualifierOverflowTablesMax(next: number, actor: string): { previous: number | 'unlimited'; cap: number | 'unlimited'; live: number } {
+  // 2026-10-23 (owner: no cap) — Infinity = unlimited; JSON, logs and the audit row carry 'unlimited'.
+  const previous = qualifierOverflowCapLabel(qualifierOverflowTablesMax);
   qualifierOverflowTablesMax = next;
   qualifierOverflow.capChanges++;
   const live = qualifierOverflowTables.size;
-  console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_cap_set', previous, cap: next, live, actor })}`);
-  auditLog(actor, 'QUALIFIER_OVERFLOW_CAP_SET', { previous, cap: next, live });
-  return { previous, cap: next, live };
+  const cap = qualifierOverflowCapLabel(next);
+  console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_cap_set', previous, cap, live, actor })}`);
+  auditLog(actor, 'QUALIFIER_OVERFLOW_CAP_SET', { previous, cap, live });
+  return { previous, cap, live };
 }
 
 /** Constant-time X-Internal-Token check (hashes first: equal lengths for timingSafeEqual). An unset token never matches. */
@@ -4102,7 +4104,7 @@ function internalTokenMatches(given: unknown, expected: string): boolean {
 }
 
 // Review fix-up (2026-10-22) — the overflow cap / kill switch at runtime, no
-// restart: POST {max: 0..20} with X-Internal-Token (the INTERNAL_NOTIFY_TOKEN
+// restart: POST {max: N >= 0 | "unlimited"} (2026-10-23: no upper clamp) with X-Internal-Token (the INTERNAL_NOTIFY_TOKEN
 // this server and the master share). FAILS CLOSED: no token configured → 403
 // (unlike /api/tournament/simulate). Answers {success, previous, cap, live};
 // GET /api/health r2Play.qualifiers.overflow.cap shows the value in force.
@@ -4114,7 +4116,7 @@ app.post('/api/qualifiers/overflow', (req, res) => {
   }
   const next = parseQualifierOverflowCapUpdate(req.body?.max);
   if (next === null) {
-    res.status(400).json({ success: false, error: 'max must be a number 0..20 (0 = off)', cap: qualifierOverflowTablesMax });
+    res.status(400).json({ success: false, error: 'max must be a number >= 0 or "unlimited" (0 = off)', cap: qualifierOverflowCapLabel(qualifierOverflowTablesMax) });
     return;
   }
   res.json({ success: true, ...setQualifierOverflowTablesMax(next, 'internal:overflow_cap') });
@@ -4353,7 +4355,7 @@ function openQualifierOverflowTable(qt: QualifierTournamentReg): string | null {
   for (const [tid, owner] of qualifierOverflowTables) if (owner === tournamentId && tournament.tableIds.includes(tid)) live++;
   if (live >= qualifierOverflowTablesMax) {
     qualifierOverflow.refusedCap++;
-    console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_cap_reached', tournamentId, cap: qualifierOverflowTablesMax, live })}`);
+    console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_cap_reached', tournamentId, cap: qualifierOverflowCapLabel(qualifierOverflowTablesMax), live })}`);
     return null;
   }
   let tableId: string | null = null;

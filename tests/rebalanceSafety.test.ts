@@ -4472,7 +4472,7 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
       'serviceQualifierOverflowTables();', 'feedLoneQualifierTable(tId, tableId, table);',
       'seatQualifierLateEntrantOnOverflowTable(socket, qt, registrant)',
       'seatQualifierReentrantOnOverflowTable(socket, qt, tournament, existingEntry, startingStack)',
-      'QUALIFIER_OVERFLOW_TABLES_MAX = 6', 'overflowTable: true',
+      'QUALIFIER_OVERFLOW_TABLES_MAX = Infinity', 'overflowTable: true',
       // Review fix-up (ff9a1cb): the runtime kill switch, the honest feed / first-deal error logs, the deferred first deal.
       '/api/qualifiers/overflow', 'qualifier_overflow_cap_set', 'qualifier_overflow_feed_followup_failed',
       'qualifier_overflow_first_deal_failed', 'setImmediate(() => startFreshTournamentTable(tableId))',

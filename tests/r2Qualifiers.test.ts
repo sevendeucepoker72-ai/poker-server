@@ -23,7 +23,7 @@ import {
   parseMasterSchedule, qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, qualifierBlindLevels,
   parseSeatPackage, seatsForTopWith, seatsWonAt,
   QUALIFIER_BASE_STACK, QUALIFIER_LATE_REG_MS, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft,
-  QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate,
+  QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel,
 } from '../src/game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from '../src/game/qualifierNoShow';
 import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
@@ -272,7 +272,7 @@ function world(opts: {
       : { tournamentDealHoldReason: () => null }),
     // Review fix-up (ff9a1cb) — the runtime cap route registers on this fake express app.
     app: { post: (p: string, fn: (req: any, res: any) => void) => { routes.set(p, fn); } },
-    createHash, timingSafeEqual, parseQualifierOverflowCapUpdate,
+    createHash, timingSafeEqual, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel,
   };
   const routes = new Map<string, (req: any, res: any) => void>();
   const { exports: m } = load(`${CODE}\n${opts.realDealHold ? REAL_DEAL_HOLD : ''}\nfunction wire(socket) {\n  ${HANDLERS}\n}`, scope, `{
@@ -1856,13 +1856,15 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     t.seats.filter((s) => s.state === 'occupied' && !s.eliminated && s.playerId === pid).map((s) => `${id}:${s.seatIndex}`));
   const entrant = (w: any, tid: string, pid: string) => w.tm.getTournament(tid)!.players.find((p: any) => p.playerId === pid);
 
-  it('B1 — the cap: QUALIFIER_OVERFLOW_TABLES_MAX = 6; the env override is clamped to 0..20 (0 = off), garbage → 6', () => {
-    expect(QUALIFIER_OVERFLOW_TABLES_MAX).toBe(6);
-    expect([undefined, '', '  ', 'x', 'NaN', 'Infinity'].map((v) => qualifierOverflowTablesCap(v))).toEqual([6, 6, 6, 6, 6, 6]);
-    expect(['0', '3', '2.7', '99', '-2', ' 4 '].map((v) => qualifierOverflowTablesCap(v))).toEqual([0, 3, 2, 20, 0, 4]);
-    // Review fix-up (ff9a1cb) — the RUNTIME value (POST /api/qualifiers/overflow): garbage is refused (null), never "6".
-    expect([0, 3, '2', 2.7, 99, -1, ' 4 '].map((v) => parseQualifierOverflowCapUpdate(v))).toEqual([0, 3, 2, 2, 20, 0, 4]);
+  // 2026-10-23 — owner (2026-10-22): "No cap on extra tables". Default = unlimited; 0 = off; no upper clamp.
+  it('B1 — the cap: QUALIFIER_OVERFLOW_TABLES_MAX = unlimited (Infinity); a number sets a cap (floored, >= 0, no upper clamp); 0 = off; garbage → unlimited', () => {
+    expect(QUALIFIER_OVERFLOW_TABLES_MAX).toBe(Infinity);
+    expect([undefined, '', '  ', 'x', 'NaN', 'Infinity', 'unlimited', ' UNLIMITED '].map((v) => qualifierOverflowTablesCap(v))).toEqual(Array(8).fill(Infinity));
+    expect(['0', '3', '2.7', '99', '-2', ' 4 '].map((v) => qualifierOverflowTablesCap(v))).toEqual([0, 3, 2, 99, 0, 4]);
+    // Review fix-up (ff9a1cb) — the RUNTIME value (POST /api/qualifiers/overflow): garbage is refused (null); "unlimited" = no cap.
+    expect([0, 3, '2', 2.7, 99, -1, ' 4 ', 'unlimited', 'Unlimited'].map((v) => parseQualifierOverflowCapUpdate(v))).toEqual([0, 3, 2, 2, 99, 0, 4, Infinity, Infinity]);
     expect([undefined, null, '', ' ', 'x', 'NaN', 'Infinity', Infinity, NaN, true, {}, [1]].map((v) => parseQualifierOverflowCapUpdate(v))).toEqual(Array(12).fill(null));
+    expect([0, 6, Infinity].map((v) => qualifierOverflowCapLabel(v))).toEqual([0, 6, 'unlimited']);
   });
 
   it('B2 — a late entry with every seat alive: a NEW table at the CURRENT level, he is seated there (one credit, kept), told overflowTable + waitingForPlayers; the one bootstrap listener is not re-registered', async () => {
@@ -1998,7 +2000,7 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
   });
 
   it('B13 — the runtime kill switch / cap (no restart): POST /api/qualifiers/overflow with the internal token; refused without it (fails closed) or with a bad value; 0 = the old no_seat refund, raised again = a new table', async () => {
-    const { w, tid, qt } = fullNine();
+    const { w, tid, qt } = fullNine({ overflowMax: Infinity });   // 2026-10-23: the new default (owner: no cap)
     const before = w.m.qualifierOverflow.capChanges;
     // Refused: no token, a wrong one, and (fails closed) any token when none is configured — nothing changes.
     expect(w.postOverflowCap({ max: 0 })).toEqual({ status: 403, body: { success: false, error: 'forbidden' } });
@@ -2008,12 +2010,12 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     expect(w.postOverflowCap({ max: 0 }, '')).toMatchObject({ status: 403 });
     env.INTERNAL_NOTIFY_TOKEN = 't';
     for (const bad of [undefined, null, '', ' ', 'off', 'NaN', {}, [3], true]) {
-      expect(w.postOverflowCap({ max: bad }, 't')).toMatchObject({ status: 400, body: { success: false, cap: 6 } });
+      expect(w.postOverflowCap({ max: bad }, 't')).toMatchObject({ status: 400, body: { success: false, cap: 'unlimited' } });
     }
-    expect(w.scope.qualifierOverflowTablesMax).toBe(6);
+    expect(w.scope.qualifierOverflowTablesMax).toBe(Infinity);
     expect(w.m.qualifierOverflow.capChanges).toBe(before);
     // OFF at runtime: a late entry with every seat alive → exactly the pre-overflow no_seat, one refund, no table.
-    expect(w.postOverflowCap({ max: 0 }, 't')).toEqual({ status: 200, body: { success: true, previous: 6, cap: 0, live: 0 } });
+    expect(w.postOverflowCap({ max: 0 }, 't')).toEqual({ status: 200, body: { success: true, previous: 'unlimited', cap: 0, live: 0 } });
     expect(w.scope.qualifierOverflowTablesMax).toBe(0);
     await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
     expect(last(w, 'SA')).toEqual(expect.objectContaining({ success: false, code: 'no_seat' }));
@@ -2023,12 +2025,13 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     expect(qt.players).toHaveLength(9);
     // Back ON (a numeric string, clamped like the env): the next arrival gets a table.
     expect(w.postOverflowCap({ max: '2' }, 't')).toEqual({ status: 200, body: { success: true, previous: 0, cap: 2, live: 0 } });
-    expect(w.postOverflowCap({ max: 99 }, 't').body).toMatchObject({ cap: 20 });
-    expect(w.postOverflowCap({ max: 2.9 }, 't').body).toMatchObject({ previous: 20, cap: 2 });
+    expect(w.postOverflowCap({ max: 99 }, 't').body).toMatchObject({ cap: 99 });             // no upper clamp any more
+    expect(w.postOverflowCap({ max: 'unlimited' }, 't').body).toMatchObject({ previous: 99, cap: 'unlimited' });
+    expect(w.postOverflowCap({ max: 2.9 }, 't').body).toMatchObject({ previous: 'unlimited', cap: 2 });
     await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
     expect(last(w, 'SD')).toEqual(expect.objectContaining({ success: true, lateEntry: true, tableId: 'OV1', overflowTable: true }));
-    expect(w.m.qualifierOverflow.capChanges).toBe(before + 4);
-    expect(w.audits.filter((x) => x.action === 'QUALIFIER_OVERFLOW_CAP_SET').map((x) => [x.d.previous, x.d.cap])).toEqual([[6, 0], [0, 2], [2, 20], [20, 2]]);
+    expect(w.m.qualifierOverflow.capChanges).toBe(before + 5);
+    expect(w.audits.filter((x) => x.action === 'QUALIFIER_OVERFLOW_CAP_SET').map((x) => [x.d.previous, x.d.cap])).toEqual([['unlimited', 0], [0, 2], [2, 99], [99, 'unlimited'], ['unlimited', 2]]);
   });
 
   it('B4 CONTROL — a free seat anywhere (an empty one, or a busted one) → no table is opened; that seat is used', async () => {

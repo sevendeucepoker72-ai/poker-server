@@ -1637,7 +1637,8 @@ if (gen === qualifierCacheGen) {
 # 2026-10-22 (owner: "Build it for Sunday") — qualifier OVERFLOW tables. A late
 # entrant or re-entrant who finds every seat of a running qualifier alive gets
 # a NEW table (it used to be refused no_seat and refunded): capped at
-# QUALIFIER_OVERFLOW_TABLES_MAX (6; env override, 0 = off), opened at the
+# QUALIFIER_OVERFLOW_TABLES_MAX (owner 2026-10-22 "No cap on extra tables":
+# unlimited by default since 2026-10-23; env override, 0 = off), opened at the
 # current level, registered with the tournament's live tableIds (never a second
 # event listener); a lone entrant there is fed the player due the big blind at
 # the fullest table's hand boundary, and its first hand is dealt once two are
@@ -1651,7 +1652,7 @@ serviceQualifierOverflowTables();
 feedLoneQualifierTable(tId, tableId, table);
 seatQualifierLateEntrantOnOverflowTable(socket, qt, registrant)
 seatQualifierReentrantOnOverflowTable(socket, qt, tournament, existingEntry, startingStack)
-QUALIFIER_OVERFLOW_TABLES_MAX = 6
+QUALIFIER_OVERFLOW_TABLES_MAX = Infinity
 overflowTable: true
 
 # 2026-10-22 review fix-up of the overflow tables: a RUNTIME kill switch / cap

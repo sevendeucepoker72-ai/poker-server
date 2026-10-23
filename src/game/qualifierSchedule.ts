@@ -127,34 +127,46 @@ export const QUALIFIER_MAX_REENTRIES: number | null = null;
  * cancels a running qualifier) — POST /api/qualifiers/overflow {max} with the
  * X-Internal-Token (index.ts setQualifierOverflowTablesMax; 0 also stops the
  * feed). That value lasts until the next restart, which reads the env again.
+ *
+ * 2026-10-23 — OWNER (2026-10-22): "No cap on extra tables". The default is now
+ * UNLIMITED (Infinity): a new overflow table opens whenever every seat is alive,
+ * however many are already in play. 0 is still the kill switch (OFF). A number
+ * still sets a cap (floored, at least 0, no upper clamp); "unlimited" means no
+ * cap. JSON surfaces show it via qualifierOverflowCapLabel ('unlimited').
  */
-export const QUALIFIER_OVERFLOW_TABLES_MAX = 6;
-const QUALIFIER_OVERFLOW_TABLES_HARD_MAX = 20;
+export const QUALIFIER_OVERFLOW_TABLES_MAX = Infinity;
 
-/** The overflow-table cap from the env value: unset / blank / not a number → 6; else floored and clamped to 0..20 (0 = off). */
+/** The overflow-table cap from the env value: unset / blank / "unlimited" / not a number → unlimited (Infinity); else floored, at least 0 (0 = off). */
 export function qualifierOverflowTablesCap(raw: string | undefined): number {
   if (raw === undefined || raw === null) return QUALIFIER_OVERFLOW_TABLES_MAX;
-  const text = String(raw).trim();
-  if (text === '') return QUALIFIER_OVERFLOW_TABLES_MAX;
+  const text = String(raw).trim().toLowerCase();
+  if (text === '' || text === 'unlimited') return QUALIFIER_OVERFLOW_TABLES_MAX;
   const n = Number(text);
   if (!Number.isFinite(n)) return QUALIFIER_OVERFLOW_TABLES_MAX;
-  return Math.min(QUALIFIER_OVERFLOW_TABLES_HARD_MAX, Math.max(0, Math.floor(n)));
+  return Math.max(0, Math.floor(n));
+}
+
+/** The cap as JSON can carry it: a number, or 'unlimited' for no cap (JSON has no Infinity). */
+export function qualifierOverflowCapLabel(cap: number): number | 'unlimited' {
+  return Number.isFinite(cap) ? cap : 'unlimited';
 }
 
 /**
  * Review fix-up (2026-10-22) — the cap an operator asks for WHILE THE SERVER
  * RUNS (POST /api/qualifiers/overflow {max}). Stricter than the env read: a
  * missing / blank / non-numeric value is refused (null → 400, nothing changes)
- * instead of quietly meaning 6. A number (or numeric string) is floored and
- * clamped to 0..20 like the env value; 0 = OFF.
+ * instead of quietly meaning the default. A number (or numeric string) is
+ * floored, at least 0, no upper clamp (2026-10-23, owner: no cap); 0 = OFF;
+ * the string "unlimited" = no cap.
  */
 export function parseQualifierOverflowCapUpdate(raw: unknown): number | null {
   if (typeof raw !== 'number' && typeof raw !== 'string') return null;
-  const text = String(raw).trim();
+  const text = String(raw).trim().toLowerCase();
+  if (text === 'unlimited') return Infinity;
   if (text === '') return null;
   const n = Number(text);
   if (!Number.isFinite(n)) return null;
-  return qualifierOverflowTablesCap(text);
+  return Math.max(0, Math.floor(n));
 }
 
 /**
