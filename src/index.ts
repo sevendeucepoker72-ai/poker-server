@@ -1261,6 +1261,8 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   'QUALIFIER_BREAKS_SET',
   // 2026-10-23 (qualifier lifecycle S4) — the early-rooms lead (POST /api/qualifiers/tables-open).
   'QUALIFIER_TABLES_OPEN_SET',
+  // S4 review fix-up — open holds undone by that route ({minutes:0, closeOpen:true}).
+  'QUALIFIER_TABLES_OPEN_CLOSED',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -4122,7 +4124,9 @@ app.post('/api/qualifiers/overflow', (req, res) => {
  * 2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — the TDA
  * table-balance switch at runtime (balanceQualifierTables / the pre-deal pass;
  * the state lives in the rebalance helpers). OFF stops every balance move: only
- * the lone-overflow feed and the Rule 1 / Rule 2 breaks move anyone. The
+ * the lone-overflow feed and the Rule 1 / Rule 2 breaks move anyone (and the
+ * early rooms' one leveling pass at the 11:00 deal — S4 review fix-up; the
+ * early-rooms lead at 0 stops that). The
  * fewest-alive placement of late entries / re-entries stays (it never reads the
  * switch: an ordering only). Players already
  * moved stay where they are (their stacks moved whole). Lasts until the next
@@ -5052,8 +5056,12 @@ function qualifierTablesOpenLeadMs(): number {
   const n = Number(qualifierTablesOpenLeadMin);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) * 60_000 : 0;
 }
-/** A held event: tournament id → its qualifier, the start second it deals at, its deal timer. */
-interface QualifierPreStartHold { qualId: string; dealsAt: number; timer: ReturnType<typeof setTimeout> | null }
+/**
+ * A held event: tournament id → its qualifier, the start second it deals at, its
+ * deal timer. Review fix-up — `waitingSince`: when the deal first found fewer
+ * than 2 registrants present (preStartDealMustWait; the hold stays on).
+ */
+interface QualifierPreStartHold { qualId: string; dealsAt: number; timer: ReturnType<typeof setTimeout> | null; waitingSince?: number | null }
 const qualifierPreStartHolds = new Map<string, QualifierPreStartHold>();
 /**
  * Health r2Play.qualifiers.preStart: opened (events opened early), seatedAtOpen
@@ -5062,11 +5070,17 @@ const qualifierPreStartHolds = new Map<string, QualifierPreStartHold>();
  * while held), released (no-shows released at the deal), dealt (holds dealt),
  * seatFailures (a present pending registrant with no seat at the deal —
  * released, refunded), backstopDeals (tables the 5 s sweep had to deal), and
- * holdErrors (should stay 0).
+ * holdErrors (should stay 0). Review fix-up (additive): dealsWaiting (holds
+ * whose start second found fewer than 2 present — held on, nobody released),
+ * cancelledTooFew (of those, cancelled + refunded at the late close),
+ * reboundAtDeal (present seated entrants put back on their seat at the deal),
+ * withdrawnDuringHold (registrants who withdrew while held), closedByOperator
+ * (holds undone by POST /api/qualifiers/tables-open {minutes:0, closeOpen:true}).
  */
 const qualifierPreStart = {
   opened: 0, seatedAtOpen: 0, seatedDuringHold: 0, lateEntriesDuringHold: 0, released: 0, dealt: 0,
   seatFailures: 0, backstopDeals: 0, holdErrors: 0, leadChanges: 0,
+  dealsWaiting: 0, cancelledTooFew: 0, reboundAtDeal: 0, withdrawnDuringHold: 0, closedByOperator: 0,
 };
 /** Tournament id → when runPreStartDeal dealt it: the 5 s sweep's backstop deal looks at it for QUALIFIER_PRESTART_BACKSTOP_MS. */
 const qualifierPreStartDealt = new Map<string, number>();
@@ -5078,7 +5092,11 @@ function qualifierPreStartHealth(): Record<string, unknown> {
   return {
     leadMin: qualifierTablesOpenLeadMin,
     ...qualifierPreStart,
-    held: [...qualifierPreStartHolds].map(([tournamentId, h]) => ({ qualifierId: h.qualId, tournamentId, dealsAt: new Date(h.dealsAt).toISOString() })),
+    held: [...qualifierPreStartHolds].map(([tournamentId, h]) => ({
+      qualifierId: h.qualId, tournamentId, dealsAt: new Date(h.dealsAt).toISOString(),
+      // Review fix-up — waiting past its start second for a second registrant present.
+      ...(h.waitingSince != null ? { waitingSince: new Date(h.waitingSince).toISOString() } : {}),
+    })),
   };
 }
 
@@ -5117,6 +5135,12 @@ function setQualifierTablesOpenLead(next: number, actor: string): { previous: nu
 // changes. Answers {success, previous, minutes, held}; /api/health
 // r2Play.qualifiers.preStart.leadMin shows the value in force. Send {minutes:0}
 // BEFORE 10:50 MT to stop an early open (an open hold still deals at 11:00).
+// Review fix-up — the way BACK after the open: {minutes: 0, closeOpen: true}
+// (additive; closeOpen 1 / true / 0 / false, anything else → 400; closeOpen
+// with minutes other than 0 → 400, nothing changes) also undoes every open
+// hold that has not dealt (revertQualifierPreStartHolds: its tables close,
+// its event returns to the 11:00 start of before, every registration and
+// credit kept); the answer adds `closed` (how many).
 app.post('/api/qualifiers/tables-open', (req, res) => {
   const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
   if (!internalTokenMatches(req.headers['x-internal-token'], tok)) {
@@ -5128,8 +5152,105 @@ app.post('/api/qualifiers/tables-open', (req, res) => {
     res.status(400).json({ success: false, error: 'minutes must be a number 0..30 (0 = off)', minutes: qualifierTablesOpenLeadMin });
     return;
   }
-  res.json({ success: true, ...setQualifierTablesOpenLead(next, 'internal:tables_open') });
+  const rawClose = req.body?.closeOpen;
+  const closeOpen = rawClose === undefined || rawClose === null ? false
+    : rawClose === true || rawClose === 1 ? true : rawClose === false || rawClose === 0 ? false : null;
+  if (closeOpen === null || (closeOpen && next !== 0)) {
+    res.status(400).json({ success: false, error: 'closeOpen must be 0, 1, true or false, and needs minutes 0', minutes: qualifierTablesOpenLeadMin });
+    return;
+  }
+  const set = setQualifierTablesOpenLead(next, 'internal:tables_open');
+  if (!closeOpen) { res.json({ success: true, ...set }); return; }
+  res.json({ success: true, ...set, closed: revertQualifierPreStartHolds('internal:tables_open') });
 });
+
+/**
+ * Review fix-up (S4) — the HELD tables of `tournamentId` close before any card
+ * was dealt (the 'prestart' hold is still on — callers check): the hold goes
+ * (its timer too); the tournament is VOIDED (voidRunningTournament: status
+ * 'cancelled' — no result, no prize, off the tournament list); every table of
+ * it is retired AT ONCE (retireFinishedTournamentTable with `reason`: the room
+ * told `tableClosed {tableId, reason, tournamentId}`, every session / spectator
+ * / reservation / timer of the table ends, its seats stood up WITHOUT any
+ * credit — tournament chips, nobody was dealt a hand); the entrants'
+ * voluntary-absence marks and the overflow registry entries go. Touches NO
+ * qualifier credit and no registration: the caller decides (a cancel refunds
+ * every credit; a revert keeps every registration for the 11:00 start).
+ * Returns how many tables closed.
+ */
+function closeHeldQualifierTables(tournamentId: string, reason: string): number {
+  const hold = qualifierPreStartHolds.get(tournamentId);
+  if (hold?.timer) clearTimeout(hold.timer);
+  qualifierPreStartHolds.delete(tournamentId);
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t) return 0;
+  const tableIds = [...t.tableIds];
+  for (const tp of t.players) voluntarilyAbsentTournamentEntrants.delete(voluntaryAbsenceKey(tournamentId, tp.playerId));
+  tournamentManager.voidRunningTournament(tournamentId);
+  let closed = 0;
+  for (const tid of tableIds) {
+    qualifierOverflowTables.delete(tid);
+    if (tournamentTables.get(tid) !== tournamentId) continue;
+    retireFinishedTournamentTable(tid, tournamentId, reason);
+    closed++;
+  }
+  return closed;
+}
+
+/**
+ * Review fix-up (S4) — fewer than 2 registrants were present from the start
+ * second through the END of late registration: the held event is CANCELLED
+ * exactly as the start of before cancelled a 'registering' event with too few
+ * here — its tables close first (closeHeldQualifierTables, 'tableClosed'
+ * reason 'tournament_cancelled'), then the UNCHANGED cancelQualifierEvent:
+ * 'finished' + cancelled, every registrant told `qualifierCancelled {reason,
+ * creditRefunded}`, every consumed credit refunded once. Log
+ * `qualifier_prestart_cancelled`.
+ */
+function cancelHeldQualifierEvent(qualId: string, qt: QualifierTournamentReg, tournamentId: string, reason: string): void {
+  const tables = closeHeldQualifierTables(tournamentId, 'tournament_cancelled');
+  qualifierPreStart.cancelledTooFew++;
+  console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_cancelled', qualifierId: qualId, tournamentId, reason, tables, registrants: qt.players.length })}`);
+  void cancelQualifierEvent(qualId, qt, reason);
+  broadcastTournamentList();
+}
+
+/**
+ * Review fix-up (S4) — the early rooms' runtime way BACK after the open (POST
+ * /api/qualifiers/tables-open {minutes: 0, closeOpen: true}; before it, once
+ * the tables opened only a restart — which cancels the event and refunds
+ * everyone — could undo them). Every open hold (nothing dealt yet, waiting
+ * past its start second included) is undone and its event returns to the
+ * start of before: its tables close (closeHeldQualifierTables, 'tableClosed'
+ * reason 'tables_reopen_at_start'), the event is 'registering' again with NO
+ * tournament, and every registration with its consumed credit STAYS (the
+ * pending registrants and the hold's late entries are all registrants); the
+ * lobbies are told (qualifierTournamentUpdate, status 'registering'). The 30 s
+ * tick then starts it at its start second exactly as with the lead at 0
+ * (S1's on-time timer; no-shows released + refunded there; fewer than 2 here →
+ * the wait and the late-close cancel of before). The lead is 0 (the route
+ * sets it first), so it never re-opens early. Logged
+ * `qualifier_tables_open_closed`, audited QUALIFIER_TABLES_OPEN_CLOSED
+ * (durable). Returns how many holds were undone.
+ */
+function revertQualifierPreStartHolds(actor: string): number {
+  let n = 0;
+  for (const [tournamentId, hold] of [...qualifierPreStartHolds]) {
+    const qt = qualifierTournaments.get(hold.qualId);
+    const tables = closeHeldQualifierTables(tournamentId, 'tables_reopen_at_start');
+    if (qt && qt.tournamentId === tournamentId && qt.status === 'running') {
+      qt.status = 'registering';
+      qt.tournamentId = null;
+      broadcastQualifierUpdate(hold.qualId, qt);
+    }
+    n++;
+    qualifierPreStart.closedByOperator++;
+    console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_tables_open_closed', qualifierId: hold.qualId, tournamentId, tables, registrants: qt ? qt.players.length : 0, actor })}`);
+    auditLog(actor, 'QUALIFIER_TABLES_OPEN_CLOSED', { qualifierId: hold.qualId, tournamentId, tables, registrants: qt ? qt.players.length : 0 });
+  }
+  if (n > 0) broadcastTournamentList();
+  return n;
+}
 
 /** A registrant of a STARTED event with no TournamentManager entrant yet (the early rooms' "pending"). */
 function qualifierRegistrantIsPending(tournamentId: string, reg: QualifierRegistrant): boolean {
@@ -5430,6 +5551,124 @@ function unseatPreStartEntrant(tournamentId: string, reg: QualifierRegistrant): 
 }
 
 /**
+ * Review fix-up (S4) — a registrant WITHDRAWS while the early rooms hold the
+ * first deal (the unregister handler; before, the event was 'running' from the
+ * open and he was refused "already started" from 10:50 — the start of before
+ * took a withdrawal until 11:00). Nothing was dealt, so a SEATED one's seat
+ * simply goes: every live socket playing it is told `seatVacated {tableId,
+ * seatIndex, reason:'withdrawn'}` and leaves the room, then
+ * unseatPreStartEntrant (stood up — tournament chips, never a wallet —,
+ * pointers, absence mark, the entrant removed: places stay 1..N) and the
+ * table's state goes out. A PENDING one has no seat. The caller then drops
+ * the registration and refunds the credit exactly as before the open
+ * (releaseQualifierRegistration 'unregistered'). false = not held (any more),
+ * or the seat could not be released: refused as before.
+ */
+function withdrawPreStartRegistrant(tournamentId: string, reg: QualifierRegistrant): boolean {
+  if (!qualifierPreStartHolds.has(tournamentId)) return false;
+  if (!qualifierRegistrantIsPending(tournamentId, reg)) {
+    const t = tournamentManager.getTournament(tournamentId);
+    const tid = t?.playerTableMap.get(reg.playerId);
+    const table = tid ? tableManager.getTable(tid) : undefined;
+    const idx = table ? tournamentLiveSeatIndex(table, reg.playerId) : -1;
+    if (tid && idx >= 0) {
+      for (const [sid, s] of [...playerSessions]) {
+        if (s.tableId !== tid || s.seatIndex !== idx) continue;
+        const sock = io.sockets.sockets.get(sid);
+        if (!sock) continue;
+        sock.leave(`table:${tid}`);
+        sock.emit('seatVacated', { tableId: tid, seatIndex: idx, reason: 'withdrawn' });
+      }
+    }
+    if (!unseatPreStartEntrant(tournamentId, reg)) return false;
+    if (tid) broadcastGameState(tid);
+  }
+  qualifierPreStart.withdrawnDuringHold++;
+  console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_withdrawn', tournamentId })}`);
+  return true;
+}
+
+/**
+ * Review fix-up (S4) — the deal's (4): a PRESENT seated entrant whose seat no
+ * live socket plays (he went back to the lobby during the 10-minute idle hold —
+ * a voluntary absence a sign-in never restores — or his seat was kept absent
+ * for a socket since freed) is put back on it on a free live socket, as the
+ * start of before bound every online registrant at 11:00 and took him to his
+ * table: restoreAbsentTournamentSeat (voluntary 'any' — his absence ends;
+ * `reconnectedToTable` + a full state: the client opens the table). Never a
+ * socket that holds a session or plays a live seat elsewhere (TOURNEY-9: he
+ * stays absent, told by his kept-seat notice). true = put back.
+ */
+function rebindPresentSeatedEntrantAtDeal(tournamentId: string, reg: QualifierRegistrant): boolean {
+  const where = tournamentSeatLocationNow(tournamentId, reg.playerId);
+  if (!where || liveSessionAt(where.tableId, where.seatIndex)) return false;
+  for (const sock of qualifierRegistrantSockets(reg)) {
+    if (playerSessions.has(sock.id) || socketPlaysLiveSeatElsewhere(sock.id, '')) continue;
+    const auth = authSessions.get(sock.id);
+    if (!auth) continue;
+    const back = restoreAbsentTournamentSeat(sock, auth, 'qualifier_prestart_deal', tournamentId, 'any');
+    if (!back) continue;
+    reg.socketId = sock.id;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Review fix-up (S4) — the deal's FIRST step: fewer than 2 registrants PRESENT
+ * at the start second (partitionByPresence, the 2-minute grace) → no deal and
+ * nobody released. The hold stays on (its timer gone): the 5 s sweep and the
+ * 30 s tick re-run the deal, which goes ahead the first time two are present —
+ * the wait of before (tickQualifierAutoStart kept a 'registering' event waiting
+ * the same way); meanwhile an online pending registrant still sits down. Still
+ * fewer than 2 when late registration ends (lateRegUntil): CANCELLED
+ * (cancelHeldQualifierEvent 'too_few_players': the tables close, every credit
+ * refunded), as before. Before this fix the deal went ahead with the seated
+ * ABSENT entrants: no-shows lost their credit and could finish in a seat-paying
+ * place. Logged once per hold `qualifier_prestart_deal_waiting`. true = wait
+ * (or cancelled): the caller deals nothing; false = deal (or the hold's event
+ * is gone — the deal's own path un-holds it).
+ */
+function preStartDealMustWait(tournamentId: string, hold: QualifierPreStartHold, now: number): boolean {
+  const qt = qualifierTournaments.get(hold.qualId);
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!qt || qt.tournamentId !== tournamentId || !t || t.status !== 'running') return false;
+  let present = 0;
+  try {
+    samplePresence(qt.players, qualifierRegistrantOnline, now);
+    present = partitionByPresence(qt.players, now).present.length;
+  } catch (e: any) {
+    qualifierPreStart.holdErrors++;
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: hold.qualId, tournamentId, step: 'presence', error: String(e?.message || e) })}`);
+    return false;
+  }
+  if (present >= 2) return false;
+  if (hold.timer) { clearTimeout(hold.timer); hold.timer = null; }
+  if (now > qualifierWindows(new Date(qt.scheduledAt).getTime()).lateRegUntil) {
+    try {
+      cancelHeldQualifierEvent(hold.qualId, qt, tournamentId, 'too_few_players');
+    } catch (e: any) {
+      // (The hold went first — closeHeldQualifierTables — so nothing deals it.)
+      qualifierPreStart.holdErrors++;
+      console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: hold.qualId, tournamentId, step: 'cancel', error: String(e?.message || e) })}`);
+    }
+    return true;
+  }
+  if (hold.waitingSince == null) {
+    hold.waitingSince = now;
+    qualifierPreStart.dealsWaiting++;
+    console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_waiting', qualifierId: hold.qualId, tournamentId, present, registrants: qt.players.length })}`);
+  }
+  try {
+    seatOnlinePendingQualifierRegistrants(hold.qualId, qt, 'wait');
+  } catch (e: any) {
+    qualifierPreStart.holdErrors++;
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: hold.qualId, tournamentId, step: 'wait_seat', error: String(e?.message || e) })}`);
+  }
+  return true;
+}
+
+/**
  * A PRESENT pending registrant at the deal: seated on a free live socket, else
  * absent (his other sockets, which play elsewhere, told `tournamentSeatKept`
  * as at a start). No seat at all (the overflow cap): released — his credit
@@ -5468,15 +5707,28 @@ function seatPresentPendingAtDeal(qualId: string, qt: QualifierTournamentReg, re
  * THE DEAL at the start second (the hold's timer; the tick and the 5 s sweep as
  * backstops). Idempotent: the hold marker is checked and deleted FIRST, so a
  * second call does nothing. In order:
+ *  (0) review fix-up — fewer than 2 PRESENT: no deal, nobody released, the
+ *      hold stays on and the sweep / tick retry; cancelled + refunded at the
+ *      late close (preStartDealMustWait) — the wait of before;
  *  (1) presence sampled, the field split (partitionByPresence: the 2-minute grace);
  *  (2) with >= 2 present, EVERY absent registrant is released through the
  *      unchanged releaseQualifierNoShows (credit refunded, master row dropped,
  *      told at the next sign-in) — a SEATED one is stood up first
- *      (unseatPreStartEntrant); with fewer than 2 present only the absent
- *      PENDING ones go and every seated entrant stays;
+ *      (unseatPreStartEntrant); (a defensive fallback only — (0) waits when
+ *      fewer than 2 are present: then only the absent PENDING ones go);
  *  (3) every present pending registrant is seated (seatPresentPendingAtDeal);
+ *  (4) review fix-up — every present SEATED entrant nobody plays (back in the
+ *      lobby during the hold) is put back on his seat on a free live socket
+ *      (rebindPresentSeatedEntrantAtDeal), as the start of before bound every
+ *      online registrant at 11:00;
  *  (5) the breaks (Rule 1 / Rule 2: empty and short tables) — no hand is in
- *      progress, so they run now; (6) the pre-deal balance (S2);
+ *      progress, so they run now; (6) the pre-deal balance (S2) — review
+ *      fix-up: run even with the balance switch OFF (ignoreSwitch). This is
+ *      the START'S seating: the start of before seated the present players
+ *      round-robin (within one of each other), while the tables here were
+ *      sized for every registrant and thinned unevenly by the releases
+ *      ([9,9,1] / [9,8,2] were left with the switch off: a lone base table
+ *      waited undealt). To stop it too, set the early-rooms lead to 0;
  *  (7) the hold ends: the FULL level 1 starts now; (8) every table with >= 2
  *      alive is dealt (restartWaitingTournamentTables startWaiting — overflow
  *      tables included); (9) the lobby and every table told.
@@ -5486,12 +5738,15 @@ function seatPresentPendingAtDeal(qualId: string, qt: QualifierTournamentReg, re
 function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
   const hold = qualifierPreStartHolds.get(tournamentId);
   if (!hold) return;
+  // (0) Never throws (its own try / catch).
+  if (preStartDealMustWait(tournamentId, hold, now)) return;
   qualifierPreStartHolds.delete(tournamentId);
   if (hold.timer) clearTimeout(hold.timer);
   const qualId = hold.qualId;
   const qt = qualifierTournaments.get(qualId);
   let seated = 0;
   let released = 0;
+  let rebound = 0;
   let breaks = 0;
   let balanceMoves = 0;
   let error: string | null = null;
@@ -5509,11 +5764,23 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
         if (!qt.players.includes(p) || !qualifierRegistrantIsPending(tournamentId, p)) continue;
         if (seatPresentPendingAtDeal(qualId, qt, p)) seated++;
       }
+      // (4) Review fix-up — each one in its own try: one failure never blocks the deal.
+      for (const p of present) {
+        if (!qt.players.includes(p) || qualifierRegistrantIsPending(tournamentId, p)) continue;
+        try {
+          if (rebindPresentSeatedEntrantAtDeal(tournamentId, p)) rebound++;
+        } catch (e: any) {
+          qualifierPreStart.holdErrors++;
+          console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: qualId, tournamentId, step: 'rebind', error: String(e?.message || e) })}`);
+        }
+      }
+      qualifierPreStart.reboundAtDeal += rebound;
       for (let i = 0; i < QUALIFIER_PRESTART_MAX_BREAKS && planTournamentRebalance(tournamentId); i++) {
         handleTableRebalance(tournamentId);
         breaks++;
       }
-      balanceMoves = balanceQualifierTablesNow(tournamentId);
+      // (6) Review fix-up — the start's seating: even with the balance switch off.
+      balanceMoves = balanceQualifierTablesNow(tournamentId, { ignoreSwitch: true });
       // Every table's progress listener (bust check, hand results) before its first hand.
       for (const tid of t.tableIds) {
         const table = tableManager.getTable(tid);
@@ -5557,7 +5824,8 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
   }
   console.log(`[Qualifier] ${JSON.stringify({
     event: 'qualifier_prestart_deal', qualifierId: qualId, tournamentId, lateByMs: Date.now() - hold.dealsAt, tables, dealtTables,
-    seated, released, breaks, balanceMoves, alive: tournamentManager.getAliveCount(tournamentId), ...(error ? { error } : {}),
+    seated, released, rebound, breaks, balanceMoves, alive: tournamentManager.getAliveCount(tournamentId),
+    ...(hold.waitingSince != null ? { waitedMs: Date.now() - hold.waitingSince } : {}), ...(error ? { error } : {}),
   })}`);
 }
 
@@ -12751,8 +13019,15 @@ io.on('connection', (socket: Socket) => {
       return;
     }
     if (qt.status !== 'registering') {
-      socket.emit('qualifierRegistrationResult', { success: false, code: 'registration_closed', error: 'This qualifier has already started.', qualifierId: qualId, registered: true });
-      return;
+      // S4 review fix-up — while the early rooms hold the first deal (the
+      // 'prestart' pause, which only they set) a registrant may still withdraw,
+      // as he could until 11:00 before the open: his seat (if any) goes first —
+      // nothing was dealt (withdrawPreStartRegistrant) — then the refund below.
+      const heldTid = !!qt.tournamentId && tournamentManager.getTournament(qt.tournamentId)?.pauseReason === 'prestart' ? qt.tournamentId : null;
+      if (!heldTid || !withdrawPreStartRegistrant(heldTid, removedPlayer)) {
+        socket.emit('qualifierRegistrationResult', { success: false, code: 'registration_closed', error: 'This qualifier has already started.', qualifierId: qualId, registered: true });
+        return;
+      }
     }
     qt.players = qt.players.filter((p) => p !== removedPlayer);
     void releaseQualifierRegistration(qualId, qt, removedPlayer, 'unregistered');
@@ -24114,14 +24389,20 @@ function scheduleFinishedTournamentTablesRetirement(tournamentId: string, tableI
   }, FINISHED_TOURNAMENT_TABLE_RETIRE_MS);
   (timer as any)?.unref?.();
 }
-function retireFinishedTournamentTable(tableId: string, tournamentId: string): void {
+// S4 review fix-up — `reason` (default 'tournament_finished', as before): the
+// early rooms' held tables closing before any card (closeHeldQualifierTables)
+// pass 'tournament_cancelled' / 'tables_reopen_at_start'.
+function retireFinishedTournamentTable(tableId: string, tournamentId: string, reason: string = 'tournament_finished'): void {
   // Only a table still mapped to THIS tournament (a table a rebalance broke is
   // already gone; never touch a table some other tournament owns).
   if (tournamentTables.get(tableId) !== tournamentId) return;
   const t = tournamentManager.getTournament(tournamentId);
   if (t && t.status === 'running') return;   // not over after all — never retire a live table
   const table = tableManager.getTable(tableId);
-  io.to(`table:${tableId}`).emit('tableClosed', { tableId, reason: 'tournament_finished', tournamentId });
+  // (The finished case keeps its literal: a canonical-features.txt token.)
+  io.to(`table:${tableId}`).emit('tableClosed', reason === 'tournament_finished'
+    ? { tableId, reason: 'tournament_finished', tournamentId }
+    : { tableId, reason, tournamentId });
   for (const [uid, r] of [...reservedSeats]) {
     if (r.tableId !== tableId) continue;
     clearTimeout(r.cleanupTimer);
@@ -24135,7 +24416,7 @@ function retireFinishedTournamentTable(tableId: string, tournamentId: string): v
   tableManager.removeTable(tableId);
   tableProgressListeners.delete(tableId);
   finishedTournamentTablesRetired.tables++;
-  console.log(`[Tournament] ${JSON.stringify({ event: 'finished_tournament_table_retired', tournamentId, tableId })}`);
+  console.log(`[Tournament] ${JSON.stringify({ event: 'finished_tournament_table_retired', tournamentId, tableId, ...(reason !== 'tournament_finished' ? { reason } : {}) })}`);
 }
 
 // Periodically check for timed tournaments
@@ -26365,7 +26646,9 @@ function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sou
  * (setQualifierTableBalance, POST /api/qualifiers/balance) — changing the env
  * restarts the process, and a restart cancels a running qualifier. OFF stops
  * every balance move (hand end and pre-deal): only the lone-overflow feed and
- * the Rule 1 / Rule 2 breaks move anyone. It is NOT a full revert of S2: the
+ * the Rule 1 / Rule 2 breaks move anyone — and (S4 review fix-up) the early
+ * rooms' ONE leveling pass at the 11:00 deal, the start's seating
+ * (runPreStartDeal, ignoreSwitch; the lead at 0 stops it). It is NOT a full revert of S2: the
  * fewest-alive / break-pending-last PLACEMENT of late entries and re-entries
  * never reads it (an ordering only; every candidate seat is still tried).
  */
@@ -26435,8 +26718,10 @@ interface QualifierBalanceMove {
  */
 function planQualifierBalanceMove(
   tournamentId: string, preDeal: boolean, source?: { tid: string; table: PokerTable },
+  // S4 review fix-up — the early rooms' 11:00 deal only (the start's seating): the switch is not read.
+  ignoreSwitch: boolean = false,
 ): QualifierBalanceMove | null {
-  if (!qualifierBalanceOn) return null;
+  if (!qualifierBalanceOn && !ignoreSwitch) return null;
   const t = tournamentManager.getTournament(tournamentId);
   if (!t || t.status !== 'running' || t.tableIds.length <= 1) return null;
   if (!preDeal && t.paused) return null;
@@ -26622,13 +26907,18 @@ function balanceQualifierTables(tournamentId: string, sourceTableId: string, sou
  * does NOT require the tournament to be unpaused: its callers (the break end,
  * the 11:00 deal) run it while their hold is still set, then resume / deal.
  * Moves are counted in preDealMoves. Never throws. Returns the moves made.
+ * S4 review fix-up — `ignoreSwitch` (the early rooms' deal, runPreStartDeal,
+ * ONLY): the pass runs even with the switch OFF — it is the start's seating
+ * (the start of before seated the present players within one of each other),
+ * before any card; every other caller (the break end, a director's resume)
+ * still reads the switch.
  */
-function balanceQualifierTablesNow(tournamentId: string): number {
+function balanceQualifierTablesNow(tournamentId: string, opts: { ignoreSwitch?: boolean } = {}): number {
   let n = 0;
   while (n < QUALIFIER_BALANCE_PRE_DEAL_MAX_MOVES) {
     let plan: QualifierBalanceMove | null = null;
     try {
-      plan = planQualifierBalanceMove(tournamentId, true);
+      plan = planQualifierBalanceMove(tournamentId, true, undefined, opts.ignoreSwitch === true);
     } catch (e: any) {
       qualifierBalance.errors++;
       console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_table_balance_failed', tournamentId, moved: false, via: 'pre_deal', error: String(e?.message || e) })}`);

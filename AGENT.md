@@ -126,10 +126,10 @@ See `src/index.ts`. Key events:
 | `SENTRY_DSN` | Optional | Exception capture |
 | `INTERNAL_NOTIFY_TOKEN` | **Required in prod** | `X-Internal-Token` for the master's internalAuth routes: qualifier-credit consume/refund/issue, qualifier schedule/register/results, and (2026-10-07) the play gate's `/users/:id/play-status/internal`. Unset = suspension checks FAIL OPEN (visible as `playGate.internalTokenConfigured:false` on `/api/health`) |
 | `QUALIFIER_OVERFLOW_TABLES_MAX` | Optional (default 6) | Online qualifier overflow tables in play per event (owner 2026-10-22). Clamped 0..20, garbage → 6; **0 = OFF** (every-seat-alive late entry / re-entry refused `no_seat`, credit refunded, as before). This is only the value AT BOOT (changing a Railway var restarts the process, and a restart cancels a running qualifier). While the server runs, change it with **`POST /api/qualifiers/overflow` `{"max": N}`** + header `X-Internal-Token` (= `INTERNAL_NOTIFY_TOKEN`; no token configured → always 403). No restart is needed, and the value lasts until the next boot. Shown as `r2Play.qualifiers.overflow.cap` on `/api/health` |
-| `QUALIFIER_TABLE_BALANCE` | Optional (unset = ON) | Online qualifier TDA table balancing (2026-10-23, lifecycle S2; section "Online qualifier TABLE BALANCING"). **`0` = OFF** = no balance move at all, hand end or pre-deal (only the lone-overflow feed and the Rule 1 / Rule 2 breaks move anyone); the fewest-alive placement of late entries / re-entries STAYS (it never reads the switch: an ordering only), so OFF is not a full revert of S2; anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs, switch it with **`POST /api/qualifiers/balance` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403). Shown as `r2Play.qualifiers.balance.on` on `/api/health` |
+| `QUALIFIER_TABLE_BALANCE` | Optional (unset = ON) | Online qualifier TDA table balancing (2026-10-23, lifecycle S2; section "Online qualifier TABLE BALANCING"). **`0` = OFF** = no balance move at all, hand end or pre-deal (only the lone-overflow feed and the Rule 1 / Rule 2 breaks move anyone — and, S4 review fix-up, the early rooms' ONE leveling pass at the 11:00 deal, the start's seating; the tables-open lead at 0 stops that too); the fewest-alive placement of late entries / re-entries STAYS (it never reads the switch: an ordering only), so OFF is not a full revert of S2; anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs, switch it with **`POST /api/qualifiers/balance` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403). Shown as `r2Play.qualifiers.balance.on` on `/api/health` |
 | `QUALIFIER_BREAKS` | Optional (unset = ON) | Online qualifier scheduled breaks (2026-10-23, lifecycle S3; section "Online qualifier CLOCK, BREAKS, PAUSE"): a 5-minute break after every 5th level. **`0` = OFF** (levels run back to back, as before S3); anything else = on. Only the value AT BOOT (a restart cancels a running qualifier). While the server runs: **`POST /api/qualifiers/breaks` `{"on": 0}`** (or 1 / true / false) + header `X-Internal-Token` (no token configured → always 403). Read at each level boundary; turning it off never ends a break already running (`POST /api/qualifiers/pause {"paused":false}` does). Shown as `r2Play.qualifiers.breaks.on` on `/api/health` |
 | `QUALIFIER_TEST_TIME_SCALE` | **Never set on Railway** (rig only) | Divides the qualifier ENGINE's level and break lengths (60 = a 12-minute level runs 12 s, the break 5 s) so the local rig can play a whole event in minutes. Inert by construction in production: `qualifierTestTimeScale` answers 1 whenever `NODE_ENV=production` or ANY Railway runtime variable is set (`RAILWAY_ENVIRONMENT`, `_NAME`, `_ID`, `RAILWAY_PROJECT_ID`, `RAILWAY_SERVICE_ID`, `RAILWAY_DEPLOYMENT_ID` — nixpacks does not set NODE_ENV). Clamped 1..120; the lobby's advertised 12-minute levels never change. Shown as `r2Play.qualifiers.testTimeScale` on `/api/health` (must read 1 in prod) |
-| `QUALIFIER_TABLES_OPEN_BEFORE_MIN` | Optional (default 10) | Online qualifier EARLY ROOMS (2026-10-23, lifecycle S4; section "Online qualifier EARLY ROOMS (T-10)"): this many minutes before the start the tables open, the online registrants sit down and the tournament is HELD (no card, no blind clock) until the start second, when the no-shows are released and refunded as before and every table is dealt. Clamped 0..30, garbage → 10; **`0` = OFF** = the 11:00 start of before (with S1's on-time timer). Only the value AT BOOT (a restart cancels a running qualifier). While the server runs: **`POST /api/qualifiers/tables-open` `{"minutes": 0}`** + header `X-Internal-Token` (no token configured → always 403); send it BEFORE 10:50 MT to stop the early open (a hold already open still deals at 11:00). Shown as `r2Play.qualifiers.preStart.leadMin` |
+| `QUALIFIER_TABLES_OPEN_BEFORE_MIN` | Optional (default 10) | Online qualifier EARLY ROOMS (2026-10-23, lifecycle S4; section "Online qualifier EARLY ROOMS (T-10)"): this many minutes before the start the tables open, the online registrants sit down and the tournament is HELD (no card, no blind clock) until the start second, when the no-shows are released and refunded as before and every table is dealt. Clamped 0..30, garbage → 10; **`0` = OFF** = the 11:00 start of before (with S1's on-time timer). Only the value AT BOOT (a restart cancels a running qualifier). While the server runs: **`POST /api/qualifiers/tables-open` `{"minutes": 0}`** + header `X-Internal-Token` (no token configured → always 403); send it BEFORE 10:50 MT to stop the early open (a hold already open still deals at 11:00). AFTER the open, **`{"minutes": 0, "closeOpen": true}`** also undoes every open hold (its tables close, nothing was dealt, every registration and credit kept; the event starts at 11:00 the old way) — S4 review fix-up. Shown as `r2Play.qualifiers.preStart.leadMin` |
 | `ONLINE_GUEST_PLAY_ENABLED` | **Leave unset** | EMERGENCY ROLLBACK ONLY. `1` re-allows guest `register` and no-account play, against the 2026-10-07 owner rule "nobody plays .online without an American Pub Poker account". Suspended players stay blocked either way. Shown as `playGate.guestPlayEnabled` on `/api/health` |
 
 ## Deploy pre-flight
@@ -616,7 +616,9 @@ of `src/index.ts`, qualifiers only):
   `qualifier_table_balance_refused`). The pre-deal pass also logs
   `qualifier_tables_balanced_pre_deal` {moves}.
 - **Kill switch — two controls.** OFF stops every balance MOVE, hand end and
-  pre-deal (only the lone-overflow feed and the Rule 1 / 2 breaks move anyone);
+  pre-deal (only the lone-overflow feed and the Rule 1 / 2 breaks move anyone —
+  and the early rooms' one leveling pass at the 11:00 deal, S4 review fix-up:
+  the start's seating; the tables-open lead at 0 stops that);
   players already moved stay where they are (their stacks moved whole). It is
   NOT a full revert of S2: the fewest-alive / break-pending-last placement of
   late entries and re-entries (previous bullet) never reads the switch and
@@ -894,27 +896,32 @@ tick — nobody could sit down before 11:00. Now (the "Early rooms" block of
   is refused `not_started` (S3).
 - **The deal** (`runPreStartDeal`, its timer at the start second; the tick and
   the 5 s sweep as backstops). Idempotent — the hold marker is checked and
-  deleted FIRST. (1) presence sampled and split with the 2-minute grace; (2)
+  deleted FIRST. (0) **Review fix-up:** fewer than 2 registrants PRESENT ->
+  no deal, nobody released, the hold stays (`preStartDealMustWait`; see "Review
+  fix-up" below); (1) presence sampled and split with the 2-minute grace; (2)
   with >= 2 present EVERY absent registrant is released through the UNCHANGED
   `releaseQualifierNoShows` (credit refunded, master row dropped, told at the
   next sign-in — the owner rule "no-shows removed + refunded at start" and the
   10:50 reminder stay true); a SEATED absent one is stood up first
   (`unseatPreStartEntrant`: standUp, `forgetSeatPointers`, his voluntary-absence
-  mark, `removeLateEntrant` — places stay 1..N); with fewer than 2 present only
-  the absent PENDING ones go and every seated entrant stays; (3) every present
+  mark, `removeLateEntrant` — places stay 1..N); (3) every present
   pending registrant is seated (on a free socket, else ABSENT and told
   `tournamentSeatKept {atStart:true}`; no seat at all → released + refunded,
-  `qualifierCancelled {reason:'no_seat'}`, `seatFailures`); (5) the breaks run
+  `qualifierCancelled {reason:'no_seat'}`, `seatFailures`); (4) **review
+  fix-up:** every present SEATED entrant nobody plays is put back on his seat
+  (`rebindPresentSeatedEntrantAtDeal`); (5) the breaks run
   now (Rule 1 / Rule 2, up to `QUALIFIER_PRESTART_MAX_BREAKS` = 60 synchronous
   breaks; the rebalance's own 500 ms cascade continues past it) and (6) S2's
-  pre-deal balance; (7) the 'prestart' resume — the FULL level 1 starts now
+  pre-deal balance (**review fix-up:** even with the balance switch off —
+  `ignoreSwitch`); (7) the 'prestart' resume — the FULL level 1 starts now
   (`levelEndsAt` = start second + 12 min); (8) `restartWaitingTournamentTables
   {startWaiting:true}` deals every table with >= 2 alive (overflow tables
   included); (9) every table's state, `qualifierTournamentUpdate {tablesOpen:
   false, dealsAt: null}`, the tournament list. Steps 1-6 are in a try: a throw
   counts `holdErrors` and the tournament is STILL un-held and dealt. Log
   `qualifier_prestart_deal` {qualifierId, tournamentId, lateByMs, tables,
-  dealtTables, seated, released, breaks, balanceMoves, alive}. Backstop: for 10
+  dealtTables, seated, released, rebound, breaks, balanceMoves, alive, waitedMs
+  (only after a wait)}. Backstop: for 10
   minutes after a deal the 5 s sweep (`servicePreStartDealBackstop`, from
   `serviceQualifierOverflowTables`) deals any of its tables still
   WaitingForPlayers with hand 0, >= 2 alive and no deal hold (log
@@ -937,16 +944,75 @@ tick — nobody could sit down before 11:00. Now (the "Early rooms" block of
   (fails closed); answers `{success, previous, minutes, held}`; logged
   `qualifier_tables_open_set`, audited `QUALIFIER_TABLES_OPEN_SET` (durable).
   A hold ALREADY open is not touched: it still deals at its start second (the
-  hold marker drives the deal, never the lead).
+  hold marker drives the deal, never the lead). **The way back AFTER the open
+  (review fix-up):** `-d '{"minutes":0,"closeOpen":true}'` also undoes every
+  open hold (`revertQualifierPreStartHolds`; details below); `closeOpen` with
+  minutes other than 0, or not 0 / 1 / true / false → 400, nothing changes.
 - **Sunday ops:** to run Sunday WITHOUT early rooms, set the lead to 0 live
   (the curl above, `{"minutes":0}`) BEFORE 10:50 MT; check
   `/api/health` → `r2Play.qualifiers.preStart.leadMin` = 0. With it on, watch
   `preStart` from 10:50: `opened` 1, `held` lists the event until 11:00:00, then
-  `dealt` 1 and `holdErrors` 0.
+  `dealt` 1 and `holdErrors` 0. A problem with the OPEN tables between 10:50 and
+  11:00: `{"minutes":0,"closeOpen":true}` (answer `closed: 1`; never a restart —
+  that cancels the event and refunds everyone); the event then starts at 11:00
+  the old way. `held[].waitingSince` set = the start second found fewer than 2
+  present (it deals once two are here; cancelled + refunded at 2 PM if never).
 - **Health:** `r2Play.qualifiers.preStart` = {leadMin, opened, seatedAtOpen,
   seatedDuringHold, lateEntriesDuringHold, released, dealt, seatFailures,
-  backstopDeals, holdErrors, leadChanges, held: [{qualifierId, tournamentId,
-  dealsAt}]} (`holdErrors` / `seatFailures` should stay 0).
+  backstopDeals, holdErrors, leadChanges, dealsWaiting, cancelledTooFew,
+  reboundAtDeal, withdrawnDuringHold, closedByOperator, held: [{qualifierId,
+  tournamentId, dealsAt, waitingSince?}]} (`holdErrors` / `seatFailures` should
+  stay 0).
+- **Review fix-up (2026-10-23, five review findings on 177723c):**
+  - *Fewer than 2 present at the start second* (`preStartDealMustWait`, the
+    deal's step 0). It used to deal anyway with the seated ABSENT entrants: a
+    no-show lost his credit and could finish in a seat-paying place. Now no
+    card and nobody released: the hold stays (its timer gone), the 5 s sweep
+    and the 30 s tick re-run the deal, which goes ahead the first time two
+    are present (the no-shows released then; the FULL level 1 from that
+    moment); an online pending registrant still sits down meanwhile. Still
+    fewer than 2 after late registration ends → `cancelHeldQualifierEvent`:
+    `closeHeldQualifierTables` (the tournament voided; every table retired at
+    once — `retireFinishedTournamentTable` with reason `tournament_cancelled`:
+    `tableClosed` to the room, sessions / reservations / timers ended, seats
+    stood up with no credit) then the UNCHANGED `cancelQualifierEvent
+    ('too_few_players')` — every credit refunded once, everyone told. This is
+    the wait-then-cancel of the start of before. Logs
+    `qualifier_prestart_deal_waiting` (once per hold), `qualifier_prestart_cancelled`.
+  - *A way back after the open* (`revertQualifierPreStartHolds`, the route's
+    `closeOpen`). Every open hold that has not dealt: `closeHeldQualifierTables`
+    (reason `tables_reopen_at_start`), the event `'registering'` again with
+    `tournamentId: null`, every registration and consumed credit KEPT (pending
+    ones and the hold's late entries included), the lobbies told. The lead is
+    0, so it never re-opens; the 30 s tick (and S1's timer) start it at the
+    start second exactly as with the lead at 0. Log `qualifier_tables_open_closed`,
+    audit `QUALIFIER_TABLES_OPEN_CLOSED` (durable).
+  - *Back in the lobby during the hold* (`rebindPresentSeatedEntrantAtDeal`,
+    the deal's step 4). Leaving the idle table marks a voluntary absence that
+    no sign-in restores, so he was dealt in absent and auto-folded until he
+    tapped "Go to my table". Now a PRESENT seated entrant whose seat no live
+    socket plays is put back on a free live socket of his
+    (`restoreAbsentTournamentSeat` voluntary 'any': `reconnectedToTable` + a
+    full state, the client opens the table; the absence ends), as the start of
+    before bound every online registrant at 11:00. Never a socket that holds a
+    session or plays a live seat elsewhere (TOURNEY-9).
+  - *Withdraw while held* (`withdrawPreStartRegistrant`, the unregister
+    handler behind the 'prestart' check). From the open the event is
+    'running', so a withdrawal was refused "already started" from 10:50. Now
+    accepted until the deal: a seated one's live sockets get `seatVacated
+    {reason:'withdrawn'}` and leave the room, his seat goes
+    (`unseatPreStartEntrant`), the registration is dropped and the credit
+    refunded exactly as before the open. After the deal: refused as before.
+    poker-3d shows no Withdraw on a held card yet (client follow-up; a stale
+    lobby can send it).
+  - *Balance switch off* (`balanceQualifierTablesNow(…, {ignoreSwitch: true})`,
+    the deal's step 6 ONLY). The tables are sized for every registrant and
+    thinned unevenly by the releases ([9,9,1] / [9,8,2]: Rule 1 and Rule 2 do
+    not fire, a lone base table waited undealt). The start of before seated
+    the present players round-robin; the deal's leveling pass now runs even
+    with `QUALIFIER_TABLE_BALANCE` off (the start's seating, before any card).
+    The break end and a director's resume still read the switch. The lead at
+    0 stops it.
 - **Contract (additive, CONTRACTS.md):** lobby item `tablesOpen: true` +
   `dealsAt` (ISO) ONLY while held (absent otherwise); `qualifierTournamentUpdate`
   the same while held (`tablesOpen: false, dealsAt: null` at the deal);
@@ -954,7 +1020,12 @@ tick — nobody could sit down before 11:00. Now (the "Early rooms" block of
   `qualifierRegistrationResult` + `preStart` (a pending registrant's tap or a
   late entry while held); `tournamentClock.dealsAt` (epoch ms while held); the
   route. Manifest tokens `qualifier_tables_opened_early`,
-  `qualifier_prestart_deal`, `/api/qualifiers/tables-open`.
+  `qualifier_prestart_deal`, `/api/qualifiers/tables-open`. Review fix-up:
+  the route's `closeOpen` + `closed`; `tableClosed` reasons
+  `tournament_cancelled` / `tables_reopen_at_start`; `seatVacated` reason
+  `withdrawn`; unregister accepted while held; manifest tokens
+  `qualifier_prestart_deal_waiting`, `qualifier_prestart_cancelled`,
+  `qualifier_tables_open_closed`.
 - **Old harnesses untouched.** Every new identifier an EXISTING handler or list
   path reads sits behind the 'prestart' pause (`tournamentManager.getTournament(
   id)?.pauseReason === 'prestart'` — only the early rooms set it): hand-listed
@@ -967,7 +1038,16 @@ tick — nobody could sit down before 11:00. Now (the "Early rooms" block of
   startQualifierTournament + bootstrap listener, rebalance helpers, S3 clock /
   pause and the shutdown claims, under fake timers). Full jest 2219 passed, 0
   failed (baseline 2201 at c57667e, +18); `npm run lint` and `npm run build`
-  clean; manifest 775 tokens, 0 missing from `dist/`.
+  clean; manifest 775 tokens, 0 missing from `dist/`. Review fix-up: E7
+  rewritten (it asserted the defect), + E7b (the late-close cancel), E17 (the
+  way back), E18 (the rebind at the deal), E19 (withdraw while held), E20 (the
+  balance switch off) + wiring; opt-in slices `S4_CLOSE_CODE` (the real table
+  retirement) and `S4_SEATS_CODE` (the real seat restore + sessionHoldsSeat)
+  so the other worlds are unchanged; each new test fails on 177723c's source.
+  Full jest 2224 passed, 0 failed (+5); lint and build clean; manifest 778
+  tokens, 0 missing from `dist/` (the `reason: 'tournament_finished'` literal
+  kept in `retireFinishedTournamentTable`). The local rig was NOT re-run for
+  the fix-up.
 - **Rig (2026-10-23, scratchpad `qrig/s4-rig.sh`, on this dist;
   `restart-server.sh` passes `QUALIFIER_TABLES_OPEN_BEFORE_MIN` through):**
   - NEW `qrig/scenario-earlyopen.js` (lead 3 min so a run takes ~7 minutes,

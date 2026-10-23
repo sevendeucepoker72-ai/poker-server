@@ -2225,13 +2225,39 @@ const S4_CODE = [
   fnSrc('function claimTournamentRefundsForShutdown('),
   fnSrc('function claimQuickAndQualifierRefundsForShutdown('),
 ].join('\n');
-const S4_HANDLERS = ['registerQualifierTournament', 'returnToTournamentSeat', 'startHand', 'getQualifierTournaments']
+const S4_HANDLERS = ['registerQualifierTournament', 'returnToTournamentSeat', 'startHand', 'getQualifierTournaments', 'unregisterQualifierTournament']
   .map((ev) => handlerSrc(ev, '\n  });\n')).join('\n  ');
+/**
+ * S4 review fix-up — the held tables CLOSING (a cancel at the late close, the
+ * operator's way back): the REAL table retirement and its view / timer teardown.
+ * Opt-in (earlyRoomsWorld extraCode) so the worlds above stay exactly as they were.
+ */
+const S4_CLOSE_CODE = [
+  slice('const finishedTournamentTablesRetired = { tables: 0 };', ';\n'),
+  fnSrc('function retireFinishedTournamentTable('),
+  fnSrc('function endTableViewsAndTimers('),
+].join('\n');
+/**
+ * S4 review fix-up — the deal's rebind of a present seated entrant nobody plays:
+ * the REAL seat restore by account (restoreAbsentTournamentSeat and its finders)
+ * and the REAL sessionHoldsSeat (so liveSessionAt sees who sits where — the
+ * default world's stub reads every seat as absent). Opt-in, as above.
+ */
+const S4_SEATS_CODE = [
+  fnSrc('function sessionHoldsSeat('),
+  fnSrc('function tournamentSeatLocationNow('),
+  fnSrc('function absentTournamentSeatsOf('),
+  fnSrc('function absentTournamentSeatOf('),
+  fnSrc('function restoreAbsentTournamentSeat('),
+  fnSrc('function tournamentSeatLeftVoluntarily('),
+  fnSrc('function tournamentEntrantIsAccount('),
+  fnSrc('function qualifierEntrantMasterId('),
+].join('\n');
 
 const S4_AT = Date.parse('2026-10-25T17:00:00.000Z');   // Sunday 11:00:00 MT
 const S4_MIN = 60_000;
 
-function earlyRoomsWorld(opts: { leadEnv?: string; overflowMax?: number; balance?: '0' | '1'; suspended?: string[]; screenGate?: Promise<void> } = {}) {
+function earlyRoomsWorld(opts: { leadEnv?: string; overflowMax?: number; balance?: '0' | '1'; suspended?: string[]; screenGate?: Promise<void>; extraCode?: string } = {}) {
   jest.setSystemTime(S4_AT - 30 * S4_MIN);
   const qualifierTournaments = new Map<string, any>();
   const tm = new TournamentManager();
@@ -2321,7 +2347,7 @@ function earlyRoomsWorld(opts: { leadEnv?: string; overflowMax?: number; balance
     ensureChipsForBuyIn: async () => 0, deductChips: async () => false, addChipsToUser: async () => true,
     app: { post: (p: string, fn: (req: any, res: any) => void) => { routes.set(p, fn); } },
   };
-  const { exports: m } = load(`${S4_CODE}\nfunction wire(socket) {\n${S4_SEAT_SESSION_FOR}\n  ${S4_HANDLERS}\n}`, scope, `{
+  const { exports: m } = load(`${S4_CODE}\n${opts.extraCode || ''}\nfunction wire(socket) {\n${S4_SEAT_SESSION_FOR}\n  ${S4_HANDLERS}\n}`, scope, `{
     wire, applyQualifierSchedule, qualifierList, tickQualifierAutoStart, tickQualifierScreens, runPreStartDeal, qualifierPreStartHolds,
     qualifierPreStart, qualifierPreStartHealth, qualifierNoShows, sweepTournamentRebalances, handleTableRebalance,
     serviceQualifierOverflowTables, startFreshTournamentTable, qualifierOverflowTables, applyDirectorPause, tournamentClockStateFor,
@@ -2594,18 +2620,82 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     for (const id of w.tour().tableIds) expect(w.tables.get(id)!.handNumber).toBe(1);
   });
 
-  it('E7 — fewer than 2 present at the start second: the seated entrants are KEPT (and dealt), only the absent PENDING registrants released', async () => {
-    const { w } = await openedEarly(4, 2);                                   // 2 seated, 2 pending
+  // Review fix-up — E7 asserted the defect: with fewer than 2 present the seated
+  // ABSENT entrants were dealt (a no-show lost his credit and could finish in a
+  // seat-paying place). Now: the wait of before, then the deal or the cancel.
+  it('E7 — fewer than 2 present at the start second: NO card and NOBODY released, the hold stays (the wait of before); two present again → the next sweep deals, the absent ones released + refunded then', async () => {
+    const { w } = await openedEarly(4, 2);                                   // S1, S2 seated; S3, S4 pending (offline)
+    const tid = w.qt().tournamentId;
+    const credits = new Map(w.qt().players.map((p: any) => [p.masterPlayerId, p.consumedCreditId]));
     w.offline('S2');                                                         // one seated leaves: 1 present
-    jest.advanceTimersByTime(10 * S4_MIN);
+    jest.advanceTimersByTime(10 * S4_MIN);                                   // 11:00:00 — the hold's timer
     await flush();
     const t = w.tour();
-    expect(w.creditRefunds).toHaveLength(2);
-    expect(w.qt().players.map((p: any) => p.masterPlayerId)).toEqual(['m-1', 'm-2']);
+    expect(w.m.qualifierPreStartHolds.has(tid)).toBe(true);
+    expect(t).toMatchObject({ status: 'running', paused: true, pauseReason: 'prestart', levelEndsAt: null });
+    for (const id of t.tableIds) expect(w.tables.get(id)!.handNumber).toBe(0);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.qt().players.map((p: any) => p.masterPlayerId)).toEqual(['m-1', 'm-2', 'm-3', 'm-4']);
     expect(t.players.map((p: any) => p.playerId)).toEqual(['user-1001', 'user-1002']);
-    expect(t.tableIds).toHaveLength(1);
+    // The 5 s sweep and the 30 s tick keep waiting; it is logged ONCE.
+    for (let k = 0; k < 4; k++) { jest.advanceTimersByTime(30_000); w.m.sweepTournamentRebalances(); w.m.tickQualifierAutoStart(Date.now()); }
+    await flush();
+    for (const id of t.tableIds) expect(w.tables.get(id)!.handNumber).toBe(0);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.logEvents('qualifier_prestart_deal_waiting')).toEqual([expect.objectContaining({ qualifierId: WEEKLY, tournamentId: tid, present: 1, registrants: 4 })]);
+    expect(w.m.qualifierPreStart).toMatchObject({ dealsWaiting: 1, dealt: 0, released: 0, holdErrors: 0 });
+    expect(w.m.qualifierPreStartHealth().held).toEqual([{ qualifierId: WEEKLY, tournamentId: tid, dealsAt: new Date(S4_AT).toISOString(), waitingSince: new Date(S4_AT).toISOString() }]);
+    expect(w.m.qualifierList(null)[0]).toMatchObject({ tablesOpen: true });
+    // 11:02 — a pending one is back: two present → the next sweep deals.
+    w.mkSocket('S3', 3);
+    w.m.sweepTournamentRebalances();
+    await flush();
+    const dealtAt = Date.now();
+    expect(w.m.qualifierPreStartHolds.has(tid)).toBe(false);
+    expect([...w.creditRefunds].sort()).toEqual([credits.get('m-2'), credits.get('m-4')].sort());   // the absent ones, once each
+    expect(w.qt().players.map((p: any) => p.masterPlayerId)).toEqual(['m-1', 'm-3']);
+    expect(t.players.map((p: any) => p.playerId).sort()).toEqual(['user-1001', 'user-1003']);
+    expect(w.playerSessions.get('S3')).toMatchObject({ playerId: 'user-1003' });
     expect(w.tables.get(t.tableIds[0])!.handNumber).toBe(1);
-    expect(t.paused).toBe(false);
+    expect(t).toMatchObject({ paused: false, pauseReason: null, levelEndsAt: dealtAt + 12 * S4_MIN });   // the FULL level 1 from the deal
+    expect(w.logEvents('qualifier_prestart_deal')).toEqual([expect.objectContaining({ released: 2, seated: 1, alive: 2, waitedMs: 2 * S4_MIN })]);
+    expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
+  });
+
+  it('E7b — still fewer than 2 present when late registration ends: CANCELLED as before — the held tables close (nothing was dealt), every credit (seated and pending) refunded exactly once, everyone online told too_few_players', async () => {
+    const { w } = await openedEarly(4, 2, { extraCode: S4_CLOSE_CODE });
+    const tid = w.qt().tournamentId;
+    const tables0 = [...w.tour().tableIds];
+    const credits = w.qt().players.map((p: any) => p.consumedCreditId);
+    w.offline('S2');
+    jest.advanceTimersByTime(10 * S4_MIN);                                   // 11:00 — waiting
+    w.tickAt(S4_AT + LATE - 30_000);                                         // 1:59:30 PM — still waiting
+    await flush();
+    expect(w.m.qualifierPreStartHolds.has(tid)).toBe(true);
+    expect(w.qt().status).toBe('running');
+    expect(w.creditRefunds).toEqual([]);
+    w.tickAt(S4_AT + LATE + 1000);                                           // past the late close
+    await flush();
+    expect(w.qt()).toMatchObject({ status: 'finished', cancelled: true });
+    expect(w.m.qualifierPreStartHolds.size).toBe(0);
+    expect([...w.creditRefunds].sort()).toEqual([...credits].sort());
+    expect(new Set(w.creditRefunds).size).toBe(4);
+    expect(w.tm.getTournament(tid)!.status).toBe('cancelled');
+    for (const id of tables0) {
+      expect(w.tables.has(id)).toBe(false);
+      expect(w.roomEmits).toContainEqual([`table:${id}`, 'tableClosed', { tableId: id, reason: 'tournament_cancelled', tournamentId: tid }]);
+    }
+    expect(w.playerSessions.has('S1')).toBe(false);
+    expect(w.of('S1', 'qualifierCancelled')).toEqual([{ qualifierId: WEEKLY, reason: 'too_few_players', creditRefunded: true }]);
+    expect(w.m.qualifierPreStart).toMatchObject({ dealt: 0, cancelledTooFew: 1, dealsWaiting: 1 });
+    expect(w.logEvents('qualifier_prestart_cancelled')).toEqual([expect.objectContaining({ tournamentId: tid, reason: 'too_few_players', tables: 1, registrants: 4 })]);
+    // Nothing more: no deal, no second refund.
+    jest.advanceTimersByTime(60_000);
+    w.m.sweepTournamentRebalances();
+    w.m.tickQualifierAutoStart(Date.now());
+    await flush();
+    expect(w.creditRefunds).toHaveLength(4);
+    expect(w.m.qualifierPreStart.dealt).toBe(0);
   });
 
   it('E8 — lead 0 (QUALIFIER_TABLES_OPEN_BEFORE_MIN=0): nothing opens early; the start second takes the path of before (dealt at once, no hold)', async () => {
@@ -2766,6 +2856,157 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     void s6;
   });
 
+  it('E17 — the way BACK after the open: POST tables-open {minutes:0, closeOpen:true} closes the held tables (nothing dealt, no credit touched); the event is registering again and starts at 11:00 exactly as with the lead at 0', async () => {
+    const { w } = await openedEarly(20, 8, { extraCode: S4_CLOSE_CODE });
+    const tid = w.qt().tournamentId;
+    const tables0 = [...w.tour().tableIds];
+    const late = w.mkSocket('S31', 31);                                      // a late entry during the hold: one consume
+    await late.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'P31' });
+    expect(w.consumed).toHaveLength(21);
+    // Refused, nothing changes: closeOpen with a lead above 0, a bad closeOpen, no token.
+    expect(w.route('/api/qualifiers/tables-open', { minutes: 5, closeOpen: true }, 't')).toMatchObject({ status: 400, body: { success: false, minutes: 10 } });
+    expect(w.route('/api/qualifiers/tables-open', { minutes: 0, closeOpen: 'yes' }, 't')).toMatchObject({ status: 400 });
+    expect(w.route('/api/qualifiers/tables-open', { minutes: 0, closeOpen: true })).toMatchObject({ status: 403 });
+    expect(w.m.qualifierPreStartHolds.has(tid)).toBe(true);
+    expect(w.m.qualifierPreStartHealth().leadMin).toBe(10);
+    jest.advanceTimersByTime(3 * S4_MIN);                                    // 10:53
+    expect(w.route('/api/qualifiers/tables-open', { minutes: 0, closeOpen: true }, 't'))
+      .toEqual({ status: 200, body: { success: true, previous: 10, minutes: 0, held: 1, closed: 1 } });
+    expect(w.m.qualifierPreStartHolds.size).toBe(0);
+    expect(w.qt()).toMatchObject({ status: 'registering', tournamentId: null });
+    expect(w.qt().players).toHaveLength(21);                                 // every registration stays…
+    expect(w.creditRefunds).toEqual([]);                                     // …with its credit
+    expect(w.consumed).toHaveLength(21);
+    expect(w.tm.getTournament(tid)!.status).toBe('cancelled');
+    for (const id of tables0) {
+      expect(w.tables.has(id)).toBe(false);
+      expect(w.roomEmits).toContainEqual([`table:${id}`, 'tableClosed', { tableId: id, reason: 'tables_reopen_at_start', tournamentId: tid }]);
+    }
+    expect(w.playerSessions.has('S1')).toBe(false);
+    expect(w.playerSessions.has('S31')).toBe(false);
+    expect(w.m.qualifierList(null)[0]).toMatchObject({ status: 'registering' });
+    expect(w.m.qualifierList(null)[0].tablesOpen).toBeUndefined();
+    expect(w.globalEmits.filter(([ev]) => ev === 'qualifierTournamentUpdate').map(([, d]) => d).pop()).toMatchObject({ status: 'registering', tournamentId: null, registeredCount: 21 });
+    expect(w.audits.filter((a) => a.action === 'QUALIFIER_TABLES_OPEN_CLOSED').map((a) => a.d)).toEqual([{ qualifierId: WEEKLY, tournamentId: tid, tables: 3, registrants: 21 }]);
+    expect(w.m.qualifierPreStart.closedByOperator).toBe(1);
+    // It never re-opens before the start (the lead is 0)…
+    w.tickAt(S4_AT - 5 * S4_MIN);
+    w.tickAt(S4_AT - 20_000);
+    expect(w.qt().status).toBe('registering');
+    expect(w.m.qualifierPreStart.opened).toBe(1);
+    // …and 11:00 is the start of before: the 8 no-shows released + refunded, the 13 here seated and dealt at once.
+    jest.advanceTimersByTime(20_000 + 250);                                  // S1's on-time timer
+    await flush();
+    const t = w.tour();
+    expect(w.qt().tournamentId).not.toBe(tid);
+    expect(t.paused).toBe(false);
+    expect(w.qt().players).toHaveLength(13);
+    expect(w.creditRefunds).toHaveLength(8);
+    expect(t.players).toHaveLength(13);
+    for (const id of t.tableIds) expect(w.tables.get(id)!.handNumber).toBe(1);
+    expect(w.consumed).toHaveLength(21);
+    expect(w.m.qualifierPreStartHolds.size).toBe(0);
+  });
+
+  it('E18 — a seated registrant who went back to the lobby during the hold (a voluntary absence) and is online at the deal is put back on his seat, as the start of before bound every online registrant; CONTROL: one whose socket plays a cash table stays absent; one at his table is not touched', async () => {
+    const { w } = await openedEarly(6, 0, { extraCode: S4_SEATS_CODE });
+    const tid = w.qt().tournamentId;
+    const va = w.scope.voluntarilyAbsentTournamentEntrants as Map<string, number>;
+    // S1 leaves the idle table for the lobby (keepTournamentSeatOnLeave: the session ends, the voluntary mark).
+    const seat1 = { ...w.playerSessions.get('S1') };
+    w.playerSessions.delete('S1');
+    va.set(`${tid}\u0000user-1001`, Date.now());
+    // S2 leaves too and sits down at a cash table on the same socket.
+    const seat2 = { ...w.playerSessions.get('S2') };
+    const cash = new PokerTable({ tableId: 'CASH', tableName: 'Cash', smallBlind: 1, bigBlind: 2, minBuyIn: 100, maxBuyIn: 1000, maxPlayers: 9 } as any);
+    w.tables.set('CASH', cash);
+    expect(cash.sitDown(0, 'P2', 100, 'user-1002', false)).toBe(true);
+    w.playerSessions.set('S2', { socketId: 'S2', tableId: 'CASH', seatIndex: 0, playerName: 'P2', playerId: 'user-1002' });
+    va.set(`${tid}\u0000user-1002`, Date.now());
+    const seat3 = { ...w.playerSessions.get('S3') };
+    jest.advanceTimersByTime(10 * S4_MIN);                                   // 11:00 — the deal
+    await flush();
+    const t = w.tour();
+    expect(t.paused).toBe(false);
+    expect(w.tables.get(seat1.tableId)!.handNumber).toBe(1);
+    // S1 is back on HIS seat (the seat kept its stack; nothing moved it — one table).
+    expect(w.playerSessions.get('S1')).toMatchObject({ tableId: seat1.tableId, seatIndex: seat1.seatIndex, playerId: 'user-1001' });
+    expect(w.of('S1', 'reconnectedToTable')).toEqual([{ tableId: seat1.tableId, seatIndex: seat1.seatIndex, tournamentId: tid, sittingOut: false }]);
+    expect(va.has(`${tid}\u0000user-1001`)).toBe(false);
+    expect(w.sockets.get('S1').rooms.has(`table:${seat1.tableId}`)).toBe(true);
+    // CONTROL — S2's socket plays the cash seat: untouched, his tournament seat stays absent.
+    expect(w.playerSessions.get('S2').tableId).toBe('CASH');
+    expect(w.of('S2', 'reconnectedToTable')).toEqual([]);
+    expect(va.has(`${tid}\u0000user-1002`)).toBe(true);
+    expect(w.tables.get(seat2.tableId)!.seats[seat2.seatIndex].playerId).toBe('user-1002');
+    // CONTROL — S3 was at his table: no restore frame.
+    expect(w.playerSessions.get('S3')).toMatchObject({ tableId: seat3.tableId, seatIndex: seat3.seatIndex });
+    expect(w.of('S3', 'reconnectedToTable')).toEqual([]);
+    expect(w.m.qualifierPreStart.reboundAtDeal).toBe(1);
+    expect(w.logEvents('qualifier_prestart_deal')).toEqual([expect.objectContaining({ rebound: 1, released: 0, alive: 6 })]);
+    expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
+  });
+
+  it('E19 — a registrant may still WITHDRAW while held (as until 11:00 before the open): a seated one\'s seat goes (told seatVacated; nothing was dealt), a pending one is dropped; each credit refunded once; after the deal, the refusal of before', async () => {
+    const { w } = await openedEarly(6, 2);                                   // S1-S4 seated, S5 + S6 pending (offline)
+    const tid = w.qt().tournamentId;
+    const credits = new Map(w.qt().players.map((p: any) => [p.masterPlayerId, p.consumedCreditId]));
+    const seat1 = { ...w.playerSessions.get('S1') };
+    await w.sockets.get('S1').handlers.unregisterQualifierTournament({ qualifierId: WEEKLY });
+    await flush();
+    expect(w.of('S1', 'qualifierRegistrationResult').pop()).toMatchObject({ success: true, unregistered: true, registered: false });
+    expect(w.creditRefunds).toEqual([credits.get('m-1')]);
+    expect(w.qt().players.map((p: any) => p.masterPlayerId)).not.toContain('m-1');
+    expect(w.tour().players.map((p: any) => p.playerId)).not.toContain('user-1001');
+    expect(w.tour().entries).toBe(3);
+    expect(w.tables.get(seat1.tableId)!.seats[seat1.seatIndex].state).toBe('empty');
+    expect(w.playerSessions.has('S1')).toBe(false);
+    expect(w.of('S1', 'seatVacated')).toEqual([{ tableId: seat1.tableId, seatIndex: seat1.seatIndex, reason: 'withdrawn' }]);
+    expect(w.sockets.get('S1').rooms.has(`table:${seat1.tableId}`)).toBe(false);
+    // A PENDING one (back online, not seated yet) withdraws.
+    const s5 = w.mkSocket('S5', 5);
+    await s5.handlers.unregisterQualifierTournament({ qualifierId: WEEKLY });
+    await flush();
+    expect(w.of('S5', 'qualifierRegistrationResult').pop()).toMatchObject({ success: true, unregistered: true });
+    expect(w.creditRefunds).toEqual([credits.get('m-1'), credits.get('m-5')]);
+    expect(w.m.qualifierPreStart.withdrawnDuringHold).toBe(2);
+    for (const id of w.tour().tableIds) expect(w.tables.get(id)!.handNumber).toBe(0);
+    // 11:00 — S2-S4 dealt; S6 (absent, pending) released + refunded.
+    jest.advanceTimersByTime(10 * S4_MIN);
+    await flush();
+    expect(w.tables.get(w.tour().tableIds[0])!.handNumber).toBe(1);
+    expect([...w.creditRefunds].sort()).toEqual([credits.get('m-1'), credits.get('m-5'), credits.get('m-6')].sort());
+    // After the deal: "already started", as before; nothing refunded.
+    await w.sockets.get('S2').handlers.unregisterQualifierTournament({ qualifierId: WEEKLY });
+    await flush();
+    expect(w.of('S2', 'qualifierRegistrationResult').pop()).toMatchObject({ success: false, code: 'registration_closed' });
+    expect(w.creditRefunds).toHaveLength(3);
+    expect(w.tour().players.map((p: any) => p.playerId)).toContain('user-1002');
+    void tid;
+  });
+
+  it('E20 — the balance switch OFF: the deal still levels the tables (the start\'s seating — [9,9,1] after 8 no-shows on one table is left within one, every table dealt)', async () => {
+    const { w } = await openedEarly(27, 0, { balance: '0', extraCode: S4_SEATS_CODE });
+    const t = w.tour();
+    expect(w.tableAlive()).toEqual([9, 9, 9]);
+    // 10:51 — eight of the third table's players go offline (absent at 11:00: released).
+    jest.advanceTimersByTime(S4_MIN);
+    const third = t.tableIds[2];
+    const leaving = [...w.playerSessions].filter(([, s]) => s.tableId === third).map(([sid]) => sid).slice(0, 8);
+    expect(leaving).toHaveLength(8);
+    for (const sid of leaving) w.offline(sid);
+    jest.advanceTimersByTime(9 * S4_MIN);                                    // 11:00
+    await flush();
+    const alive = w.tableAlive();
+    expect(alive.reduce((a, b) => a + b, 0)).toBe(19);
+    expect(alive).toHaveLength(3);
+    expect(Math.max(...alive) - Math.min(...alive)).toBeLessThanOrEqual(1);   // [9,9,1] before the fix
+    for (const id of t.tableIds) expect({ id, hand: w.tables.get(id)!.handNumber }).toEqual({ id, hand: 1 });
+    expect(w.logEvents('qualifier_prestart_deal')[0].balanceMoves).toBeGreaterThan(0);
+    expect(w.creditRefunds).toHaveLength(8);
+    expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
+  });
+
   it('wiring — the hold guards sit where the rebalance runs; the default bootstrap still deals; the manifest locks the log tags', () => {
     expect(fnSrc('function handleTableRebalance(tournamentId: string): void {')).toContain('if (qualifierPreStartHolds.has(tournamentId)) return;');
     expect(fnSrc('function sweepTournamentRebalances(')).toContain('if (qualifierPreStartHolds.has(tournamentId)) continue;');
@@ -2776,5 +3017,15 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     for (const tok of ['qualifier_tables_opened_early', 'qualifier_prestart_deal', '/api/qualifiers/tables-open']) expect(manifest).toContain(tok);
     expect(slice('const DURABLE_AUDIT_ACTIONS = new Set([', ']);')).toContain("'QUALIFIER_TABLES_OPEN_SET'");
     expect(SRC).toContain('let qualifierTablesOpenLeadMin = qualifierTablesOpenBeforeMin(process.env.QUALIFIER_TABLES_OPEN_BEFORE_MIN);');
+    // Review fix-up — the wait comes BEFORE the hold is dropped; only the early rooms' deal levels with the switch off;
+    // the break end and a director's resume still read it; the new tags and the durable audit are locked.
+    const deal = fnSrc('function runPreStartDeal(');
+    expect(deal.indexOf('if (preStartDealMustWait(tournamentId, hold, now)) return;')).toBeGreaterThan(0);
+    expect(deal.indexOf('if (preStartDealMustWait(tournamentId, hold, now)) return;')).toBeLessThan(deal.indexOf('qualifierPreStartHolds.delete(tournamentId);'));
+    expect(SRC.split('ignoreSwitch: true').length - 1).toBe(1);
+    expect(deal).toContain('balanceQualifierTablesNow(tournamentId, { ignoreSwitch: true })');
+    expect(fnSrc('function applyDirectorPause(')).toContain('balanceQualifierTablesNow(tournamentId);');
+    for (const tok of ['qualifier_prestart_deal_waiting', 'qualifier_prestart_cancelled', 'qualifier_tables_open_closed']) expect(manifest).toContain(tok);
+    expect(slice('const DURABLE_AUDIT_ACTIONS = new Set([', ']);')).toContain("'QUALIFIER_TABLES_OPEN_CLOSED'");
   });
 });

@@ -1712,3 +1712,11 @@ tournamentClock
 qualifier_tables_opened_early
 qualifier_prestart_deal
 /api/qualifiers/tables-open
+
+# S4 review fix-up (2026-10-23): fewer than 2 present at the start second -> the
+# hold stays (no card, nobody released) and is cancelled + refunded at the late
+# close as before; the operator's way back after the open
+# (POST /api/qualifiers/tables-open {minutes:0, closeOpen:true}).
+qualifier_prestart_deal_waiting
+qualifier_prestart_cancelled
+qualifier_tables_open_closed
