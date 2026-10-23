@@ -1165,6 +1165,76 @@ export class TournamentManager {
     return true;
   }
 
+  /**
+   * 2026-10-24 (owner 2026-10-23, TDA; the HAND-FOR-HAND companion) — these
+   * entrants busted in the SAME hand-for-hand hand, at one table or several. Each
+   * was eliminated at once (eliminatePlayer: alive + 1 at that moment), so their
+   * places followed whichever table's bust check ran first. They are re-placed
+   * among their OWN place numbers by their stack at the START of that hand: the
+   * bigger stack takes the better (smaller) place.
+   *  - Members: entrants of this RUNNING tournament that are eliminated with a
+   *    place (> 0) and not disqualified; ids de-duplicated (the first entry
+   *    counts). Fewer than two → [] and nothing changes.
+   *  - Equal starting stacks: the larger `order` (the caller's table order x
+   *    MAX_SEATS + seat index) takes the better number — the LOWER-numbered seat
+   *    (Qualifier Table 1 before 2) takes the WORSE place, the existing in-table
+   *    rule — and every such group of 2+ gets ONE fresh tie group (overriding an
+   *    in-table one), so finishTournament splits their places' money and marks
+   *    them tied (the existing tie rule; a qualifier's pool is 0).
+   *  - eliminationOrder: the members' slots are refilled worst place first.
+   * Only the members' own numbers are permuted, so places stay a permutation of
+   * 1..N, everyone once (the place range is fixed: hand-for-hand runs only after
+   * the late close). No chip or credit moves. Returns every member's
+   * {playerId, from, to}, best place first.
+   */
+  placeSimultaneousBusts(
+    tournamentId: string, busts: Array<{ playerId: string; startStack: number; order: number }>,
+  ): Array<{ playerId: string; from: number; to: number }> {
+    const t = this.tournaments.get(tournamentId);
+    if (!t || t.status !== 'running' || !Array.isArray(busts)) return [];
+    const seen = new Set<string>();
+    const members: Array<{ p: TournamentPlayer; startStack: number; order: number }> = [];
+    for (const b of busts) {
+      if (!b || typeof b.playerId !== 'string' || seen.has(b.playerId)) continue;
+      const p = t.players.find((x) => x.playerId === b.playerId);
+      if (!p || !p.eliminated || !(p.finishPosition > 0) || p.disqualified) continue;
+      seen.add(b.playerId);
+      members.push({
+        p,
+        startStack: Number.isFinite(b.startStack) ? b.startStack : 0,
+        order: Number.isFinite(b.order) ? b.order : 0,
+      });
+    }
+    if (members.length < 2) return [];
+    const places = members.map((m) => m.p.finishPosition).sort((a, b) => a - b);
+    const ranked = [...members].sort((a, b) => (b.startStack - a.startStack) || (b.order - a.order));
+    const out: Array<{ playerId: string; from: number; to: number }> = [];
+    ranked.forEach((m, k) => {
+      out.push({ playerId: m.p.playerId, from: m.p.finishPosition, to: places[k] });
+      m.p.finishPosition = places[k];
+    });
+    // eliminationOrder runs worst place first: the members' own slots, refilled in that order.
+    const slots: number[] = [];
+    t.eliminationOrder.forEach((id, i) => { if (seen.has(id)) slots.push(i); });
+    if (slots.length === ranked.length) {
+      const worstFirst = [...ranked].reverse().map((m) => m.p.playerId);
+      slots.forEach((slot, k) => { t.eliminationOrder[slot] = worstFirst[k]; });
+    }
+    // An exact tie (equal starting stacks): one fresh tie group per group of 2+.
+    const byStack = new Map<number, TournamentPlayer[]>();
+    for (const m of ranked) {
+      const g = byStack.get(m.startStack) || [];
+      g.push(m.p);
+      byStack.set(m.startStack, g);
+    }
+    for (const g of byStack.values()) {
+      if (g.length < 2) continue;
+      const group = this.nextTieGroup++;
+      for (const p of g) p.tieGroup = group;
+    }
+    return out;
+  }
+
   private finishTournament(tournamentId: string): { finished: boolean; position: number; payout: number } | null {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament) return null;

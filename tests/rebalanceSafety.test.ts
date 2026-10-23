@@ -2351,8 +2351,10 @@ describe('V2 / P-e — a kept-absent seat that busts while its player sits at CA
 
   it('CONTROL — "plays here" read AFTER the elimination: the vacated seat holder is never told eliminatedToSpectator', async () => {
     const BEFORE = '    const bustSidPlaysHere = !!bustSid && playerSessions.get(bustSid)?.tableId === tableId;\n';
-    const AFTER_IF = '        if (toSpectator && sid && sock) {\n';
-    const AFTER_RECOMPUTE = '        toSpectator = !!sid && !!sock && playerSessions.get(sid)?.tableId === tableId && !seatedElsewhere;\n';
+    // 2026-10-24 — the notices moved verbatim into tellTournamentBustNow; "after the
+    // elimination" is now just before the bust check hands it what it decided.
+    const AFTER_IF = '        const bustCtx = { sid: bustSid, toSpectator, seatedElsewhere, playsHere: bustSidPlaysHere };\n';
+    const AFTER_RECOMPUTE = '        toSpectator = !!bustSid && !!bustSock && playerSessions.get(bustSid)?.tableId === tableId && !seatedElsewhere;\n';
     expect(P.helpers).toContain(BEFORE);
     expect(P.helpers).toContain(TO_SPECTATOR);
     expect(P.helpers).toContain(AFTER_IF);
@@ -4986,5 +4988,641 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
     expect(busted && busted.tableId).toBe('TB');
     for (const src of [LATE_SEAT, BUSTED_SEAT, REENTRY]) expect(src).not.toContain('qualifierBalanceOn');
     expect(REENTRY).toContain('reentryTables');
+  });
+});
+
+// ═══════════════════════ 2026-10-24 — H: HAND-FOR-HAND at the qualifier seat bubble ══
+/**
+ * Owner 2026-10-23: "Build it for Sunday" — HAND-FOR-HAND at an online
+ * qualifier's SEAT BUBBLE (Sunday: 15 seats to the top 10, so 11 alive), and
+ * the TDA companion: players busted in the SAME hand-for-hand hand (at the same
+ * or different tables) are placed by their chip count at the START of that hand.
+ *
+ * Engages only when ALL hold: late registration CLOSED (now > lateRegUntil),
+ * 2+ tables in play, alive === seatsForTop + 1 and > 9. Every table is held
+ * between hands; when every table is idle and its bust check has run, the
+ * round's busts are placed (and only THEN told — never a provisional place) and
+ * the next round deals every table ONE hand together. A watchdog releases every
+ * held table after 4 minutes (fail OPEN; never during a pause or a break). The
+ * runtime switch POST /api/qualifiers/hand-for-hand needs no restart.
+ *
+ * The REAL autoStartNextHand, handleHandComplete, runTournamentBustCheck,
+ * tournamentDealHoldReason, restartWaitingTournamentTables, the bootstrap
+ * listener, the 'startHand' handler and the route (the rebalance helpers block
+ * holds the hand-for-hand block), on real PokerTables. Every index.ts slice is
+ * taken INSIDE the world builder: on 5b8ad77 only these tests fail.
+ */
+describe('2026-10-24 (owner 2026-10-23: "Build it for Sunday") — H: HAND-FOR-HAND at the qualifier seat bubble; same-hand busts placed by starting stack', () => {
+  // require (not import): on 5b8ad77 these names do not exist and the rest of this file must still compile.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const QS: Record<string, any> = require('../src/game/qualifierSchedule');
+  const PKG = { 1: 3, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 1 };   // Sunday: top 10 win seats
+  const HOUR = 3600_000;
+  const uniq = (xs: string[]) => [...new Set(xs)];
+  const json = (l: string) => JSON.parse(l.slice(l.indexOf('{')));
+
+  interface HOpts {
+    layout?: Record<string, Entrant[]>;
+    /** Earlier busts (bust()): default TA seats 6 and 7 — 13 entrants, 11 alive. */
+    earlier?: Record<string, number[]>;
+    /** The event's scheduled start (ms); default 3 h 1 min ago = the late window closed a minute ago. null = no scheduledAt. */
+    scheduledAt?: number | null;
+    seatPackage?: Record<number, number> | null;
+    env?: Record<string, string | undefined>;
+    scope?: Record<string, unknown>;
+    config?: Record<string, unknown>;
+    /** qualifierOfTournament answers this many calls, then throws (H12). */
+    qotThrowsAfter?: number;
+  }
+
+  /**
+   * A running weekly qualifier with Sunday's seat package on 9-seat tables:
+   * default TA 8 seats (a6, a7 busted earlier → 6 alive) + TB 5 = 11 alive, 13
+   * entrants. Everyone alive on a live socket. Room emits recorded (with their
+   * .except list); scheduleAutoStart is the world's recorder (`scheduled`).
+   */
+  function hfh(o: HOpts = {}) {
+    const QOT = fnSrc('function qualifierOfTournament(');
+    const DEAL_HOOK = fnSrc('function scheduleDealAfterTournamentSeat(');
+    const SWITCH = [
+      fnSrc('function setQualifierHandForHand('),
+      fnSrc('function internalTokenMatches('),
+      slice("app.post('/api/qualifiers/hand-for-hand'", '\n});\n'),
+    ].join('\n');
+    expect(P.helpers).toContain('// ===== Hand-for-hand at the qualifier seat bubble');
+    const OUT = `
+hx.states = handForHandStates; hx.stats = handForHandStats; hx.tripped = handForHandTripped;
+hx.holdReason = tournamentDealHoldReason; hx.restartWaiting = restartWaitingTournamentTables;
+hx.serviceAll = serviceAllHandForHand; hx.clock = handForHandClockFields; hx.health = handForHandHealth;
+hx.isOn = () => qualifierHandForHandOn;
+`;
+    const hx: Record<string, any> = {};
+    const qualifierTournaments = new Map<string, any>();
+    const routes = new Map<string, (req: any, res: any) => void>();
+    const roomEmits: Array<{ room: string; ev: string; d: any; except: string[] }> = [];
+    const ref: { w?: ReturnType<typeof world> } = {};
+    const io: any = {
+      to: (room: string) => {
+        const op: any = { ex: [] as string[] };
+        op.except = (ids: string | string[]) => { op.ex = [...op.ex, ...(Array.isArray(ids) ? ids : [ids])]; return op; };
+        op.emit = (ev: string, d: any) => roomEmits.push({ room, ev, d, except: op.ex });
+        return op;
+      },
+      emit() {},
+      sockets: { get sockets() { return ref.w!.live; } },
+    };
+    const proc = { env: { INTERNAL_NOTIFY_TOKEN: 'tok', ...(o.env || {}) } as Record<string, string | undefined> };
+    let qotCalls = 0;
+    const qotScope = o.qotThrowsAfter === undefined ? {} : {
+      qualifierOfTournament: (tId: string) => {
+        qotCalls++;
+        if (qotCalls > o.qotThrowsAfter!) throw new Error('registry read failed');
+        for (const [qualId, qt] of qualifierTournaments) if (qt.tournamentId === tId) return { qualId, qt };
+        return null;
+      },
+    };
+    const layout = o.layout ?? { TA: field('a', 8, 5000, 100), TB: field('b', 5, 5000, 200) };
+    const w = world({
+      layout,
+      config: o.config,
+      over: { helpers: `${P.helpers}\n${o.qotThrowsAfter === undefined ? QOT : ''}\n${DEAL_HOOK}\n${SWITCH}\n${OUT}` },
+      scope: {
+        ...persistenceScope(null),
+        qualifierTournaments, hx, process: proc, io,
+        app: { post: (p: string, fn: (req: any, res: any) => void) => { routes.set(p, fn); } }, createHash, timingSafeEqual,
+        qualifierLateEntries: { reentrySeatedOnBustedSeat: 0 }, QUALIFIER_BASE_STACK: 5000,
+        qualifierWindows: QS.qualifierWindows, seatsForTopWith: QS.seatsForTopWith, qualifierTestTimeScale: QS.qualifierTestTimeScale,
+        handForHandApplies: QS.handForHandApplies, qualifierHandForHandOnAtBoot: QS.qualifierHandForHandOnAtBoot,
+        qualifierHandForHandWatchdogMs: QS.qualifierHandForHandWatchdogMs, qualifierHandForHandOnText: QS.qualifierHandForHandOnText,
+        QUALIFIER_HAND_FOR_HAND_TEXT: QS.QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT: QS.QUALIFIER_HAND_FOR_HAND_OFF_TEXT,
+        ...qotScope,
+        ...(o.scope || {}),
+      },
+    });
+    ref.w = w;
+    const earlier = o.earlier ?? (o.layout ? {} : { TA: [6, 7] });
+    for (const [id, seats] of Object.entries(earlier)) bust(w, id, seats);
+    const scheduledAt = o.scheduledAt === null ? undefined : new Date(o.scheduledAt ?? (Date.now() - 3 * HOUR - 60_000)).toISOString();
+    qualifierTournaments.set('Q-weekly', {
+      qualifierId: 'Q-weekly', tournamentId: w.tid, status: 'running', startingStack: 5000, qualifierType: 'weekly',
+      scheduledAt, seatPackage: o.seatPackage === undefined ? PKG : o.seatPackage, players: [],
+    });
+    // Everyone alive on a live socket (his own account).
+    const players = w.tm.getTournament(w.tid)!.players;
+    for (const [id, t] of w.tables) {
+      t.seats.forEach((s, i) => {
+        if (s.state !== 'occupied' || s.eliminated) return;
+        const tp = players.find((p) => p.playerId === s.playerId)!;
+        w.seatLive(`S-${s.playerId}`, id, i, tp.userId!, `m-${s.playerId}`);
+      });
+    }
+    /** POST /api/qualifiers/hand-for-hand through the REAL route: {status, body}. */
+    const post = (body: unknown, token?: string) => {
+      const out: { status: number; body: any } = { status: 200, body: null };
+      const res = { status(c: number) { out.status = c; return res; }, json(b: unknown) { out.body = b; return res; } };
+      routes.get('/api/qualifiers/hand-for-hand')!({ headers: token === undefined ? {} : { 'x-internal-token': token }, body }, res);
+      return out;
+    };
+    const t = (id: string) => w.tables.get(id)!;
+    const ids = () => [...w.tm.getTournament(w.tid)!.tableIds];
+    const lines = (ev: string) => w.logs.filter((l) => l.includes(`"event":"${ev}"`)).map(json);
+    const tp = (pid: string) => w.tm.getTournament(w.tid)!.players.find((p) => p.playerId === pid)!;
+    return { w, hx, proc, post, t, ids, lines, tp, roomEmits, qualifierTournaments };
+  }
+  type H = ReturnType<typeof hfh>;
+
+  /** Every hand boundary the (fake) scheduleAutoStart queued, once each, in order. */
+  function runScheduled(x: H): string[] {
+    const ids = uniq(x.w.scheduled.splice(0));
+    for (const id of ids) x.w.m.autoStartNextHand(id);
+    return ids;
+  }
+  /**
+   * `tableId`'s hand ends (folded out); each of `busts` loses his whole stack to
+   * the first other live seat (chips conserved), then the REAL handleHandComplete
+   * (capture → the persistence awaits → the bust check).
+   */
+  async function endHand(x: H, tableId: string, busts: string[] = []): Promise<void> {
+    const t = x.t(tableId);
+    if (t.isHandInProgress()) foldOut(t);
+    expect(t.currentPhase).toBe(GamePhase.HandComplete);
+    const win = t.seats.findIndex((s) => s.state === 'occupied' && !s.eliminated && s.chipCount > 0 && !busts.includes(s.playerId));
+    for (const pid of busts) {
+      const i = t.seats.findIndex((s) => s.state === 'occupied' && !s.eliminated && s.playerId === pid);
+      expect({ pid, i: i >= 0 }).toEqual({ pid, i: true });
+      t.seats[win].chipCount += t.seats[i].chipCount;
+      t.seats[i].chipCount = 0;
+    }
+    await x.w.m.handleHandComplete(tableId, win >= 0 ? [{ seatIndex: win, amount: 1 }] : []);
+  }
+  /** Both tables idle at a hand end (nothing dealt yet): TA's boundary engages, TB's gathers, round 1 deals both ONE hand. */
+  async function toRound1(x: H): Promise<void> {
+    for (const id of x.ids()) (x.t(id) as any).currentPhase = GamePhase.HandComplete;
+    x.w.m.autoStartNextHand('TA');
+    x.w.m.autoStartNextHand('TB');
+    expect(x.t('TA').handNumber + x.t('TB').handNumber).toBe(0);
+    await flush();
+    expect(runScheduled(x)).toEqual(['TA', 'TB']);
+    expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([1, 1]);
+  }
+  const notices = (s: any) => s.emitted.filter(([ev]: [string]) => ev === 'eliminatedToSpectator' || ev === 'playerEliminated');
+  const roomBusts = (x: H, pid: string) => x.roomEmits.filter((e) => e.ev === 'playerEliminated' && e.d.playerId === pid);
+  const announcements = (x: H) => x.roomEmits.filter((e) => e.ev === 'serverAnnouncement').map((e) => [e.room, e.d.kind, e.d.on]);
+  /** Play the tournament out (TournamentManager) and return its final places, sorted. */
+  function playOut(x: H, keep: string): number[] {
+    const t = playDownTo(x.w, keep);
+    expect(t.status).toBe('finished');
+    return t.players.map((p) => p.finishPosition).sort((a, b) => a - b);
+  }
+  const permutation = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
+
+  it('H1 — engaged at the bubble (late close passed, 2 tables, 11 alive, top 10): a table that ends its hand while the other is mid-hand does NOT deal; when both are idle round 1 deals every table ONE hand together; a table that finished its round hand waits again', async () => {
+    const x = hfh();
+    const TA = x.t('TA');
+    const TB = x.t('TB');
+    expect(TB.startNewHand()).toBe(true);                                    // TB mid-hand (before hand-for-hand)
+    (TA as any).currentPhase = GamePhase.HandComplete;                       // TA at its hand end
+    x.w.m.autoStartNextHand('TA');
+    expect(TA.handNumber).toBe(0);                                           // HELD — 5b8ad77 dealt hand 1 here
+    expect(x.lines('qualifier_hand_for_hand_engaged')).toEqual([expect.objectContaining({
+      tournamentId: x.w.tid, qualifierId: 'Q-weekly', alive: 11, seatsForTop: 10, tables: 2, watchdogMs: 240_000,
+    })]);
+    expect(announcements(x)).toEqual([['table:TA', 'hand_for_hand', true], ['table:TB', 'hand_for_hand', true]]);
+    expect(x.roomEmits.find((e) => e.ev === 'serverAnnouncement')!.d.message)
+      .toBe('Hand-for-hand: 11 players left and the top 10 win seats. Every table now plays one hand at a time; your table waits for the others between hands.');
+    expect(x.hx.holdReason('TA', x.w.tid, TA)).toBe('hand_for_hand');
+    await flush();
+    expect(x.w.scheduled).toEqual([]);                                       // TB still mid-hand: no round yet
+    await endHand(x, 'TB');                                                  // TB's (pre-engagement) hand ends
+    x.w.m.autoStartNextHand('TB');
+    expect(TB.handNumber).toBe(1);                                           // held too
+    await flush();
+    expect(uniq(x.w.scheduled)).toEqual(['TA', 'TB']);                       // round 1: both kicked in ONE pass
+    expect(x.lines('qualifier_hand_for_hand_round')).toEqual([{
+      event: 'qualifier_hand_for_hand_round', tournamentId: x.w.tid, round: 1, alive: 11,
+      tables: [{ tableId: 'TA', hand: 1, alive: 6 }, { tableId: 'TB', hand: 2, alive: 5 }],
+    }]);
+    runScheduled(x);
+    expect([TA.handNumber, TB.handNumber]).toEqual([1, 2]);                  // each table: exactly ONE hand
+    expect(TA.isHandInProgress() && TB.isHandInProgress()).toBe(true);
+    // TA ends its round hand while TB is still in its: TA waits (the server timer and a repeated boundary).
+    await endHand(x, 'TA');
+    x.w.m.autoStartNextHand('TA');
+    x.w.m.autoStartNextHand('TA');
+    expect(TA.handNumber).toBe(1);
+    expect(x.hx.health()).toMatchObject({ on: true, engagedTotal: 1, rounds: 1, errors: 0, watchdogReleases: 0 });
+    expect(x.hx.health().engaged).toEqual([expect.objectContaining({ tournamentId: x.w.tid, qualifierId: 'Q-weekly', round: 1, gathering: false, held: 1 })]);
+    // TB ends: round 2 deals both together again.
+    await endHand(x, 'TB');
+    x.w.m.autoStartNextHand('TB');
+    await flush();
+    expect(runScheduled(x)).toEqual(['TA', 'TB']);
+    expect([TA.handNumber, TB.handNumber]).toEqual([2, 3]);
+    expect(x.hx.stats).toMatchObject({ rounds: 2, errors: 0 });
+    expect([...x.w.stubbed].filter((n) => /andForHand|qualifierWindows|seatsForTop|qualifierOfTournament/.test(n))).toEqual([]);
+  });
+
+  it('H2 — engages ONLY when every condition holds: the late window open, 12 alive, one table, the switch off, no scheduledAt → the table deals at once; the all-hold case holds', async () => {
+    const dealsAtOnce = (o: HOpts) => {
+      const x = hfh(o);
+      for (const id of x.ids()) if (id !== 'TA') expect(x.t(id).startNewHand()).toBe(true);   // the others mid-hand
+      (x.t('TA') as any).currentPhase = GamePhase.HandComplete;
+      x.w.m.autoStartNextHand('TA');
+      return { dealt: x.t('TA').handNumber === 1, engaged: x.lines('qualifier_hand_for_hand_engaged').length };
+    };
+    expect(dealsAtOnce({ scheduledAt: Date.now() - 1 * HOUR })).toEqual({ dealt: true, engaged: 0 });                      // late registration open
+    expect(dealsAtOnce({ scheduledAt: Date.now() - 3 * HOUR })).toEqual({ dealt: true, engaged: 0 });                      // now === lateRegUntil
+    expect(dealsAtOnce({ earlier: { TA: [7] } })).toEqual({ dealt: true, engaged: 0 });                                    // 12 alive
+    expect(dealsAtOnce({ layout: { TA: field('a', 9, 5000, 100) }, seatPackage: { 1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 1, 8: 1 } })).toEqual({ dealt: true, engaged: 0 });   // one table at its bubble
+    expect(dealsAtOnce({ env: { QUALIFIER_HAND_FOR_HAND: '0' } })).toEqual({ dealt: true, engaged: 0 });                 // the switch off at boot
+    expect(dealsAtOnce({ scheduledAt: null })).toEqual({ dealt: true, engaged: 0 });                                      // no schedule
+    expect(dealsAtOnce({ seatPackage: null })).toEqual({ dealt: true, engaged: 0 });                                      // the standard top 3
+    expect(dealsAtOnce({})).toEqual({ dealt: false, engaged: 1 });                                                        // ALL hold → held
+  });
+
+  it('H3 — a table whose round-hand bust check is still pending keeps the round unsettled; when it runs (its re-kick) the round settles and round 2 kicks every table together', async () => {
+    let holdNext: Promise<void> | null = null;
+    const hold = deferred();
+    const x = hfh({ scope: { mergeUserStats: async () => { const h = holdNext; if (h) await h; } } });
+    await toRound1(x);
+    foldOut(x.t('TB'));
+    holdNext = hold.p;
+    const tbDone = x.w.m.handleHandComplete('TB', [{ seatIndex: 0, amount: 1 }]);   // its capture is pending…
+    holdNext = null;
+    expect(x.w.m.tournamentBustChecksPending.get('TB')?.size).toBe(1);
+    x.w.m.autoStartNextHand('TB');                                           // S1: waits for its bust check
+    await endHand(x, 'TA');
+    x.w.m.autoStartNextHand('TA');                                           // held
+    await flush();
+    expect(x.lines('qualifier_hand_for_hand_round')).toHaveLength(1);        // NOT settled: TB's check has not run
+    expect(x.w.scheduled.filter((id) => id === 'TA')).toEqual([]);
+    expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([1, 1]);
+    x.w.scheduled.length = 0;
+    hold.resolve();
+    await tbDone;
+    await flush();
+    expect(x.w.scheduled).toEqual(['TB']);                                   // S1's re-kick
+    runScheduled(x);                                                         // TB's boundary: held → the round settles
+    await flush();
+    expect(x.lines('qualifier_hand_for_hand_round').map((l) => l.round)).toEqual([1, 2]);
+    expect(runScheduled(x)).toEqual(['TA', 'TB']);
+    expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([2, 2]);
+  });
+
+  it('H4 — same-hand busts at TWO tables are placed by starting stack (a0 9,000 → 10th, b0 3,000 → 11th, although a0\'s check ran first), and told ONLY at the settle, once each, with the FINAL place', async () => {
+    const layout = { TA: field('a', 8, 5000, 100), TB: field('b', 5, 5000, 200) };
+    layout.TA[0].stack = 9000;
+    layout.TB[0].stack = 3000;
+    const x = hfh({ layout, earlier: { TA: [6, 7] } });
+    const total = x.w.chipsInPlay();
+    const sA0 = x.w.live.get('S-a0');
+    const sB0 = x.w.live.get('S-b0');
+    await toRound1(x);
+    await endHand(x, 'TA', ['a0']);                                          // a0's check runs FIRST
+    expect(x.tp('a0')).toMatchObject({ eliminated: true, finishPosition: 11 });   // provisional (eliminated at once)
+    x.w.m.autoStartNextHand('TA');                                           // held (TB mid-hand)
+    await flush();
+    await endHand(x, 'TB', ['b0']);                                          // 9 alive → Rule 1 breaks TB into TA
+    expect(x.ids()).toEqual(['TA']);
+    expect(x.w.seatless()).toEqual([]);
+    expect(x.w.couldNotPlace()).toEqual([]);
+    // Nothing told yet: no direct notice, no room copy.
+    expect([notices(sA0), notices(sB0), roomBusts(x, 'a0'), roomBusts(x, 'b0')]).toEqual([[], [], [], []]);
+    runScheduled(x);                                                         // TA's boundary → the settle
+    await flush();
+    expect([x.tp('a0').finishPosition, x.tp('b0').finishPosition]).toEqual([10, 11]);   // 5b8ad77: a0 11th, b0 10th
+    expect(notices(sA0)).toEqual([['eliminatedToSpectator', expect.objectContaining({ tournamentId: x.w.tid, tableId: 'TA', position: 10 })]]);
+    expect(notices(sB0)).toEqual([['eliminatedToSpectator', expect.objectContaining({ tournamentId: x.w.tid, tableId: 'TA', position: 11 })]]);
+    expect(roomBusts(x, 'a0').map((e) => [e.room, e.d.position, e.d.handForHand])).toEqual([['table:TA', 10, true]]);
+    expect(roomBusts(x, 'b0').map((e) => [e.room, e.d.position, e.d.handForHand])).toEqual([['table:TA', 11, true]]);
+    // Worst place told first.
+    expect(x.roomEmits.findIndex((e) => e.ev === 'playerEliminated' && e.d.playerId === 'b0'))
+      .toBeLessThan(x.roomEmits.findIndex((e) => e.ev === 'playerEliminated' && e.d.playerId === 'a0'));
+    expect(x.lines('qualifier_hand_for_hand_busts_placed')).toEqual([{
+      event: 'qualifier_hand_for_hand_busts_placed', tournamentId: x.w.tid, round: 1, running: true,
+      busts: [
+        { playerId: 'a0', tableId: 'TA', seatIndex: 0, startStack: 9000, from: 11, to: 10 },
+        { playerId: 'b0', tableId: 'TB', seatIndex: 0, startStack: 3000, from: 10, to: 11 },
+      ],
+    }]);
+    expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_HAND_FOR_HAND_PLACES')).toHaveLength(1);
+    expect(x.hx.stats).toMatchObject({ bustsPlaced: 2, placesChanged: 2, errors: 0 });
+    // 9 alive: the bubble burst — released, everyone told.
+    expect(x.lines('qualifier_hand_for_hand_ended')).toEqual([expect.objectContaining({ reason: 'bubble_burst', rounds: 1, alive: 9 })]);
+    expect(x.w.chipsInPlay()).toBe(total);
+    expect(x.w.credits).toEqual([]);
+    expect(playOut(x, 'a1')).toEqual(permutation(13));
+    expect([x.tp('a0').finishPosition, x.tp('b0').finishPosition]).toEqual([10, 11]);
+  });
+
+  it('H5 — the bubble bursts (one bust in a round): released (bubble_burst) at the settle, both tables re-kicked, the end announced, the clock fields gone; then a table deals on without waiting', async () => {
+    const x = hfh();
+    await toRound1(x);
+    await endHand(x, 'TA', ['a1']);
+    x.w.m.autoStartNextHand('TA');
+    await endHand(x, 'TB');
+    x.w.m.autoStartNextHand('TB');
+    expect(x.hx.clock(x.w.tid)).toEqual({ handForHand: true, handForHandRound: 1, handForHandText: 'Hand-for-hand: waiting for the other tables to finish their hand' });
+    await flush();
+    expect(x.tp('a1').finishPosition).toBe(11);
+    expect(notices(x.w.live.get('S-a1'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11 })]]);
+    expect(x.lines('qualifier_hand_for_hand_ended')).toEqual([{ event: 'qualifier_hand_for_hand_ended', tournamentId: x.w.tid, reason: 'bubble_burst', rounds: 1, alive: 10 }]);
+    expect(announcements(x).slice(-2)).toEqual([['table:TA', 'hand_for_hand', false], ['table:TB', 'hand_for_hand', false]]);
+    expect(x.roomEmits.filter((e) => e.ev === 'serverAnnouncement').pop()!.d.message).toBe('Hand-for-hand is over: normal play resumes.');
+    expect(x.hx.clock(x.w.tid)).toEqual({});
+    expect(x.hx.health()).toMatchObject({ engaged: [], released: expect.objectContaining({ bubble_burst: 1 }) });
+    expect(runScheduled(x)).toEqual(['TA', 'TB']);
+    expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([2, 2]);
+    await endHand(x, 'TA');
+    x.w.m.autoStartNextHand('TA');
+    await endHand(x, 'TA');
+    x.w.m.autoStartNextHand('TA');
+    expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([4, 2]);    // TA dealt twice while TB is mid-hand
+  });
+
+  it('H6 — a table BROKEN mid-round (its 2 busts → 9 alive → Rule 1 breaks idle TA into mid-hand TB): the movers sit TB\'s hand out with their stacks exact; the round settles on TB alone; the busts are placed by starting stack; released', async () => {
+    const layout = { TA: field('a', 6, 5000, 100), TB: field('b', 5, 5000, 200) };
+    layout.TA[1].stack = 4000;
+    layout.TA[2].stack = 7000;
+    const x = hfh({ layout });
+    const total = x.w.chipsInPlay();
+    await toRound1(x);
+    const before = new Map(['a0', 'a3', 'a4', 'a5'].map((pid) => [pid, x.t('TA').seats.find((s) => s.playerId === pid)!]));
+    await endHand(x, 'TA', ['a1', 'a2']);
+    expect(x.ids()).toEqual(['TB']);                                         // TA broken into TB
+    const TB = x.t('TB');
+    expect(TB.isHandInProgress()).toBe(true);
+    for (const [pid, old] of before) {
+      const s = TB.seats.find((z) => z.state === 'occupied' && z.playerId === pid)!;
+      expect({ pid, folded: s.folded, cards: s.holeCards.length, chips: s.chipCount }).toEqual({ pid, folded: true, cards: 0, chips: old.chipCount });
+    }
+    expect(x.w.seatless()).toEqual([]);
+    expect(x.w.couldNotPlace()).toEqual([]);
+    expect([notices(x.w.live.get('S-a1')), notices(x.w.live.get('S-a2'))]).toEqual([[], []]);
+    await endHand(x, 'TB');
+    x.w.m.autoStartNextHand('TB');
+    await flush();
+    expect(x.lines('qualifier_hand_for_hand_busts_placed')[0].busts.map((b: any) => [b.playerId, b.startStack, b.to])).toEqual([['a1', 4000, 11], ['a2', 7000, 10]]);
+    expect(notices(x.w.live.get('S-a1'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11, tableId: 'TB' })]]);
+    expect(notices(x.w.live.get('S-a2'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 10, tableId: 'TB' })]]);
+    expect(x.lines('qualifier_hand_for_hand_ended')).toEqual([expect.objectContaining({ reason: 'bubble_burst', alive: 9 })]);
+    expect(x.w.chipsInPlay()).toBe(total);
+    expect(playOut(x, 'b0')).toEqual(permutation(11));
+  });
+
+  it('H7 — the WATCHDOG fails OPEN: a round stuck 4 minutes (TB never ends its hand) releases every held table (logged, counted, durable audit), trips the event (it deals on at the bubble); {on:1} re-arms it', async () => {
+    const x = hfh();
+    await toRound1(x);
+    await endHand(x, 'TA');
+    x.w.m.autoStartNextHand('TA');                                           // held; TB stuck mid-hand
+    x.w.scheduled.length = 0;
+    jest.advanceTimersByTime(240_000 - 1);
+    expect(x.hx.stats.watchdogReleases).toBe(0);
+    expect(x.w.scheduled).toEqual([]);
+    jest.advanceTimersByTime(1);
+    expect(x.hx.stats).toMatchObject({ watchdogReleases: 1, released: expect.objectContaining({ watchdog: 1 }), errors: 0 });
+    const line = x.lines('qualifier_hand_for_hand_watchdog_released')[0];
+    expect(line).toMatchObject({ tournamentId: x.w.tid, round: 1, heldMs: 240_000, held: ['TA'] });
+    expect(line.waitingOn).toEqual([expect.objectContaining({ tableId: 'TB', handNumber: 1, base: 0, bustCheckPending: false })]);
+    expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_HAND_FOR_HAND_WATCHDOG')).toHaveLength(1);
+    expect([...x.hx.tripped]).toEqual([x.w.tid]);
+    expect(x.hx.health().tripped).toEqual([x.w.tid]);
+    expect(x.w.scheduled).toContain('TA');                                   // released → kicked
+    runScheduled(x);
+    expect(x.t('TA').handNumber).toBe(2);
+    await endHand(x, 'TA');
+    x.w.m.autoStartNextHand('TA');                                           // tripped: no hand-for-hand although 11 alive / 2 tables
+    expect(x.t('TA').handNumber).toBe(3);
+    expect(x.post({ on: 1 }, 'tok').body).toEqual({ success: true, previous: true, on: true, released: 0, rearmed: 1 });
+    await endHand(x, 'TA');
+    x.w.m.autoStartNextHand('TA');
+    expect(x.t('TA').handNumber).toBe(3);                                    // held again
+    expect(x.lines('qualifier_hand_for_hand_engaged')).toHaveLength(2);
+  });
+
+  it('H8 — the watchdog never fires during a director pause or a scheduled break; busts are placed and told during the pause; the resume / break end starts ONE new round with every table dealt once', async () => {
+    // (a) A director pause of 12 minutes with TA held: no release; the sweep settles the round → gathering; resume → round 2.
+    {
+      const x = hfh();
+      await toRound1(x);
+      await endHand(x, 'TA');
+      x.w.m.autoStartNextHand('TA');
+      expect(x.w.tm.pauseTournament(x.w.tid, true)).toBe(true);
+      await endHand(x, 'TB');
+      x.w.m.autoStartNextHand('TB');                                         // paused: holds before the gate
+      jest.advanceTimersByTime(6 * 60_000);
+      x.hx.serviceAll();                                                     // the 5 s sweep
+      expect(x.hx.stats).toMatchObject({ watchdogReleases: 0, rounds: 1 });
+      expect(x.hx.health().engaged).toEqual([expect.objectContaining({ round: null, gathering: true })]);
+      jest.advanceTimersByTime(6 * 60_000);
+      expect(x.hx.stats.watchdogReleases).toBe(0);
+      expect(x.w.tm.pauseTournament(x.w.tid, false)).toBe(true);
+      x.w.m.autoStartNextHand('TA');                                         // the resume's re-kick (applyDirectorPause)
+      x.w.m.autoStartNextHand('TB');
+      expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([1, 1]);
+      await flush();
+      expect(runScheduled(x)).toEqual(['TA', 'TB']);
+      expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([2, 2]);
+      expect(x.hx.stats).toMatchObject({ rounds: 2, watchdogReleases: 0, errors: 0 });
+    }
+    // (b) A bust in the round that ran into the pause: placed and TOLD during the pause (the bubble burst → released; nothing dealt while paused).
+    {
+      const x = hfh();
+      await toRound1(x);
+      await endHand(x, 'TA', ['a1']);
+      x.w.m.autoStartNextHand('TA');
+      expect(x.w.tm.pauseTournament(x.w.tid, true)).toBe(true);
+      await endHand(x, 'TB');
+      x.w.m.autoStartNextHand('TB');
+      expect(notices(x.w.live.get('S-a1'))).toEqual([]);
+      x.hx.serviceAll();
+      expect(notices(x.w.live.get('S-a1'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11 })]]);
+      expect(x.lines('qualifier_hand_for_hand_ended')).toEqual([expect.objectContaining({ reason: 'bubble_burst' })]);
+      runScheduled(x);
+      expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([1, 1]);   // paused: nothing dealt
+    }
+    // (c) A SCHEDULED break (after level 1, 300 s) while TA is held: the watchdog re-arms through it; its end deals round 2.
+    {
+      const x = hfh({ config: { blindLevels: [{ sb: 100, bb: 200, ante: 0, duration: 60 }, { sb: 150, bb: 300, ante: 0, duration: 3600 }], breaks: { everyLevels: 1, seconds: 300 } } });
+      await toRound1(x);
+      await endHand(x, 'TA');
+      x.w.m.autoStartNextHand('TA');
+      jest.advanceTimersByTime(60_000);                                      // the break starts
+      expect(x.w.tm.getTournament(x.w.tid)!.pauseReason).toBe('break');
+      await endHand(x, 'TB');
+      x.w.m.autoStartNextHand('TB');
+      jest.advanceTimersByTime(299_000);
+      expect(x.hx.stats.watchdogReleases).toBe(0);
+      x.w.scheduled.length = 0;
+      jest.advanceTimersByTime(1_000);                                       // the break ends: every table re-kicked
+      expect(x.w.tm.getTournament(x.w.tid)!.paused).toBe(false);
+      expect(runScheduled(x)).toEqual(['TA', 'TB']);                         // both held: the round settles
+      await flush();
+      expect(runScheduled(x)).toEqual(['TA', 'TB']);
+      expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([2, 2]);
+      jest.advanceTimersByTime(200_000);
+      expect(x.hx.stats).toMatchObject({ watchdogReleases: 0, rounds: 2, errors: 0 });
+    }
+    // (d) A pause while a table is still DUE its round hand: after the resume that hand gets the full watchdog
+    //     time (the paused time never counts — no 5 s sweep needed): a 3m50s hand right after the resume is fine.
+    {
+      const x = hfh();
+      for (const id of x.ids()) (x.t(id) as any).currentPhase = GamePhase.HandComplete;
+      x.w.m.autoStartNextHand('TA');
+      x.w.m.autoStartNextHand('TB');
+      await flush();                                                         // round 1 (the watchdog runs from here)
+      expect(uniq(x.w.scheduled.splice(0))).toEqual(['TA', 'TB']);
+      x.w.m.autoStartNextHand('TA');                                         // TA deals its round hand…
+      expect(x.w.tm.pauseTournament(x.w.tid, true)).toBe(true);              // …the pause lands before TB's
+      x.w.m.autoStartNextHand('TB');                                         // paused: TB still DUE (hand 0)
+      await endHand(x, 'TA');
+      x.w.m.autoStartNextHand('TA');
+      jest.advanceTimersByTime(270_000);                                     // 4m30s paused
+      expect(x.hx.stats.watchdogReleases).toBe(0);
+      expect(x.w.tm.pauseTournament(x.w.tid, false)).toBe(true);
+      x.w.m.autoStartNextHand('TA');                                         // the resume's re-kick
+      x.w.m.autoStartNextHand('TB');
+      expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([1, 1]); // TB dealt its round hand; TA holds
+      jest.advanceTimersByTime(230_000);                                     // TB's hand runs 3m50s after the resume
+      expect(x.hx.stats.watchdogReleases).toBe(0);
+      expect(x.hx.health().engaged).toEqual([expect.objectContaining({ round: 1 })]);
+      await endHand(x, 'TB');
+      x.w.m.autoStartNextHand('TB');
+      await flush();
+      expect(runScheduled(x)).toEqual(['TA', 'TB']);
+      expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([2, 2]);
+      expect(x.hx.stats).toMatchObject({ rounds: 2, watchdogReleases: 0, errors: 0 });
+    }
+  });
+
+  it('H9 — POST /api/qualifiers/hand-for-hand: 403 without / with a wrong token, 403 with no token configured, 400 for a bad value; {on:0} while engaged releases AT ONCE (the recorded bust placed and told, the held table kicked); {on:1} answers previous:false', async () => {
+    const x = hfh();
+    expect(x.post({ on: 0 })).toEqual({ status: 403, body: { success: false, error: 'forbidden' } });
+    expect(x.post({ on: 0 }, 'nope')).toEqual({ status: 403, body: { success: false, error: 'forbidden' } });
+    expect(x.post({ on: 'x' }, 'tok')).toEqual({ status: 400, body: { success: false, error: 'on must be 0, 1, true or false', on: true } });
+    expect(x.hx.isOn()).toBe(true);
+    const unset = hfh({ env: { INTERNAL_NOTIFY_TOKEN: undefined } });
+    expect(unset.post({ on: 0 }, 'tok').status).toBe(403);
+    expect(unset.hx.isOn()).toBe(true);
+    await toRound1(x);
+    await endHand(x, 'TA', ['a1']);
+    x.w.m.autoStartNextHand('TA');                                           // held; a1's notice waits
+    expect(notices(x.w.live.get('S-a1'))).toEqual([]);
+    x.w.scheduled.length = 0;
+    expect(x.post({ on: 0 }, 'tok')).toEqual({ status: 200, body: { success: true, previous: true, on: false, released: 1, rearmed: 0 } });
+    expect(notices(x.w.live.get('S-a1'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11 })]]);
+    expect(x.lines('qualifier_hand_for_hand_ended')).toEqual([expect.objectContaining({ reason: 'switch_off' })]);
+    expect(x.lines('qualifier_hand_for_hand_set')).toEqual([expect.objectContaining({ previous: true, on: false, released: 1, actor: 'internal:hand_for_hand' })]);
+    expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_HAND_FOR_HAND_SET')).toEqual([{ actor: 'internal:hand_for_hand', action: 'QUALIFIER_HAND_FOR_HAND_SET', d: { previous: true, on: false, released: 1, rearmed: 0 } }]);
+    expect(runScheduled(x)).toEqual(['TA']);
+    expect(x.t('TA').handNumber).toBe(2);                                    // dealt at once
+    expect(x.post({ on: 1 }, 'tok').body).toEqual({ success: true, previous: false, on: true, released: 0, rearmed: 0 });
+    expect(x.hx.stats.switchChanges).toBe(2);
+  });
+
+  it('H10 — the client\'s startHand: a held HandComplete table does not deal; a held WaitingForPlayers table is answered tournament_hand_held, reason \'hand_for_hand\' (then dealt by the round)', async () => {
+    const x = hfh();
+    (x.t('TA') as any).currentPhase = GamePhase.HandComplete;               // TA at a hand end; TB never dealt (WaitingForPlayers)
+    x.w.m.autoStartNextHand('TA');                                           // engaged, TA held
+    const sA = x.w.wireSocket('S-a1');
+    await sA.handlers.startHand();
+    expect(x.t('TA').handNumber).toBe(0);
+    expect(sA.emitted.filter(([ev]: [string]) => ev === 'error')).toEqual([]);
+    const sB = x.w.wireSocket('S-b1');
+    await sB.handlers.startHand();
+    expect(x.t('TB').handNumber).toBe(0);
+    expect(sB.emitted.filter(([ev]: [string]) => ev === 'error')).toEqual([['error', { message: 'The tournament deals the next hand itself.', code: 'tournament_hand_held', reason: 'hand_for_hand' }]]);
+    await flush();                                                           // both idle → round 1
+    expect(x.t('TB').handNumber).toBe(1);                                    // the waiting table dealt by the round
+    runScheduled(x);
+    expect(x.t('TA').handNumber).toBe(1);
+  });
+
+  it('H11 — the 5 s sweep: a FINISHED tournament\'s state is dropped (watchdog cleared, the waiting notice told with its place as it stands); a settled round no table re-entered is serviced', async () => {
+    {
+      const x = hfh();
+      await toRound1(x);
+      await endHand(x, 'TA', ['a1']);
+      x.w.m.autoStartNextHand('TA');
+      playDownTo(x.w, 'a0');
+      expect(x.w.tm.getTournament(x.w.tid)!.status).toBe('finished');
+      expect(notices(x.w.live.get('S-a1'))).toEqual([]);
+      x.hx.serviceAll();
+      expect(x.hx.health().engaged).toEqual([]);
+      expect(x.hx.stats.released.tournament_over).toBe(1);
+      expect(notices(x.w.live.get('S-a1'))).toEqual([['eliminatedToSpectator', expect.objectContaining({ position: 11 })]]);
+      jest.advanceTimersByTime(10 * 60_000);
+      expect(x.lines('qualifier_hand_for_hand_watchdog_released')).toEqual([]);
+    }
+    {
+      const x = hfh({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 5, 5000, 200) } });
+      await toRound1(x);
+      await endHand(x, 'TA', ['a1', 'a2']);                                  // TA broken into TB
+      await endHand(x, 'TB');                                                // …and nobody re-enters a boundary
+      expect(x.lines('qualifier_hand_for_hand_ended')).toEqual([]);
+      x.hx.serviceAll();
+      expect(x.lines('qualifier_hand_for_hand_ended')).toEqual([expect.objectContaining({ reason: 'bubble_burst' })]);
+      expect(notices(x.w.live.get('S-a1')).length + notices(x.w.live.get('S-a2')).length).toBe(2);
+    }
+  });
+
+  it('H12 — the hand-for-hand code never throws into a deal: a registry read that throws (in the gate, or after engagement in the round service) → counted, tripped, released, and the table DEALS', async () => {
+    // (a) the gate's very first read throws.
+    {
+      const x = hfh({ qotThrowsAfter: 0 });
+      expect(x.t('TB').startNewHand()).toBe(true);
+      (x.t('TA') as any).currentPhase = GamePhase.HandComplete;
+      x.w.m.autoStartNextHand('TA');
+      expect(x.t('TA').handNumber).toBe(1);                                  // dealt
+      expect(x.hx.stats.errors).toBe(1);
+      expect([...x.hx.tripped]).toEqual([x.w.tid]);
+      expect(x.lines('qualifier_hand_for_hand_failed')).toEqual([expect.objectContaining({ where: 'gate', tableId: 'TA', error: 'registry read failed' })]);
+    }
+    // (b) engaged fine, then the round service's read throws.
+    {
+      const x = hfh({ qotThrowsAfter: 1 });
+      expect(x.t('TB').startNewHand()).toBe(true);
+      (x.t('TA') as any).currentPhase = GamePhase.HandComplete;
+      x.w.m.autoStartNextHand('TA');
+      expect(x.lines('qualifier_hand_for_hand_engaged')).toHaveLength(1);
+      await endHand(x, 'TB');
+      x.w.m.autoStartNextHand('TB');
+      await flush();
+      expect(x.hx.stats).toMatchObject({ errors: 1, released: expect.objectContaining({ error: 1 }) });
+      expect([...x.hx.tripped]).toEqual([x.w.tid]);
+      expect(runScheduled(x)).toEqual(['TA', 'TB']);
+      expect([x.t('TA').handNumber, x.t('TB').handNumber]).toEqual([1, 2]);   // both DEAL
+    }
+  });
+
+  it('H13 — wiring: the gate sits in every deal path (after the pause / bust-check / break / under-5 holds, before the feed and the balance); the room notice of a round bust waits; durable audits; health; the sweep; the boot switch; the manifest', () => {
+    const A = fnSrc('function autoStartNextHand(tableId: string): void {');
+    const gate = A.indexOf('if (handForHandHoldsDeal(tId, tableId, table)) return;');
+    expect(gate).toBeGreaterThan(A.indexOf('if (aliveOnTable < 5 && planTournamentRebalance(tId)) {'));
+    expect(gate).toBeGreaterThan(A.indexOf('if (tournamentDealWaitsForBustCheck(tableId, tId, table)) {'));
+    expect(gate).toBeLessThan(A.indexOf('const fed = feedLoneQualifierTable(tId, tableId, table);'));
+    const R = fnSrc('function tournamentDealHoldReason(');
+    expect(R).toContain("if (handForHandHoldsDeal(tournamentId, tableId, table)) return 'hand_for_hand';");
+    expect(R.indexOf("return 'hand_for_hand'")).toBeGreaterThan(R.indexOf("return 'rebalance_pending'"));
+    const W = fnSrc('function restartWaitingTournamentTables(');
+    const wg = W.indexOf('if (handForHandHoldsDeal(tournamentId, tid, table)) continue;');
+    expect(wg).toBeGreaterThan(W.indexOf('if (!opts.startWaiting || t.paused) continue;'));
+    expect(wg).toBeLessThan(W.indexOf('table.startNewHand()'));
+    const ev = P.events.slice(P.events.indexOf("if (event === 'playerEliminated') {"));
+    expect(ev).toContain('if (!handForHandNoticeDeferred(data?.playerId)) {');
+    expect(ev.indexOf('handleTableRebalance(tournamentId);')).toBeGreaterThan(ev.indexOf('if (!handForHandNoticeDeferred('));
+    const B = fnSrc('function runTournamentBustCheck(');
+    expect(B).toContain('handForHandQuietBust = seat.playerId;');
+    expect(B).toContain('tellTournamentBustNow(');
+    const durable = slice('const DURABLE_AUDIT_ACTIONS = new Set([', ']);');
+    for (const a of ['QUALIFIER_HAND_FOR_HAND_SET', 'QUALIFIER_HAND_FOR_HAND_PLACES', 'QUALIFIER_HAND_FOR_HAND_WATCHDOG']) expect(durable).toContain(`'${a}'`);
+    expect(SRC).toContain('handForHand: handForHandHealth(),');
+    expect(fnSrc('function sweepTournamentRebalances(')).toContain('serviceAllHandForHand();');
+    expect(SRC).toContain('let qualifierHandForHandOn = qualifierHandForHandOnAtBoot(process.env.QUALIFIER_HAND_FOR_HAND);');
+    expect(SRC).toContain("app.post('/api/qualifiers/hand-for-hand'");
+    const manifest = fs.readFileSync(path.join(__dirname, '..', 'canonical-features.txt'), 'utf8').split(/\r?\n/).map((l) => l.trim());
+    for (const tok of ['qualifier_hand_for_hand_engaged', 'qualifier_hand_for_hand_busts_placed', '/api/qualifiers/hand-for-hand']) {
+      expect({ tok, listed: manifest.includes(tok), inSource: SRC.includes(tok) }).toEqual({ tok, listed: true, inSource: true });
+    }
   });
 });

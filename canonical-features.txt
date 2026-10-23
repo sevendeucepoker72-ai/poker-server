@@ -1721,3 +1721,13 @@ qualifier_prestart_deal
 qualifier_prestart_deal_waiting
 qualifier_prestart_cancelled
 qualifier_tables_open_closed
+
+# 2026-10-24 (owner 2026-10-23: "Build it for Sunday") — HAND-FOR-HAND at an online
+# qualifier's seat bubble (late registration closed, 2+ tables, alive = the seat
+# package's last paid place + 1): every table plays ONE hand per round and waits
+# for the others; a 4-minute watchdog releases every held table (fail open); busts
+# of the same round are placed by their starting stack and told only then. Runtime
+# switch POST /api/qualifiers/hand-for-hand (X-Internal-Token, fails closed).
+qualifier_hand_for_hand_engaged
+qualifier_hand_for_hand_busts_placed
+/api/qualifiers/hand-for-hand

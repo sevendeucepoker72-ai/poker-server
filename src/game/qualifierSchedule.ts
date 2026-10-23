@@ -346,3 +346,63 @@ export function qualifierBreakConfig(timeScale: number = 1): { everyLevels: numb
   const k = engineTimeScale(timeScale);
   return { everyLevels: QUALIFIER_BREAK_EVERY_LEVELS, seconds: Math.max(1, Math.round((QUALIFIER_BREAK_MINUTES * 60) / k)) };
 }
+
+/**
+ * 2026-10-24 (owner 2026-10-23: "Build it for Sunday") — HAND-FOR-HAND at the
+ * qualifier's SEAT BUBBLE (index.ts, the hand-for-hand block of the rebalance
+ * helpers). When the last player out of the seats is about to bust, every table
+ * plays ONE hand at a time and waits for the others between hands, so nobody can
+ * stall into a seat; players busted in the SAME such hand (at one table or
+ * several) are placed by their stack at the START of that hand.
+ *
+ * Engages only when ALL hold (handForHandApplies): the late registration has
+ * CLOSED (now > lateRegUntil — no field change, no place shift, can be ahead);
+ * two or more tables are in play; alive === seatsForTop + 1 (the event's seat
+ * package: Sunday's top 10 → 11 alive); and the field does not fit one table
+ * (alive > QUALIFIER_TABLE_SEATS — Rule 1 merges a field of 9 or fewer onto
+ * the final table). The weekly default (top 3) and the monthly (top 6) never
+ * engage. It ends the moment alive <= seatsForTop or one table is left.
+ * The WATCHDOG (QUALIFIER_HAND_FOR_HAND_WATCHDOG_MS) releases every held table
+ * when a round has not settled in time — fail OPEN; never during a break or a
+ * director pause. Railway env QUALIFIER_HAND_FOR_HAND at boot ('0' = off, unset
+ * = on); while the server runs: POST /api/qualifiers/hand-for-hand {on}
+ * (X-Internal-Token). Owner-correctable here.
+ */
+export const QUALIFIER_HAND_FOR_HAND_WATCHDOG_MS = 240_000;
+export const QUALIFIER_HAND_FOR_HAND_MIN_WATCHDOG_MS = 5_000;
+/** The seats of a qualifier table (TournamentManager.checkRebalance's own 9). */
+export const QUALIFIER_TABLE_SEATS = 9;
+
+/** The hand-for-hand switch at boot from env QUALIFIER_HAND_FOR_HAND: '0' = OFF, unset / anything else = ON (the QUALIFIER_TABLE_BALANCE pattern). */
+export function qualifierHandForHandOnAtBoot(raw: string | undefined): boolean {
+  return raw !== '0';
+}
+
+/**
+ * The watchdog's length: 4 minutes, divided by the RIG time scale
+ * (qualifierTestTimeScale — always 1 on Railway / NODE_ENV=production), never
+ * under 5 s. Garbage → 4 minutes.
+ */
+export function qualifierHandForHandWatchdogMs(timeScale: number = 1): number {
+  return Math.max(QUALIFIER_HAND_FOR_HAND_MIN_WATCHDOG_MS, Math.round(QUALIFIER_HAND_FOR_HAND_WATCHDOG_MS / engineTimeScale(timeScale)));
+}
+
+/** Does hand-for-hand apply right now? Pure; every input must be a real number (an event with no scheduled time never engages). */
+export function handForHandApplies(o: { now: number; lateRegUntil: number; alive: number; seatsForTop: number; tablesInPlay: number }): boolean {
+  if (!o || typeof o !== 'object') return false;
+  const { now, lateRegUntil, alive, seatsForTop, tablesInPlay } = o;
+  if (!Number.isFinite(now) || !Number.isFinite(lateRegUntil) || !(now > lateRegUntil)) return false;
+  if (!Number.isFinite(tablesInPlay) || tablesInPlay < 2) return false;
+  if (!Number.isInteger(seatsForTop) || seatsForTop < 1) return false;
+  if (!Number.isInteger(alive) || alive !== seatsForTop + 1) return false;
+  return alive > QUALIFIER_TABLE_SEATS;
+}
+
+/** What every table room is told when hand-for-hand starts (the existing 'serverAnnouncement' toast; ASCII, <= 200 chars). */
+export function qualifierHandForHandOnText(alive: number, seatsForTop: number): string {
+  return `Hand-for-hand: ${alive} players left and the top ${seatsForTop} win seats. Every table now plays one hand at a time; your table waits for the others between hands.`;
+}
+/** The table clock's banner while hand-for-hand is on (tournamentClock.handForHandText). */
+export const QUALIFIER_HAND_FOR_HAND_TEXT = 'Hand-for-hand: waiting for the other tables to finish their hand';
+/** What every table room is told when hand-for-hand ends. */
+export const QUALIFIER_HAND_FOR_HAND_OFF_TEXT = 'Hand-for-hand is over: normal play resumes.';

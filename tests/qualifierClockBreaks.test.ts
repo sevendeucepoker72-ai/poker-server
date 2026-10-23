@@ -636,7 +636,8 @@ const STATE = [
   fnSrc('function qualifierOfTournament('),
 ].join('\n');
 
-function stateWorld() {
+/** `extra` (2026-10-24, C1): more source + scope + exports on top of STATE (the hand-for-hand block). */
+function stateWorld(extra: { code?: string; scope?: Record<string, unknown>; exports?: string } = {}) {
   const tm = new TournamentManager();
   const tid = tm.createTournament({
     name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 99, startInterval: 0,
@@ -656,14 +657,15 @@ function stateWorld() {
     status: 'running', tournamentId: tid, qualifierType: 'weekly',
     seatPackage: { 1: 3, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 1 },
   }]]);
-  const { exports: m } = load(STATE, {
+  const { exports: m } = load(extra.code ? `${STATE}\n${extra.code}` : STATE, {
     tournamentManager: tm, qualifierTournaments, seatsForTopWith, MAX_SEATS, GamePhase, cardToString,
     playerSessions: new Map(), turnStartedAtMap: new Map(), TURN_TIMEOUT_MS: 30000, bombPotActive: new Map(),
     dealersChoiceState: new Map(), DEALERS_CHOICE_VARIANTS: [], insuranceQuoteForSeat: () => null,
     tournamentIdOfTable: (id: string) => tournamentTables.get(id), rebuyAllowedAt: () => false,
     progressionManager: { getProgress: () => null, equippedTheme: () => null }, sitOutTracker: new Map(),
     console: quiet,
-  }, '{ getGameStateForPlayer, tournamentClockStateFor }');
+    ...(extra.scope || {}),
+  }, `{ getGameStateForPlayer, tournamentClockStateFor${extra.exports ?? ''} }`);
   return { tm, tid, t: tm.getTournament(tid)!, tourT, cashT, qualifierTournaments, m };
 }
 
@@ -935,5 +937,45 @@ describe('wiring', () => {
     for (const tok of ['qualifier_break_started', 'tournamentClock', '/api/qualifiers/breaks', '/api/qualifiers/pause']) {
       expect({ tok, listed: manifest.includes(tok) }).toEqual({ tok, listed: true });
     }
+  });
+});
+
+// ═══════════════════════════════ 2026-10-24 — hand-for-hand in the clock (additive) ══
+describe('2026-10-24 (owner 2026-10-23: "Build it for Sunday") — hand-for-hand: the table clock says so while it is engaged (additive keys)', () => {
+  it('C1 — engaged: tournamentClock gains {handForHand:true, handForHandRound, handForHandText} at the VERY next state (the memo is keyed by it); released: the keys are gone (the exact S3 baseline)', () => {
+    // require (not import): the names do not exist on 5b8ad77 and the rest of this file must still compile.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const QS: Record<string, any> = require('../src/game/qualifierSchedule');
+    const HFH = slice('// ===== Hand-for-hand at the qualifier seat bubble', '// ===== end hand-for-hand =====\n');
+    const w = stateWorld({
+      code: HFH,
+      scope: { qualifierHandForHandOnAtBoot: QS.qualifierHandForHandOnAtBoot, QUALIFIER_HAND_FOR_HAND_TEXT: QS.QUALIFIER_HAND_FOR_HAND_TEXT, process: { env: {} } },
+      exports: ', handForHandStates',
+    });
+    const base = w.m.getGameStateForPlayer(w.tourT, 0, false).tournamentClock;
+    for (const k of ['handForHand', 'handForHandRound', 'handForHandText']) expect(k in base).toBe(false);
+    // Engaged, round 2 running — inside the 500 ms memo window: rebuilt at once.
+    w.m.handForHandStates.set(w.tid, { tournamentId: w.tid, round: { no: 2 }, rounds: 2, held: new Set(), heldSince: null, watchdog: null });
+    const on = w.m.getGameStateForPlayer(w.tourT, 1, false).tournamentClock;
+    expect(on).toEqual({ ...base, handForHand: true, handForHandRound: 2, handForHandText: 'Hand-for-hand: waiting for the other tables to finish their hand' });
+    // Gathering (between rounds / after a pause): still engaged, no round number.
+    w.m.handForHandStates.get(w.tid).round = null;
+    expect(w.m.getGameStateForPlayer(w.tourT, 2, false).tournamentClock).toMatchObject({ handForHand: true, handForHandRound: null });
+    // Released: the keys are gone at once (the per-socket delta replaces the object, so the client clears them).
+    w.m.handForHandStates.delete(w.tid);
+    const off = w.m.getGameStateForPlayer(w.tourT, 3, false).tournamentClock;
+    expect(off).toEqual(base);
+    // A cash table: still null.
+    expect(w.m.getGameStateForPlayer(w.cashT, 0, false).tournamentClock).toBeNull();
+  });
+
+  it('C2 — the manifest locks the feature: its tokens are in canonical-features.txt and in src/index.ts; the clock wires the fields + the memo key', () => {
+    const manifest = fs.readFileSync(path.join(__dirname, '..', 'canonical-features.txt'), 'utf8').split(/\r?\n/).map((l) => l.trim());
+    for (const tok of ['qualifier_hand_for_hand_engaged', 'qualifier_hand_for_hand_busts_placed', '/api/qualifiers/hand-for-hand']) {
+      expect({ tok, listed: manifest.includes(tok), inSource: SRC.includes(tok) }).toEqual({ tok, listed: true, inSource: true });
+    }
+    const clock = slice('// ===== Tournament level clock', '// ===== end tournament level clock =====\n');
+    expect(clock).toContain('...handForHandClockFields(tournamentId),');
+    expect(clock).toContain('|${handForHandClockSig(tournamentId)}');
   });
 });

@@ -87,8 +87,15 @@ const BUST_CHECK = [
   // CommonJS that the lockfile's TypeScript 6 emits ("use strict"), so CI failed
   // here on every push since 2026-10-10 while a stale local TS 5.x passed.
   slice('let eliminationDirectNotice', ';\n'),
+  // 2026-10-24 (hand-for-hand at the seat bubble): the bust check asks for its
+  // round (handForHandRoundOf → handForHandStates), ASSIGNS the quiet-bust `let`,
+  // and tells a bust through the extracted tellTournamentBustNow.
+  slice('const handForHandStates = new Map', ';\n'),
+  slice('let handForHandQuietBust', ';\n'),
+  fnSrc('function handForHandRoundOf('),
   fnSrc('function captureTournamentBustCheck('),
   fnSrc('function runTournamentBustCheck('),
+  fnSrc('function tellTournamentBustNow('),
   fnSrc('function tournamentEntrantHasLiveSeat('),
   fnSrc('function tournamentLiveSeatIndex('),
   fnSrc('function tournamentLiveSeatOf('),
