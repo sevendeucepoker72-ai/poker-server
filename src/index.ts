@@ -3697,6 +3697,7 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     ? Math.max(0, Math.floor(Number(tierCredits.find((p) => String(p.playerId) === viewerMasterId)?.creditCount) || 0))
     : null;
   const reEntryCap = qt.maxReEntries ?? QUALIFIER_MAX_REENTRIES;
+  const structure = qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK);
   return {
     qualifierId: id,
     masterQualifierId: qt.masterQualifierId ?? id,
@@ -3725,7 +3726,11 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     maxReEntries: reEntryCap,
     reEntries: mine ? (mine.reEntries || 0) : null,
     players: qt.players.length,
-    structure: qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK),
+    // S3 review fix-up — `structure.breaks.on` (additive) follows the live break
+    // switch (QUALIFIER_BREAKS / POST /api/qualifiers/breaks, read at each level
+    // boundary): with it off the card no longer promises breaks (poker-3d
+    // qualifierBreaksText reads `on: false` as no breaks).
+    structure: { ...structure, breaks: { ...structure.breaks, on: !!tournamentManager.breaksEnabled } },
     seatsForTop,
     // 2026-10-21 — {place: seats} when this event has a seat package (the lobby lists it), else null.
     seatPackage: qt.seatPackage || null,
@@ -4153,6 +4158,8 @@ function applyDirectorPause(
   if (before && before.status === 'running' && before.paused && before.pauseReason === 'prestart') {
     return { ok: false, code: 'not_started', message: 'This tournament has not started yet.' };
   }
+  // Read BEFORE pauseTournament: `before` is the live object it mutates.
+  const wasPaused = !!(before && before.status === 'running' && before.paused);
   const ok = tournamentManager.pauseTournament(tournamentId, paused, 'director');
   const tourn = tournamentManager.getTournament(tournamentId);
   if (!ok) {
@@ -4162,6 +4169,17 @@ function applyDirectorPause(
     return { ok: false, code: 'not_running', message: 'Tournament not running' };
   }
   auditLog(actor, 'TOURNAMENT_PAUSE', { tournamentId, paused });
+  // S3 review fix-up — a Resume that ends a hold (a director pause, a break, or
+  // a director pause that replaced a break) evens the tables BEFORE they are
+  // re-kicked, as the break's own end does ('tournamentBreakEnded'): busts in
+  // the hand that ran into the hold, and late entries / re-entries seated
+  // during it, used to be evened one move per hand boundary instead. S2's
+  // pre-deal pass: qualifiers only, a no-op with its switch off, tables still
+  // in a hand skipped; a moved player takes his stack (no chip made or lost).
+  // Never throws here.
+  if (!paused && wasPaused) {
+    try { balanceQualifierTablesNow(tournamentId); } catch (_) { /* never blocks the resume */ }
+  }
   const evt = paused ? 'tournamentPaused' : 'tournamentResumed';
   // F90 (2026-10-21) — a SINGLE-table tournament (startTournamentGame, 9 or
   // fewer entrants) records only `tableId`; its `tableIds` stay empty, so

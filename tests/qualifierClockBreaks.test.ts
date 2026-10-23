@@ -23,6 +23,7 @@ import { cardToString } from '../src/game/Card';
 import {
   qualifierBlindLevels, qualifierBreakConfig, qualifierStructure, qualifierTestTimeScale, seatsForTopWith,
   QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, QUALIFIER_BASE_STACK,
+  qualifierWindows, qualifierStatusOf, qualifierReEntriesLeft, QUALIFIER_MAX_REENTRIES,
 } from '../src/game/qualifierSchedule';
 import { SRC, slice, fnSrc, handlerSrc, load } from './helpers/indexSource';
 
@@ -488,24 +489,34 @@ describe('the break at the tables (REAL bootstrap listener + REAL autoStartNextH
 const ROUTES = slice('// ===== Director pause + scheduled breaks', '// ===== end director pause + scheduled breaks =====\n');
 const TOKEN_FN = fnSrc('function internalTokenMatches(');
 
-function routesWorld(opts: { token?: string } = {}) {
+function routesWorld(opts: { token?: string; routes?: string; balanceThrows?: boolean } = {}) {
   const w = tmWorld();
   const routes = new Map<string, (req: any, res: any) => void>();
   const audits: Array<{ actor: string; action: string; d: any }> = [];
   const roomEmits: Array<[string, string, any]> = [];
   const scheduled: string[] = [];
   const broadcasts: string[] = [];
+  // Review fix-up — the pre-deal balance at a director Resume (S2's REAL pass is
+  // covered by its own tests; here: called, when, and before the re-kick).
+  const balanced: string[] = [];
+  const seq: string[] = [];
   const qualifierTournaments = new Map<string, any>();
   w.tm.setTableIds(w.tid, ['T1', 'T2']);
   const logs: string[] = [];
-  const { exports: m } = load(`${TOKEN_FN}\n${ROUTES}\nfunction wire(socket) {\n${handlerSrc('pauseTournament', '\n  });\n')}\n}`, {
+  const { exports: m } = load(`${TOKEN_FN}\n${opts.routes ?? ROUTES}\nfunction wire(socket) {\n${handlerSrc('pauseTournament', '\n  });\n')}\n}`, {
     app: { post: (p: string, fn: any) => { routes.set(p, fn); } },
     createHash, timingSafeEqual,
     process: { env: { INTERNAL_NOTIFY_TOKEN: opts.token ?? 'tok' } },
     tournamentManager: w.tm, qualifierTournaments,
     auditLog: (actor: string, action: string, d: any) => { audits.push({ actor, action, d }); },
     io: { to: (room: string) => ({ emit: (ev: string, d: any) => roomEmits.push([room, ev, d]) }) },
-    scheduleAutoStart: (id: string) => { scheduled.push(id); },
+    balanceQualifierTablesNow: (id: string) => {
+      balanced.push(id);
+      seq.push(`balance:${id}:paused=${w.tm.getTournament(id)?.paused}`);
+      if (opts.balanceThrows) throw new Error('balance failed');
+      return 0;
+    },
+    scheduleAutoStart: (id: string) => { scheduled.push(id); seq.push(`kick:${id}`); },
     broadcastGameState: (id: string) => { broadcasts.push(id); },
     broadcastTournamentList() {},
     authSessions: new Map([['ADMIN', { userId: 1, username: 'admin' }]]), isUserAdmin: async () => true,
@@ -518,7 +529,7 @@ function routesWorld(opts: { token?: string } = {}) {
     routes.get(p)!({ headers: token === undefined ? {} : { 'x-internal-token': token }, body }, res);
     return { status, body: json };
   };
-  return { ...w, routes, audits, roomEmits, scheduled, broadcasts, qualifierTournaments, call, m, logs };
+  return { ...w, routes, audits, roomEmits, scheduled, broadcasts, balanced, seq, qualifierTournaments, call, m, logs };
 }
 
 describe('POST /api/qualifiers/breaks (the break switch, no restart)', () => {
@@ -749,6 +760,161 @@ describe('gameState: the level clock in every full state (always-present keys; a
     const w = stateWorld();
     w.qualifierTournaments.clear();
     expect(w.m.getGameStateForPlayer(w.tourT, 0, false).tournamentClock.paidPlaces).toBeNull();
+  });
+});
+
+// ═══════════════════════════════ review fix-up (on 8c7d9ca) ══
+// The block applyDirectorPause gained (the CONTROL below removes it).
+const BALANCE_ON_RESUME = '  if (!paused && wasPaused) {\n    try { balanceQualifierTablesNow(tournamentId); } catch (_) { /* never blocks the resume */ }\n  }\n';
+/** poker-3d utils/tournamentClock.js marksDirectorPause, as TournamentLobby applies it to a list item. */
+const lobbyOffersResume = (item: any): boolean => !!item.paused && item.pauseReason !== 'break' && item.pauseReason !== 'prestart';
+
+describe('review fix-up: the lobby list names the pause', () => {
+  it("getTournamentList: pauseReason 'break' during a break (the lobby's TD control then offers no '▶ Resume'), 'director' for his pause, 'prestart' for the start hold, null while running", () => {
+    const w = tmWorld();
+    const item = () => (w.tm.getTournamentList(null) as any[]).find((x) => x.tournamentId === w.tid);
+    expect(item()).toMatchObject({ status: 'running', paused: false, pauseReason: null });
+    jest.advanceTimersByTime(5 * LEVEL_MS);                                   // break 1
+    expect(item()).toMatchObject({ paused: true, pauseReason: 'break' });
+    expect(lobbyOffersResume(item())).toBe(false);
+    // Old list item (no pauseReason): the client read the break as a director pause.
+    expect(lobbyOffersResume({ ...item(), pauseReason: undefined })).toBe(true);
+    expect(w.tm.pauseTournament(w.tid, true)).toBe(true);                    // his pause replaces the break
+    expect(item()).toMatchObject({ paused: true, pauseReason: 'director' });
+    expect(lobbyOffersResume(item())).toBe(true);
+    expect(w.tm.pauseTournament(w.tid, false)).toBe(true);
+    expect(item()).toMatchObject({ paused: false, pauseReason: null });
+    expect(w.tm.pauseTournament(w.tid, true, 'prestart')).toBe(true);
+    expect(item()).toMatchObject({ paused: true, pauseReason: 'prestart' });
+    expect(lobbyOffersResume(item())).toBe(false);
+    // The rest of the item is unchanged (additive).
+    expect(Object.keys(item())).toEqual([
+      'registered', 'entryId', 'minPlayers', 'tournamentId', 'name', 'buyIn', 'prizePool', 'fundedPool', 'isFreeroll',
+      'maxPlayers', 'registeredPlayers', 'status', 'paused', 'pauseReason', 'nextStartTime', 'currentBlinds', 'blindLevel', 'blindLevelCount',
+    ]);
+  });
+});
+
+describe('review fix-up: a director Resume evens the tables before the re-kick (as the break end does)', () => {
+  function withRunningQualifier(w: ReturnType<typeof routesWorld>) {
+    w.qualifierTournaments.set('Q1', { qualifierId: 'Q1', status: 'running', tournamentId: w.tid, qualifierType: 'weekly' });
+  }
+
+  it('Resume of a director pause: balanceQualifierTablesNow runs once, after the clock restarts and BEFORE every table is re-kicked; Pause and an idempotent Resume do not balance', () => {
+    expect(ROUTES).toContain(BALANCE_ON_RESUME);
+    const w = routesWorld();
+    withRunningQualifier(w);
+    jest.advanceTimersByTime(4 * 60_000);
+    expect(w.call('/api/qualifiers/pause', { paused: 1 }, 'tok').status).toBe(200);
+    expect(w.balanced).toEqual([]);                                          // Pause: nothing moves
+    expect(w.call('/api/qualifiers/pause', { paused: 0 }, 'tok').body).toMatchObject({ success: true, paused: false });
+    expect(w.seq).toEqual([`balance:${w.tid}:paused=false`, 'kick:T1', 'kick:T2']);
+    expect(w.t.levelEndsAt).toBe(Date.now() + 8 * 60_000);                   // the time left, unchanged by the fix
+    // A Resume of a tournament that is not paused (idempotent): no balance.
+    w.seq.length = 0;
+    expect(w.call('/api/qualifiers/pause', { paused: 0 }, 'tok').status).toBe(200);
+    expect(w.seq).toEqual(['kick:T1', 'kick:T2']);
+    expect(w.balanced).toEqual([w.tid]);
+  });
+
+  it('the admin socket Resume balances the same way (one body: applyDirectorPause)', async () => {
+    const w = routesWorld();
+    const socket: any = { id: 'ADMIN', handlers: {}, emitted: [] as any[] };
+    socket.on = (ev: string, fn: any) => { socket.handlers[ev] = fn; };
+    socket.emit = (ev: string, d: any) => socket.emitted.push([ev, d]);
+    w.m.wire(socket);
+    await socket.handlers.pauseTournament({ tournamentId: w.tid, paused: true });
+    expect(w.balanced).toEqual([]);
+    await socket.handlers.pauseTournament({ tournamentId: w.tid, paused: false });
+    expect(w.seq).toEqual([`balance:${w.tid}:paused=false`, 'kick:T1', 'kick:T2']);
+    expect(socket.emitted).toEqual([]);
+  });
+
+  it('a Resume that ends a BREAK, and one that ends a director pause which replaced a break: the next level in force, then the balance, then the re-kick', () => {
+    const w = routesWorld();
+    withRunningQualifier(w);
+    jest.advanceTimersByTime(5 * LEVEL_MS + 30_000);
+    expect(w.t.pauseReason).toBe('break');
+    expect(w.call('/api/qualifiers/pause', { paused: 0 }, 'tok').status).toBe(200);
+    expect(w.t.currentBlindLevel).toBe(5);                                   // L6, full time
+    expect(w.seq).toEqual([`balance:${w.tid}:paused=false`, 'kick:T1', 'kick:T2']);
+    // Break 2 (after L10), replaced by the director's pause, then his Resume.
+    w.seq.length = 0;
+    jest.advanceTimersByTime(5 * LEVEL_MS);
+    expect(w.t.pauseReason).toBe('break');
+    expect(w.call('/api/qualifiers/pause', { paused: 1 }, 'tok').body).toMatchObject({ paused: true, pauseReason: 'director' });
+    expect(w.seq).toEqual([]);
+    expect(w.call('/api/qualifiers/pause', { paused: 0 }, 'tok').status).toBe(200);
+    expect(w.t.currentBlindLevel).toBe(10);                                  // L11, full time
+    expect(w.t.levelEndsAt).toBe(Date.now() + LEVEL_MS);
+    expect(w.seq).toEqual([`balance:${w.tid}:paused=false`, 'kick:T1', 'kick:T2']);
+  });
+
+  it('a throwing balance never blocks the Resume: the clock runs, every table is told and re-kicked', () => {
+    const w = routesWorld({ balanceThrows: true });
+    withRunningQualifier(w);
+    w.call('/api/qualifiers/pause', { paused: 1 }, 'tok');
+    w.roomEmits.length = 0;
+    expect(w.call('/api/qualifiers/pause', { paused: 0 }, 'tok').body).toMatchObject({ success: true, paused: false });
+    expect(w.t.paused).toBe(false);
+    expect(w.scheduled).toEqual(['T1', 'T2']);
+    expect(w.roomEmits.map(([room, ev]) => [room, ev])).toEqual([['table:T1', 'tournamentResumed'], ['table:T2', 'tournamentResumed']]);
+  });
+
+  it('CONTROL — without the fix-up block a director Resume (of a pause or of a break) never balances', () => {
+    const w = routesWorld({ routes: ROUTES.replace(BALANCE_ON_RESUME, '') });
+    withRunningQualifier(w);
+    w.call('/api/qualifiers/pause', { paused: 1 }, 'tok');
+    w.call('/api/qualifiers/pause', { paused: 0 }, 'tok');
+    jest.advanceTimersByTime(5 * LEVEL_MS);
+    expect(w.t.pauseReason).toBe('break');
+    w.call('/api/qualifiers/pause', { paused: 0 }, 'tok');
+    expect(w.balanced).toEqual([]);
+    expect(w.scheduled).toEqual(['T1', 'T2', 'T1', 'T2']);
+  });
+});
+
+describe('review fix-up: the qualifier card follows the break switch (structure.breaks.on)', () => {
+  function listWorld() {
+    const tm = new TournamentManager();
+    const at = Date.now() + 2 * 60 * 60_000;
+    const qt: any = {
+      qualifierId: 'Q1', masterQualifierId: 'Q1', qualifierType: 'weekly', qualifierName: 'Weekly Qualifier',
+      scheduledAt: new Date(at).toISOString(), startingStack: QUALIFIER_BASE_STACK, players: [], status: 'registering',
+      tournamentId: null, results: null, seatPackage: null,
+    };
+    const { exports: m, stubbed } = load(fnSrc('function qualifierListItem('), {
+      tournamentManager: tm, qualifierWindows, qualifierStatusOf, seatsForTopWith, qualifierStructure, QUALIFIER_BASE_STACK,
+      QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(),
+    }, '{ qualifierListItem }');
+    return { tm, qt, item: () => m.qualifierListItem('Q1', qt, Date.now(), null), stubbed };
+  }
+
+  it("breaks on: {everyLevels:5, minutes:5, on:true}; switched off (QUALIFIER_BREAKS=0 / POST /api/qualifiers/breaks {on:0}): on:false — the levels unchanged either way", () => {
+    const w = listWorld();
+    const s = qualifierStructure(QUALIFIER_BASE_STACK);
+    expect(w.item().structure).toEqual({ ...s, breaks: { everyLevels: 5, minutes: 5, on: true } });
+    w.tm.breaksEnabled = false;
+    expect(w.item().structure).toEqual({ ...s, breaks: { everyLevels: 5, minutes: 5, on: false } });
+    w.tm.breaksEnabled = true;
+    expect(w.item().structure.breaks.on).toBe(true);
+    expect([...w.stubbed]).toEqual([]);                                     // nothing it reads was silently stubbed
+  });
+
+  it('the route flips what the card says (setQualifierBreaks writes the same switch the list reads)', () => {
+    const r = routesWorld();
+    const w = listWorld();
+    // One TournamentManager for both: the route's.
+    const { exports: m } = load(fnSrc('function qualifierListItem('), {
+      tournamentManager: r.tm, qualifierWindows, qualifierStatusOf, seatsForTopWith, qualifierStructure, QUALIFIER_BASE_STACK,
+      QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(),
+    }, '{ qualifierListItem }');
+    const item = () => m.qualifierListItem('Q1', w.qt, Date.now(), null);
+    expect(item().structure.breaks.on).toBe(true);
+    expect(r.call('/api/qualifiers/breaks', { on: 0 }, 'tok').body).toEqual({ success: true, previous: true, on: false });
+    expect(item().structure.breaks.on).toBe(false);
+    expect(r.call('/api/qualifiers/breaks', { on: 1 }, 'tok').status).toBe(200);
+    expect(item().structure.breaks.on).toBe(true);
   });
 });
 

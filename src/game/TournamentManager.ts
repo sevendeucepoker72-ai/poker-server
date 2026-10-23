@@ -460,6 +460,13 @@ export class TournamentManager {
         // list so an admin watching from the LOBBY (not in the tournament's
         // table room, where the tournamentPaused echo goes) still sees it.
         paused: t.paused,
+        // 2026-10-23 (qualifier lifecycle S3 review fix-up) — WHY it is paused
+        // (additive): 'director' | 'break' | 'prestart', null when not paused —
+        // the same rule as getLevelClock. The lobby's TD control (poker-3d
+        // TournamentLobby, marksDirectorPause) offers '▶ Resume' only for a
+        // director pause; without this every scheduled break read as one, and
+        // a TD's click ended the break at once.
+        pauseReason: t.paused ? (t.pauseReason ?? 'director') : null,
         nextStartTime: t.nextStartTime,
         currentBlinds: t.status === 'running' ? { sb: currentBlinds.sb, bb: currentBlinds.bb, ante: currentBlinds.ante } : null,
         blindLevel: t.currentBlindLevel + 1,

@@ -722,7 +722,10 @@ level widget, GameHUD, never showed). Now:
   12-minute levels from 11:00 put the breaks at 12:00, 1:05, 2:10, 3:15 and 4:20
   MT; none after level 26. Late entries / re-entries during a break are seated
   and dealt in after it. The lobby's `structure` gains `breaks {everyLevels,
-  minutes}` (additive; the levels and their 12-minute display are unchanged).
+  minutes, on}` (additive; the levels and their 12-minute display are
+  unchanged). `on` (review fix-up) = `tournamentManager.breaksEnabled` at the
+  moment the item is built, so with the switch off the qualifier card stops
+  promising breaks (poker-3d `qualifierBreaksText` reads `on: false` as none).
   - The bootstrap listener (the ONE `onEvent`): on 'tournamentBreak' every LIVE
     table room (overflow tables included) gets `tournamentPaused` {tournamentId,
     reason:'break', resumesAt (ISO), afterLevel} and its state; log
@@ -743,6 +746,18 @@ level widget, GameHUD, never showed). Now:
   during a break ends it at once the same way. A 'prestart' hold (the 11:00
   deal, S4) is ended ONLY by a 'prestart' resume (which arms the full level 1);
   a director resume there returns false. The idempotence guard stays.
+  **'prestart' is plumbing only as of S3:** nothing in the server pauses with
+  reason 'prestart' yet and `tournamentClock.dealsAt` is always null. The
+  owner's "open the rooms 10 minutes before game start" is NOT delivered by S3;
+  it needs the S4 start-hold step (and poker-3d c80f157's tablesOpen / dealsAt
+  card state gets no data until then).
+  - The polled tournament list (`getTournamentList`, the lobby's
+    `tournamentList`) carries `pauseReason` next to `paused` (review fix-up;
+    additive; null when not paused, 'director' when paused with no reason —
+    the getLevelClock rule). poker-3d TournamentLobby's TD control
+    (`marksDirectorPause`) offers '▶ Resume' only for a director pause; before
+    the fix every scheduled break showed as director-paused there, and a TD's
+    click ended the break at once.
   - The admin socket `pauseTournament` handler's body is `applyDirectorPause(tId,
     paused, actor)` (shared with the route): audits TOURNAMENT_PAUSE (durable),
     tells every table room `tournamentPaused` / `tournamentResumed`
@@ -750,6 +765,14 @@ level widget, GameHUD, never showed). Now:
     state, re-kicks every table on Resume (F90 loop unchanged). During the
     'prestart' hold BOTH Pause and Resume are refused, nothing changes:
     'This tournament has not started yet.' (code `not_started`).
+    Review fix-up: a Resume of a tournament that WAS paused (a director pause,
+    a break, or a director pause that replaced a break) runs
+    `balanceQualifierTablesNow` BEFORE the re-kick loop, as the break's own
+    end does — busts in the hand that ran into the hold and late entries /
+    re-entries seated during it are evened at once, not one move per hand
+    boundary. Qualifiers only, a no-op with `QUALIFIER_TABLE_BALANCE` off,
+    tables still in a hand skipped; wrapped in try (a throw never blocks the
+    resume). An idempotent Resume (not paused) does not balance.
   - **`POST /api/qualifiers/pause`** `{"paused": 0|1|true|false, "qualifierId"?}`
     + `X-Internal-Token` — the director's backup when the owner's .online Admin
     link is not at hand. FAILS CLOSED (403; no token configured → always 403);
@@ -768,6 +791,12 @@ level widget, GameHUD, never showed). Now:
   level boundary; OFF never ends a break already running — `POST
   /api/qualifiers/pause {"paused":false}` ends it at once. The clock fields have
   no switch (additive; an old client ignores them).
+- **Deploy order (review fix-up).** Ship poker-3d's HUD commits (f1198d2 +
+  e7581ea, and the lobby card c2ce285 / c80f157) BEFORE this server, or
+  together. The pushed client (origin/main 48e42a6) has an old level widget
+  (GameHUD `blindLevel && nextBlindIn > 0`) that switches on as soon as these
+  state keys arrive: it does not tick between frames and shows raw seconds
+  ("Level 3 · Next in 718s"). Cosmetic only, but avoidable.
 - **Rig knob.** `QUALIFIER_TEST_TIME_SCALE` (env table above) divides ONLY the
   engine's level and break lengths; inert on Railway / NODE_ENV=production by
   construction (`qualifierTestTimeScale`).
@@ -783,7 +812,9 @@ level widget, GameHUD, never showed). Now:
   `tests/gameplay_S8_tournaments.test.ts` F90 now slices `applyDirectorPause`
   with the handler (its loop moved there, two-space indent). Full jest 2193
   passed, 0 failed (baseline 2158 at 4b13ee8, +35); `npm run lint` and
-  `npm run build` clean; manifest 772 tokens, 0 missing from `dist/`.
+  `npm run build` clean; manifest 772 tokens, 0 missing from `dist/`. Review
+  fix-up: +8 in the same file (the list's pauseReason, the balance on Resume
+  plus its CONTROL, structure.breaks.on); full jest 2201 passed, 0 failed.
 - **Rig** (scratchpad `qrig/scenario-breaks.js`, `qrig/s3-rig.sh`;
   `restart-server.sh` passes `QUALIFIER_BREAKS` / `QUALIFIER_TEST_TIME_SCALE`
   through): at scale 60, the clock in every state, levels 12 s apart, break 1
