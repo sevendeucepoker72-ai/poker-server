@@ -277,6 +277,156 @@ describe('(d) bootstrapTournamentTables: one table\'s throw no longer escapes (i
   });
 });
 
+// ──────────── (d) review fix-up: a throw with NO table dealt is re-thrown ────────────
+// Swallowed, a TOTAL start failure (the only table of a field of 9 or fewer, or
+// every table) left a 'running' event nothing deals: no elimination ever asks
+// for a rebalance, late entries kept consuming credits into it, no results,
+// every credit held until a restart. Re-thrown, it is the uncaughtException it
+// was before S1: the crash flush voids the event and refunds every credit.
+describe('(d) review fix-up — a throw with NO table dealt is re-thrown (the old crash-and-refund); a partial one is not', () => {
+  const BOOT = [slice('const tournamentBootstrapStats = {', ';\n'), fnSrc('function bootstrapTournamentTables(')].join('\n');
+
+  type Mode = 'deal' | 'throw' | 'noDeal' | 'throwAfterDeal';
+  function harness(modes: Record<string, Mode>) {
+    const tables = new Map<string, PokerTable>();
+    const broadcasts: string[] = [];
+    for (const [id, mode] of Object.entries(modes)) {
+      const t = new PokerTable({ tableId: id, tableName: id, smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+      t.sitDown(0, `${id}-a`, 50_000, `${id}-a`, false, true);
+      t.sitDown(1, `${id}-b`, 50_000, `${id}-b`, false, true);
+      if (mode === 'throw') (t as any).startNewHand = () => { throw new Error(`deck exploded at ${id}`); };
+      if (mode === 'noDeal') (t as any).startNewHand = () => false;
+      tables.set(id, t);
+    }
+    const onEvents: string[] = [];
+    const errors: string[] = [];
+    const { exports: m } = load(BOOT, {
+      tableManager: { getTable: (id: string) => tables.get(id) },
+      ensureTableProgressListener() {},
+      broadcastGameState: (id: string) => {
+        broadcasts.push(id);
+        if (modes[id] === 'throwAfterDeal') throw new Error(`broadcast failed at ${id}`);
+      },
+      scheduleAIAction() {},
+      tournamentManager: { onEvent: (id: string) => { onEvents.push(id); }, getTournament: () => undefined },
+      Sentry: null,
+      console: { log() {}, warn() {}, error: (...a: unknown[]) => { errors.push(a.map(String).join(' ')); } },
+    }, '{ bootstrapTournamentTables, stats: tournamentBootstrapStats }');
+    const lines = (event: string) => errors.filter((l) => l.includes(`"event":"${event}"`)).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    return { m, tables, onEvents, broadcasts, lines };
+  }
+
+  it('the ONLY table (a field of 9 or fewer) throws: re-thrown with its own error, no onEvent listener, one no_table_dealt line', () => {
+    const h = harness({ T1: 'throw' });
+    expect(() => h.m.bootstrapTournamentTables('TQ', ['T1'])).toThrow('deck exploded at T1');
+    expect(h.onEvents).toEqual([]);
+    expect(h.m.stats).toEqual({ tableFailures: 1 });
+    expect(h.lines('tournament_table_bootstrap_failed').map((l) => l.tableId)).toEqual(['T1']);
+    expect(h.lines('tournament_bootstrap_no_table_dealt')).toEqual([
+      { event: 'tournament_bootstrap_no_table_dealt', tournamentId: 'TQ', tables: 1, failedTables: 1, outcome: 'rethrown' },
+    ]);
+    // The seated stacks are untouched (the crash flush voids the event; nothing is cashed from a tournament seat).
+    expect(h.tables.get('T1')!.seats.filter((s) => s.state === 'occupied').map((s) => s.chipCount)).toEqual([50_000, 50_000]);
+  });
+
+  it('EVERY table throws: each is tried and logged, then the FIRST error is re-thrown; no onEvent listener', () => {
+    const h = harness({ T1: 'throw', T2: 'throw', T3: 'throw' });
+    expect(() => h.m.bootstrapTournamentTables('TQ', ['T1', 'T2', 'T3'])).toThrow('deck exploded at T1');
+    expect(h.lines('tournament_table_bootstrap_failed').map((l) => l.tableId)).toEqual(['T1', 'T2', 'T3']);
+    expect(h.m.stats).toEqual({ tableFailures: 3 });
+    expect(h.lines('tournament_bootstrap_no_table_dealt')).toEqual([
+      { event: 'tournament_bootstrap_no_table_dealt', tournamentId: 'TQ', tables: 3, failedTables: 3, outcome: 'rethrown' },
+    ]);
+    expect(h.onEvents).toEqual([]);
+  });
+
+  it('one table throws and the other deals NOTHING (startNewHand false): no table dealt, re-thrown', () => {
+    const h = harness({ T1: 'noDeal', T2: 'throw' });
+    expect(() => h.m.bootstrapTournamentTables('TQ', ['T1', 'T2'])).toThrow('deck exploded at T2');
+    expect(h.onEvents).toEqual([]);
+  });
+
+  it('one table deals and one throws (partial): NOT re-thrown, the dealt table plays, onEvent once (S1 unchanged)', () => {
+    const h = harness({ T1: 'throw', T2: 'deal' });
+    expect(() => h.m.bootstrapTournamentTables('TQ', ['T1', 'T2'])).not.toThrow();
+    expect(h.tables.get('T2')!.isHandInProgress()).toBe(true);
+    expect(h.onEvents).toEqual(['TQ']);
+    expect(h.lines('tournament_bootstrap_no_table_dealt')).toEqual([]);
+  });
+
+  it('a table that DEALT and then threw (its broadcast) counts as dealt: not re-thrown, its hand is in progress', () => {
+    const h = harness({ T1: 'throwAfterDeal' });
+    expect(() => h.m.bootstrapTournamentTables('TQ', ['T1'])).not.toThrow();
+    expect(h.tables.get('T1')!.isHandInProgress()).toBe(true);
+    expect(h.m.stats).toEqual({ tableFailures: 1 });
+    expect(h.onEvents).toEqual(['TQ']);
+  });
+
+  it('no throw at all, nothing dealt: unchanged — no throw (nothing to re-throw), onEvent once', () => {
+    const h = harness({ T1: 'noDeal' });
+    expect(() => h.m.bootstrapTournamentTables('TQ', ['T1'])).not.toThrow();
+    expect(h.onEvents).toEqual(['TQ']);
+    expect(h.m.stats).toEqual({ tableFailures: 0 });
+  });
+
+  it('through the REAL startQualifierTournament: a field of 9 (one table) whose first deal throws escapes it; a field of 18 with Table 1 throwing does not', () => {
+    const START_Q = fnSrc('function startQualifierTournament(');
+    function start(n: number, throwAt: string) {
+      const tm = new TournamentManager();
+      const tables = new Map<string, PokerTable>();
+      const onEvents: string[] = [];
+      let created = 0;
+      const { exports: m } = load(`${START_Q}\n${BOOT}`, {
+        tournamentManager: Object.assign(tm, { onEvent: (id: string) => { onEvents.push(id); } }),
+        tournamentTables: new Map(), fastModeTables: new Map(), qualifierBlindLevels,
+        playerSessions: new Map(), io: { to: () => ({ emit() {} }), emit() {}, sockets: { sockets: new Map() } },
+        tableManager: {
+          createQuickTable: (name: string, seats: number, sb: number, bb: number, buyIn: number) => {
+            const id = `T${++created}`;
+            const t = new PokerTable({ tableId: id, tableName: name, smallBlind: sb, bigBlind: bb, minBuyIn: buyIn, maxBuyIn: buyIn * 10, maxPlayers: seats } as any);
+            if (id === throwAt) (t as any).startNewHand = () => { throw new Error(`deck exploded at ${id}`); };
+            tables.set(id, t);
+            return id;
+          },
+          getTable: (id: string) => tables.get(id),
+        },
+        bindRegistrantSocket: () => '',
+        randomInt: (max: number) => randomInt(max),
+        ensureTableProgressListener() {}, broadcastGameState() {}, scheduleAIAction() {},
+        Sentry: null, console: quiet,
+      }, '{ startQualifierTournament }');
+      const players = Array.from({ length: n }, (_, i) => ({ id: `q-${i}`, name: `P${i}`, socketId: `S${i}`, masterId: `m-${i}` }));
+      return { run: () => m.startQualifierTournament(players, 50_000, false), tables, onEvents };
+    }
+    // 9 entrants → one table: its throw reaches the caller (tickQualifierAutoStart → uncaughtException → crash flush).
+    const nine = start(9, 'T1');
+    expect(() => nine.run()).toThrow('deck exploded at T1');
+    expect(nine.onEvents).toEqual([]);
+    // 18 entrants → two tables: Table 1 throws, Table 2 deals, the event runs.
+    const eighteen = start(18, 'T1');
+    const r = eighteen.run();
+    expect(r).toMatchObject({ tableCount: 2 });
+    expect(eighteen.tables.get('T2')!.isHandInProgress()).toBe(true);
+    expect(eighteen.onEvents).toHaveLength(1);
+  });
+
+  it('wiring: the re-throw sits after the per-table loop and BEFORE the onEvent listener; the tick does not catch it', () => {
+    const body = fnSrc('function bootstrapTournamentTables(');
+    const rethrowAt = body.indexOf('throw firstFailure;');
+    expect(rethrowAt).toBeGreaterThan(body.indexOf('tournamentBootstrapStats.tableFailures++;'));
+    expect(rethrowAt).toBeLessThan(body.indexOf('tournamentManager.onEvent('));
+    expect(body).toContain('if (failedTables > 0 && dealtTables === 0) {');
+    expect(body).toContain('if (table.startNewHand()) dealtTables++;');
+    // The start tick calls startQualifierTournament bare (no try): the throw is the
+    // uncaughtException the crash flush handles (qt stays 'starting' → released, refunded).
+    const tick = fnSrc('function tickQualifierAutoStart(');
+    const callAt = tick.indexOf('const result = startQualifierTournament(humanPlayers');
+    expect(callAt).toBeGreaterThan(-1);
+    expect(tick.slice(0, callAt)).not.toMatch(/\btry\s*\{/);
+    expect(tick.slice(0, callAt)).toContain("qt.status = 'starting';");
+  });
+});
+
 // ─────────────────────────── (e) the schedule-sync retry ───────────────────────────
 describe('(e) syncQualifierSchedule: a failure with an EMPTY registry retries in 30 s (one at a time); the fetch is bounded at 10 s', () => {
   const SYNC = [slice('const qualifierSyncStats = {', '\n}\n'), fnSrc('async function syncQualifierSchedule(')].join('\n');

@@ -437,10 +437,27 @@ SHA (or push the previous one) before the Sunday freeze.
     every entrant.
   - The tournament's ONE `onEvent` listener stays outside the loop, registered
     exactly once.
-  - A table that failed keeps its seated stacks and waits un-dealt. Nothing
-    re-deals a WaitingForPlayers tournament table except a rebalance break
-    (`restartWaitingTournamentTables` with `startWaiting`). The log line is the
-    signal to look at that table.
+  - A table that failed keeps its seated stacks and waits un-dealt while the
+    OTHER tables play. No automatic path re-deals a WaitingForPlayers
+    tournament table except a rebalance break
+    (`restartWaitingTournamentTables` with `startWaiting`), and a break needs
+    eliminations on the tables that did deal. The log line is the signal to
+    look at that table.
+  - **Review fix-up: a throw with NO table dealt is re-thrown.** When the only
+    table (a field of 9 or fewer) or every table throws, and no table's
+    `startNewHand()` began a hand, the first error is re-thrown after the loop
+    and BEFORE the `onEvent` listener. One more line,
+    `tournament_bootstrap_no_table_dealt` {tournamentId, tables, failedTables,
+    outcome:'rethrown'}, says why. That is the pre-S1 crash-and-refund: the
+    start tick does not catch it, so it is an uncaughtException and the crash
+    flush voids the event (`qt` still 'starting') and releases every
+    registration, refunding each consumed credit on the master. Swallowed (as
+    first shipped in 2d4924f) it left a 'running' event that nothing deals: no
+    elimination ever asks for a rebalance, late entries kept consuming credits
+    into those tables until 2 PM, no results were posted, and every credit was
+    held until someone restarted Railway.
+  - A table that DEALT and then threw (its broadcast or AI kick) counts as
+    dealt. A start with no throw that dealt nothing is unchanged (no throw).
 - **Schedule-sync retry** (`syncQualifierSchedule`).
   - The `/qualifiers/schedule` fetch is bounded at 10 s (AbortController; it had
     no timeout).
@@ -464,7 +481,11 @@ SHA (or push the previous one) before the Sunday freeze.
 - **Tests:** `tests/qualifierLifecycleS1.test.ts` covers (a) the draw, (c) the
   durable names, (d) the guard and (e) the retry. `tests/r2Qualifiers.test.ts`
   "S1 (2026-10-23)" covers (b) the start timer. Full jest 2134 passed
-  (baseline 2116 at 3769903, +18).
+  (baseline 2116 at 3769903, +18). Review fix-up: the same file's "(d) review
+  fix-up" block covers the re-throw (the only table / every table / a throw
+  plus a no-deal re-thrown; partial, dealt-then-threw and no-throw not; the
+  REAL `startQualifierTournament` with 9 and 18 entrants; the wiring). Manifest
+  token `tournament_bootstrap_no_table_dealt`.
 - **Rig (2026-10-23, scratchpad `qrig/s1-rig.sh`, on this dist):**
   - `scenario-full` passed 28/28; the event started 281 ms after its scheduled
     second (the check allows 31 s).
@@ -609,16 +630,51 @@ re-sends the POST (`tests/qualifierResultsDurable.test.ts`).
      ```sql
      SELECT id, player_id, tier, redeemed_at, notes FROM qualifier_credits WHERE id IN ('<credit_id>', '<credit_id>');
      ```
-     A consume appends ` [entry:<qid>]` or ` [re-entry:<qid>]` to `notes`, and
-     a refund clears `redeemed_at` but keeps `notes`. Decide per row:
+     A consume sets `redeemed_at` and appends ` [entry:<qid>]` or
+     ` [re-entry:<qid>]` to `notes`; a refund clears `redeemed_at` but keeps
+     `notes`. So `redeemed_at` is always the credit's LATEST consume (an admin
+     redeem also sets it, and REPLACES `notes`), and the question per row is
+     whether an entry in this event stands on THAT consume. Decide per row:
      - `redeemed_at` IS NULL → it was already given back (the master answers
        `refunded:false` for a credit that is not redeemed). Nothing to do.
-     - Still redeemed, this event's tag appears ONCE, and `redeemed_at` is
-       before the FAILED row's `ts` → the entry it paid for never happened, and
-       no live entry stands on it. Refund it.
-     - Still redeemed with this event's tag TWICE, or `redeemed_at` after the
-       FAILED row → it was consumed again by a later entry or re-entry, which
-       stands on it. Leave it.
+     - Still redeemed: compare `redeemed_at` with the LATEST
+       `QUALIFIER_*_REFUND_FAILED` row for this credit, by `creditId` alone
+       (any event; the durable re-entry consume / refund rows come with it):
+       ```sql
+       SELECT ts, action, actor, details FROM audit_log WHERE details->>'creditId' = '<credit_id>' ORDER BY ts DESC;
+       ```
+       - `redeemed_at` BEFORE that row → no consume came after the failure, so
+         the refund that failed was for the credit's current redemption: the
+         entry it paid for was refused, released or withdrawn, and nothing
+         stands on it. Refund it, however many times this event's tag appears.
+       - `redeemed_at` AFTER that row → the credit was given back after all (a
+         lost answer, a later refund) and consumed again by a LATER entry or
+         re-entry, which stands on it (had its own refund failed too, that
+         would be a later FAILED row). Leave it.
+       - The two times come from two clocks (the master's Cloud SQL for
+         `redeemed_at`, poker-server's database for `ts`). Within a few seconds
+         of each other, decide by poker-server's own lines instead: find the
+         LATEST consume of this credit (`QUALIFIER_REENTRY_CREDIT_CONSUME` in
+         `audit_log`; `QUALIFIER_ENTRY_CREDIT_CONSUME` only in Railway stdout,
+         each `[AUDIT]` line carries its own ISO time). A `*_REFUND_FAILED` for
+         the credit after it, with no successful refund line after it
+         (`QUALIFIER_CREDIT_REFUND`, `QUALIFIER_ENTRY_CREDIT_REFUND`,
+         `QUALIFIER_REENTRY_CREDIT_REFUND`, `QUALIFIER_SUSPENDED_CREDIT_REFUND`)
+         → refund it. Nothing after it, or only a `*_SHARED_KEPT` → an entry
+         stands on it: leave it.
+     - NEVER decide by how many times this event's tag appears in `notes`. The
+       master takes the player's OLDEST unused credit first and a refund keeps
+       the notes, so a credit given back (say a no-show released at the start)
+       and taken again by the same player's late entry carries this event's
+       tag TWICE. If that late entry's `no_seat` refund then fails, the credit
+       is still redeemed with two tags, its `redeemed_at` is before the FAILED
+       row, and NO entry stands on it: it is owed (the old "tag twice → leave
+       it" rule lost that credit).
+     - Cross-check per player: a player in this event's
+       `QUALIFIER_RESULTS_RECORDED` `finishOrder` (or with a `qualifier_entries`
+       row on the master) had at least one entry stand. It does not say which
+       credit it stood on, so it never overrides the rule above. A disqualified
+       (suspended) entrant is left out of the finish order too.
    - The refund: no admin page can un-redeem a credit (admin Championship only
      lists and redeems). Use the same idempotent call poker-server makes, with
      the token taken from the environment (never pasted into a chat or a form).

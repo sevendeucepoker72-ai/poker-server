@@ -23305,24 +23305,46 @@ function startQualifierTournament(
 // and refunded every entrant. The tournament's ONE onEvent listener below stays
 // outside the loop and is registered exactly once (a second one would post the
 // results twice). A table that failed keeps its seated stacks and waits
-// un-dealt (nothing re-deals a WaitingForPlayers tournament table except a
-// rebalance break) — the log + counter are the signal to act.
+// un-dealt while OTHER tables play: no automatic path re-deals a
+// WaitingForPlayers tournament table except a rebalance break, which needs
+// eliminations on the tables that did deal — the log + counter are the signal
+// to act.
+//
+// Review fix-up (2026-10-23) — a throw with NO table dealt (the only table of
+// a field of 9 or fewer, or every table) is RE-THROWN after the loop, before
+// the onEvent listener: the old crash-and-refund. Swallowed, it left a
+// 'running' event whose tables nothing deals (no elimination ever asks for a
+// rebalance), late entries still consuming credits into them until the late
+// close, and no results — every credit held until a restart. Re-thrown, it is
+// the uncaughtException it always was: the crash flush voids the event and
+// releases every registration (each consumed credit refunded on the master).
+// `dealt` = a table whose startNewHand() began a hand; one more line,
+// `tournament_bootstrap_no_table_dealt`, says why the process is going down.
 const tournamentBootstrapStats = { tableFailures: 0 };
 function bootstrapTournamentTables(tournamentId: string, tableIds: string[]): void {
   // Set up each table: listeners, start hands
+  let dealtTables = 0;
+  let failedTables = 0;
+  let firstFailure: unknown = null;
   for (const tid of tableIds) {
     const table = tableManager.getTable(tid);
     if (!table) continue;
     try {
       ensureTableProgressListener(table, tid);
-      table.startNewHand();
+      if (table.startNewHand()) dealtTables++;
       broadcastGameState(tid);
       scheduleAIAction(tid);
     } catch (e: any) {
       tournamentBootstrapStats.tableFailures++;
+      if (failedTables === 0) firstFailure = e;
+      failedTables++;
       console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_table_bootstrap_failed', tournamentId, tableId: tid, error: String(e?.message || e) })}`);
       try { if (Sentry) Sentry.captureException(e, { tags: { area: 'tournamentBootstrap' }, extra: { tournamentId, tableId: tid } }); } catch (_) { /* never rethrow */ }
     }
+  }
+  if (failedTables > 0 && dealtTables === 0) {
+    console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_bootstrap_no_table_dealt', tournamentId, tables: tableIds.length, failedTables, outcome: 'rethrown' })}`);
+    throw firstFailure;
   }
 
   // Listen for blind level changes → apply to ALL tables
