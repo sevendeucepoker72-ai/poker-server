@@ -1850,3 +1850,6 @@ markQualifierEngineTournament
 # Sit & Go fix-all F17 review fix-up - a running Spin & Go's seeds are held; held entries say seedHeldFor tournament (qualifiers unchanged).
 SPIN_GO_SEED_HOLD_PREFIX
 seedHeldFor: 'tournament'
+# Sit & Go fix-all F16 review fix-up - a failed shutdown settlement that was saved is logged as retried at boot, never "reconcile by hand".
+SAVED FOR RETRY AT BOOT (do NOT grant by hand)
+ledgerSavedForRetry

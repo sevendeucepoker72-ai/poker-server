@@ -58,6 +58,13 @@ export interface LedgerResult {
   noUser: LedgerCredit[];
   attempts: number;
   error?: string;
+  /**
+   * F16 review fix-up (2026-10-24) — on a 'failed' result: true when the
+   * settlement is saved in prize_ledger_pending (the next boot retries it, so
+   * nobody may grant it by hand); false when persistence is off or the save
+   * itself failed (only the in-memory retry list holds it: a restart loses it).
+   */
+  persisted?: boolean;
 }
 
 interface QueryClient {
@@ -287,7 +294,7 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
     prizeLedgerStats.pending = pending.size;
     await persistSave(s);   // F16 — survives a restart
     log(`[prize-ledger] ${JSON.stringify({ event: 'settlement_pending_retry', label: s.label, credits: s.credits.length, error: lastError })}`);
-    return { status: 'failed', paid: [], alreadyPaid: [], noUser: [], attempts: backoff.length, error: lastError };
+    return { status: 'failed', paid: [], alreadyPaid: [], noUser: [], attempts: backoff.length, error: lastError, persisted: !!deps.persistPending && persisted.has(s.label) };
   }
 
   /** Retry every pending settlement once (the key makes a retry of a committed one a no-op). */

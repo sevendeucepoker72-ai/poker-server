@@ -29635,6 +29635,8 @@ const shutdownFlushStats = {
   seatsCashedOut: 0, chipsCashedOut: 0, seatsNotCashed: 0, tournamentsCancelled: 0, tournamentsVoided: 0,
   entryFeesRefunded: 0, clubTournamentsRefunded: 0, qualifierRegistrationsReleased: 0, spinGoFeesRefunded: 0,
   spinGoSettled: 0, ledgerStatus: '' as string, phasesCutShort: 0,
+  // F16 review fix-up — a failed shutdown settlement was saved for the next boot's retry (never grant it by hand).
+  ledgerSavedForRetry: false,
   // R3 — decided career / heads-up / all-in-or-fold / challenge games settled (S1-4); upcoming-qualifier
   // registrants told (S1-6); cash seats no claim reached, credited / with no owner to credit (TOURNEY-9).
   quickGamesSettled: 0, qualifierRegistrantsTold: 0, unclaimedSeatsCredited: 0, unclaimedSeatsUnowned: 0,
@@ -29981,9 +29983,23 @@ async function settleShutdownCredits(seats: ShutdownSeatCredit[], entryFees: Led
     console.log(`[Shutdown] ${c.kind} ${c.amount} for user ${c.userId} ${JSON.stringify(c.details || {})}`);
   }
   if (r.status !== 'committed') {
-    // Never silent: every credit the flush could not settle is in the log (and Sentry) to reconcile.
-    for (const c of credits) console.error(`[Shutdown] NOT SETTLED ${c.kind} ${c.amount} for user ${c.userId} ${JSON.stringify(c.details || {})}`);
-    if (Sentry) Sentry.captureMessage(`shutdown flush: ${credits.length} credit(s) not settled (${r.error || r.status})`);
+    // F16 review fix-up (2026-10-24) — SAVED for the boot retry (prize_ledger_pending,
+    // loadPersistedPending + retryPending at the next boot): nobody may grant these
+    // by hand (a manual grant is paid AGAIN by the retry - the ledger keys stop only
+    // ledger re-runs). Not saved (the save failed too / persistence off): nothing
+    // will retry it - reconcile by hand, as before. Never silent either way.
+    const saved = r.status === 'failed' && r.persisted === true;
+    shutdownFlushStats.ledgerSavedForRetry = saved;
+    for (const c of credits) {
+      console.error(saved
+        ? `[Shutdown] SAVED FOR RETRY AT BOOT (do NOT grant by hand) ${c.kind} ${c.amount} for user ${c.userId} ${JSON.stringify(c.details || {})}`
+        : `[Shutdown] NOT SETTLED ${c.kind} ${c.amount} for user ${c.userId} ${JSON.stringify(c.details || {})}`);
+    }
+    if (Sentry) {
+      Sentry.captureMessage(saved
+        ? `shutdown flush: ${credits.length} credit(s) saved for retry at the next boot (${r.error || r.status}) - do not grant by hand`
+        : `shutdown flush: ${credits.length} credit(s) not settled and not saved (${r.error || r.status}) - reconcile by hand`);
+    }
   }
 }
 
