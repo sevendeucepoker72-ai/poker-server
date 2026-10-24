@@ -3165,8 +3165,9 @@ app.get('/api/health', async (_req, res) => {
           // seat bubble: closed = events closed there; resolverErrors / noticeErrors should stay 0.
           lateRegBubble: { ...tournamentManager.lateEntryBubbleStats, ...qualifierLateRegBubble },
           // 2026-10-24 (owner 2026-10-23: "Fix both") — a running qualifier's fairness seeds held
-          // until it ends: heldEntriesServed = /api/fairness entries answered without the seed.
-          fairnessHold: { ...fairnessSeedHoldStats },
+          // until it ends: heldEntriesServed = /api/fairness entries answered without the seed;
+          // every qualifier hand is kept past the 50-hand ring (eventEntriesDroppedAtMax stays 0).
+          fairnessHold: { ...fairnessSeedHoldStats, ...fairnessEventBufferStats },
           // 2026-10-24 (owner 2026-10-23: "Turn all off") — help tools refused at qualifier
           // tables (training, whispers, AI coach / recap, commentary skipped, flags cleared).
           helpToolsOff: { ...qualifierHelpToolsOff },
@@ -4735,7 +4736,12 @@ function noteQualifierLateRegClosedAtBubble(
     setImmediate(() => {
       try {
         const live = qualifierOfTournament(tournamentId);
-        const message = qualifierLateRegClosedText(alive, seatsForTop);
+        // Review fix-up — the count NOW, not at the closing elimination: the bust check
+        // eliminates every bust of the hand synchronously before this runs, so a double
+        // bust that skips the bubble (12 -> 10, top 10) is told 10 left, not 11. The audit
+        // / log record above keeps the closing count (alive at the close).
+        const aliveNow = tournamentManager.getAliveCount(tournamentId);
+        const message = qualifierLateRegClosedText(Number.isInteger(aliveNow) && aliveNow > 0 ? aliveNow : alive, seatsForTop);
         for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
           try {
             io.to(`table:${tid}`).emit('serverAnnouncement', {
@@ -7233,6 +7239,45 @@ interface RevealedCommitment {
 }
 const revealedCommitmentsByTable = new Map<string, RevealedCommitment[]>();
 const FAIRNESS_BUFFER_SIZE = 50;
+/**
+ * 2026-10-24 (review fix-up, owner 2026-10-23: "Fix both") — a QUALIFIER's hands
+ * (entries stamped holdForTournamentId) are exempt from the 50-hand ring: their
+ * seeds are held until the qualifier ends, and a 4-6 hour qualifier table plays
+ * far more than 50 hands, so the ring trimmed them before anyone could verify
+ * them (the rules page: "After the qualifier ends, each hand's shuffle code can
+ * be checked"). Every hand of the event is kept for FAIRNESS_EVENT_KEEP_MS (the
+ * advertised 7 days, = the Redis TTL) up to FAIRNESS_EVENT_BUFFER_MAX entries per
+ * table (a safety cap ~6x a long qualifier table; = redisStore FAIRNESS_LIST_MAX).
+ * Every other entry: the newest 50, exactly as before.
+ */
+const FAIRNESS_EVENT_BUFFER_MAX = 2000;
+const FAIRNESS_EVENT_KEEP_MS = 7 * 24 * 3600_000;
+/** health r2Play.qualifiers.fairnessHold (merged): eventEntriesDroppedAtMax = qualifier hands dropped at the per-table max (should stay 0). */
+const fairnessEventBufferStats = { eventEntriesDroppedAtMax: 0 };
+/** A table's buffer (newest-first) trimmed: the newest 50, plus every qualifier hand of the last 7 days, up to the max. */
+function trimFairnessBuffer<T extends { holdForTournamentId?: string; revealedAt?: number }>(buf: T[], now: number = Date.now()): T[] {
+  if (buf.length <= FAIRNESS_BUFFER_SIZE) return buf;
+  const out = buf.slice(0, FAIRNESS_BUFFER_SIZE);
+  for (let i = FAIRNESS_BUFFER_SIZE; i < buf.length; i++) {
+    const e = buf[i];
+    if (!e || !e.holdForTournamentId) continue;
+    const at = Number(e.revealedAt);
+    if (Number.isFinite(at) && now - at > FAIRNESS_EVENT_KEEP_MS) continue;
+    if (out.length >= FAIRNESS_EVENT_BUFFER_MAX) { fairnessEventBufferStats.eventEntriesDroppedAtMax++; continue; }
+    out.push(e);
+  }
+  return out;
+}
+/** The Redis LTRIM cap for this buffer: the max while it holds a qualifier's hands (so Redis keeps a superset), else 50. */
+function fairnessRedisKeepFor(buf: Array<{ holdForTournamentId?: string }>): number {
+  return buf.some((e) => !!e && !!e.holdForTournamentId) ? FAIRNESS_EVENT_BUFFER_MAX : FAIRNESS_BUFFER_SIZE;
+}
+/** Boot rehydrate: one table's buffer from Redis, trimmed by the same rule. Returns the entries kept. */
+function restoreFairnessBuffer(tableId: string, entries: RevealedCommitment[]): number {
+  const kept = trimFairnessBuffer(Array.isArray(entries) ? entries : []);
+  revealedCommitmentsByTable.set(tableId, kept);
+  return kept.length;
+}
 
 function recordRevealedCommitment(tableId: string, rc: RevealedCommitment) {
   // 2026-10-24 — a running qualifier's hand: stamped, so its seed is held until it ends.
@@ -7241,13 +7286,17 @@ function recordRevealedCommitment(tableId: string, rc: RevealedCommitment) {
   let buf = revealedCommitmentsByTable.get(tableId);
   if (!buf) { buf = []; revealedCommitmentsByTable.set(tableId, buf); }
   buf.unshift(rc);
-  if (buf.length > FAIRNESS_BUFFER_SIZE) buf.length = FAIRNESS_BUFFER_SIZE;
+  // 2026-10-24 review fix-up — the newest 50 + every qualifier hand (see trimFairnessBuffer).
+  if (buf.length > FAIRNESS_BUFFER_SIZE) {
+    buf = trimFairnessBuffer(buf);
+    revealedCommitmentsByTable.set(tableId, buf);
+  }
   // Mirror to Redis so the rolling buffer survives Railway restarts.
   // Fire-and-forget — the in-process Map is the authoritative read source
   // for /api/fairness/* during this process's lifetime; Redis only matters
   // after a restart. If Redis is unavailable the helper logs once and
   // no-ops, so this never blocks gameplay.
-  appendFairnessCommitment(tableId, rc).catch((err) => {
+  appendFairnessCommitment(tableId, rc, fairnessRedisKeepFor(buf)).catch((err) => {
     console.warn(`[Fairness] persist failed for table=${tableId} hand=${rc.handNumber}:`, (err as Error)?.message);
   });
 }
@@ -7299,13 +7348,14 @@ function seedHeldFieldsFor(tableId: string): { seedHeld?: true } {
 // ===== Help tools off at qualifier tables (2026-10-24, owner 2026-10-23: "Turn all off") =====
 // No server-computed decision aid at any table of a qualifier (start + overflow
 // tables, seated or watching): trainingData / toggleTraining, coachHand,
-// requestSessionRecap, the coachWhisper relay and tableCommentary. Stable code
+// requestSessionRecap, the coachWhisper relay and tableCommentary; requestProfile
+// answers without opponent VPIP / PFR (review fix-up). Stable code
 // `help_tools_off_qualifier`; log tag `help_tools_refused_at_qualifier`. poker-3d
 // hides the tools already (utils/qualifierHelpTools.js); this is the server half.
 // Cash and non-qualifier tables are unchanged.
 const QUALIFIER_HELP_TOOLS_OFF_CODE = 'help_tools_off_qualifier';
-/** health r2Play.qualifiers.helpToolsOff — refusals per tool; sessionsForcedOff = training flags cleared on a move onto a qualifier table. */
-const qualifierHelpToolsOff = { trainingRefused: 0, sessionsForcedOff: 0, whispersRefused: 0, coachRefused: 0, recapRefused: 0, commentarySkipped: 0 };
+/** health r2Play.qualifiers.helpToolsOff — refusals per tool; sessionsForcedOff = training flags cleared on a move onto a qualifier table; profileStatsWithheld = profiles answered without opponent VPIP / PFR (review fix-up). */
+const qualifierHelpToolsOff = { trainingRefused: 0, sessionsForcedOff: 0, whispersRefused: 0, coachRefused: 0, recapRefused: 0, commentarySkipped: 0, profileStatsWithheld: 0 };
 /** The qualifier (registry id) whose tournament plays at this table (live or just-broken), else null. Never throws. */
 function qualifierIdOfTable(tableId: string): string | null {
   try {
@@ -21286,6 +21336,15 @@ Give feedback in this JSON format:
       const pfrHands = Math.max(Number(stats.pfrHands) || 0, live?.pfrHands || 0);
       const level = Math.max(Number(u.level) || 1, live?.level || 0);
       const seasonXp = live ? progressionManager.getSeasonXp(live.playerId) : seasonXpOf(level, Number(u.xp) || 0);
+      // 2026-10-24 review fix-up (owner 2026-10-23: "Turn all off") — no opponent
+      // VPIP / PFR (the HUD stats) to a socket at a qualifier table, seated or
+      // watching: vpip / pfr null + statsWithheld (poker-3d shows '-'). His own
+      // profile and every other table are unchanged.
+      const statsOffAt = targetId !== viewer.userId ? socketAtQualifierTable(socket) : null;
+      if (statsOffAt) {
+        qualifierHelpToolsOff.profileStatsWithheld++;
+        noteHelpToolRefusedAtQualifier('profile_stats', statsOffAt);
+      }
       let publicId: string | null = byPublicId || null;
       let badges: string[] = [];
       try {
@@ -21308,8 +21367,9 @@ Give feedback in this JSON format:
         totalHands,
         winRate: totalHands > 0 ? ((wins / totalHands) * 100).toFixed(1) : '0.0',
         netChips: stats.netChips || 0,
-        vpip: totalHands > 0 ? Number(((vpipHands / totalHands) * 100).toFixed(1)) : 0,
-        pfr: totalHands > 0 ? Number(((pfrHands / totalHands) * 100).toFixed(1)) : 0,
+        vpip: statsOffAt ? null : (totalHands > 0 ? Number(((vpipHands / totalHands) * 100).toFixed(1)) : 0),
+        pfr: statsOffAt ? null : (totalHands > 0 ? Number(((pfrHands / totalHands) * 100).toFixed(1)) : 0),
+        ...(statsOffAt ? { statsWithheld: QUALIFIER_HELP_TOOLS_OFF_CODE } : {}),
         vipTier: vipTierForSeasonXp(seasonXp)?.name || 'Bronze',
         vipXp: seasonXp,
         badges,
@@ -28929,10 +28989,10 @@ httpServer.listen(PORT, async () => {
       const fairnessBuffers = await scanFairnessBuffers();
       let totalEntries = 0;
       for (const { tableId, entries } of fairnessBuffers) {
-        // Defensive cap in case Redis state somehow exceeds the limit.
-        const capped = entries.slice(0, FAIRNESS_BUFFER_SIZE);
-        revealedCommitmentsByTable.set(tableId, capped);
-        totalEntries += capped.length;
+        // Defensive cap in case Redis state somehow exceeds the limit: the newest
+        // 50 + every qualifier hand of the last 7 days (2026-10-24 review fix-up —
+        // a 50-slice dropped a finished qualifier's older hands for good).
+        totalEntries += restoreFairnessBuffer(tableId, entries);
       }
       if (totalEntries > 0) {
         console.log(`[Rehydrate] restored ${totalEntries} fairness commitment(s) across ${fairnessBuffers.length} table(s) from Redis`);

@@ -1764,3 +1764,14 @@ seedHeld
 # refused there (code help_tools_off_qualifier); gameState isQualifier + qualifierId.
 help_tools_off_qualifier
 help_tools_refused_at_qualifier
+# 2026-10-24 (review fix-up) - every hand of a qualifier stays verifiable after it ends: its
+# hands are exempt from the 50-hand fairness ring (memory, Redis LTRIM/LRANGE, boot rehydrate).
+restoreFairnessBuffer
+eventEntriesDroppedAtMax
+# 2026-10-24 (review fix-up) - the seat-bubble close also fires at the first elimination after a
+# crossing the resolver could not judge or a bubble the seat package moved (the field that played).
+lateEntryPeakAlive
+# 2026-10-24 (review fix-up, owner "Turn all off") - requestProfile sends no opponent VPIP / PFR
+# to a socket at a qualifier table (vpip/pfr null + statsWithheld).
+statsWithheld
+profileStatsWithheld

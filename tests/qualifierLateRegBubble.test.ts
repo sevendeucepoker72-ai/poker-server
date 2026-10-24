@@ -216,3 +216,66 @@ describe('LB6 — the player-facing sentences (plain ASCII, short)', () => {
     }
   });
 });
+
+describe('LB14 (review fix-up) — the bubble is reached by any elimination at or below it once the field PLAYED above it, not only by the one crossing elimination', () => {
+  it('the resolver has no answer at the 12 -> 11 bust (a registry read at that moment), then answers again: the 11 -> 10 bust closes; a later late entry is refused and the seat-winning busters keep their places (c00b5b8: never closed; the late entry pushed 10th to 11th)', () => {
+    let blind = false;
+    const w = field(13, (_tid: string) => (blind ? null : { closeAtAlive: 11, openUntil: Date.now() + HOUR }));
+    w.tm.eliminatePlayer(w.tid, 'p12');                                     // 12 alive
+    blind = true;
+    w.tm.eliminatePlayer(w.tid, 'p11');                                     // 11 alive: no answer, nothing closes
+    blind = false;
+    expect(w.tm.lateEntryClosedAtBubble(w.tid)).toBeNull();
+    w.tm.eliminatePlayer(w.tid, 'p10');                                     // 10 alive: closed now
+    expect(w.tm.lateEntryClosedAtBubble(w.tid)).toEqual({ at: expect.any(Number), alive: 10, closeAtAlive: 11, playerId: 'p10' });
+    expect(w.closes()).toEqual([expect.objectContaining({ alive: 10, closeAtAlive: 11, playerId: 'p10' })]);
+    w.tm.eliminatePlayer(w.tid, 'p9');                                      // 9 alive: p9 finished 10th (a seat)
+    expect(w.place('p9')).toBe(10);
+    expect(w.tm.addLateEntrant(w.tid, 'late-1', 'Late', 'sl', 50_000, { masterUserId: 'm-late' })).toBeNull();
+    expect(w.tm.reinstateForReentry(w.tid, 'p11', 50_000)).toBe(false);
+    expect([w.place('p9'), w.place('p10'), w.place('p11'), w.place('p12')]).toEqual([10, 11, 12, 13]);
+    expect(w.closes()).toHaveLength(1);
+  });
+
+  it('the seat package moves the bubble from 11 to 13 while 12 are left (a field of 20): the next bust (12 -> 11) closes (c00b5b8: the bust to 11 never closed, the crossing of 13 had happened under the old bubble)', () => {
+    let bubble = 11;
+    const w = field(20, (_tid: string) => ({ closeAtAlive: bubble, openUntil: Date.now() + HOUR }));
+    for (let i = 19; i >= 12; i--) w.tm.eliminatePlayer(w.tid, `p${i}`);    // 20 -> 12 alive, the old bubble (11) not reached
+    expect(w.tm.getAliveCount(w.tid)).toBe(12);
+    expect(w.tm.lateEntryClosedAtBubble(w.tid)).toBeNull();
+    bubble = 13;                                                             // the owner widened the package to the top 12
+    w.tm.eliminatePlayer(w.tid, 'p11');                                      // 11 alive
+    expect(w.tm.lateEntryClosedAtBubble(w.tid)).toMatchObject({ alive: 11, closeAtAlive: 13, playerId: 'p11' });
+  });
+
+  it('CONTROL — a bubble moved ABOVE the largest field that played (13 entrants, bubble raised to 14) never closes: that field never played above it (open until 2:00 PM, as published)', () => {
+    let bubble = 11;
+    const w = field(13, (_tid: string) => ({ closeAtAlive: bubble, openUntil: Date.now() + HOUR }));
+    w.tm.eliminatePlayer(w.tid, 'p12');                                      // 12
+    bubble = 14;
+    for (const id of ['p11', 'p10', 'p9']) w.tm.eliminatePlayer(w.tid, id);  // 9
+    expect(w.tm.lateEntryClosedAtBubble(w.tid)).toBeNull();
+    expect(w.tm.addLateEntrant(w.tid, 'late-1', 'Late', 'sl', 50_000, { masterUserId: 'm-late' })).toBeTruthy();
+  });
+
+  it('played above the bubble, then a seat undone (removeLateEntrant, not an elimination) leaves 11: the next ELIMINATION (11 -> 10) closes (c00b5b8: never closed for the rest of the window)', () => {
+    const w = field(13, sunday());
+    w.tm.eliminatePlayer(w.tid, 'p12');                                      // 12, played at 13
+    expect(w.tm.removeLateEntrant(w.tid, 'p11')).toBe(true);                 // 11, not an elimination: nothing closes
+    expect(w.tm.lateEntryClosedAtBubble(w.tid)).toBeNull();
+    w.tm.eliminatePlayer(w.tid, 'p10');                                      // 10
+    expect(w.tm.lateEntryClosedAtBubble(w.tid)).toMatchObject({ alive: 10, closeAtAlive: 11, playerId: 'p10' });
+  });
+
+  it('an elimination during the prestart hold (30 seated, before the no-shows are released) does not count as the field playing: 20 no-shows released, 10 left, the first bust after the deal closes nothing', () => {
+    const w = field(30, sunday());
+    expect(w.tm.pauseTournament(w.tid, true, 'prestart')).toBe(true);
+    w.tm.eliminatePlayer(w.tid, 'p29');                                      // e.g. a disqualification while held
+    for (let i = 10; i < 29; i++) w.tm.removeLateEntrant(w.tid, `p${i}`);
+    expect(w.tm.getAliveCount(w.tid)).toBe(10);
+    expect(w.tm.pauseTournament(w.tid, false, 'prestart')).toBe(true);
+    w.tm.eliminatePlayer(w.tid, 'p9');                                       // 9
+    expect(w.tm.lateEntryClosedAtBubble(w.tid)).toBeNull();
+    expect(w.tm.addLateEntrant(w.tid, 'late-1', 'Late', 'sl', 50_000, { masterUserId: 'm-late' })).toBeTruthy();
+  });
+});

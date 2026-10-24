@@ -21,11 +21,23 @@ const DEFAULT_DEBOUNCE_MS = 100;
 
 // Provably-fair revealed-commitment buffer keys: one LIST per table,
 // newest-first (LPUSH + LTRIM 0 49), capped at 50 entries to match the
-// in-process FAIRNESS_BUFFER_SIZE. 7-day TTL — older verifications
-// aren't useful to clients and we don't want unbounded growth.
+// in-process FAIRNESS_BUFFER_SIZE — except a qualifier table, which keeps
+// every hand of the event (FAIRNESS_LIST_MAX, 2026-10-24 review fix-up).
+// 7-day TTL — older verifications aren't useful to clients and we don't
+// want unbounded growth.
 const FAIRNESS_KEY_PREFIX = 'poker:fairness:';
 const FAIRNESS_KEY_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const FAIRNESS_LIST_CAP = 50;
+/**
+ * 2026-10-24 (review fix-up, owner 2026-10-23: "Fix both") — the most entries one
+ * table's list may keep: a QUALIFIER table keeps EVERY hand of the event (its
+ * seeds are held until the qualifier ends, so a 50-entry ring would trim them
+ * before anyone could verify them; a 4-6 hour table plays ~300 hands). index.ts
+ * asks for this cap (appendFairnessCommitment `keep`) only while the table's
+ * buffer holds event hands; every other table keeps FAIRNESS_LIST_CAP, as
+ * before. Must equal index.ts FAIRNESS_EVENT_BUFFER_MAX.
+ */
+export const FAIRNESS_LIST_MAX = 2000;
 
 let client: RedisClientType | null = null;
 let ready = false;
@@ -214,11 +226,13 @@ function warnFairnessUnavailableOnce(reason: string): void {
 
 /**
  * Append a revealed commitment to the persistent rolling list for the
- * given table. Newest-first (LPUSH), capped at FAIRNESS_LIST_CAP via
- * LTRIM, with a 7-day TTL. Safe to call on Redis-less instances —
- * degrades to a one-time warning.
+ * given table. Newest-first (LPUSH), capped via LTRIM at `keep` entries
+ * (default FAIRNESS_LIST_CAP = 50; clamped to FAIRNESS_LIST_CAP..FAIRNESS_LIST_MAX
+ * — index.ts passes FAIRNESS_LIST_MAX while the table's buffer holds a
+ * qualifier's hands), with a 7-day TTL. Safe to call on Redis-less
+ * instances — degrades to a one-time warning.
  */
-export async function appendFairnessCommitment(tableId: string, entry: RevealedFairnessEntry): Promise<void> {
+export async function appendFairnessCommitment(tableId: string, entry: RevealedFairnessEntry, keep: number = FAIRNESS_LIST_CAP): Promise<void> {
   if (!isRedisReady() || !client) {
     warnFairnessUnavailableOnce(process.env.REDIS_URL ? 'redis not ready' : 'no REDIS_URL');
     return;
@@ -226,11 +240,12 @@ export async function appendFairnessCommitment(tableId: string, entry: RevealedF
   try {
     const key = FAIRNESS_KEY_PREFIX + tableId;
     const json = JSON.stringify(entry);
+    const cap = Number.isInteger(keep) ? Math.min(FAIRNESS_LIST_MAX, Math.max(FAIRNESS_LIST_CAP, keep)) : FAIRNESS_LIST_CAP;
     // Pipeline so all three commands ship in one round-trip and the
     // cap+TTL are guaranteed to apply alongside the push.
     const multi = client.multi();
     multi.lPush(key, json);
-    multi.lTrim(key, 0, FAIRNESS_LIST_CAP - 1);
+    multi.lTrim(key, 0, cap - 1);
     multi.expire(key, FAIRNESS_KEY_TTL_SECONDS);
     await multi.exec();
   } catch (err) {
@@ -240,13 +255,15 @@ export async function appendFairnessCommitment(tableId: string, entry: RevealedF
 
 /**
  * Load the persisted fairness buffer for one table. Returns newest-first
- * (matching the in-process Map shape) so callers can assign the result
- * directly. Empty array if Redis is down or the key doesn't exist.
+ * (matching the in-process Map shape); up to FAIRNESS_LIST_MAX entries (a
+ * qualifier table's event hands — 2026-10-24 review fix-up; every other
+ * table's list holds at most 50). index.ts trims it with its own rule
+ * (restoreFairnessBuffer). Empty array if Redis is down or the key doesn't exist.
  */
 export async function loadFairnessBuffer(tableId: string): Promise<RevealedFairnessEntry[]> {
   if (!isRedisReady() || !client) return [];
   try {
-    const raw = await client.lRange(FAIRNESS_KEY_PREFIX + tableId, 0, FAIRNESS_LIST_CAP - 1);
+    const raw = await client.lRange(FAIRNESS_KEY_PREFIX + tableId, 0, FAIRNESS_LIST_MAX - 1);
     const out: RevealedFairnessEntry[] = [];
     for (const item of raw) {
       try {

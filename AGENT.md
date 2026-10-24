@@ -70,7 +70,7 @@ Railway (not in this repo).
 | 3 | **Chip mutations server-authoritative.** Only paths: `addChipsToUser` (additive SQL `chips = chips + $1`), `deductChips` (atomic), pot distribution at hand-complete, admin grants (audited). NEVER accept `chips` from a client socket payload. | 2026-04-22 (saveProgress mint vector) |
 | 4 | **Player action nonces are deduped** (`actionNonces` Map, keyed `tableId:seat`) at `src/index.ts:~5700-5708`. Replay of same nonce returns "Duplicate action" error — clients treat as success (idempotent retry). | Convention |
 | 5 | **Pino logger via `LOG_LEVEL` env** (default `info` in prod, `debug` in dev). | Convention |
-| 6 | **Provably-fair deck commitments emit BEFORE hand starts**, seed reveal emits AFTER hand ends. Buffer 50 commitments per table in `ensureTableProgressListener`. REST `/api/fairness/*` reads from buffer + computes verification. **2026-10-24 (owner "Fix both"): a RUNNING qualifier's seeds are WITHHELD** — its entries are stamped `holdForTournamentId` and served `seed: null, seedHeld: true` (single route: no computedHash / verified) until that tournament is no longer running; then every seed is served and verifies. A NEW place that serves or emits a seed must go through `publicFairnessEntry` / `fairnessSeedIsHeld` (the seed rebuilds every folded hand; the repo is public). The per-hand `deckSeedRevealed` still reaches no client (F162). | 2026-04-22; 2026-10-24 |
+| 6 | **Provably-fair deck commitments emit BEFORE hand starts**, seed reveal emits AFTER hand ends. Buffer 50 commitments per table in `ensureTableProgressListener`. REST `/api/fairness/*` reads from buffer + computes verification. **2026-10-24 (owner "Fix both"): a RUNNING qualifier's seeds are WITHHELD** — its entries are stamped `holdForTournamentId` and served `seed: null, seedHeld: true` (single route: no computedHash / verified) until that tournament is no longer running; then every seed is served and verifies. A NEW place that serves or emits a seed must go through `publicFairnessEntry` / `fairnessSeedIsHeld` (the seed rebuilds every folded hand; the repo is public). The per-hand `deckSeedRevealed` still reaches no client (F162). **Review fix-up: a qualifier's hands (stamped entries) are EXEMPT from the 50 cap** (7 days, up to 2000 per table) in memory (`trimFairnessBuffer`), in Redis (`appendFairnessCommitment` keep / `FAIRNESS_LIST_MAX`) and at boot (`restoreFairnessBuffer`) — a new trim of the buffer must keep them, or the event's early hands can never be verified. | 2026-04-22; 2026-10-24 |
 | 7 | **Admin socket handlers MUST `await isUserAdmin(auth.userId)`** before mutating state. Client-side route hiding is UX, not security. | 2026-04-22 |
 | 8 | **`package.json` + `package-lock.json` commit together.** Mismatched lockfile breaks Railway's `npm ci`. Pre-push: `npm ci --dry-run`. | 2026-04-22 |
 | 9 | **Regression-guard tests in `tests/PokerTable.test.ts`** — every state-machine fix gets a test that reproduces the bad state and asserts the fix. Wired into CI. | Convention |
@@ -95,7 +95,7 @@ Railway (not in this repo).
 | 28 | **Table lifecycle, quick games, money settlement and progression (.online R2, 2026-10-11).** (a) **One seat teardown** (`teardownSeat`): every leave / departure / ghost cleanup / reservation end goes through it. A seat whose chips are in a live pot is stood up only at the hand's end (`pendingSeatRemovalAfterHand`); an ALL-IN leaver keeps his hand only at a ring table where the stack is his own wallet (`leaverKeepsAllInHand` — never a tournament or fixed-roster game); a bot seat is never taken for a joiner mid-hand (`aiSeatTakeableNow` / `takeAiSeatForJoin`); every fold or leave that moves the turn calls `scheduleAIAction(tableId)` so the next actor is always clocked. (b) **Fixed-roster tables** (`isFixedRosterTable`: every quick format — heads-up, Spin & Go, all-in-or-fold, career — plus a club challenge): no AI fill, a busted bot is never reloaded, and the game ENDS when decided (`quickGameEndCheck`). Ring-table bot stacks are reset to one buy-in above 3 buy-ins (`reloadAndCapBotStacks`, `BOT_STACK_CAP_BUYINS`). (c) **Only joinable PUBLIC cash tables** are listed, Quick-Played, waitlisted or joined by `joinTable` (`isPublicCashTable`; anything else answers `table_not_joinable` before any side effect); private / club tables have their own entry paths. (d) **Prize and refund settlements are durable** (`createPrizeLedger` → `prize_payouts`, retried on a DB blip); the shutdown flush (`claimSeatsForShutdown`, audited `SHUTDOWN_FLUSH`) cashes out each seat EXACTLY once. (e) **One progress record per account**, re-hydrated on login; the hand-end progress push is DB-fresh. `users.chips` is BIGINT — `src/economy/schema.ts` installs the int8 → number parser (`setTypeParser(20, …)`) at import; never read a BIGINT column without it. R3 (S3-3): the migration runs only after the previous container is gone (`scheduleChipsBigintMigration` — the boot account ops' wait); rolling back below R2 needs the column turned back first (Rollback). (f) **Season / leaderboard "chips won" counts PUBLIC cash tables only** (`tableCountsForChipsWon`: never private, club, quick or tournament hands — friends at a table of their choosing could feed one account a paid season place); a club table still feeds its own club stats (`tableFeedsClubStats`). R3 (S3-2): one entry per dealt-in human SEAT by ACCOUNT (`chipsWonSeatsOfHand` / `dealtInSeatAccount`: the live session, else the hand-end removal, else the reservation), captured before any seat is stood up — a player who leaves or drops mid-hand gets his loss; never by live session only. R3 (XL-2): a season before `FIRST_CHIPS_WON_SEASON` ('2026-10', the ledger's first month) is never awarded and never marked (`awardSeason` → `pre_ledger`; admin `pre_ledger_season`) — paying one is an owner decision. (g) R3: Battle Pass premium is the purchase row or the PARSED top-level `stats.battlePassPremium` — never a substring of the stats text (`stats.clientData` is client-written). Bundles, mystery boxes and the scratch pool hold only RENDERED types (`RENDERED_ITEM_TYPES`: theme / card_back / frame / title / emote) and the shop sells only those plus profile backgrounds (`SOLD_COSMETIC_TYPES` — drawn on the lobby banner / profile page). Each `handHistory` copy carries `tableId` + the recipient's own `viewerSeat` / `viewerHoleCards` (stored the same); `loadHandHistory` drops `handName` wherever `holeCards` are absent. A level-up whose settlement fails stays owed (re-sent; per-level ledger keys). | .online R2 audit 2026-10-11 (R3 fixes same day) |
 | 29 | **Engine, relays, tickets, logs (.online R3 SF-C, 2026-10-11).** (a) **S2-1:** `teardownSeat` keeps a seat's hand at a ring table when it has NO decision left — all-in OR the runout is HELD for the insurance window (`table.isRunoutHeld()`: the covering caller too); its final stack is credited at the hand's end. (b) **K1-6:** a seat restore keeps the player's fast mode — `reserveSeatForDeparture` snapshots `fastMode` on the reservation, every restore path (oauthLogin, tokenLogin x2, resumeSession, `restoreAbsentTournamentSeat`) calls `restoreFastModeOnSeatRestore` right after its `reconnectedToTable` (session flag + `fastModeSet {enabled}` to that socket); `setFastMode` also sets the socket's extra-table sessions; per-player state carries `fastMode`. (c) **AUTH-P3-1:** a peer relay (`voiceOffer` / `voiceAnswer` / `voiceIce`, `coachWhisper`) reaches only a LIVE socket that shares a `voice_<tableId>` (voice) / `table:<tableId>` (coach) room with the sender (`relayPeerSharingRoom`) — never `io.to(<client string>)`, which reached any socket id or any room; a whisper is a string, max 500 chars. (d) **AUTH-P3-3:** a play ticket (`authWithTicket`, `joinWithWaitlistContext`) is burned DURABLY — `src/auth/ticketReplay.ts`, table `used_play_tickets` (SHA-256 of the ticket only), one `INSERT … ON CONFLICT (ticket_hash) DO NOTHING RETURNING 1` per claim, the in-memory map as the fast path, hourly TTL prune; a DB that cannot answer falls back to the in-memory guard (`/api/health` `ticketReplayGuard.durableErrors`). (e) **AUTH-P3-4:** `enableDealersChoice` only by a player SEATED at that table (`socketSeatedAt`) and only at a ring table (`dealersChoiceAllowedAt`), else `error {code:'dealers_choice_not_allowed'}`. (f) **AUTH-P3-2:** `/api/health identityGuard.stampDurable` is true on a jsonb AND a TEXT `users.stats` (`statsStampDurable`). (g) **GAME-P3-10:** the AI opponent model is keyed by the seat's player id (`opponentModelKey`), never the display name; bounded (`OPPONENT_PROFILES_CAP`, least recently observed out). (h) **OPS-P3-2:** no login handle (legacy handles are phone numbers) in logs — an `[AUDIT]` actor that is a phone-number handle prints as `user:<id>` / `phone-handle` (`auditActorLabel`; the durable `audit_log` row keeps the raw actor), admin / ticket-login lines print ids, a malformed `/me` logs its keys only. | .online R3 2026-10-11 |
 | 30 | **All-in insurance is OFF; a cash-out refreshes the bank (owner 2026-10-24).** (a) Insurance runs only when the env `ALLIN_INSURANCE` is exactly `1` (`allInInsurance.on`; `insuranceCandidates` returns `[]` otherwise, so no window, quote, held runout or settlement, and Accept answers unavailable). Earned: an insured player who WON was shown the whole pot ("WINNER +2,000", BIG WIN confetti), then `settleInsuranceForHand` cut his stack to the locked cashout and the rest left the economy — 65 clawbacks, 371,861 chips, 12 players 2026-10-12..24, refunded once by `src/economy/insuranceClawbackRefund.ts` (one_time_ops `insurance_clawback_refund_2026_10_24`, durable `BUG_REFUND`). Do NOT turn it back on without the owner AND a table display that shows the net (the clawback) to everyone. (b) Every cash-out credit that COMMITS calls `refreshWalletAfterCashOut` (fresh `playerProgress` to the account's sockets): `creditSeatStackToWallet`, `endCashReservation` (table gone), `cleanupQuickTable`, `adminForceCloseTable`, and the refill `not_broke` answer. No cash-out path pushed before, so the .online lobby bank showed the wallet minus the buy-in until a reload. A FAILED credit pushes nothing. (c) `CASH_OUT_FAILED`, `INSURANCE_PAYOUT` / `INSURANCE_COLLECT` / `INSURANCE_VOID` and `BUG_REFUND` are durable audit actions (they used to reach Railway stdout only). (d) **Sit & Gos start only when FULL** (owner 2026-10-24: "Make the sit and gos not start until full"): the 'Sit & Go' (9) and 'Sit & Go Turbo' (6) templates carry `minPlayers` = `maxPlayers`; every other on-demand template keeps the default start at 4. A Sit & Go short of full is still cancelled + refunded 30 minutes after its first entry (`checkStalledTournaments`). | owner 2026-10-24 |
-| 31 | **A qualifier's late entry + re-entry close AT THE SEAT BUBBLE (owner 2026-10-23: "Fix both").** TournamentManager closes it inside the elimination that takes the alive count from above `seatsForTop + 1` to it or below inside the 2:00 PM window (`lateEntryBubbleOf` = index.ts `qualifierLateEntryBubbleOf`, assigned at boot); once closed `addLateEntrant` / `reinstateForReentry` refuse at their top and `registerQualifierTournament` refuses `registration_closed` (reason `seat_bubble`) BEFORE any credit is consumed, refunding any consume a close overtook (re-checked after EVERY await that follows a consume). A NEW late-entry / re-entry path must read `tournamentManager.lateEntryClosedAtBubble(tid)` before it consumes and again after its last await, and must never un-eliminate a refused reinstatement. Hand-for-hand treats the bubble close as "late registration closed". Section "Online qualifier LATE CLOSE AT THE SEAT BUBBLE, HELD SEEDS, HELP TOOLS OFF". **Same day, same section: NO help tools at a qualifier table** (owner "Turn all off") - a NEW server-computed decision aid (training, coach, recap, commentary, equity / range, a relay into a table room) must refuse with code `help_tools_off_qualifier` when `qualifierIdOfTable(tableId)` / `socketAtQualifierTable(socket)` names a qualifier, and never stamp it into a qualifier table's gameState; the seeds rule is row 6. | owner 2026-10-23 |
+| 31 | **A qualifier's late entry + re-entry close AT THE SEAT BUBBLE (owner 2026-10-23: "Fix both").** TournamentManager closes it inside the elimination that takes the alive count from above `seatsForTop + 1` to it or below inside the 2:00 PM window (review fix-up: or the first elimination at or below it after that, once the field PLAYED above it - `lateEntryPeakAlive`) (`lateEntryBubbleOf` = index.ts `qualifierLateEntryBubbleOf`, assigned at boot); once closed `addLateEntrant` / `reinstateForReentry` refuse at their top and `registerQualifierTournament` refuses `registration_closed` (reason `seat_bubble`) BEFORE any credit is consumed, refunding any consume a close overtook (re-checked after EVERY await that follows a consume). A NEW late-entry / re-entry path must read `tournamentManager.lateEntryClosedAtBubble(tid)` before it consumes and again after its last await, and must never un-eliminate a refused reinstatement. Hand-for-hand treats the bubble close as "late registration closed". Section "Online qualifier LATE CLOSE AT THE SEAT BUBBLE, HELD SEEDS, HELP TOOLS OFF". **Same day, same section: NO help tools at a qualifier table** (owner "Turn all off") - a NEW server-computed decision aid (training, coach, recap, commentary, equity / range, a relay into a table room) must refuse with code `help_tools_off_qualifier` when `qualifierIdOfTable(tableId)` / `socketAtQualifierTable(socket)` names a qualifier, and never stamp it into a qualifier table's gameState; the seeds rule is row 6. | owner 2026-10-23 |
 
 ## Surface area
 
@@ -1374,6 +1374,15 @@ left." All qualifiers (weekly and monthly), like hand-for-hand.
   default top 3 → 4; the monthly top 6 → 7).
 - The bubble is REACHED by an ELIMINATION that takes the alive count from above
   the bubble to the bubble or below, while `now <= lateRegUntil`.
+- Review fix-up (2026-10-24): precisely, by an elimination that leaves the alive
+  count at the bubble or below once the field has PLAYED above it
+  (`Tournament.lateEntryPeakAlive` = the alive count just before each elimination
+  after the first deal; an elimination during the `'prestart'` hold is not
+  counted). Normally that is the crossing elimination itself; if the crossing
+  could not close (no resolver answer at that moment, or the seat package moved
+  the bubble mid-event: applyQualifierSchedule resyncs `seatPackage` for running
+  events), the NEXT elimination closes. Before, such a crossing left late entry
+  open for the rest of the window and later late entries pushed seat winners down.
 - Each elimination removes exactly one player, so a double bust that skips past
   the bubble still passes through it on the first of the two eliminations. It
   counts.
@@ -1383,9 +1392,9 @@ left." All qualifiers (weekly and monthly), like hand-for-hand.
   buster to 11th by a later late entry, "you move down one place").
 - A no-show release or an undone seat (`removeLateEntrant`) never counts.
 - Once closed, it never reopens for that event.
-- Why crossing-at-elimination and not "the largest field ever seen": 30 players
+- Why "the field that PLAYED" and not "the largest field ever seen": 30 players
   seated at 10:50 with 20 no-shows released at 11:00 leaves 10. That field never
-  played above the bubble.
+  played above the bubble (no elimination saw more than 10 alive), so it stays open.
 
 How:
 
@@ -1394,7 +1403,9 @@ How:
   bounty and `'playerEliminated'` — it asks `lateEntryBubbleOf(tid)` (a resolver
   throw is counted, closes nothing), requires an integer `closeAtAlive >= 2`, a
   finite `openUntil`, `now <= openUntil` and the crossing (`alive + 1 >
-  closeAtAlive && alive <= closeAtAlive`), sets `Tournament.lateEntryClosed =
+  closeAtAlive && alive <= closeAtAlive`; review fix-up: `lateEntryPeakAlive >
+  closeAtAlive && alive <= closeAtAlive`, the peak recorded before the resolver is
+  asked), sets `Tournament.lateEntryClosed =
   {at, alive, closeAtAlive, playerId}` FIRST, then emits
   `'lateEntryClosedAtBubble'` (a throwing listener is logged
   `late_entry_closed_listener_failed` and never breaks the elimination).
@@ -1411,7 +1422,9 @@ How:
   via `setImmediate` (never inside the bust check), every table room gets the
   existing toast `serverAnnouncement {message, kind:'late_reg_closed',
   tournamentId, qualifierId, at}` ("Late entry and re-entry are now closed: 11
-  players are left and the top 10 win seats.") and every lobby
+  players are left and the top 10 win seats." — the count read when the toast is
+  sent, review fix-up: a double bust that skips the bubble, 12 -> 10, says 10; the
+  audit / log keep the closing count, 11) and every lobby
   `qualifierTournamentUpdate {…, lateRegOpen:false, lateRegClosedAt,
   lateRegClosedReason:'seat_bubble'}`.
 - **The handler** (`registerQualifierTournament`; `closedAtBubble()` is a closure
@@ -1457,20 +1470,22 @@ How:
   noticeErrors}. `resolverErrors` and `noticeErrors` should stay 0; `closed` is 0
   or 1 per event.
 - **Tests:** `tests/qualifierLateRegBubble.test.ts` (LB1-LB6, the real
-  TournamentManager), `tests/r2Qualifiers.test.ts` LB7-LB13 (the real handler:
+  TournamentManager; LB14 review fix-up: a crossing with no resolver answer, a
+  bubble the package moved, an undone seat, the prestart hold), `tests/r2Qualifiers.test.ts` LB7-LB13 + LB15 (the toast count) (the real handler:
   refused before consume, refunded after, the last-await re-check, never above the
   bubble, the no-show notice, wiring), `tests/qualifierHandForHand.test.ts` HP7,
   `tests/rebalanceSafety.test.ts` H18 / H19 (the real bust check → close →
   engaged; a skip never engages). Every one fails on 9c37499.
 - **Manifest:** `qualifier_late_reg_closed_at_bubble`,
   `QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE`, `lateRegClosesAtBubble`,
-  `late_reg_closed`.
+  `late_reg_closed`, `lateEntryPeakAlive`.
 - **Risks (by design):** players who busted before the bubble and still hold
   credits can no longer re-enter, even before 2 PM; hand-for-hand can start
   earlier and last longer (lower blinds) — the 4-minute watchdog (extended up to
   10) and `{"on":0}` cover a slow bubble. A package changed mid-event: an earlier
-  crossing stays closed; a bubble raised above the current alive count does not
-  close retroactively.
+  crossing stays closed; a bubble moved to or above the current alive count closes
+  at the next elimination if the field played above it (review fix-up), and never
+  if the field never played above the new bubble.
 
 **(B) A running qualifier's fairness seeds are held until it ends.** The finding:
 `GET /api/fairness/:tableId` and `/:tableId/:handNumber` are unauthenticated and
@@ -1507,19 +1522,43 @@ history (no seed field), spectator frames, tournamentFinished, logs or audit.
   does LPUSH + LTRIM 50 + EXPIRE 7 days re-armed on every append
   (`redisStore.ts`), so each key lasts 7 days after that table's LAST hand, and
   the boot rehydrate restores every key still alive. So it is TRUE while
-  `REDIS_URL` is set (live: Redis-8Erh) and Redis keeps its keys. Caveats: only the
-  LAST 50 hands per table are kept (a 4-5 hour table plays more — its early hands'
-  seeds are gone); a restart while Redis is down loses the buffer; Redis's
-  eviction policy was not verifiable without prod access. No change was needed.
+  `REDIS_URL` is set (live: Redis-8Erh) and Redis keeps its keys. Caveats: a
+  restart while Redis is down loses the buffer; Redis's eviction policy was not
+  verifiable without prod access.
+- **Review fix-up — every hand of the EVENT is kept, not only the last 50.** A
+  held seed sat in the same 50-entry ring as every other seed, so a 4-6 hour
+  qualifier table (~300 hands) lost every hand older than its last 50 BEFORE the
+  qualifier ended and its seeds were released (list route: left out; single route:
+  404) — the rules page's "After the qualifier ends, each hand's shuffle code can
+  be checked" was false (reviewer probe: 80 hands played, 30 never verifiable).
+  Now `trimFairnessBuffer` keeps the newest 50 PLUS every stamped entry
+  (`holdForTournamentId`, i.e. played while a qualifier ran) younger than 7 days
+  (`FAIRNESS_EVENT_KEEP_MS`), up to `FAIRNESS_EVENT_BUFFER_MAX` = 2000 per table
+  (`eventEntriesDroppedAtMax` counts any drop at the max; should stay 0). The
+  exemption is by the STAMP, not the hold state, so the event's hands stay after
+  it ends and after a restart (the rehydrated tournament id is unknown → released).
+  Redis: `appendFairnessCommitment(tableId, rc, keep)` LTRIMs to
+  `fairnessRedisKeepFor(buf)` = 2000 while the buffer holds a stamped entry (a
+  superset), else 50 as before; `loadFairnessBuffer` LRANGEs up to
+  `FAIRNESS_LIST_MAX` (= 2000, must equal `FAIRNESS_EVENT_BUFFER_MAX`); the boot
+  rehydrate goes through `restoreFairnessBuffer` (the same trim, no more 50-slice).
+  Non-qualifier tables: exactly the newest 50, as before. Memory: ~300 entries x
+  the event's tables per week, kept for the process life (the buffer has no
+  delete; pre-existing pattern). The rules page now says "The server keeps every
+  hand of the qualifier for 7 days." (poker-3d `qualifierRules.js`).
 - If an event never left `'running'` its seeds would stay held until a restart
   (then released: unknown id). Pre-existing: the in-memory buffer grows with every
   table id over a process life (memory only).
-- **Health:** `r2Play.qualifiers.fairnessHold` = {heldEntriesServed}.
+- **Health:** `r2Play.qualifiers.fairnessHold` = {heldEntriesServed,
+  eventEntriesDroppedAtMax}.
 - **Tests:** `tests/fairnessSeedHold.test.ts` FS1-FS6 (real routes, listener,
-  TournamentManager, PokerTable); `tests/r2Qualifiers.test.ts` LB7 (lobby flag);
+  TournamentManager, PokerTable), FS7-FS8 (review fix-up: 80 hands at a running
+  qualifier table all verify after it ends, in memory and through the REAL
+  redisStore on a fake client + a restart; cash keeps 50); `tests/r2Qualifiers.test.ts` LB7 (lobby flag);
   `tests/gameplay_S9_modes_misc.test.ts` F162 (no seedHeld key off a qualifier);
   `tests/r3EconomyFixes.test.ts` (seedHeldFieldsFor is an expected inert stub in
-  its cash hand world). **Manifest:** `seedsHeldUntilEnd`, `seedHeld`.
+  its cash hand world). **Manifest:** `seedsHeldUntilEnd`, `seedHeld`,
+  `restoreFairnessBuffer`, `eventEntriesDroppedAtMax`.
 
 **(C) No help tools at qualifier tables, server side** (owner "Turn all off";
 poker-3d already hides them — `src/utils/qualifierHelpTools.js`). At ANY table of
@@ -1550,22 +1589,29 @@ qualifier tournaments." — the client's own sentence):
   cap, the rate-limit stamp and any Anthropic client → `coachResult {error, code}`
   / `sessionRecapResult {success:false, code, error}`.
 - `tableCommentary`: never generated at a qualifier table (`commentarySkipped`).
+- `requestProfile` (review fix-up): another player's profile asked from a socket
+  at a qualifier table answers `vpip: null, pfr: null, statsWithheld:
+  'help_tools_off_qualifier'` (log tool `profile_stats`, `profileStatsWithheld`):
+  the lifetime VPIP / PFR is the HUD stat poker-3d hides at those tables, and the
+  rules page says no player stats are shown there. His own profile and every
+  other socket: unchanged. Like every refusal here it is per SOCKET (a second
+  lobby-only tab of the same account still gets it; the rules forbid using it).
 - Reviewed and NOT changed (not server-computed decision aids at the table, or
   not on the owner's list): pushFoldSolver (bots only), insuranceQuote (off; cash
   Hold'em only), rabbitHunt (post-hand board cards — TDA bans rabbit hunting; flag
-  for the owner), predictions, requestProfile lifetime VPIP/PFR, getDetailedStats,
-  voice rooms. A socket at a qualifier table can still use training at its own
+  for the owner), predictions, getDetailedStats (his own stats), voice rooms. A socket at a qualifier table can still use training at its own
   extra CASH table (cash tables are unchanged; the rules page forbids it, the
   server does not enforce it).
 - **Health:** `r2Play.qualifiers.helpToolsOff` = {trainingRefused,
   sessionsForcedOff, whispersRefused, coachRefused, recapRefused,
-  commentarySkipped}.
+  commentarySkipped, profileStatsWithheld}.
 - **Tests:** `tests/qualifierHelpToolsOff.test.ts` (helpers, HT1-HT5, HT6
-  moveTournamentSeatPointers, HT7 wiring; tableCommentary is sliced as its own
+  moveTournamentSeatPointers, HT7 wiring, HT8 requestProfile (review fix-up); tableCommentary is sliced as its own
   block — deviation from "the r3EconomyFixes handWorld": the same real code, no
   hand world needed) + `tests/r2Qualifiers.test.ts` HT6 (the re-entry's reused
   session — the handler harness lives there). **Manifest:**
-  `help_tools_off_qualifier`, `help_tools_refused_at_qualifier`.
+  `help_tools_off_qualifier`, `help_tools_refused_at_qualifier`, `statsWithheld`,
+  `profileStatsWithheld`.
 
 ### Recovering a qualifier's finish order (the results POST never landed)
 

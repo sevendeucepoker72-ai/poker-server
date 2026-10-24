@@ -172,6 +172,16 @@ export interface Tournament {
    * closed, it never reopens for this event). See lateEntryBubbleOf.
    */
   lateEntryClosed?: LateEntryClosedAtBubble | null;
+  /**
+   * 2026-10-24 review fix-up — the largest field that PLAYED: the alive count just
+   * before each elimination after the first deal (an elimination during the
+   * 'prestart' hold is not counted; a no-show release / an undone seat is not an
+   * elimination). The bubble is reached by any elimination that leaves the alive
+   * count at the bubble or below once this went above it — so a crossing the
+   * resolver could not judge (no answer at that moment) or a bubble the seat
+   * package moved closes at the next elimination instead of never.
+   */
+  lateEntryPeakAlive?: number;
 }
 
 /**
@@ -358,13 +368,17 @@ export class TournamentManager {
    * bubble: every tournament that is not an online qualifier). index.ts assigns
    * qualifierLateEntryBubbleOf at boot (the event's live seat package; the 2:00
    * PM late close). The rule (eliminatePlayer): the bubble is REACHED by an
-   * elimination that takes the alive count from ABOVE closeAtAlive to
-   * closeAtAlive or below while now <= openUntil. One elimination removes one
-   * player, so a double bust that skips past the bubble passes through it on the
-   * first of the two. A field that never went above the bubble stays open until
-   * openUntil; removeLateEntrant (a no-show release, an undone seat) never
-   * counts. Once closed, addLateEntrant / reinstateForReentry refuse (no push, no
-   * place shift) for the rest of the event.
+   * elimination that leaves the alive count at closeAtAlive or below while now
+   * <= openUntil, once the field has PLAYED above closeAtAlive (lateEntryPeakAlive:
+   * the alive count before each elimination after the first deal). Normally that
+   * is the elimination that crosses it; review fix-up: if that one could not close
+   * (no resolver answer at that moment, or the seat package moved the bubble), the
+   * next elimination does. One elimination removes one player, so a double bust
+   * that skips past the bubble passes through it on the first of the two. A field
+   * that never played above the bubble stays open until openUntil;
+   * removeLateEntrant (a no-show release, an undone seat) never counts. Once
+   * closed, addLateEntrant / reinstateForReentry refuse (no push, no place shift)
+   * for the rest of the event.
    */
   lateEntryBubbleOf: ((tournamentId: string) => LateEntryBubble | null) | null = null;
   /**
@@ -1167,6 +1181,9 @@ export class TournamentManager {
    */
   private closeLateEntryIfBubbleReached(tournamentId: string, t: Tournament, alive: number, playerId: string): void {
     if (t.lateEntryClosed || !this.lateEntryBubbleOf) return;
+    // Review fix-up — the field that played (alive + 1 were playing), recorded
+    // BEFORE the resolver is asked, so a moment it has no answer is not lost.
+    if (!(t.paused && t.pauseReason === 'prestart')) t.lateEntryPeakAlive = Math.max(t.lateEntryPeakAlive ?? 0, alive + 1);
     let bubble: LateEntryBubble | null;
     try {
       bubble = this.lateEntryBubbleOf(tournamentId);
@@ -1180,7 +1197,10 @@ export class TournamentManager {
     if (typeof openUntil !== 'number' || !Number.isFinite(openUntil)) return;
     const now = Date.now();
     if (now > openUntil) return;                                       // after 2:00 PM: already closed by the clock
-    if (!(alive + 1 > closeAtAlive && alive <= closeAtAlive)) return;   // not the elimination that crossed it
+    // Review fix-up — at or below the bubble now, having PLAYED above it (the
+    // crossing elimination itself, or the first elimination after a crossing the
+    // resolver could not judge / after the package moved the bubble).
+    if (!((t.lateEntryPeakAlive ?? 0) > closeAtAlive && alive <= closeAtAlive)) return;
     t.lateEntryClosed = { at: now, alive, closeAtAlive, playerId };
     this.lateEntryBubbleStats.closed++;
     try {

@@ -40,24 +40,26 @@ const CODE = [
 
 const sha = (s: string) => createHash('sha256').update(s).digest('hex');
 
-function world() {
+function world(extraScope: Record<string, unknown> = {}) {
   const tm = new TournamentManager();
   const tournamentTables = new Map<string, string>();
   const qualifierTournaments = new Map<string, any>();
   const routes = new Map<string, (req: any, res: any) => void>();
   const room: Array<[string, string, any]> = [];
-  const appended: Array<[string, any]> = [];
+  const appended: Array<[string, any, number | undefined]> = [];
   const tables = new Map<string, PokerTable>();
   const scope: Record<string, unknown> = {
     tournamentManager: tm, tournamentTables, qualifierTournaments, SEAT_RESERVE_MS: 6 * 3600_000,
     app: { get: (p: string, fn: (req: any, res: any) => void) => { routes.set(p, fn); } },
     io: { to: (r: string) => ({ emit: (ev: string, d: any) => room.push([r, ev, d]) }) },
-    appendFairnessCommitment: async (tid: string, e: any) => { appended.push([tid, e]); },
+    appendFairnessCommitment: async (tid: string, e: any, keep?: number) => { appended.push([tid, e, keep]); },
     console: { log() {}, warn() {}, error() {} },
+    ...extraScope,
   };
   const { exports: m, stubbed } = load(CODE, scope, `{
     recordRevealedCommitment, revealedCommitmentsByTable, wireFairness, brokenTournamentTables,
     fairnessSeedHoldOf, fairnessSeedIsHeld, publicFairnessEntry, seedHeldFieldsFor, fairnessSeedHoldStats,
+    trimFairnessBuffer, restoreFairnessBuffer, fairnessRedisKeepFor, fairnessEventBufferStats,
   }`);
   const startTournament = (n = 2) => {
     const tid = tm.createTournament({ name: 'T', buyIn: 0, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: [{ sb: 25, bb: 50, ante: 0, duration: 720 }], startingChips: 50_000 } as any);
@@ -233,9 +235,169 @@ describe('FS6 — the lobby item says so (seedsHeldUntilEnd: capability flag the
   });
 
   it('wiring: health key, manifest tokens, the routes go through publicFairnessEntry', () => {
-    expect(SRC).toContain('fairnessHold: { ...fairnessSeedHoldStats },');
+    expect(SRC).toContain('fairnessHold: { ...fairnessSeedHoldStats, ...fairnessEventBufferStats },');
     expect(slice("app.get('/api/fairness/:tableId', (req, res) => {", '\n});\n')).toContain('commitments: buf.map(publicFairnessEntry)');
     const manifest = require('fs').readFileSync(require('path').join(__dirname, '..', 'canonical-features.txt'), 'utf8');
     for (const tok of ['seedsHeldUntilEnd', 'seedHeld']) expect(manifest).toContain(tok);
+  });
+});
+
+// ═══════════════════════ review fix-up — EVERY hand of the event stays verifiable ══
+/**
+ * A held seed sat in the same 50-entry ring as every other seed, so a qualifier
+ * table (4-6 hours, ~300 hands) lost every hand older than its last 50 before the
+ * qualifier ended and its seeds were released: the list route left them out and
+ * the single route said 404 — "After the qualifier ends, each hand's shuffle code
+ * can be checked" was false. Now a qualifier's hands (stamped holdForTournamentId)
+ * are exempt from the ring (7 days, up to 2000 per table) in memory, in Redis
+ * (LTRIM keep / LRANGE) and in the boot rehydrate. Every other table: the newest
+ * 50, exactly as before.
+ */
+function fakeRedis() {
+  const lists = new Map<string, string[]>();
+  const ttl = new Map<string, number>();
+  const trims: Array<[string, number, number]> = [];
+  const handlers: Record<string, (...a: any[]) => void> = {};
+  const client: any = {
+    on: (ev: string, fn: (...a: any[]) => void) => { handlers[ev] = fn; return client; },
+    connect: async () => { if (handlers.ready) handlers.ready(); },
+    multi: () => {
+      const ops: Array<() => void> = [];
+      const m: any = {
+        lPush: (k: string, v: string) => { ops.push(() => { lists.set(k, [v, ...(lists.get(k) || [])]); }); return m; },
+        lTrim: (k: string, a: number, b: number) => { trims.push([k, a, b]); ops.push(() => { lists.set(k, (lists.get(k) || []).slice(a, b + 1)); }); return m; },
+        expire: (k: string, sec: number) => { ops.push(() => { ttl.set(k, sec); }); return m; },
+        exec: async () => { for (const op of ops) op(); return []; },
+      };
+      return m;
+    },
+    lRange: async (k: string, a: number, b: number) => (lists.get(k) || []).slice(a, b + 1),
+    scanIterator: async function* scan(opts: { MATCH: string }) {
+      const pre = opts.MATCH.replace(/\*$/, '');
+      for (const k of [...lists.keys()]) if (k.startsWith(pre)) yield k;
+    },
+  };
+  return { client, lists, ttl, trims };
+}
+/** The REAL redisStore on a fake Redis client (REDIS_URL set only while it connects). */
+async function realRedisStore() {
+  const fake = fakeRedis();
+  let rs: any;
+  jest.isolateModules(() => {
+    jest.doMock('redis', () => ({ createClient: () => fake.client }));
+    rs = require('../src/redisStore');
+  });
+  const prev = process.env.REDIS_URL;
+  process.env.REDIS_URL = 'redis://fake-for-test';
+  const quiet = jest.spyOn(console, 'log').mockImplementation(() => {});   // '[redisStore] ready'
+  try {
+    expect(await rs.connectRedis()).toBe(true);
+  } finally {
+    quiet.mockRestore();
+    if (prev === undefined) delete process.env.REDIS_URL; else process.env.REDIS_URL = prev;
+  }
+  expect(rs.isRedisReady()).toBe(true);
+  return { rs, fake };
+}
+const settle = () => new Promise((r) => setImmediate(r));
+
+describe('FS7 — a qualifier table plays 80 hands while it runs: after it ends EVERY one of the 80 is listed and verifies (51ddfd8: only the last 50 — hands 1-30 never verifiable); a cash table keeps its newest 50 as before', () => {
+  it('in memory: the list route serves 80 seeds, the single route verifies each (hand 1 included); the cash table 50; Redis is asked to keep the max for the qualifier table, 50 for cash', () => {
+    const w = world();
+    const qtid = w.startTournament(3);
+    w.qualifierTournaments.set('Q-weekly', { tournamentId: qtid, status: 'running', qualifierType: 'weekly', players: [] });
+    const QA = w.table('QA', qtid);
+    const C1 = w.table('C1');
+    for (let i = 0; i < 80; i++) { w.playHand(QA); w.playHand(C1); }
+    // While it runs: 80 held entries, no seed served.
+    const held = w.list('QA').body.commitments;
+    expect(held).toHaveLength(80);
+    expect(held.every((c: any) => c.seed === null && c.seedHeld === true)).toBe(true);
+    const handsQA = held.map((c: any) => c.handNumber);
+    w.finish(qtid);
+    const after = w.list('QA').body.commitments;
+    expect(after.map((c: any) => c.handNumber)).toEqual(handsQA);   // nothing lost, newest-first
+    for (const c of after) {
+      expect(sha(c.seed)).toBe(c.hash);
+      expect(w.one('QA', c.handNumber).body).toMatchObject({ verified: true, seed: c.seed });
+    }
+    expect(w.one('QA', Math.min(...handsQA)).status).toBe(200);     // the FIRST hand of the event
+    // The cash table: the newest 50, exactly as before (key order included).
+    const cash = w.list('C1').body.commitments;
+    expect(cash).toHaveLength(50);
+    expect(cash.every((c: any) => Object.keys(c).join() === 'seed,hash,handNumber,revealedAt')).toBe(true);
+    expect(w.one('C1', Math.min(...cash.map((c: any) => c.handNumber)) - 1).status).toBe(404);
+    // Redis LTRIM keep: the max for the qualifier table (a superset), 50 for cash.
+    const keeps = (id: string) => [...new Set(w.appended.filter(([t]) => t === id).map(([, , k]) => k))];
+    expect(keeps('QA')).toEqual([2000]);
+    expect(keeps('C1')).toEqual([50]);
+    expect(w.m.fairnessEventBufferStats).toEqual({ eventEntriesDroppedAtMax: 0 });
+  });
+
+  it('the trim rule: newest 50 + every qualifier hand of the last 7 days, up to 2000 per table; unstamped entries past 50 dropped; a 7-day-old qualifier hand past 50 dropped', () => {
+    const w = world();
+    const now = Date.now();
+    const e = (n: number, stamp: boolean, ageMs = 0) => ({ handNumber: n, seed: `s${n}`, hash: `h${n}`, revealedAt: now - ageMs, ...(stamp ? { holdForTournamentId: 'T' } : {}) });
+    // 60 unstamped (newest), then 40 stamped, then 5 stamped older than 7 days.
+    const buf = [
+      ...Array.from({ length: 60 }, (_, i) => e(200 - i, false)),
+      ...Array.from({ length: 40 }, (_, i) => e(100 - i, true, 3600_000)),
+      ...Array.from({ length: 5 }, (_, i) => e(50 - i, true, 8 * 24 * 3600_000)),
+    ];
+    const out = w.m.trimFairnessBuffer(buf, now);
+    expect(out.slice(0, 50).map((x: any) => x.handNumber)).toEqual(buf.slice(0, 50).map((x) => x.handNumber));
+    expect(out.slice(50).map((x: any) => x.handNumber)).toEqual(Array.from({ length: 40 }, (_, i) => 100 - i));
+    expect(out).toHaveLength(90);
+    // 50 or fewer: the same array, untouched.
+    const small = buf.slice(0, 50);
+    expect(w.m.trimFairnessBuffer(small, now)).toBe(small);
+    // The per-table max.
+    const huge = Array.from({ length: 2100 }, (_, i) => e(5000 - i, true));
+    expect(w.m.trimFairnessBuffer(huge, now)).toHaveLength(2000);
+    expect(w.m.fairnessEventBufferStats.eventEntriesDroppedAtMax).toBe(100);
+    expect(w.m.fairnessRedisKeepFor([e(1, false)])).toBe(50);
+    expect(w.m.fairnessRedisKeepFor([e(2, false), e(1, true)])).toBe(2000);
+  });
+});
+
+describe('FS8 — through the REAL redisStore (fake client) and a restart: the qualifier table keeps all 80 hands through LTRIM, the boot scan and the rehydrate, and all verify (51ddfd8: LTRIM 0 49 + LRANGE 0 49 + slice 50)', () => {
+  it('80 hands at a running qualifier table + 80 at a cash table: Redis keeps 80 / 50 (7-day TTL); a new process restores 80 / 50; every qualifier seed is served (its tournament is unknown after the restart) and verifies', async () => {
+    const { rs, fake } = await realRedisStore();
+    expect(rs.FAIRNESS_LIST_MAX).toBe(2000);
+    expect(SRC).toContain('const FAIRNESS_EVENT_BUFFER_MAX = 2000;');   // the two caps agree
+    const w = world({ appendFairnessCommitment: rs.appendFairnessCommitment });
+    const qtid = w.startTournament(3);
+    w.qualifierTournaments.set('Q-weekly', { tournamentId: qtid, status: 'running', qualifierType: 'weekly', players: [] });
+    const QA = w.table('QA', qtid);
+    const C1 = w.table('C1');
+    for (let i = 0; i < 80; i++) { w.playHand(QA); w.playHand(C1); await settle(); }
+    await settle();
+    expect(fake.lists.get('poker:fairness:QA')).toHaveLength(80);
+    expect(fake.lists.get('poker:fairness:C1')).toHaveLength(50);
+    expect(fake.ttl.get('poker:fairness:QA')).toBe(7 * 24 * 3600);
+    expect(new Set(fake.trims.filter(([k]) => k === 'poker:fairness:C1').map(([, , b]) => b))).toEqual(new Set([49]));
+    // A restart: a NEW process (its TournamentManager never knew the qualifier) rehydrates from Redis.
+    const scanned = await rs.scanFairnessBuffers();
+    expect(scanned.map((x: any) => [x.tableId, x.entries.length]).sort()).toEqual([['C1', 50], ['QA', 80]]);
+    const y = world();
+    let restored = 0;
+    for (const { tableId, entries } of scanned) restored += y.m.restoreFairnessBuffer(tableId, entries);
+    expect(restored).toBe(130);
+    const qa = y.list('QA').body.commitments;
+    expect(qa).toHaveLength(80);
+    for (const c of qa) {
+      expect('holdForTournamentId' in c).toBe(false);   // the stamp is never served
+      expect(sha(c.seed)).toBe(c.hash);
+      expect(y.one('QA', c.handNumber).body).toMatchObject({ verified: true });
+    }
+    expect(y.list('C1').body.commitments).toHaveLength(50);
+  });
+
+  it('wiring: the boot rehydrate restores through restoreFairnessBuffer (no 50-slice left); record passes the Redis keep', () => {
+    const boot = slice('const fairnessBuffers = await scanFairnessBuffers();', "console.warn('[Rehydrate] fairness scan failed:'");
+    expect(boot).toContain('totalEntries += restoreFairnessBuffer(tableId, entries);');
+    expect(boot).not.toContain('entries.slice(0, FAIRNESS_BUFFER_SIZE)');
+    expect(fnSrc('function recordRevealedCommitment(')).toContain('appendFairnessCommitment(tableId, rc, fairnessRedisKeepFor(buf))');
+    expect(SRC).not.toContain('if (buf.length > FAIRNESS_BUFFER_SIZE) buf.length = FAIRNESS_BUFFER_SIZE;');
   });
 });

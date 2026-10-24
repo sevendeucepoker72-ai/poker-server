@@ -109,7 +109,7 @@ describe('the help-tools helpers: which table / socket is at a qualifier', () =>
     const watching = w.mkSocket('S3', 3); watching.join('table:QS1');
     const cash = w.mkSocket('S4', 4); w.seat(cash, 'C1', 1); cash.join('table:SG1');
     expect([seated, extra, watching, cash].map((s) => m.socketAtQualifierTable(s))).toEqual(['Q-weekly', 'Q-weekly', 'Q-weekly', null]);
-    expect(m.qualifierHelpToolsOff).toEqual({ trainingRefused: 0, sessionsForcedOff: 0, whispersRefused: 0, coachRefused: 0, recapRefused: 0, commentarySkipped: 0 });
+    expect(m.qualifierHelpToolsOff).toEqual({ trainingRefused: 0, sessionsForcedOff: 0, whispersRefused: 0, coachRefused: 0, recapRefused: 0, commentarySkipped: 0, profileStatsWithheld: 0 });
     expect(QS.QUALIFIER_HELP_TOOLS_OFF_TEXT).toBe(OFF_TEXT);
     expect(/^[\x20-\x7e]+$/.test(QS.QUALIFIER_HELP_TOOLS_OFF_TEXT)).toBe(true);
   });
@@ -328,9 +328,49 @@ describe('HT7 — wiring: every handler asks, the health keys, the manifest toke
     const recap = handlerSrc('requestSessionRecap', '\n  });\n');
     expect(recap.indexOf('socketAtQualifierTable(socket)')).toBeLessThan(recap.indexOf('recapLastRequest.set('));
     expect(handlerSrc('coachWhisper', '\n  });\n')).toContain('socketAtQualifierTable(student)');
+    expect(handlerSrc('requestProfile', '\n  });\n')).toContain('const statsOffAt = targetId !== viewer.userId ? socketAtQualifierTable(socket) : null;');
     expect(fnSrc('function getGameStateForPlayer(')).toContain('!stateQualifierId &&');
     expect(SRC).toContain('helpToolsOff: { ...qualifierHelpToolsOff },');
     const manifest = require('fs').readFileSync(require('path').join(__dirname, '..', 'canonical-features.txt'), 'utf8');
     for (const tok of ['help_tools_off_qualifier', 'help_tools_refused_at_qualifier']) expect(manifest).toContain(tok);
+  });
+});
+
+describe('HT8 (review fix-up) — requestProfile answers WITHOUT opponent VPIP / PFR to a socket at a qualifier table (the rules page: "No ... player stats are shown there")', () => {
+  function wired(w: ReturnType<typeof world>) {
+    const code = `${HELP}\nfunction wire(socket) {\n${handlerSrc('requestProfile', '\n  });\n')}\n}`;
+    const row = { level: 7, xp: 10, stats: '{"handsPlayed":40,"handsWon":10,"vpipHands":10,"pfrHands":4}', achievements: '[]' };
+    const scope = {
+      ...w.scope,
+      getPool: () => ({ query: async (_t: string, p: unknown[]) => ({ rows: [1, 2].includes(p[0] as number) ? [row] : [] }) }),
+      getPublicNames: async (ids: number[]) => new Map(ids.filter((i) => [1, 2].includes(i)).map((i) => [i, `Player ${i}`])),
+      publicIdsFor: async (ids: number[]) => new Map(ids.map((i) => [i, `p${String(i).padStart(15, '0')}`])),
+      userIdForPublicId: async () => null, publicNameForUser: async (i: number) => `Player ${i}`,
+      findUsersByDisplayName: async () => [], isPublicDisplayName: () => false,
+      loadInventory: async () => [],
+      progressionManager: { userRecord: () => undefined, getSeasonXp: () => 0 },
+      seasonXpOf: () => 0, vipTierForSeasonXp: () => ({ name: 'Bronze' }),
+    };
+    return load(code, scope, '{ wire, qualifierHelpToolsOff }');
+  }
+  it('seated at the start table / only watching the overflow table: vpip + pfr null, statsWithheld; his OWN profile there and a cash-table viewer: the numbers as before (dd172ae: 25 / 10 to the qualifier table)', async () => {
+    const w = world();
+    const { exports: m, stubbed } = wired(w);
+    const seated = w.mkSocket('S1', 1); w.seat(seated, 'QS1', 0); m.wire(seated);
+    const watching = w.mkSocket('S3', 3); watching.join('table:QOV'); m.wire(watching);
+    const cash = w.mkSocket('S4', 4); w.seat(cash, 'C1', 1); m.wire(cash);
+    for (const s of [seated, watching, cash]) { await s.handlers.requestProfile({ userId: 2 }); await flush(); }
+    await seated.handlers.requestProfile({ userId: 1 }); await flush();
+    const [atQ, own] = w.of('S1', 'profileData');
+    expect(atQ).toMatchObject({ userId: 2, displayName: 'Player 2', isYou: false, totalHands: 40, wins: 10, vpip: null, pfr: null, statsWithheld: CODE_OFF });
+    expect(w.of('S3', 'profileData')[0]).toMatchObject({ vpip: null, pfr: null, statsWithheld: CODE_OFF });
+    expect(own).toMatchObject({ isYou: true, vpip: 25, pfr: 10 });
+    expect('statsWithheld' in own).toBe(false);
+    const c = w.of('S4', 'profileData')[0];
+    expect(c).toMatchObject({ userId: 2, isYou: false, vpip: 25, pfr: 10 });
+    expect('statsWithheld' in c).toBe(false);
+    expect(m.qualifierHelpToolsOff.profileStatsWithheld).toBe(2);
+    expect(refusedLines(w.logs, 'profile_stats')).toHaveLength(2);
+    expect([...stubbed].filter((n) => !n.includes('.'))).toEqual([]);
   });
 });

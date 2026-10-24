@@ -3273,6 +3273,19 @@ describe('2026-10-24 (owner 2026-10-23: "Fix both") — late entry and re-entry 
     expect(x.w.of('SG2', 'qualifierCancelled')).toEqual([expect.objectContaining({ reason: 'absent_at_start', lateRegOpen: false, lateRegUntil: new Date(lateRegUntil).toISOString() })]);
   });
 
+  it('LB15 (review fix-up) — a double bust that skips the bubble (12 -> 10 in one bust check): the audit keeps the closing count (11), the room toast says 10 are left (c00b5b8: "11 players are left" while 10 remained)', async () => {
+    const x = bubbleField(14, 2);
+    expect(x.alive()).toBe(12);
+    x.bust('user-303');                                                        // 12 -> 11: closes (audit alive 11)
+    x.bust('user-304');                                                        // 11 -> 10, the same synchronous bust check
+    expect(x.alive()).toBe(10);
+    expect(x.closeAudits()).toEqual([{ actor: 'SYSTEM', action: 'QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE', d: expect.objectContaining({ alive: 11, bubble: 11, seatsForTop: 10, playerId: 'user-303' }) }]);
+    await flush();
+    const notices = x.w.roomEmits.filter(([, ev, d]) => ev === 'serverAnnouncement' && d.kind === 'late_reg_closed');
+    expect(notices.map(([room]) => room).sort()).toEqual(['table:Q1', 'table:Q2']);
+    for (const [, , d] of notices) expect(d.message).toBe('Late entry and re-entry are now closed: 10 players are left and the top 10 win seats.');
+  });
+
   it('LB13 — wiring: TournamentManager asks the per-event bubble (assigned at boot); the bootstrap listener tells the close; durable audit, health and manifest tokens', () => {
     expect(SRC).toContain('tournamentManager.lateEntryBubbleOf = qualifierLateEntryBubbleOf;');
     const ev = slice('  tournamentManager.onEvent(tournamentId, (event, data) => {', '\n  });\n', SRC.indexOf('function bootstrapTournamentTables('));
