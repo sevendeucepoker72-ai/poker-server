@@ -1775,3 +1775,8 @@ lateEntryPeakAlive
 # to a socket at a qualifier table (vpip/pfr null + statsWithheld).
 statsWithheld
 profileStatsWithheld
+# 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all) - F21 "5-minute levels": the two
+# Sit & Go templates' own structures (1,500 chips; 5 / 3 minute levels); lobby item blindStructure.
+SIT_AND_GO_TURBO_LEVELS
+SIT_AND_GO_STARTING_CHIPS
+levelSeconds

@@ -789,8 +789,9 @@ describe('review fix-up: the lobby list names the pause', () => {
     expect(w.tm.pauseTournament(w.tid, true, 'prestart')).toBe(true);
     expect(item()).toMatchObject({ paused: true, pauseReason: 'prestart' });
     expect(lobbyOffersResume(item())).toBe(false);
-    // The rest of the item is unchanged (additive).
-    expect(Object.keys(item())).toEqual([
+    // The rest of the item is unchanged (additive). 2026-10-24 (Sit & Go fix-all F21):
+    // more additive keys follow these (startingChips, levelSeconds, blindStructure, ...).
+    expect(Object.keys(item()).slice(0, 18)).toEqual([
       'registered', 'entryId', 'minPlayers', 'tournamentId', 'name', 'buyIn', 'prizePool', 'fundedPool', 'isFreeroll',
       'maxPlayers', 'registeredPlayers', 'status', 'paused', 'pauseReason', 'nextStartTime', 'currentBlinds', 'blindLevel', 'blindLevelCount',
     ]);

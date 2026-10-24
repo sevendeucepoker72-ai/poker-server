@@ -1806,6 +1806,19 @@ re-sends the POST (`tests/qualifierResultsDurable.test.ts`).
      exits before the insert lands. The `SHUTDOWN_FLUSH` row's
      `qualifierRegistrationsReleased` says how many refunds that flush started.
 
+### Sit & Go fix-all (owner 2026-10-23: "Fix all", after the 9-player Sit & Go audit)
+
+The 9-player Sit & Go audit (6ed9e7b3, 2026-10-23) found every result and chip
+correct, and a list of record / display / rule gaps. Each fix is its own
+commit on branch `sng-fixes` (subject "Sit & Go fix-all (owner 2026-10-23): ...")
+so a proven item can ship alone. **Qualifier rule:** nothing here changes a
+qualifier path unless the row says so; items scoped to non-qualifier
+tournaments say "non-qualifier". Every frame / route change is additive.
+
+| Item | What the server does now | Where | Tests |
+|---|---|---|---|
+| F21 Sit & Go structure (owner: "5-minute levels") | 'Sit & Go' (9 max) starts everyone with 1,500 chips and every level lasts 5 minutes; 'Sit & Go Turbo' (6 max) 1,500 chips, 3-minute levels. Each has its OWN level array (`SIT_AND_GO_LEVELS` / `SIT_AND_GO_TURBO_LEVELS`): the old amounts level for level, then 750/1500/150 .. 5000/10000/1000 so one hand's forced bets at a full table cover every chip in play. `SNG_BLIND_LEVELS` is unchanged, so Bounty Turbo (derived from it) and every other template are exactly as before. Lobby item (additive): `startingChips`, `levelSeconds` (null when the levels differ), `blindStructure` [{level, sb, bb, ante, durationSec}]. Qualifiers: untouched (own structure). | `TournamentManager.ts` templates, `structureOf` | `tests/sngF21BlindStructure.test.ts` |
+
 ## Gotchas
 
 - **There is no SQLite (corrected 2026-10-11, CLUBS-P3-1).** Clubs (and

@@ -264,6 +264,28 @@ const SNG_BLIND_LEVELS: BlindLevel[] = [
   { sb: 500, bb: 1000, ante: 100, duration: 60 },
 ];
 
+/**
+ * 2026-10-24 (owner 2026-10-23: "5-minute levels"; Sit & Go fix-all F21) — the
+ * two Sit & Go templates' OWN structures. The blind / ante amounts of the old
+ * SNG_BLIND_LEVELS are kept level for level; every level now lasts the same
+ * time (Sit & Go 5 minutes, Turbo 3 minutes), and the schedule is extended past
+ * 500/1000 (ante = bb / 10) until one hand's forced bets at a full table cover
+ * every chip in play (9 x 1,500), so a long game never sits on the last level.
+ * SNG_BLIND_LEVELS itself is unchanged: Bounty Turbo is still derived from it.
+ */
+const SNG_STRUCTURE_AMOUNTS: Array<[number, number, number]> = [
+  ...SNG_BLIND_LEVELS.map((l): [number, number, number] => [l.sb, l.bb, l.ante]),
+  [750, 1500, 150], [1000, 2000, 200], [1500, 3000, 300], [2000, 4000, 400], [3000, 6000, 600], [5000, 10000, 1000],
+];
+function sitAndGoStructure(levelSeconds: number): BlindLevel[] {
+  return SNG_STRUCTURE_AMOUNTS.map(([sb, bb, ante]) => ({ sb, bb, ante, duration: levelSeconds }));
+}
+/** F21 — 'Sit & Go' (9 max): 1,500 chips, 5-minute levels. */
+export const SIT_AND_GO_LEVELS: BlindLevel[] = sitAndGoStructure(5 * 60);
+/** F21 — 'Sit & Go Turbo' (6 max): 1,500 chips, 3-minute levels. */
+export const SIT_AND_GO_TURBO_LEVELS: BlindLevel[] = sitAndGoStructure(3 * 60);
+export const SIT_AND_GO_STARTING_CHIPS = 1500;
+
 const TOURNAMENT_TEMPLATES: TournamentTemplate[] = [
   {
     name: 'Freeroll',
@@ -303,7 +325,9 @@ const TOURNAMENT_TEMPLATES: TournamentTemplate[] = [
     // taken, never the templates' default of 4 (startThreshold).
     minPlayers: 9,
     startInterval: 0, // starts when full
-    blindLevels: SNG_BLIND_LEVELS,
+    // F21 (owner 2026-10-23: "5-minute levels") — its own structure: 1,500 chips, 5-minute levels.
+    blindLevels: SIT_AND_GO_LEVELS,
+    startingChips: SIT_AND_GO_STARTING_CHIPS,
   },
   {
     name: 'Sit & Go Turbo',
@@ -312,10 +336,9 @@ const TOURNAMENT_TEMPLATES: TournamentTemplate[] = [
     maxPlayers: 6,
     minPlayers: 6,   // 2026-10-24 (owner) — starts only when full
     startInterval: 0,
-    blindLevels: SNG_BLIND_LEVELS.map((l) => ({
-      ...l,
-      duration: Math.floor(l.duration * 0.6),
-    })),
+    // F21 — its own structure: 1,500 chips, 3-minute levels.
+    blindLevels: SIT_AND_GO_TURBO_LEVELS,
+    startingChips: SIT_AND_GO_STARTING_CHIPS,
   },
   {
     name: 'Bounty Hunter',
@@ -540,9 +563,29 @@ export class TournamentManager {
         currentBlinds: t.status === 'running' ? { sb: currentBlinds.sb, bb: currentBlinds.bb, ante: currentBlinds.ante } : null,
         blindLevel: t.currentBlindLevel + 1,
         blindLevelCount: t.config.blindLevels.length,
+        // F21 (2026-10-24) — the structure, for the lobby card / detail (additive):
+        // the starting stack, the one level length in seconds (null when the
+        // levels differ) and every level.
+        ...this.structureOf(t),
       });
     }
     return list;
+  }
+
+  /**
+   * F21 (2026-10-24) — the structure fields of a lobby item: `startingChips`,
+   * `levelSeconds` (every level's length when they are all the same, else null)
+   * and `blindStructure` [{level, sb, bb, ante, durationSec}].
+   */
+  private structureOf(t: Tournament): { startingChips: number; levelSeconds: number | null; blindStructure: Array<{ level: number; sb: number; bb: number; ante: number; durationSec: number }> } {
+    const levels = t.config.blindLevels || [];
+    const first = levels.length > 0 ? levels[0].duration : null;
+    const uniform = first !== null && levels.every((l) => l.duration === first);
+    return {
+      startingChips: t.config.startingChips || 1000,
+      levelSeconds: uniform ? first : null,
+      blindStructure: levels.map((l, i) => ({ level: i + 1, sb: l.sb, bb: l.bb, ante: l.ante, durationSec: l.duration })),
+    };
   }
 
   /**
