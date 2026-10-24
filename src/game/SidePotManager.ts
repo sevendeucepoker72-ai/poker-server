@@ -49,6 +49,38 @@ export interface AwardPotsResult {
  */
 export class SidePotManager {
   /**
+   * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F4) — the chips a
+   * FOLDED seat put in that no seat still in the hand can ever win: when EVERY
+   * contender (occupied, not folded — PokerTable passes a seat with no cards
+   * as folded, as determineWinners does) is ALL-IN, each folded seat's LIVE investment (total - dead money) above
+   * the largest contender's live investment is an uncalled bet and goes back
+   * to it. Evidence hand 11 (9-player Sit & Go): the big blind folded with a
+   * free check facing two short all-ins; the 105 of his big blind nobody
+   * matched went to the bigger all-in's side pot (calculatePots' orphan rule).
+   * A contender that is NOT all-in can win every tier (F1/F2 eligibility), so
+   * nothing is returned then (the F22 leaver rule: his unmatched bet stays
+   * dead money for the live seat). Dead money always stays in the pot.
+   * Pure: returns [{seatIndex, amount}] (amount > 0), the caller moves the chips.
+   */
+  static unmatchedFoldedExcess(seats: SeatInfo[]): Array<{ seatIndex: number; amount: number }> {
+    const occupied = seats.filter((s) => s.state === 'occupied');
+    const isFolded = (s: SeatInfo) => !!s.folded;
+    const deadOf = (s: SeatInfo): number =>
+      Math.max(0, Math.min(s.totalInvestedThisHand, Math.floor(Number(s.deadMoney) || 0)));
+    const liveOf = (s: SeatInfo): number => s.totalInvestedThisHand - deadOf(s);
+    const contenders = occupied.filter((s) => !isFolded(s));
+    if (contenders.length === 0 || contenders.some((s) => !s.allIn)) return [];
+    const top = Math.max(...contenders.map(liveOf));
+    const out: Array<{ seatIndex: number; amount: number }> = [];
+    for (const s of occupied) {
+      if (!isFolded(s)) continue;
+      const excess = liveOf(s) - top;
+      if (excess > 0) out.push({ seatIndex: s.seatIndex, amount: excess });
+    }
+    return out;
+  }
+
+  /**
    * Calculate pots based on each seat's totalInvestedThisHand.
    *
    * TDA-correct algorithm: side pots are created ONLY by all-in players.

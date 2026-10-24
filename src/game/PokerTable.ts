@@ -2766,7 +2766,39 @@ export class PokerTable extends EventEmitter {
    * the determineWinners() / Omaha / Stud call sites don't need touching.
    */
   protected refundUncalledBets(): void {
-    /* intentionally empty — see C16 note above */
+    // (The C16 whole-hand net stays removed — see above.)
+    // 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F4) — a pot tier
+    // only a FOLDED seat paid into, when every seat still in the hand is
+    // all-in: nobody left can win it, so it goes back to him as an uncalled bet
+    // (SidePotManager.unmatchedFoldedExcess) instead of to the bigger all-in
+    // (calculatePots' orphan rule). Runs before every pot calculation (base,
+    // Omaha and Stud determineWinners). Chips only move from the pot back to
+    // their contributor: conserved.
+    const infos: SeatInfo[] = this.seats
+      .filter((s) => s.state === 'occupied' && !s.eliminated)
+      .map((s) => ({
+        seatIndex: s.seatIndex,
+        chipCount: s.chipCount,
+        totalInvestedThisHand: s.totalInvestedThisHand,
+        folded: s.folded || s.holeCards.length === 0,
+        allIn: s.allIn,
+        holeCards: s.holeCards,
+        state: s.state,
+        deadMoney: s.deadMoneyThisHand,
+      }));
+    for (const { seatIndex, amount } of SidePotManager.unmatchedFoldedExcess(infos)) {
+      const seat = this.seats[seatIndex];
+      const back = Math.min(amount, seat.totalInvestedThisHand);
+      if (!(back > 0)) continue;
+      seat.chipCount += back;
+      seat.totalInvestedThisHand -= back;
+      this.emit('uncalledBetReturned', { seatIndex, amount: back });
+      this.actionLog.push({
+        seatIndex,
+        playerName: seat.playerName,
+        action: `uncalled bet (${back}) returned`,
+      });
+    }
   }
 
   /**

@@ -1793,3 +1793,5 @@ raised to|bet |straddle|went all-in
 markAutoAction
 withAutoAction
 autoActForSeat(tableId, t, activeSeat, 'timeout')
+# Sit & Go fix-all F4 - a pot tier only a folded seat paid into (every contender all-in) is returned to him as uncalled.
+unmatchedFoldedExcess
