@@ -14555,7 +14555,8 @@ Give feedback in this JSON format:
       // 2026-10-07 — the sign-in succeeded; only the seat restore was refused.
       // Sent after loginResult so the client is signed in when it lands (C5).
       if (seatRestoreRefusal) emitPlayRefusal(socket, seatRestoreRefusal);
-      tellDeadTournamentSeat(socket, oauthSession, deadTournamentSeat);   // G183
+      const oauthG183Told = tellDeadTournamentSeat(socket, oauthSession, deadTournamentSeat);   // G183
+      tellUnseenTournamentResults(socket, oauthSession, oauthG183Told);   // F12 — results he was never told
       // P-b (S2 fixed protocol) — his VOLUNTARILY left tournament seats were
       // not restored: tell this socket (not a secondary multi-table socket).
       if (!data?.skipSeatRecovery) tellKeptTournamentSeats(socket, oauthSession, 'voluntary', 'oauthLogin');
@@ -14852,7 +14853,8 @@ Give feedback in this JSON format:
             ...(tlRequestId ? { requestId: tlRequestId } : {}),
           });
           if (tlSeatRestoreRefusal) emitPlayRefusal(socket, tlSeatRestoreRefusal); // 2026-10-07
-          tellDeadTournamentSeat(socket, tlSession, tlDeadTournamentSeat);   // G183
+          const tlG183Told = tellDeadTournamentSeat(socket, tlSession, tlDeadTournamentSeat);   // G183
+          tellUnseenTournamentResults(socket, tlSession, tlG183Told);   // F12
           tellKeptTournamentSeats(socket, tlSession, 'voluntary', 'tokenLogin'); // P-b (S2 fixed protocol)
           hydrateAndPushProgress(socket, progress.userData.id, progress.userData.username).catch(() => {});
           return;
@@ -14927,7 +14929,8 @@ Give feedback in this JSON format:
         // P-b (S2 fixed protocol) — his voluntarily left tournament seats: told, not restored.
         const legacyAuthNow = authSessions.get(socket.id);
         if (legacyAuthNow && result.userData && legacyAuthNow.userId === result.userData.id) {
-          tellDeadTournamentSeat(socket, legacyAuthNow, legacyDeadTournamentSeat);   // G183
+          const legacyG183Told = tellDeadTournamentSeat(socket, legacyAuthNow, legacyDeadTournamentSeat);   // G183
+          tellUnseenTournamentResults(socket, legacyAuthNow, legacyG183Told);   // F12
           tellKeptTournamentSeats(socket, legacyAuthNow, 'voluntary', 'tokenLogin_legacy');
         }
       } else {
@@ -18458,7 +18461,8 @@ Give feedback in this JSON format:
         });
         // The sign-in succeeded; only the seat restore was refused (C5, after loginResult).
         if (rsSeatRestoreRefusal) emitPlayRefusal(socket, rsSeatRestoreRefusal);
-        tellDeadTournamentSeat(socket, rsSession, rsDeadTournamentSeat);   // G183
+        const rsG183Told = tellDeadTournamentSeat(socket, rsSession, rsDeadTournamentSeat);   // G183
+        tellUnseenTournamentResults(socket, rsSession, rsG183Told);   // F12
         // P-b (S2 fixed protocol) — voluntarily left tournament seats: told, not restored.
         if (!data?.skipSeatRecovery) tellKeptTournamentSeats(socket, rsSession, 'voluntary', 'resumeSession');
         hydrateAndPushProgress(socket, userId, row.username).catch(() => {});
@@ -23228,14 +23232,14 @@ function restoreSeatReservation(
  * {tournamentId, position, tournamentName}. Nothing when nothing is known (a
  * re-entered entrant is alive: (c) restores his live seat by account).
  */
-function tellDeadTournamentSeat(socket: Socket, auth: SocketAuthSession, dead: DeadTournamentReservation | undefined): void {
-  if (!dead?.tournamentId) return;
+function tellDeadTournamentSeat(socket: Socket, auth: SocketAuthSession, dead: DeadTournamentReservation | undefined): string | null {
+  if (!dead?.tournamentId) return null;
   const why = tournamentEntryOutcomeOfAccount(auth, dead.tournamentId);
-  if (!why) return;
+  if (!why) return null;
   if (why.kind === 'eliminated') {
     // Hand-for-hand review fix-up — a round bust not placed yet: nothing now; the
     // settle tells every live socket of his (this one too) his FINAL place.
-    if (dead.playerId && handForHandBustPending(dead.tournamentId, dead.playerId)) return;
+    if (dead.playerId && handForHandBustPending(dead.tournamentId, dead.playerId)) return null;
     // F7 (2026-10-24) — + his prize when the place is paid.
     const prize = dead.playerId ? tournamentManager.prizeForEntrant(dead.tournamentId, dead.playerId) : null;
     noticeTournamentEliminationToEntrant(dead.tournamentId, dead.playerId || '', [socket.id], dead.playerName, why.position, prize);
@@ -23248,6 +23252,53 @@ function tellDeadTournamentSeat(socket: Socket, auth: SocketAuthSession, dead: D
       ...(prize && prize > 0 ? { prize } : {}),
       tournamentName: tournamentManager.getTournament(dead.tournamentId)?.config.name || 'Tournament',
     });
+  }
+  return dead.tournamentId;   // F12 (2026-10-24) — the sign-in's result notice skips it
+}
+
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F12) — a player who
+ * busted while DISCONNECTED is told his place (and prize) at his next sign-in,
+ * even after the table closed: this account's UNTOLD durable results (F14:
+ * tournament_result_players.told_at IS NULL; non-qualifier, not voided, within
+ * 7 days, at most 5). Finished → the existing 'tournamentFinishedForEntrant'
+ * {tournamentId, position, prize?, tournamentName, atSignIn:true}; still
+ * running HERE → the existing 'playerEliminated' {tournamentId, playerId,
+ * playerName, position, prize?, atSignIn:true} (a running row whose tournament
+ * this process no longer has - a crash - is left untold). Each told row gets
+ * told_at. `toldTournamentId` = the tournament the G183 notice
+ * (tellDeadTournamentSeat) just told: not told again, marked told. Nothing when
+ * the socket signed out / switched account before the answer. Fire-and-forget;
+ * never throws into the sign-in (the whole body is guarded: a harness without
+ * the durable store just tells nothing).
+ */
+const unseenResultNotices = { told: 0, skippedToldByG183: 0, runningGone: 0, failures: 0 };
+function tellUnseenTournamentResults(socket: Socket, auth: SocketAuthSession | undefined, toldTournamentId: string | null): void {
+  try {
+    if (!auth) return;
+    const master = auth.masterUserId || auth.statsMasterUserId || null;
+    void tournamentResults.unseenFor(auth.userId ?? null, master ? String(master) : null, 5).then((rows) => {
+      if (authSessions.get(socket.id) !== auth || socket.connected === false) return;
+      for (const r of rows) {
+        if (toldTournamentId && r.tournamentId === toldTournamentId) {
+          unseenResultNotices.skippedToldByG183++;
+          void tournamentResults.markTold(r.tournamentId, r.playerId);
+          continue;
+        }
+        const prize = r.prize > 0 ? { prize: r.prize } : {};
+        if (r.status === 'finished') {
+          socket.emit('tournamentFinishedForEntrant', { tournamentId: r.tournamentId, position: r.place, ...prize, tournamentName: r.name, atSignIn: true });
+        } else {
+          const t = tournamentManager.getTournament(r.tournamentId);
+          if (!t || t.status !== 'running') { unseenResultNotices.runningGone++; continue; }
+          socket.emit('playerEliminated', { tournamentId: r.tournamentId, playerId: r.playerId, playerName: r.playerName ?? '', position: r.place, ...prize, atSignIn: true });
+        }
+        unseenResultNotices.told++;
+        void tournamentResults.markTold(r.tournamentId, r.playerId);
+      }
+    }).catch(() => { unseenResultNotices.failures++; });
+  } catch {
+    unseenResultNotices.failures++;
   }
 }
 

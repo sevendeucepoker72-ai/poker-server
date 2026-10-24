@@ -1829,3 +1829,6 @@ handHistoryViewerOfSeat
 tournament_result_players
 recordTournamentResultsBust
 recordTournamentResultsFinish
+# Sit & Go fix-all F12 - a player who busted while away is told his place (and prize) at his next sign-in.
+tellUnseenTournamentResults
+atSignIn
