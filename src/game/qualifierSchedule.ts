@@ -459,3 +459,11 @@ export const QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT = 'Late entry and re-entry ar
 export function qualifierLateRegClosedText(alive: number, seatsForTop: number): string {
   return `Late entry and re-entry are now closed: ${alive} players are left and the top ${seatsForTop} win seats.`;
 }
+
+/**
+ * 2026-10-24 (owner 2026-10-23: "Turn all off") — NO HELP TOOLS at a qualifier
+ * table (training data, AI coach, session recap, coach whispers, table
+ * commentary). The refusal's words (code `help_tools_off_qualifier`); the same
+ * sentence poker-3d shows in its table menu (utils/qualifierHelpTools.js).
+ */
+export const QUALIFIER_HELP_TOOLS_OFF_TEXT = 'Help tools are off in qualifier tournaments.';

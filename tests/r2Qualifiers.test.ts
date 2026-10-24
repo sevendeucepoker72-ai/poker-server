@@ -3285,3 +3285,43 @@ describe('2026-10-24 (owner 2026-10-23: "Fix both") — late entry and re-entry 
     for (const tok of ['qualifier_late_reg_closed_at_bubble', 'QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE', 'lateRegClosesAtBubble', 'late_reg_closed']) expect(manifest).toContain(tok);
   });
 });
+
+// ═══════════════════════ 2026-10-24 — no help tools at a qualifier table (the re-entry's reused session) ══
+describe('2026-10-24 (owner 2026-10-23: "Turn all off") — HT6: a re-entry that REUSES his session at a qualifier table clears its training flag', () => {
+  it('Alice enters late, turns training on (a flag from before), busts and re-enters on the same socket: the reused session is moved to her new seat with trainingEnabled false (9c37499: left on)', async () => {
+    const w = world();
+    w.sync(Date.now() - 10 * 60_000);
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    const tid = w.tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 9, startInterval: 0, blindLevels: qualifierBlindLevels(50_000), startingChips: 50_000 } as any);
+    w.tm.registerPlayer(tid, 'user-201', 'Bob', 'sb', undefined, 'm-201');
+    w.tm.registerPlayer(tid, 'user-202', 'Carl', 'sc', undefined, 'm-202');
+    w.tm.startTournament(tid);
+    const t = new PokerTable({ tableId: 'Q1', tableName: 'Q1', smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+    t.sitDown(0, 'Bob', 50_000, 'user-201', false, true);
+    t.sitDown(1, 'Carl', 50_000, 'user-202', false, true);
+    w.tables.set('Q1', t);
+    w.tournamentTables.set('Q1', tid);
+    w.tm.setTableIds(tid, ['Q1']);
+    w.tm.setPlayerTable(tid, 'user-201', 'Q1');
+    w.tm.setPlayerTable(tid, 'user-202', 'Q1');
+    Object.assign(qt, { status: 'running', tournamentId: tid, players: [
+      { playerId: 'user-201', masterPlayerId: 'm-201', playerName: 'Bob', phone: '', socketId: 'sb' },
+      { playerId: 'user-202', masterPlayerId: 'm-202', playerName: 'Carl', phone: '', socketId: 'sc' },
+    ] });
+    // Which table plays a qualifier: the help-tools helper (the real one is covered by tests/qualifierHelpToolsOff.test.ts).
+    w.scope.qualifierIdOfTable = (tableId: string) => (w.tournamentTables.get(tableId) === tid ? WEEKLY : null);
+    const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await a.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'x' });
+    const sess = w.playerSessions.get('SA');
+    expect(sess).toMatchObject({ tableId: 'Q1' });
+    sess.trainingEnabled = true;
+    const i = t.seats.findIndex((s) => s.state === 'occupied' && !s.eliminated && s.playerId === 'user-101');
+    t.seats[i].chipCount = 0;
+    (t.seats[i] as any).eliminated = true;
+    w.tm.eliminatePlayer(tid, 'user-101');
+    await a.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'x' });
+    expect(w.of('SA', 'qualifierRegistrationResult').slice(-1)[0]).toEqual(expect.objectContaining({ success: true, reentry: true }));
+    expect(w.playerSessions.get('SA')).toBe(sess);                             // the SAME session object, reused
+    expect(sess).toMatchObject({ tableId: 'Q1', trainingEnabled: false });
+  });
+});

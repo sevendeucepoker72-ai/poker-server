@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT, QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT, QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText, QUALIFIER_HELP_TOOLS_OFF_TEXT } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -3167,6 +3167,9 @@ app.get('/api/health', async (_req, res) => {
           // 2026-10-24 (owner 2026-10-23: "Fix both") — a running qualifier's fairness seeds held
           // until it ends: heldEntriesServed = /api/fairness entries answered without the seed.
           fairnessHold: { ...fairnessSeedHoldStats },
+          // 2026-10-24 (owner 2026-10-23: "Turn all off") — help tools refused at qualifier
+          // tables (training, whispers, AI coach / recap, commentary skipped, flags cleared).
+          helpToolsOff: { ...qualifierHelpToolsOff },
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
@@ -6590,6 +6593,12 @@ function getGameStateForPlayer(
   const stateTournamentId = tournamentIdOfTable(table.config.tableId) ?? null;
   stateObj.isTournament = !!stateTournamentId;
   stateObj.tournamentId = stateTournamentId;
+  // 2026-10-24 (owner 2026-10-23: "Turn all off") — ALWAYS present (false / null off a
+  // qualifier, so the per-socket delta clears them): this is a QUALIFIER's table (start or
+  // overflow). poker-3d's helpToolsOffAt honours it; no trainingData is stamped here.
+  const stateQualifierId = stateTournamentId ? qualifierIdOfTable(table.config.tableId) : null;
+  stateObj.isQualifier = !!stateQualifierId;
+  stateObj.qualifierId = stateQualifierId;
   // 2026-10-23 (qualifier lifecycle S3, owner: "run the blinds and raise them,
   // take breaks") — the LEVEL CLOCK, in every full state. ALWAYS present (null
   // / 0 on a cash table) so the per-socket delta (shallowDiff) clears them
@@ -6702,9 +6711,11 @@ function getGameStateForPlayer(
     }
   }
 
-  // Add training data if enabled
+  // Add training data if enabled. 2026-10-24 — never at a qualifier table, whatever the
+  // session flag says (every call site, moved sessions, extra-table snapshots).
   if (
     trainingEnabled &&
+    !stateQualifierId &&
     playerSeatIndex >= 0 &&
     playerSeatIndex < MAX_SEATS &&
     table.currentPhase !== GamePhase.WaitingForPlayers &&
@@ -7285,6 +7296,57 @@ function seedHeldFieldsFor(tableId: string): { seedHeld?: true } {
 }
 // ===== end fairness seed hold =====
 
+// ===== Help tools off at qualifier tables (2026-10-24, owner 2026-10-23: "Turn all off") =====
+// No server-computed decision aid at any table of a qualifier (start + overflow
+// tables, seated or watching): trainingData / toggleTraining, coachHand,
+// requestSessionRecap, the coachWhisper relay and tableCommentary. Stable code
+// `help_tools_off_qualifier`; log tag `help_tools_refused_at_qualifier`. poker-3d
+// hides the tools already (utils/qualifierHelpTools.js); this is the server half.
+// Cash and non-qualifier tables are unchanged.
+const QUALIFIER_HELP_TOOLS_OFF_CODE = 'help_tools_off_qualifier';
+/** health r2Play.qualifiers.helpToolsOff — refusals per tool; sessionsForcedOff = training flags cleared on a move onto a qualifier table. */
+const qualifierHelpToolsOff = { trainingRefused: 0, sessionsForcedOff: 0, whispersRefused: 0, coachRefused: 0, recapRefused: 0, commentarySkipped: 0 };
+/** The qualifier (registry id) whose tournament plays at this table (live or just-broken), else null. Never throws. */
+function qualifierIdOfTable(tableId: string): string | null {
+  try {
+    const tid = typeof tableId === 'string' && tableId ? tournamentIdOfTable(tableId) : undefined;
+    return tid ? (qualifierOfTournament(tid)?.qualId ?? null) : null;
+  } catch {
+    return null;
+  }
+}
+/**
+ * The qualifier a socket is at, if any: its main session's table, any of its
+ * extra-table sessions, or any `table:` room it is in (watching). null = none.
+ */
+function socketAtQualifierTable(sock: { id: string; rooms?: Iterable<string> } | null | undefined): string | null {
+  try {
+    if (!sock) return null;
+    const main = playerSessions.get(sock.id);
+    const fromMain = main ? qualifierIdOfTable(main.tableId) : null;
+    if (fromMain) return fromMain;
+    for (const ms of multiTableSessions.get(sock.id) || []) {
+      const q = ms ? qualifierIdOfTable(ms.tableId) : null;
+      if (q) return q;
+    }
+    for (const room of sock.rooms || []) {
+      if (typeof room !== 'string' || !room.startsWith('table:')) continue;
+      const q = qualifierIdOfTable(room.slice('table:'.length));
+      if (q) return q;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+/** One refusal: counted by the caller, logged here. Never throws. */
+function noteHelpToolRefusedAtQualifier(tool: string, qualifierId: string, extra: Record<string, unknown> = {}): void {
+  try {
+    console.log(`[Qualifier] ${JSON.stringify({ event: 'help_tools_refused_at_qualifier', tool, qualifierId, ...extra })}`);
+  } catch (_) { /* logging only */ }
+}
+// ===== end help tools off =====
+
 // Build the authoritative prediction-market facts from the final hand state,
 // resolve all open bets/picks for the hand, and push results to each affected
 // user's sockets. Called from the handResult listener (3c). The facts are
@@ -7662,7 +7724,10 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // showdown). Silent no-op on any failure so a model hiccup can't disturb play.
     try {
       const apiKey = process.env.ANTHROPIC_API_KEY;
-      if (apiKey) {
+      // 2026-10-24 (owner 2026-10-23: "Turn all off") — no commentary at a qualifier table.
+      const commentaryOffHere = !!apiKey && !!qualifierIdOfTable(tableId);
+      if (commentaryOffHere) qualifierHelpToolsOff.commentarySkipped++;
+      if (apiKey && !commentaryOffHere) {
         const winner = (data.results || []).slice().sort((a, b) => (b?.chipsWon || 0) - (a?.chipsWon || 0))[0];
         const pot = (data.results || []).reduce((s, r) => s + (r?.chipsWon > 0 ? r.chipsWon : 0), 0);
         const notable = winner && (pot >= 2000 || table.wentToShowdown);
@@ -13114,6 +13179,8 @@ io.on('connection', (socket: Socket) => {
             // spectating: re-seated with no session he could never act — the
             // turn timer blinded his new stack out.
             const sess = playerSessions.get(socket.id);
+            // 2026-10-24 (owner 2026-10-23: "Turn all off") — a reused session now sits at a qualifier table: training off.
+            if (sess && sess.trainingEnabled && qualifierIdOfTable(tid)) { sess.trainingEnabled = false; qualifierHelpToolsOff.sessionsForcedOff++; }
             if (sess) { sess.tableId = tid; sess.seatIndex = s; }
             else {
               playerSessions.set(socket.id, {
@@ -13584,6 +13651,16 @@ io.on('connection', (socket: Socket) => {
     try {
       const auth = authSessions.get(socket.id);
       if (!auth) { socket.emit('coachResult', { error: 'Not authenticated' }); return; }
+
+      // 2026-10-24 (owner 2026-10-23: "Turn all off") — no AI coach at a qualifier table
+      // (before the size cap, the rate-limit stamp and any Anthropic client).
+      const coachQualifierId = socketAtQualifierTable(socket);
+      if (coachQualifierId) {
+        qualifierHelpToolsOff.coachRefused++;
+        noteHelpToolRefusedAtQualifier('coach_hand', coachQualifierId);
+        socket.emit('coachResult', { error: QUALIFIER_HELP_TOOLS_OFF_TEXT, code: QUALIFIER_HELP_TOOLS_OFF_CODE });
+        return;
+      }
 
       // Payload size cap — prevents LLM token DoS
       const serialized = JSON.stringify(data || {});
@@ -20081,6 +20158,18 @@ Give feedback in this JSON format:
   socket.on('toggleTraining', async (data: { tableId?: string } = {}) => {
     const session = seatSessionFor(data?.tableId);
     if (!session) return;
+    // 2026-10-24 (owner 2026-10-23: "Turn all off") — no training at a qualifier table:
+    // refused with the stable code, the flag forced off, no training frame.
+    const trainingQualifierId = qualifierIdOfTable(session.tableId);
+    if (trainingQualifierId) {
+      session.trainingEnabled = false;
+      qualifierHelpToolsOff.trainingRefused++;
+      noteHelpToolRefusedAtQualifier('training', trainingQualifierId, { tableId: session.tableId });
+      socket.emit('trainingToggled', {
+        enabled: false, tableId: session.tableId, refused: true, code: QUALIFIER_HELP_TOOLS_OFF_CODE, message: QUALIFIER_HELP_TOOLS_OFF_TEXT,
+      });
+      return;
+    }
 
     session.trainingEnabled = !session.trainingEnabled;
     socket.emit('trainingToggled', { enabled: session.trainingEnabled, tableId: session.tableId });
@@ -22123,8 +22212,19 @@ Give feedback in this JSON format:
     // its `table:` room, seated or watching), and only a bounded text. It used
     // to reach any socket id — or any room — with any payload.
     if (typeof data.message !== 'string') return;
+    // 2026-10-24 (owner 2026-10-23: "Turn all off") — no whisper from a qualifier table, nor
+    // to a student at one (seated, on an extra seat, or watching): nothing is relayed.
+    const refuseWhisper = (qualifierId: string) => {
+      qualifierHelpToolsOff.whispersRefused++;
+      noteHelpToolRefusedAtQualifier('coach_whisper', qualifierId);
+      socket.emit('error', { code: QUALIFIER_HELP_TOOLS_OFF_CODE, message: QUALIFIER_HELP_TOOLS_OFF_TEXT, event: 'coachWhisper' });
+    };
+    const senderQualifierId = socketAtQualifierTable(socket);
+    if (senderQualifierId) { refuseWhisper(senderQualifierId); return; }
     const student = relayPeerSharingRoom(socket, data.targetSocketId, 'table:');
     if (!student) return;
+    const studentQualifierId = socketAtQualifierTable(student);
+    if (studentQualifierId) { refuseWhisper(studentQualifierId); return; }
     student.emit('coachWhisper', {
       message: data.message.slice(0, 500),
       // R1 — the coach's public name (the client's coachName was spoofable,
@@ -22147,6 +22247,15 @@ Give feedback in this JSON format:
       // a plain number since they are interpolated raw into the prompt.
       const auth = authSessions.get(socket.id);
       if (!auth) { socket.emit('sessionRecapResult', { success: false, error: 'Not authenticated' }); return; }
+      // 2026-10-24 (owner 2026-10-23: "Turn all off") — no AI recap at a qualifier table
+      // (before the rate-limit stamp and any Anthropic client).
+      const recapQualifierId = socketAtQualifierTable(socket);
+      if (recapQualifierId) {
+        qualifierHelpToolsOff.recapRefused++;
+        noteHelpToolRefusedAtQualifier('session_recap', recapQualifierId);
+        socket.emit('sessionRecapResult', { success: false, code: QUALIFIER_HELP_TOOLS_OFF_CODE, error: QUALIFIER_HELP_TOOLS_OFF_TEXT });
+        return;
+      }
       const now = Date.now();
       const last = recapLastRequest.get(auth.userId) || 0;
       if (now - last < 30_000) {
@@ -25985,6 +26094,8 @@ function moveTournamentSeatPointers(
     }
     s.tableId = toTableId;
     s.seatIndex = toSeat;
+    // 2026-10-24 (owner 2026-10-23: "Turn all off") — moved onto a qualifier table: training off.
+    if (s.trainingEnabled && qualifierIdOfTable(toTableId)) { s.trainingEnabled = false; qualifierHelpToolsOff.sessionsForcedOff++; }
     sock.leave(`table:${fromTableId}`);
     sock.join(`table:${toTableId}`);
     // R2 (TABLEUI-11 / contract C11) — the next gameState for this socket is a
@@ -26004,6 +26115,7 @@ function moveTournamentSeatPointers(
       if (ms.tableId !== fromTableId || ms.seatIndex !== fromSeat) continue;
       ms.tableId = toTableId;
       ms.seatIndex = toSeat;
+      if (ms.trainingEnabled && qualifierIdOfTable(toTableId)) { ms.trainingEnabled = false; qualifierHelpToolsOff.sessionsForcedOff++; }   // 2026-10-24
       sock.leave(`table:${fromTableId}`);
       sock.join(`table:${toTableId}`);
     }

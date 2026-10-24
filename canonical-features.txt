@@ -1759,3 +1759,8 @@ late_reg_closed
 # carries seedHeld:true); every seed verifies once the qualifier ends. Lobby flag seedsHeldUntilEnd.
 seedsHeldUntilEnd
 seedHeld
+# 2026-10-24 (owner 2026-10-23: "Turn all off") - no help tools at qualifier tables, server side:
+# toggleTraining / trainingData / coachWhisper / coachHand / requestSessionRecap / tableCommentary
+# refused there (code help_tools_off_qualifier); gameState isQualifier + qualifierId.
+help_tools_off_qualifier
+help_tools_refused_at_qualifier
