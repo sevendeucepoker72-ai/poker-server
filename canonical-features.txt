@@ -1803,3 +1803,7 @@ potCountsForWalletRewards
 # Sit & Go fix-all F6 - random seat draw + random first button when a Sit & Go / non-qualifier tournament starts.
 drawSeatOrder
 presetFirstButton
+# Sit & Go fix-all F9 - a fresh registering instance opens the moment a template Sit & Go starts (one per template).
+recreateTemplateIfNone
+hasRegisteringInstanceOf
+fromTemplate

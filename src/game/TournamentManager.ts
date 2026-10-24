@@ -38,6 +38,13 @@ export interface TournamentConfig {
    * every other tournament runs its levels back to back, as before.
    */
   breaks?: TournamentBreaks;
+  /**
+   * 2026-10-24 (Sit & Go fix-all F9) — born from a lobby TEMPLATE
+   * (createTemplateTournaments / a template's re-creation). Only these are
+   * re-created (one registering instance per template); a custom, club or
+   * qualifier event never is, whatever its name.
+   */
+  fromTemplate?: boolean;
 }
 
 /** S3 — the break schedule: `seconds` of break after every `everyLevels`-th level. */
@@ -419,11 +426,11 @@ export class TournamentManager {
 
   private createTemplateTournaments(): void {
     for (const template of TOURNAMENT_TEMPLATES) {
-      this.createTournament(template);
+      this.createTournament(template, { fromTemplate: true });
     }
   }
 
-  createTournament(template: TournamentTemplate): string {
+  createTournament(template: TournamentTemplate, opts?: { fromTemplate?: boolean }): string {
     const tournamentId = uuidv4();
     const config: TournamentConfig = {
       tournamentId,
@@ -439,6 +446,7 @@ export class TournamentManager {
       ...(template.minPlayers !== undefined ? { minPlayers: template.minPlayers } : {}),
       ...(template.unlisted ? { unlisted: true } : {}),
       ...(template.breaks ? { breaks: { everyLevels: template.breaks.everyLevels, seconds: template.breaks.seconds } } : {}),
+      ...(opts?.fromTemplate ? { fromTemplate: true } : {}),   // F9
     };
 
     const now = Date.now();
@@ -478,9 +486,32 @@ export class TournamentManager {
     this.eventCallbacks.delete(tournamentId);
   }
 
-  /** R2 — the template this tournament re-creates after it ends (templates only; ad-hoc tournaments are not resurrected). */
+  /**
+   * R2 — the template this tournament re-creates after it ends (templates only;
+   * ad-hoc tournaments are not resurrected). F9 (2026-10-24): only a
+   * tournament BORN from a template (config.fromTemplate) — a custom / club
+   * event named like a template used to be cloned.
+   */
   private templateOf(t: Tournament): TournamentTemplate | undefined {
+    if (!t.config.fromTemplate) return undefined;
     return TOURNAMENT_TEMPLATES.find((x) => x.name === t.config.name);
+  }
+
+  /** F9 — is a template instance of this name open for registration right now? */
+  private hasRegisteringInstanceOf(name: string): boolean {
+    for (const t of this.tournaments.values()) {
+      if (t.config.fromTemplate && t.config.name === name && t.status === 'registering') return true;
+    }
+    return false;
+  }
+
+  /**
+   * F9 — re-create a template instance, unless one of that template is already
+   * registering (exactly one registering instance per template at any time).
+   */
+  private recreateTemplateIfNone(template: TournamentTemplate): void {
+    if (this.hasRegisteringInstanceOf(template.name)) return;
+    this.createTournament(template, { fromTemplate: true });
   }
 
   /**
@@ -834,7 +865,7 @@ export class TournamentManager {
     if (template) {
       const recreate = setTimeout(() => {
         this.dropTournament(tournamentId);
-        this.createTournament(template);
+        this.recreateTemplateIfNone(template);   // F9 — never a second registering instance
       }, 10000);
       (recreate as any)?.unref?.();   // R2 — a pending re-creation never holds the process open
     }
@@ -907,6 +938,14 @@ export class TournamentManager {
 
     // Schedule blind level ups
     this.scheduleBlindUp(tournamentId);
+
+    // 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F9) — an
+    // on-demand TEMPLATE event (the Sit & Gos, Daily 5K, ...) opens a fresh
+    // registering instance the moment it starts, so arriving players queue for
+    // the next table (there used to be none until 10 s after this one ENDED).
+    // The timed Freeroll keeps its finish + 10 s re-creation (its cadence).
+    const template = this.templateOf(tournament);
+    if (template && tournament.config.startInterval === 0) this.recreateTemplateIfNone(template);
 
     return { success: true, startingChips, blinds: firstLevel };
   }
@@ -1476,12 +1515,14 @@ export class TournamentManager {
       results,
     });
 
-    // Re-create the tournament for next round after a delay
+    // Re-create the tournament for next round after a delay. F9 (2026-10-24):
+    // the finished record is dropped; a new instance only if none of that
+    // template is registering (an on-demand one opened at this one's start).
     const recreate = setTimeout(() => {
       const template = this.templateOf(tournament);
       if (template) {
         this.dropTournament(tournamentId);
-        this.createTournament(template);
+        this.recreateTemplateIfNone(template);
       }
     }, 10000);
     (recreate as any)?.unref?.();   // R2 — a pending re-creation never holds the process open
