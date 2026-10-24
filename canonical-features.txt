@@ -1807,3 +1807,6 @@ presetFirstButton
 recreateTemplateIfNone
 hasRegisteringInstanceOf
 fromTemplate
+# Sit & Go fix-all F8 - stall clock from the earliest remaining entry; lobby stallCancelMs / stallCancelAt.
+stallCancelAt
+stallCancelMs

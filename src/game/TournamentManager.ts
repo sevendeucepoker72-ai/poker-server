@@ -376,6 +376,13 @@ const TOURNAMENT_TEMPLATES: TournamentTemplate[] = [
 ];
 
 export class TournamentManager {
+  /**
+   * 2026-10-24 (Sit & Go fix-all F8) — an on-demand buy-in event still short
+   * of its start threshold this long after its earliest REMAINING entry is
+   * cancelled and refunded (checkStalledTournaments). The lobby item says so
+   * (stallCancelMs / stallCancelAt).
+   */
+  static readonly STALL_MS = 30 * 60 * 1000;
   private tournaments: Map<string, Tournament> = new Map();
   private eventCallbacks: Map<string, Array<(event: string, data: any) => void>> = new Map();
   /**
@@ -594,6 +601,11 @@ export class TournamentManager {
         currentBlinds: t.status === 'running' ? { sb: currentBlinds.sb, bb: currentBlinds.bb, ante: currentBlinds.ante } : null,
         blindLevel: t.currentBlindLevel + 1,
         blindLevelCount: t.config.blindLevels.length,
+        // F8 (2026-10-24) — an on-demand BUY-IN event (startInterval 0) is cancelled
+        // + refunded STALL_MS after its earliest remaining entry if still short of
+        // `minPlayers`: stallCancelMs (null for other events) and stallCancelAt
+        // (ms; only while registering with an entrant, else null). Additive.
+        ...this.stallFieldsOf(t),
         // F21 (2026-10-24) — the structure, for the lobby card / detail (additive):
         // the starting stack, the one level length in seconds (null when the
         // levels differ) and every level.
@@ -601,6 +613,15 @@ export class TournamentManager {
       });
     }
     return list;
+  }
+
+  /** F8 — the stall-cancel fields of a lobby item (see getTournamentList). */
+  private stallFieldsOf(t: Tournament): { stallCancelMs: number | null; stallCancelAt: number | null } {
+    const onDemandBuyIn = t.config.startInterval === 0 && (t.config.buyIn || 0) > 0;
+    if (!onDemandBuyIn) return { stallCancelMs: null, stallCancelAt: null };
+    const at = t.status === 'registering' && t.players.length > 0 && t.firstRegistrationAt !== null
+      ? t.firstRegistrationAt + TournamentManager.STALL_MS : null;
+    return { stallCancelMs: TournamentManager.STALL_MS, stallCancelAt: at };
   }
 
   /**
@@ -804,6 +825,14 @@ export class TournamentManager {
     tournament.players = tournament.players.filter((p) => p.playerId !== playerId);
     // R2 (TOURNEY-5) — an empty field's stall clock starts again at the next registration.
     if (tournament.players.length === 0) tournament.firstRegistrationAt = null;
+    // 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F8) — else the
+    // clock restarts from the EARLIEST REMAINING entry: it kept the first
+    // registrant's time after he left, so the others could be cancelled minutes
+    // after they entered.
+    else if (tournament.players.length < before) {
+      const now = Date.now();
+      tournament.firstRegistrationAt = Math.min(...tournament.players.map((p) => p.registeredAt ?? now));
+    }
     return tournament.players.length < before;
   }
 
@@ -819,7 +848,7 @@ export class TournamentManager {
    *     still below its start threshold.
    */
   checkStalledTournaments(now: number = Date.now()): string[] {
-    const STALL_MS = 30 * 60 * 1000; // 30 min
+    const STALL_MS = TournamentManager.STALL_MS; // 30 min (F8: also shown in the lobby)
     const GRACE_MS = 5 * 60 * 1000;  // 5 min past the scheduled start
     const stalled: string[] = [];
     for (const [id, t] of this.tournaments) {
