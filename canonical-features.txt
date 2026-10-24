@@ -1819,3 +1819,6 @@ finishResultsFor
 # Sit & Go fix-all F13 - the tournament-starting alert goes by master id to every entrant (away ones too).
 notifyTournamentStart
 tournamentStartAlerts
+# Sit & Go fix-all F10 - non-qualifier tournaments: short clock after 2 timed-out hands; no 500 ms act for a start no-show.
+absentShortClockScope
+absentTimeoutStreaks

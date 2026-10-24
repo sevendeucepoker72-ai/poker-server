@@ -94,6 +94,8 @@ const P = {
   // Round 6 (2026-10-10): P-i / P-j — the absent auto-action (autoActForSeat) and "sitting out = absent".
   autoAct: slice('function seatHasPlayingSession(', "  t.playerFold(seatIndex);\n  return 'fold';\n}\n"),
   armTurnTimer: fnSrc('function armTurnTimer('),
+  // 2026-10-24 (Sit & Go fix-all F10) — the absent-seat streak clock armTurnTimer reads.
+  absentClock: slice('// ===== Absent tournament seat clock (Sit & Go fix-all F10) =====', '// ===== end absent tournament seat clock =====\n'),
   tick: fnSrc('function tickReservedSeatHands('),
   resume: slice('  let resumeWindowStart = 0;', "\n    })\n  );\n"),
   oauth: slice("socket.on('oauthLogin', trackLogin(socket, 'oauthLogin', async", '\n  }));\n'),
@@ -159,6 +161,7 @@ ${p.standUpAbsent}
 ${p.seatHasLiveSession}
 ${p.isAbsentPastLimit}
 ${p.autoAct}
+${p.absentClock}
 ${p.armTurnTimer}
 ${p.tick}
 ${p.fastModeRestore}
@@ -364,6 +367,7 @@ function world(opts: WorldOpts = {}) {
     turnTimers: new Map(), turnWarningTimers: new Map(), turnStartedAtMap: new Map(), turnStartedSeatMap: new Map(),
     turnStartedHandMap: new Map(), turnStartedPhaseMap: new Map(), globalTurnId: 0, DrawPhases: [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3], GamePhase,
     TURN_TIMEOUT_MS, ABSENT_TOURNAMENT_SEAT_TURN_MS,
+    qualifierIdOfTable: () => null,   // F10 — no qualifier tables in this world
   };
   const mod: { exports: any } = { exports: {} };
   // eslint-disable-next-line no-new-func

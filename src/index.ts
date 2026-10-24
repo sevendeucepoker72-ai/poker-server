@@ -6934,6 +6934,59 @@ function autoActForSeat(tableId: string, t: PokerTable, seatIndex: number, reaso
   return 'fold';
 }
 
+// ===== Absent tournament seat clock (Sit & Go fix-all F10) =====
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F10) — absent
+ * players at NON-QUALIFIER tournament tables (Sit & Go, custom, club,
+ * scheduled). The 9-player audit: absent players kept the 30 s clock for 20
+ * hands (13 timeouts = 28% of the event's time).
+ *  - After ABSENT_SHORT_CLOCK_AFTER_HANDS hands in which an ABSENT seat (no
+ *    session PLAYING it) timed out, it acts on the short clock
+ *    (ABSENT_TOURNAMENT_SEAT_TURN_MS) until it returns; a session playing the
+ *    seat again resets the streak (and the fire-time re-check gives him the
+ *    rest of the full clock).
+ *  - A registrant absent at the very start (no session, no reservation) is not
+ *    acted for by the 500 ms orphan act (broadcastGameState): the turn clock is
+ *    his deadline, like a disconnect's.
+ * Qualifier tables are OUT of scope (absentShortClockScope): the U4 hand limit,
+ * the P-j sit-out short clock, the 500 ms orphan act, the no-show release and
+ * the early rooms are exactly as before. Cash tables unchanged.
+ * Streaks are keyed table:seat:playerId (bounded; a table's keys go when it is
+ * retired).
+ */
+function absentShortClockScope(tableId: string): boolean {
+  return isTournamentTable(tableId) && !qualifierIdOfTable(tableId);
+}
+const ABSENT_SHORT_CLOCK_AFTER_HANDS = 2;
+const absentTimeoutStreaks = new Map<string, { hand: number; streak: number }>();
+function absentStreakKey(tableId: string, t: PokerTable, seatIndex: number): string {
+  return `${tableId}:${seatIndex}:${t.seats[seatIndex]?.playerId ?? ''}`;
+}
+/** F10 — an absent seat past its streak: the short clock. */
+function absentSeatOnShortClock(tableId: string, t: PokerTable, seatIndex: number): boolean {
+  if (!absentShortClockScope(tableId) || seatHasPlayingSession(tableId, seatIndex)) return false;
+  return (absentTimeoutStreaks.get(absentStreakKey(tableId, t, seatIndex))?.streak ?? 0) >= ABSENT_SHORT_CLOCK_AFTER_HANDS;
+}
+/** F10 — the turn clock acted for an absent seat: one more timed-out hand (once per hand). */
+function noteAbsentTimeout(tableId: string, t: PokerTable, seatIndex: number): void {
+  if (!absentShortClockScope(tableId) || seatHasPlayingSession(tableId, seatIndex)) return;
+  const key = absentStreakKey(tableId, t, seatIndex);
+  const rec = absentTimeoutStreaks.get(key);
+  if (rec && rec.hand === t.handNumber) return;
+  if (absentTimeoutStreaks.size >= 5_000) absentTimeoutStreaks.clear();   // bound; a streak simply starts again
+  absentTimeoutStreaks.set(key, { hand: t.handNumber, streak: (rec?.streak ?? 0) + 1 });
+}
+/** F10 — he is back (a session plays the seat): the streak ends. */
+function clearAbsentTimeoutStreak(tableId: string, t: PokerTable, seatIndex: number): void {
+  absentTimeoutStreaks.delete(absentStreakKey(tableId, t, seatIndex));
+}
+/** F10 — a retired table's streaks. */
+function dropAbsentTimeoutStreaksOfTable(tableId: string): void {
+  const prefix = `${tableId}:`;
+  for (const k of [...absentTimeoutStreaks.keys()]) if (k.startsWith(prefix)) absentTimeoutStreaks.delete(k);
+}
+// ===== end absent tournament seat clock =====
+
 function armTurnTimer(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) return;
@@ -6966,7 +7019,11 @@ function armTurnTimer(tableId: string): void {
       // player sits out. Re-checked when it fires: a player who reconnected or
       // sat back in meanwhile (a session PLAYING the seat) gets the REST of the
       // normal clock instead of being acted for.
+      // F10 (2026-10-24) — he plays the seat again: his absent streak ends; an
+      // absent seat (non-qualifier tournament) past 2 timed-out hands: short clock.
+      if (seatHasPlayingSession(tableId, activeSeat)) clearAbsentTimeoutStreak(tableId, table, activeSeat);
       const shortClock = isAbsentTournamentSeatPastHandLimit(tableId, activeSeat) || tournamentSeatSitsOut(tableId, activeSeat);
+      const useShortClock = shortClock || absentSeatOnShortClock(tableId, table, activeSeat);   // F10
       const onTurnTimeout = (short: boolean) => (): void => {
         const entry = turnTimers.get(tableId);
         if (!entry || entry.turnId !== turnId) return;
@@ -6983,6 +7040,7 @@ function armTurnTimer(tableId: string): void {
         // P-i — check, an absent seat's ≤1 BB limp in an all-absent hand
         // (all_absent_hand_auto_call), else fold.
         const did = autoActForSeat(tableId, t, activeSeat, 'timeout');   // F3 — stamped auto: 'timeout'
+        noteAbsentTimeout(tableId, t, activeSeat);   // F10 — one more timed-out hand for an absent seat
         // 2026-10-10 — info, not debug: since the watchdog defers to a live
         // turn clock, this is THE record of every turn the server takes for a
         // player (the post-hotfix check needs to see them).
@@ -6990,7 +7048,7 @@ function armTurnTimer(tableId: string): void {
         broadcastGameState(tableId);
         scheduleAIAction(tableId);
       };
-      const timeout = setTimeout(onTurnTimeout(shortClock), shortClock ? ABSENT_TOURNAMENT_SEAT_TURN_MS : TURN_TIMEOUT_MS);
+      const timeout = setTimeout(onTurnTimeout(useShortClock), useShortClock ? ABSENT_TOURNAMENT_SEAT_TURN_MS : TURN_TIMEOUT_MS);
       turnTimers.set(tableId, { timeout, seatIndex: activeSeat, turnId });
 
       // 2026-08-25 — REMOVED the server-side push dispatch for `your_turn` and
@@ -7129,7 +7187,10 @@ function broadcastGameState(tableId: string): void {
       const seat = table.seats[activeIdx];
       if (seat && seat.state === 'occupied' && !seat.isAI) {
         const hasLiveSession = seatHasAnySession(tableId, activeIdx);
-        if (!hasLiveSession) shouldAutoAct = true;
+        // F10 (2026-10-24) — not at a non-qualifier tournament table: a
+        // registrant absent at the start gets the turn clock (a normal seat
+        // hold, then the short clock after 2 timed-out hands), not a 500 ms act.
+        if (!hasLiveSession && !absentShortClockScope(tableId)) shouldAutoAct = true;
       }
     }
 
@@ -25122,6 +25183,7 @@ function retireFinishedTournamentTable(tableId: string, tournamentId: string, re
   noteBrokenTournamentTable(tableId, tournamentId);   // still a tournament table to any chip decision
   tournamentTables.delete(tableId);
   fastModeTables.delete(tableId);
+  dropAbsentTimeoutStreaksOfTable(tableId);   // F10
   tableManager.removeTable(tableId);
   tableProgressListeners.delete(tableId);
   finishedTournamentTablesRetired.tables++;
