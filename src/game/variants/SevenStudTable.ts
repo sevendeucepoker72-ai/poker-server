@@ -269,6 +269,7 @@ export class SevenStudTable extends PokerTable {
           seat.chipCount -= anteAmount;
           seat.totalInvestedThisHand += anteAmount;
           if (seat.chipCount === 0) seat.allIn = true;
+          this.logAntePosted(seatIdx, anteAmount);   // Sit & Go fix-all F1 (2026-10-24): antes are in the hand history
           this.emit('blindPosted', { seatIndex: seatIdx, amount: anteAmount, type: 'ante' });
         }
       }

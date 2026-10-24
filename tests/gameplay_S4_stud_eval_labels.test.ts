@@ -316,7 +316,8 @@ describe('G168 — the bring-in seat decides first: stay or complete', () => {
       expect(t.getMinRaise()).toBe(100);
       expect(t.activeSeatIndex).toBe((b + 1) % 4);
       for (const s of t.seats.filter((x) => x.state === 'occupied' && x.seatIndex !== b)) expect(s.hasActedSinceLastFullRaise).toBe(false);
-      expect(t.actionLog.filter((a) => a.seatIndex === b).map((a) => a.action)).toEqual(['posted bring-in 25', 'raised to 50']);
+      // 2026-10-24 (Sit & Go fix-all F1) — the seat's ante is in the log first.
+      expect(t.actionLog.filter((a) => a.seatIndex === b).map((a) => a.action)).toEqual(['posted ante 5', 'posted bring-in 25', 'raised to 50']);
     });
   }
 

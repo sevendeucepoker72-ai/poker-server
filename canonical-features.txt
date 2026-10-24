@@ -1783,3 +1783,6 @@ levelSeconds
 # Sit & Go fix-all F18 - every full state carries the level the HAND is played at (handSmallBlind / handBigBlind / handAnte).
 handSmallBlind
 handLevelOnTable
+# Sit & Go fix-all F1 - every ante is in the hand history (posted ante N; allIn flag for an ante for less).
+logAntePosted
+posted ante 

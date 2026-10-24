@@ -159,6 +159,12 @@ export interface ActionLogEntry {
   // e.g. 'PreFlop'/'Flop'/...). Lets the client opponent-tracker compute
   // street-aware stats (3-bet%, fold-to-cbet%) from the shipped actionLog.
   street?: string;
+  /**
+   * 2026-10-24 (Sit & Go fix-all F1) — this post took the seat's whole stack
+   * (an ante for less). A separate field: the action text always ends in the
+   * amount, which every client parser reads. Absent otherwise.
+   */
+  allIn?: boolean;
 }
 
 /** Complete hand history record */
@@ -1318,6 +1324,11 @@ export class PokerTable extends EventEmitter {
         const anteAmount = Math.min(this.config.ante, this.seats[seat].chipCount);
         this.seats[seat].chipCount -= anteAmount;
         this.seats[seat].totalInvestedThisHand += anteAmount;
+        // 2026-10-24 (Sit & Go fix-all F1) — every ante is in the hand history
+        // (no street, like the blinds; an ante for less is flagged allIn). They
+        // were taken and paid out but never logged: a saved hand's posts and
+        // actions came up short of its pot by the ante total.
+        if (anteAmount > 0) this.logAntePosted(seat, anteAmount);
         // #4 (2026-07-01 audit): an ante that takes the player's whole stack
         // leaves them all-in — set the flag like every other deduction site
         // (SB, BB, dead-blind, postOwedBlindsNow). Without it a 0-chip seat is
@@ -1373,6 +1384,22 @@ export class PokerTable extends EventEmitter {
     }
 
     this.currentBetToMatch = this.config.bigBlind;
+  }
+
+  /**
+   * 2026-10-24 (Sit & Go fix-all F1) — THE ante log line: `posted ante N`, no
+   * street (read as '' in the saved record, like the blinds), `allIn: true`
+   * when the ante took the whole stack. Called right after the chips moved
+   * (base postBlinds, SevenStudTable.postBlinds, applyBombPot).
+   */
+  protected logAntePosted(seatIndex: number, amount: number): void {
+    const seat = this.seats[seatIndex];
+    this.actionLog.push({
+      seatIndex,
+      playerName: seat.playerName,
+      action: `posted ante ${amount}`,
+      ...(seat.chipCount === 0 ? { allIn: true } : {}),
+    });
   }
 
   /**
@@ -2112,6 +2139,7 @@ export class PokerTable extends EventEmitter {
     if (this.currentPhase !== GamePhase.PreFlop || this.communityCards.length > 0) return false;
     if (this.actionLog.some(a => a.street === GamePhase.PreFlop)) return false;
     if (!Number.isFinite(ante) || ante <= 0) return false;
+    const bombAntes: Array<[number, number]> = [];   // F1
     for (const seat of this.seats) {
       if (seat.state !== 'occupied' || seat.eliminated) continue;
       // 2026-10-21 (gameplay F14) — a dead blind returned with the rest is
@@ -2130,7 +2158,16 @@ export class PokerTable extends EventEmitter {
       seat.totalInvestedThisHand = posted;
       // A stack the ante takes whole is all-in (never auto-folded out of a pot it paid into).
       if (seat.chipCount === 0) seat.allIn = true;
+      bombAntes.push([seat.seatIndex, posted]);
     }
+    // F1 (2026-10-24) — the log says what was really posted: the refunded
+    // antes / blinds go (the dead blind's line went in restoreRefundedDeadBlind)
+    // and the bomb pot's own antes are logged.
+    for (let i = this.actionLog.length - 1; i >= 0; i--) {
+      const a = this.actionLog[i];
+      if (a.street === undefined && /^posted (ante|SB|BB) /.test(a.action)) this.actionLog.splice(i, 1);
+    }
+    for (const [seatIndex, posted] of bombAntes) if (posted > 0) this.logAntePosted(seatIndex, posted);
     // Straight to the flop: a fresh betting round, dealt by this table.
     this.currentPhase = GamePhase.Flop;
     this.resetBettingRound();
