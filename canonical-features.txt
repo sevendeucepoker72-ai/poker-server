@@ -1825,3 +1825,7 @@ absentTimeoutStreaks
 # Sit & Go fix-all F11 - every seated account gets its own hand-history copy, even while disconnected.
 recordHandHistoryCopiesForEverySeat
 handHistoryViewerOfSeat
+# Sit & Go fix-all F14 - durable tournament results (tournament_results / tournament_result_players), non-qualifier.
+tournament_result_players
+recordTournamentResultsBust
+recordTournamentResultsFinish

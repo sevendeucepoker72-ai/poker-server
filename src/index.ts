@@ -20,6 +20,7 @@ import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierSt
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
+import { createTournamentResultsStore, tournamentResultsStats, ResultsEntrant } from './game/tournamentResults';
 import { EscrowBacker, EscrowOffer, normalizeBackers, planEscrowRefund, planCashedSettlement, validateStakeOffer } from './game/stakingEscrow';
 import {
   connectRedis as connectHandStore,
@@ -12348,6 +12349,82 @@ setInterval(() => {
   prizeLedger.retryPending().catch((e: any) => console.error('[prize-ledger] retry sweep failed:', e?.message || e));
 }, 60_000).unref?.();
 
+// ===== Durable tournament results (Sit & Go fix-all F14) =====
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F14) — every
+ * NON-QUALIFIER tournament's result is written to tournament_results /
+ * tournament_result_players (src/game/tournamentResults.ts): the header + one
+ * row per entrant at the start, each player's place / prize / eliminator / bust
+ * hand / told? as he busts (runTournamentBustCheck), every place + prize at the
+ * finish (emitTournamentFinishedToEntrants). Places 4..N and the eliminators
+ * were stored nowhere; F12 reads the untold rows at the next sign-in.
+ * Qualifiers are out (their results have their own durable path); so is a
+ * tournament with no account entrant (an admin simulation). Fire-and-forget,
+ * one serialized write chain; never throws into the game.
+ */
+const tournamentResults = createTournamentResultsStore({ query: (sql, params) => getPool().query(sql, params as any[]) });
+function tournamentResultsInScope(tournamentId: string): boolean {
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t || qualifierOfTournament(tournamentId)) return false;
+  return t.players.some((p) => p.userId !== undefined || !!p.masterUserId);
+}
+function tournamentResultsEntrant(tp: { playerId: string; userId?: number; masterUserId?: string; playerName: string }): ResultsEntrant {
+  return {
+    playerId: tp.playerId, ...(tp.userId !== undefined ? { userId: tp.userId } : {}),
+    ...(tp.masterUserId ? { masterUserId: String(tp.masterUserId) } : {}), playerName: tp.playerName,
+  };
+}
+function tournamentResultsKind(tournamentId: string): string {
+  const t = tournamentManager.getTournament(tournamentId);
+  if (clubLiveTournaments.has(tournamentId)) return 'club';
+  return t?.config.fromTemplate ? 'template' : 'custom';
+}
+function recordTournamentResultsStart(tournamentId: string, tableIds: string[]): void {
+  try {
+    if (!tournamentResultsInScope(tournamentId)) return;
+    const t = tournamentManager.getTournament(tournamentId)!;
+    const pool = (t.config.buyIn || 0) === 0 ? (t.config.prizePool || 0) : t.collectedEntryFees;
+    void tournamentResults.recordStart({
+      tournamentId, name: t.config.name, kind: tournamentResultsKind(tournamentId), buyIn: t.config.buyIn || 0,
+      entrants: t.players.length, prizePool: pool, tableIds: [...tableIds], startedAt: t.startedAt || Date.now(),
+    }, t.players.map(tournamentResultsEntrant));
+  } catch (e: any) {
+    console.warn(`[Tournament] results start not recorded for ${tournamentId}:`, e?.message || e);
+  }
+}
+function recordTournamentResultsBust(tournamentId: string, playerId: string, o: { eliminatorId?: string; handNumber?: number; told: boolean }): void {
+  try {
+    if (!tournamentResultsInScope(tournamentId)) return;
+    const t = tournamentManager.getTournament(tournamentId)!;
+    const tp = t.players.find((p) => p.playerId === playerId);
+    if (!tp || !(tp.finishPosition > 0)) return;
+    void tournamentResults.recordBust(tournamentId, {
+      playerId, place: tp.finishPosition, prize: tournamentManager.prizeForEntrant(tournamentId, playerId) || 0,
+      eliminatedBy: o.eliminatorId ?? null, bustHand: o.handNumber ?? null, told: !!o.told,
+    }, tournamentResultsEntrant(tp));
+  } catch (e: any) {
+    console.warn(`[Tournament] results bust not recorded for ${tournamentId}:`, e?.message || e);
+  }
+}
+function recordTournamentResultsFinish(tournamentId: string, data: any, toldPlayerIds: Set<string>): void {
+  try {
+    if (!tournamentResultsInScope(tournamentId)) return;
+    const t = tournamentManager.getTournament(tournamentId)!;
+    const pool = (t.config.buyIn || 0) === 0 ? (t.config.prizePool || 0) : t.collectedEntryFees;
+    const places = ((data?.results || []) as any[]).filter((r) => r && r.playerId).map((r) => {
+      const tp = t.players.find((p) => p.playerId === r.playerId);
+      return {
+        playerId: String(r.playerId), place: Number(r.position) || 0, prize: Math.max(0, Math.floor(Number(r.payout) || 0)),
+        told: toldPlayerIds.has(String(r.playerId)), ...(tp ? { entrant: tournamentResultsEntrant(tp) } : {}),
+      };
+    });
+    void tournamentResults.recordFinish(tournamentId, { tableIds: t.tableIds.length ? [...t.tableIds] : (t.tableId ? [t.tableId] : []), entrants: t.players.length, prizePool: pool }, places);
+  } catch (e: any) {
+    console.warn(`[Tournament] results finish not recorded for ${tournamentId}:`, e?.message || e);
+  }
+}
+// ===== end durable tournament results =====
+
 // ========== Quick games: a real END (R2, 2026-10-11 — S1) ==========
 // TOURNEY-6 / GAME-7 / ECON-8 / CLUBS-1 + the R1 money reviewer's P2. Every
 // quick format and a club challenge is a FIXED-ROSTER game (isFixedRosterTable:
@@ -24147,6 +24224,7 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
   // 2026-10-24 (Sit & Go fix-all F7) — recorded FIRST (it was right after the
   // room frames): every non-qualifier socket's own result comes from it.
   const rec = noteFinishedTournament(id, data);
+  let resultsTold: Set<string> | null = null;   // F14 — non-qualifier: the entrants told here
   if (!q) {
     // F7 (owner 2026-10-23: "Fix all") — PER SOCKET in the rooms (one frame
     // each): `data` plus `myResult {place, prize, tied?} | null` (that
@@ -24154,6 +24232,8 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
     // the room frame only named the winner. No isQualifier / wonSeat here: an
     // older client reads `wonSeat` as a qualifier result.
     const tiedOf = new Set<string>(((data?.results || []) as any[]).filter((r) => r?.tied).map((r) => String(r.playerId)));
+    // F14 / F12 (2026-10-24) — who was told his result here (the durable rows' told_at).
+    resultsTold = new Set<string>();
     // F19 (2026-10-24) — the results for ONE socket: its own row as it is; every
     // other row without the local account id (`userId`) and the playerId that
     // embeds it (`user-<id>`). The source rows are not modified (the prize /
@@ -24176,6 +24256,7 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
       // tied / disqualified; only THIS socket's own row keeps userId + playerId
       // (`user-<id>`) - an older client finds its row by userId.
       sock.emit('tournamentFinished', { ...data, results: finishResultsFor(data?.results, e?.playerId ?? null), myResult });
+      if (e) resultsTold.add(e.playerId);
     }
   } else {
     const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop: seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage), seatPackage: q.qt.seatPackage || null };
@@ -24201,7 +24282,10 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
       ...(q ? { isQualifier: true, qualifierId: q.qualId, myResult: qMine, wonSeat: !!qMine?.wonSeat } : {}),
     });
     told++;
+    if (resultsTold) resultsTold.add(e.playerId);
   }
+  // F14 (2026-10-24) — the durable result rows (non-qualifier), told_at for the entrants told here.
+  if (resultsTold) recordTournamentResultsFinish(id, data, resultsTold);
   tournamentFinishedNotices.entrantSockets += told;
   if (told > 0) {
     console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_finished_told_to_entrants', tournamentId, sockets: told })}`);
@@ -24838,6 +24922,7 @@ function startTournamentGame(tournamentId: string): void {
   // R2 — more than one table's worth of entrants: every one of them is seated.
   if (tournament.players.length > 9) {
     startRegisteredTournamentTables(tournamentId, result.startingChips, result.blinds);
+    recordTournamentResultsStart(tournamentId, tournamentManager.getTournament(tournamentId)?.tableIds || []);   // F14
     return;
   }
 
@@ -24855,6 +24940,7 @@ function startTournamentGame(tournamentId: string): void {
   const table = tableManager.getTable(tableId)!;
   tournamentManager.setTableId(tournamentId, tableId);
   tournamentTables.set(tableId, tournamentId);
+  recordTournamentResultsStart(tournamentId, [tableId]);   // F14 — the durable header + entrants
 
   // Seat all players — F6 (2026-10-24): by a RANDOM DRAW (seat i gets the
   // drawn player; tournament.players keeps registration order).
@@ -26991,7 +27077,9 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
             startStack: startChips.get(i) || 0, eliminatorId, ctx: bustCtx,
           });
         } else {
-          tellTournamentBustNow(tournamentId, tableId, seat, bustCtx, bustPosition, noticeSids);
+          const toldNow = tellTournamentBustNow(tournamentId, tableId, seat, bustCtx, bustPosition, noticeSids);
+          // F14 (2026-10-24) — his durable result row (non-qualifier): place, prize, eliminator, bust hand, told?
+          recordTournamentResultsBust(tournamentId, seat.playerId, { eliminatorId, handNumber: check?.handNumber ?? table.handNumber, told: toldNow > 0 });
           // A quiet bust that could not wait (it ended the tournament): the room's copy the listener held back.
           if (hfhQuiet) emitHandForHandRoomBust(tournamentId, { playerId: seat.playerId, playerName: seat.playerName, position: bustPosition, eliminatorId }, noticeSids);
         }
@@ -27017,8 +27105,9 @@ function tellTournamentBustNow(
   tournamentId: string, tableId: string, bust: { playerId: string; playerName: string },
   ctx: { sid: string | null; toSpectator: boolean; seatedElsewhere: boolean; playsHere: boolean },
   bustPosition: number, noticeSids: string[], watchingTableId?: string,
-): void {
+): number {
   const sid = ctx.sid;
+  let toldSockets = 0;   // F14 / F12 (2026-10-24) — how many of his sockets were told
   const sock = sid ? io.sockets.sockets.get(sid) : undefined;
   const toSpectator = ctx.toSpectator;
   const seatedElsewhere = ctx.seatedElsewhere;
@@ -27056,12 +27145,14 @@ function tellTournamentBustNow(
       tableIds: tournamentManager.getTournament(tournamentId)?.tableIds || [],
       ...(bustPrize && bustPrize > 0 ? { prize: bustPrize } : {}),   // F7
     });
+    toldSockets++;
   }
   // P-e / P-e' — the plain elimination notice (`playerEliminated` +
   // tournamentId: a toast, the away seat ends) to every live socket
   // signed in as him except the one switched to spectator above — the
   // room's copy skipped them (one notice each).
-  noticeTournamentEliminationToEntrant(tournamentId, bust.playerId, noticeSids, bust.playerName, bustPosition, bustPrize);
+  toldSockets += noticeTournamentEliminationToEntrant(tournamentId, bust.playerId, noticeSids, bust.playerName, bustPosition, bustPrize);
+  return toldSockets;
 }
 
 /** S1 — run every capture still pending on this table now (its handleHandComplete threw), then re-kick its deal. */

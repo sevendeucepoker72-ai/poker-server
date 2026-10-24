@@ -250,6 +250,8 @@ function world(opts: {
   const pendingAutoStartTimers = new Map<string, any>();
   const scope: Record<string, unknown> = {
     tournamentTables, tournamentManager: tm, qualifierTournaments: new Map(),
+    // 2026-10-24 (Sit & Go fix-all F14) — the durable result rows: a DB side effect, inert in this world.
+    recordTournamentResultsBust() {}, recordTournamentResultsStart() {}, recordTournamentResultsFinish() {},
     tableManager: { getTable: (id: string) => tables.get(id), removeTable: (id: string) => tables.delete(id) },
     DEFAULT_BLIND_LEVELS, GamePhase,
     reservedSeats, playerSessions, authSessions, multiTableSessions, spectators, aiProfiles: new Map(),

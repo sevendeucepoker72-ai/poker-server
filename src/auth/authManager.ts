@@ -1,4 +1,5 @@
 import { Pool } from 'pg';
+import { TOURNAMENT_RESULTS_DDL } from '../game/tournamentResults';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
@@ -325,6 +326,11 @@ export async function initDB(): Promise<void> {
     ALTER TABLE user_battle_pass_claims ADD PRIMARY KEY (user_id, season_id, tier_id, track);
   EXCEPTION WHEN others THEN NULL; END $$;`).catch((e: any) => console.warn('[Auth] bp_claims pk rebuild:', e.message));
 
+  // 2026-10-24 (Sit & Go fix-all F14) — durable tournament results (tournament_results,
+  // tournament_result_players); ASCII-only DDL shared with the writer's lazy retry.
+  for (const sql of TOURNAMENT_RESULTS_DDL) {
+    await pool.query(sql).catch((e: any) => console.warn('[Auth] tournament results DDL:', e.message));
+  }
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_hand_history (
       id          BIGSERIAL PRIMARY KEY,
