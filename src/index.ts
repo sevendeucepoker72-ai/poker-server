@@ -1338,6 +1338,24 @@ function auditLog(actorUsername: string, action: string, details: Record<string,
   })();
 }
 
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F15) — ONE shape
+ * for every entry-fee row (TOURNAMENT_ENTRY_DEDUCT / _REFUND / _REFUND_FAILED:
+ * registration, unregister, the start screen, a stall-cancel, a restart
+ * refund): actor = his login handle (`user:<id>` when it is not known), details
+ * {userId, entryFee, amount, reason, tournamentId} (+ `extra`). The rows used
+ * three different shapes (some had no userId, some no amount, the restart
+ * refunds no audit row at all).
+ */
+function tournamentFeeAudit(
+  action: 'TOURNAMENT_ENTRY_DEDUCT' | 'TOURNAMENT_ENTRY_REFUND' | 'TOURNAMENT_ENTRY_REFUND_FAILED',
+  o: { login?: string | null; userId: number; tournamentId: string; entryFee: number; amount: number; reason: string; extra?: Record<string, unknown> },
+): void {
+  auditLog(o.login || `user:${o.userId}`, action, {
+    userId: o.userId, entryFee: o.entryFee, amount: o.amount, reason: o.reason, tournamentId: o.tournamentId, ...(o.extra || {}),
+  });
+}
+
 // ========== Testing-mode unlimited chip refills ==========
 //
 // On-demand auto-top-up: any buy-in path that finds `dbChips < buyIn`
@@ -2124,7 +2142,7 @@ function buyInStateChanged(socket: Socket, expect: BuyInExpectation): string | n
  */
 async function buyInSocketGone(
   socket: Socket, via: string, stage: string,
-  refund?: { userId: number; username: string; amount: number; tableId?: string | null; action?: string },
+  refund?: { userId: number; username: string; amount: number; tableId?: string | null; action?: string; extra?: Record<string, unknown> },
   expect?: BuyInExpectation,
 ): Promise<boolean> {
   let reason = 'socket_gone';
@@ -2143,7 +2161,7 @@ async function buyInSocketGone(
   let refundResult: 'none' | 'refunded' | 'failed' = 'none';
   if (refund && refund.amount > 0) {
     const action = refund.action || 'BUY_IN_REFUND';
-    const detail = { userId: refund.userId, tableId: refund.tableId ?? null, amount: refund.amount, reason, via, stage };
+    const detail = { userId: refund.userId, tableId: refund.tableId ?? null, amount: refund.amount, reason, via, stage, ...(refund.extra || {}) };   // F15: + extra
     try {
       const ok = await addChipsToUser(refund.userId, refund.amount);
       refundResult = ok ? 'refunded' : 'failed';
@@ -10811,8 +10829,8 @@ async function screenAndStartTournament(tournamentId: string, via: 'register' | 
       );
       for (const r of removed) {
         if (r.userId !== null && (r.refunded > 0 || r.refundFailed)) {
-          auditLog(String(r.userId), r.refundFailed ? 'TOURNAMENT_ENTRY_REFUND_FAILED' : 'TOURNAMENT_ENTRY_REFUND', {
-            tournamentId, entryFee, reason: 'suspended_at_start',
+          tournamentFeeAudit(r.refundFailed ? 'TOURNAMENT_ENTRY_REFUND_FAILED' : 'TOURNAMENT_ENTRY_REFUND', {   // F15
+            userId: r.userId, tournamentId, entryFee, amount: r.refunded || entryFee, reason: 'suspended_at_start',
           });
         }
         console.warn(`[play-gate] ${JSON.stringify({
@@ -21720,13 +21738,14 @@ Give feedback in this JSON format:
       if (await buyInSocketGone(socket, 'registerTournament', 'balance_read', undefined, regState)) return; // F3 — nothing deducted yet
       if (entryFee > dbChips) { socket.emit('error', { message: `Not enough chips for the ${entryFee.toLocaleString()} entry fee` }); return; }
       if (!(await deductChips(authT.userId, entryFee))) { socket.emit('error', { message: 'Could not deduct entry fee — try again' }); return; }
-      auditLog(authT.username, 'TOURNAMENT_ENTRY_DEDUCT', { tournamentId: data.tournamentId, entryFee });
+      tournamentFeeAudit('TOURNAMENT_ENTRY_DEDUCT', { login: authT.username, userId: authT.userId, tournamentId: data.tournamentId, entryFee, amount: entryFee, reason: 'register' });   // F15
       // F3 — the socket dropped during the deduct: refund the fee and register
       // nothing (registerPlayer is what adds it to the prize pool, so the pool
       // stays in lockstep). Registered on a dead socket, he would be seated at
       // the start with no session — an absent seat blinded out.
       if (await buyInSocketGone(socket, 'registerTournament', 'deduct', {
         userId: authT.userId, username: authT.username, amount: entryFee, action: 'TOURNAMENT_ENTRY_REFUND',
+        extra: { entryFee, tournamentId: data.tournamentId },   // F15 — the fee row's shape
       }, regState)) return;
     }
 
@@ -21735,6 +21754,8 @@ Give feedback in this JSON format:
       authT ? (viewer?.masterUserId || undefined) : undefined,
     );
     if (result.success) {
+      // F15 (2026-10-24) — his login on the entry: every later fee row (cancel, restart) names him by it.
+      if (authT) { const regTp = tournamentManager.getTournament(data.tournamentId)?.players.find((p) => p.playerId === playerId); if (regTp) regTp.login = authT.username; }
       // TOURNEY-10 — his progression entry exists (hydrated from the DB) before his first tournament hand.
       if (authT) progressionManager.getOrCreateProgress(playerId, playerName, authT.userId);
       socket.emit('tournamentRegistered', { tournamentId: data.tournamentId, entryId: result.entryId ?? null });
@@ -21748,8 +21769,8 @@ Give feedback in this JSON format:
       // Registration failed AFTER the deduct — refund the wallet. (registerPlayer
       // only increments the pool on success, so the pool needs no back-out here.)
       if (entryFee > 0 && authT) {
-        await addChipsToUser(authT.userId, entryFee);
-        auditLog(authT.username, 'TOURNAMENT_ENTRY_REFUND', { tournamentId: data.tournamentId, entryFee });
+        const refundedOk = await addChipsToUser(authT.userId, entryFee);
+        tournamentFeeAudit(refundedOk ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { login: authT.username, userId: authT.userId, tournamentId: data.tournamentId, entryFee, amount: entryFee, reason: 'registration_failed' });   // F15
       }
       socket.emit('error', { message: result.error || 'Registration failed', code: result.code || 'registration_failed', tournamentId: data.tournamentId });
     }
@@ -21781,7 +21802,7 @@ Give feedback in this JSON format:
       tournamentManager.refundEntryFee(data.tournamentId, reg.userId);
       const ok = await addChipsToUser(reg.userId, entryFee);
       refunded = ok ? entryFee : 0;
-      auditLog(authT?.username || String(reg.userId), ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId: data.tournamentId, entryFee, reason: 'unregister' });
+      tournamentFeeAudit(ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { login: authT?.username || reg.login, userId: reg.userId, tournamentId: data.tournamentId, entryFee, amount: entryFee, reason: 'unregister' });   // F15
     }
     // R2 (C4) — a seller who unregistered: his backers get their escrow back.
     if (removed && reg.userId !== undefined) void refundStakesOf(data.tournamentId, 'seller_unregistered', reg.userId);
@@ -25118,7 +25139,7 @@ function startTournamentGame(tournamentId: string): void {
  */
 function refundCancelledTournamentEntrants(
   tournamentId: string,
-  registrants: Array<{ playerId: string; userId?: number; masterUserId?: string; socketId?: string; refund: number }>,
+  registrants: Array<{ playerId: string; userId?: number; masterUserId?: string; socketId?: string; refund: number; login?: string }>,
   reason: string,
 ): void {
   // R2 (TOURNEY-14) — a CLUB tournament's buy-ins were paid to the club: they
@@ -25146,11 +25167,13 @@ function refundCancelledTournamentEntrants(
     if (credits.length > 0) {
       void prizeLedger.settle({ label: `tfee:${tournamentId}`, credits })
         .then((res) => {
-          for (const c of res.paid) auditLog(String(c.userId), 'TOURNAMENT_ENTRY_REFUND', { tournamentId, amount: c.amount, reason });
-          for (const c of res.noUser) auditLog(String(c.userId), 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: c.amount, reason, error: 'no_user_row' });
+          // F15 (2026-10-24) — the one fee-row shape, actor = his login.
+          const loginOf = (uid: number): string | undefined => registrants.find((x) => x.userId === uid && !!x.login)?.login;
+          for (const c of res.paid) tournamentFeeAudit('TOURNAMENT_ENTRY_REFUND', { login: loginOf(c.userId), userId: c.userId, tournamentId, entryFee: c.amount, amount: c.amount, reason });
+          for (const c of res.noUser) tournamentFeeAudit('TOURNAMENT_ENTRY_REFUND_FAILED', { login: loginOf(c.userId), userId: c.userId, tournamentId, entryFee: c.amount, amount: c.amount, reason, extra: { error: 'no_user_row' } });
           // Not settled yet: kept by the ledger and retried (retryPending) — the key pays it once.
           if (res.status !== 'committed') {
-            for (const c of credits) auditLog(String(c.userId), 'TOURNAMENT_ENTRY_REFUND_FAILED', { tournamentId, amount: c.amount, reason, pendingRetry: true, error: res.error || res.status });
+            for (const c of credits) tournamentFeeAudit('TOURNAMENT_ENTRY_REFUND_FAILED', { login: loginOf(c.userId), userId: c.userId, tournamentId, entryFee: c.amount, amount: c.amount, reason, extra: { pendingRetry: true, error: res.error || res.status } });
           }
         })
         .catch((e: any) => console.error(`[Tournament ${tournamentId}] entry-fee refund settlement threw:`, e?.message || e));
@@ -29514,7 +29537,29 @@ const shutdownFlushStats = {
   // R3 — decided career / heads-up / all-in-or-fold / challenge games settled (S1-4); upcoming-qualifier
   // registrants told (S1-6); cash seats no claim reached, credited / with no owner to credit (TOURNEY-9).
   quickGamesSettled: 0, qualifierRegistrantsTold: 0, unclaimedSeatsCredited: 0, unclaimedSeatsUnowned: 0,
+  // 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F15) — WHAT the counts
+  // above are: the tournaments voided / cancelled (id, name, entrants) and the seats
+  // not cashed out (table, seat, player, why). Bounded (SHUTDOWN_FLUSH_LIST_MAX each).
+  voidedTournaments: [] as Array<{ tournamentId: string; name: string; entrants: number; refunds: number }>,
+  cancelledTournaments: [] as Array<{ tournamentId: string; name: string; registrants: number; refunds: number }>,
+  seatsSkipped: [] as Array<{ tableId: string; seatIndex: number; tournamentId: string | null; playerId: string | null; playerName: string | null; userId: number | null; reason: string }>,
 };
+const SHUTDOWN_FLUSH_LIST_MAX = 100;
+/** F15 — append to one of the SHUTDOWN_FLUSH row's lists (bounded; never throws). */
+function pushShutdownList(key: 'voidedTournaments' | 'cancelledTournaments' | 'seatsSkipped', item: unknown): void {
+  const list = (shutdownFlushStats as any)[key];
+  if (Array.isArray(list) && list.length < SHUTDOWN_FLUSH_LIST_MAX) list.push(item);
+}
+/** F15 — one skipped seat (a tournament / Spin & Go stack: never cashed out) in the SHUTDOWN_FLUSH row. */
+function noteShutdownSeatSkipped(tableId: string, seatIndex: number, userId: number | null, reason: string): void {
+  try {
+    const seat = tableManager.getTable(tableId)?.seats?.[seatIndex];
+    pushShutdownList('seatsSkipped', {
+      tableId, seatIndex, tournamentId: tournamentIdOfTable(tableId) ?? brokenTournamentTables.get(tableId)?.tournamentId ?? null,
+      playerId: seat?.playerId || null, playerName: seat?.playerName || null, userId: userId ?? null, reason,
+    });
+  } catch { /* the row is an explanation; never break the flush */ }
+}
 
 interface ShutdownSeatCredit { userId: number; amount: number; tableId: string; seatIndex: number; via: string; invested: number }
 
@@ -29535,6 +29580,7 @@ function claimSeatsForShutdown(): { credits: ShutdownSeatCredit[]; progress: Arr
     // Tournament stacks are NOT wallet-funded (a mint) — the tournament's entry
     // fees are refunded instead; a Spin & Go stack is its prize format's (the
     // fee is refunded). F2: a table a rebalance just broke counts.
+    if (isTournamentTable(tableId) || isPrizeFormatTable(tableId)) noteShutdownSeatSkipped(tableId, seatIndex, userId, isPrizeFormatTable(tableId) ? 'spin_go_stack' : 'tournament_stack');   // F15
     if (isTournamentTable(tableId) || isPrizeFormatTable(tableId)) { creditedSeats.add(seatKey); shutdownFlushStats.seatsNotCashed++; return; }
     const table = tableManager.getTable(tableId);
     const seat = table?.seats?.[seatIndex];
@@ -29577,6 +29623,8 @@ function claimSeatsForShutdown(): { credits: ShutdownSeatCredit[]; progress: Arr
       const table = tableManager.getTable(session.tableId);
       const seat = table?.seats?.[session.seatIndex];
       const seatKey = `${session.tableId}:${session.seatIndex}`;
+      // F15 (2026-10-24) — a seated TOURNAMENT stack is never cashed out (its fee is refunded): listed in the row.
+      if (seat && seat.state === 'occupied' && isTournamentTable(session.tableId)) noteShutdownSeatSkipped(session.tableId, session.seatIndex, auth.userId, 'tournament_stack_seated');
       if (seat && seat.state === 'occupied' && !creditedSeats.has(seatKey) && !isTournamentTable(session.tableId)) {
         // R3 (live P1) — a restored session is checked against the seat's own id.
         take(auth.userId, session.tableId, session.seatIndex, 'seated', session.seatPlayerId || session.playerId);
@@ -29595,6 +29643,7 @@ function claimSeatsForShutdown(): { credits: ShutdownSeatCredit[]; progress: Arr
     clearTimeout(reserved.cleanupTimer);
     reservedSeats.delete(userId);
     // T1: isTournamentReservation also covers a table a break took out of tournamentTables.
+    if (isTournamentReservation(reserved)) noteShutdownSeatSkipped(reserved.tableId, reserved.seatIndex, userId, 'tournament_reservation');   // F15
     if (isTournamentReservation(reserved)) { shutdownFlushStats.seatsNotCashed++; continue; }
     take(userId, reserved.tableId, reserved.seatIndex, 'reserved', undefined, reserved.chips);
   }
@@ -29675,7 +29724,7 @@ function claimTournamentRefundsForShutdown(): {
   const entryFees: LedgerCredit[] = [];
   const clubRefunds: Array<{ clubTid: number; liveId: string; entrants: Array<{ userId: number; amount: number }> }> = [];
   const stakes: string[] = [];
-  const owe = (tid: string, regs: Array<{ playerId: string; userId?: number; refund: number }>) => {
+  const owe = (tid: string, regs: Array<{ playerId: string; userId?: number; refund: number; login?: string }>) => {
     const clubTid = clubLiveTournaments.get(tid);
     const owed = regs.filter((r) => r.userId !== undefined && r.refund > 0);
     if (clubTid !== undefined) {
@@ -29686,22 +29735,36 @@ function claimTournamentRefundsForShutdown(): {
           key: `tfee:${tid}:${r.playerId}`, userId: r.userId as number, amount: r.refund, kind: 'TOURNAMENT_ENTRY_REFUND',
           details: { tournamentId: tid, reason: 'server_restart' },
         });
+        // F15 (2026-10-24) — the restart refund's durable audit row needs his login (settleShutdownCredits).
+        if (r.login) shutdownRefundLogins.set(`tfee:${tid}:${r.playerId}`, r.login);
       }
     }
     for (const r of regs) { try { tellTournamentCancelled(tid, r, 'server_restart'); } catch { /* the sockets are going anyway */ } }
   };
   for (const tid of tournamentManager.tournamentIdsWithStatus('registering')) {
     stakes.push(tid);
+    const name = tournamentManager.getTournament(tid)?.config.name || 'Tournament';
     const regs = tournamentManager.cancelTournament(tid);
-    if (regs.length > 0) shutdownFlushStats.tournamentsCancelled++;
+    if (regs.length > 0) {
+      shutdownFlushStats.tournamentsCancelled++;
+      // F15 (2026-10-24) — which one (id, name, registrants, fees owed).
+      pushShutdownList('cancelledTournaments', { tournamentId: tid, name, registrants: regs.length, refunds: regs.filter((r) => r.userId !== undefined && r.refund > 0).length });
+    }
     owe(tid, regs);
   }
+  const voidedIds: string[] = [];
   for (const tid of tournamentManager.tournamentIdsWithStatus('running')) {
     stakes.push(tid);
+    const name = tournamentManager.getTournament(tid)?.config.name || 'Tournament';
     const regs = tournamentManager.voidRunningTournament(tid);
     shutdownFlushStats.tournamentsVoided++;
+    voidedIds.push(tid);
+    // F15 — which one (a qualifier, a Sit & Go, an admin simulation with no fees ...).
+    pushShutdownList('voidedTournaments', { tournamentId: tid, name, entrants: regs.length, refunds: regs.filter((r) => r.userId !== undefined && r.refund > 0).length });
     owe(tid, regs);
   }
+  // F15 / F14 — a voided event is never told as a result (best effort: the process is going).
+  try { void tournamentResults.markVoided(voidedIds); } catch { /* no durable store here */ }
   return { entryFees, clubRefunds, stakes };
 }
 
@@ -29790,6 +29853,9 @@ function claimQuickAndQualifierRefundsForShutdown(entryFees: LedgerCredit[]): Pr
   return tasks;
 }
 
+/** F15 — the restart refunds' logins (ledger key -> login), for their audit rows. */
+const shutdownRefundLogins = new Map<string, string>();
+
 /** Phase 1 — the seat cash-outs + entry fees: ONE ledger settlement (idempotent, retried). */
 async function settleShutdownCredits(seats: ShutdownSeatCredit[], entryFees: LedgerCredit[]): Promise<void> {
   const credits: LedgerCredit[] = [
@@ -29805,6 +29871,12 @@ async function settleShutdownCredits(seats: ShutdownSeatCredit[], entryFees: Led
   for (const c of r.paid) {
     if (c.kind === 'SHUTDOWN_CASH_OUT') { shutdownFlushStats.seatsCashedOut++; shutdownFlushStats.chipsCashedOut += c.amount; }
     else shutdownFlushStats.entryFeesRefunded++;
+    // F15 (2026-10-24) — a restart refund of an entry fee gets its durable audit row (the one fee shape);
+    // it used to be only in prize_payouts.
+    if (c.kind === 'TOURNAMENT_ENTRY_REFUND') {
+      const tid = String((c.details as any)?.tournamentId ?? '');
+      tournamentFeeAudit('TOURNAMENT_ENTRY_REFUND', { login: shutdownRefundLogins.get(c.key), userId: c.userId, tournamentId: tid, entryFee: c.amount, amount: c.amount, reason: 'server_restart', extra: { ledgerKey: c.key } });
+    }
     console.log(`[Shutdown] ${c.kind} ${c.amount} for user ${c.userId} ${JSON.stringify(c.details || {})}`);
   }
   if (r.status !== 'committed') {

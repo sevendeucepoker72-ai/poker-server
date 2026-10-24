@@ -1832,3 +1832,7 @@ recordTournamentResultsFinish
 # Sit & Go fix-all F12 - a player who busted while away is told his place (and prize) at his next sign-in.
 tellUnseenTournamentResults
 atSignIn
+# Sit & Go fix-all F15 - SHUTDOWN_FLUSH lists voided / cancelled tournaments + skipped seats; one fee-row shape; restart refunds audited.
+tournamentFeeAudit
+noteShutdownSeatSkipped
+voidedTournaments

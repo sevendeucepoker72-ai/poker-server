@@ -111,6 +111,12 @@ export interface TournamentPlayer {
    * seat number.
    */
   tieGroup?: number;
+  /**
+   * 2026-10-24 (Sit & Go fix-all F15) — the login handle he registered with
+   * (index.ts sets it after registerPlayer): every entry-fee audit row (deduct,
+   * unregister, stall-cancel, restart refund) names him by it. Identity only.
+   */
+  login?: string;
 }
 
 export type TournamentStatus = 'registering' | 'running' | 'finished' | 'cancelled';
@@ -924,7 +930,7 @@ export class TournamentManager {
    * userId + the per-entrant refund amount) so the caller can refund wallets.
    * Sets status to 'cancelled' and zeroes the collected pool. Idempotent.
    */
-  cancelTournament(tournamentId: string): { playerId: string; userId?: number; refund: number }[] {
+  cancelTournament(tournamentId: string): { playerId: string; userId?: number; refund: number; login?: string }[] {
     const tournament = this.tournaments.get(tournamentId);
     if (!tournament || tournament.status !== 'registering') return [];
     const entryFee = tournament.config.buyIn || 0;
@@ -932,6 +938,8 @@ export class TournamentManager {
       playerId: p.playerId,
       userId: p.userId,
       refund: (entryFee > 0 && p.userId !== undefined) ? entryFee : 0,
+      // F15 (2026-10-24) — for the audit rows (additive; only when known).
+      ...(p.login ? { login: p.login } : {}),
     }));
     tournament.status = 'cancelled';
     tournament.players = [];
@@ -963,7 +971,7 @@ export class TournamentManager {
    * refund), clock stopped — and every PAYING entrant (eliminated or not) is
    * returned with his entry fee to refund. Idempotent (a second call returns []).
    */
-  voidRunningTournament(tournamentId: string): { playerId: string; userId?: number; entryId?: string; refund: number }[] {
+  voidRunningTournament(tournamentId: string): { playerId: string; userId?: number; entryId?: string; refund: number; login?: string }[] {
     const t = this.tournaments.get(tournamentId);
     if (!t || t.status !== 'running') return [];
     const fee = t.config.buyIn || 0;
@@ -974,6 +982,7 @@ export class TournamentManager {
       playerId: p.playerId, userId: p.userId, ...(p.entryId ? { entryId: p.entryId } : {}),
       // A DISQUALIFIED entrant (suspended mid-tournament) is never paid — not even his fee back (2026-10-09 S4 rule).
       refund: fee > 0 && p.userId !== undefined && !p.disqualified ? fee : 0,
+      ...(p.login ? { login: p.login } : {}),   // F15 — the audit rows (only when known)
     }));
   }
 

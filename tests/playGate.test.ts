@@ -1033,7 +1033,7 @@ describe('index.ts — every play-entry handler is gated before its first side e
     // every entrant still audited (refunded, or FAILED while the ledger retries it).
     expect(refundFn).toContain('void prizeLedger.settle({ label: `tfee:${tournamentId}`, credits })');
     expect(refundFn).toContain('key: `tfee:${tournamentId}:${r.playerId}`');
-    expect(refundFn).toContain("auditLog(String(c.userId), 'TOURNAMENT_ENTRY_REFUND', { tournamentId, amount: c.amount, reason });");
+    expect(refundFn).toContain("tournamentFeeAudit('TOURNAMENT_ENTRY_REFUND', { login: loginOf(c.userId), userId: c.userId, tournamentId, entryFee: c.amount, amount: c.amount, reason });");
     expect(refundFn).toContain("'TOURNAMENT_ENTRY_REFUND_FAILED'");
   });
 

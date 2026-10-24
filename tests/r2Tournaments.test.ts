@@ -197,7 +197,8 @@ describe('staking escrow planning (pure)', () => {
 
 // ─────────────────────────── the real index.ts paths ───────────────────────────
 const REG = slice('// ========== Tournament registration — per account, per socket (R2, C2) ==========', "  return userId !== undefined ? `user-${userId}` : `player-${uuidv4()}`;\n}\n");
-const REFUND_CANCELLED = fnSrc('function refundCancelledTournamentEntrants(');
+// 2026-10-24 (Sit & Go fix-all F15) — + the one fee-row helper the refunds audit through.
+const REFUND_CANCELLED = fnSrc('function refundCancelledTournamentEntrants(') + '\n' + fnSrc('function tournamentFeeAudit(');
 const PRIZES = slice('const paidOutTournaments = new Set<string>();', '    tournamentsSettlingStakes.delete(tid);\n  }\n}\n');
 const START = SRC.slice(
   SRC.indexOf('/**\n * R2 (TOURNEY-9) — does this socket PLAY a live seat elsewhere'),
@@ -705,8 +706,10 @@ describe('R3 (TOURNEY-P3-3) — a cancelled tournament\'s entry fees are refunde
     expect([w.db.wallets.get(ALICE), w.db.wallets.get(BOB)]).toEqual([100_000, 100_000]);
     expect([...w.db.payouts.keys()].sort()).toEqual([`tfee:${tid}:user-101`, `tfee:${tid}:user-102`]);
     expect(w.db.payouts.get(`tfee:${tid}:user-101`)).toMatchObject({ userId: ALICE, amount: 500, kind: 'TOURNAMENT_ENTRY_REFUND' });
+    // F15 (2026-10-24) — the one fee-row shape: {userId, entryFee, amount, reason, tournamentId}.
     expect(w.audits.filter((x) => x.action === 'TOURNAMENT_ENTRY_REFUND').map((x) => x.d)).toEqual([
-      { tournamentId: tid, amount: 500, reason: 'tournament_cancelled_stalled' }, { tournamentId: tid, amount: 500, reason: 'tournament_cancelled_stalled' },
+      { userId: ALICE, entryFee: 500, tournamentId: tid, amount: 500, reason: 'tournament_cancelled_stalled' },
+      { userId: BOB, entryFee: 500, tournamentId: tid, amount: 500, reason: 'tournament_cancelled_stalled' },
     ]);
   });
 
