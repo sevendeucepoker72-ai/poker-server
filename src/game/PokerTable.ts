@@ -2014,6 +2014,11 @@ export class PokerTable extends EventEmitter {
 
     if (additionalChips <= 0) return false;
 
+    // 2026-10-24 (Sit & Go fix-all F2) — the FIRST bet of a street is saved as
+    // 'bet N' (nothing to match yet); a raise stays 'raised to N'. Pre-flop the
+    // big blind is the bet, so an open there stays a raise.
+    const openingBet = this.currentBetToMatch === 0;
+
     if (totalRaiseAmount > this.currentBetToMatch) this.noteBetIncrease(totalRaiseAmount);   // F22 fix-up
 
     // Track if this is a full raise (for re-raise eligibility)
@@ -2048,7 +2053,7 @@ export class PokerTable extends EventEmitter {
     this.actionLog.push({
       seatIndex,
       playerName: seat.playerName,
-      action: `raised to ${totalRaiseAmount}`,
+      action: openingBet ? `bet ${totalRaiseAmount}` : `raised to ${totalRaiseAmount}`,   // F2
       street: this.currentPhase,
     });
 
@@ -2255,6 +2260,7 @@ export class PokerTable extends EventEmitter {
     }
     const trulyAllIn = allInAmount >= stack;
     const totalBet = seat.currentBet + allInAmount;
+    const openingBet = this.currentBetToMatch === 0;   // F2 (2026-10-24) — a capped opening bet is 'bet N (pot-limit cap)'
 
     // Check if this constitutes a raise
     if (totalBet > this.currentBetToMatch) {
@@ -2294,7 +2300,7 @@ export class PokerTable extends EventEmitter {
     this.actionLog.push({
       seatIndex,
       playerName: seat.playerName,
-      action: trulyAllIn ? `went all-in for ${totalBet}` : `raised to ${totalBet} (pot-limit cap)`,
+      action: trulyAllIn ? `went all-in for ${totalBet}` : `${openingBet ? 'bet' : 'raised to'} ${totalBet} (pot-limit cap)`,
       street: this.currentPhase,
     });
 

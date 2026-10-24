@@ -134,7 +134,8 @@ export const BOT_EQUITY_BUDGET_MS = 40;
 export const BOT_MAX_STREET_RAISES_PREFLOP = 3;
 export const BOT_MAX_STREET_RAISES_POSTFLOP = 2;
 export const BOT_MAX_OWN_RAISES_PER_STREET = 2;
-const OWN_RAISE_RE = /^(raised to|straddle|went all-in)/;
+// 2026-10-24 (Sit & Go fix-all F2) — an opening bet is logged 'bet N': it is one of the bot's own raises too.
+const OWN_RAISE_RE = /^(raised to|bet |straddle|went all-in)/;
 
 export function limitBotRaiseWar(
   table: PokerTable,

@@ -1786,3 +1786,6 @@ handLevelOnTable
 # Sit & Go fix-all F1 - every ante is in the hand history (posted ante N; allIn flag for an ante for less).
 logAntePosted
 posted ante 
+# Sit & Go fix-all F2 - the first bet of a street is saved as bet N (raises stay raised to N).
+openingBet ? `bet 
+raised to|bet |straddle|went all-in
