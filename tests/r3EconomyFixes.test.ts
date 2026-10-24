@@ -360,6 +360,7 @@ function handWorld(kind: 'cash' | 'club' = 'cash') {
     standUpSuspendedSeatsBeforeDeal() {}, tickReservedSeatHands() {}, settleInsuranceForHand() {}, captureTournamentBustCheck: () => null,
     runTournamentBustCheck: () => { handDone(); }, rekickTournamentDealAfterBustCheck() {}, runPendingTournamentBustChecks() {},
     broadcastGameState() {}, tableCountsForChipsWon: () => kind === 'cash', tableFeedsClubStats: () => kind === 'club',
+    potCountsForWalletRewards: () => true,   // Sit & Go fix-all F5 (2026-10-24) — not a tournament / Spin & Go table here
     denverDateKey: () => '2026-10-11', economyStats: { chipsWonWrites: 0, chipsWonWriteFailures: 0 },
     recordChipWins: async (userId: number, _day: string, net: number) => { chipsWon.push({ userId, net }); },
     recordClubHand: (_t: string, entries: any[]) => { club.push(...entries); },

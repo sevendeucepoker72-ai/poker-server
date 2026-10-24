@@ -1798,3 +1798,5 @@ unmatchedFoldedExcess
 # Sit & Go fix-all F20 - auto-muck: a losing hand that does not have to be shown (non-all-in showdown, TDA order) is mucked.
 showdownMuckedSeats
 muckedAtShowdown
+# Sit & Go fix-all F5 - tournament / Spin & Go pots feed no chip-amount reward (pot missions, pot achievements, XP pot bonus, ticker).
+potCountsForWalletRewards

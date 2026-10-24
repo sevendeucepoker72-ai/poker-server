@@ -77,6 +77,7 @@ function world(opts: { tableKind?: string; humanName?: string } = {}) {
     tickReservedSeatHands() {}, settleInsuranceForHand() {}, captureTournamentBustCheck: () => null,
     runTournamentBustCheck() {}, rekickTournamentDealAfterBustCheck() {}, runPendingTournamentBustChecks() {}, broadcastGameState() {},
     tableCountsForChipsWon: () => (opts.tableKind ?? 'cash') === 'cash', denverDateKey, economyStats: { chipsWonWrites: 0, chipsWonWriteFailures: 0 },
+    potCountsForWalletRewards: () => (opts.tableKind ?? 'cash') === 'cash',   // Sit & Go fix-all F5 (2026-10-24)
     recordChipWins: async (uid: number, day: string, net: number) => { chipsWon.push([uid, day, net]); },
     recordClubHand() {}, publicNameOf, PUBLIC_NAME_FALLBACK, recordHand: async () => {},
     progressionHandRank,   // F42 (2026-10-21) — the real rank normaliser

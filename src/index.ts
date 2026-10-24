@@ -9503,6 +9503,8 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   const countsForChipsWon = tableCountsForChipsWon(tableId);
   const feedsClubStats = tableFeedsClubStats(tableId);
   const chipsWonSeats = (countsForChipsWon || feedsClubStats) ? chipsWonSeatsOfHand(tableId, table, dealtInSeats) : [];
+  // F5 (2026-10-24) — a tournament / Spin & Go pot pays no chip-amount reward (pot 0 below).
+  const potRewards = potCountsForWalletRewards(tableId);
 
   // Decrement sit-out hand counter for reserved (disconnected) seats on this
   // table. Addendum (R2): AFTER the insurance settlement — a reserved seat at
@@ -9590,7 +9592,10 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       );
       const wasAllIn = seat?.allIn || false;
 
-      progressionManager.recordHandWon(session.playerId, potSize, handRank, wasAllIn);
+      // F5 — at a tournament / Spin & Go table the pot size is 0 here: the win
+      // counts (handsWon, streaks, rare hands, 10 base XP) but no pot mission,
+      // pot achievement, biggest pot or XP pot bonus.
+      progressionManager.recordHandWon(session.playerId, potRewards ? potSize : 0, handRank, wasAllIn);
       progressionManager.recordPositionResult(session.playerId, posCategory, true);
 
       // Live activity ticker: surface notable real wins (big pots, rare hands).
@@ -9598,7 +9603,7 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       // login handle); a player without one is not announced.
       const winnerPublic = publicNameOf(seat?.playerName || session.playerName);
       const winnerName = winnerPublic !== PUBLIC_NAME_FALLBACK ? winnerPublic : '';
-      if (winnerName && potSize >= 10000) {
+      if (winnerName && potRewards && potSize >= 10000) {   // F5 — never a tournament stack
         pushActivity(`🏆 ${winnerName} won ${potSize.toLocaleString()} chips`);
       } else if (winnerName && handRank === HandRank.RoyalFlush) {
         pushActivity(`👑 ${winnerName} hit a ROYAL FLUSH!`);
@@ -11891,6 +11896,20 @@ function evictIdleProgress(): void {
 function tableCountsForChipsWon(tableId: string): boolean {
   if (isTournamentTable(tableId)) return false;
   return tableKindOf(tableId) === 'cash';
+}
+
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F5) — does a pot
+ * won here feed the CHIP-AMOUNT rewards that pay wallet chips / XP (pot
+ * missions, biggest-pot / daily / weekly pot achievements, the XP pot bonus,
+ * the lobby "won N chips" ticker)? Not at a tournament table (qualifier, Sit &
+ * Go, scheduled, club; a broken table too) nor a Spin & Go: those stacks are
+ * not wallet money (one 50,000-chip qualifier pot paid like a 50,000 cash pot).
+ * Count-based rewards (hands played / won, streaks, rare hands) are unchanged.
+ * Club challenges and heads-up / career games keep counting (wallet stacks).
+ */
+function potCountsForWalletRewards(tableId: string): boolean {
+  return !isTournamentTable(tableId) && !isPrizeFormatTable(tableId);
 }
 
 /**

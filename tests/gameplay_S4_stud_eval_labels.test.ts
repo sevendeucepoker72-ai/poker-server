@@ -618,7 +618,8 @@ describe('F42 — progression gets a STANDARD hand rank', () => {
   it('wiring: recordHandWon and the ticker / royal-flush checks read the normalised rank', () => {
     const hc = fnSrc('async function handleHandComplete(');
     expect(hc).toContain('const handRank = progressionHandRank(');
-    expect(hc).toContain('progressionManager.recordHandWon(session.playerId, potSize, handRank, wasAllIn);');
+    // 2026-10-24 (Sit & Go fix-all F5) — the pot size is 0 at a tournament / Spin & Go table.
+    expect(hc).toContain('progressionManager.recordHandWon(session.playerId, potRewards ? potSize : 0, handRank, wasAllIn);');
     expect(hc).not.toContain('handResultPerSeat');
     expect(SRC).toContain("import { progressionHandRank } from './progression/progressionHandRank';");
   });
