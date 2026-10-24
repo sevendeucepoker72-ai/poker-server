@@ -1858,3 +1858,6 @@ muckedSeats: [...table.showdownMuckedSeats()]
 # Sit & Go fix-all F19 review fix-up - the table-room playerEliminated copy carries opaque ids, never user-<id> (non-qualifier).
 ROOM_ENTRANT_TOKEN_KEY
 roomEliminationPayload
+# Sit & Go fix-all C2 / C1 review fix-up - hand records carry tableKind / tournamentId and the hand's smallBlind / bigBlind / ante.
+handRecordKindOf
+handLevelOfRecord

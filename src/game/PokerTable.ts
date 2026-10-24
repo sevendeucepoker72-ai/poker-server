@@ -204,6 +204,16 @@ export interface HandHistoryRecord {
   // the replay labels a hand by the game's own rules (an Omaha replay was
   // judged by Hold'em's any-5-of-N). Additive; persisted with the record.
   variant?: string;
+  /**
+   * 2026-10-24 (Sit & Go fix-all C1, review fix-up) — the level the hand was
+   * PLAYED at (handSmallBlind / handBigBlind / handAnte, F18): a mid-hand
+   * level-up does not change them. Stamped by emitHandCompletion on every
+   * variant's record; poker-3d reads them for the header stakes (it guessed
+   * from the log, wrong when both blinds were short all-ins). Additive.
+   */
+  smallBlind?: number;
+  bigBlind?: number;
+  ante?: number;
 }
 
 /**
@@ -3249,6 +3259,16 @@ export class PokerTable extends EventEmitter {
     return breakdown;
   }
 
+  /** C1 review fix-up — the hand's level for its record (the table level when no hand level was captured, e.g. a rehydrated hand). */
+  protected handLevelOfRecord(): { smallBlind: number; bigBlind: number; ante: number } {
+    const captured = this.handBigBlind > 0;
+    return {
+      smallBlind: captured ? this.handSmallBlind : this.config.smallBlind,
+      bigBlind: captured ? this.handBigBlind : this.config.bigBlind,
+      ante: captured ? this.handAnte : (this.config.ante || 0),
+    };
+  }
+
   /**
    * The ONE way a finished hand is announced — the base determineWinners AND
    * the Omaha / Stud hi-lo overrides (2026-10-10). Before this the hi-lo
@@ -3272,9 +3292,11 @@ export class PokerTable extends EventEmitter {
       const seat = this.seats[r.seatIndex];
       return { ...r, playerId: seat?.playerId || '', isAI: !!seat?.isAI, chipsWon: r.amount };
     });
+    // C1 review fix-up (2026-10-24) — every record says the level the hand was played at.
+    const record: HandHistoryRecord | null = handHistory ? { ...handHistory, ...this.handLevelOfRecord() } : null;
     this.whileCompletingHand(() => {
       this.emit('handResult', { results, handNumber: this.handNumber });
-      if (handHistory) this.emit('handHistory', handHistory);
+      if (record) this.emit('handHistory', record);
       // Reveal seed so players can verify the shuffle was fair
       if (commitment) {
         this.emit('deckSeedRevealed', { seed: commitment.seed, hash: commitment.hash, handNumber: commitment.handNumber });

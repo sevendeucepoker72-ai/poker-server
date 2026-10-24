@@ -8016,6 +8016,9 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
 
     const serializedHistory = {
       ...history,
+      // C2 review fix-up (2026-10-24) — the table's kind (+ tournamentId at a
+      // tournament table) on every copy: emitted, saved, and the F11 copies.
+      ...handRecordKindOf(tableId),
       communityCards: history.communityCards.map(serializeCard),
       // G165 (2026-10-21) — an insured seat's row carries insuranceDelta / insuranceCashout.
       players: withInsuranceSettlement(tableId, history.handNumber, history.players.map((p) => ({
@@ -8065,6 +8068,24 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // away player): persisted only, no socket emit.
     recordHandHistoryCopiesForEverySeat(table, tableId, history, serializedHistory, copiesWritten);
   });
+}
+
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all C2, review fix-up)
+ * — what kind of table a hand record came from: `tableKind` (tableKindOf:
+ * 'tournament' / 'spingo' / 'cash' / 'private' / 'club' / ...) and, at a
+ * tournament table, its `tournamentId`. poker-3d C2 leaves tournament and Spin
+ * & Go hands out of the bankroll; a STORED record (durableState.handHistory
+ * after a reload, every F11 copy) had no way to say so. Additive. Never throws.
+ */
+function handRecordKindOf(tableId: string): { tableKind?: string; tournamentId?: string } {
+  try {
+    const tableKind = tableKindOf(tableId);
+    const tournamentId = tableKind === 'tournament' ? tournamentIdOfTable(tableId) : undefined;
+    return tournamentId ? { tableKind, tournamentId } : { tableKind };
+  } catch {
+    return {};
+  }
 }
 
 /**
