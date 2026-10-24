@@ -71,6 +71,14 @@ export interface PrizeLedgerDeps {
   log?: (line: string) => void;
   /** Backoff before each retry (ms). Default 0, 500, 2000, 8000. */
   backoffMs?: number[];
+  /**
+   * 2026-10-24 (Sit & Go fix-all F16) — keep a settlement that exhausted its
+   * attempts in `prize_ledger_pending` (label, settlement JSONB), remove it once
+   * it commits (or conflicts), and loadPersistedPending() at boot so a restart
+   * retries it (the retry list was memory only: a restart lost a pending prize /
+   * refund). Off by default (tests, tools); index.ts turns it on.
+   */
+  persistPending?: boolean;
 }
 
 export const PRIZE_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS prize_payouts (
@@ -81,6 +89,14 @@ export const PRIZE_LEDGER_DDL = `CREATE TABLE IF NOT EXISTS prize_payouts (
   details JSONB,
   credited BOOLEAN NOT NULL DEFAULT TRUE,
   paid_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)`;
+
+/** F16 — pending settlements kept across a restart (ASCII-only DDL; authManager.initDB + lazily here). */
+export const PRIZE_LEDGER_PENDING_DDL = `CREATE TABLE IF NOT EXISTS prize_ledger_pending (
+  label TEXT PRIMARY KEY,
+  settlement JSONB NOT NULL,
+  first_failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )`;
 
 const isWhole = (n: unknown): n is number => typeof n === 'number' && Number.isInteger(n) && n > 0 && n <= Number.MAX_SAFE_INTEGER;
@@ -96,6 +112,10 @@ export const prizeLedgerStats = {
   creditsAlreadyPaid: 0,
   creditsNoUser: 0,
   invalidCreditsDropped: 0,
+  // F16 (2026-10-24) — pending settlements saved / restored / their save or delete failed.
+  pendingPersisted: 0,
+  pendingRestored: 0,
+  pendingPersistFailures: 0,
 };
 
 export function createPrizeLedger(deps: PrizeLedgerDeps) {
@@ -105,6 +125,80 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
   let tableReady = false;
   /** Settlements that exhausted their attempts — retried by retryPending(). */
   const pending = new Map<string, LedgerSettlement>();
+  /** F16 — labels with a prize_ledger_pending row (saved here or restored at boot). */
+  const persisted = new Set<string>();
+
+  async function persistSave(s: LedgerSettlement): Promise<void> {
+    if (!deps.persistPending || persisted.has(s.label)) return;
+    try {
+      const client = await deps.connect();
+      try {
+        await client.query(PRIZE_LEDGER_PENDING_DDL);
+        await client.query(
+          `INSERT INTO prize_ledger_pending (label, settlement) VALUES ($1, $2::jsonb)
+           ON CONFLICT (label) DO UPDATE SET settlement = EXCLUDED.settlement, updated_at = NOW()`,
+          [s.label, JSON.stringify(s)],
+        );
+        persisted.add(s.label);
+        prizeLedgerStats.pendingPersisted++;
+      } finally {
+        try { client.release(); } catch { /* ignore */ }
+      }
+    } catch (e: any) {
+      prizeLedgerStats.pendingPersistFailures++;
+      log(`[prize-ledger] ${JSON.stringify({ event: 'pending_persist_failed', label: s.label, error: String(e?.message || e).slice(0, 200) })}`);
+    }
+  }
+
+  async function persistRemove(label: string): Promise<void> {
+    if (!deps.persistPending || !persisted.has(label)) return;
+    try {
+      const client = await deps.connect();
+      try {
+        await client.query('DELETE FROM prize_ledger_pending WHERE label = $1', [label]);
+        persisted.delete(label);
+      } finally {
+        try { client.release(); } catch { /* ignore */ }
+      }
+    } catch (e: any) {
+      prizeLedgerStats.pendingPersistFailures++;
+      log(`[prize-ledger] ${JSON.stringify({ event: 'pending_remove_failed', label, error: String(e?.message || e).slice(0, 200) })}`);
+    }
+  }
+
+  /**
+   * F16 — at boot: every saved pending settlement back in the retry list (the
+   * idempotency keys make a retry of one another process already settled a
+   * no-op). Returns how many were added. Never throws.
+   */
+  async function loadPersistedPending(): Promise<number> {
+    if (!deps.persistPending) return 0;
+    let added = 0;
+    try {
+      const client = await deps.connect();
+      try {
+        await client.query(PRIZE_LEDGER_PENDING_DDL);
+        const r = await client.query('SELECT label, settlement FROM prize_ledger_pending');
+        for (const row of r.rows || []) {
+          const label = String(row.label);
+          const s = typeof row.settlement === 'string' ? JSON.parse(row.settlement) : row.settlement;
+          if (!s || !Array.isArray(s.credits)) continue;
+          persisted.add(label);
+          if (pending.has(label)) continue;
+          pending.set(label, { ...s, label });
+          added++;
+        }
+      } finally {
+        try { client.release(); } catch { /* ignore */ }
+      }
+    } catch (e: any) {
+      prizeLedgerStats.pendingPersistFailures++;
+      log(`[prize-ledger] ${JSON.stringify({ event: 'pending_load_failed', error: String(e?.message || e).slice(0, 200) })}`);
+    }
+    prizeLedgerStats.pendingRestored += added;
+    prizeLedgerStats.pending = pending.size;
+    return added;
+  }
 
   async function attempt(s: LedgerSettlement): Promise<Omit<LedgerResult, 'attempts' | 'status'> & { conflict?: boolean }> {
     const client = await deps.connect();
@@ -172,6 +266,7 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
         if (r.conflict) {
           prizeLedgerStats.conflicts++;
           if (pending.delete(s.label)) prizeLedgerStats.pending = pending.size;
+          await persistRemove(s.label);   // F16
           log(`[prize-ledger] ${JSON.stringify({ event: 'settlement_conflict', label: s.label })}`);
           return { status: 'conflict', paid: [], alreadyPaid: [], noUser: [], attempts: i + 1 };
         }
@@ -180,6 +275,7 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
         prizeLedgerStats.creditsAlreadyPaid += r.alreadyPaid.length;
         prizeLedgerStats.creditsNoUser += r.noUser.length;
         if (pending.delete(s.label)) prizeLedgerStats.pending = pending.size;
+        await persistRemove(s.label);   // F16
         return { status: 'committed', ...r, attempts: i + 1 };
       } catch (e: any) {
         lastError = String(e?.message || e).slice(0, 200);
@@ -189,6 +285,7 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
     prizeLedgerStats.failedSettlements++;
     pending.set(s.label, s);
     prizeLedgerStats.pending = pending.size;
+    await persistSave(s);   // F16 — survives a restart
     log(`[prize-ledger] ${JSON.stringify({ event: 'settlement_pending_retry', label: s.label, credits: s.credits.length, error: lastError })}`);
     return { status: 'failed', paid: [], alreadyPaid: [], noUser: [], attempts: backoff.length, error: lastError };
   }
@@ -200,6 +297,7 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
       try {
         const r = await attempt(s);
         pending.delete(label);
+        await persistRemove(label);   // F16
         if (r.conflict) { prizeLedgerStats.conflicts++; continue; }
         committed++;
         prizeLedgerStats.committed++;
@@ -209,13 +307,14 @@ export function createPrizeLedger(deps: PrizeLedgerDeps) {
         log(`[prize-ledger] ${JSON.stringify({ event: 'pending_settlement_committed', label, paid: r.paid.length })}`);
       } catch (e: any) {
         log(`[prize-ledger] ${JSON.stringify({ event: 'pending_settlement_retry_failed', label, error: String(e?.message || e).slice(0, 200) })}`);
+        await persistSave(s);   // F16 — a save that failed earlier gets another try
       }
     }
     prizeLedgerStats.pending = pending.size;
     return committed;
   }
 
-  return { settle, retryPending, pendingCount: () => pending.size, pendingLabels: () => [...pending.keys()] };
+  return { settle, retryPending, loadPersistedPending, pendingCount: () => pending.size, pendingLabels: () => [...pending.keys()] };
 }
 
 export type PrizeLedger = ReturnType<typeof createPrizeLedger>;

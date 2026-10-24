@@ -12361,6 +12361,7 @@ function publicTournamentStandings(standings: any): any {
 const prizeLedger = createPrizeLedger({
   connect: () => getPool().connect() as any,
   log: (line) => console.warn(line),
+  persistPending: true,   // F16 (2026-10-24) — a pending settlement survives a restart (prize_ledger_pending)
 });
 setInterval(() => {
   if (prizeLedger.pendingCount() === 0) return;
@@ -21798,15 +21799,31 @@ Give feedback in this JSON format:
     const entryFee = tourn.config.buyIn || 0;
     const removed = tournamentManager.unregisterPlayer(data.tournamentId, reg.playerId);
     let refunded = 0;
+    let refundPending = false;
     if (removed && entryFee > 0 && reg.userId !== undefined) {
       tournamentManager.refundEntryFee(data.tournamentId, reg.userId);
-      const ok = await addChipsToUser(reg.userId, entryFee);
+      // 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F16) — through the
+      // PRIZE LEDGER: one transaction, a key per REGISTRATION (a re-entry and a later
+      // cancel refund `tfee:<tid>:<playerId>` are never blocked by it), retried with
+      // backoff and kept (persisted) for retryPending. It was a bare addChipsToUser:
+      // a DB blip lost the refund for good.
+      const key = `tfee:${data.tournamentId}:${reg.playerId}:unreg:${reg.entryId || Date.now()}`;
+      const res = await prizeLedger.settle({
+        label: `tfee-unreg:${data.tournamentId}:${reg.playerId}:${reg.entryId || ''}`,
+        credits: [{ key, userId: reg.userId, amount: entryFee, kind: 'TOURNAMENT_ENTRY_REFUND', details: { tournamentId: data.tournamentId, reason: 'unregister' } }],
+      });
+      const ok = res.status === 'committed' && (res.paid.length > 0 || res.alreadyPaid.length > 0);
       refunded = ok ? entryFee : 0;
-      tournamentFeeAudit(ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', { login: authT?.username || reg.login, userId: reg.userId, tournamentId: data.tournamentId, entryFee, amount: entryFee, reason: 'unregister' });   // F15
+      refundPending = res.status === 'failed';
+      tournamentFeeAudit(ok ? 'TOURNAMENT_ENTRY_REFUND' : 'TOURNAMENT_ENTRY_REFUND_FAILED', {
+        login: authT?.username || reg.login, userId: reg.userId, tournamentId: data.tournamentId, entryFee, amount: entryFee, reason: 'unregister',
+        ...(ok ? {} : { extra: { ...(refundPending ? { pendingRetry: true } : {}), error: res.error || res.status } }),
+      });   // F15
     }
     // R2 (C4) — a seller who unregistered: his backers get their escrow back.
     if (removed && reg.userId !== undefined) void refundStakesOf(data.tournamentId, 'seller_unregistered', reg.userId);
-    socket.emit('tournamentUnregistered', { tournamentId: data.tournamentId, refunded });
+    // F16 — refundPending (additive): not settled yet; the ledger retries it.
+    socket.emit('tournamentUnregistered', { tournamentId: data.tournamentId, refunded, ...(refundPending ? { refundPending: true } : {}) });
     broadcastTournamentList();
   });
 
@@ -29222,6 +29239,13 @@ initDB().then(async () => {
       'an unowned row only with a master-attested phone, never an admin / guest / tombstone row)' +
       (process.env.ONLINE_IDENTITY_GUARD_ENFORCE ? ' — ONLINE_IDENTITY_GUARD_ENFORCE is set and IGNORED' : '')
   );
+  // 2026-10-24 (Sit & Go fix-all F16) — the previous process's pending prize / refund settlements: retried now.
+  void prizeLedger.loadPersistedPending().then((n) => {
+    if (n > 0) {
+      console.log(`[prize-ledger] ${JSON.stringify({ event: 'pending_settlements_restored', count: n })}`);
+      void prizeLedger.retryPending().catch(() => {});
+    }
+  });
   try { await initClubTables(); } catch (e) { console.error('[Clubs] initClubTables failed', e); }
   try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }
   try { await initPredictionTables(); } catch (e) { console.error('[prediction] initPredictionTables failed', e); }

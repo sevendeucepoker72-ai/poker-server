@@ -1836,3 +1836,7 @@ atSignIn
 tournamentFeeAudit
 noteShutdownSeatSkipped
 voidedTournaments
+# Sit & Go fix-all F16 - the unregister refund goes through the prize ledger; pending settlements persisted (prize_ledger_pending).
+prize_ledger_pending
+loadPersistedPending
+refundPending

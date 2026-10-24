@@ -1,5 +1,6 @@
 import { Pool } from 'pg';
 import { TOURNAMENT_RESULTS_DDL } from '../game/tournamentResults';
+import { PRIZE_LEDGER_PENDING_DDL } from '../game/prizeLedger';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
@@ -331,6 +332,8 @@ export async function initDB(): Promise<void> {
   for (const sql of TOURNAMENT_RESULTS_DDL) {
     await pool.query(sql).catch((e: any) => console.warn('[Auth] tournament results DDL:', e.message));
   }
+  // 2026-10-24 (Sit & Go fix-all F16) — prize / refund settlements still pending (retried after a restart).
+  await pool.query(PRIZE_LEDGER_PENDING_DDL).catch((e: any) => console.warn('[Auth] prize_ledger_pending:', e.message));
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_hand_history (
       id          BIGSERIAL PRIMARY KEY,
