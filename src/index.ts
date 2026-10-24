@@ -3222,7 +3222,7 @@ app.get('/api/fairness/:tableId/:handNumber', (req, res) => {
   // 2026-10-24 — held while its qualifier runs: the commitment only (verifiable after it ends).
   if (fairnessSeedIsHeld(rc)) {
     fairnessSeedHoldStats.heldEntriesServed++;
-    res.json({ tableId: req.params.tableId, handNumber: rc.handNumber, hash: rc.hash, revealedAt: rc.revealedAt, seed: null, seedHeld: true });
+    res.json({ tableId: req.params.tableId, handNumber: rc.handNumber, hash: rc.hash, revealedAt: rc.revealedAt, seed: null, seedHeld: true, ...seedHeldForOf(rc.holdForTournamentId) });
     return;
   }
   const computed = require('crypto').createHash('sha256').update(rc.seed).digest('hex');
@@ -7450,30 +7450,69 @@ const fairnessSeedHoldStats = { heldEntriesServed: 0 };
 function fairnessSeedHoldOf(tableId: string): string | null {
   try {
     const tid = tournamentIdOfTable(tableId);
-    if (!tid) return null;
-    return tournamentManager.getTournament(tid)?.status === 'running' ? tid : null;
+    if (tid) return tournamentManager.getTournament(tid)?.status === 'running' ? tid : null;
+    // F17 review fix-up (2026-10-24) — a running SPIN & GO (a prize-format quick
+    // table, never in tournamentTables): held under `spingo:<tableId>` while
+    // that game runs (one game per table; see spinGoSeedHoldRunning).
+    return spinGoSeedHoldRunning(tableId) ? `${SPIN_GO_SEED_HOLD_PREFIX}${tableId}` : null;
   } catch {
     return null;
   }
 }
-/** Is this recorded hand's seed withheld right now (its qualifier still running)? */
+/**
+ * F17 review fix-up (2026-10-24, owner 2026-10-23: "Fix all") — the hold key of
+ * a running Spin & Go is `spingo:<tableId>`: F17 holds the seeds of EVERY
+ * running tournament and F5 counts a Spin & Go as one, but fairnessSeedHoldOf
+ * found an event only through tournamentIdOfTable, so a Spin & Go served each
+ * hand's seed (the bots' folded hands) the moment it ended, mid-game. Its game
+ * runs while quickGames has its entry (format spinGo, not ended) and the table
+ * is still a Spin & Go; the end, the table's removal or a restart releases it.
+ */
+const SPIN_GO_SEED_HOLD_PREFIX = 'spingo:';
+function spinGoSeedHoldRunning(tableId: string): boolean {
+  const qg = quickGames.get(tableId);
+  return !!qg && qg.format === 'spinGo' && !qg.ended && spinGoMultipliers.has(tableId);
+}
+/** Is this recorded hand's seed withheld right now (its tournament / Spin & Go still running)? */
 function fairnessSeedIsHeld(rc: { holdForTournamentId?: string }): boolean {
   const tid = rc && rc.holdForTournamentId;
-  return !!tid && tournamentManager.getTournament(tid)?.status === 'running';
+  if (!tid) return false;
+  if (tid.startsWith(SPIN_GO_SEED_HOLD_PREFIX)) return spinGoSeedHoldRunning(tid.slice(SPIN_GO_SEED_HOLD_PREFIX.length));
+  return tournamentManager.getTournament(tid)?.status === 'running';
+}
+/**
+ * F17 review fix-up (2026-10-24) — which kind of event holds a seed, for
+ * poker-3d's wording (K10 heldSeedText): `seedHeldFor: 'tournament'` (additive)
+ * for every NON-qualifier hold (Sit & Go, custom, club, scheduled, Spin & Go);
+ * nothing for a qualifier's (its frames / entries byte-identical: no key = the
+ * qualifier line). Never throws.
+ */
+function seedHeldForOf(holdKey: string | undefined): { seedHeldFor?: 'tournament' } {
+  if (!holdKey) return {};
+  try {
+    return qualifierOfTournament(holdKey) ? {} : { seedHeldFor: 'tournament' };
+  } catch {
+    return {};
+  }
 }
 /** One buffer entry as /api/fairness/:tableId serves it: held → no seed; else the entry as before (the stamp stripped). */
 function publicFairnessEntry(rc: RevealedCommitment): Record<string, unknown> {
   if (fairnessSeedIsHeld(rc)) {
     fairnessSeedHoldStats.heldEntriesServed++;
-    return { handNumber: rc.handNumber, hash: rc.hash, revealedAt: rc.revealedAt, seed: null, seedHeld: true };
+    return { handNumber: rc.handNumber, hash: rc.hash, revealedAt: rc.revealedAt, seed: null, seedHeld: true, ...seedHeldForOf(rc.holdForTournamentId) };
   }
   if (rc.holdForTournamentId === undefined) return rc as unknown as Record<string, unknown>;
   const { holdForTournamentId: _released, ...entry } = rc;
   return entry as unknown as Record<string, unknown>;
 }
-/** The pre-hand 'deckCommitment' frame's extra field: `{seedHeld: true}` at a running qualifier's table, else nothing. */
-function seedHeldFieldsFor(tableId: string): { seedHeld?: true } {
-  return fairnessSeedHoldOf(tableId) ? { seedHeld: true } : {};
+/**
+ * The pre-hand 'deckCommitment' frame's extra fields: `{seedHeld: true}` at a
+ * running qualifier's table; `{seedHeld: true, seedHeldFor: 'tournament'}` at
+ * any other held table (F17 review fix-up); else nothing.
+ */
+function seedHeldFieldsFor(tableId: string): { seedHeld?: true; seedHeldFor?: 'tournament' } {
+  const hold = fairnessSeedHoldOf(tableId);
+  return hold ? { seedHeld: true, ...seedHeldForOf(hold) } : {};
 }
 // ===== end fairness seed hold =====
 

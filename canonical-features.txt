@@ -1847,3 +1847,6 @@ ONLY the part no other seat matched
 getCurrentPotsNetOfReturns
 # Sit & Go fix-all F10 review fix-up - a qualifier table keeps the 500 ms orphan act on hand 1 (marked before its first deal).
 markQualifierEngineTournament
+# Sit & Go fix-all F17 review fix-up - a running Spin & Go's seeds are held; held entries say seedHeldFor tournament (qualifiers unchanged).
+SPIN_GO_SEED_HOLD_PREFIX
+seedHeldFor: 'tournament'

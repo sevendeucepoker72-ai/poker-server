@@ -90,7 +90,8 @@ describe('F17 — every running tournament\'s seeds are held until it ends', () 
     const sng = w.start('Sit & Go');
     const SG = w.table('SG', sng);
     w.play(SG, 3);
-    for (const c of w.list('SG')) expect(c).toEqual({ handNumber: expect.any(Number), hash: expect.stringMatching(/^[0-9a-f]{64}$/), revealedAt: expect.any(Number), seed: null, seedHeld: true });
+    // F17 review fix-up — + seedHeldFor: 'tournament' (a non-qualifier hold; K10's wording).
+    for (const c of w.list('SG')) expect(c).toEqual({ handNumber: expect.any(Number), hash: expect.stringMatching(/^[0-9a-f]{64}$/), revealedAt: expect.any(Number), seed: null, seedHeld: true, seedHeldFor: 'tournament' });
     expect(w.one('SG', 1).body).toMatchObject({ seed: null, seedHeld: true });
     w.finish(sng);
     for (const c of w.list('SG')) {
