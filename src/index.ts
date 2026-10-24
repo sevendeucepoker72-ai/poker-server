@@ -7416,11 +7416,19 @@ function recordRevealedCommitment(tableId: string, rc: RevealedCommitment) {
 // per-hand 'deckSeedRevealed' still reaches no client (F162).
 /** health r2Play.qualifiers.fairnessHold: heldEntriesServed = entries answered with the seed held. */
 const fairnessSeedHoldStats = { heldEntriesServed: 0 };
-/** The running QUALIFIER tournament a hand at this table belongs to (live or just-broken table), else null. Never throws. */
+/**
+ * The running tournament a hand at this table belongs to (live or just-broken
+ * table), else null. Never throws. 2026-10-24 (owner 2026-10-23: "Fix all";
+ * Sit & Go fix-all F17) — EVERY running tournament (Sit & Go, custom, club,
+ * scheduled), not only qualifiers: a Sit & Go hand's seed was served the moment
+ * the hand ended, rebuilding the folded hands of opponents still playing. The
+ * stamp also keeps every hand of the event 7 days (trimFairnessBuffer), so any
+ * hand verifies after the table closes. Qualifiers: unchanged (held as before).
+ */
 function fairnessSeedHoldOf(tableId: string): string | null {
   try {
     const tid = tournamentIdOfTable(tableId);
-    if (!tid || !qualifierOfTournament(tid)) return null;
+    if (!tid) return null;
     return tournamentManager.getTournament(tid)?.status === 'running' ? tid : null;
   } catch {
     return null;

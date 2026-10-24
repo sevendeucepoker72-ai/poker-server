@@ -623,6 +623,10 @@ export class TournamentManager {
         // `minPlayers`: stallCancelMs (null for other events) and stallCancelAt
         // (ms; only while registering with an entrant, else null). Additive.
         ...this.stallFieldsOf(t),
+        // F17 (2026-10-24) — capability flag (additive): this server holds a running
+        // tournament's fairness seeds until it ends (index.ts fairnessSeedHoldOf) and
+        // keeps every hand of it 7 days. Absent on an older server.
+        seedsHeldUntilEnd: true,
         // F21 (2026-10-24) — the structure, for the lobby card / detail (additive):
         // the starting stack, the one level length in seconds (null when the
         // levels differ) and every level.

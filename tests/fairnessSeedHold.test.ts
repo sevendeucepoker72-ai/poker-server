@@ -113,8 +113,8 @@ function field(hands = 2) {
   return { ...w, qtid, sng, QA, QB, SG, C1 };
 }
 
-describe('FS1 — while the qualifier RUNS: the hash is served, the seed is held (seed:null, seedHeld:true); cash / Sit & Go tables are byte-identical to before', () => {
-  it('list + single route at a qualifier table: no seed anywhere in the answer; at a cash and a Sit & Go table: exactly {seed, hash, handNumber, revealedAt} with the seed (9c37499: the seed of every finished qualifier hand)', () => {
+describe('FS1 — while the qualifier RUNS: the hash is served, the seed is held (seed:null, seedHeld:true); cash tables are byte-identical to before (2026-10-24, Sit & Go fix-all F17: a running Sit & Go is held too)', () => {
+  it('list + single route at a qualifier table: no seed anywhere in the answer; at a cash table: exactly {seed, hash, handNumber, revealedAt} with the seed (9c37499: the seed of every finished qualifier hand); a running Sit & Go: held like a qualifier', () => {
     const x = field(2);
     const qa = x.list('QA');
     expect(qa.status).toBe(200);
@@ -131,8 +131,8 @@ describe('FS1 — while the qualifier RUNS: the hash is served, the seed is held
     const seeds = x.m.revealedCommitmentsByTable.get('QA').map((r: any) => r.seed);
     expect(seeds.every((s: any) => typeof s === 'string' && s.length > 0)).toBe(true);
     for (const s of seeds) expect(JSON.stringify([qa.body, single.body])).not.toContain(s);
-    // Cash + Sit & Go: unchanged, key order included (byte-identical JSON).
-    for (const id of ['C1', 'SG']) {
+    // Cash: unchanged, key order included (byte-identical JSON).
+    for (const id of ['C1']) {
       const body = x.list(id).body;
       expect(body.commitments).toHaveLength(2);
       for (const c of body.commitments) {
@@ -142,8 +142,10 @@ describe('FS1 — while the qualifier RUNS: the hash is served, the seed is held
       const s = x.one(id, body.commitments[0].handNumber).body;
       expect(s).toEqual({ tableId: id, handNumber: body.commitments[0].handNumber, seed: body.commitments[0].seed, hash: body.commitments[0].hash, computedHash: body.commitments[0].hash, verified: true, revealedAt: body.commitments[0].revealedAt });
     }
+    // F17 (2026-10-24) — a RUNNING Sit & Go is held too (every running tournament).
+    for (const c of x.list('SG').body.commitments) expect(c).toMatchObject({ seed: null, seedHeld: true });
     expect(x.one('QA', 999).status).toBe(404);
-    expect(x.m.fairnessSeedHoldStats.heldEntriesServed).toBe(3);
+    expect(x.m.fairnessSeedHoldStats.heldEntriesServed).toBe(5);   // QA list 2 + QA single 1 + SG list 2
   });
 });
 
@@ -191,7 +193,9 @@ describe('FS4 — the stamp is persisted with the entry (Redis); a rehydrated en
     const of = (id: string) => x.appended.filter(([t]) => t === id).map(([, e]) => e);
     expect(of('QA')).toEqual([expect.objectContaining({ holdForTournamentId: x.qtid, seed: expect.any(String) })]);
     expect(of('QB')).toEqual([expect.objectContaining({ holdForTournamentId: x.qtid })]);
-    for (const id of ['C1', 'SG']) expect(of(id).map((e) => Object.keys(e))).toEqual([['seed', 'hash', 'handNumber', 'revealedAt']]);
+    expect(of('C1').map((e) => Object.keys(e))).toEqual([['seed', 'hash', 'handNumber', 'revealedAt']]);
+    // F17 (2026-10-24) — a running Sit & Go's hand is stamped too.
+    expect(of('SG')).toEqual([expect.objectContaining({ holdForTournamentId: x.sng })]);
     // The boot rehydrate (index.ts) puts Redis entries straight into the buffer.
     const seed = 'f'.repeat(64);
     x.m.revealedCommitmentsByTable.set('OLD', [{ seed, hash: sha(seed), handNumber: 7, revealedAt: 1, holdForTournamentId: 'a-previous-process-tournament' }]);
@@ -206,10 +210,11 @@ describe('FS5 — the pre-hand commitment frame says the seed will be held; the 
     const commits = (id: string) => x.room.filter(([r, ev]) => r === `table:${id}` && ev === 'deckCommitment').map(([, , d]) => d);
     expect(commits('QA')).toEqual([expect.objectContaining({ tableId: 'QA', hash: expect.any(String), seedHeld: true, committedAt: expect.any(Number) })]);
     expect(commits('QB')[0].seedHeld).toBe(true);
-    for (const id of ['C1', 'SG']) {
+    for (const id of ['C1']) {
       expect(commits(id)).toHaveLength(1);
       expect('seedHeld' in commits(id)[0]).toBe(false);
     }
+    expect(commits('SG')[0].seedHeld).toBe(true);   // F17 (2026-10-24) — a running Sit & Go too
     expect(x.room.filter(([, ev]) => ev === 'deckSeedRevealed')).toEqual([]);
     // After the end, a qualifier table (if it deals on) is no longer marked.
     x.finish(x.qtid);

@@ -1840,3 +1840,5 @@ voidedTournaments
 prize_ledger_pending
 loadPersistedPending
 refundPending
+# Sit & Go fix-all F17 - every running tournament's fairness seeds held until it ends; every hand kept 7 days.
+EVERY running tournament (Sit & Go, custom, club
