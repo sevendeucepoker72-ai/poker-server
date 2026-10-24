@@ -110,10 +110,20 @@ describe('contested showdowns still reveal the tabled hands (cards + hand name)'
     t.startNewHand();
     checkDown(t);
     expect(t.wentToShowdown).toBe(true);
+    // 2026-10-24 (Sit & Go fix-all F20) — a losing hand that did not have to be
+    // shown is MUCKED (no cards, no name, mucked: true); every winner is shown.
+    const winners = new Set(records[0].winners.map((w: any) => w.seatIndex));
+    expect(winners.size).toBeGreaterThan(0);
     for (const p of records[0].players) {
+      if ((p as any).mucked) {
+        expect(winners.has(p.seatIndex)).toBe(false);
+        expect([p.holeCards, p.handName]).toEqual([null, null]);
+        continue;
+      }
       expect(p.holeCards).toHaveLength(2);
       expect(typeof p.handName).toBe('string');
     }
+    expect(records[0].players.filter((p: any) => !p.mucked).length).toBeGreaterThan(0);
   });
 
   it('Omaha Hi-Lo', () => {
@@ -122,10 +132,20 @@ describe('contested showdowns still reveal the tabled hands (cards + hand name)'
     t.startNewHand();
     checkDown(t);
     expect(t.wentToShowdown).toBe(true);
+    // 2026-10-24 (Sit & Go fix-all F20) — a losing hand that did not have to be
+    // shown is MUCKED (no cards, no name, mucked: true); every winner is shown.
+    const winners = new Set(records[0].winners.map((w: any) => w.seatIndex));
+    expect(winners.size).toBeGreaterThan(0);
     for (const p of records[0].players) {
+      if ((p as any).mucked) {
+        expect(winners.has(p.seatIndex)).toBe(false);
+        expect([p.holeCards, p.handName]).toEqual([null, null]);
+        continue;
+      }
       expect(p.holeCards).toHaveLength(4);
       expect(typeof p.handName).toBe('string');
     }
+    expect(records[0].players.filter((p: any) => !p.mucked).length).toBeGreaterThan(0);
   });
 
   it('Stud Hi-Lo: the showdown hands are in the result and the engine marks the showdown', () => {

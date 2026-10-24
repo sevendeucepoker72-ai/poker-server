@@ -391,16 +391,19 @@ export class OmahaTable extends PokerTable {
           // CONTESTED showdown. This used to reveal every non-folded seat —
           // the uncontested winner's four hole cards went to the whole table
           // and into every player's stored hand history.
+          // F20 (2026-10-24) — nor a hand mucked at the showdown (auto-muck).
+          const muckedHere = !s.folded && this.wentToShowdown && this.showdownMuckedSeats().has(s.seatIndex);
           const shown = !s.folded && this.wentToShowdown && s.holeCards.length > 0;
+          const showCards = shown && !muckedHere;   // F20 — a mucked hand: no cards, no name
           let handRes: { handName: string } | null = null;
-          if (shown && s.holeCards.length >= 4 && this.communityCards.length >= 3) {
+          if (showCards && s.holeCards.length >= 4 && this.communityCards.length >= 3) {
             const hiLo = evaluateOmahaHiLo(s.holeCards, this.communityCards);
             handRes = { handName: hiLo.high.handName };
           }
           return {
             seatIndex: s.seatIndex,
             name: s.playerName,
-            holeCards: shown ? [...s.holeCards] : null,
+            holeCards: showCards ? [...s.holeCards] : null,
             startChips: this.startChips.get(s.seatIndex) || 0,
             endChips: s.chipCount,
             actions: this.actionLog
@@ -408,6 +411,7 @@ export class OmahaTable extends PokerTable {
               .map(a => a.action),
             folded: s.folded,
             handName: handRes?.handName || null,
+            ...(muckedHere ? { mucked: true } : {}),   // F20
           };
         }),
       winners: winnerInfos.map(w => ({

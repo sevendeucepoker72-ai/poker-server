@@ -191,6 +191,8 @@ export interface HandHistoryRecord {
     actions: string[];
     folded: boolean;
     handName: string | null;
+    /** 2026-10-24 (Sit & Go fix-all F20) — true: tabled at the showdown but mucked (auto-muck; holeCards null). */
+    mucked?: boolean;
   }[];
   winners: { seatIndex: number; name: string; chipsWon: number; handName: string }[];
   pots: { amount: number; winners: number[] }[];
@@ -373,6 +375,8 @@ export class PokerTable extends EventEmitter {
    * showed and their cards must stay hidden. 2026-07-05 audit fix.
    */
   public wentToShowdown: boolean = false;
+  /** F20 — showdownMuckedSeats() memo (one answer per finished hand). */
+  private _muckMemo: { handNumber: number; result: LastHandResult; mucked: Set<number> } | null = null;
 
   /**
    * 2026-10-11 (.online R1, ECON-1 / TABLEUI-1) — the all-in insurance
@@ -2802,6 +2806,55 @@ export class PokerTable extends EventEmitter {
   }
 
   /**
+   * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F20) — AUTO-MUCK.
+   * The seats that tabled at THIS hand's contested showdown but whose hand is
+   * mucked: never revealed to another player (getGameStateForPlayer) nor in
+   * the shared hand-history record (its own player keeps his cards). Empty
+   * unless the hand reached a contested showdown that is NOT an all-in (when
+   * any seat still in the hand is all-in, every hand is tabled - TDA 16).
+   * TDA show order: the last aggressor of the final street first, then
+   * clockwise from him; with no bet on the final street, the first seat left
+   * of the button. A later hand is shown only if it beats or ties the best
+   * hand shown so far (this table's comparator: lowball / Badugi included);
+   * every winner of any share of any pot (a hi-lo low half too) is shown.
+   * A hand the evaluator cannot rate is shown (as before). Memoized per hand;
+   * the seats keep their cards / flags until the next deal.
+   */
+  showdownMuckedSeats(): Set<number> {
+    const r = this.lastHandResult;
+    if (!r || r.handNumber !== this.handNumber || !this.wentToShowdown) return new Set();
+    if (this._muckMemo && this._muckMemo.handNumber === this.handNumber && this._muckMemo.result === r) return this._muckMemo.mucked;
+    const mucked = new Set<number>();
+    try {
+      const contenders = this.seats.filter((s) => s.state === 'occupied' && !s.eliminated && !s.folded && s.holeCards.length > 0);
+      if (contenders.length >= 2 && !contenders.some((s) => s.allIn)) {
+        const winners = new Set(r.winners.filter((w) => (w.chipsWon || 0) > 0).map((w) => w.seatIndex));
+        const tabled = r.showdownHands.map((h) => h.seatIndex).filter((i) => contenders.some((s) => s.seatIndex === i));
+        const aggr = this.lastAggressorSeat;
+        const from = tabled.includes(aggr) ? (aggr - 1 + MAX_SEATS) % MAX_SEATS : this.dealerButtonSeat;
+        const order = SidePotManager.orderClockwiseFromDealer(tabled, from, MAX_SEATS);
+        const cmp = this.getHandComparator();
+        let best: HandResult | null = null;
+        for (const seatIndex of order) {
+          const seat = this.seats[seatIndex];
+          let hr: HandResult | null = null;
+          try { hr = this.evaluatePlayerHand(seat.holeCards, this.communityCards); } catch { hr = null; }
+          if (!hr) continue;                                   // cannot rate it: shown, as before
+          if (best === null) { best = hr; continue; }          // the first to show always shows
+          const c = cmp(hr, best);
+          if (c > 0) best = hr;
+          if (c >= 0 || winners.has(seatIndex)) continue;      // beats / ties what is shown, or wins a share
+          mucked.add(seatIndex);
+        }
+      }
+    } catch {
+      mucked.clear();                                          // never break a hand's end over the muck rule
+    }
+    this._muckMemo = { handNumber: this.handNumber, result: r, mucked };
+    return mucked;
+  }
+
+  /**
    * 2026-06-11 audit G2/G3: the comparator used to RANK showdown hands when
    * awarding pots (passed into SidePotManager.awardPots). Contract matches
    * compareTo — returns POSITIVE when `a` is the better (winning) hand. The
@@ -3062,15 +3115,18 @@ export class PokerTable extends EventEmitter {
           // name was computed for every non-folded seat, so the replay of an
           // uncontested pot said "Two Pair, Kings and 7s" next to hidden cards
           // (888 of 8,463 stored records). Masked cards = no hand name.
+          // F20 (2026-10-24) — nor a hand mucked at the showdown (auto-muck).
+          const muckedHere = !s.folded && this.wentToShowdown && this.showdownMuckedSeats().has(s.seatIndex);
           const shown = !s.folded && this.wentToShowdown && s.holeCards.length > 0;
+          const showCards = shown && !muckedHere;   // F20 — a mucked hand: no cards, no name
           const allCards = [...s.holeCards, ...this.communityCards];
           // R7: `>= 4` for non-community games so 4-card Badugi evaluates.
-          const handRes = shown && (allCards.length >= 5 || (!this.usesCommunityCards() && s.holeCards.length >= 4))
+          const handRes = showCards && (allCards.length >= 5 || (!this.usesCommunityCards() && s.holeCards.length >= 4))
             ? this.evaluatePlayerHand(s.holeCards, this.communityCards) : null;
           return {
             seatIndex: s.seatIndex,
             name: s.playerName,
-            holeCards: shown ? [...s.holeCards] : null,
+            holeCards: showCards ? [...s.holeCards] : null,
             startChips: this.startChips.get(s.seatIndex) || 0,
             endChips: s.chipCount,
             actions: this.actionLog
@@ -3078,6 +3134,7 @@ export class PokerTable extends EventEmitter {
               .map(a => a.action),
             folded: s.folded,
             handName: handRes?.handName || null,
+            ...(muckedHere ? { mucked: true } : {}),   // F20
           };
         }),
       winners: winnerInfos.map(w => ({

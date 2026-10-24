@@ -6412,7 +6412,12 @@ function getGameStateForPlayer(
       table.currentPhase === GamePhase.Showdown ||
       table.currentPhase === GamePhase.HandComplete
     ) {
-      if (table.wentToShowdown && !seat.folded && seat.holeCards.length > 0) {
+      // 2026-10-24 (Sit & Go fix-all F20) — never a hand MUCKED at the showdown
+      // (auto-muck: a losing hand that did not have to be shown); the seat says
+      // `mucked: true` instead. Its own player keeps his cards (yourCards).
+      const muckedAtShowdown = table.wentToShowdown && !seat.folded && table.showdownMuckedSeats().has(seat.seatIndex);
+      if (muckedAtShowdown) seatData.mucked = true;
+      if (table.wentToShowdown && !seat.folded && seat.holeCards.length > 0 && !muckedAtShowdown) {
         seatData.holeCards = seat.holeCards.map((c) => ({
           suit: c.suit,
           rank: c.rank,
@@ -6552,7 +6557,8 @@ function getGameStateForPlayer(
         handName: w.handName,
         bestFiveCards: w.bestFiveCards.map(serializeCard),
       })),
-      showdownHands: table.lastHandResult.showdownHands.map((h) => ({
+      // F20 — a mucked hand is not in anyone's showdown list.
+      showdownHands: table.lastHandResult.showdownHands.filter((h) => !table.showdownMuckedSeats().has(h.seatIndex)).map((h) => ({
         seatIndex: h.seatIndex,
         playerName: h.playerName,
         handName: h.handName,
@@ -20203,7 +20209,9 @@ Give feedback in this JSON format:
     const uncontestedWinner = handOver && !seat.folded && !table.wentToShowdown
       && !!table.lastHandResult && table.lastHandResult.handNumber === table.handNumber
       && table.lastHandResult.winners.some((w) => w.seatIndex === session.seatIndex);
-    if (!seat.folded && !uncontestedWinner) return;
+    // F20 (2026-10-24) — a hand MUCKED at the showdown (auto-muck) may be shown too.
+    const muckedAtShowdown = handOver && !seat.folded && table.wentToShowdown && table.showdownMuckedSeats().has(session.seatIndex);
+    if (!seat.folded && !uncontestedWinner && !muckedAtShowdown) return;
     const key = `${session.tableId}:${table.handNumber}:${session.seatIndex}`;
     if (shownMuckedHands.has(key)) return;
     if (shownMuckedHands.size >= 10_000) shownMuckedHands.clear();
