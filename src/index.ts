@@ -8925,14 +8925,21 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
  * reloaded for free (~1.9M chips/hour minted fleet-wide), the winners kept
  * every chip (measured: one bot at 54x buy-in after 300 hands), and humans
  * cashed those unbounded stacks out. The reset burns what the reloads mint.
+ *
+ * 2026-10-24 (owner, after the Shark Tank hand audit: "No limit at all") — the
+ * cap is OFF: a ring-table bot keeps every chip it wins, so a player can win
+ * back what a bot took. A busted bot still reloads to one buy-in. Setting
+ * BOT_STACK_CAP_BUYINS to a whole number >= 1 in the env turns the old reset
+ * back on at that many buy-ins; unset, 0 or junk = no cap.
  */
-const BOT_STACK_CAP_BUYINS = 3;
+const BOT_STACK_CAP_BUYINS: number = ((n: number) => (Number.isInteger(n) && n >= 1 ? n : 0))(Number(process.env.BOT_STACK_CAP_BUYINS));
 const botStackStats = { reloads: 0, minted: 0, caps: 0, burned: 0, fixedRosterReloadsSkipped: 0 };
 
 /**
  * GAME-18 — the hand-boundary bot step (autoStartNextHand, never a tournament
- * table): a busted bot is reloaded to one buy-in, a bot above
- * BOT_STACK_CAP_BUYINS buy-ins is reset to one. A FIXED-ROSTER quick table
+ * table): a busted bot is reloaded to one buy-in; only when the env cap is on
+ * (BOT_STACK_CAP_BUYINS >= 1 — off by default since 2026-10-24) is a bot above
+ * that many buy-ins reset to one. A FIXED-ROSTER quick table
  * (heads-up, Spin & Go, career, all-in-or-fold, club challenge) is left
  * entirely alone: its bot busting is the game's end, never a free refill.
  */
@@ -8956,7 +8963,7 @@ function reloadAndCapBotStacks(
       out.minted += buyIn;
       // Addendum (R2): debug, not info — this fired for every bot bust, 24/7.
       log.debug(`[Reload] AI ${seat.playerName} busted → reloaded to ${buyIn}`);
-    } else if (seat.chipCount > BOT_STACK_CAP_BUYINS * buyIn) {
+    } else if (BOT_STACK_CAP_BUYINS > 0 && seat.chipCount > BOT_STACK_CAP_BUYINS * buyIn) {
       out.capped++;
       out.burned += seat.chipCount - buyIn;
       log.debug(`[Reload] AI ${seat.playerName} stack ${seat.chipCount} over ${BOT_STACK_CAP_BUYINS}x buy-in → reset to ${buyIn}`);

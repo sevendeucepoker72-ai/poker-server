@@ -10,7 +10,8 @@
  *           draw round completes, a hand left with one player is awarded
  *   GAME-17 bots are stripped only at the hand's end; the heartbeat revives a
  *           HandComplete table nothing will deal
- *   GAME-18 bot stacks capped at BOT_STACK_CAP_BUYINS buy-ins, reloads skipped
+ *   GAME-18 bot stacks uncapped by default (owner 2026-10-24); the
+ *           BOT_STACK_CAP_BUYINS env turns the reset back on; reloads skipped
  *           on fixed-roster quick tables
  *   APPUI-21 a second departure of the same account never strands the first
  *           reservation's seat
@@ -364,7 +365,7 @@ describe('GAME-17 — the heartbeat revives a HandComplete table nothing will de
     fnSrc('function trimExcessAI('),
     fnSrc('function fillWithAI('),
     fnSrc('function aiSeatsMutableNow('),
-    slice('const BOT_STACK_CAP_BUYINS = 3;', '  return isFixedRosterTable(tableId);\n}\n'),
+    slice('const BOT_STACK_CAP_BUYINS: number = ', '  return isFixedRosterTable(tableId);\n}\n'),
     fnSrc('function isFixedRosterTable('),   // the merged predicate (S1) isFixedRosterQuickTable delegates to
     fnSrc('function autoStartNextHand('),
   ].join('\n');
@@ -415,25 +416,52 @@ describe('GAME-17 — the heartbeat revives a HandComplete table nothing will de
   });
 });
 
-describe('GAME-18 — bot stacks are capped; fixed-roster quick tables never reload', () => {
+describe('GAME-18 — bot stacks uncapped by default (owner 2026-10-24), env cap optional; fixed-roster quick tables never reload', () => {
   const RELOAD = [
-    slice('const BOT_STACK_CAP_BUYINS = 3;', '  return isFixedRosterTable(tableId);\n}\n'),
+    slice('const BOT_STACK_CAP_BUYINS: number = ', '  return isFixedRosterTable(tableId);\n}\n'),
     fnSrc('function isFixedRosterTable('),   // the merged predicate (S1) isFixedRosterQuickTable delegates to
   ].join('\n');
-  function reloadWorld() {
+  function reloadWorld(env: Record<string, string> = {}) {
     const table = new PokerTable({ tableId: T, tableName: T, smallBlind: 50, bigBlind: 100, ante: 0, minBuyIn: 10000 } as any);
     const debug: string[] = [];
     const info: string[] = [];
     const scope = {
       MAX_SEATS, quickTables: new Set<string>(), careerTables: new Map(), spinGoMultipliers: new Map(), allInOrFoldTables: new Set(),
       challengeTables: new Map(), log: { debug: (m: string) => debug.push(m), info: (m: string) => info.push(m) }, console: { log: (m: string) => info.push(m) },
+      process: { env },
     };
     const { exports: m } = load(RELOAD, scope, '{ reloadAndCapBotStacks, isFixedRosterQuickTable, botStackStats, BOT_STACK_CAP_BUYINS }');
     return { table, m, scope, debug, info };
   }
 
-  it('a busted bot reloads to one buy-in; a bot above 3 buy-ins is reset to one; a human is never touched; logs at DEBUG', () => {
+  it('DEFAULT (owner 2026-10-24: no limit): a busted bot reloads to one buy-in; a bot at 54x keeps every chip; a human is never touched', () => {
     const w = reloadWorld();
+    expect(w.m.BOT_STACK_CAP_BUYINS).toBe(0);
+    w.table.sitDown(0, 'Busted', 10000, 'ai-0', true);
+    w.table.sitDown(1, 'Fat', 10000, 'ai-1', true);
+    w.table.sitDown(2, 'Fine', 10000, 'ai-2', true);
+    w.table.sitDown(3, 'Human', 10000, 'h', false);
+    w.table.seats[0].chipCount = 0;
+    w.table.seats[1].chipCount = 540_000;                         // 54x buy-in: kept
+    w.table.seats[2].chipCount = 30_000;
+    w.table.seats[3].chipCount = 90_000;                          // a human: never
+    const r = w.m.reloadAndCapBotStacks(w.table, T, false);
+    expect(r).toEqual({ reloaded: 1, minted: 10000, capped: 0, burned: 0 });
+    expect(w.table.seats.slice(0, 4).map((s) => s.chipCount)).toEqual([10000, 540_000, 30_000, 90_000]);
+    expect(w.m.botStackStats.caps).toBe(0);
+    expect(w.m.botStackStats.burned).toBe(0);
+    expect(w.debug.filter((l) => l.includes('over'))).toEqual([]);
+  });
+
+  it('the env switch: unset, 0, negative, fractional or junk = no cap; a whole number >= 1 turns the reset on', () => {
+    for (const v of ['', '0', '-3', '2.5', 'abc', 'Infinity']) expect(reloadWorld({ BOT_STACK_CAP_BUYINS: v }).m.BOT_STACK_CAP_BUYINS).toBe(0);
+    expect(reloadWorld({ BOT_STACK_CAP_BUYINS: '1' }).m.BOT_STACK_CAP_BUYINS).toBe(1);
+    expect(reloadWorld({ BOT_STACK_CAP_BUYINS: '3' }).m.BOT_STACK_CAP_BUYINS).toBe(3);
+    expect(reloadWorld({ BOT_STACK_CAP_BUYINS: '10' }).m.BOT_STACK_CAP_BUYINS).toBe(10);
+  });
+
+  it('ENV CAP ON (BOT_STACK_CAP_BUYINS=3): a busted bot reloads to one buy-in; a bot above 3 buy-ins is reset to one; a human is never touched; logs at DEBUG', () => {
+    const w = reloadWorld({ BOT_STACK_CAP_BUYINS: '3' });
     expect(w.m.BOT_STACK_CAP_BUYINS).toBe(3);
     w.table.sitDown(0, 'Busted', 10000, 'ai-0', true);
     w.table.sitDown(1, 'Fat', 10000, 'ai-1', true);

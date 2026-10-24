@@ -903,7 +903,11 @@ aiSeatTakeableNow(
 stripBotsAfterHandIfMarked(tableId);
 heartbeatRestarts.handComplete++;
 reloadAndCapBotStacks(table, tableId, isFixedRosterQuickTable(tableId));
-BOT_STACK_CAP_BUYINS = 3
+# 2026-10-24 (owner: "No limit at all") — the 3-buy-in bot reset is RETIRED:
+# ring-table bots keep every chip they win; busted bots still reload. The cap
+# is OFF unless the BOT_STACK_CAP_BUYINS env is a whole number >= 1.
+Number(process.env.BOT_STACK_CAP_BUYINS)
+BOT_STACK_CAP_BUYINS > 0 && seat.chipCount > BOT_STACK_CAP_BUYINS * buyIn
 dealtInSeats.has(session.seatIndex)
 SIT_OUT_HANDS_LIMIT = 30
 sit_out_limit

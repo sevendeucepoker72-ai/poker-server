@@ -55,7 +55,7 @@ const H = {
 const LEAVE = fnSrc('function handlePlayerLeave(');
 const AUTOSTART = fnSrc('function autoStartNextHand(');
 // R2 merge (S2, GAME-18): autoStartNextHand's bot step (reload + cap) asks the fixed-roster predicate.
-const BOT_STACKS = slice('const BOT_STACK_CAP_BUYINS = 3;', '  return isFixedRosterTable(tableId);\n}\n');
+const BOT_STACKS = slice('const BOT_STACK_CAP_BUYINS: number = ', '  return isFixedRosterTable(tableId);\n}\n');
 const IS_TOURNAMENT_RESERVATION = fnSrc('function isTournamentReservation(');
 // R2 (CLUBS-4): joinClubTable finds (or re-creates) the club table's runtime table.
 const CLUB_RUNTIME = slice('const clubTablesRecreating = new Map', '\n  return job;\n}\n');

@@ -175,7 +175,7 @@ describe('F50 — a client deal at a hand END runs the hand-boundary step; a joi
   const PRE_F50 = without(without(START_HAND, F50_ROUTE),
     '      // F50 — a bomb pot triggered while the table waited fires on this deal (E6).\n      activateBombPotIfPending(session.tableId, table);\n');
   const AUTOSTART = fnSrc('function autoStartNextHand(');
-  const BOT_STACKS = slice('const BOT_STACK_CAP_BUYINS = 3;', '  return isFixedRosterTable(tableId);\n}\n');
+  const BOT_STACKS = slice('const BOT_STACK_CAP_BUYINS: number = ', '  return isFixedRosterTable(tableId);\n}\n');
 
   function world(startHand = START_HAND) {
     const table = new PokerTable(cfg('t1'));
@@ -196,6 +196,9 @@ describe('F50 — a client deal at a hand END runs the hand-boundary step; a joi
       broadcastGameState() {}, scheduleAIAction() {}, io: { sockets: { sockets: new Map() } },
       tournamentManager: { getTournament: () => undefined }, clearHandSnapshot: async () => {},
       log: { debug() {}, info() {} }, console: quiet,
+      // The env cap is OFF by default (owner 2026-10-24); these tests switch it on
+      // because a bot reset is the visible proof that the hand-boundary step ran.
+      process: { env: { BOT_STACK_CAP_BUYINS: '3' } },
     };
     const code = `${BOT_STACKS}\n${AUTOSTART}\n${fnSrc('function scheduleAutoStart(')}\n${fnSrc('function dealAfterJoin(')}\n`
       + `function wire(socket) {\n${SEAT_SESSION_FOR_SRC}\n${startHand}\n}`;
@@ -214,13 +217,13 @@ describe('F50 — a client deal at a hand END runs the hand-boundary step; a joi
   }
   const stackOf = (t: PokerTable, i: number) => t.seats[i].chipCount + (t.seats[i].totalInvestedThisHand || 0);
 
-  it("Auto Deal's startHand at HandComplete: the bot above 3 buy-ins is reset to one, a pending bomb pot is honoured, the hand is dealt", async () => {
+  it("Auto Deal's startHand at HandComplete: the hand-boundary step runs (env cap on: the bot above 3 buy-ins is reset to one), a pending bomb pot is honoured, the hand is dealt", async () => {
     const w = world();
     toHandEnd(w);
     w.pendingAutoStartTimers.set('t1', setTimeout(() => {}, 3000));      // the action handler's 3s boundary timer
     await w.handlers.startHand({});
     expect(w.table.isHandInProgress()).toBe(true);
-    expect(stackOf(w.table, 1)).toBe(1000);                               // GAME-18 cap
+    expect(stackOf(w.table, 1)).toBe(1000);                               // GAME-18 cap (env on)
     expect(w.m.botStackStats.caps).toBe(1);
     expect(w.bombs).toEqual(['t1']);
     expect(w.pendingAutoStartTimers.has('t1')).toBe(false);               // its timer would only no-op now
@@ -245,7 +248,7 @@ describe('F50 — a client deal at a hand END runs the hand-boundary step; a joi
     expect(w.bombs).toEqual(['t1']);
   });
 
-  it('a JOIN during HandComplete deals nothing inline — the boundary timer deals (with the cap); from WaitingForPlayers it deals', () => {
+  it('a JOIN during HandComplete deals nothing inline — the boundary timer deals (with the env cap on); from WaitingForPlayers it deals', () => {
     const w = world();
     toHandEnd(w);
     expect(w.m.dealAfterJoin('t1', w.table)).toBe(false);
