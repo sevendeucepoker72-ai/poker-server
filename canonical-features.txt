@@ -1855,3 +1855,6 @@ SAVED FOR RETRY AT BOOT (do NOT grant by hand)
 ledgerSavedForRetry
 # Sit & Go fix-all F20 review fix-up - handResult.muckedSeats + the viewer's own mucked entry (the K9 display contract).
 muckedSeats: [...table.showdownMuckedSeats()]
+# Sit & Go fix-all F19 review fix-up - the table-room playerEliminated copy carries opaque ids, never user-<id> (non-qualifier).
+ROOM_ENTRANT_TOKEN_KEY
+roomEliminationPayload

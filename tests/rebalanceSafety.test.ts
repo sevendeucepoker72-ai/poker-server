@@ -53,7 +53,7 @@ import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC
 import fs from 'fs';
 import path from 'path';
 // 2026-10-23 (qualifier lifecycle S1) — startQualifierTournament's seat draw (crypto randomInt).
-import { randomInt, createHash, timingSafeEqual } from 'crypto';
+import { randomInt, createHash, createHmac, randomBytes, timingSafeEqual } from 'crypto';
 
 const P = {
   absentIds: slice('const ABSENT_SEAT_MASTER_ID_TTL_MS', '\n}\n'),
@@ -252,6 +252,9 @@ function world(opts: {
     tournamentTables, tournamentManager: tm, qualifierTournaments: new Map(),
     // 2026-10-24 (Sit & Go fix-all F14) — the durable result rows: a DB side effect, inert in this world.
     recordTournamentResultsBust() {}, recordTournamentResultsStart() {}, recordTournamentResultsFinish() {},
+    // 2026-10-24 (Sit & Go fix-all F19 review fix-up) — roomEliminationPayload (in the helpers block):
+    // no qualifier here, so a room copy's ids are opaque tokens (createHmac / randomBytes real).
+    qualifierOfTournament: () => null, qualifierEngineTournamentIds: new Set<string>(), createHmac, randomBytes,
     tableManager: { getTable: (id: string) => tables.get(id), removeTable: (id: string) => tables.delete(id) },
     DEFAULT_BLIND_LEVELS, GamePhase,
     reservedSeats, playerSessions, authSessions, multiTableSessions, spectators, aiProfiles: new Map(),
@@ -2294,14 +2297,16 @@ describe('V2 / P-e — a kept-absent seat that busts while its player sits at CA
   /** Every playerEliminated for b2 that reached S-b2: the direct ones, plus the room copies of rooms he is in that did not except him. */
   const noticesFor = (s: any, roomEmits: Array<{ room: string; ev: string; except: string[]; d: any }>) => [
     ...s.emitted.filter(([ev, d]: [string, any]) => ev === 'playerEliminated' && d.playerId === 'b2').map(() => 'direct'),
-    ...roomEmits.filter((e) => e.ev === 'playerEliminated' && e.d.playerId === 'b2' && s.rooms.has(e.room) && !e.except.includes('S-b2')).map(() => 'room'),
+    // F19 review fix-up — the room copy's playerId is an opaque token at a non-qualifier event: matched by name.
+    ...roomEmits.filter((e) => e.ev === 'playerEliminated' && e.d.playerName === 'b2' && !String(e.d.playerId).startsWith('b') && s.rooms.has(e.room) && !e.except.includes('S-b2')).map(() => 'room'),
   ];
 
   it('round 6 — ONE notice: watching his own table, the away entrant gets the direct notice (with tournamentId) and the room\'s copy skips him (.except) — one toast, not two', async () => {
     let roomEmits: Array<{ room: string; ev: string; except: string[]; d: any }> = [];
     const { s } = await bustInLobby({}, watchTB, (ref) => { const x = exceptIo(ref); roomEmits = x.roomEmits; return { ...persistenceScope(null), io: x.io }; });
     expect(noticesFor(s, roomEmits)).toEqual(['direct']);
-    const room = roomEmits.filter((e) => e.ev === 'playerEliminated' && e.d.playerId === 'b2');
+    const room = roomEmits.filter((e) => e.ev === 'playerEliminated' && e.d.playerName === 'b2');   // F19 review fix-up: by name (opaque id)
+    for (const e of room) expect(e.d.playerId).toMatch(/^e-[0-9a-f]{16}$/);
     expect(room.length).toBeGreaterThan(0);
     for (const e of room) expect(e.except).toEqual(['S-b2']);
   });
@@ -3534,7 +3539,7 @@ describe('Z2 — the FINAL bust tells the runner-up HIS place (2nd), never the w
       told: s1.emitted
         .filter(([ev]: [string]) => ['playerEliminated', 'eliminatedToSpectator', 'tournamentFinishedForEntrant'].includes(ev))
         .map(([ev, d]: [string, any]) => [ev, d.position]),
-      roomCopies: x.roomEmits.filter((e) => e.ev === 'playerEliminated' && e.d.playerId === 'b1' && s1.rooms.has(e.room) && !e.except.includes('S-b1')).map((e) => e.d.position),
+      roomCopies: x.roomEmits.filter((e) => e.ev === 'playerEliminated' && e.d.playerName === 'b1' && s1.rooms.has(e.room) && !e.except.includes('S-b1')).map((e) => e.d.position),   // F19 review fix-up: by name
     };
   }
 

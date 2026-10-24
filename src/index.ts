@@ -59,6 +59,8 @@ import { createWindowRateLimiter } from './auth/rateLimit';
 import { createTicketReplayGuard, initUsedPlayTicketsTable, ticketReplayStats } from './auth/ticketReplay';
 import { publicNameOf, PUBLIC_NAME_FALLBACK, isPublicDisplayName, LISTABLE_USER_SQL } from './social/publicIdentity';
 import { createHash, randomInt, timingSafeEqual } from 'crypto';
+// F19 review fix-up (2026-10-24) — the room elimination copy's opaque entrant tokens (roomEntrantToken).
+import { createHmac, randomBytes } from 'crypto';
 import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer, Tournament } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
@@ -25220,7 +25222,8 @@ function startTournamentGame(tournamentId: string): void {
       // Round 6 — the sockets told directly by the bust check are skipped (one notice each).
       const except = roomEliminationNoticeExcept(data?.playerId);
       const room = io.to(`table:${tableId}`);
-      (except.length > 0 ? room.except(except) : room).emit('playerEliminated', data);
+      // F19 review fix-up — no account ids in the room copy (non-qualifier).
+      (except.length > 0 ? room.except(except) : room).emit('playerEliminated', roomEliminationPayload(tournamentId, data));
     }
   });
 }
@@ -25912,9 +25915,10 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[], opt
       if (!handForHandNoticeDeferred(data?.playerId)) {
         // Round 6 — the sockets told directly by the bust check are skipped (one notice each).
         const except = roomEliminationNoticeExcept(data?.playerId);
+        const roomData = roomEliminationPayload(tournamentId, data);   // F19 review fix-up (non-qualifier)
         for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
           const room = io.to(`table:${tid}`);
-          (except.length > 0 ? room.except(except) : room).emit('playerEliminated', data);
+          (except.length > 0 ? room.except(except) : room).emit('playerEliminated', roomData);
         }
       }
       // Check table rebalancing after elimination
@@ -27038,6 +27042,40 @@ let eliminationDirectNotice: { playerId: string; sids: string[] } | null = null;
 function roomEliminationNoticeExcept(playerId: unknown): string[] {
   return eliminationDirectNotice && eliminationDirectNotice.playerId === playerId ? eliminationDirectNotice.sids : [];
 }
+
+// ===== F19 review fix-up: room elimination ids =====
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F19, review
+ * fix-up) — the TABLE-ROOM 'playerEliminated' copy (every socket in the room,
+ * spectators included) of a NON-qualifier tournament carries no local account
+ * id: its `playerId` / `eliminatorId` ('user-<users.id>' for an account
+ * entrant) become opaque tokens `e-` + HMAC-SHA256(boot key, tournamentId:id)
+ * (16 hex). The key is random per process, so a token never maps back to an
+ * account; the same entrant gets the same token in every room copy of the
+ * event (the client's dedupe key `playerId|position` still matches; it never
+ * compared the room copy's id with a seat - gameState seats carry no
+ * playerId). F19 stripped the ids from the finish frame, but each bust still
+ * sent them to the room. Qualifier rooms: byte-identical. The direct notices
+ * to the entrant's own sockets keep his own id; `.except(...)` still keys on
+ * the real id. Never throws.
+ */
+const ROOM_ENTRANT_TOKEN_KEY = randomBytes(16);
+function roomEntrantToken(tournamentId: string, id: string): string {
+  return `e-${createHmac('sha256', ROOM_ENTRANT_TOKEN_KEY).update(`${tournamentId}:${id}`).digest('hex').slice(0, 16)}`;
+}
+function roomEliminationPayload<T>(tournamentId: string, data: T): T {
+  try {
+    if (!data || typeof data !== 'object') return data;
+    if (qualifierOfTournament(tournamentId) || qualifierEngineTournamentIds.has(tournamentId)) return data;
+    const d: Record<string, unknown> = { ...(data as unknown as Record<string, unknown>) };
+    if (typeof d.playerId === 'string' && d.playerId) d.playerId = roomEntrantToken(tournamentId, d.playerId);
+    if (typeof d.eliminatorId === 'string' && d.eliminatorId) d.eliminatorId = roomEntrantToken(tournamentId, d.eliminatorId);
+    return d as unknown as T;
+  } catch {
+    return data;
+  }
+}
+// ===== end F19 review fix-up =====
 
 /**
  * S1 — the tournament bust check (moved out of handleHandComplete; same rules):
@@ -28638,7 +28676,7 @@ function emitHandForHandRoomBust(
   for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
     try {
       const room = io.to(`table:${tid}`);
-      (except.length > 0 ? room.except(except) : room).emit('playerEliminated', { ...payload, handForHand: true });
+      (except.length > 0 ? room.except(except) : room).emit('playerEliminated', { ...roomEliminationPayload(tournamentId, payload), handForHand: true });   // F19 review fix-up
     } catch (e) {
       handForHandFailed(tournamentId, 'room_notice', e, tid);
     }
