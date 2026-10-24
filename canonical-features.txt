@@ -1816,3 +1816,6 @@ prizeForEntrant
 payoutsProjected
 # Sit & Go fix-all F19 - the finish frame carries no other entrant's local account id (own row only).
 finishResultsFor
+# Sit & Go fix-all F13 - the tournament-starting alert goes by master id to every entrant (away ones too).
+notifyTournamentStart
+tournamentStartAlerts

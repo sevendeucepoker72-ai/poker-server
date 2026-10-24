@@ -24570,6 +24570,62 @@ function drawSeatOrder(n: number): number[] {
   return order;
 }
 
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F13) — the
+ * 'tournament starting' alert, by MASTER account id, to EVERY entrant (also a
+ * registrant away at the start). It used to go to the bound socket's LOCAL
+ * integer id (the master's notification service keys on the master id, so it
+ * reached nobody - see the your_turn note in armTurnTimer) and only to bound
+ * registrants; the > 9-entrant start sent none. Master id: the registration's
+ * masterUserId, the bound socket's session, a reservation snapshot, the
+ * absent-seat cache, else resolved from the row's stats stamp (loadLocalStats
+ * -> masterIdFromStats) and sent then. An account-less entrant: nothing.
+ * Fire-and-forget (Promise.allSettled), never throws. Qualifier / simulation
+ * starts do not call it.
+ */
+const tournamentStartAlerts = { sent: 0, resolvedFromRow: 0, noAccount: 0, failed: 0 };
+function notifyTournamentStart(tournamentId: string, seats: Array<{ playerId: string; tableId: string; seatIndex: number; tableNum: number }>): void {
+  try {
+    const t = tournamentManager.getTournament(tournamentId);
+    if (!t) return;
+    const name = t.config.name;
+    const sends: Promise<unknown>[] = [];
+    for (const s of seats) {
+      const tp = t.players.find((p) => p.playerId === s.playerId);
+      if (!tp) continue;
+      const send = (masterId: string | null | undefined): Promise<void> => {
+        if (!masterId) { tournamentStartAlerts.noAccount++; return Promise.resolve(); }
+        tournamentStartAlerts.sent++;
+        return notifyPlayer(masterId, 'tournament_start', 'Tournament starting', `${name} is starting now — you're seated at Table ${s.tableNum}`, {
+          priority: 'urgent',
+          metadata: { gameId: s.tableId, tournamentId, seatNumber: s.seatIndex, tableNum: s.tableNum },
+        });
+      };
+      let master: string | null | undefined = tp.masterUserId || undefined;
+      if (!master && tp.socketId) {
+        const a = authSessions.get(tp.socketId);
+        if (a && (tp.userId === undefined || a.userId === tp.userId) && a.masterUserId) master = String(a.masterUserId);
+      }
+      if (!master && tp.userId !== undefined) {
+        const r = reservedSeats.get(tp.userId);
+        if (r?.masterUserId) master = String(r.masterUserId);
+        else {
+          const hit = absentSeatMasterIds.get(tp.userId);
+          if (hit?.masterId) master = hit.masterId;
+        }
+      }
+      if (master) { sends.push(send(master)); continue; }
+      if (tp.userId === undefined) { tournamentStartAlerts.noAccount++; continue; }
+      sends.push(loadLocalStats(tp.userId)
+        .then((stats) => { tournamentStartAlerts.resolvedFromRow++; return send(masterIdFromStats(stats)); })
+        .catch(() => { tournamentStartAlerts.failed++; }));
+    }
+    if (sends.length > 0) void Promise.allSettled(sends);
+  } catch (err) {
+    console.warn('[notifyPlayer tournament_start] hook failed:', (err as Error)?.message);
+  }
+}
+
 function startRegisteredTournamentTables(tournamentId: string, startingChips: number, blinds: { sb: number; bb: number; ante: number }): void {
   const tournament = tournamentManager.getTournament(tournamentId);
   if (!tournament) return;
@@ -24585,6 +24641,7 @@ function startRegisteredTournamentTables(tournamentId: string, startingChips: nu
   tournamentManager.setTableIds(tournamentId, tableIds);
   // F6 (2026-10-24) — the round-robin follows a random draw (tournament.players keeps registration order).
   const drawn = drawSeatOrder(tournament.players.length);
+  const startSeats: Array<{ playerId: string; tableId: string; seatIndex: number; tableNum: number }> = [];   // F13
   drawn.forEach((pi, i) => {
     const tp = tournament.players[pi];
     const tid = tableIds[i % tableCount];
@@ -24592,6 +24649,7 @@ function startRegisteredTournamentTables(tournamentId: string, startingChips: nu
     const table = tableManager.getTable(tid);
     if (!table || !table.sitDown(seatIdx, tp.playerName, startingChips, tp.playerId, false)) return;
     tournamentManager.setPlayerTable(tournamentId, tp.playerId, tid);
+    startSeats.push({ playerId: tp.playerId, tableId: tid, seatIndex: seatIdx, tableNum: (i % tableCount) + 1 });
     const boundSid = bindRegistrantSocket(tournamentId, tp);
     if (!boundSid) return;
     if (keepStartSeatAbsentForLiveSeatElsewhere(tournamentId, tp, boundSid, tid, seatIdx, startingChips)) return;
@@ -24617,6 +24675,7 @@ function startRegisteredTournamentTables(tournamentId: string, startingChips: nu
     for (let s = 0; s < t.seats.length; s++) if (t.seats[s].state === 'occupied') occ.push(s);
     if (occ.length > 0) t.presetFirstButton(occ[randomInt(occ.length)]);
   }
+  notifyTournamentStart(tournamentId, startSeats);   // F13 — it sent no start alert at all
   bootstrapTournamentTables(tournamentId, tableIds);
   console.log(`[Tournament] ${JSON.stringify({ event: 'registered_tournament_multi_table_start', tournamentId, players: tournament.players.length, tableCount })}`);
 }
@@ -24688,38 +24747,9 @@ function startTournamentGame(tournamentId: string): void {
   }
 
   // === Push notification: tournament_start ===
-  // Fan out to every registered human player on this tournament. Uses
-  // Promise.allSettled so one bad subscription can't block the rest.
-  // dedupeKey on the API side (60s window) prevents same-key replay.
-  try {
-    const tName = tournament.config.name;
-    const notifyTargets: Promise<void>[] = [];
-    for (let i = 0; i < seatOrder.length; i++) {
-      const tp = tournament.players[seatOrder[i]];   // F6 — seat i holds the drawn player
-      // 2026-10-10 — tp.socketId is now the registrant's OWN bound socket or ''
-      // (bindRegistrantSocket), so this is never whoever took his old socket.
-      const auth = authSessions.get(tp.socketId);
-      const uid = auth?.userId;
-      if (!uid) continue; // skip unauthenticated / bots
-      notifyTargets.push(
-        notifyPlayer(
-          uid,
-          'tournament_start',
-          'Tournament starting',
-          `${tName} is starting now — you're seated at Table 1`,
-          {
-            priority: 'urgent',
-            metadata: { gameId: tableId, tournamentId, seatNumber: i, tableNum: 1 },
-          }
-        )
-      );
-    }
-    if (notifyTargets.length > 0) {
-      void Promise.allSettled(notifyTargets);
-    }
-  } catch (err) {
-    console.warn('[notifyPlayer tournament_start] hook failed:', (err as Error)?.message);
-  }
+  // 2026-10-24 (Sit & Go fix-all F13) — every entrant, by MASTER id, with his
+  // drawn seat (notifyTournamentStart): bound or away at the start.
+  notifyTournamentStart(tournamentId, seatOrder.map((pi, i) => ({ playerId: tournament.players[pi].playerId, tableId, seatIndex: i, tableNum: 1 })));
 
   // #9 (2026-07-01 audit): do NOT backfill AI here. AI seated by fillWithAI are
   // never added to tournament.players, so eliminatePlayer/finishTournament
