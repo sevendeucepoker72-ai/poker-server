@@ -6576,14 +6576,21 @@ function getGameStateForPlayer(
         handName: w.handName,
         bestFiveCards: w.bestFiveCards.map(serializeCard),
       })),
-      // F20 — a mucked hand is not in anyone's showdown list.
-      showdownHands: table.lastHandResult.showdownHands.filter((h) => !table.showdownMuckedSeats().has(h.seatIndex)).map((h) => ({
+      // F20 — a mucked hand is not in anyone's showdown list. Review fix-up
+      // (2026-10-24): except its OWN player's (his cards / name - he has them as
+      // yourCards): poker-3d K9 marks it 'Mucked - only you see your cards'.
+      showdownHands: table.lastHandResult.showdownHands.filter((h) => !table.showdownMuckedSeats().has(h.seatIndex) || h.seatIndex === playerSeatIndex).map((h) => ({
         seatIndex: h.seatIndex,
         playerName: h.playerName,
         handName: h.handName,
         bestFiveCards: h.bestFiveCards.map(serializeCard),
         holeCards: h.holeCards.map(serializeCard),
       })),
+      // F20 review fix-up (2026-10-24) — additive, every viewer: the seats whose
+      // hand was MUCKED at this showdown (ascending; [] when none). Who mucked is
+      // public (each such seat already says `mucked: true`); never their cards.
+      // poker-3d K9 lists them as 'Mucked' in the showdown panel.
+      muckedSeats: [...table.showdownMuckedSeats()].sort((a, b) => a - b),
       // Per-pot breakdown for UI: who won what from which pot
       potBreakdown: table.lastHandResult.pots.map((p: any) => ({
         name: p.name || 'Main Pot',
