@@ -1743,3 +1743,4 @@ cash_out_progress_push
 insurance_clawback_refund_2026_10_24
 # 2026-10-24 (owner: "Make the sit and gos not start until full") - Sit & Go 9, Turbo 6
 minPlayers: 9,
+minPlayers: 6,

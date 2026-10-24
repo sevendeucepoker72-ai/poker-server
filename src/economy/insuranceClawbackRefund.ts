@@ -16,7 +16,7 @@
  * rolls everything back and the next boot retries. An account that no longer
  * exists is skipped and recorded, never fatal.
  */
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 
 export const INSURANCE_REFUND_OP_ID = 'insurance_clawback_refund_2026_10_24';
 export const INSURANCE_REFUND_ID = 'online-insurance-clawback-refund-2026-10-24';
@@ -51,8 +51,9 @@ export type InsuranceRefundOutcome = {
 export type InsuranceRefundCredited = (userId: number, chips: number, hands: number) => void;
 
 export async function runInsuranceClawbackRefund(pool: Pool, onCredited: InsuranceRefundCredited): Promise<InsuranceRefundOutcome> {
-  const client = await pool.connect();
+  let client: PoolClient | null = null;
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
     const claim = await client.query(
       `INSERT INTO one_time_ops (op_id, detail) VALUES ($1, '{"status":"running"}'::jsonb)
@@ -80,11 +81,11 @@ export async function runInsuranceClawbackRefund(pool: Pool, onCredited: Insuran
     console.log(`[insurance-refund] refunded ${chips.toLocaleString('en-US')} chips to ${credited.length} account(s)${missing.length ? `; missing ${missing.join(',')}` : ''} (${INSURANCE_REFUND_ID})`);
     return { status: 'done', recipients: credited.length, chips, missing };
   } catch (e: any) {
-    try { await client.query('ROLLBACK'); } catch { /* ignore */ }
+    if (client) { try { await client.query('ROLLBACK'); } catch { /* ignore */ } }
     const error = String(e?.message || e).slice(0, 300);
     console.error('[insurance-refund] FAILED (nothing credited; retried next boot):', error);
     return { status: 'error', recipients: 0, chips: 0, missing: [], error };
   } finally {
-    client.release();
+    client?.release();
   }
 }

@@ -28363,8 +28363,9 @@ initDB().then(async () => {
   // 2026-10-24 (owner) — one-time refund of the all-in insurance clawbacks
   // (economy/insuranceClawbackRefund.ts): additive credits, exactly once (one
   // transaction with its one_time_ops claim), so it is safe beside the previous
-  // container. Each credit: durable BUG_REFUND audit (+ the large-credit alert)
-  // and a fresh wallet push to any live socket of the account.
+  // container. Each credit: durable BUG_REFUND audit (auditEconomyCredit; its
+  // large-credit alert only at / above CHIP_GRANT_ALERT_THRESHOLD) and a fresh
+  // wallet push to any live socket of the account.
   setTimeout(() => {
     void runInsuranceClawbackRefund(getPool(), (userId, chips, hands) => {
       auditEconomyCredit(userId, 'BUG_REFUND', chips, 0, { refundId: INSURANCE_REFUND_ID, hands, reason: 'insurance_clawback' });

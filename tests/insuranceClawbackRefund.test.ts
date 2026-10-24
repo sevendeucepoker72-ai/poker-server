@@ -92,7 +92,14 @@ describe('insurance clawback refund (one-time, exactly once)', () => {
     expect(out).toMatchObject({ status: 'done', recipients: 11, chips: 371_861 - INSURANCE_REFUNDS[11].chips, missing: [gone] });
   });
 
-  test('wiring: boot runs it with the durable BUG_REFUND audit (+ large-credit alert) and a fresh wallet push', () => {
+  test('an unreachable database at boot is an error outcome, never an unhandled rejection; nothing is told', async () => {
+    const told: number[] = [];
+    const out = await runInsuranceClawbackRefund({ connect: async () => { throw new Error('ECONNREFUSED'); } } as any, (uid) => told.push(uid));
+    expect(out).toMatchObject({ status: 'error', recipients: 0, chips: 0 });
+    expect(told).toEqual([]);
+  });
+
+  test('wiring: boot runs it with the durable BUG_REFUND audit (auditEconomyCredit) and a fresh wallet push', () => {
     expect(SRC).toContain("auditEconomyCredit(userId, 'BUG_REFUND', chips, 0, { refundId: INSURANCE_REFUND_ID, hands, reason: 'insurance_clawback' });");
     expect(SRC).toContain('void runInsuranceClawbackRefund(getPool(), (userId, chips, hands) => {');
   });
