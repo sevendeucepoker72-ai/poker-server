@@ -3158,6 +3158,7 @@ describe('2026-10-24 (owner 2026-10-23: "Fix both") — late entry and re-entry 
     const item = x.w.m.qualifierList(null)[0];
     expect(item).toMatchObject({
       lateRegOpen: false, lateRegClosedReason: 'seat_bubble', lateRegClosedAt: updates[0].lateRegClosedAt, signupOpen: false, lateRegClosesAtBubble: true,
+      seedsHeldUntilEnd: true,   // 2026-10-24 (B) — the running qualifier's fairness seeds are held until it ends
       lateRegUntil: lateRegUntilOf(x.qt), signupClosesAt: lateRegUntilOf(x.qt),
     });
     // Places stay a permutation of 1..N (15 entries: 14 + Alice) once it is played out.

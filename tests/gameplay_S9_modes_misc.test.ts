@@ -464,6 +464,8 @@ describe('F162 — deck commitment names its table; the seed reveal waits on the
     const commit = room.find(([, ev]) => ev === 'deckCommitment')!;
     expect(commit[0]).toBe('table:f1');
     expect(commit[2]).toMatchObject({ handNumber: t.handNumber, tableId: 'f1', hash: expect.any(String) });   // pre-F162: no tableId
+    // 2026-10-24 — a table that is not a running qualifier's carries no seedHeld key (seedHeldFieldsFor answers nothing here).
+    expect('seedHeld' in commit[2]).toBe(false);
     while (t.isHandInProgress()) t.playerFold(t.activeSeatIndex);
     expect(recorded).toHaveLength(1);
     expect(recorded[0][1]).toMatchObject({ handNumber: commit[2].handNumber, hash: commit[2].hash, seed: expect.any(String) });

@@ -3164,6 +3164,9 @@ app.get('/api/health', async (_req, res) => {
           // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry / re-entry closed at the
           // seat bubble: closed = events closed there; resolverErrors / noticeErrors should stay 0.
           lateRegBubble: { ...tournamentManager.lateEntryBubbleStats, ...qualifierLateRegBubble },
+          // 2026-10-24 (owner 2026-10-23: "Fix both") — a running qualifier's fairness seeds held
+          // until it ends: heldEntriesServed = /api/fairness entries answered without the seed.
+          fairnessHold: { ...fairnessSeedHoldStats },
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
@@ -3182,7 +3185,9 @@ app.get('/api/health', async (_req, res) => {
 
 app.get('/api/fairness/:tableId', (req, res) => {
   const buf = revealedCommitmentsByTable.get(req.params.tableId) || [];
-  res.json({ tableId: req.params.tableId, commitments: buf });
+  // 2026-10-24 (owner 2026-10-23: "Fix both") — a running qualifier's seeds are held
+  // (seed:null, seedHeld:true) until it ends; every other entry is served as before.
+  res.json({ tableId: req.params.tableId, commitments: buf.map(publicFairnessEntry) });
 });
 
 app.get('/api/fairness/:tableId/:handNumber', (req, res) => {
@@ -3190,6 +3195,12 @@ app.get('/api/fairness/:tableId/:handNumber', (req, res) => {
   const buf = revealedCommitmentsByTable.get(req.params.tableId) || [];
   const rc = buf.find((r) => r.handNumber === handNumber);
   if (!rc) { res.status(404).json({ error: 'no revealed commitment for that hand' }); return; }
+  // 2026-10-24 — held while its qualifier runs: the commitment only (verifiable after it ends).
+  if (fairnessSeedIsHeld(rc)) {
+    fairnessSeedHoldStats.heldEntriesServed++;
+    res.json({ tableId: req.params.tableId, handNumber: rc.handNumber, hash: rc.hash, revealedAt: rc.revealedAt, seed: null, seedHeld: true });
+    return;
+  }
   const computed = require('crypto').createHash('sha256').update(rc.seed).digest('hex');
   res.json({
     tableId: req.params.tableId,
@@ -3808,6 +3819,9 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     // lateRegOpen / lateRegClosedAt / lateRegClosedReason: the live state (the card stops
     // offering Late Register / Re-enter).
     lateRegClosesAtBubble: true,
+    // 2026-10-24 (owner 2026-10-23: "Fix both") — additive capability flag: this server keeps a
+    // running qualifier's fairness seeds private until it ends (poker-3d's rules page reads it).
+    seedsHeldUntilEnd: true,
     lateRegOpen,
     lateRegClosedAt,
     lateRegClosedReason,
@@ -7198,11 +7212,21 @@ interface RevealedCommitment {
   seed: string;
   hash: string;
   revealedAt: number;
+  /**
+   * 2026-10-24 (owner 2026-10-23: "Fix both") — the RUNNING qualifier tournament
+   * this hand was played in: its seed is served only once that tournament is no
+   * longer running (fairnessSeedIsHeld). Stamped at record time, persisted to
+   * Redis with the entry, never served.
+   */
+  holdForTournamentId?: string;
 }
 const revealedCommitmentsByTable = new Map<string, RevealedCommitment[]>();
 const FAIRNESS_BUFFER_SIZE = 50;
 
 function recordRevealedCommitment(tableId: string, rc: RevealedCommitment) {
+  // 2026-10-24 — a running qualifier's hand: stamped, so its seed is held until it ends.
+  const holdFor = fairnessSeedHoldOf(tableId);
+  if (holdFor) rc = { ...rc, holdForTournamentId: holdFor };
   let buf = revealedCommitmentsByTable.get(tableId);
   if (!buf) { buf = []; revealedCommitmentsByTable.set(tableId, buf); }
   buf.unshift(rc);
@@ -7216,6 +7240,50 @@ function recordRevealedCommitment(tableId: string, rc: RevealedCommitment) {
     console.warn(`[Fairness] persist failed for table=${tableId} hand=${rc.handNumber}:`, (err as Error)?.message);
   });
 }
+
+// ===== Fairness seed hold (2026-10-24, owner 2026-10-23: "Fix both") =====
+// GET /api/fairness/* is unauthenticated and the seed alone rebuilds the whole
+// deck (CardDeck.ts; the repo is public): served during a seat event, it showed
+// every opponent's folded / mucked cards to anyone with a table id. For a table
+// of a qualifier tournament that is still RUNNING the commitment (hash) is served
+// but not the seed (`seed: null, seedHeld: true`); once that tournament is no
+// longer running (finished, cancelled, pruned, or unknown after a restart — a
+// restart cancels a running qualifier) every seed of the event is served and
+// verifies. Checked when SERVING (the stamp names the tournament), so a table
+// broken mid-event stays held. Non-qualifier tables are byte-identical. The
+// per-hand 'deckSeedRevealed' still reaches no client (F162).
+/** health r2Play.qualifiers.fairnessHold: heldEntriesServed = entries answered with the seed held. */
+const fairnessSeedHoldStats = { heldEntriesServed: 0 };
+/** The running QUALIFIER tournament a hand at this table belongs to (live or just-broken table), else null. Never throws. */
+function fairnessSeedHoldOf(tableId: string): string | null {
+  try {
+    const tid = tournamentIdOfTable(tableId);
+    if (!tid || !qualifierOfTournament(tid)) return null;
+    return tournamentManager.getTournament(tid)?.status === 'running' ? tid : null;
+  } catch {
+    return null;
+  }
+}
+/** Is this recorded hand's seed withheld right now (its qualifier still running)? */
+function fairnessSeedIsHeld(rc: { holdForTournamentId?: string }): boolean {
+  const tid = rc && rc.holdForTournamentId;
+  return !!tid && tournamentManager.getTournament(tid)?.status === 'running';
+}
+/** One buffer entry as /api/fairness/:tableId serves it: held → no seed; else the entry as before (the stamp stripped). */
+function publicFairnessEntry(rc: RevealedCommitment): Record<string, unknown> {
+  if (fairnessSeedIsHeld(rc)) {
+    fairnessSeedHoldStats.heldEntriesServed++;
+    return { handNumber: rc.handNumber, hash: rc.hash, revealedAt: rc.revealedAt, seed: null, seedHeld: true };
+  }
+  if (rc.holdForTournamentId === undefined) return rc as unknown as Record<string, unknown>;
+  const { holdForTournamentId: _released, ...entry } = rc;
+  return entry as unknown as Record<string, unknown>;
+}
+/** The pre-hand 'deckCommitment' frame's extra field: `{seedHeld: true}` at a running qualifier's table, else nothing. */
+function seedHeldFieldsFor(tableId: string): { seedHeld?: true } {
+  return fairnessSeedHoldOf(tableId) ? { seedHeld: true } : {};
+}
+// ===== end fairness seed hold =====
 
 // Build the authoritative prediction-market facts from the final hand state,
 // resolve all open bets/picks for the hand, and push results to each affected
@@ -7639,7 +7707,8 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   // F162 (2026-10-21) — + `tableId` (additive): a multi-table client files the
   // commitment under the table it belongs to, not whichever table it shows.
   table.on('deckCommitment', (c: { hash: string; handNumber: number }) => {
-    io.to(`table:${tableId}`).emit('deckCommitment', { ...c, committedAt: Date.now(), tableId });
+    // 2026-10-24 — + `seedHeld: true` (additive) at a running qualifier's table: its seed is served after the qualifier ends.
+    io.to(`table:${tableId}`).emit('deckCommitment', { ...c, ...seedHeldFieldsFor(tableId), committedAt: Date.now(), tableId });
   });
 
   // Emit hand history to all human players at the table (Part 3)

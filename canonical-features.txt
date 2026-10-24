@@ -1754,3 +1754,8 @@ qualifier_late_reg_closed_at_bubble
 QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE
 lateRegClosesAtBubble
 late_reg_closed
+# 2026-10-24 (owner 2026-10-23: "Fix both") - a RUNNING qualifier's fairness seeds are held
+# until it ends: /api/fairness serves the hash with seed:null + seedHeld:true (deckCommitment
+# carries seedHeld:true); every seed verifies once the qualifier ends. Lobby flag seedsHeldUntilEnd.
+seedsHeldUntilEnd
+seedHeld

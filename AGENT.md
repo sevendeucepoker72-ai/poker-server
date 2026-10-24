@@ -70,7 +70,7 @@ Railway (not in this repo).
 | 3 | **Chip mutations server-authoritative.** Only paths: `addChipsToUser` (additive SQL `chips = chips + $1`), `deductChips` (atomic), pot distribution at hand-complete, admin grants (audited). NEVER accept `chips` from a client socket payload. | 2026-04-22 (saveProgress mint vector) |
 | 4 | **Player action nonces are deduped** (`actionNonces` Map, keyed `tableId:seat`) at `src/index.ts:~5700-5708`. Replay of same nonce returns "Duplicate action" error — clients treat as success (idempotent retry). | Convention |
 | 5 | **Pino logger via `LOG_LEVEL` env** (default `info` in prod, `debug` in dev). | Convention |
-| 6 | **Provably-fair deck commitments emit BEFORE hand starts**, seed reveal emits AFTER hand ends. Buffer 50 commitments per table in `ensureTableProgressListener`. REST `/api/fairness/*` reads from buffer + computes verification. | 2026-04-22 |
+| 6 | **Provably-fair deck commitments emit BEFORE hand starts**, seed reveal emits AFTER hand ends. Buffer 50 commitments per table in `ensureTableProgressListener`. REST `/api/fairness/*` reads from buffer + computes verification. **2026-10-24 (owner "Fix both"): a RUNNING qualifier's seeds are WITHHELD** — its entries are stamped `holdForTournamentId` and served `seed: null, seedHeld: true` (single route: no computedHash / verified) until that tournament is no longer running; then every seed is served and verifies. A NEW place that serves or emits a seed must go through `publicFairnessEntry` / `fairnessSeedIsHeld` (the seed rebuilds every folded hand; the repo is public). The per-hand `deckSeedRevealed` still reaches no client (F162). | 2026-04-22; 2026-10-24 |
 | 7 | **Admin socket handlers MUST `await isUserAdmin(auth.userId)`** before mutating state. Client-side route hiding is UX, not security. | 2026-04-22 |
 | 8 | **`package.json` + `package-lock.json` commit together.** Mismatched lockfile breaks Railway's `npm ci`. Pre-push: `npm ci --dry-run`. | 2026-04-22 |
 | 9 | **Regression-guard tests in `tests/PokerTable.test.ts`** — every state-machine fix gets a test that reproduces the bad state and asserts the fix. Wired into CI. | Convention |
@@ -101,7 +101,7 @@ Railway (not in this repo).
 
 ### REST routes (see CONTRACTS.md)
 
-- `GET /api/fairness/:tableId` — last 50 deck commitments
+- `GET /api/fairness/:tableId` — last 50 deck commitments (2026-10-24: a running qualifier's entries without the seed: `seed: null, seedHeld: true`)
 - `GET /api/fairness/:tableId/:handNumber` — verification record
 
 ### Socket.io events
@@ -1471,6 +1471,55 @@ How:
   10) and `{"on":0}` cover a slow bubble. A package changed mid-event: an earlier
   crossing stays closed; a bubble raised above the current alive count does not
   close retroactively.
+
+**(B) A running qualifier's fairness seeds are held until it ends.** The finding:
+`GET /api/fairness/:tableId` and `/:tableId/:handNumber` are unauthenticated and
+served each finished hand's seed; the seed rebuilds the whole deck (CardDeck.ts,
+public repo), so anyone with a table id saw every opponent's folded / mucked
+cards during a seat event. Every place a seed leaves the server (verified at
+9c37499): (1) the list route — LEAK, fixed; (2) the single route — LEAK, fixed;
+(3) the socket `'deckSeedRevealed'` — sent to NO client (PokerTable emits it only
+to the server listener that records it; F162, still off); (4) Redis
+`poker:fairness:<tableId>` — private, restored into the buffer at boot; (5) the
+Redis hand snapshot — private, never served. Not carried by gameState, hand
+history (no seed field), spectator frames, tournamentFinished, logs or audit.
+
+- `recordRevealedCommitment` stamps `holdForTournamentId` (persisted to Redis
+  with the entry) when the table belongs to a qualifier tournament whose
+  TournamentManager status is `'running'` (`fairnessSeedHoldOf`: live or
+  just-broken table).
+- `fairnessSeedIsHeld(rc)` = stamped AND that tournament is still `'running'` —
+  checked when SERVING, so finished / cancelled / pruned / unknown after a restart
+  (a restart already cancels the event) releases automatically and every seed then
+  verifies, and a table broken mid-event stays held by its stamp.
+- `publicFairnessEntry`: held → `{handNumber, hash, revealedAt, seed: null,
+  seedHeld: true}`; otherwise the entry exactly as before (the stamp stripped;
+  non-qualifier tables byte-identical, key order included). The single route, when
+  held: 200 `{tableId, handNumber, hash, revealedAt, seed: null, seedHeld: true}`
+  (no computedHash / verified). The pre-hand `deckCommitment` frame gains
+  `seedHeld: true` (additive) at a running qualifier's table
+  (`seedHeldFieldsFor`, spread before `committedAt` — the F162 test slice needle
+  is unchanged). Lobby item `seedsHeldUntilEnd: true` (capability flag the rules
+  page reads).
+- **What is true about "the last 50 hands of each table for 7 days"** (rules
+  page): the in-process buffer is never deleted from (no `.delete`;
+  `retireFinishedTournamentTable` does not touch it) — it lasts the process. Redis
+  does LPUSH + LTRIM 50 + EXPIRE 7 days re-armed on every append
+  (`redisStore.ts`), so each key lasts 7 days after that table's LAST hand, and
+  the boot rehydrate restores every key still alive. So it is TRUE while
+  `REDIS_URL` is set (live: Redis-8Erh) and Redis keeps its keys. Caveats: only the
+  LAST 50 hands per table are kept (a 4-5 hour table plays more — its early hands'
+  seeds are gone); a restart while Redis is down loses the buffer; Redis's
+  eviction policy was not verifiable without prod access. No change was needed.
+- If an event never left `'running'` its seeds would stay held until a restart
+  (then released: unknown id). Pre-existing: the in-memory buffer grows with every
+  table id over a process life (memory only).
+- **Health:** `r2Play.qualifiers.fairnessHold` = {heldEntriesServed}.
+- **Tests:** `tests/fairnessSeedHold.test.ts` FS1-FS6 (real routes, listener,
+  TournamentManager, PokerTable); `tests/r2Qualifiers.test.ts` LB7 (lobby flag);
+  `tests/gameplay_S9_modes_misc.test.ts` F162 (no seedHeld key off a qualifier);
+  `tests/r3EconomyFixes.test.ts` (seedHeldFieldsFor is an expected inert stub in
+  its cash hand world). **Manifest:** `seedsHeldUntilEnd`, `seedHeld`.
 
 ### Recovering a qualifier's finish order (the results POST never landed)
 

@@ -197,6 +197,12 @@ export interface RevealedFairnessEntry {
   seed: string;
   hash: string;
   revealedAt: number;
+  /**
+   * 2026-10-24 (owner 2026-10-23: "Fix both") — the qualifier tournament that was
+   * RUNNING when the hand was played: index.ts serves the seed only once that
+   * tournament is no longer running (after a restart it is unknown → served).
+   */
+  holdForTournamentId?: string;
 }
 
 let fairnessRedisWarned = false;
