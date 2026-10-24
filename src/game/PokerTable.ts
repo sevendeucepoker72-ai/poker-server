@@ -273,6 +273,15 @@ export class PokerTable extends EventEmitter {
    * 0 = no hand dealt yet (an older snapshot, a fresh table).
    */
   public handBigBlind: number = 0;
+  /**
+   * 2026-10-24 (Sit & Go fix-all F18) — the rest of the level THIS hand was
+   * dealt at (small blind, ante), captured with handBigBlind. Every full state
+   * carries the three (index.ts getGameStateForPlayer handSmallBlind /
+   * handBigBlind / handAnte) so the HUD shows the level being played, not the
+   * one a mid-hand level-up just set. 0 = no hand dealt yet / an older snapshot.
+   */
+  public handSmallBlind: number = 0;
+  public handAnte: number = 0;
 
   /** TDA Rule 33 (Dead Button): track previous BB position so blinds advance
    * by exactly one occupied seat per hand even when players bust. */
@@ -886,6 +895,8 @@ export class PokerTable extends EventEmitter {
     this.currentBetToMatch = 0;
     this.lastRaiseAmount = this.config.bigBlind;
     this.handBigBlind = this.config.bigBlind;   // Z3: this hand's level (a mid-hand level-up changes config only)
+    this.handSmallBlind = this.config.smallBlind;   // F18 (2026-10-24): the whole level of the hand
+    this.handAnte = this.config.ante || 0;
     this.lastAggressorSeat = -1;
     this.actionLog = [];
     this._debtSettledByLiveBB.clear();   // F5 fix-up — this hand's record only
@@ -3285,6 +3296,8 @@ export class PokerTable extends EventEmitter {
       currentBetToMatch: this.currentBetToMatch,
       lastRaiseAmount: this.lastRaiseAmount,
       handBigBlind: this.handBigBlind,
+      handSmallBlind: this.handSmallBlind,   // F18
+      handAnte: this.handAnte,               // F18
       stateVersion: this.stateVersion,
       lastAggressorSeat: this.lastAggressorSeat,
       previousBigBlindSeat: this.previousBigBlindSeat,
@@ -3337,6 +3350,9 @@ export class PokerTable extends EventEmitter {
     this.lastRaiseAmount = snap.lastRaiseAmount;
     // Z3 — older snapshots lack it: 0 (absentTournamentSeatMayLimp then reads config.bigBlind).
     this.handBigBlind = typeof snap.handBigBlind === 'number' ? snap.handBigBlind : 0;
+    // F18 — older snapshots lack them: 0 (the state then shows the table level).
+    this.handSmallBlind = typeof snap.handSmallBlind === 'number' ? snap.handSmallBlind : 0;
+    this.handAnte = typeof snap.handAnte === 'number' ? snap.handAnte : 0;
     // Restore the decision-point version if the snapshot carries it (older
     // snapshots won't — a rehydrate resetting it lower is safe; see field doc).
     // rehydrate itself will re-emit phaseChanged/turnChanged during resume,
@@ -3385,6 +3401,9 @@ export interface PokerTableSnapshot {
   lastRaiseAmount: number;
   /** Z3 — the big blind the hand was dealt at (optional: older snapshots). */
   handBigBlind?: number;
+  /** F18 (2026-10-24) — the small blind / ante the hand was dealt at (optional: older snapshots). */
+  handSmallBlind?: number;
+  handAnte?: number;
   /** Decision-point version — optional for backward-compat with older snapshots. */
   stateVersion?: number;
   lastAggressorSeat: number;

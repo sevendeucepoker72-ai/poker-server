@@ -1780,3 +1780,6 @@ profileStatsWithheld
 SIT_AND_GO_TURBO_LEVELS
 SIT_AND_GO_STARTING_CHIPS
 levelSeconds
+# Sit & Go fix-all F18 - every full state carries the level the HAND is played at (handSmallBlind / handBigBlind / handAnte).
+handSmallBlind
+handLevelOnTable

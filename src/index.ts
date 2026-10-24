@@ -6587,6 +6587,17 @@ function getGameStateForPlayer(
   if (table.config.ante && table.config.ante > 0) {
     stateObj.ante = table.config.ante;
   }
+  // 2026-10-24 (Sit & Go fix-all F18) — the level of the HAND on the table,
+  // ALWAYS present (additive): a tournament level-up rewrites config (the
+  // smallBlind / bigBlind / ante keys above = the CURRENT level, what the next
+  // hand is dealt at) while the hand in play keeps the level it was dealt at.
+  // The HUD's Blinds / Ante line, big-blind stack counts and 3x BB / sizing
+  // buttons read these during a hand; with no hand dealt yet they equal the
+  // table level.
+  const handLevelOnTable = table.handBigBlind > 0 && table.handNumber > 0 && table.currentPhase !== GamePhase.WaitingForPlayers;
+  stateObj.handSmallBlind = handLevelOnTable && table.handSmallBlind > 0 ? table.handSmallBlind : table.config.smallBlind;
+  stateObj.handBigBlind = handLevelOnTable ? table.handBigBlind : table.config.bigBlind;
+  stateObj.handAnte = handLevelOnTable ? table.handAnte : (table.config.ante || 0);
 
   // 2026-10-10 (S2 fixed protocol, P-d) — a TOURNAMENT table says so in every
   // full state: `isTournament: true` + its `tournamentId` (a live tournament
