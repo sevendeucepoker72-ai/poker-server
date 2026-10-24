@@ -1842,3 +1842,6 @@ loadPersistedPending
 refundPending
 # Sit & Go fix-all F17 - every running tournament's fairness seeds held until it ends; every hand kept 7 days.
 EVERY running tournament (Sit & Go, custom, club
+# Sit & Go fix-all F4 review fix-up - only the part of a folded bet no other seat matched is returned; insurance priced net of it.
+ONLY the part no other seat matched
+getCurrentPotsNetOfReturns

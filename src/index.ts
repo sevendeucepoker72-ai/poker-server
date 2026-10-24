@@ -11443,7 +11443,11 @@ function insuranceCandidates(tableId: string, table: PokerTable): Array<{ seatIn
  */
 function insuranceExclusivePot(table: PokerTable, insured: number): number {
   let pot = 0;
-  for (const p of table.getCurrentPots()) {
+  // F4 review fix-up (2026-10-24) — net of the F4 return: a folded seat's
+  // uncalled bet above every all-in goes back to HIM at the hand's end, so it
+  // is never part of the insured seat's exclusive pot (the settlement would pay
+  // those chips twice: to the folder by F4, to the insured seat by the house).
+  for (const p of table.getCurrentPotsNetOfReturns()) {
     const elig = p.eligibleSeatIndices;
     if (elig.length === 1 && elig[0] === insured) pot += p.amount;
   }
@@ -11453,7 +11457,7 @@ function insuranceExclusivePot(table: PokerTable, insured: number): number {
 /** The pots BOTH remaining players can win — what an insured seat stands to win or lose. */
 function insuranceContestedPot(table: PokerTable, a: number, b: number): number {
   let pot = 0;
-  for (const p of table.getCurrentPots()) {
+  for (const p of table.getCurrentPotsNetOfReturns()) {   // F4 review fix-up — the pots the hand will pay
     if (p.eligibleSeatIndices.includes(a) && p.eligibleSeatIndices.includes(b)) pot += p.amount;
   }
   return pot;

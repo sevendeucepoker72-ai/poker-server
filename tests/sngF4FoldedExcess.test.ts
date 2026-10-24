@@ -34,9 +34,10 @@ describe('F4 — SidePotManager.unmatchedFoldedExcess', () => {
   it('a live seat that is NOT all-in contests every tier: nothing is returned (F22)', () => {
     expect(fx([si(1, 600, { folded: true }), si(2, 50), si(3, 30, { allIn: true })])).toEqual([]);
   });
-  it('two folded seats above the largest contender: each gets back his own excess', () => {
+  it('two folded seats above the largest contender: only the part the other folder did not match comes back (review fix-up)', () => {
+    // Seat 2's 700 matched seat 1's first 700: called money, it stays in the pot (calculatePots' rule).
     expect(fx([si(1, 900, { folded: true }), si(2, 700, { folded: true }), si(3, 400, { allIn: true }), si(4, 500, { allIn: true })]))
-      .toEqual([{ seatIndex: 1, amount: 400 }, { seatIndex: 2, amount: 200 }]);
+      .toEqual([{ seatIndex: 1, amount: 200 }]);
   });
   it('dead money is not live: a folded seat whose LIVE part is at or below the contenders gets nothing back', () => {
     expect(fx([si(1, 600, { folded: true, deadMoney: 150 }), si(3, 450, { allIn: true })])).toEqual([]);

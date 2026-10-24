@@ -61,6 +61,15 @@ export class SidePotManager {
    * nothing is returned then (the F22 leaver rule: his unmatched bet stays
    * dead money for the live seat). Dead money always stays in the pot.
    * Pure: returns [{seatIndex, amount}] (amount > 0), the caller moves the chips.
+   *
+   * Review fix-up (2026-10-24) — ONLY the part no other seat matched: the
+   * refund is the folded seat's live investment above the LARGER of the top
+   * contender's live investment and every OTHER folded seat's live investment.
+   * Chips another folded seat matched were CALLED (two deep players built a
+   * side pot on the flop, then both folded on the turn with all-ins left): they
+   * stay with calculatePots' existing rule (the orphan tier to the
+   * most-invested contender, as on e038f7b) and are never logged 'uncalled'.
+   * Hand 11 is unchanged (the big blind is the only seat above the all-ins).
    */
   static unmatchedFoldedExcess(seats: SeatInfo[]): Array<{ seatIndex: number; amount: number }> {
     const occupied = seats.filter((s) => s.state === 'occupied');
@@ -71,10 +80,13 @@ export class SidePotManager {
     const contenders = occupied.filter((s) => !isFolded(s));
     if (contenders.length === 0 || contenders.some((s) => !s.allIn)) return [];
     const top = Math.max(...contenders.map(liveOf));
+    const folded = occupied.filter(isFolded);
     const out: Array<{ seatIndex: number; amount: number }> = [];
-    for (const s of occupied) {
-      if (!isFolded(s)) continue;
-      const excess = liveOf(s) - top;
+    for (const s of folded) {
+      // The highest live bet of any OTHER folded seat: what of his bet was matched (called) by a folder.
+      let matchedByFolder = 0;
+      for (const o of folded) if (o !== s) matchedByFolder = Math.max(matchedByFolder, liveOf(o));
+      const excess = liveOf(s) - Math.max(top, matchedByFolder);
       if (excess > 0) out.push({ seatIndex: s.seatIndex, amount: excess });
     }
     return out;

@@ -2794,6 +2794,26 @@ export class PokerTable extends EventEmitter {
     // (calculatePots' orphan rule). Runs before every pot calculation (base,
     // Omaha and Stud determineWinners). Chips only move from the pot back to
     // their contributor: conserved.
+    for (const [seatIndex, back] of this.foldedExcessReturns()) {
+      const seat = this.seats[seatIndex];
+      seat.chipCount += back;
+      seat.totalInvestedThisHand -= back;
+      this.emit('uncalledBetReturned', { seatIndex, amount: back });
+      this.actionLog.push({
+        seatIndex,
+        playerName: seat.playerName,
+        action: `uncalled bet (${back}) returned`,
+      });
+    }
+  }
+
+  /**
+   * F4 (review fix-up, 2026-10-24) — what refundUncalledBets WILL return right
+   * now: Map seatIndex -> chips (> 0, never above the seat's investment), from
+   * SidePotManager.unmatchedFoldedExcess on the seats as determineWinners sees
+   * them (a seat with no cards counts as folded). Pure: moves nothing.
+   */
+  protected foldedExcessReturns(): Map<number, number> {
     const infos: SeatInfo[] = this.seats
       .filter((s) => s.state === 'occupied' && !s.eliminated)
       .map((s) => ({
@@ -2806,19 +2826,28 @@ export class PokerTable extends EventEmitter {
         state: s.state,
         deadMoney: s.deadMoneyThisHand,
       }));
+    const out = new Map<number, number>();
     for (const { seatIndex, amount } of SidePotManager.unmatchedFoldedExcess(infos)) {
-      const seat = this.seats[seatIndex];
-      const back = Math.min(amount, seat.totalInvestedThisHand);
-      if (!(back > 0)) continue;
-      seat.chipCount += back;
-      seat.totalInvestedThisHand -= back;
-      this.emit('uncalledBetReturned', { seatIndex, amount: back });
-      this.actionLog.push({
-        seatIndex,
-        playerName: seat.playerName,
-        action: `uncalled bet (${back}) returned`,
-      });
+      const back = Math.min(amount, this.seats[seatIndex].totalInvestedThisHand);
+      if (back > 0) out.set(seatIndex, back);
     }
+    return out;
+  }
+
+  /**
+   * F4 (review fix-up, 2026-10-24) — the pots as the hand WILL pay them: the
+   * getCurrentPots() split after the F4 return of a folded seat's uncalled
+   * bet (refundUncalledBets runs first in determineWinners). The all-in
+   * insurance quote prices from this, so its exclusive pot never includes the
+   * chips F4 hands back to the folded seat (the house would pay them twice).
+   * getCurrentPots() itself (every table's display) is unchanged.
+   */
+  getCurrentPotsNetOfReturns(): Pot[] {
+    const back = this.foldedExcessReturns();
+    if (back.size === 0) return this.getCurrentPots();
+    return this.potsOfSeatInfos(this.potSeatInfos().map((s) => (back.has(s.seatIndex)
+      ? { ...s, totalInvestedThisHand: s.totalInvestedThisHand - (back.get(s.seatIndex) as number) }
+      : s)));
   }
 
   /**
@@ -3314,7 +3343,12 @@ export class PokerTable extends EventEmitter {
   }
 
   getCurrentPots(): Pot[] {
-    const seatInfos: SeatInfo[] = this.seats
+    return this.potsOfSeatInfos(this.potSeatInfos());
+  }
+
+  /** The seats getCurrentPots splits (F4 review fix-up: shared with getCurrentPotsNetOfReturns). */
+  private potSeatInfos(): SeatInfo[] {
+    return this.seats
       .filter(s => s.state === 'occupied' && !s.eliminated)
       .map(s => ({
         seatIndex: s.seatIndex,
@@ -3327,7 +3361,10 @@ export class PokerTable extends EventEmitter {
         state: s.state,
         deadMoney: s.deadMoneyThisHand,   // F1/F2
       }));
+  }
 
+  /** getCurrentPots' split of `seatInfos` (unchanged rule). */
+  private potsOfSeatInfos(seatInfos: SeatInfo[]): Pot[] {
     // Only split into side pots when at least one player is actually all-in.
     // Without an all-in, unequal contributions (SB/BB) would create false "side pots".
     const hasAllIn = seatInfos.some(s => s.allIn);
