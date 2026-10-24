@@ -7927,6 +7927,8 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
       }))),
     };
 
+    // F11 (2026-10-24) — the accounts that got their copy here (one per hand).
+    const copiesWritten = new Set<number>();
     for (const [socketId, session] of playerSessions) {
       if (session.tableId === tableId) {
         // R3 (H1 — TABLEUI-6 / APPUI-16 / K2-6) — each recipient's OWN copy:
@@ -7957,9 +7959,14 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         if (auth) {
           const handId = `${tableId}-${serializedHistory.handNumber}-${session.seatIndex}-${Date.now()}`;
           recordHand(auth.userId, handId, forViewer).catch(() => {});
+          copiesWritten.add(auth.userId);   // F11
         }
       }
     }
+    // F11 (owner 2026-10-23: "Fix all") — every OTHER seated account dealt into
+    // the hand gets its own copy too (an extra-table seat; a disconnected /
+    // away player): persisted only, no socket emit.
+    recordHandHistoryCopiesForEverySeat(table, tableId, history, serializedHistory, copiesWritten);
   });
 }
 
@@ -7986,6 +7993,86 @@ function handHistoryViewerOf(
   const discard: Card | null = typeof discardOf === 'function' ? (discardOf.call(table, seatIndex) ?? null) : null;
   return { seatIndex, holeCards: seat.holeCards.length > 0 ? [...seat.holeCards] : null, discard };
 }
+
+// ===== Hand-history copies for every seated account (Sit & Go fix-all F11) =====
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F11) — the 'handHistory'
+ * listener wrote a copy only for a LIVE main session at the table: an absent
+ * player (disconnected, Back to Lobby, away at a tournament start) and an
+ * extra-table seat had no record of the hands they were dealt. After the
+ * live-session loop (which fills `written`):
+ *  (a) every extra-table session at this table that still holds its seat;
+ *  (b) every other human seat DEALT INTO the hand: its account by
+ *      dealtInSeatAccount (a session / extra seat holding it, a pending
+ *      removal, a reservation of the same occupant); at a tournament table,
+ *      else the entrant's local userId (a qualifier entrant without a session
+ *      or reservation has no local id here: skipped).
+ * Each gets HIS copy (handHistoryViewerOfSeat: his seat, his hole cards, his
+ * Pineapple discard) through recordHand - idempotent per (user, hand id), the
+ * 100-row cap - and never a socket emit. One copy per account per hand.
+ */
+const handHistoryCopyStats = { extraSeat: 0, absentSeat: 0, tournamentEntrant: 0 };
+function handHistoryViewerOfSeat(
+  table: PokerTable, history: HandHistoryRecord, seatIndex: number,
+): { seatIndex: number; holeCards: Card[] | null; discard: Card | null } | null {
+  if (!Number.isInteger(seatIndex) || seatIndex < 0) return null;
+  const row = history.players.find((p) => p.seatIndex === seatIndex);
+  const seat = table.seats[seatIndex];
+  if (!row || !seat || seat.state !== 'occupied' || seat.isAI) return null;
+  if (row.name !== seat.playerName) return null;
+  const discardOf = (table as any).discardOf;
+  const discard: Card | null = typeof discardOf === 'function' ? (discardOf.call(table, seatIndex) ?? null) : null;
+  return { seatIndex, holeCards: seat.holeCards.length > 0 ? [...seat.holeCards] : null, discard };
+}
+function recordHandHistoryCopiesForEverySeat(
+  table: PokerTable, tableId: string, history: HandHistoryRecord, serialized: Record<string, any>, written: Set<number>,
+): void {
+  try {
+    const ser = (c: Card) => ({ suit: c.suit, rank: c.rank, display: cardToString(c) });
+    const copyFor = (uid: number, seatIndex: number): boolean => {
+      const viewer = handHistoryViewerOfSeat(table, history, seatIndex);
+      if (!viewer) return false;
+      const forViewer: Record<string, unknown> = { ...serialized, tableId, viewerSeat: viewer.seatIndex };
+      if (viewer.holeCards) forViewer.viewerHoleCards = viewer.holeCards.map(ser);
+      if (viewer.discard) forViewer.viewerDiscard = ser(viewer.discard);
+      written.add(uid);
+      recordHand(uid, `${tableId}-${serialized.handNumber}-${seatIndex}-${Date.now()}`, forViewer).catch(() => {});
+      return true;
+    };
+    // (a) extra-table sessions at this table.
+    for (const [sid, list] of multiTableSessions) {
+      if (!Array.isArray(list)) continue;
+      for (const ms of list) {
+        if (!ms || ms.tableId !== tableId) continue;
+        const uid = authSessions.get(sid)?.userId;
+        const seat = table.seats[ms.seatIndex];
+        if (!uid || written.has(uid) || !seat || !sessionHoldsSeat(ms, seat)) continue;
+        if (copyFor(uid, ms.seatIndex)) handHistoryCopyStats.extraSeat++;
+      }
+    }
+    // (b) every other human seat dealt into the hand.
+    const tid = tournamentIdOfTable(tableId);
+    const tourn = tid ? tournamentManager.getTournament(tid) : undefined;
+    for (const row of history.players) {
+      const seat = table.seats[row.seatIndex];
+      if (!seat || seat.state !== 'occupied' || seat.isAI || seat.holeCards.length === 0) continue;
+      let uid: number | null = dealtInSeatAccount(tableId, seat);
+      let viaEntrant = false;
+      if (!uid && tourn) {
+        const tp = tourn.players.find((p) => p.playerId === seat.playerId);
+        if (tp?.userId) { uid = tp.userId; viaEntrant = true; }
+      }
+      if (!uid || written.has(uid)) continue;
+      if (copyFor(uid, row.seatIndex)) {
+        if (viaEntrant) handHistoryCopyStats.tournamentEntrant++;
+        else handHistoryCopyStats.absentSeat++;
+      }
+    }
+  } catch (e: any) {
+    console.warn(`[handHistory] copies for every seat failed on ${tableId}:`, e?.message || e);
+  }
+}
+// ===== end hand-history copies =====
 
 // Target occupancy for cash tables. Keeps the game alive without hogging
 // every seat — humans walking into the lobby always see open seats at

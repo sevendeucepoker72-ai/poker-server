@@ -1822,3 +1822,6 @@ tournamentStartAlerts
 # Sit & Go fix-all F10 - non-qualifier tournaments: short clock after 2 timed-out hands; no 500 ms act for a start no-show.
 absentShortClockScope
 absentTimeoutStreaks
+# Sit & Go fix-all F11 - every seated account gets its own hand-history copy, even while disconnected.
+recordHandHistoryCopiesForEverySeat
+handHistoryViewerOfSeat
