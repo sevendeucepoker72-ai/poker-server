@@ -99,6 +99,19 @@ export interface UnseenResult {
   status: string;
 }
 
+/** C2 review fix-up — one finished result of an account, as durableState.tournamentResults sends it. */
+export interface OwnTournamentResult {
+  tournamentId: string;
+  name: string;
+  place: number;
+  prize: number;
+  /** The event's buy-in (one entry). */
+  entryFee: number;
+  /** ms since epoch, or null. */
+  finishedAt: number | null;
+  tableIds: string[];
+}
+
 export const tournamentResultsStats = {
   writes: 0,
   writeFailures: 0,
@@ -245,12 +258,49 @@ export function createTournamentResultsStore(deps: { query: TournamentResultsQue
     });
   }
 
+  /**
+   * 2026-10-24 (Sit & Go fix-all C2, review fix-up) — this account's FINISHED
+   * results (a place, not voided, not a qualifier, within 30 days), newest
+   * first, at most `limit`: index.ts sends them as durableState.tournamentResults
+   * so poker-3d plots prize - entry fee after a reload (it kept them in page
+   * memory only). Through the same chain; a failed read answers [].
+   */
+  function resultsFor(userId: number, limit = 50): Promise<OwnTournamentResult[]> {
+    const job = chain.then(async () => {
+      await ensureTables();
+      tournamentResultsStats.reads++;
+      const r = await deps.query(
+        `SELECT p.tournament_id, p.place, p.prize, r.name, r.buy_in, r.table_ids, r.finished_at
+           FROM tournament_result_players p JOIN tournament_results r ON r.tournament_id = p.tournament_id
+          WHERE p.user_id = $1 AND p.place IS NOT NULL AND r.kind <> 'qualifier' AND r.status = 'finished'
+            AND r.finished_at > NOW() - INTERVAL '30 days'
+          ORDER BY r.finished_at DESC LIMIT $2`,
+        [userId, Math.max(1, Math.min(200, Math.floor(limit)))],
+      );
+      return (r.rows || []).map((x: any): OwnTournamentResult => {
+        const at = x.finished_at ? new Date(x.finished_at).getTime() : NaN;
+        const ids = typeof x.table_ids === 'string' ? JSON.parse(x.table_ids) : x.table_ids;
+        return {
+          tournamentId: String(x.tournament_id), name: String(x.name || 'Tournament'), place: Number(x.place) || 0,
+          prize: Number(x.prize) || 0, entryFee: Number(x.buy_in) || 0, finishedAt: Number.isFinite(at) ? at : null,
+          tableIds: Array.isArray(ids) ? ids.map(String) : [],
+        };
+      });
+    });
+    chain = job.catch(() => {});
+    return job.catch((e: any) => {
+      tournamentResultsStats.readFailures++;
+      log(`[tournament-results] ${JSON.stringify({ event: 'read_failed', what: 'resultsFor', error: String(e?.message || e).slice(0, 160) })}`);
+      return [] as OwnTournamentResult[];
+    });
+  }
+
   /** Resolves once every queued write ran (tests, the shutdown flush). */
   function drain(): Promise<void> {
     return chain.then(() => {}, () => {});
   }
 
-  return { recordStart, recordBust, recordFinish, markVoided, markTold, unseenFor, drain };
+  return { recordStart, recordBust, recordFinish, markVoided, markTold, unseenFor, resultsFor, drain };
 }
 
 export type TournamentResultsStore = ReturnType<typeof createTournamentResultsStore>;

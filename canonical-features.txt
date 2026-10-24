@@ -1861,3 +1861,6 @@ roomEliminationPayload
 # Sit & Go fix-all C2 / C1 review fix-up - hand records carry tableKind / tournamentId and the hand's smallBlind / bigBlind / ante.
 handRecordKindOf
 handLevelOfRecord
+# Sit & Go fix-all C2 review fix-up - durableState.tournamentResults from the durable F14 rows.
+durableTournamentResultsFor
+DURABLE_TOURNAMENT_RESULTS_WAIT_MS

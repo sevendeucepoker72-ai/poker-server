@@ -12501,6 +12501,28 @@ function tournamentResultsKind(tournamentId: string): string {
   if (clubLiveTournaments.has(tournamentId)) return 'club';
   return t?.config.fromTemplate ? 'template' : 'custom';
 }
+/**
+ * C2 review fix-up (2026-10-24) — durableState.tournamentResults: his finished
+ * non-qualifier results (tournamentResults.resultsFor), waited for at most
+ * DURABLE_TOURNAMENT_RESULTS_WAIT_MS (the store's chain may be busy with
+ * writes): a slow / failed / odd read answers [] and never holds up or loses
+ * the rest of durableState. Never rejects.
+ */
+const DURABLE_TOURNAMENT_RESULTS_WAIT_MS = 1500;
+async function durableTournamentResultsFor(userId: number): Promise<unknown[]> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const read = Promise.resolve(tournamentResults.resultsFor(userId, 50)).catch(() => null);
+    const wait = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), DURABLE_TOURNAMENT_RESULTS_WAIT_MS); });
+    const r = await Promise.race([read, wait]);
+    return Array.isArray(r) ? r : [];
+  } catch {
+    return [];
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 function recordTournamentResultsStart(tournamentId: string, tableIds: string[]): void {
   try {
     if (!tournamentResultsInScope(tournamentId)) return;
@@ -18046,12 +18068,13 @@ Give feedback in this JSON format:
     try {
       const ctx = await ensureHydrated(socket);
       if (!ctx) return;
-      const [inventory, bpClaims, durable, handHistory, careerProgress] = await Promise.all([
+      const [inventory, bpClaims, durable, handHistory, careerProgress, ownTournamentResults] = await Promise.all([
         loadInventory(ctx.userId),
         loadBattlePassClaims(ctx.userId, CURRENT_BATTLE_PASS_SEASON),   // R1 — the server's season (client seasonId ignored)
         loadDurableProgress(ctx.userId),
         loadHandHistory(ctx.userId, 100),
         loadCareerProgress(ctx.userId),
+        durableTournamentResultsFor(ctx.userId),   // C2 review fix-up (never rejects; bounded wait)
       ]);
       const rec = progressionManager.userRecord(ctx.userId);
       socket.emit('durableState', {
@@ -18068,6 +18091,10 @@ Give feedback in this JSON format:
         // R2 — the client's own saved blob (what saveProgress { stats: { clientData } } stored), or null.
         clientData: durable?.clientData ?? null,
         handHistory,
+        // C2 review fix-up (2026-10-24) — additive: his finished tournament results
+        // (F14 rows, non-qualifier) [{tournamentId, name, place, prize, entryFee,
+        // finishedAt, tableIds}]: poker-3d's bankroll plots prize - entry fee.
+        tournamentResults: ownTournamentResults,
       });
     } catch (err: any) {
       console.error('getDurableState error:', err);

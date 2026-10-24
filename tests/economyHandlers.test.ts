@@ -117,6 +117,8 @@ function world(over: Record<string, unknown> = {}) {
     userIdForPublicId: jest.fn(async (p: string) => { const id = /^p0+(\d+)$/.test(p) ? Number(p.replace(/^p0+/, '')) : NaN; return users.has(id) ? id : null; }),
     saveProgress: jest.fn(async (uid: number, d: any) => { saves.push([uid, d]); return true; }),
     loadInventory: jest.fn(async () => []),
+    // 2026-10-24 (Sit & Go fix-all C2 review fix-up) — getDurableState's durable tournament results (F14 rows): none here.
+    durableTournamentResultsFor: jest.fn(async () => []),
     getPool: jest.fn(() => ({ query: async (_t: string, p: unknown[]) => ({ rows: users.has(p[0] as number) ? [{ level: 7, xp: 10, stats: '{"handsPlayed":40,"handsWon":10,"vpipHands":10,"pfrHands":4}', achievements: '[]' }] : [] }) })),
     getPublicNames: jest.fn(async (ids: number[]) => new Map(ids.filter((i) => users.has(i)).map((i) => [i, `Player ${i}`]))),
     findUsersByDisplayName: jest.fn(async () => []),
