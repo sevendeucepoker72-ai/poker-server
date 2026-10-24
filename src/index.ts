@@ -6974,7 +6974,29 @@ function autoActForSeat(tableId: string, t: PokerTable, seatIndex: number, reaso
  * retired).
  */
 function absentShortClockScope(tableId: string): boolean {
-  return isTournamentTable(tableId) && !qualifierIdOfTable(tableId);
+  if (!isTournamentTable(tableId) || qualifierIdOfTable(tableId)) return false;
+  // Review fix-up (2026-10-24) — a qualifier table whose registry entry does not
+  // name its tournament yet (startQualifierTournament deals hand 1 before
+  // tickQualifierAutoStart sets qt.tournamentId) is still a qualifier table.
+  const tid = tournamentIdOfTable(tableId);
+  return !(tid && qualifierEngineTournamentIds.has(tid));
+}
+/**
+ * F10 review fix-up (2026-10-24) — the tournaments startQualifierTournament
+ * created, marked BEFORE any table is dealt: qualifierIdOfTable finds a
+ * qualifier through qt.tournamentId, which the tick start path sets only after
+ * hand 1 was dealt and broadcast, so for that broadcast a qualifier table
+ * looked like a Sit & Go and lost the 500 ms orphan act. Bounded (oldest
+ * dropped past 200; a handful of qualifiers run per week).
+ */
+const qualifierEngineTournamentIds = new Set<string>();
+function markQualifierEngineTournament(tournamentId: string): void {
+  qualifierEngineTournamentIds.add(tournamentId);
+  while (qualifierEngineTournamentIds.size > 200) {
+    const oldest = qualifierEngineTournamentIds.values().next().value;
+    if (oldest === undefined) break;
+    qualifierEngineTournamentIds.delete(oldest);
+  }
 }
 const ABSENT_SHORT_CLOCK_AFTER_HANDS = 2;
 const absentTimeoutStreaks = new Map<string, { hand: number; streak: number }>();
@@ -25558,6 +25580,10 @@ function startQualifierTournament(
     // (qualifierBreakConfig; switch: tournamentManager.breaksEnabled).
     breaks: qualifierBreakConfig(timeScale),
   });
+
+  // F10 review fix-up (2026-10-24) — a qualifier's tournament, known as one
+  // before its first deal (absentShortClockScope: the 500 ms orphan act stays).
+  markQualifierEngineTournament(tournamentId);
 
   const tournament = tournamentManager.getTournament(tournamentId);
   if (!tournament) return null;

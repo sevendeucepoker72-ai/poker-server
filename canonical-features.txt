@@ -1845,3 +1845,5 @@ EVERY running tournament (Sit & Go, custom, club
 # Sit & Go fix-all F4 review fix-up - only the part of a folded bet no other seat matched is returned; insurance priced net of it.
 ONLY the part no other seat matched
 getCurrentPotsNetOfReturns
+# Sit & Go fix-all F10 review fix-up - a qualifier table keeps the 500 ms orphan act on hand 1 (marked before its first deal).
+markQualifierEngineTournament
