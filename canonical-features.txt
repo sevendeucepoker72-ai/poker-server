@@ -1789,3 +1789,7 @@ posted ante
 # Sit & Go fix-all F2 - the first bet of a street is saved as bet N (raises stay raised to N).
 openingBet ? `bet 
 raised to|bet |straddle|went all-in
+# Sit & Go fix-all F3 - actions the server takes for a player carry auto: 'timeout' | 'away' in the hand history.
+markAutoAction
+withAutoAction
+autoActForSeat(tableId, t, activeSeat, 'timeout')

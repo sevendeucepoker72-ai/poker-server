@@ -165,7 +165,18 @@ export interface ActionLogEntry {
    * amount, which every client parser reads. Absent otherwise.
    */
   allIn?: boolean;
+  /**
+   * 2026-10-24 (Sit & Go fix-all F3) — the SERVER took this action for the
+   * player: 'timeout' = his turn clock ran out (normal or short clock);
+   * 'away' = acted for while absent (the 500 ms orphan act, a Sit Out / AFK on
+   * his own turn, a departure acted for on the clock). Absent on a voluntary
+   * action. The replay / history shows '(timed out)'.
+   */
+  auto?: AutoActReason;
 }
+
+/** F3 — why the server acted for a seat (ActionLogEntry.auto). */
+export type AutoActReason = 'timeout' | 'away';
 
 /** Complete hand history record */
 export interface HandHistoryRecord {
@@ -1387,6 +1398,37 @@ export class PokerTable extends EventEmitter {
   }
 
   /**
+   * 2026-10-24 (Sit & Go fix-all F3) — the server is about to act FOR this
+   * seat. markAutoAction is one shot: the next fold / check / call / raise /
+   * all-in entry of THAT seat carries `auto: reason`, and the mark is gone with
+   * it — or at the next decision point (stateVersion moved: a turn, a street, a
+   * hand), so it can never stamp a later voluntary action. withAutoAction
+   * scopes it to `fn` (restored after). Entries pushed for OTHER seats meanwhile
+   * (an uncalled bet returned to the winner) are never stamped.
+   */
+  private _autoAct: { seatIndex: number; reason: AutoActReason; stateVersion: number } | null = null;
+  markAutoAction(seatIndex: number, reason: AutoActReason): void {
+    this._autoAct = { seatIndex, reason, stateVersion: this.stateVersion };
+  }
+  withAutoAction<T>(seatIndex: number, reason: AutoActReason, fn: () => T): T {
+    const prev = this._autoAct;
+    this.markAutoAction(seatIndex, reason);
+    try {
+      return fn();
+    } finally {
+      this._autoAct = prev;
+    }
+  }
+  private autoStampFor(seatIndex: number): { auto?: AutoActReason } {
+    const a = this._autoAct;
+    if (!a) return {};
+    if (a.stateVersion !== this.stateVersion) { this._autoAct = null; return {}; }
+    if (a.seatIndex !== seatIndex) return {};
+    this._autoAct = null;   // one shot
+    return { auto: a.reason };
+  }
+
+  /**
    * 2026-10-24 (Sit & Go fix-all F1) — THE ante log line: `posted ante N`, no
    * street (read as '' in the saved record, like the blinds), `allIn: true`
    * when the ante took the whole stack. Called right after the chips moved
@@ -1690,6 +1732,7 @@ export class PokerTable extends EventEmitter {
       playerName: this.seats[seatIndex].playerName,
       action: 'folded',
       street: this.currentPhase,
+      ...this.autoStampFor(seatIndex),   // F3
     });
 
     this.emit('playerAction', {
@@ -1903,6 +1946,7 @@ export class PokerTable extends EventEmitter {
       playerName: seat.playerName,
       action: 'checked',
       street: this.currentPhase,
+      ...this.autoStampFor(seatIndex),   // F3
     });
 
     this.emit('playerAction', {
@@ -1939,6 +1983,7 @@ export class PokerTable extends EventEmitter {
       playerName: seat.playerName,
       action: `called ${callAmount}`,
       street: this.currentPhase,
+      ...this.autoStampFor(seatIndex),   // F3
     });
 
     this.emit('playerAction', {
@@ -2055,6 +2100,7 @@ export class PokerTable extends EventEmitter {
       playerName: seat.playerName,
       action: openingBet ? `bet ${totalRaiseAmount}` : `raised to ${totalRaiseAmount}`,   // F2
       street: this.currentPhase,
+      ...this.autoStampFor(seatIndex),   // F3
     });
 
     this.emit('playerAction', {
@@ -2302,6 +2348,7 @@ export class PokerTable extends EventEmitter {
       playerName: seat.playerName,
       action: trulyAllIn ? `went all-in for ${totalBet}` : `${openingBet ? 'bet' : 'raised to'} ${totalBet} (pot-limit cap)`,
       street: this.currentPhase,
+      ...this.autoStampFor(seatIndex),   // F3
     });
 
     this.emit('playerAction', {

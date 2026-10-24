@@ -1763,7 +1763,8 @@ describe('P-i (round 6) — an absent tournament seat checks, limps at most ONE 
   });
 
   it('wiring: the turn timer, the 500ms orphan auto-act and a tournament Sit Out / AFK on the clock all act through autoActForSeat; round 5\'s unbounded rule is gone', () => {
-    expect(P.armTurnTimer).toContain('const did = autoActForSeat(tableId, t, activeSeat);');
+    // 2026-10-24 (Sit & Go fix-all F3) — the turn clock's action is stamped auto: 'timeout'.
+    expect(P.armTurnTimer).toContain("const did = autoActForSeat(tableId, t, activeSeat, 'timeout');");
     const bc = fnSrc('function broadcastGameState(');
     expect(bc).toContain('autoActForSeat(tableId, t, activeIdx);');
     expect(bc).not.toContain('t.playerFold(activeIdx);');

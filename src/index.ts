@@ -1638,6 +1638,7 @@ function teardownSeat(
       seatTeardownStats.departureKept++;
       if (!DrawPhases.includes(table.currentPhase) && table.activeSeatIndex === seatIndex) {
         const owed = table.currentBetToMatch - (seat.currentBet || 0);
+        table.markAutoAction(seatIndex, 'away');   // F3 — acted for on the clock
         if (!(owed <= 0 && table.playerCheck(seatIndex))) table.playerFold(seatIndex);
       }
     } else {
@@ -6909,7 +6910,11 @@ function absentTournamentSeatMayLimp(tableId: string, t: PokerTable, seatIndex: 
  * nothing is owed; CALL only what absentTournamentSeatMayLimp allows; else
  * FOLD. A refused call folds. Cash tables: check-or-fold, as always.
  */
-function autoActForSeat(tableId: string, t: PokerTable, seatIndex: number): 'check' | 'call' | 'fold' {
+function autoActForSeat(tableId: string, t: PokerTable, seatIndex: number, reason: 'timeout' | 'away' = 'away'): 'check' | 'call' | 'fold' {
+  // 2026-10-24 (Sit & Go fix-all F3) — the action below is the SERVER's: its
+  // log entry carries auto: 'timeout' (the turn clock) or 'away' (everything
+  // else that acts for an absent seat). One shot (PokerTable.markAutoAction).
+  t.markAutoAction(seatIndex, reason);
   const callAmt = t.currentBetToMatch - (t.seats[seatIndex]?.currentBet || 0);
   if (callAmt <= 0) {
     t.playerCheck(seatIndex);
@@ -6971,7 +6976,7 @@ function armTurnTimer(tableId: string): void {
         if (!seat || !seat.playerName || seat.folded) return;
         // P-i — check, an absent seat's ≤1 BB limp in an all-absent hand
         // (all_absent_hand_auto_call), else fold.
-        const did = autoActForSeat(tableId, t, activeSeat);
+        const did = autoActForSeat(tableId, t, activeSeat, 'timeout');   // F3 — stamped auto: 'timeout'
         // 2026-10-10 — info, not debug: since the watchdog defers to a live
         // turn clock, this is THE record of every turn the server takes for a
         // player (the post-hotfix check needs to see them).
@@ -20017,7 +20022,7 @@ Give feedback in this JSON format:
       } else if (table && table.activeSeatIndex === session.seatIndex) {
         // F102 (2026-10-21) — a club challenge seat is dealt in while sitting out: acted for, never folded off a free check.
         if (isTournamentTable(session.tableId) || challengeTables.has(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);
-        else table.playerFold(session.seatIndex);
+        else { table.markAutoAction(session.seatIndex, 'away'); table.playerFold(session.seatIndex); }   // F3
         broadcastGameState(session.tableId);
         broadcastDone = true;
         // 2026-10-10 — hand the turn on: the next bot acts now, not after its 30s
@@ -20056,7 +20061,7 @@ Give feedback in this JSON format:
       }
     } else if (table && table.activeSeatIndex === session.seatIndex) {
       if (isTournamentTable(session.tableId) || challengeTables.has(session.tableId)) autoActForSeat(session.tableId, table, session.seatIndex);   // F102
-      else table.playerFold(session.seatIndex);
+      else { table.markAutoAction(session.seatIndex, 'away'); table.playerFold(session.seatIndex); }   // F3
       broadcastGameState(session.tableId);
       broadcastDone = true;
       scheduleAIAction(session.tableId); // 2026-10-10 — the next bot acts now
@@ -22774,6 +22779,7 @@ function reserveSeatForDeparture(
     // It used to fold whatever was owed — a big blind with the option, or a
     // free check on a later street, handed the pot away.
     const owed = table.currentBetToMatch - (table.seats[session.seatIndex]?.currentBet || 0);
+    table.markAutoAction(session.seatIndex, 'away');   // F3
     if (!(owed <= 0 && table.playerCheck(session.seatIndex))) table.playerFold(session.seatIndex);
     broadcastGameState(session.tableId);
     // 2026-10-10 hotfix — like every other fold path, hand the turn to the next
@@ -23442,6 +23448,7 @@ function keepTournamentSeatOnLeave(
     if (!reserved && table.isHandInProgress() && table.activeSeatIndex === session.seatIndex && !DrawPhases.includes(table.currentPhase)) {
       // Z6 — kept in play: check when free, fold only facing a bet (as reserveSeatForDeparture).
       const owed = table.currentBetToMatch - (seat.currentBet || 0);
+      table.markAutoAction(session.seatIndex, 'away');   // F3
       if (!(owed <= 0 && table.playerCheck(session.seatIndex))) table.playerFold(session.seatIndex);
       broadcastGameState(session.tableId);
       scheduleAIAction(session.tableId);   // R2 (GAME-16) — the next bot acts now, not after its 30s clock
