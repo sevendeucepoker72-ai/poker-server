@@ -189,6 +189,12 @@ export interface Tournament {
    * package moved closes at the next elimination instead of never.
    */
   lateEntryPeakAlive?: number;
+  /**
+   * 2026-10-24 (Sit & Go fix-all F7) — finishTournament's results (each
+   * entrant's position + payout), kept on the record so prizeForEntrant can
+   * answer the runner-up's bust notice (his bust is what finished it).
+   */
+  finalResults?: Array<{ playerId: string; position: number; payout: number; tied?: boolean; disqualified?: boolean }>;
 }
 
 /**
@@ -601,6 +607,11 @@ export class TournamentManager {
         currentBlinds: t.status === 'running' ? { sb: currentBlinds.sb, bb: currentBlinds.bb, ante: currentBlinds.ante } : null,
         blindLevel: t.currentBlindLevel + 1,
         blindLevelCount: t.config.blindLevels.length,
+        // F7 (2026-10-24) — the payout table (places paid + amounts) for the card /
+        // detail, before registering: the SAME floor(pool x share) finishTournament
+        // pays. payoutField = the field it is computed for; payoutsProjected =
+        // the field (so the table) can still change. [] when nothing is paid.
+        ...(() => { const pt = this.payoutTableOf(t); return { payouts: pt.payouts, payoutField: pt.field, payoutsProjected: pt.projected }; })(),
         // F8 (2026-10-24) — an on-demand BUY-IN event (startInterval 0) is cancelled
         // + refunded STALL_MS after its earliest remaining entry if still short of
         // `minPlayers`: stallCancelMs (null for other events) and stallCancelAt
@@ -613,6 +624,49 @@ export class TournamentManager {
       });
     }
     return list;
+  }
+
+  /**
+   * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F7) — the payout
+   * table of a tournament: `field` (running / finished: the entrants; else the
+   * field it starts with: the registrants, at least the start threshold, at
+   * most maxPlayers), `projected` (registering and that field can still change)
+   * and `payouts` [{place, amount}] = floor(pool x payoutSharesFor(field)), the
+   * same numbers finishTournament pays. pool: a freeroll's advertised prizePool;
+   * a buy-in event's collected fees once running, buyIn x field before. [] when
+   * the pool is 0 (a qualifier pays seats, not chips).
+   */
+  payoutTableOf(t: Tournament): { field: number; projected: boolean; payouts: Array<{ place: number; amount: number }> } {
+    const started = t.status === 'running' || t.status === 'finished';
+    const max = Math.max(1, t.config.maxPlayers);
+    const field = started ? t.players.length : Math.min(max, Math.max(t.players.length, this.startThreshold(t)));
+    const freeroll = (t.config.buyIn || 0) === 0;
+    const pool = freeroll ? (t.config.prizePool || 0) : (started ? t.collectedEntryFees : (t.config.buyIn || 0) * field);
+    const projected = t.status === 'registering' && (t.config.startInterval > 0 || this.startThreshold(t) < max);
+    if (!(pool > 0) || !(field > 0)) return { field, projected, payouts: [] };
+    const payouts = payoutSharesFor(field).map((share, i) => ({ place: i + 1, amount: Math.floor(pool * share) }));
+    return { field, projected, payouts };
+  }
+
+  /**
+   * F7 — the prize of one entrant, for HIS notices: finished → his payout in
+   * the stored results (0 = null); running and eliminated in a PAID place, not
+   * in a tie group (the split is known at the finish) and not disqualified →
+   * floor(pool x share) of his place (a non-qualifier field is fixed after the
+   * start); otherwise null. A qualifier's pool is 0 → always null.
+   */
+  prizeForEntrant(tournamentId: string, playerId: string): number | null {
+    const t = this.tournaments.get(tournamentId);
+    if (!t) return null;
+    if (t.status === 'finished') {
+      const r = t.finalResults?.find((x) => x.playerId === playerId);
+      return r && r.payout > 0 ? r.payout : null;
+    }
+    if (t.status !== 'running') return null;
+    const p = t.players.find((x) => x.playerId === playerId);
+    if (!p || !p.eliminated || !(p.finishPosition > 0) || p.tieGroup !== undefined || p.disqualified) return null;
+    const row = this.payoutTableOf(t).payouts.find((x) => x.place === p.finishPosition);
+    return row && row.amount > 0 ? row.amount : null;
   }
 
   /** F8 — the stall-cancel fields of a lobby item (see getTournamentList). */
@@ -1538,6 +1592,12 @@ export class TournamentManager {
         ...(p.disqualified ? { disqualified: true } : {}),
       };
     });
+
+    // F7 (2026-10-24) — kept for prizeForEntrant (the runner-up's own bust notice).
+    tournament.finalResults = results.map((r) => ({
+      playerId: r.playerId, position: r.position, payout: r.payout,
+      ...(r.tied ? { tied: true } : {}), ...(r.disqualified ? { disqualified: true } : {}),
+    }));
 
     this.emitEvent(tournamentId, 'tournamentFinished', {
       tournamentId,

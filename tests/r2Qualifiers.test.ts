@@ -1185,11 +1185,13 @@ describe('the qualifier lifecycle — started, cancelled for too few players, fi
     expect(w.roomEmits).toEqual([]);                                          // per socket, not one broadcast
   });
 
-  it('CONTROL — any other tournament: the rooms\' broadcast exactly as before', () => {
+  it('CONTROL — any other tournament: no qualifier fields (2026-10-24, Sit & Go fix-all F7: one frame per socket in the rooms with its own myResult, null for a spectator)', () => {
     const w = world();
     const data = { tournamentId: 'T-other', results: [] };
+    const spec = w.mkSocket('Sx', null, null); spec.join('table:X1');
     w.m.emitTournamentFinishedToEntrants('T-other', ['X1'], data);
-    expect(w.roomEmits).toEqual([['table:X1', 'tournamentFinished', data]]);
+    expect(w.of('Sx', 'tournamentFinished')).toEqual([{ ...data, myResult: null }]);
+    expect(w.roomEmits).toEqual([]);
   });
 
   it('results reach the master: a failed POST is RETRIED (it awards the seats), audited when it never lands', async () => {

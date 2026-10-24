@@ -1810,3 +1810,7 @@ fromTemplate
 # Sit & Go fix-all F8 - stall clock from the earliest remaining entry; lobby stallCancelMs / stallCancelAt.
 stallCancelAt
 stallCancelMs
+# Sit & Go fix-all F7 - every paid finisher told his place + prize; lobby payout table.
+payoutTableOf
+prizeForEntrant
+payoutsProjected

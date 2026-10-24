@@ -23011,10 +23011,16 @@ function tellDeadTournamentSeat(socket: Socket, auth: SocketAuthSession, dead: D
     // Hand-for-hand review fix-up — a round bust not placed yet: nothing now; the
     // settle tells every live socket of his (this one too) his FINAL place.
     if (dead.playerId && handForHandBustPending(dead.tournamentId, dead.playerId)) return;
-    noticeTournamentEliminationToEntrant(dead.tournamentId, dead.playerId || '', [socket.id], dead.playerName, why.position);
+    // F7 (2026-10-24) — + his prize when the place is paid.
+    const prize = dead.playerId ? tournamentManager.prizeForEntrant(dead.tournamentId, dead.playerId) : null;
+    noticeTournamentEliminationToEntrant(dead.tournamentId, dead.playerId || '', [socket.id], dead.playerName, why.position, prize);
   } else {
+    // F7 — + his prize (the finished record keeps it after the tournament is dropped).
+    const prize = (dead.playerId ? tournamentManager.prizeForEntrant(dead.tournamentId, dead.playerId) : null)
+      ?? (finishedTournamentRecords.get(dead.tournamentId)?.entrants.find((e) => finishedEntrantIsAccount(e, auth))?.prize ?? null);
     socket.emit('tournamentFinishedForEntrant', {
       tournamentId: dead.tournamentId, position: why.position,
+      ...(prize && prize > 0 ? { prize } : {}),
       tournamentName: tournamentManager.getTournament(dead.tournamentId)?.config.name || 'Tournament',
     });
   }
@@ -23788,8 +23794,10 @@ function tournamentEliminationNoticeSockets(
  */
 function noticeTournamentEliminationToEntrant(
   tournamentId: string, playerId: string, sids: string[], playerName: string, position: number,
+  /** 2026-10-24 (Sit & Go fix-all F7) — his prize (a paid place); added to the payload only when > 0. */
+  prize?: number | null,
 ): number {
-  const payload = { tournamentId, playerId, playerName, position };
+  const payload = { tournamentId, playerId, playerName, position, ...(prize && prize > 0 ? { prize } : {}) };
   let told = 0;
   for (const sid of sids) {
     const sock = io.sockets.sockets.get(sid);
@@ -23988,8 +23996,22 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
   // Each socket in the rooms gets ONE frame. Every other tournament: the
   // rooms' broadcast exactly as before.
   const q = qualifierOfTournament(id);
+  // 2026-10-24 (Sit & Go fix-all F7) — recorded FIRST (it was right after the
+  // room frames): every non-qualifier socket's own result comes from it.
+  const rec = noteFinishedTournament(id, data);
   if (!q) {
-    for (const room of rooms) io.to(room).emit('tournamentFinished', data);
+    // F7 (owner 2026-10-23: "Fix all") — PER SOCKET in the rooms (one frame
+    // each): `data` plus `myResult {place, prize, tied?} | null` (that
+    // socket's account; null for a spectator). The 2nd / 3rd were paid but
+    // the room frame only named the winner. No isQualifier / wonSeat here: an
+    // older client reads `wonSeat` as a qualifier result.
+    const tiedOf = new Set<string>(((data?.results || []) as any[]).filter((r) => r?.tied).map((r) => String(r.playerId)));
+    for (const [sid, sock] of io.sockets.sockets) {
+      if (!sock || !rooms.some((r) => sock.rooms?.has(r))) continue;
+      const e = rec.entrants.find((x) => finishedEntrantIsAccount(x, authSessions.get(sid)));
+      const myResult = e ? { place: e.position, prize: e.prize || 0, ...(tiedOf.has(e.playerId) ? { tied: true } : {}) } : null;
+      sock.emit('tournamentFinished', { ...data, myResult });
+    }
   } else {
     const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop: seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage), seatPackage: q.qt.seatPackage || null };
     for (const [sid, sock] of io.sockets.sockets) {
@@ -23999,7 +24021,6 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
     }
   }
   tournamentFinishedNotices.roomBroadcasts += rooms.length;
-  const rec = noteFinishedTournament(id, data);
   const tournamentName = tournamentManager.getTournament(id)?.config.name || 'Tournament';
   let told = 0;
   for (const [sid, a] of authSessions) {
@@ -26806,6 +26827,10 @@ function tellTournamentBustNow(
   const toSpectator = ctx.toSpectator;
   const seatedElsewhere = ctx.seatedElsewhere;
   const bustSidPlaysHere = ctx.playsHere;
+  // 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F7) — his PRIZE
+  // when the place is paid (a qualifier: never - its pool is 0): on both
+  // notices below. The audit's 2nd / 3rd were paid but never told.
+  const bustPrize = tournamentManager.prizeForEntrant(tournamentId, bust.playerId);
   // The elimination may have broken THIS table (playerEliminated →
   // handleTableRebalance runs synchronously), or a break ran since: read it now.
   const brokenNow = !tournamentTables.has(tableId);
@@ -26833,13 +26858,14 @@ function tellTournamentBustNow(
       totalPlayers: tournamentManager.getTournament(tournamentId)?.players.length || 0,
       status: tournamentManager.getTournamentStatus(tournamentId),
       tableIds: tournamentManager.getTournament(tournamentId)?.tableIds || [],
+      ...(bustPrize && bustPrize > 0 ? { prize: bustPrize } : {}),   // F7
     });
   }
   // P-e / P-e' — the plain elimination notice (`playerEliminated` +
   // tournamentId: a toast, the away seat ends) to every live socket
   // signed in as him except the one switched to spectator above — the
   // room's copy skipped them (one notice each).
-  noticeTournamentEliminationToEntrant(tournamentId, bust.playerId, noticeSids, bust.playerName, bustPosition);
+  noticeTournamentEliminationToEntrant(tournamentId, bust.playerId, noticeSids, bust.playerName, bustPosition, bustPrize);
 }
 
 /** S1 — run every capture still pending on this table now (its handleHandComplete threw), then re-kick its deal. */

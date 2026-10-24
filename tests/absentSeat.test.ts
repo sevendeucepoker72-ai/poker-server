@@ -2632,7 +2632,7 @@ describe('S6 — reconnect, restore and reservations (gameplay 2026-10-21)', () 
       expect(w.reservedSeats.has(ALICE)).toBe(false);
       const evs = evNames(w, 'S2');
       expect(evs.indexOf('playerEliminated')).toBeGreaterThan(evs.indexOf('loginResult'));
-      expect(payloadOf(w, 'S2', 'playerEliminated')).toEqual({ tournamentId: w.tid, playerId: 'user_101', playerName: 'Alice', position: 3 });
+      expect(payloadOf(w, 'S2', 'playerEliminated')).toEqual({ tournamentId: w.tid, playerId: 'user_101', playerName: 'Alice', position: 3, prize: 300 });   // Sit & Go fix-all F7: + his prize (a paid place)
     });
 
     it('CONTROL — pre-G183 (occupied + not AI was enough): his socket is bound to the dead 0-chip seat as if it were his live seat', async () => {
@@ -2668,7 +2668,7 @@ describe('S6 — reconnect, restore and reservations (gameplay 2026-10-21)', () 
         expect(w.reservedSeats.has(ALICE)).toBe(false);
         const evs = evNames(w, 'S2');
         expect(evs.indexOf('playerEliminated')).toBeGreaterThan(evs.indexOf('loginResult'));
-        expect(payloadOf(w, 'S2', 'playerEliminated')).toEqual({ tournamentId: w.tid, playerId: 'user_101', playerName: 'Alice', position: 3 });
+        expect(payloadOf(w, 'S2', 'playerEliminated')).toEqual({ tournamentId: w.tid, playerId: 'user_101', playerName: 'Alice', position: 3, prize: 300 });   // Sit & Go fix-all F7: + his prize (a paid place)
       });
 
       it('still ALIVE (not eliminated): told nothing — no false elimination notice', async () => {
