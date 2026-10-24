@@ -164,6 +164,34 @@ export interface Tournament {
    * entries x the starting stack / alive.
    */
   entries: number;
+  /**
+   * 2026-10-24 (owner 2026-10-23: "Fix both") — late entry AND re-entry CLOSED
+   * at the qualifier's seat bubble (null / absent = not closed that way; the
+   * 2:00 PM close is index.ts's lateRegUntil). Set by eliminatePlayer in the
+   * same synchronous call that lowered the alive count; never cleared (once
+   * closed, it never reopens for this event). See lateEntryBubbleOf.
+   */
+  lateEntryClosed?: LateEntryClosedAtBubble | null;
+}
+
+/**
+ * 2026-10-24 — when (`at`, ms), at what alive count (`alive`, = the bubble or
+ * below), against which bubble (`closeAtAlive`) and by whose elimination
+ * (`playerId`) late entry closed at the seat bubble.
+ */
+export interface LateEntryClosedAtBubble {
+  at: number;
+  alive: number;
+  closeAtAlive: number;
+  playerId: string;
+}
+
+/** 2026-10-24 — what lateEntryBubbleOf answers for a tournament (null = no bubble close: not a qualifier). */
+export interface LateEntryBubble {
+  /** The seat bubble: seatsForTop + 1 (Sunday's package, top 10 → 11). An integer >= 2. */
+  closeAtAlive: number;
+  /** The 2:00 PM late close (ms): an elimination after it never closes anything (late entry is already closed). */
+  openUntil: number;
 }
 
 export const DEFAULT_BLIND_LEVELS: BlindLevel[] = [
@@ -324,6 +352,29 @@ export class TournamentManager {
    * or a resume, which ends it at once).
    */
   readonly breakStats = { taken: 0, endedEarly: 0 };
+  /**
+   * 2026-10-24 (owner 2026-10-23: "Fix both") — the seat bubble of a tournament,
+   * asked at EVERY elimination (null / a null answer = it never closes at the
+   * bubble: every tournament that is not an online qualifier). index.ts assigns
+   * qualifierLateEntryBubbleOf at boot (the event's live seat package; the 2:00
+   * PM late close). The rule (eliminatePlayer): the bubble is REACHED by an
+   * elimination that takes the alive count from ABOVE closeAtAlive to
+   * closeAtAlive or below while now <= openUntil. One elimination removes one
+   * player, so a double bust that skips past the bubble passes through it on the
+   * first of the two. A field that never went above the bubble stays open until
+   * openUntil; removeLateEntrant (a no-show release, an undone seat) never
+   * counts. Once closed, addLateEntrant / reinstateForReentry refuse (no push, no
+   * place shift) for the rest of the event.
+   */
+  lateEntryBubbleOf: ((tournamentId: string) => LateEntryBubble | null) | null = null;
+  /**
+   * 2026-10-24 — health r2Play.qualifiers.lateRegBubble: `closed` = events closed
+   * at the bubble; `resolverErrors` = lateEntryBubbleOf threw (nothing closed —
+   * should stay 0); `lockRefusals` = late entries / re-entries refused HERE
+   * because the event was closed (index.ts refuses them before any credit is
+   * consumed, so this is the second lock).
+   */
+  readonly lateEntryBubbleStats = { closed: 0, resolverErrors: 0, lockRefusals: 0 };
 
   constructor() {
     this.createTemplateTournaments();
@@ -561,6 +612,8 @@ export class TournamentManager {
   ): TournamentPlayer | null {
     const t = this.tournaments.get(tournamentId);
     if (!t || t.status !== 'running') return null;
+    // 2026-10-24 — closed at the seat bubble: nobody is added (no push, no place shift).
+    if (t.lateEntryClosed) { this.lateEntryBubbleStats.lockRefusals++; return null; }
     if (t.players.some((p) => p.playerId === playerId)
         || this.entryOfAccount(tournamentId, { userId: identity.userId, masterUserId: identity.masterUserId ?? null })) return null;
     const tp: TournamentPlayer = {
@@ -603,6 +656,8 @@ export class TournamentManager {
   reinstateForReentry(tournamentId: string, playerId: string, chips: number): boolean {
     const t = this.tournaments.get(tournamentId);
     if (!t || t.status !== 'running') return false;
+    // 2026-10-24 — closed at the seat bubble: he stays out, every place unchanged.
+    if (t.lateEntryClosed) { this.lateEntryBubbleStats.lockRefusals++; return false; }
     const p = t.players.find((x) => x.playerId === playerId);
     if (!p || !p.eliminated) return false;
     const old = p.finishPosition;
@@ -1059,6 +1114,12 @@ export class TournamentManager {
     const alivePlayers = tournament.players.filter((p) => !p.eliminated);
     player.finishPosition = alivePlayers.length + 1;
 
+    // 2026-10-24 (owner 2026-10-23: "Fix both") — did THIS elimination reach the
+    // seat bubble? Decided here, in the same synchronous call that lowered the
+    // alive count, BEFORE the bounty and 'playerEliminated' (so no late entry can
+    // slip in between, and the close is recorded before the bust is handled).
+    this.closeLateEntryIfBubbleReached(tournamentId, tournament, alivePlayers.length, playerId);
+
     // Bounty payout: award the eliminator if this is a bounty tournament
     let bountyPayout = 0;
     if (tournament.config.isBounty && tournament.config.bountyAmount && eliminatorId) {
@@ -1089,6 +1150,44 @@ export class TournamentManager {
     }
 
     return { finished: false, position: player.finishPosition, payout: 0, bountyPayout };
+  }
+
+  /** 2026-10-24 — the seat-bubble close of a tournament (null = late entry was not closed that way). */
+  lateEntryClosedAtBubble(tournamentId: string): LateEntryClosedAtBubble | null {
+    return this.tournaments.get(tournamentId)?.lateEntryClosed ?? null;
+  }
+
+  /**
+   * 2026-10-24 — eliminatePlayer's seat-bubble test (see lateEntryBubbleOf).
+   * `alive` = the alive count AFTER this elimination (it was alive + 1). Never
+   * throws: a resolver that throws is counted and closes nothing. The state is
+   * set BEFORE the 'lateEntryClosedAtBubble' event, so the lock holds even if a
+   * listener throws; a throwing listener is logged and never breaks the
+   * elimination.
+   */
+  private closeLateEntryIfBubbleReached(tournamentId: string, t: Tournament, alive: number, playerId: string): void {
+    if (t.lateEntryClosed || !this.lateEntryBubbleOf) return;
+    let bubble: LateEntryBubble | null;
+    try {
+      bubble = this.lateEntryBubbleOf(tournamentId);
+    } catch {
+      this.lateEntryBubbleStats.resolverErrors++;
+      return;
+    }
+    if (!bubble || typeof bubble !== 'object') return;
+    const { closeAtAlive, openUntil } = bubble;
+    if (!Number.isInteger(closeAtAlive) || closeAtAlive < 2) return;
+    if (typeof openUntil !== 'number' || !Number.isFinite(openUntil)) return;
+    const now = Date.now();
+    if (now > openUntil) return;                                       // after 2:00 PM: already closed by the clock
+    if (!(alive + 1 > closeAtAlive && alive <= closeAtAlive)) return;   // not the elimination that crossed it
+    t.lateEntryClosed = { at: now, alive, closeAtAlive, playerId };
+    this.lateEntryBubbleStats.closed++;
+    try {
+      this.emitEvent(tournamentId, 'lateEntryClosedAtBubble', { tournamentId, alive, closeAtAlive, playerId, at: now });
+    } catch (e) {
+      console.error(`[Tournament] ${JSON.stringify({ event: 'late_entry_closed_listener_failed', tournamentId, error: String((e as Error)?.message || e) })}`);
+    }
   }
 
   /**

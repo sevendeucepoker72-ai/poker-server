@@ -1744,3 +1744,13 @@ insurance_clawback_refund_2026_10_24
 # 2026-10-24 (owner: "Make the sit and gos not start until full") - Sit & Go 9, Turbo 6
 minPlayers: 9,
 minPlayers: 6,
+# 2026-10-24 (owner 2026-10-23: "Fix both") - online qualifier late entry AND re-entry close
+# at the SEAT BUBBLE (or 2:00 PM, whichever comes first): TournamentManager records the close
+# inside the elimination that reached it; every later late entry / re-entry is refused
+# registration_closed (reason seat_bubble) before any credit is consumed; durable audit;
+# room toast kind late_reg_closed; lobby item lateRegClosesAtBubble + lateRegOpen; hand-for-hand
+# engages at once when the bubble is reached inside the window.
+qualifier_late_reg_closed_at_bubble
+QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE
+lateRegClosesAtBubble
+late_reg_closed

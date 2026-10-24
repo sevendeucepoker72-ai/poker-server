@@ -356,7 +356,8 @@ export function qualifierBreakConfig(timeScale: number = 1): { everyLevels: numb
  * several) are placed by their stack at the START of that hand.
  *
  * Engages only when ALL hold (handForHandApplies): the late registration has
- * CLOSED (now > lateRegUntil — no field change, no place shift, can be ahead);
+ * CLOSED (now > lateRegUntil, or — 2026-10-24 — late entry closed at the seat
+ * bubble inside the window: no field change, no place shift, can be ahead);
  * two or more tables are in play; alive === seatsForTop + 1 (the event's seat
  * package: Sunday's top 10 → 11 alive); and the field does not fit one table
  * (alive > QUALIFIER_TABLE_SEATS — Rule 1 merges a field of 9 or fewer onto
@@ -415,11 +416,19 @@ export function qualifierHandForHandHardCapMs(timeScale: number = 1): number {
   return Math.max(qualifierHandForHandWatchdogMs(timeScale), Math.round(QUALIFIER_HAND_FOR_HAND_HARD_CAP_MS / engineTimeScale(timeScale)));
 }
 
-/** Does hand-for-hand apply right now? Pure; every input must be a real number (an event with no scheduled time never engages). */
-export function handForHandApplies(o: { now: number; lateRegUntil: number; alive: number; seatsForTop: number; tablesInPlay: number }): boolean {
+/**
+ * Does hand-for-hand apply right now? Pure; every input must be a real number (an event with no scheduled time never engages).
+ * 2026-10-24 (owner 2026-10-23: "Fix both") — `lateRegClosed`: late entry has CLOSED AT THE SEAT
+ * BUBBLE (TournamentManager.lateEntryClosedAtBubble). "Late registration closed" is now that OR
+ * now > lateRegUntil (2:00 PM), so the gate engages at once when the bubble is reached inside
+ * the window. Only a real `true` counts; `now` must still be a real number.
+ */
+export function handForHandApplies(o: { now: number; lateRegUntil: number; alive: number; seatsForTop: number; tablesInPlay: number; lateRegClosed?: boolean }): boolean {
   if (!o || typeof o !== 'object') return false;
   const { now, lateRegUntil, alive, seatsForTop, tablesInPlay } = o;
-  if (!Number.isFinite(now) || !Number.isFinite(lateRegUntil) || !(now > lateRegUntil)) return false;
+  if (!Number.isFinite(now)) return false;
+  const closedByClock = Number.isFinite(lateRegUntil) && now > lateRegUntil;
+  if (!(o.lateRegClosed === true || closedByClock)) return false;
   if (!Number.isFinite(tablesInPlay) || tablesInPlay < 2) return false;
   if (!Number.isInteger(seatsForTop) || seatsForTop < 1) return false;
   if (!Number.isInteger(alive) || alive !== seatsForTop + 1) return false;
@@ -434,3 +443,19 @@ export function qualifierHandForHandOnText(alive: number, seatsForTop: number): 
 export const QUALIFIER_HAND_FOR_HAND_TEXT = 'Hand-for-hand: waiting for the other tables to finish their hand';
 /** What every table room is told when hand-for-hand ends. */
 export const QUALIFIER_HAND_FOR_HAND_OFF_TEXT = 'Hand-for-hand is over: normal play resumes.';
+
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix both") — LATE ENTRY AND RE-ENTRY CLOSE AT THE
+ * SEAT BUBBLE, or at 2:00 PM MT (QUALIFIER_LATE_REG_MS), whichever comes first.
+ * The bubble = seatsForTop + 1 of the event's live seat package; it is REACHED
+ * by an elimination that takes the alive count from above it to it or below
+ * inside the late window (TournamentManager.lateEntryBubbleOf, assigned by
+ * index.ts). A field that never went above the bubble stays open until 2:00 PM.
+ * Once closed it never reopens. Owner-correctable here (the sentences).
+ */
+/** The refusal of a late entry / re-entry after the close (qualifierRegistrationResult `registration_closed`, reason 'seat_bubble'). */
+export const QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT = 'Late entry and re-entry are closed: the seat bubble was reached.';
+/** What every table room of the event is told at the close (the existing 'serverAnnouncement' toast, kind 'late_reg_closed'). */
+export function qualifierLateRegClosedText(alive: number, seatsForTop: number): string {
+  return `Late entry and re-entry are now closed: ${alive} players are left and the top ${seatsForTop} win seats.`;
+}

@@ -29,6 +29,12 @@ import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from 
 import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
 // Review fix-up (ff9a1cb) — the runtime overflow cap's X-Internal-Token check.
 import { createHash, timingSafeEqual } from 'crypto';
+// 2026-10-24 (owner 2026-10-23: "Fix both") — the seat-bubble close. require (not import): on
+// 9c37499 these names do not exist and the rest of this file must still compile.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const QS: Record<string, any> = require('../src/game/qualifierSchedule');
+/** A top-level index.ts function when it exists (9c37499 has none of the seat-bubble ones: '' — they then resolve to inert stubs). */
+const optFnSrc = (signature: string): string => (SRC.includes(signature) ? fnSrc(signature) : '');
 
 // The master's REAL answer (captured from prod 2026-10-11, read-only): one weekly event + a TOC with no time.
 const MASTER_BODY = {
@@ -136,6 +142,10 @@ const CODE = [
   fnSrc('function setQualifierOverflowTablesMax('),
   fnSrc('function internalTokenMatches('),
   slice("app.post('/api/qualifiers/overflow'", '\n});\n'),
+  // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry / re-entry close at the seat
+  // bubble: the per-event bubble TournamentManager asks, and the close's notice.
+  optFnSrc('function qualifierLateEntryBubbleOf('),
+  optFnSrc('function noteQualifierLateRegClosedAtBubble('),
 ].join('\n');
 /**
  * Review fix-up (ff9a1cb) — the REAL tournament deal hold (it used to be a stub
@@ -273,6 +283,8 @@ function world(opts: {
     // Review fix-up (ff9a1cb) — the runtime cap route registers on this fake express app.
     app: { post: (p: string, fn: (req: any, res: any) => void) => { routes.set(p, fn); } },
     createHash, timingSafeEqual, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel,
+    // 2026-10-24 — the seat-bubble close's sentences (pure qualifierSchedule).
+    QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT: QS.QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText: QS.qualifierLateRegClosedText,
   };
   const routes = new Map<string, (req: any, res: any) => void>();
   const { exports: m } = load(`${CODE}\n${opts.realDealHold ? REAL_DEAL_HOLD : ''}\nfunction wire(socket) {\n  ${HANDLERS}\n}`, scope, `{
@@ -281,6 +293,7 @@ function world(opts: {
     qualifierNoShows, tellQualifierNoShowReleases, qualifierCreditHeldByConcurrentEntry,
     qualifierOverflow, qualifierOverflowTables, openQualifierOverflowTable, startFreshTournamentTable, tournamentDealHoldReason,
     qualifierStartTimers,
+    qualifierLateEntryBubbleOf, noteQualifierLateRegClosedAtBubble, qualifierLateRegBubble, qualifierNoShowNotices,
   }`);
   /** POST /api/qualifiers/overflow through the REAL route: {status, body}. */
   const postOverflowCap = (body: unknown, token?: string) => {
@@ -3030,5 +3043,244 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     expect(fnSrc('function applyDirectorPause(')).toContain('balanceQualifierTablesNow(tournamentId);');
     for (const tok of ['qualifier_prestart_deal_waiting', 'qualifier_prestart_cancelled', 'qualifier_tables_open_closed']) expect(manifest).toContain(tok);
     expect(slice('const DURABLE_AUDIT_ACTIONS = new Set([', ']);')).toContain("'QUALIFIER_TABLES_OPEN_CLOSED'");
+  });
+});
+
+// ═══════════════════════ 2026-10-24 — late entry / re-entry close at the SEAT BUBBLE ══
+describe('2026-10-24 (owner 2026-10-23: "Fix both") — late entry and re-entry CLOSE AT THE SEAT BUBBLE (or 2:00 PM, whichever comes first)', () => {
+  const PKG = { 1: 3, 2: 2, 3: 2, 4: 2, 5: 1, 6: 1, 7: 1, 8: 1, 9: 1, 10: 1 };   // Sunday: top 10 → the bubble is 11
+  const enter = (s: any) => s.handlers.registerQualifierTournament({ qualifierId: WEEKLY, playerName: 'x' });
+  const last = (w: any, sid: string) => w.of(sid, 'qualifierRegistrationResult').slice(-1)[0];
+  const closedRefusal = () => expect.objectContaining({
+    success: false, code: 'registration_closed', reason: 'seat_bubble', qualifierId: WEEKLY,
+    error: 'Late entry and re-entry are closed: the seat bubble was reached.', lateRegClosedAt: expect.any(String),
+  });
+
+  /**
+   * A RUNNING weekly with Sunday's package, started an hour ago (late entry open
+   * until 2:00 PM), on two 9-seat tables: `n` entrants user-301.. (master m-301..),
+   * the first `busted` of them out earlier (seat occupied at 0 chips, as the bust
+   * check leaves it). TournamentManager asks the REAL qualifierLateEntryBubbleOf
+   * (index.ts assigns it at boot) and its close reaches the REAL notice (the
+   * bootstrap listener's branch, forwarded here).
+   */
+  function bubbleField(n = 14, busted = 2) {
+    const w = world();
+    w.sync(Date.now() - H);
+    const qt = w.qualifierTournaments.get(WEEKLY);
+    expect(qt).toBeTruthy();
+    qt.seatPackage = PKG;
+    (w.tm as any).lateEntryBubbleOf = w.m.qualifierLateEntryBubbleOf;
+    const tid = w.tm.createTournament({ name: 'Qualifier Tournament', buyIn: 0, prizePool: 0, maxPlayers: 99, startInterval: 0, blindLevels: qualifierBlindLevels(50_000), startingChips: 50_000 } as any);
+    const uids = Array.from({ length: n }, (_, i) => 301 + i);
+    for (const u of uids) w.tm.registerPlayer(tid, `user-${u}`, `P${u}`, `s${u}`, undefined, `m-${u}`);
+    expect(w.tm.startTournament(tid)).toBeTruthy();
+    w.tm.onEvent(tid, (ev: string, d: any) => { if (ev === 'lateEntryClosedAtBubble') w.m.noteQualifierLateRegClosedAtBubble(tid, d); });
+    const tables: PokerTable[] = [];
+    for (const id of ['Q1', 'Q2']) {
+      const t = new PokerTable({ tableId: id, tableName: id, smallBlind: 25, bigBlind: 50, minBuyIn: 50_000, maxBuyIn: 500_000, maxPlayers: 9 } as any);
+      w.tables.set(id, t);
+      w.tournamentTables.set(id, tid);
+      tables.push(t);
+    }
+    w.tm.setTableIds(tid, ['Q1', 'Q2']);
+    uids.forEach((u, i) => {
+      const t = tables[i % 2];
+      const seat = Math.floor(i / 2);
+      expect(t.sitDown(seat, `P${u}`, 50_000, `user-${u}`, false, true)).toBe(true);
+      w.tm.setPlayerTable(tid, `user-${u}`, t.config.tableId);
+    });
+    Object.assign(qt, {
+      status: 'running', tournamentId: tid,
+      players: uids.map((u) => ({ playerId: `user-${u}`, masterPlayerId: `m-${u}`, playerName: `P${u}`, phone: '', socketId: `s${u}`, consumedCreditId: `c-${u}` })),
+    });
+    /** The bust check ran on `pid`'s LIVE seat: 0 chips, eliminated, the seat left occupied. */
+    const bust = (pid: string) => {
+      for (const t of tables) {
+        const i = t.seats.findIndex((s) => s.state === 'occupied' && !s.eliminated && s.playerId === pid);
+        if (i < 0) continue;
+        t.seats[i].chipCount = 0;
+        (t.seats[i] as any).eliminated = true;
+        w.tm.eliminatePlayer(tid, pid);
+        return;
+      }
+      throw new Error(`no live seat for ${pid}`);
+    };
+    for (let i = 0; i < busted; i++) bust(`user-${uids[i]}`);
+    const alive = () => w.tm.getAliveCount(tid);
+    const liveSeats = (pid: string) => tables.flatMap((t) => t.seats.filter((s) => s.state === 'occupied' && !s.eliminated && s.playerId === pid));
+    const closeAudits = () => w.audits.filter((a) => a.action === 'QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE');
+    return { w, qt, tid, tables, bust, alive, liveSeats, closeAudits };
+  }
+  const lateRegUntilOf = (qt: any) => new Date(new Date(qt.scheduledAt).getTime() + LATE).toISOString();
+
+  it('LB7 — 12 alive: a late entry is seated; the bust to 11 CLOSES: the buster\'s re-entry, an earlier buster\'s re-entry and a new late entry are refused registration_closed (seat_bubble) with NO credit consumed; audited once; rooms + lobby told; the lobby item stops offering it (9c37499: consumed and seated)', async () => {
+    const x = bubbleField(14, 2);
+    expect(x.alive()).toBe(12);
+    expect(x.w.m.qualifierList(null)[0]).toMatchObject({ status: 'running', lateRegOpen: true, lateRegClosedReason: null, lateRegClosedAt: null, signupOpen: true, lateRegClosesAtBubble: true });
+    const alice = x.w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(alice);                                                        // 12 → 13, open
+    expect(last(x.w, 'SA')).toEqual(expect.objectContaining({ success: true, lateEntry: true }));
+    expect(x.alive()).toBe(13);
+    expect(x.w.consumed).toHaveLength(1);
+    x.bust('user-303');                                                        // 13 → 12: still open
+    expect(x.closeAudits()).toEqual([]);
+    x.bust('user-304');                                                        // 12 → 11: the seat bubble
+    expect(x.alive()).toBe(11);
+    expect(x.closeAudits()).toEqual([{ actor: 'SYSTEM', action: 'QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE', d: expect.objectContaining({
+      qualifierId: WEEKLY, tournamentId: x.tid, alive: 11, seatsForTop: 10, bubble: 11, playerId: 'user-304',
+      lateRegUntil: lateRegUntilOf(x.qt), closedAt: expect.any(String),
+    }) }]);
+    // Every tap after the close is refused BEFORE any credit is touched.
+    const buster = x.w.mkSocket('S304', 304, 'm-304', 'P304');
+    const earlier = x.w.mkSocket('S301', 301, 'm-301', 'P301');
+    const bob = x.w.mkSocket('SB', BOB, 'm-bob', 'Bob');
+    await enter(buster);
+    await enter(earlier);
+    await enter(bob);
+    for (const sid of ['S304', 'S301', 'SB']) expect({ sid, r: last(x.w, sid) }).toEqual({ sid, r: closedRefusal() });
+    expect(x.w.consumed).toHaveLength(1);                                       // only Alice's entry, before the close
+    expect(x.w.creditRefunds).toEqual([]);
+    expect(x.alive()).toBe(11);
+    expect(x.liveSeats('user-304')).toEqual([]);
+    expect(x.liveSeats('user-301')).toEqual([]);
+    expect(x.qt.players.some((p: any) => p.masterPlayerId === 'm-bob')).toBe(false);
+    expect(x.closeAudits()).toHaveLength(1);
+    expect(x.w.m.qualifierLateRegBubble).toMatchObject({ refusedBeforeConsume: 3, refundedAfterConsume: 0, noticeErrors: 0 });
+    await flush();
+    // The rooms (the existing toast) and every lobby (the live card).
+    const notices = x.w.roomEmits.filter(([, ev, d]) => ev === 'serverAnnouncement' && d.kind === 'late_reg_closed');
+    expect(notices.map(([room]) => room).sort()).toEqual(['table:Q1', 'table:Q2']);
+    expect(notices[0][2]).toMatchObject({ message: 'Late entry and re-entry are now closed: 11 players are left and the top 10 win seats.', tournamentId: x.tid, qualifierId: WEEKLY, at: expect.any(Number) });
+    const updates = x.w.globalEmits.filter(([ev, d]) => ev === 'qualifierTournamentUpdate' && d.lateRegClosedReason === 'seat_bubble').map(([, d]) => d);
+    expect(updates).toEqual([expect.objectContaining({ qualifierId: WEEKLY, status: 'running', lateRegOpen: false, lateRegClosedAt: expect.any(String), lateRegClosedReason: 'seat_bubble' })]);
+    // The lobby item: closed at the bubble; the 2:00 PM contract fields unchanged.
+    const item = x.w.m.qualifierList(null)[0];
+    expect(item).toMatchObject({
+      lateRegOpen: false, lateRegClosedReason: 'seat_bubble', lateRegClosedAt: updates[0].lateRegClosedAt, signupOpen: false, lateRegClosesAtBubble: true,
+      lateRegUntil: lateRegUntilOf(x.qt), signupClosesAt: lateRegUntilOf(x.qt),
+    });
+    // Places stay a permutation of 1..N (15 entries: 14 + Alice) once it is played out.
+    const t = x.w.tm.getTournament(x.tid)!;
+    for (const p of [...t.players]) if (!p.eliminated && p.playerId !== 'user-310') x.w.tm.eliminatePlayer(x.tid, p.playerId);
+    expect(t.status).toBe('finished');
+    expect(t.players.map((p) => p.finishPosition).sort((a, b) => a - b)).toEqual(Array.from({ length: 15 }, (_, i) => i + 1));
+  });
+
+  /** A consume that waits for `gate` (the master's answer still in flight). */
+  function slowMaster(w: any) {
+    const gate = deferred();
+    let n = 0;
+    w.scope.consumeQualifierCreditOnMaster = async (masterId: string, tier: string, _q: string, label: string) => {
+      w.consumed.push({ masterId, tier, label });
+      const id = `slow-${++n}`;
+      await gate.p;
+      return { consumed: true, creditId: id };
+    };
+    return gate;
+  }
+
+  it('LB8 — the bubble is reached while the master is still consuming: the re-entry AND the late first entry are refunded once (late_reg_closed_bubble), not seated, not added (9c37499: both seated)', async () => {
+    const x = bubbleField(14, 2);
+    const gate = slowMaster(x.w);
+    const earlier = x.w.mkSocket('S301', 301, 'm-301', 'P301');
+    const alice = x.w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    const p1 = enter(earlier);
+    const p2 = enter(alice);
+    await flush();
+    expect([...x.w.consumed.map((c) => c.label)].sort()).toEqual(['entry', 're-entry']);
+    const idOf = (label: string) => `slow-${x.w.consumed.findIndex((c) => c.label === label) + 1}`;
+    x.bust('user-305');                                                        // 12 → 11 while both consumes are in flight
+    gate.resolve();
+    await Promise.all([p1, p2]);
+    await flush();
+    expect(last(x.w, 'S301')).toEqual(closedRefusal());
+    expect(last(x.w, 'SA')).toEqual(closedRefusal());
+    expect([...x.w.creditRefunds].sort()).toEqual(['slow-1', 'slow-2']);
+    expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_REENTRY_CREDIT_REFUND').map((a) => a.d)).toEqual([{ qualifierId: WEEKLY, creditId: idOf('re-entry'), reason: 'late_reg_closed_bubble' }]);
+    expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_ENTRY_CREDIT_REFUND').map((a) => a.d)).toEqual([{ qualifierId: WEEKLY, creditId: idOf('entry'), reason: 'late_reg_closed_bubble' }]);
+    expect(x.liveSeats('user-301')).toEqual([]);
+    expect(x.w.tm.getTournament(x.tid)!.players.find((p) => p.playerId === 'user-301')).toMatchObject({ eliminated: true });
+    expect(x.qt.players.some((p: any) => p.masterPlayerId === 'm-alice')).toBe(false);
+    expect(x.qt.players.find((p: any) => p.masterPlayerId === 'm-301').reEntries || 0).toBe(0);
+    expect(x.alive()).toBe(11);
+    expect(x.w.m.qualifierLateRegBubble).toMatchObject({ refundedAfterConsume: 2 });
+  });
+
+  it('LB9 — two re-entries and two late entries all in flight at the close: 4 consumed, 4 refunded, nobody seated', async () => {
+    const x = bubbleField(14, 2);
+    const gate = slowMaster(x.w);
+    const socks = [x.w.mkSocket('S301', 301, 'm-301', 'P301'), x.w.mkSocket('S302', 302, 'm-302', 'P302'), x.w.mkSocket('SA', ALICE, 'm-alice', 'Alice'), x.w.mkSocket('SB', BOB, 'm-bob', 'Bob')];
+    const ps = socks.map((s) => enter(s));
+    await flush();
+    expect(x.w.consumed).toHaveLength(4);
+    x.bust('user-306');
+    gate.resolve();
+    await Promise.all(ps);
+    await flush();
+    expect([...x.w.creditRefunds].sort()).toEqual(['slow-1', 'slow-2', 'slow-3', 'slow-4']);
+    for (const sid of ['S301', 'S302', 'SA', 'SB']) expect({ sid, r: last(x.w, sid) }).toEqual({ sid, r: closedRefusal() });
+    for (const pid of ['user-301', 'user-302', 'user-101', 'user-102']) expect({ pid, seats: x.liveSeats(pid) }).toEqual({ pid, seats: [] });
+    expect(x.alive()).toBe(11);
+    expect(x.qt.players).toHaveLength(14);
+  });
+
+  it('LB10 — the bubble is reached during the LAST await of a late first entry (after the consume and its re-check): refunded and refused there — the check after the last await', async () => {
+    const x = bubbleField(14, 2);
+    let hook: (() => void) | null = null;
+    // buyInSocketGone (after the consume) asks shutdownFlushActive first: the bust lands inside that await.
+    x.w.scope.shutdownFlushActive = () => { const h = hook; hook = null; if (h) h(); return false; };
+    const base = x.w.scope.consumeQualifierCreditOnMaster as (...a: any[]) => Promise<any>;
+    x.w.scope.consumeQualifierCreditOnMaster = async (...a: any[]) => { const r = await base(...a); hook = () => x.bust('user-307'); return r; };
+    const alice = x.w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(alice);
+    expect(hook).toBeNull();                                                   // the bust ran inside the late branch's await
+    expect(x.alive()).toBe(11);
+    expect(last(x.w, 'SA')).toEqual(closedRefusal());
+    expect(x.w.creditRefunds).toEqual(['credit-1']);
+    expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_ENTRY_CREDIT_REFUND').map((a) => a.d.reason)).toEqual(['late_reg_closed_bubble']);
+    expect(x.liveSeats('user-101')).toEqual([]);
+    expect(x.qt.players.some((p: any) => p.masterPlayerId === 'm-alice')).toBe(false);
+  });
+
+  it('LB11 — a field that never went above the bubble (8 entrants, top 10) keeps late entry OPEN until 2:00 PM: lateRegOpen true and a late entry is seated; after 2:00 PM the card says closed by the clock', async () => {
+    const x = bubbleField(8, 0);
+    for (const pid of ['user-301', 'user-302', 'user-303']) x.bust(pid);     // 8 → 5, never above 11
+    expect(x.closeAudits()).toEqual([]);
+    expect(x.w.m.qualifierList(null)[0]).toMatchObject({ lateRegOpen: true, lateRegClosedReason: null, signupOpen: true });
+    const alice = x.w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+    await enter(alice);
+    expect(last(x.w, 'SA')).toEqual(expect.objectContaining({ success: true, lateEntry: true }));
+    expect(x.liveSeats('user-101')).toHaveLength(1);
+    expect(x.w.consumed).toHaveLength(1);
+    const after = new Date(x.qt.scheduledAt).getTime() + LATE + 1;
+    expect(x.w.m.qualifierList(null, after)[0]).toMatchObject({ lateRegOpen: false, lateRegClosedReason: 'time', lateRegClosedAt: lateRegUntilOf(x.qt), signupOpen: false });
+  });
+
+  it('LB12 — a no-show told at sign-in after the bubble closed is told late entry is NOT open (lateRegOpen false); before the close, true', async () => {
+    const x = bubbleField(14, 2);
+    const lateRegUntil = new Date(x.qt.scheduledAt).getTime() + LATE;
+    const notice = () => [{ qualifierId: WEEKLY, qualifierName: x.qt.qualifierName, lateRegUntil, creditRefunded: true, at: Date.now() }];
+    const g1 = x.w.mkSocket('SG1', 901, 'm-ghost1', 'Ghost');
+    x.w.m.qualifierNoShowNotices.set('m-ghost1', notice());
+    expect(x.w.m.tellQualifierNoShowReleases(g1, x.w.authSessions.get('SG1'), 'test')).toBe(1);
+    expect(x.w.of('SG1', 'qualifierCancelled')).toEqual([expect.objectContaining({ reason: 'absent_at_start', lateRegOpen: true })]);
+    x.bust('user-303');                                                        // 12 → 11: closed
+    const g2 = x.w.mkSocket('SG2', 902, 'm-ghost2', 'Ghost');
+    x.w.m.qualifierNoShowNotices.set('m-ghost2', notice());
+    expect(x.w.m.tellQualifierNoShowReleases(g2, x.w.authSessions.get('SG2'), 'test')).toBe(1);
+    expect(x.w.of('SG2', 'qualifierCancelled')).toEqual([expect.objectContaining({ reason: 'absent_at_start', lateRegOpen: false, lateRegUntil: new Date(lateRegUntil).toISOString() })]);
+  });
+
+  it('LB13 — wiring: TournamentManager asks the per-event bubble (assigned at boot); the bootstrap listener tells the close; durable audit, health and manifest tokens', () => {
+    expect(SRC).toContain('tournamentManager.lateEntryBubbleOf = qualifierLateEntryBubbleOf;');
+    const ev = slice('  tournamentManager.onEvent(tournamentId, (event, data) => {', '\n  });\n', SRC.indexOf('function bootstrapTournamentTables('));
+    expect(ev).toContain("if (event === 'lateEntryClosedAtBubble') noteQualifierLateRegClosedAtBubble(tournamentId, data);");
+    expect(slice('const DURABLE_AUDIT_ACTIONS = new Set([', ']);')).toContain("'QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE'");
+    expect(SRC).toContain('lateRegBubble: { ...tournamentManager.lateEntryBubbleStats, ...qualifierLateRegBubble },');
+    // Hand-for-hand reads the close too (engages at once when the bubble is reached inside the window).
+    expect(fnSrc('function handForHandInputs(')).toContain('lateRegClosed: !!tournamentManager.lateEntryClosedAtBubble?.(tournamentId),');
+    const manifest = require('fs').readFileSync(require('path').join(__dirname, '..', 'canonical-features.txt'), 'utf8');
+    for (const tok of ['qualifier_late_reg_closed_at_bubble', 'QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE', 'lateRegClosesAtBubble', 'late_reg_closed']) expect(manifest).toContain(tok);
   });
 });

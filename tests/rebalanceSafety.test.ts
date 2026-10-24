@@ -5057,7 +5057,11 @@ hx.serviceAll = serviceAllHandForHand; hx.clock = handForHandClockFields; hx.hea
 hx.isOn = () => qualifierHandForHandOn;
 hx.drains = handForHandDrains; hx.pending = handForHandBustPending;
 hx.outcome = tournamentEntryOutcomeOfAccount; hx.tellDead = tellDeadTournamentSeat;
+hx.bubbleOf = qualifierLateEntryBubbleOf;
 `;
+    // 2026-10-24 (owner 2026-10-23: "Fix both") — the per-event seat bubble TournamentManager asks
+    // (H18 / H19 assign it; on 9c37499 it does not exist and resolves to an inert stub).
+    const BUBBLE = SRC.includes('function qualifierLateEntryBubbleOf(') ? fnSrc('function qualifierLateEntryBubbleOf(') : '';
     const hx: Record<string, any> = {};
     const qualifierTournaments = new Map<string, any>();
     const routes = new Map<string, (req: any, res: any) => void>();
@@ -5087,7 +5091,7 @@ hx.outcome = tournamentEntryOutcomeOfAccount; hx.tellDead = tellDeadTournamentSe
     const w = world({
       layout,
       config: o.config,
-      over: { helpers: `${P.helpers}\n${o.qotThrowsAfter === undefined ? QOT : ''}\n${DEAL_HOOK}\n${SWITCH}\n${OUT}` },
+      over: { helpers: `${P.helpers}\n${o.qotThrowsAfter === undefined ? QOT : ''}\n${DEAL_HOOK}\n${SWITCH}\n${BUBBLE}\n${OUT}` },
       scope: {
         ...persistenceScope(null),
         qualifierTournaments, hx, process: proc, io,
@@ -5821,5 +5825,46 @@ hx.outcome = tournamentEntryOutcomeOfAccount; hx.tellDead = tellDeadTournamentSe
     expect(notices(phone)).toEqual([['playerEliminated', { tournamentId: x.w.tid, playerId: 'a0', playerName: 'a0', position: 10 }]]);
     // An ordinary (not hand-for-hand) bust keeps its place in the answer.
     expect(x.hx.outcome(x.w.authSessions.get('S-b0'), x.w.tid)).toEqual({ kind: 'eliminated', position: 11 });
+  });
+
+  // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry also closes AT THE SEAT BUBBLE, so
+  // hand-for-hand engages at once when the bubble is reached inside the 2:00 PM window.
+  it('H18 — INSIDE the late window (an hour after the start), 12 alive: the REAL bust check takes one player out (12 → 11), which closes late entry; both tables then hold for hand-for-hand at once (9c37499: TA dealt on — the gate waited for 2:00 PM)', async () => {
+    const x = hfh({ scheduledAt: Date.now() - 1 * HOUR, earlier: { TA: [7] } });   // TA 7 alive + TB 5 = 12, 13 entrants
+    (x.w.tm as any).lateEntryBubbleOf = x.hx.bubbleOf;                       // index.ts assigns it at boot
+    const TA = x.t('TA');
+    const TB = x.t('TB');
+    expect(x.w.tm.getAliveCount(x.w.tid)).toBe(12);
+    expect(TA.startNewHand()).toBe(true);
+    expect(TB.startNewHand()).toBe(true);                                    // TB mid-hand
+    await endHand(x, 'TA', ['a0']);                                          // the bust check: 12 → 11, the seat bubble
+    expect(x.w.tm.getAliveCount(x.w.tid)).toBe(11);
+    expect((x.w.tm as any).lateEntryClosedAtBubble?.(x.w.tid)).toMatchObject({ alive: 11, closeAtAlive: 11, playerId: 'a0' });
+    x.w.m.autoStartNextHand('TA');
+    expect(TA.handNumber).toBe(1);                                           // HELD: hand-for-hand engaged before 2:00 PM
+    expect(x.lines('qualifier_hand_for_hand_engaged')).toEqual([expect.objectContaining({
+      tournamentId: x.w.tid, alive: 11, seatsForTop: 10, tables: 2, lateRegClosedAtBubble: true,
+    })]);
+    await endHand(x, 'TB');
+    x.w.m.autoStartNextHand('TB');
+    expect(TB.handNumber).toBe(1);                                           // held too
+    await flush();
+    expect(runScheduled(x)).toEqual(['TA', 'TB']);                           // round 1: both together
+    expect([TA.handNumber, TB.handNumber]).toEqual([2, 2]);
+    expect(x.hx.stats).toMatchObject({ errors: 0 });
+  });
+
+  it('H19 — two busts in ONE hand inside the window (12 → 10): late entry closes (it passed through 11) but hand-for-hand never engages (the bubble burst in the same hand)', async () => {
+    const x = hfh({ scheduledAt: Date.now() - 1 * HOUR, earlier: { TA: [7] } });
+    (x.w.tm as any).lateEntryBubbleOf = x.hx.bubbleOf;
+    const TA = x.t('TA');
+    expect(TA.startNewHand()).toBe(true);
+    expect(x.t('TB').startNewHand()).toBe(true);
+    await endHand(x, 'TA', ['a0', 'a1']);
+    expect(x.w.tm.getAliveCount(x.w.tid)).toBe(10);
+    expect((x.w.tm as any).lateEntryClosedAtBubble?.(x.w.tid)).toMatchObject({ alive: 11, closeAtAlive: 11 });
+    x.w.m.autoStartNextHand('TA');
+    expect(TA.handNumber).toBe(2);                                           // deals on: 10 alive is past the bubble
+    expect(x.lines('qualifier_hand_for_hand_engaged')).toEqual([]);
   });
 });

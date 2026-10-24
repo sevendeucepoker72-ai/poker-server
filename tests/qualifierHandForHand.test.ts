@@ -299,3 +299,39 @@ describe('HP6 — guards: never a tournament that is not running; fewer than two
     expect(w.tm.placeSimultaneousBusts(w.tid, null as any)).toEqual([]);
   });
 });
+
+describe('HP7 (2026-10-24, owner 2026-10-23: "Fix both") — late entry also closes AT THE SEAT BUBBLE: hand-for-hand reads that close too', () => {
+  // require (not import): on 9c37499 these names do not exist and the rest of this file must still compile.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const QS: Record<string, any> = require('../src/game/qualifierSchedule');
+  const late = Date.parse('2026-10-25T20:00:00.000Z');   // Sunday 2:00 PM Denver
+  const base = { now: late - 60_000, lateRegUntil: late, alive: 11, seatsForTop: 10, tablesInPlay: 2 };
+
+  it('inside the 2:00 PM window: closed at the bubble (lateRegClosed) → true; without the flag → false (9c37499: false either way)', () => {
+    expect(handForHandApplies({ ...base, lateRegClosed: true } as any)).toBe(true);
+    expect(handForHandApplies(base)).toBe(false);
+    expect(handForHandApplies({ ...base, lateRegClosed: false } as any)).toBe(false);
+    // Every other condition still holds the gate: not the bubble, one table, a field that fits one table.
+    expect(handForHandApplies({ ...base, lateRegClosed: true, alive: 10 } as any)).toBe(false);
+    expect(handForHandApplies({ ...base, lateRegClosed: true, tablesInPlay: 1 } as any)).toBe(false);
+    expect(handForHandApplies({ ...base, lateRegClosed: true, alive: 9, seatsForTop: 8 } as any)).toBe(false);
+    // After 2:00 PM the time close alone still engages (unchanged).
+    expect(handForHandApplies({ ...base, now: late + 1 })).toBe(true);
+  });
+
+  it('the NaN cases are unchanged: a non-finite `now` never engages, flag or not; garbage → false', () => {
+    expect(handForHandApplies({ ...base, now: NaN, lateRegClosed: true } as any)).toBe(false);
+    expect(handForHandApplies({ ...base, lateRegUntil: NaN })).toBe(false);
+    expect(handForHandApplies({ ...base, lateRegClosed: 'yes' } as any)).toBe(false);   // only a real true counts
+    expect(handForHandApplies(undefined as any)).toBe(false);
+  });
+
+  it('the new player-facing texts are plain ASCII, at most 200 characters', () => {
+    const texts = [QS.QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, typeof QS.qualifierLateRegClosedText === 'function' ? QS.qualifierLateRegClosedText(11, 10) : undefined];
+    for (const s of texts) {
+      expect(typeof s).toBe('string');
+      expect(s.length).toBeLessThanOrEqual(200);
+      expect(/^[\x20-\x7e]+$/.test(s)).toBe(true);
+    }
+  });
+});

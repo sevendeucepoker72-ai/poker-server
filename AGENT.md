@@ -95,6 +95,7 @@ Railway (not in this repo).
 | 28 | **Table lifecycle, quick games, money settlement and progression (.online R2, 2026-10-11).** (a) **One seat teardown** (`teardownSeat`): every leave / departure / ghost cleanup / reservation end goes through it. A seat whose chips are in a live pot is stood up only at the hand's end (`pendingSeatRemovalAfterHand`); an ALL-IN leaver keeps his hand only at a ring table where the stack is his own wallet (`leaverKeepsAllInHand` — never a tournament or fixed-roster game); a bot seat is never taken for a joiner mid-hand (`aiSeatTakeableNow` / `takeAiSeatForJoin`); every fold or leave that moves the turn calls `scheduleAIAction(tableId)` so the next actor is always clocked. (b) **Fixed-roster tables** (`isFixedRosterTable`: every quick format — heads-up, Spin & Go, all-in-or-fold, career — plus a club challenge): no AI fill, a busted bot is never reloaded, and the game ENDS when decided (`quickGameEndCheck`). Ring-table bot stacks are reset to one buy-in above 3 buy-ins (`reloadAndCapBotStacks`, `BOT_STACK_CAP_BUYINS`). (c) **Only joinable PUBLIC cash tables** are listed, Quick-Played, waitlisted or joined by `joinTable` (`isPublicCashTable`; anything else answers `table_not_joinable` before any side effect); private / club tables have their own entry paths. (d) **Prize and refund settlements are durable** (`createPrizeLedger` → `prize_payouts`, retried on a DB blip); the shutdown flush (`claimSeatsForShutdown`, audited `SHUTDOWN_FLUSH`) cashes out each seat EXACTLY once. (e) **One progress record per account**, re-hydrated on login; the hand-end progress push is DB-fresh. `users.chips` is BIGINT — `src/economy/schema.ts` installs the int8 → number parser (`setTypeParser(20, …)`) at import; never read a BIGINT column without it. R3 (S3-3): the migration runs only after the previous container is gone (`scheduleChipsBigintMigration` — the boot account ops' wait); rolling back below R2 needs the column turned back first (Rollback). (f) **Season / leaderboard "chips won" counts PUBLIC cash tables only** (`tableCountsForChipsWon`: never private, club, quick or tournament hands — friends at a table of their choosing could feed one account a paid season place); a club table still feeds its own club stats (`tableFeedsClubStats`). R3 (S3-2): one entry per dealt-in human SEAT by ACCOUNT (`chipsWonSeatsOfHand` / `dealtInSeatAccount`: the live session, else the hand-end removal, else the reservation), captured before any seat is stood up — a player who leaves or drops mid-hand gets his loss; never by live session only. R3 (XL-2): a season before `FIRST_CHIPS_WON_SEASON` ('2026-10', the ledger's first month) is never awarded and never marked (`awardSeason` → `pre_ledger`; admin `pre_ledger_season`) — paying one is an owner decision. (g) R3: Battle Pass premium is the purchase row or the PARSED top-level `stats.battlePassPremium` — never a substring of the stats text (`stats.clientData` is client-written). Bundles, mystery boxes and the scratch pool hold only RENDERED types (`RENDERED_ITEM_TYPES`: theme / card_back / frame / title / emote) and the shop sells only those plus profile backgrounds (`SOLD_COSMETIC_TYPES` — drawn on the lobby banner / profile page). Each `handHistory` copy carries `tableId` + the recipient's own `viewerSeat` / `viewerHoleCards` (stored the same); `loadHandHistory` drops `handName` wherever `holeCards` are absent. A level-up whose settlement fails stays owed (re-sent; per-level ledger keys). | .online R2 audit 2026-10-11 (R3 fixes same day) |
 | 29 | **Engine, relays, tickets, logs (.online R3 SF-C, 2026-10-11).** (a) **S2-1:** `teardownSeat` keeps a seat's hand at a ring table when it has NO decision left — all-in OR the runout is HELD for the insurance window (`table.isRunoutHeld()`: the covering caller too); its final stack is credited at the hand's end. (b) **K1-6:** a seat restore keeps the player's fast mode — `reserveSeatForDeparture` snapshots `fastMode` on the reservation, every restore path (oauthLogin, tokenLogin x2, resumeSession, `restoreAbsentTournamentSeat`) calls `restoreFastModeOnSeatRestore` right after its `reconnectedToTable` (session flag + `fastModeSet {enabled}` to that socket); `setFastMode` also sets the socket's extra-table sessions; per-player state carries `fastMode`. (c) **AUTH-P3-1:** a peer relay (`voiceOffer` / `voiceAnswer` / `voiceIce`, `coachWhisper`) reaches only a LIVE socket that shares a `voice_<tableId>` (voice) / `table:<tableId>` (coach) room with the sender (`relayPeerSharingRoom`) — never `io.to(<client string>)`, which reached any socket id or any room; a whisper is a string, max 500 chars. (d) **AUTH-P3-3:** a play ticket (`authWithTicket`, `joinWithWaitlistContext`) is burned DURABLY — `src/auth/ticketReplay.ts`, table `used_play_tickets` (SHA-256 of the ticket only), one `INSERT … ON CONFLICT (ticket_hash) DO NOTHING RETURNING 1` per claim, the in-memory map as the fast path, hourly TTL prune; a DB that cannot answer falls back to the in-memory guard (`/api/health` `ticketReplayGuard.durableErrors`). (e) **AUTH-P3-4:** `enableDealersChoice` only by a player SEATED at that table (`socketSeatedAt`) and only at a ring table (`dealersChoiceAllowedAt`), else `error {code:'dealers_choice_not_allowed'}`. (f) **AUTH-P3-2:** `/api/health identityGuard.stampDurable` is true on a jsonb AND a TEXT `users.stats` (`statsStampDurable`). (g) **GAME-P3-10:** the AI opponent model is keyed by the seat's player id (`opponentModelKey`), never the display name; bounded (`OPPONENT_PROFILES_CAP`, least recently observed out). (h) **OPS-P3-2:** no login handle (legacy handles are phone numbers) in logs — an `[AUDIT]` actor that is a phone-number handle prints as `user:<id>` / `phone-handle` (`auditActorLabel`; the durable `audit_log` row keeps the raw actor), admin / ticket-login lines print ids, a malformed `/me` logs its keys only. | .online R3 2026-10-11 |
 | 30 | **All-in insurance is OFF; a cash-out refreshes the bank (owner 2026-10-24).** (a) Insurance runs only when the env `ALLIN_INSURANCE` is exactly `1` (`allInInsurance.on`; `insuranceCandidates` returns `[]` otherwise, so no window, quote, held runout or settlement, and Accept answers unavailable). Earned: an insured player who WON was shown the whole pot ("WINNER +2,000", BIG WIN confetti), then `settleInsuranceForHand` cut his stack to the locked cashout and the rest left the economy — 65 clawbacks, 371,861 chips, 12 players 2026-10-12..24, refunded once by `src/economy/insuranceClawbackRefund.ts` (one_time_ops `insurance_clawback_refund_2026_10_24`, durable `BUG_REFUND`). Do NOT turn it back on without the owner AND a table display that shows the net (the clawback) to everyone. (b) Every cash-out credit that COMMITS calls `refreshWalletAfterCashOut` (fresh `playerProgress` to the account's sockets): `creditSeatStackToWallet`, `endCashReservation` (table gone), `cleanupQuickTable`, `adminForceCloseTable`, and the refill `not_broke` answer. No cash-out path pushed before, so the .online lobby bank showed the wallet minus the buy-in until a reload. A FAILED credit pushes nothing. (c) `CASH_OUT_FAILED`, `INSURANCE_PAYOUT` / `INSURANCE_COLLECT` / `INSURANCE_VOID` and `BUG_REFUND` are durable audit actions (they used to reach Railway stdout only). (d) **Sit & Gos start only when FULL** (owner 2026-10-24: "Make the sit and gos not start until full"): the 'Sit & Go' (9) and 'Sit & Go Turbo' (6) templates carry `minPlayers` = `maxPlayers`; every other on-demand template keeps the default start at 4. A Sit & Go short of full is still cancelled + refunded 30 minutes after its first entry (`checkStalledTournaments`). | owner 2026-10-24 |
+| 31 | **A qualifier's late entry + re-entry close AT THE SEAT BUBBLE (owner 2026-10-23: "Fix both").** TournamentManager closes it inside the elimination that takes the alive count from above `seatsForTop + 1` to it or below inside the 2:00 PM window (`lateEntryBubbleOf` = index.ts `qualifierLateEntryBubbleOf`, assigned at boot); once closed `addLateEntrant` / `reinstateForReentry` refuse at their top and `registerQualifierTournament` refuses `registration_closed` (reason `seat_bubble`) BEFORE any credit is consumed, refunding any consume a close overtook (re-checked after EVERY await that follows a consume). A NEW late-entry / re-entry path must read `tournamentManager.lateEntryClosedAtBubble(tid)` before it consumes and again after its last await, and must never un-eliminate a refused reinstatement. Hand-for-hand treats the bubble close as "late registration closed". Section "Online qualifier LATE CLOSE AT THE SEAT BUBBLE, HELD SEEDS, HELP TOOLS OFF". | owner 2026-10-23 |
 
 ## Surface area
 
@@ -213,6 +214,11 @@ credits and each entry consume a credit". Each rule is ONE constant in
   `/qualifiers/schedule` must keep listing an open event for at least that
   long after its start, or an event still waiting for 2 players is cancelled
   `removed_from_schedule` early (a RUNNING event is never affected).
+  **2026-10-24 (owner 2026-10-23: "Fix both"): late entry and re-entry ALSO
+  close the moment the SEAT BUBBLE is reached, whichever comes first** — see
+  "Online qualifier LATE CLOSE AT THE SEAT BUBBLE, HELD SEEDS, HELP TOOLS OFF"
+  below. `lateRegUntil` / `signupClosesAt` stay the 2:00 PM contract; the lobby's
+  `lateRegOpen` / `signupOpen` say whether it is open NOW.
 - `QUALIFIER_MAX_REENTRIES` (null = no cap): a busted entrant re-enters as
   often as he holds an unused credit of the tier. Every entry (the first and
   each re-entry) consumes exactly ONE credit through the master's atomic
@@ -1095,10 +1101,15 @@ hand-for-hand =====`) plus the pure `qualifierSchedule.ts` helpers and
   - the switch is on and the event has not tripped its watchdog;
   - the tournament is running and is a qualifier (`qualifierOfTournament`);
   - its late registration has CLOSED: `now > lateRegUntil` (strict; scheduledAt
-    + 180 min — 2:00 PM Denver on Sunday). After the close no late entry or
-    re-entry can shift a place, so re-placing a round's busts among their own
-    numbers keeps places a permutation of 1..N. A registry row with no
-    `scheduledAt` gives NaN: it never engages;
+    + 180 min — 2:00 PM Denver on Sunday) **OR, since 2026-10-24, late entry
+    closed AT THE SEAT BUBBLE** (`handForHandInputs.lateRegClosed` =
+    `TournamentManager.lateEntryClosedAtBubble(tid)`; section "Online qualifier
+    LATE CLOSE AT THE SEAT BUBBLE …" below) — so when the bubble is reached
+    inside the window the gate engages at the next hand boundary. After the
+    close no late entry or re-entry can shift a place, so re-placing a round's
+    busts among their own numbers keeps places a permutation of 1..N. A registry
+    row with no `scheduledAt` gives NaN: it never engages (and never closes at
+    the bubble either);
   - two or more tables are in play (live tournament tables with >= 1 alive);
   - `alive === seatsForTop + 1` AND `alive > 9` (a field that fits one table
     belongs to Rule 1). The weekly default (top 3) and the monthly (top 6) never
@@ -1344,6 +1355,122 @@ hand-for-hand =====`) plus the pure `qualifierSchedule.ts` helpers and
   (3) the end reason is re-checked after the round-start break; (4) the extra
   release reason `not_bubble`; (5) the places log + durable audit are written for
   every non-empty batch (a single bust too), with `running`.
+
+### Online qualifier LATE CLOSE AT THE SEAT BUBBLE, HELD SEEDS, HELP TOOLS OFF (2026-10-24)
+
+Owner 2026-10-23: "Fix both" (the late-reg close at the seat bubble and the
+running qualifier's fairness seeds), "Turn all off" (every help tool at a
+qualifier table), "Use the suggestions" (the rules page). The published rules
+(poker-3d `src/content/qualifierRules.js`): "Late entry and re-entry close at
+2:00 PM MT, or as soon as the seat bubble is reached, whichever comes first."
+and "For this qualifier, the seat bubble is reached when {bubble} players are
+left." All qualifiers (weekly and monthly), like hand-for-hand.
+
+**(A) Late entry + re-entry close at the seat bubble.** The interpretation
+(implemented exactly; change it only with the owner):
+
+- The bubble = `seatsForTop + 1`, read LIVE from the event's seat package at each
+  elimination (`qualifierLateEntryBubbleOf`; Sunday's top 10 → 11; the weekly
+  default top 3 → 4; the monthly top 6 → 7).
+- The bubble is REACHED by an ELIMINATION that takes the alive count from above
+  the bubble to the bubble or below, while `now <= lateRegUntil`.
+- Each elimination removes exactly one player, so a double bust that skips past
+  the bubble still passes through it on the first of the two eliminations. It
+  counts.
+- A field that never went above the bubble stays open until 2:00 PM (everyone
+  left already wins a seat; late entrants can still come — and the published
+  place shift still applies: an 11-entrant field, top 10, can push a 10th-place
+  buster to 11th by a later late entry, "you move down one place").
+- A no-show release or an undone seat (`removeLateEntrant`) never counts.
+- Once closed, it never reopens for that event.
+- Why crossing-at-elimination and not "the largest field ever seen": 30 players
+  seated at 10:50 with 20 no-shows released at 11:00 leaves 10. That field never
+  played above the bubble.
+
+How:
+
+- **TournamentManager** decides, atomically: `eliminatePlayer` calls
+  `closeLateEntryIfBubbleReached` right after the place is set and BEFORE the
+  bounty and `'playerEliminated'` — it asks `lateEntryBubbleOf(tid)` (a resolver
+  throw is counted, closes nothing), requires an integer `closeAtAlive >= 2`, a
+  finite `openUntil`, `now <= openUntil` and the crossing (`alive + 1 >
+  closeAtAlive && alive <= closeAtAlive`), sets `Tournament.lateEntryClosed =
+  {at, alive, closeAtAlive, playerId}` FIRST, then emits
+  `'lateEntryClosedAtBubble'` (a throwing listener is logged
+  `late_entry_closed_listener_failed` and never breaks the elimination).
+  `lateEntryClosedAtBubble(tid)` reads it. Second lock: `addLateEntrant` returns
+  null and `reinstateForReentry` false AT THEIR TOP once closed (no push, no place
+  shift: places stay 1..N; `lockRefusals`). index.ts assigns
+  `tournamentManager.lateEntryBubbleOf = qualifierLateEntryBubbleOf` at boot;
+  every other tournament gets null and never closes.
+- **The listener** (bootstrap `'lateEntryClosedAtBubble'` branch →
+  `noteQualifierLateRegClosedAtBubble`, never throws): log
+  `[Qualifier] {"event":"qualifier_late_reg_closed_at_bubble", qualifierId,
+  tournamentId, alive, seatsForTop, bubble, lateRegUntil, closedAt, playerId}` +
+  durable audit `QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE` (same fields) at once; then,
+  via `setImmediate` (never inside the bust check), every table room gets the
+  existing toast `serverAnnouncement {message, kind:'late_reg_closed',
+  tournamentId, qualifierId, at}` ("Late entry and re-entry are now closed: 11
+  players are left and the top 10 win seats.") and every lobby
+  `qualifierTournamentUpdate {…, lateRegOpen:false, lateRegClosedAt,
+  lateRegClosedReason:'seat_bubble'}`.
+- **The handler** (`registerQualifierTournament`; `closedAtBubble()` is a closure
+  over the TournamentManager member — harnesses that slice the handler keep
+  working): (a) a running event that is closed is refused `registration_closed`
+  `{reason:'seat_bubble', lateRegClosedAt}` with
+  `QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT` BEFORE the qualification read and before
+  any credit (every tap after the close: the buster's own re-entry, concurrent
+  taps, a new late entry — `refusedBeforeConsume`); re-checked again right BEFORE
+  each consume (after the qualification read / the chip deduct — deviation from
+  the design, stated: a close landing during those awaits is refused without
+  consuming at all); (b) the re-entry, after its consume → refund
+  (`refundQualifierReentryCharges`, reason `late_reg_closed_bubble`); (c) the late
+  first entry after its consume (`lateNow`) AND after its LAST await (after
+  `buyInSocketGone`, just before `seatQualifierLateEntrant`) → refund
+  (`refundQualifierEntryCredit`, `late_reg_closed_bubble`;
+  `refundedAfterConsume`); (d) the re-seat fallback that used to un-eliminate on a
+  refused `reinstateForReentry` now stands the seat up and takes the no_seat
+  refund when the event is closed (unreachable after (b); defensive). **A refused
+  late entry / re-entry never costs a credit**: the master's atomic consume always
+  precedes seating, and every refusal after it refunds through the existing
+  helpers. (Pre-existing, unchanged: a consume the master commits after
+  poker-server's 6 s abort is still lost — needs a master idempotency key.)
+- **Lobby item** (`qualifierListItem` → socket list, both REST
+  `/api/qualifier-tournaments` routes; reads only TournamentManager — the lobby
+  harnesses slice it alone): `lateRegClosesAtBubble: true` (capability flag the
+  poker-3d rules page reads), `lateRegOpen` (while running: `now <= lateRegUntil
+  && !closed`; else null), `lateRegClosedAt` (ISO | null), `lateRegClosedReason`
+  ('seat_bubble' | 'time' | null). `signupOpen` = registering ||
+  `lateRegOpen === true`. `lateRegUntil` / `signupClosesAt` are UNCHANGED (the 2 PM
+  contract — old cached bundles still offer Late Register until 2 PM; a tap is
+  refused before any consume). The `qualifierCancelled absent_at_start` notice's
+  `lateRegOpen` is false once closed at the bubble.
+- **Hand-for-hand:** `handForHandApplies` takes `lateRegClosed?: boolean`;
+  closed = `lateRegClosed === true || (finite lateRegUntil && now > lateRegUntil)`
+  (a finite `now` still required). So once the bubble is reached inside the
+  window, the gate engages at the next hand boundary (alive === 11, alive > 9, two
+  or more tables). A skip past the bubble (12 → 10) closes late entry but never
+  engages hand-for-hand, as before. The engaged log carries
+  `lateRegClosedAtBubble`.
+- **Health:** `r2Play.qualifiers.lateRegBubble` = {closed, resolverErrors,
+  lockRefusals, noticed, refusedBeforeConsume, refundedAfterConsume,
+  noticeErrors}. `resolverErrors` and `noticeErrors` should stay 0; `closed` is 0
+  or 1 per event.
+- **Tests:** `tests/qualifierLateRegBubble.test.ts` (LB1-LB6, the real
+  TournamentManager), `tests/r2Qualifiers.test.ts` LB7-LB13 (the real handler:
+  refused before consume, refunded after, the last-await re-check, never above the
+  bubble, the no-show notice, wiring), `tests/qualifierHandForHand.test.ts` HP7,
+  `tests/rebalanceSafety.test.ts` H18 / H19 (the real bust check → close →
+  engaged; a skip never engages). Every one fails on 9c37499.
+- **Manifest:** `qualifier_late_reg_closed_at_bubble`,
+  `QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE`, `lateRegClosesAtBubble`,
+  `late_reg_closed`.
+- **Risks (by design):** players who busted before the bubble and still hold
+  credits can no longer re-enter, even before 2 PM; hand-for-hand can start
+  earlier and last longer (lower blinds) — the 4-minute watchdog (extended up to
+  10) and `{"on":0}` cover a slow bubble. A package changed mid-event: an earlier
+  crossing stays closed; a bubble raised above the current alive count does not
+  close retroactively.
 
 ### Recovering a qualifier's finish order (the results POST never landed)
 

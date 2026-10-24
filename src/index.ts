@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT, QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -836,6 +836,10 @@ const tournamentManager = new TournamentManager();
 // else) = on. While the server runs: POST /api/qualifiers/breaks {on} (a
 // restart cancels a running qualifier — never change the env during one).
 tournamentManager.breaksEnabled = process.env.QUALIFIER_BREAKS !== '0';
+// 2026-10-24 (owner 2026-10-23: "Fix both") — late entry AND re-entry close at the
+// qualifier's SEAT BUBBLE (or 2:00 PM, whichever comes first): TournamentManager asks
+// each event's bubble at every elimination (non-qualifier tournaments: null, never).
+tournamentManager.lateEntryBubbleOf = qualifierLateEntryBubbleOf;
 
 // Track which socket is at which table/seat
 interface PlayerSession {
@@ -1210,6 +1214,9 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // create / delete chips; off by default now, rare when on) and a bug refund.
   'CASH_OUT_FAILED', 'INSURANCE_PAYOUT', 'INSURANCE_COLLECT', 'INSURANCE_VOID', 'BUG_REFUND',
   'QUALIFIER_REENTRY_CREDIT_CONSUME', 'QUALIFIER_REENTRY_CREDIT_REFUND',
+  // 2026-10-24 (owner 2026-10-23: "Fix both") — a qualifier's late entry / re-entry closed at
+  // the seat bubble (once per event; the moment every later entry is refused).
+  'QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE',
   // Batch 5 admin actions — chip/privilege/ban mutations need a durable trail.
   'ADMIN_ADJUST_CHIPS', 'ADMIN_IP_BAN', 'ADMIN_TOGGLE_ADMIN',
   'ADMIN_FORCE_CLOSE_TABLE', 'ADMIN_KICK',
@@ -3154,6 +3161,9 @@ app.get('/api/health', async (_req, res) => {
           // engaged = events playing it now; tripped = events a watchdog released (they
           // never re-engage until {on:true}); errors / watchdogReleases should stay 0.
           handForHand: handForHandHealth(),
+          // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry / re-entry closed at the
+          // seat bubble: closed = events closed there; resolverErrors / noticeErrors should stay 0.
+          lateRegBubble: { ...tournamentManager.lateEntryBubbleStats, ...qualifierLateRegBubble },
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
@@ -3735,6 +3745,17 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     : null;
   const reEntryCap = qt.maxReEntries ?? QUALIFIER_MAX_REENTRIES;
   const structure = qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK);
+  // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry + re-entry close at the SEAT
+  // BUBBLE or at 2:00 PM, whichever comes first. Read from TournamentManager only (no
+  // module helper: the lobby harnesses slice this function alone). lateRegOpen: while
+  // running, whether a late entry / re-entry is taken now (null otherwise); the reason and
+  // moment of the close ('seat_bubble' | 'time'); lateRegUntil / signupClosesAt stay the
+  // 2:00 PM contract.
+  const bubbleClose = qt.tournamentId ? (tournamentManager.lateEntryClosedAtBubble?.(qt.tournamentId) ?? null) : null;
+  const lateRegOpen = status === 'running' ? (now <= w.lateRegUntil && !bubbleClose) : null;
+  const lateRegClosedReason = bubbleClose ? 'seat_bubble' : (status === 'running' && now > w.lateRegUntil ? 'time' : null);
+  const lateRegClosedAt = bubbleClose ? new Date(bubbleClose.at).toISOString()
+    : lateRegClosedReason === 'time' ? new Date(w.lateRegUntil).toISOString() : null;
   return {
     qualifierId: id,
     masterQualifierId: qt.masterQualifierId ?? id,
@@ -3780,7 +3801,16 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     qualifierType: qt.qualifierType,
     qualifierName: qt.qualifierName,
     registeredCount: qt.players.length,
-    signupOpen: status === 'registering' || (status === 'running' && now <= w.lateRegUntil),
+    // 2026-10-24 — false once late entry closed at the seat bubble (was: running and before 2:00 PM).
+    signupOpen: status === 'registering' || lateRegOpen === true,
+    // 2026-10-24 (owner 2026-10-23: "Fix both") — additive. lateRegClosesAtBubble: this server
+    // closes late entry / re-entry at the seat bubble (poker-3d's rules page reads it);
+    // lateRegOpen / lateRegClosedAt / lateRegClosedReason: the live state (the card stops
+    // offering Late Register / Re-enter).
+    lateRegClosesAtBubble: true,
+    lateRegOpen,
+    lateRegClosedAt,
+    lateRegClosedReason,
   };
 }
 
@@ -3852,6 +3882,15 @@ const QUALIFIER_LEAVE_TABLE_FIRST = 'Leave your current table first, then enter 
 // and second re-entries of an account that was already back in (refunded).
 // Review fix-up — + entries refused on a credit the master gave to two calls at once (kept, not refunded).
 const qualifierLateEntries = { seated: 0, refundedNoSeat: 0, reentrySeatedOnBustedSeat: 0, reentryRefusedAlreadyBack: 0, sharedCreditKept: 0 };
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix both") — late entry / re-entry closed at the
+ * seat bubble (health r2Play.qualifiers.lateRegBubble, with TournamentManager's
+ * lateEntryBubbleStats): noticed = closes told (log + audit + notices);
+ * refusedBeforeConsume = taps refused before any credit was consumed;
+ * refundedAfterConsume = entries refused after their consume (the close landed
+ * while the master answered) — every one refunded; noticeErrors should stay 0.
+ */
+const qualifierLateRegBubble = { noticed: 0, refusedBeforeConsume: 0, refundedAfterConsume: 0, noticeErrors: 0 };
 
 /** R2 — the master's registration row for this event (so the master knows who entered). Fire-and-forget. */
 function persistQualifierRegistration(qt: QualifierTournamentReg, masterId: string): void {
@@ -4620,6 +4659,79 @@ function qualifierOfTournament(tournamentId: string): { qualId: string; qt: Qual
   return null;
 }
 
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix both") — LATE ENTRY AND RE-ENTRY CLOSE AT THE
+ * SEAT BUBBLE, or at 2:00 PM, whichever comes first (poker-3d rules page: "Late
+ * entry and re-entry close at 2:00 PM MT, or as soon as the seat bubble is
+ * reached, whichever comes first."). TournamentManager.lateEntryBubbleOf (assigned
+ * at boot) asks this at EVERY elimination: the event's bubble = seatsForTop + 1,
+ * read LIVE from its seat package (Sunday: top 10 → 11), and its 2:00 PM late
+ * close. null = not a qualifier (or no seat place / no scheduled time): it never
+ * closes at the bubble. The rule itself (an elimination that takes the alive count
+ * from above the bubble to it or below, inside the window; once closed, never
+ * reopened) is TournamentManager's; the handler refuses every later late entry /
+ * re-entry before any credit is consumed.
+ */
+function qualifierLateEntryBubbleOf(tournamentId: string): { closeAtAlive: number; openUntil: number } | null {
+  const q = qualifierOfTournament(tournamentId);
+  const seatsForTop = q ? seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage ?? null) : 0;
+  const openUntil = q ? qualifierWindows(new Date(q.qt.scheduledAt).getTime()).lateRegUntil : NaN;
+  if (!q || !(Number.isInteger(seatsForTop) && seatsForTop >= 1) || !Number.isFinite(openUntil)) return null;
+  return { closeAtAlive: seatsForTop + 1, openUntil };
+}
+
+/**
+ * 2026-10-24 — the bootstrap listener's 'lateEntryClosedAtBubble' branch: the
+ * close is logged (`qualifier_late_reg_closed_at_bubble`) and audited
+ * (QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE, durable) at once; then — OUTSIDE the bust
+ * check that raised it (setImmediate) — every table room of the event gets the
+ * existing toast ('serverAnnouncement' kind 'late_reg_closed') and every lobby the
+ * live card (qualifierTournamentUpdate lateRegOpen:false, lateRegClosedAt,
+ * lateRegClosedReason:'seat_bubble'). Never throws (it runs inside an elimination).
+ */
+function noteQualifierLateRegClosedAtBubble(
+  tournamentId: string,
+  data: { alive?: unknown; closeAtAlive?: unknown; playerId?: unknown; at?: unknown } | null | undefined,
+): void {
+  const failed = (where: string, e: unknown) => {
+    qualifierLateRegBubble.noticeErrors++;
+    try {
+      console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_late_reg_closed_notice_failed', tournamentId, where, error: String((e as any)?.message || e) })}`);
+    } catch (_) { /* never rethrow */ }
+  };
+  try {
+    qualifierLateRegBubble.noticed++;
+    const q = qualifierOfTournament(tournamentId);
+    const alive = Number(data?.alive);
+    const bubble = Number(data?.closeAtAlive);
+    const seatsForTop = q ? seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage ?? null) : bubble - 1;
+    const atMs = Number(data?.at);
+    const closedAt = new Date(Number.isFinite(atMs) && atMs > 0 ? atMs : Date.now()).toISOString();
+    const lateRegUntilMs = q ? qualifierWindows(new Date(q.qt.scheduledAt).getTime()).lateRegUntil : NaN;
+    const record = {
+      qualifierId: q ? q.qualId : null, tournamentId, alive, seatsForTop, bubble,
+      lateRegUntil: Number.isFinite(lateRegUntilMs) ? new Date(lateRegUntilMs).toISOString() : null,
+      closedAt, playerId: typeof data?.playerId === 'string' ? data.playerId : null,
+    };
+    console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_late_reg_closed_at_bubble', ...record })}`);
+    auditLog('SYSTEM', 'QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE', record);
+    setImmediate(() => {
+      try {
+        const live = qualifierOfTournament(tournamentId);
+        const message = qualifierLateRegClosedText(alive, seatsForTop);
+        for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
+          try {
+            io.to(`table:${tid}`).emit('serverAnnouncement', {
+              message, kind: 'late_reg_closed', tournamentId, qualifierId: live ? live.qualId : record.qualifierId, at: Date.parse(closedAt),
+            });
+          } catch (e) { failed('room_notice', e); }
+        }
+        if (live) broadcastQualifierUpdate(live.qualId, live.qt, { lateRegOpen: false, lateRegClosedAt: closedAt, lateRegClosedReason: 'seat_bubble' });
+      } catch (e) { failed('notices', e); }
+    });
+  } catch (e) { failed('note', e); }
+}
+
 /** R2 (C3) — one socket's account's own qualifier result (`myResult`), or null (not a finisher / not signed in). */
 function qualifierResultOf(qt: QualifierTournamentReg, auth: SocketAuthSession | undefined): { place: number; wonSeat: boolean; seats: number } | null {
   const master = auth ? String(auth.masterUserId || auth.statsMasterUserId || '') : '';
@@ -4944,9 +5056,12 @@ function tellQualifierNoShowReleases(socket: Socket, auth: SocketAuthSession, vi
     let told = 0;
     for (const n of list) {
       if (now - n.at >= QUALIFIER_NO_SHOW_NOTICE_TTL_MS) continue;
+      // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry also closes at the seat bubble.
+      const noShowTid = qualifierTournaments.get(n.qualifierId)?.tournamentId;
+      const closedAtBubble = noShowTid ? !!tournamentManager.lateEntryClosedAtBubble?.(noShowTid) : false;
       socket.emit('qualifierCancelled', {
         qualifierId: n.qualifierId, reason: 'absent_at_start', qualifierName: n.qualifierName,
-        lateRegUntil: new Date(n.lateRegUntil).toISOString(), lateRegOpen: now < n.lateRegUntil, creditRefunded: n.creditRefunded,
+        lateRegUntil: new Date(n.lateRegUntil).toISOString(), lateRegOpen: now < n.lateRegUntil && !closedAtBubble, creditRefunded: n.creditRefunded,
       });
       told++;
     }
@@ -12564,6 +12679,14 @@ io.on('connection', (socket: Socket) => {
     const [qualId, qt] = found;
     const refuseQualifier = (code: string, error: string, extra: Record<string, unknown> = {}) =>
       socket.emit('qualifierRegistrationResult', { success: false, code, error, qualifierId: qualId, ...extra });
+    // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry and re-entry ALSO close at the
+    // seat bubble (TournamentManager records it inside the elimination that reached it; it
+    // never reopens). Read through TournamentManager (no module helper) at every step below:
+    // before any credit is touched, and again after each await that follows a consume.
+    const closedAtBubble = () => (qt.tournamentId ? (tournamentManager.lateEntryClosedAtBubble?.(qt.tournamentId) ?? null) : null);
+    const refuseClosedAtBubble = (rec: { at: number }) => refuseQualifier('registration_closed', QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, {
+      reason: 'seat_bubble', lateRegClosedAt: new Date(rec.at).toISOString(),
+    });
 
     // Signup window (qualifierWindows): opens 3 hours before the start; closes
     // — late entry and re-entry included — QUALIFIER_LATE_REG_MS after it
@@ -12590,9 +12713,18 @@ io.on('connection', (socket: Socket) => {
     }
 
     // Late registration: the event is RUNNING and its late window is still open.
-    const isLateReg = qt.status === 'running' && !!qt.tournamentId && now <= windows.lateRegUntil;
+    // 2026-10-24 — and late entry has not closed at the seat bubble.
+    const bubbleClosedAtTap = qt.status === 'running' ? closedAtBubble() : null;
+    const isLateReg = qt.status === 'running' && !!qt.tournamentId && now <= windows.lateRegUntil && !bubbleClosedAtTap;
 
     if (qt.status !== 'registering' && !isLateReg) {
+      if (bubbleClosedAtTap) {
+        // 2026-10-24 — every tap after the close (the buster's own re-entry, concurrent
+        // taps, a new late entry): refused here, BEFORE any credit is consumed.
+        qualifierLateRegBubble.refusedBeforeConsume++;
+        refuseClosedAtBubble(bubbleClosedAtTap);
+        return;
+      }
       refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
       return;
     }
@@ -12709,6 +12841,17 @@ io.on('connection', (socket: Socket) => {
           if (await buyInSocketGone(socket, 'registerQualifierTournament_reentry', 'deduct', {
             userId: auth.userId, username: auth.username, amount: buyIn, action: 'QUALIFIER_REENTRY_BUYIN_REFUND',
           }, reentryState)) return;
+        }
+
+        // 2026-10-24 — the seat bubble may have been reached during the awaits above
+        // (the qualification read, the chip deduct): refused BEFORE the credit consume
+        // (a chip buy-in taken above goes back once).
+        const bubbleBeforeReentryConsume = closedAtBubble();
+        if (bubbleBeforeReentryConsume) {
+          qualifierLateRegBubble.refusedBeforeConsume++;
+          if (buyIn > 0) await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, null, 'late_reg_closed_bubble');
+          refuseClosedAtBubble(bubbleBeforeReentryConsume);
+          return;
         }
 
         // (c) Qualifier-credit consumption — atomic conditional update
@@ -12834,6 +12977,15 @@ io.on('connection', (socket: Socket) => {
           refuseQualifier('already_registered', 'Already registered and still playing', { registered: true });
           return;
         }
+        // 2026-10-24 — the seat bubble was reached while the master consumed: the credit
+        // goes back (never a credit without a seat), nothing is seated.
+        const bubbleAfterReentryConsume = closedAtBubble();
+        if (bubbleAfterReentryConsume) {
+          qualifierLateRegBubble.refundedAfterConsume++;
+          await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'late_reg_closed_bubble');
+          refuseClosedAtBubble(bubbleAfterReentryConsume);
+          return;
+        }
         if (!reentrant || qualifierTournaments.get(qualId) !== qt || qt.status !== 'running' || tournament.status !== 'running'
             || Date.now() > windows.lateRegUntil) {
           await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'registration_closed');
@@ -12862,6 +13014,9 @@ io.on('connection', (socket: Socket) => {
             breakPending: tournamentBreaksAwaitingHandEnd.get(tid) === qt.tournamentId,
           }))
           .sort((a, b) => (Number(a.breakPending) - Number(b.breakPending)) || (a.alive - b.alive));
+        // 2026-10-24 — set when TournamentManager refused the reinstatement because the
+        // event closed at the seat bubble (unreachable after the check above: defensive).
+        let reseatRefusedClosed = false;
         for (const { tid, table } of reentryTables) {
           if (!table) continue;
           for (let s = 0; s < 9; s++) {
@@ -12879,6 +13034,9 @@ io.on('connection', (socket: Socket) => {
             // busted after him move down one (they used to collide with the
             // next bust). Fallback keeps the old behaviour for a non-busted entry.
             if (tp && !tournamentManager.reinstateForReentry(qt.tournamentId!, existingEntry.playerId, startingStack)) {
+              // 2026-10-24 — closed at the seat bubble: never un-eliminate him. The seat is
+              // stood up again and the no_seat refund below returns every charge.
+              if (closedAtBubble()) { table.standUp(s); reseatRefusedClosed = true; break; }
               tp.eliminated = false; tp.chips = startingStack;
             }
             // Update socket session — or CREATE one (2026-10-10). A rebalance
@@ -12907,14 +13065,17 @@ io.on('connection', (socket: Socket) => {
             console.log(`[Tournament] Re-entry: ${existingEntry.playerName} seated at table ${tid} seat ${s}`);
             break;
           }
+          if (reseatRefusedClosed) break;
           if (seated) break;
         }
-        // 2026-10-22 (owner: "re entries if they have more credits") — no
-        // never-used seat left: a BUSTED seat, his own dead one first.
-        if (!seated && seatQualifierReentrantOnBustedSeat(socket, qt, tournament, existingEntry, startingStack)) seated = true;
-        // 2026-10-22 (owner: "Build it for Sunday") — every seat alive: a NEW
-        // (overflow) table for him; refused → the no_seat refund below, as before.
-        if (!seated && seatQualifierReentrantOnOverflowTable(socket, qt, tournament, existingEntry, startingStack)) seated = true;
+        if (!reseatRefusedClosed) {
+          // 2026-10-22 (owner: "re entries if they have more credits") — no
+          // never-used seat left: a BUSTED seat, his own dead one first.
+          if (!seated && seatQualifierReentrantOnBustedSeat(socket, qt, tournament, existingEntry, startingStack)) seated = true;
+          // 2026-10-22 (owner: "Build it for Sunday") — every seat alive: a NEW
+          // (overflow) table for him; refused → the no_seat refund below, as before.
+          if (!seated && seatQualifierReentrantOnOverflowTable(socket, qt, tournament, existingEntry, startingStack)) seated = true;
+        }
         if (!seated) {
           // Roll back every charge so the player isn't billed for a
           // seat they never got. Mirrors the BUY_IN_REFUND path at
@@ -12984,6 +13145,14 @@ io.on('connection', (socket: Socket) => {
       refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
       return;
     }
+    // 2026-10-24 — the seat bubble may have been reached during the qualification read:
+    // a late first entry is refused BEFORE its credit is consumed.
+    const bubbleBeforeEntryConsume = qt.status === 'running' ? closedAtBubble() : null;
+    if (bubbleBeforeEntryConsume) {
+      qualifierLateRegBubble.refusedBeforeConsume++;
+      refuseClosedAtBubble(bubbleBeforeEntryConsume);
+      return;
+    }
 
     // Consume a qualifier credit before registering (first-entry path) via the
     // master API — mirrors the re-entry block above. The consume is atomic
@@ -13018,7 +13187,9 @@ io.on('connection', (socket: Socket) => {
     // may have registered meanwhile (another tab), or the event moved on. The
     // credit just consumed goes back — never a credit without an entry.
     const dupe = qt.players.find((p) => p.masterPlayerId === masterId);
-    const lateNow = qt.status === 'running' && !!qt.tournamentId && Date.now() <= windows.lateRegUntil;
+    // 2026-10-24 — and late entry has not closed at the seat bubble meanwhile.
+    const bubbleAfterEntryConsume = qt.status === 'running' ? closedAtBubble() : null;
+    const lateNow = qt.status === 'running' && !!qt.tournamentId && Date.now() <= windows.lateRegUntil && !bubbleAfterEntryConsume;
     if (qualifierTournaments.get(qualId) !== qt || dupe || (qt.status !== 'registering' && !lateNow)) {
       // Review fix-up — the master (before mono d01522e6) gave the concurrent
       // registration that won the SAME credit: it pays for that entry and is
@@ -13027,9 +13198,14 @@ io.on('connection', (socket: Socket) => {
       if (sharedCredit) {
         qualifierLateEntries.sharedCreditKept++;
         auditLog(auth.username, 'QUALIFIER_ENTRY_CREDIT_SHARED_KEPT', { qualifierId: qualId, creditId: entryCreditId });
-      } else if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, dupe ? 'already_registered' : 'registration_closed');
+      } else if (entryCreditId) {
+        await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, dupe ? 'already_registered' : bubbleAfterEntryConsume ? 'late_reg_closed_bubble' : 'registration_closed');
+      }
       if (dupe) refuseQualifier('already_registered', 'You are already registered for this qualifier.', { registered: true });
-      else refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
+      else if (bubbleAfterEntryConsume && qualifierTournaments.get(qualId) === qt) {
+        qualifierLateRegBubble.refundedAfterConsume++;
+        refuseClosedAtBubble(bubbleAfterEntryConsume);
+      } else refuseQualifier('registration_closed', 'Tournament is no longer accepting registrations');
       return;
     }
 
@@ -13064,6 +13240,16 @@ io.on('connection', (socket: Socket) => {
       if (socketPlaysLiveSeatElsewhere(socket.id, '')) {
         if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, 'seated_elsewhere');
         refuseQualifier('already_seated', QUALIFIER_LEAVE_TABLE_FIRST);
+        return;
+      }
+      // 2026-10-24 — re-checked after the LAST await (buyInSocketGone): the seat bubble
+      // reached meanwhile → the credit goes back, nothing is seated. Synchronous from here
+      // until he is seated.
+      const bubbleBeforeLateSeat = closedAtBubble();
+      if (bubbleBeforeLateSeat) {
+        qualifierLateRegBubble.refundedAfterConsume++;
+        if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, 'late_reg_closed_bubble');
+        refuseClosedAtBubble(bubbleBeforeLateSeat);
         return;
       }
       let seat = seatQualifierLateEntrant(socket, qt, registrant);
@@ -24923,6 +25109,10 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[], opt
         console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_break_resume_failed', tournamentId, error: String((err as Error)?.message || err) })}`);
       }
     }
+    // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry / re-entry CLOSED at the seat
+    // bubble (TournamentManager, inside the elimination, BEFORE its 'playerEliminated'):
+    // logged + audited now, rooms and lobbies told outside the bust check. Never throws.
+    if (event === 'lateEntryClosedAtBubble') noteQualifierLateRegClosedAtBubble(tournamentId, data);
     if (event === 'playerEliminated') {
       // 2026-10-24 (hand-for-hand) — a bust of a hand-for-hand ROUND hand is told
       // when the round settles, with his FINAL place (placeAndTellHandForHandBusts):
@@ -27310,7 +27500,7 @@ function handForHandTablesInPlay(tournamentId: string): string[] {
 
 /** What the bubble test reads, or null (not a qualifier). A registry row with no scheduledAt gives NaN: never engages. */
 function handForHandInputs(tournamentId: string): {
-  qualifierId: string; now: number; lateRegUntil: number; alive: number; seatsForTop: number; tablesInPlay: number;
+  qualifierId: string; now: number; lateRegUntil: number; alive: number; seatsForTop: number; tablesInPlay: number; lateRegClosed: boolean;
 } | null {
   const q = qualifierOfTournament(tournamentId);
   if (!q) return null;
@@ -27322,6 +27512,9 @@ function handForHandInputs(tournamentId: string): {
     alive: tournamentManager.getAliveCount(tournamentId),
     seatsForTop: seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage ?? null),
     tablesInPlay: handForHandTablesInPlay(tournamentId).length,
+    // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry closed at the seat bubble
+    // (inside the 2:00 PM window): "late registration closed" for the gate too.
+    lateRegClosed: !!tournamentManager.lateEntryClosedAtBubble?.(tournamentId),
   };
 }
 
@@ -27369,7 +27562,7 @@ function engageHandForHand(tournamentId: string, inputs: NonNullable<ReturnType<
   console.log(`[Qualifier] ${JSON.stringify({
     event: 'qualifier_hand_for_hand_engaged', tournamentId, qualifierId: inputs.qualifierId, alive: inputs.alive,
     seatsForTop: inputs.seatsForTop, tables: inputs.tablesInPlay, lateRegUntil: new Date(inputs.lateRegUntil).toISOString(),
-    watchdogMs: handForHandWatchdogMsNow(),
+    watchdogMs: handForHandWatchdogMsNow(), lateRegClosedAtBubble: inputs.lateRegClosed,
   })}`);
   tellHandForHandRooms(tournamentId, qualifierHandForHandOnText(inputs.alive, inputs.seatsForTop), true);
   return st;
