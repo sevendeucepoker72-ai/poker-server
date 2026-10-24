@@ -24516,6 +24516,22 @@ function keepStartSeatAbsentForLiveSeatElsewhere(
  * TOURNEY-9), then the shared multi-table bootstrap (deal, listeners,
  * rebalance on eliminations).
  */
+/**
+ * 2026-10-24 (owner 2026-10-23: "Fix all"; Sit & Go fix-all F6) — a random
+ * seating order for a tournament start: a Fisher-Yates shuffle of 0..n-1 with
+ * crypto randomInt (the qualifier draw's algorithm). Sit & Gos used to seat in
+ * registration order with the first button on seat 0, every time (TDA wants a
+ * random draw). Not used by startQualifierTournament (it has its own draw).
+ */
+function drawSeatOrder(n: number): number[] {
+  const order = Array.from({ length: Math.max(0, Math.floor(n)) }, (_, k) => k);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = randomInt(i + 1);
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  return order;
+}
+
 function startRegisteredTournamentTables(tournamentId: string, startingChips: number, blinds: { sb: number; bb: number; ante: number }): void {
   const tournament = tournamentManager.getTournament(tournamentId);
   if (!tournament) return;
@@ -24529,7 +24545,10 @@ function startRegisteredTournamentTables(tournamentId: string, startingChips: nu
     tournamentTables.set(tid, tournamentId);
   }
   tournamentManager.setTableIds(tournamentId, tableIds);
-  tournament.players.forEach((tp, i) => {
+  // F6 (2026-10-24) — the round-robin follows a random draw (tournament.players keeps registration order).
+  const drawn = drawSeatOrder(tournament.players.length);
+  drawn.forEach((pi, i) => {
+    const tp = tournament.players[pi];
     const tid = tableIds[i % tableCount];
     const seatIdx = Math.floor(i / tableCount);
     const table = tableManager.getTable(tid);
@@ -24552,6 +24571,14 @@ function startRegisteredTournamentTables(tournamentId: string, startingChips: nu
       });
     }
   });
+  // F6 — each table's first button is drawn among its occupied seats.
+  for (const tid of tableIds) {
+    const t = tableManager.getTable(tid);
+    if (!t) continue;
+    const occ: number[] = [];
+    for (let s = 0; s < t.seats.length; s++) if (t.seats[s].state === 'occupied') occ.push(s);
+    if (occ.length > 0) t.presetFirstButton(occ[randomInt(occ.length)]);
+  }
   bootstrapTournamentTables(tournamentId, tableIds);
   console.log(`[Tournament] ${JSON.stringify({ event: 'registered_tournament_multi_table_start', tournamentId, players: tournament.players.length, tableCount })}`);
 }
@@ -24584,9 +24611,11 @@ function startTournamentGame(tournamentId: string): void {
   tournamentManager.setTableId(tournamentId, tableId);
   tournamentTables.set(tableId, tournamentId);
 
-  // Seat all players
-  for (let i = 0; i < tournament.players.length && i < 9; i++) {
-    const tp = tournament.players[i];
+  // Seat all players — F6 (2026-10-24): by a RANDOM DRAW (seat i gets the
+  // drawn player; tournament.players keeps registration order).
+  const seatOrder = drawSeatOrder(Math.min(tournament.players.length, 9));
+  for (let i = 0; i < seatOrder.length; i++) {
+    const tp = tournament.players[seatOrder[i]];
     table.sitDown(i, tp.playerName, result.startingChips, tp.playerId, false);
 
     // Create session for each player — 2026-10-10: only on a socket still
@@ -24627,8 +24656,8 @@ function startTournamentGame(tournamentId: string): void {
   try {
     const tName = tournament.config.name;
     const notifyTargets: Promise<void>[] = [];
-    for (let i = 0; i < tournament.players.length && i < 9; i++) {
-      const tp = tournament.players[i];
+    for (let i = 0; i < seatOrder.length; i++) {
+      const tp = tournament.players[seatOrder[i]];   // F6 — seat i holds the drawn player
       // 2026-10-10 — tp.socketId is now the registrant's OWN bound socket or ''
       // (bindRegistrantSocket), so this is never whoever took his old socket.
       const auth = authSessions.get(tp.socketId);
@@ -24663,6 +24692,8 @@ function startTournamentGame(tournamentId: string): void {
   // guarantees >= 2 registered players, so the table always has a live game.
   ensureTableProgressListener(table, tableId);
 
+  // F6 (2026-10-24) — the first button is drawn too (TDA), not always seat 0.
+  if (seatOrder.length > 0) table.presetFirstButton(randomInt(seatOrder.length));
   table.startNewHand();
   broadcastGameState(tableId);
   scheduleAIAction(tableId);

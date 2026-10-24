@@ -1014,8 +1014,14 @@ export class PokerTable extends EventEmitter {
 
     // First hand: pick first occupied seat as dealer button
     if (this.dealerButtonSeat === -1 || this.previousBigBlindSeat === -1 || freshTable) {
-      const firstOccupied = this.getNextOccupiedSeat(0);
+      let firstOccupied = this.getNextOccupiedSeat(0);
       if (firstOccupied === -1) return;
+      // 2026-10-24 (Sit & Go fix-all F6) — a tournament start draws the first
+      // button (presetFirstButton): taken on the table's very first deal when
+      // that seat is in play; otherwise the old first-occupied rule.
+      const preset = this._presetFirstButton;
+      this._presetFirstButton = -1;
+      if (this.dealerButtonSeat === -1 && preset >= 0 && occupied.includes(preset)) firstOccupied = preset;
       this.dealerButtonSeat = firstOccupied;
 
       // Initial blinds: SB is next occupied after button (or button itself in HU)
@@ -1399,6 +1405,16 @@ export class PokerTable extends EventEmitter {
     }
 
     this.currentBetToMatch = this.config.bigBlind;
+  }
+
+  /**
+   * 2026-10-24 (Sit & Go fix-all F6) — the first hand's button, drawn at a
+   * tournament start (index.ts startTournamentGame). Used once, on the table's
+   * first deal, if that seat is occupied and in play; else ignored.
+   */
+  private _presetFirstButton = -1;
+  presetFirstButton(seatIndex: number): void {
+    this._presetFirstButton = Number.isInteger(seatIndex) && seatIndex >= 0 && seatIndex < MAX_SEATS ? seatIndex : -1;
   }
 
   /**

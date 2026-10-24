@@ -253,6 +253,7 @@ function world(opts: { wallets?: Record<number, number> } = {}) {
     pushActivity() {}, uuidv4: () => `u-${++n}`, notifyPlayer: async () => {}, ensureTableProgressListener() {},
     broadcastGameState() {}, scheduleAIAction() {}, bootstrapTournamentTables() {}, detachSocketFromOtherTables() {},
     normalizeBackers, planEscrowRefund, planCashedSettlement, validateStakeOffer,
+    randomInt: require('crypto').randomInt,   // Sit & Go fix-all F6 (2026-10-24) — the start's seat draw
     console: { log() {}, warn() {}, error() {} },
   };
   const code = `${BINDINGS}\n${VIEWER}\n${REG}\n${REFUND_CANCELLED}\n${PRIZES}\n${START}\nfunction wire(socket) {\n  ${Object.values(H).join('\n  ')}\n}`;

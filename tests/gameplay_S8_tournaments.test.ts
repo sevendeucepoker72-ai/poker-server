@@ -56,7 +56,8 @@ beforeEach(() => { jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 
 afterEach(() => { jest.clearAllTimers(); jest.useRealTimers(); });
 
 // ═════════════════════════════════════════ tournament start + director pause ══
-const START = fnSrc('function startTournamentGame(') + '\n' + fnSrc('function startRegisteredTournamentTables(');
+// 2026-10-24 (Sit & Go fix-all F6) — + drawSeatOrder (the random seat draw; the scope's randomInt is the real crypto one).
+const START = fnSrc('function startTournamentGame(') + '\n' + fnSrc('function startRegisteredTournamentTables(') + '\n' + fnSrc('function drawSeatOrder(');
 // 2026-10-23 (qualifier lifecycle S3) — the handler's body is applyDirectorPause
 // (shared with POST /api/qualifiers/pause): the slice carries both, and the
 // F90 loop now sits in the top-level helper (two-space indent).
@@ -81,6 +82,7 @@ function startWorld(opts: { pause?: string; levels?: any[]; entrants?: number; m
     notifyPlayer: async () => {}, ensureTableProgressListener() {}, broadcastGameState() {}, scheduleAIAction() {},
     bootstrapTournamentTables() {}, scheduleAutoStart: (id: string) => { scheduled.push(id); },
     userIdForSeat: () => undefined, console: quiet,
+    randomInt: require('crypto').randomInt,   // F6
   };
   const pause = opts.pause ?? PAUSE;
   const { exports: m } = load(`${START}\nfunction wire(socket) {\n${pause}\n}`, scope, '{ startTournamentGame, wire }');

@@ -1800,3 +1800,6 @@ showdownMuckedSeats
 muckedAtShowdown
 # Sit & Go fix-all F5 - tournament / Spin & Go pots feed no chip-amount reward (pot missions, pot achievements, XP pot bonus, ticker).
 potCountsForWalletRewards
+# Sit & Go fix-all F6 - random seat draw + random first button when a Sit & Go / non-qualifier tournament starts.
+drawSeatOrder
+presetFirstButton

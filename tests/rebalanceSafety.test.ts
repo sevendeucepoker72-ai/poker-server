@@ -1133,7 +1133,8 @@ describe('minor (2026-10-10) — Omaha / Stud HI-LO hands reveal their deck seed
 
 describe('minor (2026-10-10) — a tournament start binds a registrant\'s seat only to a socket still signed in as HIM', () => {
   const HELPERS = slice('const registrantBindings = {', 'return bound;\n}\n');
-  const START = fnSrc('function startTournamentGame(');
+  // 2026-10-24 (Sit & Go fix-all F6) — + drawSeatOrder (the start's random seat draw).
+  const START = fnSrc('function startTournamentGame(') + '\n' + fnSrc('function drawSeatOrder(');
   const START_Q = fnSrc('function startQualifierTournament(');
   function harness(start: string) {
     const tm = new TournamentManager();
