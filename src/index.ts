@@ -24006,11 +24006,28 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
     // the room frame only named the winner. No isQualifier / wonSeat here: an
     // older client reads `wonSeat` as a qualifier result.
     const tiedOf = new Set<string>(((data?.results || []) as any[]).filter((r) => r?.tied).map((r) => String(r.playerId)));
+    // F19 (2026-10-24) — the results for ONE socket: its own row as it is; every
+    // other row without the local account id (`userId`) and the playerId that
+    // embeds it (`user-<id>`). The source rows are not modified (the prize /
+    // staking paths read them).
+    const finishResultsFor = (results: unknown, ownPlayerId: string | null): unknown => {
+      if (!Array.isArray(results)) return results;
+      return results.map((r: any) => {
+        if (!r || typeof r !== 'object') return r;
+        if (ownPlayerId !== null && r.playerId === ownPlayerId) return r;
+        const { userId: _u, playerId: _p, ...rest } = r;
+        return rest;
+      });
+    };
     for (const [sid, sock] of io.sockets.sockets) {
       if (!sock || !rooms.some((r) => sock.rooms?.has(r))) continue;
       const e = rec.entrants.find((x) => finishedEntrantIsAccount(x, authSessions.get(sid)));
       const myResult = e ? { place: e.position, prize: e.prize || 0, ...(tiedOf.has(e.playerId) ? { tied: true } : {}) } : null;
-      sock.emit('tournamentFinished', { ...data, myResult });
+      // F19 (2026-10-24, owner 2026-10-23: "Fix all") — no other entrant's LOCAL
+      // ACCOUNT ID: every row keeps playerName / position / payout / entryId /
+      // tied / disqualified; only THIS socket's own row keeps userId + playerId
+      // (`user-<id>`) - an older client finds its row by userId.
+      sock.emit('tournamentFinished', { ...data, results: finishResultsFor(data?.results, e?.playerId ?? null), myResult });
     }
   } else {
     const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop: seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage), seatPackage: q.qt.seatPackage || null };

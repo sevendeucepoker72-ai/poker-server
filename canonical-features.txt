@@ -1814,3 +1814,5 @@ stallCancelMs
 payoutTableOf
 prizeForEntrant
 payoutsProjected
+# Sit & Go fix-all F19 - the finish frame carries no other entrant's local account id (own row only).
+finishResultsFor
