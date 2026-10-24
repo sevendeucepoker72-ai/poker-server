@@ -1737,3 +1737,9 @@ qualifier_hand_for_hand_busts_placed
 # the tables still in their round hand (the drain).
 qualifier_hand_for_hand_watchdog_extended
 qualifier_hand_for_hand_drain_open
+# 2026-10-24 (owner: won pots "disappear") - insurance OFF unless ALLIN_INSURANCE=1; cash-out wallet push; one-time clawback refund
+process.env.ALLIN_INSURANCE
+cash_out_progress_push
+insurance_clawback_refund_2026_10_24
+# 2026-10-24 (owner: "Make the sit and gos not start until full") - Sit & Go 9, Turbo 6
+minPlayers: 9,

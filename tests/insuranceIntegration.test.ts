@@ -40,7 +40,7 @@ const HISTORY_LISTENER = slice("  table.on('handHistory', (history: HandHistoryR
 
 interface Socket { id: string; emitted: Array<[string, any]>; handlers: Record<string, (d?: any) => void>; emit: (ev: string, d: any) => void; on: (ev: string, fn: any) => void }
 
-function world() {
+function world(opts: { insuranceOff?: boolean } = {}) {
   const tables = new Map<string, PokerTable>();
   const playerSessions = new Map<string, any>();
   const multiTableSessions = new Map<string, any[]>();
@@ -77,7 +77,10 @@ function world() {
   const { exports: m, stubbed } = load(code, scope, `{
     tableKindOf, rebuyAllowedAt, rebuyRefusalAt, insuranceCandidates, ensureInsuranceHoldWired, insuranceQuoteForSeat,
     releaseInsuranceHold, settleInsuranceForHand, getGameStateForPlayer, registerInsurance, wireHandHistory,
-    insuranceOffers, insuranceStats, privateTableIds, clubTableIds, INSURANCE_DECISION_MS, lastInsuranceSettlement }`);
+    insuranceOffers, insuranceStats, privateTableIds, clubTableIds, INSURANCE_DECISION_MS, lastInsuranceSettlement, allInInsurance }`);
+  // 2026-10-24 — insurance is OFF by default (owner); these worlds exercise it switched ON
+  // (opts.insuranceOff keeps the production default).
+  m.allInInsurance.on = !opts.insuranceOff;
 
   const mkSocket = (id: string): Socket => {
     const s: Socket = {
@@ -408,6 +411,32 @@ describe('acceptInsurance -> the window ends -> the insured stack ends the hand 
     }
     expect(t.currentPhase).toBe(GamePhase.HandComplete);
     expect(w.audits.find((a) => a.action === 'INSURANCE_VOID')?.d).toMatchObject({ reason: 'other_hand' });
+  });
+});
+
+describe('2026-10-24 (owner: "Turn it off") — all-in insurance is OFF unless ALLIN_INSURANCE=1', () => {
+  it('production default: off at boot unless the env is exactly "1"', () => {
+    expect(SRC).toContain("const allInInsurance = { on: process.env.ALLIN_INSURANCE === '1' };");
+    expect(fnSrc('function insuranceCandidates(')).toContain('if (!allInInsurance.on) return [];');
+  });
+  it('off: the same pre-flop shove gets no candidate, no quote and no held runout; Accept is refused; the winner keeps the whole pot', () => {
+    const w = world({ insuranceOff: true });
+    const { t, hero } = w.mkTable();
+    expect(w.m.allInInsurance.on).toBe(false);
+    expect(t.startNewHand()).toBe(true);
+    w.rig(t, 'Ah Kh', 'Qs Qd', 'Ac 7d 9s 3h 4c');        // AK pairs the ace
+    w.play(t);
+    expect(w.m.insuranceCandidates('T1', t)).toEqual([]);
+    expect(t.isRunoutHeld()).toBe(false);
+    expect(w.m.insuranceOffers.size).toBe(0);
+    expect(w.m.insuranceStats.windows).toBe(0);
+    expect(w.m.insuranceQuoteForSeat('T1', t, 0)).toBeNull();
+    hero.handlers.acceptInsurance({ tableId: 'T1', handNumber: t.handNumber });
+    expect(w.m.insuranceStats.accepted).toBe(0);
+    expect(w.audits.filter((x) => x.action === 'INSURANCE_ACCEPTED' || x.action === 'INSURANCE_COLLECT')).toEqual([]);
+    expect(t.currentPhase).toBe(GamePhase.HandComplete);
+    expect(t.seats[0].chipCount).toBe(2000);              // the whole pot, never cut back
+    expect(t.seats[1].chipCount).toBe(4000);
   });
 });
 

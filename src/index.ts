@@ -224,6 +224,7 @@ import {
   monthDateRange, denverWeekRange, addDaysToDateKey, denverWallTimeToMs,
 } from './economy/denverTime';
 import { initEconomyTables, migrateUsersChipsToBigint } from './economy/schema';
+import { runInsuranceClawbackRefund, INSURANCE_REFUND_ID, InsuranceRefundOutcome } from './economy/insuranceClawbackRefund';
 import { userProgressKey, seasonXpOf } from './progression/ProgressionManager';
 
 // ========== Sentry (optional, prod-only crash reporting) ==========
@@ -1203,6 +1204,11 @@ function incrementChipVelocityAlert(userId: number): number {
 // 500s is upsizing the db-f1-micro tier — tracked separately.)
 const DURABLE_AUDIT_ACTIONS = new Set([
   'GRANT_CHIPS', 'RESTORE_BALANCE', 'BAN_USER', 'UNBAN_USER',
+  // 2026-10-24 (owner report: won pots "disappear") — a cash-out credit that
+  // failed (the stack is gone from the table and NOT in the wallet: the only
+  // record a refund can be made from), the all-in insurance settlements (they
+  // create / delete chips; off by default now, rare when on) and a bug refund.
+  'CASH_OUT_FAILED', 'INSURANCE_PAYOUT', 'INSURANCE_COLLECT', 'INSURANCE_VOID', 'BUG_REFUND',
   'QUALIFIER_REENTRY_CREDIT_CONSUME', 'QUALIFIER_REENTRY_CREDIT_REFUND',
   // Batch 5 admin actions — chip/privilege/ban mutations need a durable trail.
   'ADMIN_ADJUST_CHIPS', 'ADMIN_IP_BAN', 'ADMIN_TOGGLE_ADMIN',
@@ -3069,6 +3075,8 @@ app.get('/api/health', async (_req, res) => {
       // (a forfeit, another hand, a seat that changed hands); open = windows
       // waiting right now (each lasts at most INSURANCE_DECISION_MS).
       insurance: { ...insuranceStats, openWindows: insuranceOffers.size },
+      // 2026-10-24 — all-in insurance is off unless ALLIN_INSURANCE=1 (owner).
+      insuranceEnabled: allInInsurance.on,
       // 2026-10-12 — the per-network rules (owner: "loosen for pubs").
       network: { maxConnectionsPerIp: MAX_CONNECTIONS_PER_IP, sameNetworkSameTable: networkStats.sameNetworkSameTable },
       // R3 review (SF-B-3) — the economy's boot work and sweeps, visible to a
@@ -3081,6 +3089,10 @@ app.get('/api/health', async (_req, res) => {
         seasonSweeps: economyStats.seasonSweeps, seasonAwards: economyStats.seasonAwards, seasonSweepErrors: economyStats.seasonSweepErrors,
         chipsWonWrites: economyStats.chipsWonWrites, chipsWonWriteFailures: economyStats.chipsWonWriteFailures,
         freshReadFailures: economyStats.freshReadFailures,
+        cashOutPushes: economyStats.cashOutPushes,
+        insuranceRefund: insuranceRefundOutcome
+          ? { status: insuranceRefundOutcome.status, recipients: insuranceRefundOutcome.recipients, chips: insuranceRefundOutcome.chips, missing: insuranceRefundOutcome.missing.length }
+          : null,
       },
       // 2026-10-11 (.online R2, S2 engine lane) — table lifecycle counters:
       // seatTeardown (GAME-15/16: stand-ups deferred to the hand's end, all-in
@@ -9058,7 +9070,13 @@ function endCashReservation(
   if (!t) {
     const chips = reserved.chips ?? 0;
     if (chips > 0) {
-      addChipsToUser(userId, chips).catch((e: any) => console.warn(`[Reserve ${reason} cash-out ${userId}]`, e?.message));
+      // 2026-10-24 — audited both ways (a false result used to vanish) + the lobby bank refreshed.
+      addChipsToUser(userId, chips)
+        .then((ok: boolean) => {
+          auditLog(username, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId, tableId: reserved.tableId, amount: chips, reason: `reserve_${reason}_table_gone` });
+          if (ok) { try { refreshWalletAfterCashOut(userId); } catch { /* display only */ } }
+        })
+        .catch((e: any) => console.warn(`[Reserve ${reason} cash-out ${userId}]`, e?.message));
     }
     return chips;
   }
@@ -10839,6 +10857,17 @@ interface InsuranceOffer {
 const insuranceOffers = new Map<string, InsuranceOffer>();
 const insuranceStats = { windows: 0, quotes: 0, accepted: 0, declined: 0, refused: 0, releasedTimeout: 0, releasedDecided: 0, settled: 0, voided: 0 };
 
+/**
+ * 2026-10-24 (owner: "Turn it off") — all-in insurance is OFF unless the env
+ * ALLIN_INSURANCE is exactly '1'. An insured player who WON the pot was shown
+ * the whole pot, then cut back to his locked cashout (the rest left the
+ * economy): 65 clawbacks, 371,861 chips, 12 players since 2026-10-12, and the
+ * table never said why. Off = insuranceCandidates() is empty, so no window,
+ * quote, hold or settlement ever starts; Accept is refused as unavailable.
+ * The feature code stays so it can come back deliberately.
+ */
+const allInInsurance = { on: process.env.ALLIN_INSURANCE === '1' };
+
 const insuranceBoardKey = (table: PokerTable): string => table.communityCards.map((c) => `${c.rank}.${c.suit}`).join(',');
 
 /** Texas Hold'em proper: the base engine itself (every variant subclasses PokerTable). Dealer's Choice only relabels. */
@@ -10889,6 +10918,7 @@ function socketIdForSeat(tableId: string, seatIndex: number): string | undefined
  * (runOutBoard asking the decider, or the runout hold being in place).
  */
 function insuranceCandidates(tableId: string, table: PokerTable): Array<{ seatIndex: number; opponent: number }> {
+  if (!allInInsurance.on) return [];   // 2026-10-24 — off (owner)
   const kind = tableKindOf(tableId);
   if (!(kind === 'cash' || kind === 'private' || kind === 'club') || challengeTables.has(tableId)) return [];
   if (!isPlainHoldemTable(table)) return [];
@@ -11185,7 +11215,27 @@ const economyStats = {
   pushes: 0, freshReads: 0, freshReadFailures: 0, credits: 0, largeCredits: 0,
   seasonSweeps: 0, seasonAwards: 0, seasonSweepErrors: 0, lastSeasonSweep: null as null | { at: string; seasonKey: string; status: string },
   evicted: 0, chipsWonWrites: 0, chipsWonWriteFailures: 0, bigintMigration: 'pending' as string,
+  // 2026-10-24 — wallet pushes after a cash-out credit committed (refreshWalletAfterCashOut).
+  cashOutPushes: 0,
 };
+/** 2026-10-24 — the boot's one-time insurance clawback refund (null until it ran this boot). */
+let insuranceRefundOutcome: InsuranceRefundOutcome | null = null;
+
+/**
+ * 2026-10-24 (owner: "chips ... dont go in peoples banks") — after a cash-out
+ * credit COMMITS, push the account's fresh wallet to every live socket of it.
+ * No cash-out path pushed anything: the .online lobby bank (set only by
+ * 'playerProgress') kept showing the wallet minus the buy-in — the whole stack,
+ * winnings included, looked gone until a reload. Fire-and-forget; it never
+ * touches chips. Callers run it only on a credit that succeeded.
+ */
+function refreshWalletAfterCashOut(userId: number): void {
+  if (!Number.isInteger(userId) || userId <= 0) return;
+  economyStats.cashOutPushes++;
+  pushProgressToUser(userId, { fresh: true }).catch((e: any) => {
+    console.warn(`[cash_out_progress_push ${userId}] failed:`, e?.message || e);
+  });
+}
 
 /** Every live socket signed in as `userId`. */
 function socketIdsOfUser(userId: number): string[] {
@@ -12236,7 +12286,10 @@ function cleanupQuickTable(tableId: string): void {
           if (refund > 0) {
             quickGameStats.cashedOut++;
             addChipsToUser(owner.userId, refund)
-              .then((ok) => auditLog(owner.username, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: owner.userId, tableId, amount: refund, reason: 'quick_game_end' }))
+              .then((ok) => {
+                auditLog(owner.username, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: owner.userId, tableId, amount: refund, reason: 'quick_game_end' });
+                if (ok) { try { refreshWalletAfterCashOut(owner.userId); } catch { /* display only */ } }
+              })
               .catch(() => {});
           }
         } else if (owner && prizeFormat && seat.chipCount > 0) {
@@ -14901,7 +14954,10 @@ Give feedback in this JSON format:
             const refund = seat.chipCount + (inHand ? (seat.totalInvestedThisHand || 0) : 0);
             if (refund > 0) {
               addChipsToUser(owner.userId, refund)
-                .then((ok) => auditLog(owner.username, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: owner.userId, tableId: data.tableId, amount: refund, reason: 'admin_force_close' }))
+                .then((ok) => {
+                  auditLog(owner.username, ok ? 'CASH_OUT' : 'CASH_OUT_FAILED', { userId: owner.userId, tableId: data.tableId, amount: refund, reason: 'admin_force_close' });
+                  if (ok) { try { refreshWalletAfterCashOut(owner.userId); } catch { /* display only */ } }
+                })
                 .catch(() => {});
             }
           }
@@ -16935,6 +16991,9 @@ Give feedback in this JSON format:
         const current = await getUserChips(ctx.userId);
         if (onTable > 0 && current < REFILL_THRESHOLD) { await tableChipsRefusal(); return; }
         socket.emit('refillResult', { success: false, error: 'not_broke', chips: current });
+        // 2026-10-24 — he is not broke: his lobby bank was stale (a cash-out it never
+        // heard about). Push the real wallet so the "Low on chips" banner clears.
+        refreshWalletAfterCashOut(ctx.userId);
         return;
       }
       // R2 (C5) — the record mirrors the DB balance; the push reaches every socket of the account.
@@ -22087,6 +22146,8 @@ function creditSeatStackToWallet(
         auditLog(username, 'CASH_OUT_FAILED', { userId, tableId, amount: chips, reason: reason + '_returned_false' });
       } else {
         auditLog(username, 'CASH_OUT', { userId, tableId, amount: chips, reason });
+        // 2026-10-24 — the lobby bank shows the credited wallet at once (never fails the credit).
+        try { refreshWalletAfterCashOut(userId); } catch { /* display only */ }
       }
     })
     .catch((e: any) => {
@@ -28298,6 +28359,18 @@ initDB().then(async () => {
     console.error('[account-ops] schedule failed (sign-ins proceed):', e?.message || e);
     releaseIdentityGate('schedule_failed');
   }
+
+  // 2026-10-24 (owner) — one-time refund of the all-in insurance clawbacks
+  // (economy/insuranceClawbackRefund.ts): additive credits, exactly once (one
+  // transaction with its one_time_ops claim), so it is safe beside the previous
+  // container. Each credit: durable BUG_REFUND audit (+ the large-credit alert)
+  // and a fresh wallet push to any live socket of the account.
+  setTimeout(() => {
+    void runInsuranceClawbackRefund(getPool(), (userId, chips, hands) => {
+      auditEconomyCredit(userId, 'BUG_REFUND', chips, 0, { refundId: INSURANCE_REFUND_ID, hands, reason: 'insurance_clawback' });
+      refreshWalletAfterCashOut(userId);
+    }).then((o) => { insuranceRefundOutcome = o; });
+  }, 20_000).unref?.();
 
   // One-time chip recovery grant for admin — compensates for the
   // "disconnect wiped my wallet" bug (fixed in commit 03b5170). Guarded

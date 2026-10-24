@@ -261,6 +261,9 @@ const TOURNAMENT_TEMPLATES: TournamentTemplate[] = [
     buyIn: 100,
     prizePool: 900,
     maxPlayers: 9,
+    // 2026-10-24 (owner: "Make the sit and gos not start until full") — every seat
+    // taken, never the templates' default of 4 (startThreshold).
+    minPlayers: 9,
     startInterval: 0, // starts when full
     blindLevels: SNG_BLIND_LEVELS,
   },
@@ -269,6 +272,7 @@ const TOURNAMENT_TEMPLATES: TournamentTemplate[] = [
     buyIn: 250,
     prizePool: 2250,
     maxPlayers: 6,
+    minPlayers: 6,   // 2026-10-24 (owner) — starts only when full
     startInterval: 0,
     blindLevels: SNG_BLIND_LEVELS.map((l) => ({
       ...l,
