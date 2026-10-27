@@ -885,8 +885,9 @@ interface PlayerSession {
 
 const playerSessions = new Map<string, PlayerSession>();
 
-// Turn timeout: tableId -> { timeout, seatIndex, turnId }
-const turnTimers = new Map<string, { timeout: ReturnType<typeof setTimeout>; seatIndex: number; turnId: number }>();
+// Turn timeout: tableId -> { timeout, seatIndex, turnId, short }
+// 2026-10-26 — `short`: armed on the short absent clock (currentTurnTimeoutMs).
+const turnTimers = new Map<string, { timeout: ReturnType<typeof setTimeout>; seatIndex: number; turnId: number; short?: boolean }>();
 let globalTurnId = 0;
 const TURN_TIMEOUT_MS = 30000; // 30 seconds
 // 2026-10-09 (U4) — the turn clock of an ABSENT tournament seat that has run
@@ -3133,6 +3134,8 @@ app.get('/api/health', async (_req, res) => {
       engine: {
         seatTeardown: { ...seatTeardownStats, pendingTables: pendingSeatRemovalAfterHand.size },
         botStacks: { ...botStackStats, capBuyIns: BOT_STACK_CAP_BUYINS },
+        // 2026-10-26 (owner: "After 1") - tournament timeout sit-out + stale-table Sit Out / I'm back fallbacks.
+        tournamentTimeoutSitOut: { ...tournamentTimeoutSitOutStats },
         heartbeatRestarts: { ...heartbeatRestarts },
         botStripsPending: botStripAfterHand.size,
         bombPots: { ...bombPotStats },
@@ -6469,7 +6472,8 @@ function getGameStateForPlayer(
     })),
     activeSeatIndex: table.activeSeatIndex,
     turnStartedAt: turnStartedAtMap.get(table.config.tableId) ?? 0,
-    turnTimeout: TURN_TIMEOUT_MS,
+    // 2026-10-26 — the clock this turn is really on (3 s for an away seat), so the countdown matches.
+    turnTimeout: currentTurnTimeoutMs(table.config.tableId),
     dealerButtonSeat: table.dealerButtonSeat,
     // 2026-10-21 (gameplay S2 fix-up, F11 / F13) — the blind positions the
     // engine really chose, ALWAYS present (additive: an older client keeps
@@ -6872,13 +6876,21 @@ function seatHasLiveSession(tableId: string, seatIndex: number): boolean {
  * play, never cashed out). Before the limit the absent player keeps the full
  * clock (he may be reconnecting); after SEAT_RESERVE_MS the reservation is
  * gone and broadcastGameState's 500ms orphan auto-act takes over.
+ * 2026-10-26 (owner: "After 1") — so does a tournament reservation that SITS
+ * OUT: he left while sat out (his own Sit Out, a timed-out turn), or his turn
+ * ran out the clock while he was away (sitOutTournamentSeatAfterTimeout marks
+ * it). A dropped socket is not "I'm back": a qualifier player who timed out and
+ * then locked his phone used to get the full clock again for 20 hands.
+ * (isTournamentReservation includes prize-format — Spin & Go — reservations: one
+ * that left while sat out is on the short clock too; connected, such a seat is
+ * already acted for at 500 ms. Only tournament-table timeouts MARK one.)
  */
 function isAbsentTournamentSeatPastHandLimit(tableId: string, seatIndex: number): boolean {
   if (seatHasLiveSession(tableId, seatIndex)) return false;
   const now = Date.now();
   for (const r of reservedSeats.values()) {
     if (r.tableId === tableId && r.seatIndex === seatIndex && r.expiresAt > now) {
-      return r.handsRemaining <= 0 && isTournamentReservation(r);
+      return (r.handsRemaining <= 0 || r.sittingOut === true) && isTournamentReservation(r);
     }
   }
   return false;
@@ -7035,6 +7047,88 @@ function dropAbsentTimeoutStreaksOfTable(tableId: string): void {
   const prefix = `${tableId}:`;
   for (const k of [...absentTimeoutStreaks.keys()]) if (k.startsWith(prefix)) absentTimeoutStreaks.delete(k);
 }
+// --- Tournament timeout sit-out (owner 2026-10-26; inside this section so every harness that loads the absent clock has it) ---
+/**
+ * 2026-10-26 (owner, after the Sun Oct 25 weekly qualifier: "players who had
+ * their turn timer expire without acting didn't sit out and the sitout button
+ * didn't work" -> "After 1") — at a TOURNAMENT table (qualifiers included) ONE
+ * turn that runs out the clock sits the player out, exactly as his own Sit Out
+ * does (P-j): he stays dealt in, his blinds are posted, and from his next turn
+ * on he is acted for on the short absent clock (ABSENT_TOURNAMENT_SEAT_TURN_MS)
+ * until he taps I'm back ('playerBack') or acts himself.
+ *
+ * Earned: the Oct 25 qualifier had 707 timeouts by 36 players in 317 of 470
+ * hands (one player 52 in a row over two hours). A timeout never changed a
+ * connected player's state, so every one ran the full TURN_TIMEOUT_MS: hands
+ * with a timeout took 95-178 s against 79 s, ~210 of 820 table-minutes.
+ *
+ * Every session PLAYING the seat (not already sitting out) is marked. A seat
+ * with no session whose player is away on a live tournament reservation (a
+ * dropped socket) has the RESERVATION marked instead: short clock from his
+ * next turn (isAbsentTournamentSeatPastHandLimit) until he is back — a sign-in
+ * restores a tournament seat PLAYING, as always (P-j). A seat with neither
+ * keeps the absent rules (the 500 ms orphan act, F10). Cash, private and club
+ * tables are unchanged.
+ */
+const tournamentTimeoutSitOutStats = {
+  satOut: 0, sessionsMarked: 0, reservationsMarked: 0, backByAction: 0, shortClockRearmed: 0, awayMoved: 0,
+  sitOutFallbacks: 0, sitOutRefusals: 0, backFallbacks: 0, backRefusals: 0,
+};
+/** Sit out this tournament seat after its turn timed out: every session playing it, else his live reservation. True when one was. */
+function sitOutTournamentSeatAfterTimeout(tableId: string, seatIndex: number): boolean {
+  if (!isTournamentTable(tableId)) return false;
+  let marked = 0;
+  const mark = (sid: string, s: PlayerSession | undefined): void => {
+    if (!s || s.tableId !== tableId || s.seatIndex !== seatIndex || s.sittingOut) return;
+    s.sittingOut = true;
+    marked++;
+    io.sockets.sockets.get(sid)?.emit('sitOutToggled', { sittingOut: true, reason: 'timeout', tableId });
+  };
+  for (const [sid, s] of playerSessions) mark(sid, s);
+  for (const [sid, list] of multiTableSessions) for (const s of list || []) mark(sid, s);
+  let reservation = false;
+  if (marked === 0 && !seatHasLiveSession(tableId, seatIndex)) {
+    const now = Date.now();
+    for (const r of reservedSeats.values()) {
+      if (r.tableId !== tableId || r.seatIndex !== seatIndex || !(r.expiresAt > now)) continue;
+      if (isTournamentReservation(r) && !r.sittingOut) { r.sittingOut = true; reservation = true; }
+      break;
+    }
+  }
+  if (marked === 0 && !reservation) return false;
+  if (!sitOutTracker.has(tableId)) sitOutTracker.set(tableId, new Set());
+  sitOutTracker.get(tableId)!.add(seatIndex);
+  syncSitOutToTable(tableId);
+  tournamentTimeoutSitOutStats.satOut++;
+  tournamentTimeoutSitOutStats.sessionsMarked += marked;
+  if (reservation) tournamentTimeoutSitOutStats.reservationsMarked++;
+  log.info(`[Timer] ${JSON.stringify({ event: 'tournament_timeout_sit_out', tableId, seatIndex, sessions: marked, ...(reservation ? { reservation: true } : {}) })}`);
+  return true;
+}
+/** A sat-out tournament session is back (it acted itself): as 'playerBack'. */
+function returnTournamentSessionFromSitOut(sock: { emit: (ev: string, d: unknown) => unknown }, session: PlayerSession, reason: 'action'): void {
+  if (!session.sittingOut || !isTournamentTable(session.tableId)) return;
+  session.sittingOut = false;
+  sitOutTracker.get(session.tableId)?.delete(session.seatIndex);
+  syncSitOutToTable(session.tableId);
+  tournamentTimeoutSitOutStats.backByAction++;
+  sock.emit('sitOutToggled', { sittingOut: false, reason, tableId: session.tableId });
+}
+/**
+ * 2026-10-26 — the length of the clock the CURRENT turn is on, stamped as
+ * `turnTimeout` in every state (the client's countdown and seat rings are
+ * display-only and draw it). It was always TURN_TIMEOUT_MS: an away seat
+ * acted for at 3 s showed a 30 s countdown — now common (one timeout sits a
+ * tournament player out). A seat on the short clock that a session plays
+ * again (I'm back) shows the full clock: the fire-time re-check gives it the
+ * rest of TURN_TIMEOUT_MS.
+ */
+function currentTurnTimeoutMs(tableId: string): number {
+  const e = turnTimers.get(tableId);
+  if (!e || !e.short || seatHasPlayingSession(tableId, e.seatIndex)) return TURN_TIMEOUT_MS;
+  return ABSENT_TOURNAMENT_SEAT_TURN_MS;
+}
+// --- end tournament timeout sit-out ---
 // ===== end absent tournament seat clock =====
 
 function armTurnTimer(tableId: string): void {
@@ -7078,6 +7172,7 @@ function armTurnTimer(tableId: string): void {
         const entry = turnTimers.get(tableId);
         if (!entry || entry.turnId !== turnId) return;
         if (short && seatHasPlayingSession(tableId, activeSeat)) {
+          entry.short = false;
           entry.timeout = setTimeout(onTurnTimeout(false), Math.max(0, TURN_TIMEOUT_MS - (Date.now() - turnStartedAt)));
           return;
         }
@@ -7091,6 +7186,24 @@ function armTurnTimer(tableId: string): void {
         // (all_absent_hand_auto_call), else fold.
         const did = autoActForSeat(tableId, t, activeSeat, 'timeout');   // F3 — stamped auto: 'timeout'
         noteAbsentTimeout(tableId, t, activeSeat);   // F10 — one more timed-out hand for an absent seat
+        // 2026-10-26 (owner: "After 1") — a tournament player who let his clock
+        // run out is sat out now (after this turn was acted for): short clock
+        // from his next turn until I'm back. No-op for cash.
+        // Review fix-up — the check above can hand him the NEXT street's first
+        // turn at once (heads-up big blind → flop): that turn was armed inside
+        // autoActForSeat, before he was sat out, on the full clock. Re-armed
+        // now, on the short clock like every later turn of his (the
+        // reservation path's round-7 rule: short from the very next turn).
+        // (Not when that turn is already short: Back to Lobby's voluntary keep.)
+        if (sitOutTournamentSeatAfterTimeout(tableId, activeSeat) && t.isHandInProgress() && t.activeSeatIndex === activeSeat
+            && !turnTimers.get(tableId)?.short) {
+          const handedBack = turnTimers.get(tableId);
+          if (handedBack) clearTimeout(handedBack.timeout);
+          turnTimers.delete(tableId);
+          turnStartedSeatMap.delete(tableId);
+          armTurnTimer(tableId);
+          if (turnTimers.get(tableId)?.short) tournamentTimeoutSitOutStats.shortClockRearmed++;
+        }
         // 2026-10-10 — info, not debug: since the watchdog defers to a live
         // turn clock, this is THE record of every turn the server takes for a
         // player (the post-hotfix check needs to see them).
@@ -7099,7 +7212,7 @@ function armTurnTimer(tableId: string): void {
         scheduleAIAction(tableId);
       };
       const timeout = setTimeout(onTurnTimeout(useShortClock), useShortClock ? ABSENT_TOURNAMENT_SEAT_TURN_MS : TURN_TIMEOUT_MS);
-      turnTimers.set(tableId, { timeout, seatIndex: activeSeat, turnId });
+      turnTimers.set(tableId, { timeout, seatIndex: activeSeat, turnId, short: useShortClock });
 
       // 2026-08-25 — REMOVED the server-side push dispatch for `your_turn` and
       // `turn_warning`. The .online client already does this locally, and does
@@ -7149,6 +7262,14 @@ function broadcastGameState(tableId: string): void {
   if (!table) return;
   ensureTurnTimerWired(tableId);
   ensureInsuranceHoldWired(tableId, table); // R1 — the insurance decision window (cash Hold'em only)
+  // 2026-10-26 — arm the turn clock BEFORE the frames below stamp turnStartedAt /
+  // turnTimeout. A table dealt before its first broadcast (bootstrapTournamentTables,
+  // startTournamentGame, the quick games) had no 'turnChanged' listener yet, so its
+  // first turn was armed only by the tail call below — after every seated frame went
+  // out with turnStartedAt 0: the first actor saw a frozen 30, no countdown, no
+  // warning, then (owner "After 1") was folded and sat out. Idempotent (seatChanged
+  // guard): every turn the listener already armed is a no-op here.
+  armTurnTimer(tableId);
 
   // Send personalized state to each player at the table
   for (const [socketId, session] of playerSessions) {
@@ -7299,7 +7420,8 @@ function broadcastGameState(tableId: string): void {
   // still arms the clock, and a redundant call no-ops on the seatChanged
   // guard. See the armTurnTimer definition for the full history (the
   // "his turn doesn't pause no more" 2026-04-22 regression, R11 new-hand
-  // arming, and the #4 draw-phase skip).
+  // arming, and the #4 draw-phase skip). (2026-10-26: the same call at the top
+  // now arms first; this one stays as the net for anything the frames above changed.)
   armTurnTimer(tableId);
 
   // Hand-state checkpoint: snapshot to Redis so a Railway restart can
@@ -19829,6 +19951,10 @@ Give feedback in this JSON format:
         return;
       }
 
+      // 2026-10-26 (owner: a timeout sits a tournament player out "until they
+      // tap I'm Back") — a sat-out TOURNAMENT player who acts himself is back.
+      if (session.sittingOut && isTournamentTable(session.tableId)) returnTournamentSessionFromSitOut(socket, session, 'action');
+
       // R2 (C10) — the action is recorded for progression by the table's
       // 'playerAction' listener (ensureTableProgressListener), with the street
       // it was made on; recording it here read the already-advanced phase.
@@ -20379,7 +20505,8 @@ Give feedback in this JSON format:
   // already in changes nothing: `sitOutToggled { sittingOut, reason:
   // 'unchanged', tableId }`.
   socket.on('sitOut', async (data: { tableId?: string; sittingOut?: boolean } = {}) => {
-    const session = seatSessionFor(data?.tableId);
+    // 2026-10-26 — a stale tournament table id falls back to his only seat.
+    const session = seatSessionFor(data?.tableId) ?? tournamentSeatForStaleTable(data?.tableId, 'sitOut');
     if (!session) { notSeatedThere(data?.tableId); return; }
 
     const want = typeof data?.sittingOut === 'boolean' ? data.sittingOut : !session.sittingOut;
@@ -20447,7 +20574,8 @@ Give feedback in this JSON format:
   // ========== AFK Handler ==========
   // F156 (2026-10-21) — `{ tableId? }`: an unknown table is ignored (silent).
   socket.on('playerAFK', async (data: { tableId?: string } = {}) => {
-    const session = seatSessionFor(data?.tableId);
+    // 2026-10-26 — a stale tournament table id falls back to his only seat (as Sit Out).
+    const session = seatSessionFor(data?.tableId) ?? tournamentSeatForStaleTable(data?.tableId, 'sitOut');
     if (!session) return;
 
     const changed = !session.sittingOut;   // G181 (2026-10-21)
@@ -20481,7 +20609,8 @@ Give feedback in this JSON format:
   });
 
   socket.on('playerBack', async (data: { tableId?: string } = {}) => {
-    const session = seatSessionFor(data?.tableId);   // F156 — silent on an unknown table
+    // F156 — silent on an unknown table; 2026-10-26 — a stale tournament table id falls back to his only seat.
+    const session = seatSessionFor(data?.tableId) ?? tournamentSeatForStaleTable(data?.tableId, 'playerBack');
     if (!session) return;
 
     const changed = !!session.sittingOut;   // G181 (2026-10-21)
@@ -21556,6 +21685,22 @@ Give feedback in this JSON format:
     if (typeof tableId !== 'string' || !tableId) return false;
     socket.emit('error', { message: 'You are not seated at that table.', code: 'not_at_table', tableId });
     return true;
+  };
+  // 2026-10-26 (owner: "the sitout button didn't work" in the Oct 25 qualifier)
+  // — Sit Out / I'm back naming a table this socket holds NO seat at, from a
+  // socket whose ONLY seat is at a TOURNAMENT table: that seat (a rebalance or a
+  // table break moved him while his app still named the old table). Counted and
+  // logged either way; a cash or multi-seat socket keeps the F156 refusal.
+  const tournamentSeatForStaleTable = (tableId: unknown, op: 'sitOut' | 'playerBack'): PlayerSession | undefined => {
+    if (typeof tableId !== 'string' || !tableId) return undefined;
+    const main = playerSessions.get(socket.id);
+    const extras = (multiTableSessions.get(socket.id) || []).filter(Boolean);
+    const ok = !!main && extras.length === 0 && isTournamentTable(main.tableId);
+    if (op === 'sitOut') {
+      if (ok) tournamentTimeoutSitOutStats.sitOutFallbacks++; else tournamentTimeoutSitOutStats.sitOutRefusals++;
+    } else if (ok) tournamentTimeoutSitOutStats.backFallbacks++; else tournamentTimeoutSitOutStats.backRefusals++;
+    log.info(`[SitOut] ${JSON.stringify({ event: ok ? 'sit_out_stale_table_fallback' : 'sit_out_not_at_table', op, namedTableId: tableId, seatTableId: main?.tableId ?? null, extraSeats: extras.length })}`);
+    return ok ? main : undefined;
   };
   // F155 (2026-10-21) — THE resync answer of 'syncTableState' (after a
   // reconnect's sign-in) and 'requestState' (tab visible again / error
@@ -26754,6 +26899,7 @@ function moveTournamentSeatPointers(
   const atOldSeat = (sid: string, s: { tableId: string; seatIndex: number }): boolean =>
     s.tableId === fromTableId && (fromSeat >= 0 ? s.seatIndex === fromSeat : sid === tp?.socketId);
   let firstLive: string | null = null;
+  let movedSittingOut = false;   // 2026-10-26 — a moved session sits out (carryAwayStateOnMove)
   for (const [sid, s] of playerSessions) {
     if (!atOldSeat(sid, s)) continue;
     const sock = io.sockets.sockets.get(sid);
@@ -26767,6 +26913,7 @@ function moveTournamentSeatPointers(
     }
     s.tableId = toTableId;
     s.seatIndex = toSeat;
+    if (s.sittingOut) movedSittingOut = true;
     // 2026-10-24 (owner 2026-10-23: "Turn all off") — moved onto a qualifier table: training off.
     if (s.trainingEnabled && qualifierIdOfTable(toTableId)) { s.trainingEnabled = false; qualifierHelpToolsOff.sessionsForcedOff++; }
     sock.leave(`table:${fromTableId}`);
@@ -26780,7 +26927,10 @@ function moveTournamentSeatPointers(
     if (sid !== tp?.socketId) tournamentHandStartSafety.reconnectedSessionsMoved++;
     if (!firstLive) firstLive = sid;
   }
-  if (fromSeat < 0) return;
+  if (fromSeat < 0) {
+    if (movedSittingOut) carryAwayStateOnMove(fromTableId, fromSeat, toTableId, toSeat, true);
+    return;
+  }
   for (const [sid, list] of multiTableSessions) {
     const sock = io.sockets.sockets.get(sid);
     if (!sock || !sock.connected || notTheirs(authSessions.get(sid))) continue;
@@ -26793,17 +26943,46 @@ function moveTournamentSeatPointers(
       sock.join(`table:${toTableId}`);
     }
   }
+  let movedReservationSittingOut = false;
   for (const [uid, r] of reservedSeats) {
     if (r.tableId !== fromTableId || r.seatIndex !== fromSeat) continue;
     if (tp?.userId !== undefined && uid !== tp.userId) continue;
     if (tp?.userId === undefined && tp?.masterUserId && r.masterUserId && String(r.masterUserId) !== String(tp.masterUserId)) continue;
     r.tableId = toTableId;
     r.seatIndex = toSeat;
+    if (r.sittingOut) movedReservationSittingOut = true;
     tournamentHandStartSafety.reservationsMoved++;
   }
   if (tp && firstLive) tp.socketId = firstLive;
   // V4 — nobody plays this seat right now: tell his own sockets where it went.
   if (tp && !firstLive && tournamentId) noteAbsentTournamentSeatMoved(tournamentId, tp, toTableId, toSeat);
+  // 2026-10-26 — away at the old seat (a moved session sits out; or, nobody
+  // live moved, the old seat was AWAY or his reservation sits out): away at the new one.
+  const away = movedSittingOut || (!firstLive && (!!sitOutTracker.get(fromTableId)?.has(fromSeat) || movedReservationSittingOut));
+  carryAwayStateOnMove(fromTableId, fromSeat, toTableId, toSeat, away);
+}
+
+/**
+ * 2026-10-26 (review of the timeout sit-out) — a tournament stack MOVED
+ * (rebalance, table break, balance, lone-table feed) takes its AWAY state with
+ * it: the sit-out tracker drives the AWAY badge every player sees and
+ * liveSessionAt's absence test, and it is per table + seat. The moved session
+ * kept sittingOut (its short clock and its own "Sitting out" banner) but the
+ * new seat was shown present until he came back. The old seat's entry goes
+ * (its next occupant must not inherit it); a stale entry at the new seat goes
+ * when he is not away.
+ */
+function carryAwayStateOnMove(fromTableId: string, fromSeat: number, toTableId: string, toSeat: number, away: boolean): void {
+  if (fromSeat >= 0) sitOutTracker.get(fromTableId)?.delete(fromSeat);
+  if (away) {
+    if (!sitOutTracker.has(toTableId)) sitOutTracker.set(toTableId, new Set());
+    sitOutTracker.get(toTableId)!.add(toSeat);
+    tournamentTimeoutSitOutStats.awayMoved++;
+  } else {
+    sitOutTracker.get(toTableId)?.delete(toSeat);
+  }
+  syncSitOutToTable(toTableId);
+  if (fromTableId !== toTableId) syncSitOutToTable(fromTableId);
 }
 
 /**

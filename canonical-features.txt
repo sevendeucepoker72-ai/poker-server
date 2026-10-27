@@ -1868,3 +1868,12 @@ handLevelOfRecord
 # Sit & Go fix-all C2 review fix-up - durableState.tournamentResults from the durable F14 rows.
 durableTournamentResultsFor
 DURABLE_TOURNAMENT_RESULTS_WAIT_MS
+# 2026-10-26 (owner: "After 1") - one turn timeout sits a TOURNAMENT player out; Sit Out / I'm back
+# with a stale tournament table id fall back to the socket's only seat.
+tournament_timeout_sit_out
+sit_out_stale_table_fallback
+tournamentTimeoutSitOutStats
+carryAwayStateOnMove
+currentTurnTimeoutMs
+shortClockRearmed
+reservationsMarked

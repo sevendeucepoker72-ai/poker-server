@@ -342,7 +342,9 @@ describe('F64 — an extra table\'s frame never becomes the MAIN table\'s delta 
 // ══════════════════════════════════════════════════════════════════ F156 ══
 describe('F156 — table-scoped seat controls act on the seat at the NAMED table (main or extra), never the wrong one', () => {
   // F87 (2026-10-21, S6): sitOut SETS a boolean `sittingOut` (else toggles) — the resolver lines are unchanged.
-  const SITOUT_NEW = '    const session = seatSessionFor(data?.tableId);\n    if (!session) { notSeatedThere(data?.tableId); return; }\n\n    const want =';
+  // 2026-10-26 — the seat lookup also falls back to his only TOURNAMENT seat on a stale table id
+  // (tournamentSeatForStaleTable); this CONTROL still swaps the whole lookup for the pre-F156 one.
+  const SITOUT_NEW = "    const session = seatSessionFor(data?.tableId) ?? tournamentSeatForStaleTable(data?.tableId, 'sitOut');\n    if (!session) { notSeatedThere(data?.tableId); return; }\n\n    const want =";
   const SITOUT_OLD = '    const session = playerSessions.get(socket.id);\n    if (!session) return;\n\n    const want =';
 
   it('sitOut {tableId:B} while it is his turn at A: B sits out; his live hand at A is NOT folded', async () => {
