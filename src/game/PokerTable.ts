@@ -640,6 +640,14 @@ export class PokerTable extends EventEmitter {
   protected isSittingOut(seatIndex: number): boolean {
     return this._sittingOutSeats.has(seatIndex);
   }
+  /**
+   * 2026-10-28 — a COPY of the seat indices the engine treats as sitting out,
+   * for diagnostics only (index.ts logs it when a cash table's next deal is
+   * refused). Read-only: changes nothing the hand logic reads.
+   */
+  public sittingOutSeatIndices(): number[] {
+    return [...this._sittingOutSeats];
+  }
 
   /**
    * Mark seats in _sittingOutSeats that would naturally be due SB/BB this

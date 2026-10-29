@@ -88,6 +88,34 @@ export interface OAuthTokenResult {
   clientAuthFailed?: boolean;
 }
 
+// 2026-10-28 (error sweep, game-server: .online sign-in failed 'Auth server
+// timed out') — a request Cloud Run routes to a NEW auth-server instance waits
+// out its cold start (7-19 s measured, up to ~30 s: container start plus the
+// first requests held while the instance warms; since 2026-10-28 the
+// auth-server runs its key-rotation check after it listens, which shortens but
+// does not remove that wait), past the 5 s abort below. Both user-visible
+// failures in a week were exactly that; the warm instance answered in
+// 0.05-0.15 s at the same moment. Introspection is read-only (RFC 7662), so a
+// TIMED-OUT attempt is re-sent ONCE: it is routed again, most often to the
+// warm instance, or finds the new one listening. The
+// gain is the re-routing, not waiting out a cold boot, so the re-send's abort
+// is SHORTER (4 s). The normal path is unchanged (one request, 5 s). Only a
+// timeout is re-tried: an answer (401 / 5xx / inactive) or a network error is
+// returned as before. Worst case 5 + 4 = 9 s: under the 10 s watchdog of
+// poker-3d's legacy tokenLogin (it reaches this path with a bridge-stored
+// opaque token; that watchdog stops listening at 10 s) and the 15 s / 25 s
+// oauthLogin watchdogs. It is still longer than DEFAULT_LOGIN_WAIT_MS (6 s,
+// the play gate's and Sign Out's wait for a sign-in in flight): a sign-in
+// that succeeds on the re-send lands after that wait gave up, as any slow
+// sign-in already could.
+export const INTROSPECTION_TIMEOUT_MS = 5000;
+export const INTROSPECTION_RETRY_TIMEOUT_MS = 4000;
+const introspectionStats = { timedOut: 0, retried: 0, retrySucceeded: 0, retryTimedOut: 0 };
+/** Counts only — surfaced on /api/health as `authIntrospection`. */
+export function getIntrospectionStats(): typeof introspectionStats {
+  return { ...introspectionStats };
+}
+
 export async function validateOAuthToken(token: string): Promise<OAuthTokenResult> {
   // 2026-07-07 — JWT access tokens (resource=API_RESOURCE clients, incl. the
   // primary poker-3d "Sign in" + silent-SSO flow) are verified via JWKS, not
@@ -97,13 +125,33 @@ export async function validateOAuthToken(token: string): Promise<OAuthTokenResul
     return verifyJwtAccessToken(token);
   }
 
+  const first = await introspectOnce(token, INTROSPECTION_TIMEOUT_MS);
+  if (!first.timedOut) return first.result;
+  introspectionStats.timedOut++;
+  introspectionStats.retried++;
+  const second = await introspectOnce(token, INTROSPECTION_RETRY_TIMEOUT_MS);
+  if (second.timedOut) introspectionStats.retryTimedOut++;
+  else if (second.result.valid) introspectionStats.retrySucceeded++;
+  // eslint-disable-next-line no-console
+  console.warn(`[oauthValidator] ${JSON.stringify({
+    event: 'introspection_timeout_retried',
+    outcome: second.timedOut ? 'timed_out_again' : second.result.valid ? 'valid' : 'answered_invalid',
+    status: second.result.status ?? null,
+  })}`);
+  return second.result;
+}
+
+/** One introspection request, aborted after `timeoutMs`. timedOut = the abort fired (nothing was answered). */
+async function introspectOnce(token: string, timeoutMs: number): Promise<{ result: OAuthTokenResult; timedOut: boolean }> {
   // 5s hard timeout — if the auth server stalls we want to fail fast so
   // the client's `loginResult` timeout doesn't fire first with no error
   // message. Previously this fetch() had no timeout and would hang until
   // Node's default TCP timeout (~2 min), making every login appear to
   // "time out" even though the real failure was upstream.
+  // (2026-10-28: the first attempt's 5 s; a timed-out attempt is re-tried
+  // once, with a 4 s abort, by validateOAuthToken.)
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 5000);
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
     // Use token introspection endpoint (RFC 7662)
     const credentials = Buffer.from(`${CLIENT_ID}:${CLIENT_SECRET}`).toString('base64');
@@ -133,35 +181,44 @@ export async function validateOAuthToken(token: string): Promise<OAuthTokenResul
             '(see rotate-poker-server-secret.sh at workspace root).'
         );
         return {
-          valid: false,
-          error: 'Sign-in is temporarily unavailable — please try again in a few minutes',
-          status: 401,
-          clientAuthFailed: true,
+          result: {
+            valid: false,
+            error: 'Sign-in is temporarily unavailable — please try again in a few minutes',
+            status: 401,
+            clientAuthFailed: true,
+          },
+          timedOut: false,
         };
       }
-      return { valid: false, error: `Introspection failed (${response.status})`, status: response.status };
+      return { result: { valid: false, error: `Introspection failed (${response.status})`, status: response.status }, timedOut: false };
     }
 
     const data: any = await response.json();
 
     if (!data.active) {
-      return { valid: false, error: 'Token is not active' };
+      return { result: { valid: false, error: 'Token is not active' }, timedOut: false };
     }
 
     return {
-      valid: true,
-      sub: data.sub,
-      username: data.username || data.preferred_username,
-      phone: data.phone || data.phone_number,
-      isAdmin: data.is_admin === true,
+      result: {
+        valid: true,
+        sub: data.sub,
+        username: data.username || data.preferred_username,
+        phone: data.phone || data.phone_number,
+        isAdmin: data.is_admin === true,
+      },
+      timedOut: false,
     };
   } catch (err: any) {
     // Not an OAuth token or introspection unreachable — return invalid.
     // AbortError from the 5s timeout surfaces here as a generic failure.
     const isTimeout = err?.name === 'AbortError';
     return {
-      valid: false,
-      error: isTimeout ? 'Auth server timed out' : (err.message || 'Token validation failed'),
+      result: {
+        valid: false,
+        error: isTimeout ? 'Auth server timed out' : (err.message || 'Token validation failed'),
+      },
+      timedOut: isTimeout,
     };
   } finally {
     clearTimeout(timeoutId);

@@ -69,7 +69,7 @@ import { SevenStudTable } from './game/variants/SevenStudTable';
 import type { PineappleTable } from './game/variants/PineappleTable';
 import { VariantType } from './game/variants/PokerVariant';
 import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims } from './auth/authManager';
-import { validateOAuthToken, preflightIntrospection, getPreflightStatus } from './auth/oauthValidator';
+import { validateOAuthToken, preflightIntrospection, getPreflightStatus, getIntrospectionStats } from './auth/oauthValidator';
 import {
   resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
   parseStatsColumn, clearMasterIdentityStamp,
@@ -102,7 +102,7 @@ import {
   claimGuestProgress, peekGuestProgress, createPgGuestClaimDb, parseAchievements, claimResultFrame, isClaimableGuestRow,
   type GuestClaimDeps, type PgPoolLike,
 } from './auth/guestClaim';
-import { notifyPlayer } from './notifyClient';
+import { notifyPlayer, notifyClientStats } from './notifyClient';
 // 2026-10-11 (R1 contract #6) — crash safety: every socket listener is wrapped
 // (sync + async errors caught, non-object payloads refused before the body) and
 // the process logs unhandled rejections / flushes then exits on an uncaught one.
@@ -1797,10 +1797,16 @@ setInterval(() => {
 // qualifier credits are keyed on; userId is poker-server's OWN local users.id.
 // Stored at oauthLogin so getQualifications can match the master id, not the
 // local int. phone kept as a display/fallback match key.
-// 2026-10-07 — statsMasterUserId: the local row's stats.masterUserId, used ONLY
-// by the play gate (resolveMasterId) for sessions with no attested master id
-// (legacy HS256 tokenLogin, password login). It does NOT stand in for
-// masterUserId anywhere else — see GateSession in auth/playGate.ts.
+// 2026-10-07 — statsMasterUserId: the local row's stats.masterUserId, for
+// sessions with no attested master id (legacy HS256 tokenLogin, password
+// login); the play gate (resolveMasterId) reads it — see GateSession in
+// auth/playGate.ts.
+// 2026-10-28 (review) — corrected: it DOES stand in for masterUserId as an
+// ADDRESS / display key (pushes via masterUserIdForSeat, the same row stamp
+// notifyTournamentStart reads; seat / reservation / stats matching, as many
+// `masterUserId || statsMasterUserId` sites already do). It must never GRANT
+// a master-id-keyed privilege on its own (qualifier entry, credit redemption):
+// those require the attested masterUserId.
 // 2026-10-11 (R1 contract #3) — displayName: the ACCOUNT's display name (users.display_name,
 // else the row's public name), set by every sign-in and by setDisplayName; what
 // seatNameForSocket shows. `username` is NOT a display value (a phone, a slug, `m:<id>`).
@@ -2546,6 +2552,102 @@ function userIdForSeat(tableId: string, seatIndex: number): number | undefined {
   return undefined;
 }
 
+/**
+ * 2026-10-28 (error sweep: .online pushes never delivered) — the MASTER account
+ * id (the master API's users.id uuid) of the human in (tableId, seatIndex), the
+ * only id a push can go to (notifyPlayer -> master /internal/notify, which keys
+ * on it and, since 2026-10-28, answers anything else 400 invalid_user_id).
+ * userIdForSeat is poker-server's LOCAL integer id: the blind_level_up pushes
+ * sent it and every one died on 'invalid input syntax for type uuid' (477 in a
+ * week, 397 on the 10-25 qualifier, 0 ever delivered). Same order as
+ * notifyTournamentStart (F13): the tournament entrant's masterUserId, the bound
+ * socket's session (attested masterUserId, then its statsMasterUserId stamp -
+ * the value F13 reads from the row), the seat reservation's snapshot, the
+ * absent-seat cache. Never awaits, never a DB read. null = no master id known
+ * (the caller skips the push). An AI / empty seat: null.
+ */
+function masterUserIdForSeat(tableId: string, seatIndex: number, tournamentId?: string): string | null {
+  const seat = tableManager.getTable(tableId)?.seats[seatIndex];
+  if (!seat || seat.state !== 'occupied' || seat.isAI) return null;
+  const tp = tournamentId
+    ? tournamentManager.getTournament(tournamentId)?.players.find((p) => p.playerId === seat.playerId)
+    : undefined;
+  if (tp?.masterUserId) return String(tp.masterUserId);
+  let localUserId: number | undefined = tp?.userId;
+  for (const [socketId, session] of playerSessions) {
+    if (session.tableId !== tableId || session.seatIndex !== seatIndex) continue;
+    const a = authSessions.get(socketId);
+    // Never another account's id: an entrant's seat is his only while the
+    // bound session is his own account (F13's check).
+    if (a && (tp?.userId === undefined || a.userId === tp.userId)) {
+      const m = a.masterUserId || a.statsMasterUserId;
+      if (m) return String(m);
+      if (localUserId === undefined) localUserId = a.userId;
+    }
+    break;
+  }
+  if (localUserId !== undefined) {
+    const r = reservedSeats.get(localUserId);
+    if (r?.masterUserId) return String(r.masterUserId);
+    const hit = absentSeatMasterIds.get(localUserId);
+    if (hit?.masterId) return hit.masterId;
+  }
+  return null;
+}
+
+/**
+ * 2026-10-28 — the 'Blinds increasing' push of a tournament table's level-up,
+ * by MASTER id (masterUserIdForSeat). It was inlined, the same, in
+ * startTournamentGame and bootstrapTournamentTables and sent the local integer
+ * id (userIdForSeat). Recipients unchanged: every human seat with a bound,
+ * signed-in session (userIdForSeat still decides that). A seat with no master
+ * id known is skipped with one debug line. Fire-and-forget; never throws (a
+ * push failure must never break the blind-up state machine).
+ *
+ * 2026-10-28 (review) — OFF unless BLIND_LEVEL_PUSH_ENABLED=1 (exactly '1').
+ * This push had never once been delivered, so repairing the id alone would
+ * turn ON a new OS push at every level (every 5 min in a Sit & Go, ~400 on a
+ * qualifier Sunday, in bursts), with no deep link, to recipients who by the
+ * rule above have a bound session - players at the table, the case the
+ * 2026-08-25 your_turn removal (armTurnTimer) rejected: a server push is
+ * defensible only for an event the player is NOT on-screen for. Owner
+ * decision. While off, nothing is sent and `disabled` counts the pushes that
+ * WOULD have gone out (seats with a master id), so the volume is visible on
+ * /api/health before anyone turns it on.
+ */
+const blindLevelUpPushes = { sent: 0, noMasterId: 0, disabled: 0 };
+function notifyBlindLevelUp(tableId: string, tournamentId: string, newLevel: number): void {
+  try {
+    const t2 = tableManager.getTable(tableId);
+    if (!t2) return;
+    const enabled = process.env.BLIND_LEVEL_PUSH_ENABLED === '1';
+    const tableLabel = t2.config.tableName || 'your table';
+    for (let i = 0; i < t2.seats.length; i++) {
+      const seat = t2.seats[i];
+      if (!seat || seat.state !== 'occupied') continue;
+      if (seat.isAI || !seat.playerName) continue;
+      if (!userIdForSeat(tableId, i)) continue;
+      const masterId = masterUserIdForSeat(tableId, i, tournamentId);
+      if (!masterId) {
+        blindLevelUpPushes.noMasterId++;
+        log.debug(`[notifyPlayer blind_level_up] ${JSON.stringify({ event: 'blind_level_up_push_skipped_no_master_id', tableId, tournamentId, seatIndex: i })}`);
+        continue;
+      }
+      if (!enabled) { blindLevelUpPushes.disabled++; continue; }
+      blindLevelUpPushes.sent++;
+      void notifyPlayer(
+        masterId,
+        'blind_level_up',
+        'Blinds increasing',
+        `Level ${newLevel} now in play at ${tableLabel}`,
+        { priority: 'normal', metadata: { gameId: tableId, tournamentId, level: newLevel } }
+      );
+    }
+  } catch (err) {
+    console.warn('[notifyPlayer blind_level_up] hook failed:', (err as Error)?.message);
+  }
+}
+
 // Tournament table mapping: tableId -> tournamentId
 const tournamentTables = new Map<string, string>();
 
@@ -2951,6 +3053,10 @@ app.get('/api/health', async (_req, res) => {
       status: 'ok',
       tables: tableManager.getTableList().length,
       authClient: getPreflightStatus(),
+      // 2026-10-28 — token introspections that timed out on the first try and
+      // were re-tried once (cold-starting auth-server): retried / retrySucceeded
+      // / retryTimedOut. Counts only.
+      authIntrospection: getIntrospectionStats(),
       authTelemetry: getAuthTelemetryStatus(),
       // 2026-10-11 (AUTH-1) — mode 'master_id_only': rows are found by master
       // id; a master with no row gets a new `m:<sub>` row (created) or, with an
@@ -3136,7 +3242,16 @@ app.get('/api/health', async (_req, res) => {
         botStacks: { ...botStackStats, capBuyIns: BOT_STACK_CAP_BUYINS },
         // 2026-10-26 (owner: "After 1") - tournament timeout sit-out + stale-table Sit Out / I'm back fallbacks.
         tournamentTimeoutSitOut: { ...tournamentTimeoutSitOutStats },
-        heartbeatRestarts: { ...heartbeatRestarts },
+        // 2026-10-28 — handComplete is NOT a freeze count: it includes the
+        // benign re-seeds of a public table everyone left (~29 per 45 h) and
+        // keeps counting them. handCompleteWithHuman (the revivals of a table a
+        // human sits at) is the alarm: it should stay ~0.
+        // cashStartRefusals: cash deals startNewHand refused (log
+        // `cash_hand_start_refused`), how many were re-tried, and `emptied` (no
+        // human, fewer than 2 seated / an empty private table: counted, not
+        // logged) (noteRefusedCashStart).
+        heartbeatRestarts: { ...heartbeatRestarts, handCompleteWithHuman: heartbeatRestartsWithHuman.handComplete },
+        cashStartRefusals: { ...cashStartRefusals },
         botStripsPending: botStripAfterHand.size,
         bombPots: { ...bombPotStats },
         sitOutLimit: { ...sitOutLimitStats, hands: SIT_OUT_HANDS_LIMIT },
@@ -3155,6 +3270,12 @@ app.get('/api/health', async (_req, res) => {
         tournamentPrizes: { ...tournamentPrizeStats },
         tournamentCancelledNotices: { ...tournamentCancelledNotices },
         tournamentStartsKeptAbsent: tournamentStartsKeptAbsent.seats,
+        // 2026-10-28 — pushes by MASTER id: the start alert (F13), the blind
+        // level-up (sent / noMasterId = skipped, no master id known / disabled =
+        // would have been sent but BLIND_LEVEL_PUSH_ENABLED is not '1', the
+        // default; enabled = that flag) and what the master answered
+        // (notifyClient: rejected = its 400, should stay 0).
+        pushes: { tournamentStart: { ...tournamentStartAlerts }, blindLevelUp: { ...blindLevelUpPushes, enabled: process.env.BLIND_LEVEL_PUSH_ENABLED === '1' }, notify: notifyClientStats() },
         // 2026-10-23 (qualifier lifecycle S1) — tournament tables whose start
         // (listener / first deal / broadcast / AI kick) threw and were skipped
         // (log `tournament_table_bootstrap_failed`). Should stay 0.
@@ -9296,6 +9417,91 @@ function autoStartNextHand(tableId: string): void {
 
     broadcastGameState(tableId);
     scheduleAIAction(tableId);
+  } else if (!tId) {
+    // 2026-10-28 — a refused deal on a CASH table is logged and tried again
+    // (noteRefusedCashStart), not left to the 12 s heartbeat.
+    noteRefusedCashStart(tableId, table);
+  }
+}
+
+/**
+ * 2026-10-28 (error sweep, game-server: "cash tables still freeze in
+ * HandComplete and are only revived by the 12 s heartbeat", counter 29 where
+ * it should stay ~0) — when autoStartNextHand's startNewHand() REFUSED the deal
+ * on a ring CASH table (fewer than 2 active stacks: seats sitting out, a busted
+ * human, the bots stripped after the last human left; or a transient refusal,
+ * the previous hand still completing) nothing was logged and nothing was
+ * scheduled: the table rested in HandComplete until the heartbeat
+ * (ensureCashTableRunning, every 12 s) ran this step again and counted
+ * heartbeatRestarts.handComplete. Now:
+ *  - ONE structured line, `cash_hand_start_refused`, at the first refusal of
+ *    a streak (then one every CASH_START_REFUSAL_LOG_EVERY refusals of the same
+ *    streak): occupied / withChips / active / sittingOut / humans and the kind
+ *    of refusal, so the real trigger is visible in the logs. A streak ends when
+ *    the table deals a hand (its handNumber moves on) or stops being a table
+ *    the heartbeat keeps running (below) - so a new episode with no deal in
+ *    between (B sits out, leaves, C joins and sits out) logs its first line.
+ *  - the step is RESCHEDULED (1.5 s, then every 3 s) while the heartbeat would
+ *    revive this table too (2+ seated, not a private table nobody sits at) and
+ *    no start is already pending: a seat that sits back in, rebuys or joins is
+ *    dealt within 3 s, not up to 12 s. Fewer than 2 seated (the table emptied):
+ *    nothing to deal, not rescheduled — the heartbeat re-seeds it, as before.
+ *  - an EMPTIED table with no human (the last human left a public table and
+ *    its bots were stripped; a private table nobody sits at) is benign - the
+ *    heartbeat re-seeds it or the idle sweep removes it - so it is counted
+ *    (`emptied`) but NOT logged: the line stays about tables that should deal.
+ * Only WHEN the step runs changes: the step and the deal (startNewHand) are
+ * autoStartNextHand's own, unchanged — no hand logic, no chips. Never throws.
+ * Tournament and fixed-roster quick tables: never (their own flows own the deal).
+ */
+const CASH_START_RETRY_FIRST_MS = 1500;
+const CASH_START_RETRY_MS = 3000;
+const CASH_START_REFUSAL_LOG_EVERY = 100;
+const cashStartRefusals = { refused: 0, rescheduled: 0, notRescheduled: 0, emptied: 0 };
+const cashStartRefusalStreaks = new WeakMap<PokerTable, { streak: number; handNumber: number }>();
+function noteRefusedCashStart(tableId: string, table: PokerTable): void {
+  try {
+    if (isTournamentTable(tableId) || quickTables.has(tableId)) return;
+    if (table.currentPhase !== GamePhase.HandComplete) return;
+    const prev = cashStartRefusalStreaks.get(table);
+    const streak = prev && prev.handNumber === table.handNumber ? prev.streak + 1 : 1;
+    cashStartRefusalStreaks.set(table, { streak, handNumber: table.handNumber });
+    cashStartRefusals.refused++;
+    const seated = table.seats.filter((s) => s.state === 'occupied');
+    const out = new Set(table.sittingOutSeatIndices());
+    const withChips = seated.filter((s) => !s.eliminated && s.chipCount > 0);
+    const active = withChips.filter((s) => !out.has(s.seatIndex)).length;
+    const humans = seated.filter((s) => !s.isAI).length;
+    // ensureCashTableRunning's own rule: a private table nobody sits at is not kept running.
+    const heartbeatKeepsIt = seated.length >= 2 && !(privateTableIds.has(tableId) && humans === 0);
+    let retryInMs: number | null = null;
+    if (heartbeatKeepsIt && !pendingAutoStartTimers.has(tableId)) {
+      retryInMs = streak === 1 ? CASH_START_RETRY_FIRST_MS : CASH_START_RETRY_MS;
+      const t = setTimeout(() => {
+        pendingAutoStartTimers.delete(tableId);
+        autoStartNextHand(tableId);
+      }, retryInMs);
+      pendingAutoStartTimers.set(tableId, t);
+      cashStartRefusals.rescheduled++;
+    } else {
+      cashStartRefusals.notRescheduled++;
+    }
+    // Review fix 2026-10-28 — no longer a table the heartbeat keeps running:
+    // this refusal episode is over (a start already pending is NOT an end).
+    if (!heartbeatKeepsIt) cashStartRefusalStreaks.delete(table);
+    if (!heartbeatKeepsIt && humans === 0) { cashStartRefusals.emptied++; return; }
+    if (streak === 1 || streak % CASH_START_REFUSAL_LOG_EVERY === 0) {
+      const reason = table.isCompletingHand() ? 'completing_hand'
+        : table.isStartingHand() ? 'reentrant'
+          : active < 2 ? 'fewer_than_2_active' : 'refused';
+      console.log(`[AutoStart] ${JSON.stringify({
+        event: 'cash_hand_start_refused', tableId, handNumber: table.handNumber, streak, reason,
+        occupied: seated.length, withChips: withChips.length, active,
+        sittingOut: seated.filter((s) => out.has(s.seatIndex)).length, humans, retryInMs,
+      })}`);
+    }
+  } catch (e: any) {
+    console.warn('[AutoStart] refused-start follow-up failed:', e?.message || e);
   }
 }
 
@@ -9367,8 +9573,21 @@ function activateBombPotIfPending(tableId: string, table: PokerTable): boolean {
 //     scheduling and rebalancing.
 
 const LIVE_ROOM_MIN_OCCUPIED = 3;
-/** R2 (GAME-17) — hand-complete tables the heartbeat had to restart (each one was frozen). */
+/**
+ * R2 (GAME-17) — hand-complete tables the heartbeat had to restart.
+ * 2026-10-28 — NOT all frozen: this total also counts the benign re-seed of a
+ * public table everyone left (bots stripped, re-seeded by the heartbeat, dealt
+ * - ~29 per 45 h measured), and keeps counting those after the fix below, so
+ * it is no alarm. heartbeatRestartsWithHuman is the one that should stay ~0.
+ */
 const heartbeatRestarts = { handComplete: 0 };
+/**
+ * 2026-10-28 — the subset of heartbeatRestarts.handComplete where a HUMAN sits
+ * at the table (a player waited for the deal). The rest are re-seeds of a
+ * public table everyone left (bots stripped, re-seeded, dealt): benign, so the
+ * total alone could never alarm. With noteRefusedCashStart this should stay ~0.
+ */
+const heartbeatRestartsWithHuman = { handComplete: 0 };
 
 function backfillAIToMin(table: PokerTable, tableId: string, min: number): void {
   // No mid-hand roster changes — defer backfill to the between-hands window.
@@ -9440,6 +9659,7 @@ function ensureCashTableRunning(tableId: string): void {
     !table.isCompletingHand()
   ) {
     heartbeatRestarts.handComplete++;
+    if (tableHasHumanSeat(table)) heartbeatRestartsWithHuman.handComplete++;   // 2026-10-28
     autoStartNextHand(tableId);
     return;
   }
@@ -25385,29 +25605,9 @@ function startTournamentGame(tournamentId: string): void {
       // === Push notification: blind_level_up ===
       // Fan out to every human seat at this tournament table. Fire-and-forget;
       // notification failure must never break the blind-up state machine.
-      try {
-        const t2 = tableManager.getTable(tableId);
-        if (t2) {
-          const newLevel = data?.level ?? 0;
-          const tableLabel = t2.config.tableName || 'your table';
-          for (let i = 0; i < t2.seats.length; i++) {
-            const seat = t2.seats[i];
-            if (!seat || seat.state !== 'occupied') continue;
-            if (seat.isAI || !seat.playerName) continue;
-            const uid = userIdForSeat(tableId, i);
-            if (!uid) continue;
-            void notifyPlayer(
-              uid,
-              'blind_level_up',
-              'Blinds increasing',
-              `Level ${newLevel} now in play at ${tableLabel}`,
-              { priority: 'normal', metadata: { gameId: tableId, tournamentId, level: newLevel } }
-            );
-          }
-        }
-      } catch (err) {
-        console.warn('[notifyPlayer blind_level_up] hook failed:', (err as Error)?.message);
-      }
+      // 2026-10-28 — by MASTER id (notifyBlindLevelUp), never the local integer id;
+      // sent only with BLIND_LEVEL_PUSH_ENABLED=1 (owner decision, default off).
+      notifyBlindLevelUp(tableId, tournamentId, data?.level ?? 0);
     }
     if (event === 'tournamentFinished') {
       void payTournamentPrizes(data).catch(() => {}); // funded prize payouts + staking settlement (mint-free, idempotent)
@@ -26023,29 +26223,9 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[], opt
         // === Push notification: blind_level_up ===
         // Fan out to every human seat at this tournament table. Fire-and-forget;
         // notification failure must never break the blind-up state machine.
-        try {
-          const t2 = tableManager.getTable(tid);
-          if (t2) {
-            const newLevel = data?.level ?? 0;
-            const tableLabel = t2.config.tableName || 'your table';
-            for (let i = 0; i < t2.seats.length; i++) {
-              const seat = t2.seats[i];
-              if (!seat || seat.state !== 'occupied') continue;
-              if (seat.isAI || !seat.playerName) continue;
-              const uid = userIdForSeat(tid, i);
-              if (!uid) continue;
-              void notifyPlayer(
-                uid,
-                'blind_level_up',
-                'Blinds increasing',
-                `Level ${newLevel} now in play at ${tableLabel}`,
-                { priority: 'normal', metadata: { gameId: tid, tournamentId, level: newLevel } }
-              );
-            }
-          }
-        } catch (err) {
-          console.warn('[notifyPlayer blind_level_up] hook failed:', (err as Error)?.message);
-        }
+        // 2026-10-28 — by MASTER id (notifyBlindLevelUp), never the local integer id;
+        // sent only with BLIND_LEVEL_PUSH_ENABLED=1 (owner decision, default off).
+        notifyBlindLevelUp(tid, tournamentId, data?.level ?? 0);
         // 2026-10-23 (qualifier lifecycle S3) — the level clock in the table's
         // state follows the new level at once (a hand may run on for a while).
         try { broadcastGameState(tid); } catch (err) {
@@ -26263,14 +26443,20 @@ function startMultiTableTournament(
         // Fire-and-forget per registered human. Promise.allSettled wraps
         // the (currently single-human) fan-out so a failing subscription
         // never blocks tournament startup.
+        // 2026-10-28 — by MASTER id (masterUserIdForSeat: the session bound just
+        // above), never auth.userId (the local integer id the master cannot use);
+        // no master id known = no push (one debug line).
         try {
           const auth = authSessions.get(humanSocketId);
-          const uid = auth?.userId;
-          if (uid) {
+          const masterId = auth ? masterUserIdForSeat(tid, seatIdx, tournamentId) : null;
+          if (auth && !masterId) {
+            log.debug(`[notifyPlayer tournament_start] ${JSON.stringify({ event: 'tournament_start_push_skipped_no_master_id', tableId: tid, tournamentId, seatIndex: seatIdx })}`);
+          }
+          if (masterId) {
             const tableNum = tableIdx + 1;
             void Promise.allSettled([
               notifyPlayer(
-                uid,
+                masterId,
                 'tournament_start',
                 'Tournament starting',
                 `${tournament.config.name} is starting now — you're seated at Table ${tableNum}`,
