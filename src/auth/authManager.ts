@@ -453,6 +453,41 @@ export async function initDB(): Promise<void> {
     )
   `).catch((e: any) => console.warn('[Auth] qualifier_configs:', e.message));
 
+  // 2026-11-02 (.online tournament broadcast, P2-S4) — broadcast keys (src/broadcast/
+  // broadcastToken.ts): the jti and its metadata, NEVER the token string. Loaded at
+  // boot so a revocation survives a restart; a jti this process does not know is
+  // refused (fail-closed). issued_by_* = the signed-in admin who minted it.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS broadcast_tokens (
+      jti              TEXT PRIMARY KEY,
+      ev               TEXT NOT NULL,
+      scopes           TEXT[] NOT NULL,
+      label            TEXT NOT NULL DEFAULT '',
+      issued_by_master TEXT,
+      issued_by_user   INTEGER,
+      nbf              TIMESTAMPTZ NOT NULL,
+      exp              TIMESTAMPTZ NOT NULL,
+      revoked_at       TIMESTAMPTZ,
+      created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      parent_jti       TEXT
+    )
+  `).catch((e: any) => console.warn('[Auth] broadcast_tokens:', e.message));
+  // 2026-11-02 (broadcast review fix) — the producer key a key was minted from (bc:producer:mintKey):
+  // a child is capped at its parent's exp and revoked with it. Additive; NULL = minted by an admin.
+  await pool.query(`ALTER TABLE broadcast_tokens ADD COLUMN IF NOT EXISTS parent_jti TEXT`).catch((e: any) => console.warn('[Auth] broadcast_tokens.parent_jti:', e.message));
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_broadcast_tokens_exp ON broadcast_tokens(exp)`).catch(() => {});
+  // 2026-11-02 (broadcast P2-S9) — which event each broadcast channel shows
+  // (src/broadcast/programStore.ts): a producer's binding survives a mid-week
+  // redeploy. No row (or event_key NULL) = the channel's default.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS broadcast_channels (
+      channel    TEXT PRIMARY KEY,
+      event_key  TEXT,
+      updated_by TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `).catch((e: any) => console.warn('[Auth] broadcast_channels:', e.message));
+
   console.log('[Auth] Persistence sweep DDL applied');
 
   // 2026-10-11 (AUTH-8 / AUTH-15) — NO admin seed any more. Every boot used to
@@ -940,8 +975,12 @@ export async function getTotalUsers(): Promise<number> {
  * the hand-complete save of the per-user progress record uses it, so no save
  * (a stale entry, a second process) can ever lower a counter. Without it the
  * patch's keys overwrite (identity stamps, one-time flags).
+ * `opts.rethrow` (2026-11-02, broadcast P1-S1) — a failed merge is still rolled
+ * back and logged, then THROWN, for a caller that must tell the user it did not
+ * save (setBroadcastOptOut answers `save_failed`). Every existing caller omits it:
+ * unchanged, a failure resolves as before.
  */
-export async function mergeUserStats(userId: number, patch: Record<string, any>, opts: { monotonic?: boolean } = {}): Promise<void> {
+export async function mergeUserStats(userId: number, patch: Record<string, any>, opts: { monotonic?: boolean; rethrow?: boolean } = {}): Promise<void> {
   // Earned 2026-05-02 audit: pre-fix, this was a plain read-modify-write.
   // Two concurrent calls both read {handsWon: 5}, both write back, second
   // wins → first's increment lost. Now wrap SELECT + UPDATE in a transaction
@@ -975,9 +1014,46 @@ export async function mergeUserStats(userId: number, patch: Record<string, any>,
   } catch (e: any) {
     try { await client.query('ROLLBACK'); } catch { /* ignore */ }
     console.warn(`[mergeUserStats ${userId}] failed (nothing written):`, e?.message || e);
+    if (opts.rethrow) throw e;
   } finally {
     client.release();
   }
+}
+
+/**
+ * 2026-11-02 (.online tournament broadcast, P1-S1) — the per-player broadcast
+ * opt-out (`users.stats.broadcastOptOut`, written through mergeUserStats) of
+ * local rows, looked up by local id and / or by MASTER id (a qualifier entrant
+ * has no local id on the tournament record — only `masterUserId`). TEXT-safe
+ * and corrupt-row-safe like accountMerge.masterRowSql (pg_input_is_valid); a
+ * merged tombstone row is skipped. At most 500 ids of each kind. Local ids
+ * are a primary-key read; master ids need the stats expression (a scan of
+ * users on a TEXT column), so the broadcast cache asks by local id whenever it
+ * has one (every qualifier registrant records his localUserId) and by master id
+ * only for an entrant it has none for.
+ * THROWS on a DB error: the caller keeps those players unknown, which the
+ * broadcast shows as 'Player' (fail-closed).
+ */
+export async function loadBroadcastOptOuts(q: { userIds?: number[]; masterIds?: string[] }): Promise<Array<{ id: number; masterUserId: string | null; optOut: boolean }>> {
+  const userIds = [...new Set((q.userIds || []).filter((n) => Number.isInteger(n) && n > 0))].slice(0, 500);
+  const masterIds = [...new Set((q.masterIds || []).filter((s) => typeof s === 'string' && s.length > 0).map(String))].slice(0, 500);
+  const cols = `id,
+       CASE WHEN pg_input_is_valid(stats::text, 'jsonb') THEN (stats::text)::jsonb ->> 'masterUserId' END AS m,
+       CASE WHEN pg_input_is_valid(stats::text, 'jsonb') THEN (stats::text)::jsonb ->> 'broadcastOptOut' END AS o,
+       COALESCE(CASE WHEN pg_input_is_valid(stats::text, 'jsonb') THEN ((stats::text)::jsonb ? 'mergedInto') END, false) AS tomb`;
+  const out = new Map<number, { id: number; masterUserId: string | null; optOut: boolean }>();
+  const take = (rows: any[]) => {
+    for (const r of rows) if (!r.tomb) out.set(Number(r.id), { id: Number(r.id), masterUserId: r.m ? String(r.m) : null, optOut: r.o === 'true' });
+  };
+  if (userIds.length > 0) take((await pool.query(`SELECT ${cols} FROM users WHERE id = ANY($1::int[])`, [userIds])).rows);
+  if (masterIds.length > 0) {
+    take((await pool.query(
+      `SELECT ${cols} FROM users
+        WHERE (CASE WHEN pg_input_is_valid(stats::text, 'jsonb') THEN (stats::text)::jsonb ->> 'masterUserId' END) = ANY($1::text[])`,
+      [masterIds],
+    )).rows);
+  }
+  return [...out.values()];
 }
 
 export interface LeaderboardEntry {

@@ -368,6 +368,9 @@ function world(opts: WorldOpts = {}) {
     turnStartedHandMap: new Map(), turnStartedPhaseMap: new Map(), globalTurnId: 0, DrawPhases: [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3], GamePhase,
     TURN_TIMEOUT_MS, ABSENT_TOURNAMENT_SEAT_TURN_MS,
     qualifierIdOfTable: () => null,   // F10 — no qualifier tables in this world
+    // 2026-11-02 (broadcast P1-S6) — the seat restore's detach forces voice off on landing at a
+    // qualifier table: none here (tests/qualifierVoiceOff.test.ts tests it).
+    forceVoiceOffAtQualifierTable: () => 0,
   };
   const mod: { exports: any } = { exports: {} };
   // eslint-disable-next-line no-new-func

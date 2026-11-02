@@ -68,7 +68,7 @@ import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import type { PineappleTable } from './game/variants/PineappleTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims } from './auth/authManager';
+import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims, loadBroadcastOptOuts } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus, getIntrospectionStats } from './auth/oauthValidator';
 import {
   resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
@@ -109,6 +109,15 @@ import { notifyPlayer, notifyClientStats } from './notifyClient';
 import { installSocketListenerGuard, socketGuardStats } from './socketGuard';
 import { clientIpFromHandshake } from './net/clientIp';
 import { installProcessCrashHandlers, processCrashStats, CRASH_FLUSH_TIMEOUT_MS } from './processGuards';
+// 2026-11-02 (broadcast P1-S0) — the commit this build runs, on /api/health.
+import { deployedCommitOf } from './deployInfo';
+// 2026-11-02 (.online tournament broadcast, P1-S1 / P2) — the /broadcast namespace,
+// the broadcast names + per-player opt-out. src/broadcast/** (contract.ts = wire contract v1).
+import { registerBroadcast, type BroadcastHandle } from './broadcast/wire';
+import { createBroadcastOptOutStore, createBroadcastOptOutHandlers } from './broadcast/broadcastNames';
+// 2026-11-02 (broadcast P2-S4) — broadcast tokens: the signed-in admin's issuer + the registration refusal code.
+import { createBroadcastIssueHandler } from './broadcast/broadcastToken';
+import { BROADCAST_STAFF_CANNOT_ENTER } from './broadcast/contract';
 // 2026-05-12 audit: pino logger import. Hot-path console.log calls are
 // being migrated to log.debug so they mute under production pino level
 // (info+) without losing the field structure for ops/debug builds.
@@ -308,6 +317,10 @@ const io = new Server(httpServer, {
   pingInterval: 20_000,
   pingTimeout: 45_000,
 });
+// 2026-11-02 (.online tournament broadcast, P2-NS) — the /broadcast namespace handle:
+// assigned by registerBroadcast(io, …) at the end of this module ("Broadcast feed");
+// declared HERE so a hook call during boot (broadcastGameState) sees null, never a TDZ.
+let broadcastFeed: BroadcastHandle | null = null;
 
 const PORT = parseInt(process.env.PORT || '3001');
 
@@ -1221,6 +1234,15 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // 2026-10-24 (owner 2026-10-23: "Fix both") — a qualifier's late entry / re-entry closed at
   // the seat bubble (once per event; the moment every later entry is refused).
   'QUALIFIER_LATE_REG_CLOSED_AT_BUBBLE',
+  // 2026-11-02 (broadcast P1-S1) — an admin changed a player's broadcast opt-out (rare; a
+  // privacy setting changed on someone else's behalf needs the durable trail).
+  'BROADCAST_OPT_OUT_SET',
+  // 2026-11-02 (broadcast P2-S4) — a broadcast key minted / revoked (a credential: jti +
+  // metadata only, never the token). Rare (a producer panel open, an OBS key).
+  'BROADCAST_TOKEN_ISSUED', 'BROADCAST_TOKEN_REVOKED',
+  // 2026-11-02 (broadcast P5) — the delayed hole-card switch turned on / off (producer or
+  // POST /api/broadcast/holecards). Rare and security-relevant: who showed hole cards when.
+  'BROADCAST_HOLECARDS_SET',
   // Batch 5 admin actions — chip/privilege/ban mutations need a durable trail.
   'ADMIN_ADJUST_CHIPS', 'ADMIN_IP_BAN', 'ADMIN_TOGGLE_ADMIN',
   'ADMIN_FORCE_CLOSE_TABLE', 'ADMIN_KICK',
@@ -1812,7 +1834,11 @@ setInterval(() => {
 // seatNameForSocket shows. `username` is NOT a display value (a phone, a slug, `m:<id>`).
 // 2026-10-21 (gameplay F77) — secondary: this socket signed in with
 // skipSeatRecovery (a Multi-Table View per-table socket) — see ReservedSeat.secondary.
-const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null; displayName?: string | null; secondary?: boolean }>();
+// 2026-11-02 (.online tournament broadcast, P2-S4) — isAdminClaim: THIS login's own
+// OIDC is_admin claim (oauthLogin / tokenLogin set it; every other sign-in leaves it
+// unset = false). 'broadcastIssueToken' needs it AND isUserAdmin: the local is_admin
+// column is grant-only (never revoked here), the claim is what the master says NOW.
+const authSessions = new Map<string, { userId: number; username: string; masterUserId?: string; phone?: string; statsMasterUserId?: string | null; displayName?: string | null; secondary?: boolean; isAdminClaim?: boolean }>();
 
 /**
  * 2026-10-11 (R1 contract #3; audit AUTH-6, APPUI-13, TOURNEY-12) — the name
@@ -3051,6 +3077,19 @@ app.get('/api/health', async (_req, res) => {
     pruneBrokenTournamentTables(); // P8 — brokenTablesRetained counts only entries still retained
     res.json({
       status: 'ok',
+      // 2026-11-02 (broadcast P1-S0) — the git commit of this build (Railway
+      // RAILWAY_GIT_COMMIT_SHA on a git-push deploy; null = not known, e.g. a
+      // `railway up` upload). Proves which commit is live. See deployInfo.ts.
+      commit: deployedCommitOf(process.env),
+      // 2026-11-02 (.online tournament broadcast) — the /broadcast feed (counts only, no
+      // ids): commit, feedOn (kill switch), policy ('off': hole cards built dark), delayMin,
+      // subscribers, refusals by code, snapshotBuildMs …; + the opt-out cache / handler counts.
+      broadcast: {
+        ...(broadcastFeed ? broadcastFeed.health() : { feedOn: false, registered: false }),
+        optOut: { ...broadcastOptOutStore.stats(), ...broadcastOptOutHandlers.stats() },
+        // 2026-11-02 (P2-S4) — 'broadcastIssueToken' answers (issued / refused counts only).
+        issue: broadcastIssueHandler.stats(),
+      },
       tables: tableManager.getTableList().length,
       authClient: getPreflightStatus(),
       // 2026-10-28 — token introspections that timed out on the first try and
@@ -3317,6 +3356,9 @@ app.get('/api/health', async (_req, res) => {
           // 2026-10-24 (owner 2026-10-23: "Turn all off") — help tools refused at qualifier
           // tables (training, whispers, AI coach / recap, commentary skipped, flags cleared).
           helpToolsOff: { ...qualifierHelpToolsOff },
+          // 2026-11-02 (broadcast P1-S6) — voice chat refused at qualifier tables /
+          // sockets forced out of voice on landing at one (and the voice_ rooms left).
+          voiceOff: { ...qualifierVoiceOff },
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
@@ -6776,6 +6818,10 @@ function getGameStateForPlayer(
   const stateQualifierId = stateTournamentId ? qualifierIdOfTable(table.config.tableId) : null;
   stateObj.isQualifier = !!stateQualifierId;
   stateObj.qualifierId = stateQualifierId;
+  // 2026-11-02 (broadcast P1-S6) — ALWAYS present (true off a qualifier, so the
+  // per-socket delta clears it): voice chat is refused at a qualifier table
+  // ('voiceRefused' voice_off_qualifier); poker-3d hides its Voice Chat button on false.
+  stateObj.voiceChatAllowed = !stateQualifierId;
   // 2026-10-23 (qualifier lifecycle S3, owner: "run the blinds and raise them,
   // take breaks") — the LEVEL CLOCK, in every full state. ALWAYS present (null
   // / 0 on a cash table) so the per-socket delta (shallowDiff) clears them
@@ -7391,6 +7437,9 @@ function broadcastGameState(tableId: string): void {
   // warning, then (owner "After 1") was folded and sat out. Idempotent (seatChanged
   // guard): every turn the listener already armed is a no-op here.
   armTurnTimer(tableId);
+  // 2026-11-02 (broadcast P2-NS) — the /broadcast program's dirty mark: an O(1) Set add
+  // (nothing at all while nobody watches). Never throws into the state build.
+  try { broadcastFeed?.hooks.tableChanged(tableId); } catch (_) { /* never */ }
 
   // Send personalized state to each player at the table
   for (const [socketId, session] of playerSessions) {
@@ -7820,6 +7869,149 @@ function noteHelpToolRefusedAtQualifier(tool: string, qualifierId: string, extra
 }
 // ===== end help tools off =====
 
+// ===== Voice chat off at qualifier tables (2026-11-02, broadcast P1-S6) =====
+// Peer-to-peer voice between opponents at a seat-awarding table is a collusion
+// channel (and qualifier tables may be streamed: owner 2026-11-02 rules text). At
+// ANY table of a qualifier (start + overflow, seated, on an extra seat, or
+// watching) 'voiceJoin' is refused — 'voiceRefused' {tableId, code, message}, the
+// socket never joins voice_<tableId> — and a socket that already sits in a voice
+// room when its session lands on a qualifier table (every qualifier seating runs
+// detachSocketFromOtherTables(…, 'seat', …); a rebalance moves through
+// moveTournamentSeatPointers) leaves EVERY voice_ room: its old peers get
+// 'voicePeerLeft', it gets 'voiceForcedOff' {code}. voiceOffer / voiceAnswer /
+// voiceIce need nothing: relayPeerSharingRoom relays only inside a shared voice
+// room. Cash tables and Sit & Gos are unchanged (owner scope: qualifier tables).
+// Stable code `voice_off_qualifier`; log tag `voice_refused_at_qualifier`.
+// gameState carries `voiceChatAllowed` (getGameStateForPlayer).
+const QUALIFIER_VOICE_OFF_CODE = 'voice_off_qualifier';
+const QUALIFIER_VOICE_OFF_TEXT = 'Voice chat is off in qualifier tournaments.';
+/** health r2Play.qualifiers.voiceOff — voiceJoin refusals; sockets forced out of voice on landing at a qualifier table; voice_ rooms they left. */
+const qualifierVoiceOff = { voiceRefused: 0, voiceForcedOff: 0, voiceRoomsLeft: 0 };
+/** voiceJoin refused at a qualifier table: told, counted, logged. Never throws. */
+function refuseVoiceAtQualifier(sock: { id: string; emit: (ev: string, d: unknown) => unknown }, tableId: string, qualifierId: string): void {
+  try {
+    qualifierVoiceOff.voiceRefused++;
+    sock.emit('voiceRefused', { tableId, code: QUALIFIER_VOICE_OFF_CODE, message: QUALIFIER_VOICE_OFF_TEXT });
+    console.log(`[Qualifier] ${JSON.stringify({ event: 'voice_refused_at_qualifier', qualifierId, tableId, socketId: sock.id })}`);
+  } catch (_) { /* never throws into a handler */ }
+}
+/**
+ * A session is landing on `tableId`: when that is a qualifier table, the socket
+ * leaves every voice_ room it is in (each room's peers get 'voicePeerLeft') and
+ * is told 'voiceForcedOff'. Returns the rooms left (0 = nothing to do). O(the
+ * socket's rooms); never throws (it runs inside seating / rebalance paths).
+ */
+function forceVoiceOffAtQualifierTable(
+  sock: { id: string; rooms?: Iterable<string>; leave?: (room: string) => unknown; to?: (room: string) => { emit: (ev: string, d: unknown) => unknown }; emit: (ev: string, d: unknown) => unknown } | null | undefined,
+  tableId: string | null | undefined,
+  via: string,
+): number {
+  try {
+    if (!sock || !tableId) return 0;
+    const qualifierId = qualifierIdOfTable(tableId);
+    if (!qualifierId) return 0;
+    const voiceRooms: string[] = [];
+    for (const room of sock.rooms || []) if (typeof room === 'string' && room.startsWith('voice_')) voiceRooms.push(room);
+    if (voiceRooms.length === 0) return 0;
+    for (const room of voiceRooms) {
+      try { sock.to?.(room).emit('voicePeerLeft', { socketId: sock.id }); } catch (_) { /* best effort */ }
+      sock.leave?.(room);
+    }
+    qualifierVoiceOff.voiceForcedOff++;
+    qualifierVoiceOff.voiceRoomsLeft += voiceRooms.length;
+    sock.emit('voiceForcedOff', { code: QUALIFIER_VOICE_OFF_CODE, tableId, message: QUALIFIER_VOICE_OFF_TEXT });
+    console.log(`[Qualifier] ${JSON.stringify({ event: 'voice_forced_off_at_qualifier', qualifierId, tableId, via, rooms: voiceRooms.length, socketId: sock.id })}`);
+    return voiceRooms.length;
+  } catch (_) {
+    return 0;
+  }
+}
+// ===== end voice off =====
+
+// ===== Broadcast names: the per-player opt-out (2026-11-02, broadcast P1-S1) =====
+// Owner 2026-11-02: a streamed qualifier shows "First name + last initial", with a
+// per-player opt-out to show as "Player". Stored in users.stats.broadcastOptOut
+// (+ broadcastOptOutAt) through mergeUserStats (row lock; survives every restart);
+// the signed-in profile carries it (loginResult.userData.stats.broadcastOptOut).
+// Socket events (signed in): 'setBroadcastOptOut' {optOut} / 'getBroadcastOptOut' {}
+// → 'broadcastOptOutResult' {ok, optOut} | {ok:false, code}; admin
+// 'adminSetBroadcastOptOut' {userId? | masterUserId?, optOut} → isUserAdmin,
+// audited BROADCAST_OPT_OUT_SET, answered 'adminBroadcastOptOutResult'. The
+// broadcast reads the cache at EMIT time; unknown = 'Player' (fail-closed). See
+// src/broadcast/broadcastNames.ts.
+// 2026-11-02 (broadcast review fix) — the master's admin answer NOW, for the two broadcast
+// admin actions (broadcastIssueToken, adminSetBroadcastOptOut): the login's is_admin claim
+// is stamped once at sign-in, and the local is_admin column is grant-only, so a demoted admin
+// kept both for the life of his socket. GET <master>/users/:masterId/me with
+// X-Auth-Server-Key (the auth-server's own extraTokenClaims call) → roles includes siteAdmin
+// or leagueAdmin (EXACTLY the auth-server's is_admin rule, auth-server/src/config.ts). false =
+// the master lists roles and none is an admin role (refused not_admin); null = could not tell
+// (no master id, unreachable, non-200, or NO roles at all — CLAUDE.md Pattern C: never trust
+// an empty roles list): the login's claim stands. 60 s cache, 4 s timeout. Never throws.
+const broadcastAdminRecheck = new Map<string, { at: number; admin: boolean }>();
+async function masterStillAdmin(masterUserId: string | null | undefined): Promise<boolean | null> {
+  const m = String(masterUserId || '').trim();
+  if (!m) return null;
+  const hit = broadcastAdminRecheck.get(m);
+  if (hit && Date.now() - hit.at < 60_000) return hit.admin;
+  const base = process.env.MASTER_API_URL || 'https://poker-prod-api-azeg4kcklq-uc.a.run.app/poker-api';
+  const bypass = process.env.AUTH_SERVER_BYPASS_KEY || '';
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 4000);
+  try {
+    const r = await fetch(`${base}/users/${encodeURIComponent(m)}/me`, { headers: bypass ? { 'X-Auth-Server-Key': bypass } : {}, signal: ac.signal });
+    if (!r.ok) return null;
+    const body: any = await r.json();
+    const user = body?.data || body;
+    const roles: unknown = user?.roles;
+    if (!Array.isArray(roles) || roles.length === 0) return null;
+    const admin = roles.includes('siteAdmin') || roles.includes('leagueAdmin');
+    if (broadcastAdminRecheck.size > 500) broadcastAdminRecheck.clear();
+    broadcastAdminRecheck.set(m, { at: Date.now(), admin });
+    if (!admin) console.warn(`[broadcast] ${JSON.stringify({ event: 'broadcast_admin_recheck_refused', masterUserId: m })}`);
+    return admin;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const broadcastOptOutStore = createBroadcastOptOutStore({ load: loadBroadcastOptOuts });
+const broadcastOptOutHandlers = createBroadcastOptOutHandlers({
+  store: broadcastOptOutStore,
+  authOf: (socketId) => authSessions.get(socketId),
+  mergeUserStats: (userId, patch, opts) => mergeUserStats(userId, patch, opts),
+  isUserAdmin,
+  auditLog,
+  limiter: createWindowRateLimiter(10, 60_000),
+  recheckAdmin: (auth) => masterStillAdmin(auth.masterUserId || auth.statsMasterUserId),
+});
+/** Warm the opt-out of a qualifier registrant (a primary-key read in the background). Never awaits, never throws. */
+function primeBroadcastOptOut(userId: number | undefined, masterUserId: string | null | undefined): void {
+  try { broadcastOptOutStore.get({ userId, masterUserId }); } catch (_) { /* never throws into a handler */ }
+}
+// ===== end broadcast opt-out =====
+
+// ===== Broadcast tokens: the signed-in admin's issuer (2026-11-02, broadcast P2-S4) =====
+// 'broadcastIssueToken' {ev, scopes, label, ttlHours, notBefore?} → 'broadcastTokenIssued'
+// (and the ack) {ok, token (shown ONCE), jti, scopes, nbf, exp} | {ok:false, code}. Needs
+// isUserAdmin (awaited first) AND this login's is_admin claim (authSessions.isAdminClaim);
+// an issuer registered in the event is refused issuer_is_entrant; 'delayed' (P5, built
+// dark) answers holecards_off while BROADCAST_HOLECARD_POLICY is 'off' (the default) and
+// issuer_not_allowlisted unless his master id is in BROADCAST_HOLECARD_ISSUERS. The poker-3d producer panel mints its own key here
+// ({ev:'ch:*', scopes:['producer']}) and uses it on /broadcast. Minting, the registry,
+// the audit (BROADCAST_TOKEN_ISSUED, never the token) are the broadcast module's
+// (src/broadcast/broadcastToken.ts + wire.ts mintToken); secret env BROADCAST_TOKEN_SECRET.
+const broadcastIssueHandler = createBroadcastIssueHandler({
+  authOf: (socketId) => authSessions.get(socketId),
+  isUserAdmin,
+  mint: (req, issuer) => (broadcastFeed ? broadcastFeed.mintToken(req, issuer) : Promise.resolve({ ok: false as const, code: 'secret_unset' })),
+  limiter: createWindowRateLimiter(20, 60 * 60_000),
+  recheckAdmin: (auth) => masterStillAdmin(auth.masterUserId),
+});
+// ===== end broadcast tokens =====
+
 // Build the authoritative prediction-market facts from the final hand state,
 // resolve all open bets/picks for the hand, and push results to each affected
 // user's sockets. Called from the handResult listener (3c). The facts are
@@ -8059,6 +8251,14 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     }
   });
 
+  // 2026-11-02 (broadcast P5, owner: hole cards on a 5-minute delayed feed; built dark) —
+  // after the deal: only when this table's event is ARMED for the delayed feed are the
+  // seats' hole cards cloned once into the in-memory delay buffer (src/broadcast/
+  // holeCardDelay.ts; never persisted, never on a public path). An O(1) miss otherwise.
+  table.on('handStarted', () => {
+    try { broadcastFeed?.hooks.handStarted(tableId, table); } catch (_) { /* never into the deal */ }
+  });
+
   // AI opponent-modeling feed (2026-07-05): populate the session-level opponent
   // profiles that the AI's adaptive-play upgrades consume (categorizeOpponent →
   // balanced bluffing / thin value). Pure data collection — no behavior change
@@ -8145,6 +8345,9 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // is over (first, synchronously: before any seat is stood up below).
     try { flushPendingMuckShows(tableId, table); } catch (e: any) { console.warn(`[showMuckedHand] flush failed on ${tableId}:`, e?.message || e); }
     incrementHandsPlayed();
+    // 2026-11-02 (broadcast P2-S2) — the /broadcast 'doubleUp' ticker (an all-in winner
+    // whose stack at least doubled), read before any seat is stood up. Stacks only; never throws.
+    try { broadcastFeed?.hooks.handResult(tableId, table, data.results); } catch (_) { /* never */ }
     // 2026-07-07 AI overhaul: record a 'showdown' observation for every player
     // who reached a CONTESTED showdown (didn't fold), completing the session
     // opponent model. Read from the authoritative seat state before teardown.
@@ -13607,6 +13810,9 @@ io.on('connection', (socket: Socket) => {
       socket.emit('qualifierRegistrationResult', { success: false, error: 'Your account is not fully linked yet — please sign out and back in, then try again.' });
       return;
     }
+    // 2026-11-02 (broadcast P1-S1) — his broadcast opt-out is read into the cache in the
+    // background (a qualifier may be streamed; unknown shows 'Player'). Never awaited.
+    primeBroadcastOptOut(auth.userId, masterId);
 
     // R2 (2026-10-11, C3 / TOURNEY-2 / TOURNEY-3) — ONLY an event the master
     // schedule lists: its master id, or the lobby catalog key
@@ -13622,6 +13828,16 @@ io.on('connection', (socket: Socket) => {
     const [qualId, qt] = found;
     const refuseQualifier = (code: string, error: string, extra: Record<string, unknown> = {}) =>
       socket.emit('qualifierRegistrationResult', { success: false, code, error, qualifierId: qualId, ...extra });
+    // 2026-11-02 (broadcast P2-S4, owner rules text: "Streamers and commentators may not
+    // play an event they broadcast") — an account holding a live broadcast key for THIS
+    // event (its q: / t: key, a channel showing it, or the producer panel's 'ch:*') is
+    // refused before any credit is touched. Revoking the key (producer panel) lets him in.
+    try {
+      if (broadcastFeed?.staffHoldsKeyFor(masterId, { qualifierId: qualId, tournamentId: qt.tournamentId })) {
+        refuseQualifier(BROADCAST_STAFF_CANNOT_ENTER, 'You hold a broadcast key for this event. Staff who broadcast an event cannot play it: revoke the key first.');
+        return;
+      }
+    } catch (_) { /* fail open: a broken check never blocks an entry */ }
     // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry and re-entry ALSO close at the
     // seat bubble (TournamentManager records it inside the elimination that reached it; it
     // never reopens). Read through TournamentManager (no module helper) at every step below:
@@ -14542,6 +14758,10 @@ Give feedback in this JSON format:
     const auth = authSessions.get(socket.id);
     if (!auth) { socket.emit('error', { message: 'Not authenticated' }); return; }
     if (!data?.tableId || !isSeatedAt(data.tableId)) { socket.emit('error', { message: 'Not seated at table' }); return; }
+    // 2026-11-02 (broadcast P1-S6) — no voice at a qualifier table, nor for a socket
+    // at one (an extra seat there, or watching one): refused before any join.
+    const voiceOffAt = qualifierIdOfTable(data.tableId) || socketAtQualifierTable(socket);
+    if (voiceOffAt) { refuseVoiceAtQualifier(socket, data.tableId, voiceOffAt); return; }
     const room = `voice_${data.tableId}`;
     socket.join(room);
     // Use the authenticated username, not the one the client sent.
@@ -14568,6 +14788,14 @@ Give feedback in this JSON format:
     if (!authSessions.get(socket.id) || !data?.to) return;
     relayPeerSharingRoom(socket, data.to, 'voice_')?.emit('voiceIce', { from: socket.id, candidate: data.candidate });
   });
+
+  // ========== Broadcast opt-out (2026-11-02, broadcast P1-S1) ==========
+  // "Show me as Player on broadcasts" — see the broadcast opt-out block (module scope).
+  socket.on('setBroadcastOptOut', (data: { optOut: boolean }) => broadcastOptOutHandlers.set(socket, data));
+  socket.on('getBroadcastOptOut', (_data: unknown = {}) => broadcastOptOutHandlers.get(socket));
+  socket.on('adminSetBroadcastOptOut', (data: { userId?: number; masterUserId?: string; optOut: boolean }) => broadcastOptOutHandlers.adminSet(socket, data));
+  // 2026-11-02 (broadcast P2-S4) — a broadcast key for a signed-in admin (see the broadcast tokens block).
+  socket.on('broadcastIssueToken', (data: Record<string, unknown>, ack?: unknown) => broadcastIssueHandler.issue(socket, data, ack));
 
   // ========== Staking Marketplace ==========
   // R2 (2026-10-11, C4 — TOURNEY-8 / ECON-15 / APPUI-22): an offer names the
@@ -14941,6 +15169,7 @@ Give feedback in this JSON format:
         masterUserId: String(oauthResult.sub),  // master-API users.id = qualifier player_id
         phone: String(phone),
         displayName: localUser.display_name || localUser.username,   // R1 contract #3
+        isAdminClaim: !!oauthResult.isAdmin,   // 2026-11-02 (broadcast P2-S4) — this login's is_admin claim
       });
       // Q3 (2026-10-10) — kept: after every await below, the seat is restored
       // only while the socket is still signed in as THIS session's account.
@@ -15254,6 +15483,7 @@ Give feedback in this JSON format:
             masterUserId: String(oauthResult.sub),
             phone: String(_tlPhone),
             displayName: _tlLocalUser.display_name || _tlLocalUser.username,   // R1 contract #3
+            isAdminClaim: !!oauthResult.isAdmin,   // 2026-11-02 (broadcast P2-S4) — this login's is_admin claim
           });
           // Q3 (2026-10-10) — kept for the overtake check after the gate below.
           const tlSession = authSessions.get(socket.id)!;
@@ -24650,6 +24880,10 @@ const tableViewDetaches = { calls: 0, spectatorViewsEnded: 0, roomsLeft: 0, dead
 function detachSocketFromOtherTables(
   socket: Socket, tableId: string | null, kind: 'seat' | 'spectate', via: string,
 ): void {
+  // 2026-11-02 (broadcast P1-S6) — every qualifier seating (start, early rooms, late
+  // entry, re-entries) comes through here first: landing on a qualifier table ends
+  // the socket's voice chat. Never throws; nothing at a cash / Sit & Go table.
+  if (kind === 'seat') forceVoiceOffAtQualifierTable(socket, tableId, via);
   const ended: string[] = [];
   for (const [tid, specs] of spectators) {
     if (kind === 'spectate' && tid === tableId) continue;
@@ -25593,6 +25827,9 @@ function startTournamentGame(tournamentId: string): void {
 
   // Listen for blind level changes
   tournamentManager.onEvent(tournamentId, (event, data) => {
+    // 2026-11-02 (broadcast P2-S2) — the /broadcast ticker capture (a template Sit & Go is
+    // broadcastable): O(1), never throws into the tournament engine.
+    try { broadcastFeed?.hooks.tournamentEvent(tournamentId, event, data); } catch (_) { /* never */ }
     if (event === 'blindLevelUp') {
       const t = tableManager.getTable(tableId);
       if (t) {
@@ -26210,6 +26447,10 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[], opt
 
   // Listen for blind level changes → apply to ALL tables
   tournamentManager.onEvent(tournamentId, (event, data) => {
+    // 2026-11-02 (broadcast P2-S2) — the /broadcast ticker capture (level, break, late close,
+    // bust — a deferred hand-for-hand bust is captured at its settle — finish): O(1), never
+    // throws into the blind timer or an elimination.
+    try { broadcastFeed?.hooks.tournamentEvent(tournamentId, event, data); } catch (_) { /* never */ }
     if (event === 'blindLevelUp') {
       for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
         const t = tableManager.getTable(tid);
@@ -27102,6 +27343,7 @@ function moveTournamentSeatPointers(
     if (s.sittingOut) movedSittingOut = true;
     // 2026-10-24 (owner 2026-10-23: "Turn all off") — moved onto a qualifier table: training off.
     if (s.trainingEnabled && qualifierIdOfTable(toTableId)) { s.trainingEnabled = false; qualifierHelpToolsOff.sessionsForcedOff++; }
+    forceVoiceOffAtQualifierTable(sock, toTableId, 'rebalanceMove');   // 2026-11-02 (broadcast P1-S6)
     sock.leave(`table:${fromTableId}`);
     sock.join(`table:${toTableId}`);
     // R2 (TABLEUI-11 / contract C11) — the next gameState for this socket is a
@@ -27125,6 +27367,7 @@ function moveTournamentSeatPointers(
       ms.tableId = toTableId;
       ms.seatIndex = toSeat;
       if (ms.trainingEnabled && qualifierIdOfTable(toTableId)) { ms.trainingEnabled = false; qualifierHelpToolsOff.sessionsForcedOff++; }   // 2026-10-24
+      forceVoiceOffAtQualifierTable(sock, toTableId, 'rebalanceMoveExtraSeat');   // 2026-11-02 (broadcast P1-S6)
       sock.leave(`table:${fromTableId}`);
       sock.join(`table:${toTableId}`);
     }
@@ -29093,6 +29336,8 @@ function startHandForHandRound(st: HandForHandState): void {
 function emitHandForHandRoomBust(
   tournamentId: string, payload: { playerId: string; playerName: string; position: number; eliminatorId?: string }, except: string[],
 ): void {
+  // 2026-11-02 (broadcast P2-S2) — the round bust's /broadcast ticker, with its FINAL place. Never throws.
+  try { broadcastFeed?.hooks.handForHandBust(tournamentId, payload); } catch (_) { /* never */ }
   for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
     try {
       const room = io.to(`table:${tid}`);
@@ -29625,6 +29870,8 @@ function handleTableRebalance(tournamentId: string): void {
 
   // Remove the broken table
   tournamentManager.removeTable(tournamentId, breakTableId);
+  // 2026-11-02 (broadcast P2-S2) — the /broadcast 'tableBroken' ticker (the table still exists). Never throws.
+  try { broadcastFeed?.hooks.tableBroken(tournamentId, breakTableId); } catch (_) { /* never */ }
   // F2 (2026-10-10) — remembered BEFORE it leaves tournamentTables: for the
   // ≤5s the table still exists (and for sessions still pointing at it) it
   // must stay a tournament table to every cash-out decision (isTournamentTable).
@@ -29788,6 +30035,9 @@ initDB().then(async () => {
       void prizeLedger.retryPending().catch(() => {});
     }
   });
+  // 2026-11-02 (broadcast P2-S4 / P2-S9) — the broadcast keys' revocation list and the
+  // channel bindings, from Postgres (tables made by initDB). Never throws; never awaited.
+  void broadcastFeed?.loadPersisted();
   try { await initClubTables(); } catch (e) { console.error('[Clubs] initClubTables failed', e); }
   try { await initFriendTables(); } catch (e) { console.error('[friends] initFriendTables failed', e); }
   try { await initPredictionTables(); } catch (e) { console.error('[prediction] initPredictionTables failed', e); }
@@ -29913,6 +30163,66 @@ initDB().then(async () => {
   console.error('[boot] initDB chain failed:', e?.message || e);
   releaseIdentityGate('initdb_failed');
 });
+
+// ========== Broadcast feed (2026-11-02, .online tournament broadcast P2-NS / P2-S2) ==========
+// The /broadcast namespace (src/broadcast/wire.ts): the anonymous, PUBLIC program
+// of a qualifier / template Sit & Go for the broadcast page (OBS). Its own guards
+// (crash guard, real IP, IP ban, per-IP + total caps, rate limits) — the default
+// namespace's live in its 'connection' handler. It reads the game through this
+// world view ONLY (never a hole card: PublicTableView has none) and is fed by
+// the guarded hooks in broadcastGameState, the tournament onEvent listeners, the
+// handResult listener, emitHandForHandRoomBust and handleTableRebalance. Kill
+// switch: env BROADCAST_FEED ('0' = off) + POST /api/broadcast/feed. REST:
+// /api/broadcast/events, /api/broadcast/on-air, /api/broadcast/:eventKey/results.
+// 2026-11-02 (P5, built dark) — the DELAYED hole-card feed: env BROADCAST_HOLECARD_POLICY
+// ('off' by default) + the producer switch from an allowlisted issuer
+// (BROADCAST_HOLECARD_ISSUERS); fed by the handStarted hook (ensureTableProgressListener)
+// and the handResult hook; kill switch POST /api/broadcast/holecards {on:0}.
+broadcastFeed = registerBroadcast(io, {
+  world: {
+    now: () => Date.now(),
+    qualifiers: () => qualifierTournaments.entries(),
+    tournament: (tid) => tournamentManager.getTournament(tid),
+    isQualifierEngineTournament: (tid) => qualifierEngineTournamentIds.has(tid),
+    table: (tableId) => tableManager.getTable(tableId),
+    tournamentIdOfTable: (tableId) => tournamentIdOfTable(tableId),
+    clockOf: (tid) => (tournamentClockStateFor(tid)?.tournamentClock ?? null),
+    handForHandOf: (tid) => handForHandStates.get(tid) ?? null,
+    payoutTableOf: (tid) => {
+      const t = tournamentManager.getTournament(tid);
+      return t ? tournamentManager.payoutTableOf(t) : null;
+    },
+    lateEntryClosedAtBubble: (tid) => tournamentManager.lateEntryClosedAtBubble?.(tid) ?? null,
+    optOut: (ids) => broadcastOptOutStore.get(ids),
+    sitGoTournaments: () => [...tournamentManager.tournamentIdsWithStatus('registering'), ...tournamentManager.tournamentIdsWithStatus('running')]
+      .map((id) => tournamentManager.getTournament(id))
+      .filter((t): t is Tournament => !!t),
+    // 2026-11-02 (broadcast P2-S3) — the featured-table frame reads the table through
+    // FrameTableView (no seat hole cards by type: only a contested showdown's tabled hands).
+    frameTable: (tableId) => tableManager.getTable(tableId),
+    turnOf: (tableId) => ({ startedAt: turnStartedAtMap.get(tableId) ?? null, timeout: currentTurnTimeoutMs(tableId) }),
+    sittingOutOf: (tableId) => sitOutTracker.get(tableId) ?? null,
+  },
+  // 2026-11-02 (broadcast P2-S4 / P2-S9) — broadcast_tokens + broadcast_channels (DDL: authManager initDB).
+  db: { query: (sql: string, params?: unknown[]) => getPool().query(sql, params as any[]) },
+  realClientIp,
+  bannedIPs,
+  env: process.env,
+  internalTokenMatches: (given) => internalTokenMatches(given, (process.env.INTERNAL_NOTIFY_TOKEN || '').trim()),
+  isDeferredBust: (playerId) => handForHandNoticeDeferred(playerId),
+  auditLog,
+  commit: () => deployedCommitOf(process.env),
+  app,
+  onHandlerError: (event, err) => {
+    if (Sentry) Sentry.captureException(err, { tags: { area: 'broadcast.handler', event } });
+  },
+});
+// 2026-11-02 (broadcast review fix) — read the persisted key list now, not only after the
+// whole initDB chain: the pool exists (initDB creates it before its first await), and a
+// failed read (initDB still creating the table, a DB blip, or initDB failing outright) is
+// retried with backoff inside loadPersisted. Until it has loaded, a keyed /broadcast
+// handshake WAITS for it (capped) instead of being refused 'revoked'. Never throws.
+try { void broadcastFeed.loadPersisted(); } catch (e: any) { console.warn('[broadcast] early persisted load failed:', e?.message || e); }
 
 // ========== Start Server ==========
 

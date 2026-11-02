@@ -112,6 +112,12 @@ export interface HandWinResult {
 /** Data for a single player's hand at showdown */
 export interface ShowdownHandInfo {
   seatIndex: number;
+  /**
+   * 2026-11-02 (broadcast review fix) — who TABLED this hand (the seat's player at the
+   * showdown). Server-side only (index.ts ships an explicit field list): the broadcast frame
+   * shows these cards only while the same player still holds the seat.
+   */
+  playerId?: string;
   playerName: string;
   handName: string;
   bestFiveCards: Card[];
@@ -3039,6 +3045,7 @@ export class PokerTable extends EventEmitter {
           handResultCache.set(info.seatIndex, handRes);
           showdownHands.push({
             seatIndex: info.seatIndex,
+            playerId: seat.playerId,
             playerName: seat.playerName,
             handName: handRes.handName || 'Unknown',
             bestFiveCards: handRes.bestFiveCards || [],

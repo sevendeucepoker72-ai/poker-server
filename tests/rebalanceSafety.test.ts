@@ -288,6 +288,11 @@ function world(opts: {
     process: { env: {} },
     // Review fix-up (ff9a1cb) — the overflow cap in force (the feed is off at 0: the runtime kill switch).
     qualifierOverflowTablesMax: 6,
+    // 2026-11-02 (.online tournament broadcast) — the /broadcast handle the onEvent / rebalance /
+    // hand-for-hand hooks read: not registered in this world (null; tests/broadcastEvents.test.ts
+    // tests the hooks); no qualifier table here, so no voice forced off (qualifierVoiceOff.test.ts).
+    broadcastFeed: null,
+    forceVoiceOffAtQualifierTable: () => 0,
     ...(opts.scope || {}),
   };
   const { exports: m, stubbed } = load(compile(opts.over), scope, `{

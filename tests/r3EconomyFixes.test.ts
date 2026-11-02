@@ -377,6 +377,9 @@ function handWorld(kind: 'cash' | 'club' = 'cash') {
     SEAT_RESERVE_MS: 600_000, DISCONNECT_HANDS_LIMIT: 20, reservationsDisplaced: { count: 0 }, shutdownFlushActive: () => false,
     setTimeout: (fn: () => void, ms: number) => ({ fn, ms, unref() {} }), clearTimeout() {},
     console: quiet,
+    // 2026-11-02 (broadcast P2-S2) — the /broadcast handle the handResult listener's doubleUp hook
+    // reads: not registered in this world (null; tests/broadcastEvents.test.ts tests the hook).
+    broadcastFeed: null,
   };
   const { exports: m, stubbed } = load(HAND_CODE, scope,
     '{ handlePlayerLeave, reserveSeatForDeparture, ensureTableProgressListener, handleHandComplete, dealtInSeatAccount }');

@@ -1,0 +1,1235 @@
+{
+  "name": "starting",
+  "note": "FIXTURE-ONLY-bc-7f3a: Tables open, dealing in 10 minutes; the producer goes on air and shows How to enter; then the deal. Recorded by poker-server tests/broadcastE2E.test.ts (real engine, /broadcast namespace).",
+  "base": 1793640957792,
+  "snapshot": {
+    "v": 1,
+    "seq": 0,
+    "serverNow": 1793640957792,
+    "feed": {
+      "mode": "public",
+      "delayMs": 0,
+      "holeCards": false,
+      "policy": "off"
+    },
+    "program": {
+      "v": 1,
+      "channel": "weekly",
+      "eventKey": "q:Q-weekly-1",
+      "onAir": false,
+      "rehearsal": false,
+      "programNow": 1793640957792,
+      "event": {
+        "kind": "weekly",
+        "qualifierId": "Q-weekly-1",
+        "tournamentId": "34e51378-6315-4a80-9dfa-a497c4fdb88c",
+        "name": "Sunday Weekly Qualifier",
+        "title": null,
+        "status": "tables_open",
+        "scheduledAt": 1793639757792,
+        "dealsAt": 1793641557792,
+        "registered": 12,
+        "entries": 12,
+        "startingStack": 5000,
+        "levels": [
+          {
+            "sb": 3,
+            "bb": 6,
+            "ante": 0,
+            "minutes": 12
+          },
+          {
+            "sb": 5,
+            "bb": 10,
+            "ante": 0,
+            "minutes": 12
+          },
+          {
+            "sb": 8,
+            "bb": 16,
+            "ante": 3,
+            "minutes": 12
+          },
+          {
+            "sb": 10,
+            "bb": 20,
+            "ante": 3,
+            "minutes": 12
+          },
+          {
+            "sb": 15,
+            "bb": 30,
+            "ante": 5,
+            "minutes": 12
+          },
+          {
+            "sb": 20,
+            "bb": 40,
+            "ante": 5,
+            "minutes": 12
+          },
+          {
+            "sb": 30,
+            "bb": 60,
+            "ante": 8,
+            "minutes": 12
+          },
+          {
+            "sb": 40,
+            "bb": 80,
+            "ante": 10,
+            "minutes": 12
+          },
+          {
+            "sb": 50,
+            "bb": 100,
+            "ante": 10,
+            "minutes": 12
+          },
+          {
+            "sb": 60,
+            "bb": 120,
+            "ante": 20,
+            "minutes": 12
+          },
+          {
+            "sb": 80,
+            "bb": 160,
+            "ante": 20,
+            "minutes": 12
+          },
+          {
+            "sb": 100,
+            "bb": 200,
+            "ante": 30,
+            "minutes": 12
+          },
+          {
+            "sb": 150,
+            "bb": 300,
+            "ante": 50,
+            "minutes": 12
+          },
+          {
+            "sb": 200,
+            "bb": 400,
+            "ante": 50,
+            "minutes": 12
+          },
+          {
+            "sb": 300,
+            "bb": 600,
+            "ante": 100,
+            "minutes": 12
+          },
+          {
+            "sb": 400,
+            "bb": 800,
+            "ante": 100,
+            "minutes": 12
+          },
+          {
+            "sb": 500,
+            "bb": 1000,
+            "ante": 150,
+            "minutes": 12
+          },
+          {
+            "sb": 600,
+            "bb": 1200,
+            "ante": 200,
+            "minutes": 12
+          },
+          {
+            "sb": 800,
+            "bb": 1600,
+            "ante": 200,
+            "minutes": 12
+          },
+          {
+            "sb": 1000,
+            "bb": 2000,
+            "ante": 300,
+            "minutes": 12
+          },
+          {
+            "sb": 1500,
+            "bb": 3000,
+            "ante": 500,
+            "minutes": 12
+          },
+          {
+            "sb": 2000,
+            "bb": 4000,
+            "ante": 500,
+            "minutes": 12
+          },
+          {
+            "sb": 3000,
+            "bb": 6000,
+            "ante": 1000,
+            "minutes": 12
+          },
+          {
+            "sb": 5000,
+            "bb": 10000,
+            "ante": 1000,
+            "minutes": 12
+          },
+          {
+            "sb": 7500,
+            "bb": 15000,
+            "ante": 2500,
+            "minutes": 12
+          },
+          {
+            "sb": 10000,
+            "bb": 20000,
+            "ante": 2500,
+            "minutes": 12
+          }
+        ],
+        "howToEnter": null,
+        "prizes": {
+          "kind": "seats",
+          "seatsForTop": 3,
+          "seatPackage": {
+            "1": 3,
+            "2": 2,
+            "3": 1
+          },
+          "paidPlaces": 3,
+          "rows": [
+            {
+              "place": 1,
+              "seats": 3
+            },
+            {
+              "place": 2,
+              "seats": 2
+            },
+            {
+              "place": 3,
+              "seats": 1
+            }
+          ],
+          "bubblePlace": 4,
+          "onBubble": false
+        },
+        "lateReg": {
+          "open": true,
+          "until": 1793650557792,
+          "closedReason": null
+        }
+      },
+      "scene": {
+        "id": "starting",
+        "auto": true,
+        "since": 1793640957792
+      },
+      "featured": {
+        "tableId": "QT1",
+        "tableNo": 1,
+        "tableName": "Qualifier Table 1",
+        "mode": "auto",
+        "reason": "chip_leader",
+        "since": 1793640957792
+      },
+      "clock": {
+        "level": 1,
+        "levels": 2,
+        "sb": 25,
+        "bb": 50,
+        "ante": 0,
+        "next": {
+          "sb": 50,
+          "bb": 100,
+          "ante": 0
+        },
+        "levelEndsAt": null,
+        "serverNow": 1793640957792,
+        "paused": true,
+        "pauseReason": "prestart",
+        "breakUntil": null,
+        "dealsAt": 1793641557792,
+        "playersLeft": 12,
+        "entries": 12,
+        "avgStack": 5000,
+        "paidPlaces": 3,
+        "levelDurationMs": 720000,
+        "levelRemainingMs": null,
+        "resumesAt": null
+      },
+      "standings": {
+        "playersLeft": 12,
+        "entries": 12,
+        "avgStack": 5000,
+        "avgStackBb": 100,
+        "paidPlaces": 3,
+        "tables": 3,
+        "leaders": [
+          {
+            "pid": "b-0eca5004e3715e4b",
+            "name": "Ann B.",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 3,
+            "rank": 1,
+            "prevRank": null
+          },
+          {
+            "pid": "b-2116618146d43ca4",
+            "name": "Cy E.",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 2,
+            "rank": 2,
+            "prevRank": null
+          },
+          {
+            "pid": "b-2828e096524251b0",
+            "name": "Zed",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 3,
+            "rank": 3,
+            "prevRank": null
+          },
+          {
+            "pid": "b-2f0a09f3f7b8e2d9",
+            "name": "Gus I.",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 3,
+            "rank": 4,
+            "prevRank": null
+          },
+          {
+            "pid": "b-321f29c6fcdc5ebe",
+            "name": "Ed G.",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 1,
+            "rank": 5,
+            "prevRank": null
+          },
+          {
+            "pid": "b-7fae613ec3fa69b8",
+            "name": "Fay H.",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 2,
+            "rank": 6,
+            "prevRank": null
+          },
+          {
+            "pid": "b-816d5b0f53f24167",
+            "name": "John S.",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 1,
+            "rank": 7,
+            "prevRank": null
+          },
+          {
+            "pid": "b-88ccc3c0aa53d4f3",
+            "name": "Di F.",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 3,
+            "rank": 8,
+            "prevRank": null
+          },
+          {
+            "pid": "b-a5831c88114f6ca6",
+            "name": "Player",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 2,
+            "rank": 9,
+            "prevRank": null
+          },
+          {
+            "pid": "b-c5418c0ef359e51d",
+            "name": "Kim P.",
+            "chips": 5000,
+            "bb": 100,
+            "tableNo": 1,
+            "rank": 10,
+            "prevRank": null
+          }
+        ]
+      },
+      "ticker": [],
+      "handForHand": null,
+      "lowerThirds": [],
+      "legal": {
+        "line": "Free to play · Play money only · No purchase necessary · 21+ to enter.",
+        "platformLine": null
+      },
+      "results": null,
+      "finalTable": null
+    },
+    "table": {
+      "t": 1793640957792,
+      "tableId": "QT1",
+      "tableNo": 1,
+      "tableName": "Qualifier Table 1",
+      "maxSeats": 9,
+      "featured": true,
+      "handNumber": 0,
+      "phase": "WaitingForPlayers",
+      "handLevel": {
+        "sb": 25,
+        "bb": 50,
+        "ante": 0
+      },
+      "dealerSeat": -1,
+      "smallBlindSeat": -1,
+      "bigBlindSeat": -1,
+      "activeSeat": -1,
+      "turnStartedAt": null,
+      "turnTimeout": null,
+      "pot": 0,
+      "board": [],
+      "seats": [
+        {
+          "seatIndex": 0,
+          "pid": "b-816d5b0f53f24167",
+          "name": "John S.",
+          "chips": 5000,
+          "bet": 0,
+          "folded": false,
+          "allIn": false,
+          "sittingOut": false,
+          "eliminated": false,
+          "hasCards": false,
+          "holeCards": null
+        },
+        {
+          "seatIndex": 1,
+          "pid": "b-c5418c0ef359e51d",
+          "name": "Kim P.",
+          "chips": 5000,
+          "bet": 0,
+          "folded": false,
+          "allIn": false,
+          "sittingOut": false,
+          "eliminated": false,
+          "hasCards": false,
+          "holeCards": null
+        },
+        {
+          "seatIndex": 2,
+          "pid": "b-f17c0bb9010224d9",
+          "name": "Bo D.",
+          "chips": 5000,
+          "bet": 0,
+          "folded": false,
+          "allIn": false,
+          "sittingOut": false,
+          "eliminated": false,
+          "hasCards": false,
+          "holeCards": null
+        },
+        {
+          "seatIndex": 3,
+          "pid": "b-321f29c6fcdc5ebe",
+          "name": "Ed G.",
+          "chips": 5000,
+          "bet": 0,
+          "folded": false,
+          "allIn": false,
+          "sittingOut": false,
+          "eliminated": false,
+          "hasCards": false,
+          "holeCards": null
+        }
+      ],
+      "handResult": null,
+      "liveHandEndedAt": null,
+      "pots": []
+    },
+    "tables": [
+      {
+        "tableId": "QT1",
+        "tableNo": 1,
+        "tableName": "Qualifier Table 1",
+        "players": 4,
+        "handNumber": 0,
+        "pot": 0,
+        "allIn": false,
+        "biggestStack": 5000,
+        "chipLeaderHere": false
+      },
+      {
+        "tableId": "QT2",
+        "tableNo": 2,
+        "tableName": "Qualifier Table 2",
+        "players": 4,
+        "handNumber": 0,
+        "pot": 0,
+        "allIn": false,
+        "biggestStack": 5000,
+        "chipLeaderHere": false
+      },
+      {
+        "tableId": "QT3",
+        "tableNo": 3,
+        "tableName": "Qualifier Table 3",
+        "players": 4,
+        "handNumber": 0,
+        "pot": 0,
+        "allIn": false,
+        "biggestStack": 5000,
+        "chipLeaderHere": true
+      }
+    ]
+  },
+  "frames": [
+    {
+      "afterMs": 1000,
+      "msg": {
+        "kind": "program",
+        "program": {
+          "v": 1,
+          "channel": "weekly",
+          "eventKey": "q:Q-weekly-1",
+          "onAir": true,
+          "rehearsal": false,
+          "programNow": 1793640958792,
+          "event": {
+            "kind": "weekly",
+            "qualifierId": "Q-weekly-1",
+            "tournamentId": "34e51378-6315-4a80-9dfa-a497c4fdb88c",
+            "name": "Sunday Weekly Qualifier",
+            "title": null,
+            "status": "tables_open",
+            "scheduledAt": 1793639757792,
+            "dealsAt": 1793641557792,
+            "registered": 12,
+            "entries": 12,
+            "startingStack": 5000,
+            "levels": [
+              {
+                "sb": 3,
+                "bb": 6,
+                "ante": 0,
+                "minutes": 12
+              },
+              {
+                "sb": 5,
+                "bb": 10,
+                "ante": 0,
+                "minutes": 12
+              },
+              {
+                "sb": 8,
+                "bb": 16,
+                "ante": 3,
+                "minutes": 12
+              },
+              {
+                "sb": 10,
+                "bb": 20,
+                "ante": 3,
+                "minutes": 12
+              },
+              {
+                "sb": 15,
+                "bb": 30,
+                "ante": 5,
+                "minutes": 12
+              },
+              {
+                "sb": 20,
+                "bb": 40,
+                "ante": 5,
+                "minutes": 12
+              },
+              {
+                "sb": 30,
+                "bb": 60,
+                "ante": 8,
+                "minutes": 12
+              },
+              {
+                "sb": 40,
+                "bb": 80,
+                "ante": 10,
+                "minutes": 12
+              },
+              {
+                "sb": 50,
+                "bb": 100,
+                "ante": 10,
+                "minutes": 12
+              },
+              {
+                "sb": 60,
+                "bb": 120,
+                "ante": 20,
+                "minutes": 12
+              },
+              {
+                "sb": 80,
+                "bb": 160,
+                "ante": 20,
+                "minutes": 12
+              },
+              {
+                "sb": 100,
+                "bb": 200,
+                "ante": 30,
+                "minutes": 12
+              },
+              {
+                "sb": 150,
+                "bb": 300,
+                "ante": 50,
+                "minutes": 12
+              },
+              {
+                "sb": 200,
+                "bb": 400,
+                "ante": 50,
+                "minutes": 12
+              },
+              {
+                "sb": 300,
+                "bb": 600,
+                "ante": 100,
+                "minutes": 12
+              },
+              {
+                "sb": 400,
+                "bb": 800,
+                "ante": 100,
+                "minutes": 12
+              },
+              {
+                "sb": 500,
+                "bb": 1000,
+                "ante": 150,
+                "minutes": 12
+              },
+              {
+                "sb": 600,
+                "bb": 1200,
+                "ante": 200,
+                "minutes": 12
+              },
+              {
+                "sb": 800,
+                "bb": 1600,
+                "ante": 200,
+                "minutes": 12
+              },
+              {
+                "sb": 1000,
+                "bb": 2000,
+                "ante": 300,
+                "minutes": 12
+              },
+              {
+                "sb": 1500,
+                "bb": 3000,
+                "ante": 500,
+                "minutes": 12
+              },
+              {
+                "sb": 2000,
+                "bb": 4000,
+                "ante": 500,
+                "minutes": 12
+              },
+              {
+                "sb": 3000,
+                "bb": 6000,
+                "ante": 1000,
+                "minutes": 12
+              },
+              {
+                "sb": 5000,
+                "bb": 10000,
+                "ante": 1000,
+                "minutes": 12
+              },
+              {
+                "sb": 7500,
+                "bb": 15000,
+                "ante": 2500,
+                "minutes": 12
+              },
+              {
+                "sb": 10000,
+                "bb": 20000,
+                "ante": 2500,
+                "minutes": 12
+              }
+            ],
+            "howToEnter": null,
+            "prizes": {
+              "kind": "seats",
+              "seatsForTop": 3,
+              "seatPackage": {
+                "1": 3,
+                "2": 2,
+                "3": 1
+              },
+              "paidPlaces": 3,
+              "rows": [
+                {
+                  "place": 1,
+                  "seats": 3
+                },
+                {
+                  "place": 2,
+                  "seats": 2
+                },
+                {
+                  "place": 3,
+                  "seats": 1
+                }
+              ],
+              "bubblePlace": 4,
+              "onBubble": false
+            },
+            "lateReg": {
+              "open": true,
+              "until": 1793650557792,
+              "closedReason": null
+            }
+          },
+          "scene": {
+            "id": "starting",
+            "auto": true,
+            "since": 1793640957792
+          },
+          "featured": {
+            "tableId": "QT1",
+            "tableNo": 1,
+            "tableName": "Qualifier Table 1",
+            "mode": "auto",
+            "reason": "chip_leader",
+            "since": 1793640957792
+          },
+          "clock": {
+            "level": 1,
+            "levels": 2,
+            "sb": 25,
+            "bb": 50,
+            "ante": 0,
+            "next": {
+              "sb": 50,
+              "bb": 100,
+              "ante": 0
+            },
+            "levelEndsAt": null,
+            "serverNow": 1793640957792,
+            "paused": true,
+            "pauseReason": "prestart",
+            "breakUntil": null,
+            "dealsAt": 1793641557792,
+            "playersLeft": 12,
+            "entries": 12,
+            "avgStack": 5000,
+            "paidPlaces": 3,
+            "levelDurationMs": 720000,
+            "levelRemainingMs": null,
+            "resumesAt": null
+          },
+          "standings": {
+            "playersLeft": 12,
+            "entries": 12,
+            "avgStack": 5000,
+            "avgStackBb": 100,
+            "paidPlaces": 3,
+            "tables": 3,
+            "leaders": [
+              {
+                "pid": "b-0eca5004e3715e4b",
+                "name": "Ann B.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 3,
+                "rank": 1,
+                "prevRank": null
+              },
+              {
+                "pid": "b-2116618146d43ca4",
+                "name": "Cy E.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 2,
+                "rank": 2,
+                "prevRank": null
+              },
+              {
+                "pid": "b-2828e096524251b0",
+                "name": "Zed",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 3,
+                "rank": 3,
+                "prevRank": null
+              },
+              {
+                "pid": "b-2f0a09f3f7b8e2d9",
+                "name": "Gus I.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 3,
+                "rank": 4,
+                "prevRank": null
+              },
+              {
+                "pid": "b-321f29c6fcdc5ebe",
+                "name": "Ed G.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 1,
+                "rank": 5,
+                "prevRank": null
+              },
+              {
+                "pid": "b-7fae613ec3fa69b8",
+                "name": "Fay H.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 2,
+                "rank": 6,
+                "prevRank": null
+              },
+              {
+                "pid": "b-816d5b0f53f24167",
+                "name": "John S.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 1,
+                "rank": 7,
+                "prevRank": null
+              },
+              {
+                "pid": "b-88ccc3c0aa53d4f3",
+                "name": "Di F.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 3,
+                "rank": 8,
+                "prevRank": null
+              },
+              {
+                "pid": "b-a5831c88114f6ca6",
+                "name": "Player",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 2,
+                "rank": 9,
+                "prevRank": null
+              },
+              {
+                "pid": "b-c5418c0ef359e51d",
+                "name": "Kim P.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 1,
+                "rank": 10,
+                "prevRank": null
+              }
+            ]
+          },
+          "ticker": [],
+          "handForHand": null,
+          "lowerThirds": [
+            {
+              "id": "enter",
+              "kind": "info",
+              "title": "How to enter",
+              "sub": "Top 5 in any game gets you in · Free to play at americanpubpoker.online",
+              "until": null
+            }
+          ],
+          "legal": {
+            "line": "Free to play · Play money only · No purchase necessary · 21+ to enter.",
+            "platformLine": null
+          },
+          "results": null,
+          "finalTable": null
+        }
+      }
+    },
+    {
+      "afterMs": 602000,
+      "msg": {
+        "kind": "program",
+        "program": {
+          "v": 1,
+          "channel": "weekly",
+          "eventKey": "q:Q-weekly-1",
+          "onAir": true,
+          "rehearsal": false,
+          "programNow": 1793641559792,
+          "event": {
+            "kind": "weekly",
+            "qualifierId": "Q-weekly-1",
+            "tournamentId": "34e51378-6315-4a80-9dfa-a497c4fdb88c",
+            "name": "Sunday Weekly Qualifier",
+            "title": null,
+            "status": "running",
+            "scheduledAt": 1793639757792,
+            "dealsAt": null,
+            "registered": 12,
+            "entries": 12,
+            "startingStack": 5000,
+            "levels": [
+              {
+                "sb": 3,
+                "bb": 6,
+                "ante": 0,
+                "minutes": 12
+              },
+              {
+                "sb": 5,
+                "bb": 10,
+                "ante": 0,
+                "minutes": 12
+              },
+              {
+                "sb": 8,
+                "bb": 16,
+                "ante": 3,
+                "minutes": 12
+              },
+              {
+                "sb": 10,
+                "bb": 20,
+                "ante": 3,
+                "minutes": 12
+              },
+              {
+                "sb": 15,
+                "bb": 30,
+                "ante": 5,
+                "minutes": 12
+              },
+              {
+                "sb": 20,
+                "bb": 40,
+                "ante": 5,
+                "minutes": 12
+              },
+              {
+                "sb": 30,
+                "bb": 60,
+                "ante": 8,
+                "minutes": 12
+              },
+              {
+                "sb": 40,
+                "bb": 80,
+                "ante": 10,
+                "minutes": 12
+              },
+              {
+                "sb": 50,
+                "bb": 100,
+                "ante": 10,
+                "minutes": 12
+              },
+              {
+                "sb": 60,
+                "bb": 120,
+                "ante": 20,
+                "minutes": 12
+              },
+              {
+                "sb": 80,
+                "bb": 160,
+                "ante": 20,
+                "minutes": 12
+              },
+              {
+                "sb": 100,
+                "bb": 200,
+                "ante": 30,
+                "minutes": 12
+              },
+              {
+                "sb": 150,
+                "bb": 300,
+                "ante": 50,
+                "minutes": 12
+              },
+              {
+                "sb": 200,
+                "bb": 400,
+                "ante": 50,
+                "minutes": 12
+              },
+              {
+                "sb": 300,
+                "bb": 600,
+                "ante": 100,
+                "minutes": 12
+              },
+              {
+                "sb": 400,
+                "bb": 800,
+                "ante": 100,
+                "minutes": 12
+              },
+              {
+                "sb": 500,
+                "bb": 1000,
+                "ante": 150,
+                "minutes": 12
+              },
+              {
+                "sb": 600,
+                "bb": 1200,
+                "ante": 200,
+                "minutes": 12
+              },
+              {
+                "sb": 800,
+                "bb": 1600,
+                "ante": 200,
+                "minutes": 12
+              },
+              {
+                "sb": 1000,
+                "bb": 2000,
+                "ante": 300,
+                "minutes": 12
+              },
+              {
+                "sb": 1500,
+                "bb": 3000,
+                "ante": 500,
+                "minutes": 12
+              },
+              {
+                "sb": 2000,
+                "bb": 4000,
+                "ante": 500,
+                "minutes": 12
+              },
+              {
+                "sb": 3000,
+                "bb": 6000,
+                "ante": 1000,
+                "minutes": 12
+              },
+              {
+                "sb": 5000,
+                "bb": 10000,
+                "ante": 1000,
+                "minutes": 12
+              },
+              {
+                "sb": 7500,
+                "bb": 15000,
+                "ante": 2500,
+                "minutes": 12
+              },
+              {
+                "sb": 10000,
+                "bb": 20000,
+                "ante": 2500,
+                "minutes": 12
+              }
+            ],
+            "howToEnter": null,
+            "prizes": {
+              "kind": "seats",
+              "seatsForTop": 3,
+              "seatPackage": {
+                "1": 3,
+                "2": 2,
+                "3": 1
+              },
+              "paidPlaces": 3,
+              "rows": [
+                {
+                  "place": 1,
+                  "seats": 3
+                },
+                {
+                  "place": 2,
+                  "seats": 2
+                },
+                {
+                  "place": 3,
+                  "seats": 1
+                }
+              ],
+              "bubblePlace": 4,
+              "onBubble": false
+            },
+            "lateReg": {
+              "open": true,
+              "until": 1793650557792,
+              "closedReason": null
+            }
+          },
+          "scene": {
+            "id": "table",
+            "auto": true,
+            "since": 1793641559792
+          },
+          "featured": {
+            "tableId": "QT1",
+            "tableNo": 1,
+            "tableName": "Qualifier Table 1",
+            "mode": "auto",
+            "reason": "chip_leader",
+            "since": 1793640957792
+          },
+          "clock": {
+            "level": 1,
+            "levels": 2,
+            "sb": 25,
+            "bb": 50,
+            "ante": 0,
+            "next": {
+              "sb": 50,
+              "bb": 100,
+              "ante": 0
+            },
+            "levelEndsAt": 1793641677771,
+            "serverNow": 1793640958792,
+            "paused": false,
+            "pauseReason": null,
+            "breakUntil": null,
+            "dealsAt": null,
+            "playersLeft": 12,
+            "entries": 12,
+            "avgStack": 5000,
+            "paidPlaces": 3,
+            "levelDurationMs": 720000,
+            "levelRemainingMs": null,
+            "resumesAt": null
+          },
+          "standings": {
+            "playersLeft": 12,
+            "entries": 12,
+            "avgStack": 5000,
+            "avgStackBb": 100,
+            "paidPlaces": 3,
+            "tables": 3,
+            "leaders": [
+              {
+                "pid": "b-0eca5004e3715e4b",
+                "name": "Ann B.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 3,
+                "rank": 1,
+                "prevRank": null
+              },
+              {
+                "pid": "b-2116618146d43ca4",
+                "name": "Cy E.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 2,
+                "rank": 2,
+                "prevRank": null
+              },
+              {
+                "pid": "b-2828e096524251b0",
+                "name": "Zed",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 3,
+                "rank": 3,
+                "prevRank": null
+              },
+              {
+                "pid": "b-2f0a09f3f7b8e2d9",
+                "name": "Gus I.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 3,
+                "rank": 4,
+                "prevRank": null
+              },
+              {
+                "pid": "b-321f29c6fcdc5ebe",
+                "name": "Ed G.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 1,
+                "rank": 5,
+                "prevRank": null
+              },
+              {
+                "pid": "b-7fae613ec3fa69b8",
+                "name": "Fay H.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 2,
+                "rank": 6,
+                "prevRank": null
+              },
+              {
+                "pid": "b-816d5b0f53f24167",
+                "name": "John S.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 1,
+                "rank": 7,
+                "prevRank": null
+              },
+              {
+                "pid": "b-88ccc3c0aa53d4f3",
+                "name": "Di F.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 3,
+                "rank": 8,
+                "prevRank": null
+              },
+              {
+                "pid": "b-a5831c88114f6ca6",
+                "name": "Player",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 2,
+                "rank": 9,
+                "prevRank": null
+              },
+              {
+                "pid": "b-c5418c0ef359e51d",
+                "name": "Kim P.",
+                "chips": 5000,
+                "bb": 100,
+                "tableNo": 1,
+                "rank": 10,
+                "prevRank": null
+              }
+            ]
+          },
+          "ticker": [],
+          "handForHand": null,
+          "lowerThirds": [
+            {
+              "id": "enter",
+              "kind": "info",
+              "title": "How to enter",
+              "sub": "Top 5 in any game gets you in · Free to play at americanpubpoker.online",
+              "until": null
+            }
+          ],
+          "legal": {
+            "line": "Free to play · Play money only · No purchase necessary · 21+ to enter.",
+            "platformLine": null
+          },
+          "results": null,
+          "finalTable": null
+        }
+      }
+    }
+  ]
+}

@@ -179,6 +179,7 @@ export class OmahaTable extends PokerTable {
             : hiLo.high.handName;
           showdownHands.push({
             seatIndex: info.seatIndex,
+            playerId: seat.playerId,
             playerName: seat.playerName,
             handName,
             bestFiveCards: hiLo.high.bestFiveCards,

@@ -1877,3 +1877,87 @@ carryAwayStateOnMove
 currentTurnTimeoutMs
 shortClockRearmed
 reservationsMarked
+# 2026-11-02 (.online tournament broadcast P1-S0) - /api/health carries the commit of the build (Railway git-push deploys).
+RAILWAY_GIT_COMMIT_SHA
+# 2026-11-02 (broadcast P1-S6) - voice chat is OFF at qualifier tables: voiceJoin refused, a voice socket landing
+# on a qualifier table is forced out of every voice_ room, gameState says voiceChatAllowed.
+voice_off_qualifier
+voice_refused_at_qualifier
+voiceForcedOff
+voiceChatAllowed
+# 2026-11-02 (broadcast P1-S1) - broadcast names First L. + the per-player opt-out ("Show me as Player on broadcasts"),
+# stored in users.stats.broadcastOptOut through mergeUserStats; admin override audited (durable).
+setBroadcastOptOut
+broadcastOptOutResult
+BROADCAST_OPT_OUT_SET
+# 2026-11-02 (broadcast P2-NS) - the /broadcast namespace (public program feed, own guards, kill switch BROADCAST_FEED +
+# POST /api/broadcast/feed): src/broadcast/wire.ts registerBroadcast, contract.ts wire contract v1.
+/broadcast
+bc:subscribe
+bc:heartbeat
+bc:snapshot
+feed_off
+# 2026-11-02 (broadcast P2-S2) - event keys + program data (no card of any kind), ticker kinds incl. doubleUp, public REST.
+not_broadcastable
+/api/broadcast/events
+/api/broadcast/on-air
+lateRegClosed
+doubleUp
+# 2026-11-02 (broadcast P2-S3) - the featured table + its PUBLIC table frames (src/broadcast/featuredTable.ts,
+# broadcastFrame.ts): rooms bc:tbl:<tableId>, coalesced 5 Hz; faces only at a contested showdown.
+broadcast_featured_changed
+toBroadcastTableFrame
+bc:tbl:
+liveHandEndedAt
+# 2026-11-02 (broadcast P2-S4) - broadcast tokens (src/broadcast/broadcastToken.ts): HS256 pinned, typ bcast+jwt,
+# output / producer scopes (delayed answers holecards_off, built dark), Postgres broadcast_tokens, the R4 entry refusal.
+bcast+jwt
+broadcastIssueToken
+broadcast_token_refused
+broadcast_staff_cannot_enter
+BROADCAST_TOKEN_ISSUED
+broadcast_tokens
+# 2026-11-02 (broadcast P2-S9) - the program store + the producer API (src/broadcast/programStore.ts, producer.ts):
+# channel bindings in Postgres broadcast_channels, on air with auto-expiry, every mutation audited.
+bc:producer:feature
+bc:producer:setScene
+BROADCAST_PRODUCER_ACTION
+broadcast_channels
+# 2026-11-02 (broadcast P5, owner: hole cards on a 5-minute delayed feed; BUILT DARK, policy off by default) - the delayed
+# hole-card feed (src/broadcast/holeCardDelay.ts buffer + release rule, delayedFeed.ts sessions): a hand's cards only once it
+# ended live AND the delay passed; direct emit to delayed sessions only; kill switch; allowlisted issuers; durable switch audit.
+holecard_delay_purged
+/api/broadcast/holecards
+bc:producer:delayedPin
+bc:producer:holeCardsSwitch
+BROADCAST_HOLECARD_POLICY
+BROADCAST_HOLECARD_ISSUERS
+BROADCAST_HOLECARDS_SET
+holeCardsReleasedAt
+# 2026-11-02 (broadcast review round 1, poker-server fixes) - bc:resync metered + a per-socket packet budget (P1);
+# keyed sessions on their own budget + keyless browser origin check; keyed handshakes wait for the persisted key
+# list after a restart (retryable code, renamed 'registry_loading' in fix round 2); keys minted from a producer key carry parent_jti (revoke withChildren);
+# the master's admin answer re-checked for broadcastIssueToken / adminSetBroadcastOptOut.
+broadcast_packet_budget_exceeded
+origin_not_allowed
+BCAST_MAX_KEYED
+BCAST_ALLOWED_ORIGINS
+BCAST_KEY_LIST_WAIT_MS
+parent_jti
+withChildren
+broadcast_admin_recheck_refused
+# 2026-11-02 (broadcast fix round 2, poker-server) - Sit & Go streaming OFF unless env BROADCAST_SITGO=1 (Sit & Go
+# players get no streaming notice / opt-out UI yet): a Sit & Go key answers not_broadcastable everywhere, health
+# broadcast.sitGoOn; the handshake's retryable "key list still loading" refusal is registry_loading (was 'starting').
+BROADCAST_SITGO
+sitGoBroadcastOn
+registry_loading
+# 2026-11-02 (broadcast fix round 3, owner answer (c)) - a one-word name of two or more joined capitalised words goes
+# on air as First L. ('JohnSmith' -> 'John S.', 'MaryJones22' -> 'Mary J.', 'JSmith' -> 'J. S.'), src/broadcast/broadcastNames.ts.
+# 2026-11-02 (broadcast fix round 4, approved promise "first name and last initial") - the name is cut into word segments at
+# every separator, digit and CamelCase boundary so no surname reaches air ('JohnSmith Jr' -> 'John J.', 'Mary22Jones' ->
+# 'Mary J.', "JohnSmith's" -> 'John S.'); surname prefixes stay whole ('McDonald'). Replaces round 3's joinedWordsName
+# function (its token removed with it). The on-air legal line ends "21+ to enter." (src/broadcast/contract.ts).
+surnameSafeName
+SURNAME_PREFIXES
+21+ to enter.

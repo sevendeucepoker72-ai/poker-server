@@ -458,6 +458,7 @@ export class SevenStudTable extends PokerTable {
       const seat = this.seats[ev.seatIndex];
       showdownHands.push({
         seatIndex: ev.seatIndex,
+        playerId: seat.playerId,
         playerName: seat.playerName,
         handName: ev.low ? `${ev.high.handName} / ${ev.low.handName}` : ev.high.handName,
         bestFiveCards: ev.high.bestFiveCards,
