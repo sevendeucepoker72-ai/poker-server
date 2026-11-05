@@ -887,6 +887,20 @@ BOT_EQUITY_BUDGET_MS = 40
 keptHoldemHoleCards(
 MIN_BUDGETED_SIMULATIONS = 64
 
+# 2026-11-04 (bots review, stud-draw-lowball SD1/SD2/SD10) - Stud / Draw bots:
+# engine-ordered strength, round-aware discards, own first-round logic
+# (src/ai/studDrawStrength.ts + the baked src/ai/studDrawCdf.ts).
+chooseBotDiscards
+studDrawEquity
+
+# 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
+# percentile table is generated offline (gen-preflop-table.ts) and committed as
+# src/ai/preflopTable.ts: no boot-time Monte Carlo, no Math.random, identical
+# ranges every boot; plus a stack-off scale (getStackOffPercentile) for
+# 4-bets and deep stack-offs.
+preflop-table-v1
+FOURBET_STACKOFF_THRESHOLD
+
 # 2026-10-11 (.online R2, S2 table lifecycle) — GAME-15/16 + Addendum: ONE seat
 # teardown (pot chips of a folded / all-in / extra-table / ghost seat wait for
 # the hand's end, the next bot acts now); never an AI seat taken mid-hand.
@@ -1344,6 +1358,25 @@ this.discardsThisHand.clear();
 forViewer.viewerDiscard = serializeCard(viewer.discard);
 isPineapple: !!variantInfo.isPineapple,
 pineappleDiscardActive: !!variantInfo.pineappleDiscardActive
+# 2026-11 (.online bots review 11-04, equity-variants C1-C6) - B6 Omaha-5/6
+# opponents hold the hero's card count; Omaha Hi-Lo equity is the pot share
+# (8-or-better low, exactly 2+3); B13 Short Deck pre-flop table + the engine's
+# Short Deck evaluator in the bots' equity; Omaha 5/6-card pre-flop
+# calibration; B14 exact Omaha outs; B7 one Pineapple keep rule shared by the
+# engine's no-pick fallback and the bots' pricing. (This group's AIPlayer and
+# index.ts tokens sit in the ai-core and server blocks.)
+function score5(
+function omahaHighScore(
+function omahaLowScore(
+function countOmahaDrawOuts(
+function omahaEquity(
+holePerOpp = Math.max(4, hn)
+SHORT_DECK_PREFLOP_PCTILE
+OMAHA5_KNOTS
+OMAHA6_KNOTS
+function calibrateOmahaPreflop(
+function pineappleDiscardIndex(
+# (the 2026-10-21 gameplay S3 tokens continue)
 const seatSessionFor =
 code: 'not_at_table'
 
