@@ -400,6 +400,23 @@ const handKeyOf = (ref?: HandRef): string =>
   ref && ref.tableId != null && ref.handNumber != null ? `${ref.tableId}#${ref.handNumber}` : '';
 const emptyFlags = (): HandFlags => ({ vpip: false, pfr: false, faced3bet: false, did3bet: false, foldedPreflop: false, allIns: 0 });
 
+/**
+ * 2026-11 (bots review, E5 / E13) — the idle-hand window. A dealt-in hand in
+ * which the account put no chip in VOLUNTARILY (index.ts decides that; a blind,
+ * an ante, a bring-in or a server auto-action never counts) is an idle hand.
+ * The first IDLE_HANDS_REWARD_LIMIT - 1 idle hands in a row still earn the
+ * per-hand rewards (hand XP, the scratch tick, the 'played' daily / weekly
+ * windows and play_hands missions, the lifetime hands-played count); from the
+ * IDLE_HANDS_REWARD_LIMIT-th on they earn nothing until the account puts a
+ * chip in voluntarily again. Owner call 2026-11-04: 30.
+ */
+export const IDLE_HANDS_REWARD_LIMIT = 30;
+/** Bound on the idle-run map (oldest entry dropped first). */
+export const IDLE_RUNS_CAP = 50_000;
+/** 2026-11 (bots review, E12) — XP per rewarded hand, and per rewarded hand past the daily full-XP limit. */
+export const HAND_XP = 5;
+export const HAND_XP_AFTER_CAP = 1;
+
 /** Internal per-record state that never leaves the server. */
 interface RecordInternals {
   handFlags: Map<string, HandFlags>;
@@ -448,6 +465,13 @@ export class ProgressionManager {
   private inflight: Set<Promise<unknown>> = new Set();
   private changeListener: ((userId: number) => void) | null = null;
   private auditHook: ((e: EconomyAuditEvent) => void) | null = null;
+  /**
+   * 2026-11 (bots review, E5) — canonical record key -> dealt-in hands in a row
+   * with no voluntary chip. Held only while > 0. Deliberately NOT in
+   * RecordInternals (a WeakMap on the record), so evictIdle (30 min after the
+   * account goes offline) does not reset it; a boot does. Bounded by IDLE_RUNS_CAP.
+   */
+  private idleRuns: Map<string, number> = new Map();
 
   /** The Battle Pass season whose premium the record carries (index.ts sets it). */
   battlePassSeason = 'season_1_the_river';
@@ -1322,18 +1346,42 @@ export class ProgressionManager {
   /**
    * A hand the player was DEALT INTO completed (handleHandComplete calls this
    * only for dealt-in seats — ECON-13). `ref` = { tableId, handNumber }.
+   *
+   * 2026-11 (bots review, E5 / E13) — `participated` = the account put a chip
+   * in VOLUNTARILY this hand (a call, bet, raise or all-in; never a blind, an
+   * ante, a bring-in or a server auto-action). Returns whether the hand EARNS
+   * the per-hand rewards: false from the IDLE_HANDS_REWARD_LIMIT-th idle hand
+   * in a row on (and for a hand not dealt in). A hand that does not earn ticks
+   * no 'played' window, no play_hands mission and no lifetime hands-played
+   * count; the caller skips its hand XP and scratch tick. The HUD flags and
+   * lastHandAt are recorded either way. No record: true (unchanged). The
+   * defaults keep every caller that passes neither flag unchanged.
    */
-  recordHandPlayed(playerId: string, variantId?: string, ref?: HandRef, dealtIn = true): void {
+  recordHandPlayed(playerId: string, variantId?: string, ref?: HandRef, dealtIn = true, participated = true): boolean {
     const progress = this.rec(playerId);
-    if (!progress) return;
+    if (!progress) return true;
     if (!dealtIn) {
       // ECON-13 — a seat sitting out / joining mid-hand: no hand, no XP, no
       // mission, no scratch progress. Its per-hand flags are dropped.
       this.takeFlags(progress, ref);
-      return;
+      return false;
     }
 
-    progress.totalHandsPlayed++;
+    const key = this.keyOf(playerId);
+    const run = participated ? 0 : (this.idleRuns.get(key) || 0) + 1;
+    this.idleRuns.delete(key);   // re-inserted below, so the map stays in last-idle order for the cap
+    if (run > 0) {
+      this.idleRuns.set(key, run);
+      if (this.idleRuns.size > IDLE_RUNS_CAP) {
+        const oldest = this.idleRuns.keys().next().value;
+        if (oldest !== undefined) this.idleRuns.delete(oldest);
+      }
+    }
+    const earns = run < IDLE_HANDS_REWARD_LIMIT;
+
+    // E13 — a hand past the idle window is not a 'played' hand anywhere (the
+    // hands_100..hands_100000 achievements, the HUD denominator, handsPlayed).
+    if (earns) progress.totalHandsPlayed++;
     progress.lastHandAt = this.now();
 
     const f = this.takeFlags(progress, ref);
@@ -1348,11 +1396,29 @@ export class ProgressionManager {
     if (variantId && !progress.variantsPlayed.includes(variantId)) {
       progress.variantsPlayed.push(variantId);
     }
-    this.tickWindows(progress, 'played', { variantId });
+    if (earns) this.tickWindows(progress, 'played', { variantId });
 
-    this.advanceMissions(progress, { played: true, allIns: f.allIns });
+    this.advanceMissions(progress, { played: earns, allIns: f.allIns });
 
     this.checkAchievements(playerId);
+    return earns;
+  }
+
+  /**
+   * 2026-11 (bots review, E12) — the XP of one rewarded hand: HAND_XP for the
+   * first `fullPerDay` rewarded hands of the account's UTC day
+   * (dailyStats.handsPlayed: the existing achievement window, which rolls at
+   * UTC midnight = 5-6 PM Denver, NOT a Denver day; only rewarded hands tick it
+   * since E5; persisted, so it survives a boot), then HAND_XP_AFTER_CAP.
+   * `fullPerDay` 0 (or not a positive number) = no cap. No record: HAND_XP.
+   * Call it right after recordHandPlayed, which has already rolled the window
+   * and counted this hand.
+   */
+  handXpFor(playerId: string, fullPerDay: number): number {
+    const p = this.rec(playerId);
+    if (!p || !(fullPerDay > 0)) return HAND_XP;
+    this.rollAchievementWindows(p);   // a no-op right after recordHandPlayed; a stale window never reduces a new day's XP
+    return (p.dailyStats?.handsPlayed || 0) > fullPerDay ? HAND_XP_AFTER_CAP : HAND_XP;
   }
 
   /**

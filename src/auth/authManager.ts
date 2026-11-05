@@ -188,6 +188,11 @@ export async function initDB(): Promise<void> {
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_claim_date DATE`).catch(() => {});
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS scratch_cards_available INTEGER NOT NULL DEFAULT 0`).catch(() => {});
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS hands_since_last_scratch INTEGER NOT NULL DEFAULT 0`).catch(() => {});
+  // 2026-11 (bots review, E7) — the daily scratch-card cap from hands
+  // (tickScratchProgress): the Denver day of the last card banked from hands,
+  // and how many were banked that day.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS scratch_earned_on DATE`).catch(() => {});
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS scratch_earned_today INTEGER NOT NULL DEFAULT 0`).catch(() => {});
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS customization JSONB NOT NULL DEFAULT '{}'`).catch(() => {});
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences   JSONB NOT NULL DEFAULT '{}'`).catch(() => {});
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_stars ON users(stars)`).catch(() => {});
@@ -1412,14 +1417,36 @@ export async function updateLoginStreak(userId: number, streak: number): Promise
   }
 }
 
-/** One dealt-in hand's scratch-card tick + the row's wallet after it (C5: the hand-complete push is DB-fresh). */
-export interface ScratchTick { awarded: boolean; chips: number; stars: number; scratchCardsAvailable: number }
+/**
+ * One dealt-in hand's scratch-card tick + the row's wallet after it (C5: the
+ * hand-complete push is DB-fresh). `capped` (2026-11, bots review E7): the
+ * hand would have banked a card but today's (Denver) SCRATCH_CARDS_PER_DAY
+ * cards from hands are already banked; the counter holds at
+ * SCRATCH_HANDS_PER_CARD until the next Denver day.
+ */
+export interface ScratchTick { awarded: boolean; chips: number; stars: number; scratchCardsAvailable: number; capped: boolean }
+
+/** Rewarded hands per scratch card banked from hands. */
+export const SCRATCH_HANDS_PER_CARD = 20;
+/**
+ * 2026-11 (bots review, E7) — cards a user can bank from hands per Denver day.
+ * Env SCRATCH_CARDS_PER_DAY (a non-negative integer); default 10; 0 = no cap
+ * (the no-deploy rollback). Owner call 2026-11-04: 10.
+ */
+export const SCRATCH_CARDS_PER_DAY: number = ((raw: string | undefined): number => {
+  const n = Number(raw);
+  return raw !== undefined && raw.trim() !== '' && Number.isInteger(n) && n >= 0 ? n : 10;
+})(process.env.SCRATCH_CARDS_PER_DAY);
 
 /**
- * Increment hands_since_last_scratch; if it crosses 20, bank a card and reset
- * the counter. Returns the tick (awarded + the wallet columns the same UPDATE
- * returns — R2: the hand-complete progress push reads the wallet from here, no
- * extra round trip), or false on a missing row / DB error.
+ * Increment hands_since_last_scratch; when it reaches SCRATCH_HANDS_PER_CARD,
+ * bank a card and reset the counter, unless the user already banked
+ * SCRATCH_CARDS_PER_DAY cards from hands today (Denver) — then the counter
+ * holds at SCRATCH_HANDS_PER_CARD and the tick reports `capped`; the first
+ * hand of the next Denver day banks (no card is owed retroactively). Returns
+ * the tick (awarded + the wallet columns the same UPDATE returns — R2: the
+ * hand-complete progress push reads the wallet from here, no extra round
+ * trip), or false on a missing row / DB error.
  */
 export async function tickScratchProgress(userId: number): Promise<ScratchTick | false> {
   try {
@@ -1429,13 +1456,37 @@ export async function tickScratchProgress(userId: number): Promise<ScratchTick |
     // both read >=20 and both award → double-banked card. After this single
     // statement, hands_since_last_scratch is 0 exactly when a card was just
     // awarded (a +1 can never produce 0 otherwise), so that's our award signal.
+    //
+    // 2026-11 (bots review, E7) — the daily cap. The award condition
+    //   A = hands_since_last_scratch + 1 >= $2
+    //       AND NOT ($3 > 0 AND scratch_earned_on IS NOT DISTINCT FROM d.today AND scratch_earned_today >= $3)
+    // is written INLINE in every CASE (never computed in the FROM subquery):
+    // every SET expression reads the OLD row under the row lock, so the
+    // 2026-06-19 double-award guard still holds. d.today is the Denver date.
     const { rows } = await pool.query(
       `UPDATE users SET
-         hands_since_last_scratch = CASE WHEN hands_since_last_scratch + 1 >= 20 THEN 0 ELSE hands_since_last_scratch + 1 END,
-         scratch_cards_available = scratch_cards_available + CASE WHEN hands_since_last_scratch + 1 >= 20 THEN 1 ELSE 0 END
-       WHERE id = $1
-       RETURNING hands_since_last_scratch, chips, stars, scratch_cards_available`,
-      [userId]
+         hands_since_last_scratch = CASE
+           WHEN hands_since_last_scratch + 1 >= $2
+            AND NOT ($3 > 0 AND scratch_earned_on IS NOT DISTINCT FROM d.today AND scratch_earned_today >= $3)
+           THEN 0 ELSE LEAST(hands_since_last_scratch + 1, $2) END,
+         scratch_cards_available = scratch_cards_available + CASE
+           WHEN hands_since_last_scratch + 1 >= $2
+            AND NOT ($3 > 0 AND scratch_earned_on IS NOT DISTINCT FROM d.today AND scratch_earned_today >= $3)
+           THEN 1 ELSE 0 END,
+         scratch_earned_today = CASE
+           WHEN hands_since_last_scratch + 1 >= $2
+            AND NOT ($3 > 0 AND scratch_earned_on IS NOT DISTINCT FROM d.today AND scratch_earned_today >= $3)
+           THEN (CASE WHEN scratch_earned_on IS NOT DISTINCT FROM d.today THEN scratch_earned_today + 1 ELSE 1 END)
+           ELSE scratch_earned_today END,
+         scratch_earned_on = CASE
+           WHEN hands_since_last_scratch + 1 >= $2
+            AND NOT ($3 > 0 AND scratch_earned_on IS NOT DISTINCT FROM d.today AND scratch_earned_today >= $3)
+           THEN d.today ELSE scratch_earned_on END
+       FROM (SELECT (NOW() AT TIME ZONE 'America/Denver')::date AS today) d
+       WHERE users.id = $1
+       RETURNING users.hands_since_last_scratch, users.chips, users.stars, users.scratch_cards_available,
+                 (users.hands_since_last_scratch >= $2) AS capped`,
+      [userId, SCRATCH_HANDS_PER_CARD, SCRATCH_CARDS_PER_DAY]
     );
     if (rows.length === 0) return false;
     return {
@@ -1443,6 +1494,7 @@ export async function tickScratchProgress(userId: number): Promise<ScratchTick |
       chips: Number(rows[0].chips) || 0,
       stars: Number(rows[0].stars) || 0,
       scratchCardsAvailable: Number(rows[0].scratch_cards_available) || 0,
+      capped: rows[0].capped === true,
     };
   } catch (e: any) {
     console.warn(`[tickScratchProgress ${userId}]`, e.message);
