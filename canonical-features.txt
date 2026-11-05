@@ -2072,3 +2072,9 @@ turnClockThrows
 drawClockThrows
 'turn_clock'
 'draw_clock'
+# 2026-11-05 (bots review fix round 2, server lane) - /api/health gates every Railway deploy: the bots-review sections
+# are built by healthSection (a throw answers { error } for that section only; the 200 stands), and
+# economy.handRewards.scratchCapColumns shows the scratch cap columns' boot state.
+[health-section-error]
+healthSectionErrors
+scratchCapColumns:

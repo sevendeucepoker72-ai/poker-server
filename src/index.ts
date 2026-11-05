@@ -69,7 +69,7 @@ import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import type { PineappleTable } from './game/variants/PineappleTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims, loadBroadcastOptOuts, SCRATCH_CARDS_PER_DAY } from './auth/authManager';
+import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims, loadBroadcastOptOuts, SCRATCH_CARDS_PER_DAY, scratchCapColumnState } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus, getIntrospectionStats } from './auth/oauthValidator';
 import {
   resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
@@ -3112,6 +3112,26 @@ app.get('/api/tables', (_req, res) => {
   res.json(publicTableList());
 });
 
+/**
+ * Fix round 2 (2026-11-05) — /api/health gates EVERY Railway deploy (railway.json
+ * healthcheckPath, 120 s): a throw anywhere in the body used to answer 503 and keep
+ * the new build from going live. The sections the bots review added are built here,
+ * one by one: a throw — or a value JSON cannot carry — answers `{ error }` for that
+ * section only (counted, logged once per section) and the rest of the 200 is intact.
+ */
+const healthSectionStats = { errors: 0 };
+const healthSectionsLogged = new Set<string>();
+function healthSection(name: string, build: () => unknown): unknown {
+  try {
+    return JSON.parse(JSON.stringify(build()));
+  } catch (e: any) {
+    healthSectionStats.errors++;
+    const error = `health section ${name} failed: ${String(e?.message || e).slice(0, 200)}`;
+    if (!healthSectionsLogged.has(name)) { healthSectionsLogged.add(name); console.error(`[health-section-error] ${JSON.stringify({ section: name, error })}`); }
+    return { error };
+  }
+}
+
 app.get('/api/health', async (_req, res) => {
   // A real liveness check: ping the DB + Redis (if configured) under a 1.5s
   // budget. A 200 here means the process can actually serve traffic; the
@@ -3178,8 +3198,9 @@ app.get('/api/health', async (_req, res) => {
         socketListeners: { ...socketGuardStats },
         process: { ...processCrashStats },
         // Bots review 2026-11-04 (A-crash) — a recovered throw on a game timer (bot action / draw,
-        // a scheduled deal, the heartbeat). Counts only; the event is in the [game-timer-error] line.
-        gameTimers: { ...gameTimerGuardStats },
+        // a scheduled deal, the heartbeat; fix round 2: the turn clock and the draw clock).
+        // Counts only; the event is in the [game-timer-error] line.
+        gameTimers: healthSection('crashSafety.gameTimers', () => ({ ...gameTimerGuardStats })),
       },
       // 2026-10-10 — one person, one local row (auth/accountMerge.ts). Counts
       // only, no ids: the identity gate, the master-first resolver (splitSeen
@@ -3336,14 +3357,19 @@ app.get('/api/health', async (_req, res) => {
           : null,
         // 2026-11 (bots review E9) — what humans took from bots per format since boot (no ids).
         // totalHumanNet == engine.botStacks.humansTookFromBots at hand boundaries (E10).
-        botFlow: {
+        botFlow: healthSection('economy.botFlow', () => ({
           since: botFlowStats.since,
           totalHumanNet: [...botFlowStats.formats.values()].reduce((a, e) => a + e.humanNet, 0),
           totalAccountNet: [...botFlowStats.formats.values()].reduce((a, e) => a + e.accountNet, 0),
           formats: Object.fromEntries(botFlowStats.formats),
-        },
+        })),
         // 2026-11 (bots review E5 / E6 / E7 / E12) — the per-hand reward gate and its limits.
-        handRewards: { ...handRewardStats, idleHandsLimit: IDLE_HANDS_REWARD_LIMIT, scratchCardsPerDay: SCRATCH_CARDS_PER_DAY, handXpFullPerDay: HAND_XP_FULL_PER_DAY },
+        // Fix round 2 (ECON-R2 / SCD-1) — scratchCapColumns: the E7 columns' boot ALTERs
+        // (alterFailed) and the ticks that ran uncapped because a column was missing.
+        handRewards: healthSection('economy.handRewards', () => ({
+          ...handRewardStats, idleHandsLimit: IDLE_HANDS_REWARD_LIMIT, scratchCardsPerDay: SCRATCH_CARDS_PER_DAY, handXpFullPerDay: HAND_XP_FULL_PER_DAY,
+          scratchCapColumns: { ...scratchCapColumnState },
+        })),
       },
       // 2026-10-11 (.online R2, S2 engine lane) — table lifecycle counters:
       // seatTeardown (GAME-15/16: stand-ups deferred to the hand's end, all-in
@@ -3353,13 +3379,13 @@ app.get('/api/health', async (_req, res) => {
       // HandComplete tables revived — should stay ~0), bombPots (GAME-12),
       // sitOutLimit (GAME-11), reservationsDisplaced (APPUI-21), chipVelocity.
       engine: {
-        seatTeardown: { ...seatTeardownStats, pendingTables: pendingSeatRemovalAfterHand.size },
+        seatTeardown: healthSection('engine.seatTeardown', () => ({ ...seatTeardownStats, pendingTables: pendingSeatRemovalAfterHand.size })),
         // 2026-11 (bots review E10) — humansTookFromBots = seated + minted - burned - removed - live:
         // what humans (and the house's removals) took from bots; == economy.botFlow.totalHumanNet at hand boundaries.
-        botStacks: ((live: number) => ({
+        botStacks: healthSection('engine.botStacks', () => ((live: number) => ({
           ...botStackStats, capBuyIns: BOT_STACK_CAP_BUYINS, liveChips: live,
           humansTookFromBots: botStackStats.seatedChips + botStackStats.minted - botStackStats.burned - botStackStats.removedChips - live,
-        }))(liveBotChips()),
+        }))(liveBotChips())),
         // 2026-10-26 (owner: "After 1") - tournament timeout sit-out + stale-table Sit Out / I'm back fallbacks.
         tournamentTimeoutSitOut: { ...tournamentTimeoutSitOutStats },
         // 2026-10-28 — handComplete is NOT a freeze count: it includes the
@@ -3382,11 +3408,11 @@ app.get('/api/health', async (_req, res) => {
         // the commit, plannedBotLost = the bot was dealt into a new hand meanwhile
         // (the join refused + refunded), preCheckRefused = joinAdditionalTable refused
         // for chips before any seat was touched.
-        joinSeats: { ...joinSeatStats },
+        joinSeats: healthSection('engine.joinSeats', () => ({ ...joinSeatStats })),
         // Bots review 2026-11-04 (A-commentary) — the LLM table commentary: keyConfigured
         // (a boolean, never the key), model calls / lines delivered / empty replies /
         // failures, and notable hands skipped because nobody was in the table's room.
-        commentary: { keyConfigured: !!process.env.ANTHROPIC_API_KEY, minIntervalMs: TABLE_COMMENTARY_MIN_INTERVAL_MS, ...tableCommentaryStats },
+        commentary: healthSection('engine.commentary', () => ({ keyConfigured: !!process.env.ANTHROPIC_API_KEY, minIntervalMs: TABLE_COMMENTARY_MIN_INTERVAL_MS, ...tableCommentaryStats })),
       },
       // 2026-10-11 (.online R2, S1) — tournaments, qualifiers, quick games,
       // home games, staking, the prize ledger. Counts only, no ids.
@@ -3451,13 +3477,15 @@ app.get('/api/health', async (_req, res) => {
           // sockets forced out of voice on landing at one (and the voice_ rooms left).
           voiceOff: { ...qualifierVoiceOff },
         },
-        quickGames: { ...quickGameStats, live: quickGames.size },
+        quickGames: healthSection('r2Play.quickGames', () => ({ ...quickGameStats, live: quickGames.size })),
         privateTables: { ...privateTableStats },
         // Bots review 2026-11-04 — club runtime tables: recreateSkippedNotMember = a
         // getClubTables from a non-member that would have (re)created a table (the list
         // is still answered); idleDealsSkipped = a club table nobody sits at not dealt.
-        clubTables: { ...clubTableRuntimeStats },
+        clubTables: healthSection('r2Play.clubTables', () => ({ ...clubTableRuntimeStats })),
       },
+      // Fix round 2 — sections above that answered { error } instead of failing this response (counted; last, so this one is in it).
+      healthSectionErrors: healthSectionStats.errors,
     });
   } catch (e: any) {
     res.status(503).json({ status: 'unhealthy', error: e?.message || String(e) });

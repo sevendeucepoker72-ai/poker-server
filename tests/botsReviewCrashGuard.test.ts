@@ -506,7 +506,7 @@ describe('C1 — a throw on a bot timer is recovered, never left to the process 
     const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'index.ts'), 'utf8');
     expect(src.split('try { autoStartNextHand(').length - 1).toBe(4);
     expect(src).toContain('if (table.currentPhase === GamePhase.Showdown && gameShowdownHeld(table)) {');
-    expect(src).toContain('gameTimers: { ...gameTimerGuardStats },');
+    expect(src).toContain("gameTimers: healthSection('crashSafety.gameTimers', () => ({ ...gameTimerGuardStats })),");
     expect(src).toContain("try { ensureCashTableRunning(t.tableId); } catch (err) { gameTimerGuardStats.heartbeatThrows++;");
   });
 });
