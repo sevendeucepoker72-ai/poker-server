@@ -896,6 +896,9 @@ studDrawEquity
 # round has its own routing, and later rounds play as the Hold'em-equivalent street.
 holdemEquivalentStreet
 studDrawFirstRound
+# 2026-11-05 (bots review fix round 2, VA-2) - studDrawEquity: an opponent start that never reaches his range
+# in MAX_TRIES deals drops the whole simulation (it was scored as dealt: a random hand in a tight range).
+if (tr >= MAX_TRIES) {
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

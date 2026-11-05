@@ -322,11 +322,15 @@ export function studDrawEquity(s: StudDrawSpot, maxSims = STUD_DRAW_MAX_SIMS, bu
     for (let i = 0; i < nOpp; i++) {
       const o = s.opps[i];
       let d = dealStart(o);
-      for (let tr = 1; tr < MAX_TRIES && scorer[i] && scorer[i]!(d.start) < thr[i]; tr++) {
+      // Fix round 2 (VA-2): a start still outside his range after MAX_TRIES deals drops the
+      // whole simulation. It used to be scored as dealt: a random hand in a tight range
+      // (~7% of them at floor 0.90) put the bot's pot share 1-3 points too high.
+      for (let tr = 1; scorer[i] && scorer[i]!(d.start) < thr[i]; tr++) {
+        if (tr >= MAX_TRIES) { ok = false; break; }
         pos -= d.unk.length;                               // rejected: re-deal the same slots
         d = dealStart(o);
       }
-      if (pos > deck.length) { ok = false; break; }
+      if (!ok || pos > deck.length) { ok = false; break; }
       hands[i + 1] = finish(o, d.unk);
     }
     if (!ok) continue;
