@@ -6,6 +6,7 @@ import {
 } from '../PokerTable';
 import { TexasHoldemVariant } from './TexasHoldemVariant';
 import { PokerVariant } from './PokerVariant';
+import { pineappleDiscardIndex } from './pineappleKeep';
 
 /**
  * PineappleTable — Pineapple and Crazy Pineapple variants of Hold'em.
@@ -17,9 +18,13 @@ import { PokerVariant } from './PokerVariant';
  *
  * Discard policy: MANUAL with server-side fallback. When the discard deadline
  * arrives, each seat's chosen card (via `selectPineappleDiscard`) is dropped.
- * If no choice was made in time, the weakest card is auto-discarded so the
- * hand can proceed (Crazy Pineapple, with the flop out: the card whose loss
- * leaves the best hand — F16).
+ * If no choice was made in time, the server discards for the seat so the hand
+ * can proceed, by the ONE Pineapple keep rule (pineappleKeep.ts,
+ * pineappleDiscardIndex — .online bots review 2026-11-04, B7): before the flop
+ * it keeps the pair with the best Hold'em pre-flop percentile (77K keeps 77);
+ * Crazy Pineapple, with the flop out, drops the card whose loss leaves the best
+ * hand (F16). Bots never pick: this fallback is their discard, and the bots
+ * price exactly this keep (TrainingEngine.keptHoldemHoleCards).
  */
 export class PineappleTable extends PokerTable {
   public variant: PokerVariant;
@@ -238,30 +243,23 @@ export class PineappleTable extends PokerTable {
   }
 
   /**
-   * The server's discard when the player chose none. Before any board
-   * (Pineapple): the weakest card by rank, ties → lowest suit. F16
+   * The server's discard when the player chose none: pineappleDiscardIndex,
+   * the ONE keep rule shared with the bots' pricing (bots review 2026-11-04,
+   * B7). Before any board (Pineapple): keep the pair with the best full-deck
+   * Hold'em pre-flop percentile — the committed table, so the same keep on
+   * every boot; ties keep the old rank rule (lowest rank, ties → lowest suit).
+   * The rank rule alone broke 50% of dealt pairs (77K kept K7). F16
    * (2026-10-21) — Crazy Pineapple discards with the flop out: drop the card
-   * whose loss leaves the BEST hand with the board (the rank rule alone broke
-   * sets, two pair and flushes); ties go to the rank rule.
+   * whose loss leaves the BEST hand with the board, under this table's own
+   * evaluator and comparator; ties go to the rank rule.
    */
   private fallbackDiscardIndex(cards: Card[]): number {
-    let weakest = 0;
-    for (let i = 1; i < cards.length; i++) {
-      const c = cards[i];
-      const w = cards[weakest];
-      if (c.rank < w.rank || (c.rank === w.rank && c.suit < w.suit)) weakest = i;
-    }
-    if (!this.isCrazyPineapple || this.communityCards.length < 3) return weakest;
-    const without = (i: number): Card[] => cards.filter((_c, j) => j !== i);
-    const cmp = this.getHandComparator();
-    let best = weakest;
-    let bestHand = this.evaluatePlayerHand(without(weakest), this.communityCards);
-    for (let i = 0; i < cards.length; i++) {
-      if (i === weakest) continue;
-      const hand = this.evaluatePlayerHand(without(i), this.communityCards);
-      if (cmp(hand, bestHand) > 0) { best = i; bestHand = hand; }
-    }
-    return best;
+    return pineappleDiscardIndex(
+      cards,
+      this.isCrazyPineapple && this.communityCards.length >= 3 ? this.communityCards : [],
+      (h, b) => this.evaluatePlayerHand(h, b),
+      this.getHandComparator(),
+    );
   }
 
   private cardLabel(c: Card): string {
