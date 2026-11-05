@@ -918,6 +918,15 @@ MICRO_CALL_NEED
 aofPushPctile
 aofCallPctile
 function aofShoverWidth(
+# 2026-11-05 (bots review fix round 2, HAI-1..HAI-4) - the value set (JJ+, AK) is judged before the
+# difficulty noise and never folds to a single bet, AA / KK never fold pre-flop; the multiway call widths
+# count at most 3 players; a size-narrowed call line stops at the top ~5.4%; the micro-call floor is per
+# opponent in the pot; a bot never folds when checking is free.
+PREMIUM_STACKOFF_THRESHOLD
+CALL_WIDTH_MAX_PLAYERS
+SIZE_NARROW_MAX_TH
+MICRO_CALL_NEED / pyta
+function decideActionForSeat(
 
 # 2026-11 bots review, equity-variants C4/C8/C10 (AIPlayer wiring): Short Deck
 # bots rank hands in the 6+ order and read their own pre-flop table; Omaha Hi-Lo

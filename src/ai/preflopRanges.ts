@@ -122,6 +122,16 @@ export const FOURBET_THRESHOLD = 0.965; // equity-vs-random scale: AA-88 + AKs
  */
 export const FOURBET_STACKOFF_THRESHOLD = 0.971;
 
+/**
+ * Bots review fix round 2 (2026-11-05, HAI-1 / HAI-2): the hands a bot never
+ * folds pre-flop, on the same STACK-OFF scale: exactly AA and KK (12 combos).
+ * Re-centred in the KK (.99321) / QQ (.98869) gap (midpoint .99095).
+ * AIPlayer.preFlopStrategy reads it, and FOURBET_STACKOFF_THRESHOLD (the value
+ * set: never folded to a single bet), on the strength BEFORE the difficulty
+ * noise. tests/botPremiumHold.test.ts pins the set.
+ */
+export const PREMIUM_STACKOFF_THRESHOLD = 0.991;
+
 /** How wide to flat/defend vs a single raise (call, not 3-bet), by position.
  * 2026-07-07 tuning: tightened the wide late-position flats (CO/BTN) — the bots
  * were flatting too loose IP, pushing TAG VPIP into LAG territory (~40%). BB
