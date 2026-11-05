@@ -22,6 +22,7 @@ import * as TE from '../src/training/TrainingEngine';
 import {
   cardCode, score5, omahaHighScore, omahaLowScore, NO_LOW, boardAllowsLow, countOmahaDrawOuts,
 } from '../src/training/fastOmahaEval';
+import { OMAHA5_KNOTS, OMAHA6_KNOTS, calibrateOmahaPreflop } from '../src/ai/omahaPreflopCalibration';
 
 const RK: Record<string, number> = { A: 14, K: 13, Q: 12, J: 11, T: 10 };
 const SU: Record<string, number> = { h: 0, d: 1, c: 2, s: 3 };
@@ -288,4 +289,48 @@ describe('C2 — calculateEquity\'s Omaha path equals an engine-evaluator refere
     expect(budgeted * 5).toBeLessThan(unbudgeted); // 64 of 500 simulations
     expect(inTime).toBe(unbudgeted);               // a spot that finishes inside the budget runs all 500
   }, 60_000);
+});
+
+describe('C2(g) — the coach passes Hi-Lo through to the equity', () => {
+  it('getFullTrainingData(..., isOmaha, isHiLo = true) shows the nut low\'s pot share (about 62%, not the high-only 25%)', () => {
+    const hole = cs('Ah 2d 3c Ks'), board = cs('5h 6c 8d');
+    const hiLo = seeded(61, () => TE.getFullTrainingData(hole, board, 1, 0, 300, 5000, 'flop', true, true));
+    const hiOnly = seeded(61, () => TE.getFullTrainingData(hole, board, 1, 0, 300, 5000, 'flop', true));
+    expect(Math.abs(hiLo.equity - 62)).toBeLessThanOrEqual(5);
+    expect(hiOnly.equity).toBeLessThan(40);
+    expect(hiLo.equity).toBe(seeded(61, () => TE.calculateEquity(hole, board, 1, true, 0, false, 0, true)));
+  }, 60_000);
+});
+
+describe('C6 — the 5/6-card Omaha pre-flop knots', () => {
+  it.each([[5, OMAHA5_KNOTS], [6, OMAHA6_KNOTS]] as const)('%i-card knots: x strictly increasing, y non-decreasing, ending at 1', (_n, kn) => {
+    for (let i = 1; i < kn.length; i++) {
+      expect(kn[i][0]).toBeGreaterThan(kn[i - 1][0]);
+      expect(kn[i][1]).toBeGreaterThanOrEqual(kn[i - 1][1]);
+    }
+    expect(kn[0]).toEqual([0.261, 0.307]);
+    expect(kn[kn.length - 1][1]).toBe(1);
+    expect(kn.filter((k) => k[1] >= 1)).toHaveLength(1);
+  });
+
+  it('calibrateOmahaPreflop interpolates, clamps to the end knots, picks the table by card count, and is monotone', () => {
+    expect(calibrateOmahaPreflop(5, NaN)).toBeNaN();
+    expect(calibrateOmahaPreflop(6, Infinity)).toBeNaN();
+    expect(calibrateOmahaPreflop(5, 0)).toBe(0.307);
+    expect(calibrateOmahaPreflop(5, 5)).toBe(1);
+    expect(calibrateOmahaPreflop(6, 1.1629)).toBe(1);
+    for (const [x, y] of OMAHA5_KNOTS) expect(calibrateOmahaPreflop(5, x)).toBeCloseTo(y, 12);
+    for (const [x, y] of OMAHA6_KNOTS) expect(calibrateOmahaPreflop(6, x)).toBeCloseTo(y, 12);
+    expect(calibrateOmahaPreflop(5, 0.4105)).toBeCloseTo(0.399 + (0.445 - 0.399) * (0.4105 - 0.399) / (0.422 - 0.399), 12);
+    expect(calibrateOmahaPreflop(6, 0.4105)).toBeCloseTo(0.422, 12);
+    expect(calibrateOmahaPreflop(7, 0.4105)).toBe(calibrateOmahaPreflop(6, 0.4105));
+    for (const n of [5, 6]) {
+      let prev = -1;
+      for (let u = 0.2; u <= 1.25; u += 0.0005) {
+        const v = calibrateOmahaPreflop(n, u);
+        expect(v).toBeGreaterThanOrEqual(prev);
+        prev = v;
+      }
+    }
+  });
 });
