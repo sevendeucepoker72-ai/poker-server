@@ -6,20 +6,22 @@
 // to express. This module replaces that with an EQUITY-RANKED, COMBO-WEIGHTED
 // percentile for all 169 canonical starting hands:
 //
-//   - At first use we Monte-Carlo each hand's heads-up equity vs a random hand,
-//     sort by equity, and assign a percentile = 1 - (combo-weighted rank). So
-//     AA ≈ 1.00 (top of the deck), 72o ≈ 0.00 (bottom), and "open the top 15%"
-//     becomes literally `percentile >= 0.85`.
+//   - Each hand's heads-up equity vs a random hand is Monte-Carlo'd OFFLINE
+//     (gen-preflop-table.ts at the repo root, fixed seed) and committed as
+//     preflopTable.ts; sorted by equity, percentile = 1 - (combo-weighted
+//     rank). So AA ≈ 1.00 (top of the deck), 32o ≈ 0.00 (bottom), and "open
+//     the top 15%" becomes literally `percentile >= 0.85`. A second column
+//     (stack-off) ranks the same hands by equity vs the top 15%.
 //   - Position buckets carry real solver-sized open/3-bet/4-bet/defend
 //     thresholds (UTG ~15%, CO ~27%, BTN ~45%, …). Archetypes widen/tighten
 //     that base by a single factor, so the personalities are now parametric off
 //     one principled range instead of scattered magic literals.
 //
-// Dependency-clean: imports only Card + the hand evaluator (no cycle with
-// TrainingEngine, which imports getPreflopPercentile back for range-aware equity).
+// Dependency-clean: imports only Card + the committed table (no cycle with
+// TrainingEngine, which imports percentileByRanks back for range-aware equity).
 // ============================================================================
-import { Card, Rank, Suit } from '../game/Card';
-import { evaluateHand, compareTo } from '../game/HandEvaluator';
+import { Card } from '../game/Card';
+import { PREFLOP_TABLE } from './preflopTable';
 
 const RANK_CHAR: Record<number, string> = {
   14: 'A', 13: 'K', 12: 'Q', 11: 'J', 10: 'T',
@@ -39,83 +41,39 @@ export function getHandCode(holeCards: Card[]): string {
   return handCodeFrom(holeCards[0].rank, holeCards[1].rank, holeCards[0].suit === holeCards[1].suit);
 }
 
-// ── Percentile table (lazy, cached) ─────────────────────────────────────────
-let _pctile: Map<string, number> | null = null;
-
-function buildDeck(): Card[] {
-  const d: Card[] = [];
-  for (let s = Suit.Hearts; s <= Suit.Spades; s++) {
-    for (let r = Rank.Two; r <= Rank.Ace; r++) d.push({ suit: s, rank: r });
-  }
-  return d;
-}
-
-/** Heads-up equity of `hole` vs one random hand over `sims` runs (0..1). */
-function equityVsRandom(hole: Card[], sims: number): number {
-  const known = new Set<string>(hole.map((c) => `${c.rank}_${c.suit}`));
-  const deck = buildDeck().filter((c) => !known.has(`${c.rank}_${c.suit}`));
-  let win = 0, tie = 0, n = 0;
-  for (let i = 0; i < sims; i++) {
-    // Fisher-Yates partial shuffle of the first 7 slots (5 board + 2 opp).
-    for (let k = 0; k < 7; k++) {
-      const j = k + Math.floor(Math.random() * (deck.length - k));
-      const t = deck[k]; deck[k] = deck[j]; deck[j] = t;
-    }
-    const board = deck.slice(0, 5);
-    const opp = deck.slice(5, 7);
-    const me = evaluateHand([...hole, ...board]);
-    const them = evaluateHand([...opp, ...board]);
-    const cmp = compareTo(me, them);
-    if (cmp > 0) win++; else if (cmp === 0) tie++;
-    n++;
-  }
-  return n > 0 ? (win + tie / 2) / n : 0.5;
-}
-
-/** Build the combo-weighted percentile table once. ~169 * SIMS evaluations. */
-function ensureTable(): void {
-  if (_pctile) return;
-  const SIMS = 600; // enough for a stable ranking (±~2% equity noise, order stable)
-  const hands: { code: string; combos: number; eq: number }[] = [];
-  for (let hi = Rank.Two; hi <= Rank.Ace; hi++) {
-    for (let lo = Rank.Two; lo <= hi; lo++) {
-      if (hi === lo) {
-        // pair — 6 combos
-        const hole = [{ suit: Suit.Hearts, rank: hi }, { suit: Suit.Spades, rank: hi }];
-        hands.push({ code: handCodeFrom(hi, lo, false), combos: 6, eq: equityVsRandom(hole, SIMS) });
-      } else {
-        // suited — 4 combos
-        const suited = [{ suit: Suit.Hearts, rank: hi }, { suit: Suit.Hearts, rank: lo }];
-        hands.push({ code: handCodeFrom(hi, lo, true), combos: 4, eq: equityVsRandom(suited, SIMS) });
-        // offsuit — 12 combos
-        const off = [{ suit: Suit.Hearts, rank: hi }, { suit: Suit.Spades, rank: lo }];
-        hands.push({ code: handCodeFrom(hi, lo, false), combos: 12, eq: equityVsRandom(off, SIMS) });
-      }
-    }
-  }
-  hands.sort((a, b) => b.eq - a.eq); // strongest first
-  const total = hands.reduce((s, h) => s + h.combos, 0); // 1326
-  const map = new Map<string, number>();
-  let running = 0;
-  for (const h of hands) {
-    const midpoint = running + h.combos / 2;
-    map.set(h.code, 1 - midpoint / total); // AA≈0.998 (top), 72o≈~0.002 (bottom)
-    running += h.combos;
-  }
-  _pctile = map;
-}
+// ── Percentile tables (B10 / NEW-2, bots review 2026-11-04): COMMITTED ──────
+// The table used to be Monte-Carlo-built lazily, synchronously and with
+// Math.random on the first bot decision after every boot (169 hands x 600
+// runs, ~710k Math.random calls): a 7-21 s whole-server freeze, and bot ranges
+// that reshuffled on every deploy. It is now generated ONCE offline by
+// gen-preflop-table.ts (repo root, fixed seed; VERIFY=1 re-checks it) and
+// committed as preflopTable.ts. Loading it is two Map fills (169 rows, < 1 ms),
+// zero Math.random calls, identical on every boot.
+const _pctile: Map<string, number> = new Map();
+const _stackOff: Map<string, number> = new Map();
+for (const [code, , pctile, stackOff] of PREFLOP_TABLE) { _pctile.set(code, pctile); _stackOff.set(code, stackOff); }
 
 /** Preflop strength as a real range PERCENTILE: 1.0 = AA, ~0.85 = top 15%. */
 export function getPreflopPercentile(holeCards: Card[]): number {
   if (!holeCards || holeCards.length < 2) return 0;
-  ensureTable();
-  return _pctile!.get(getHandCode(holeCards)) ?? 0;
+  return _pctile.get(getHandCode(holeCards)) ?? 0;
 }
 
 /** Percentile by (rank, rank, suited) — used by the range-aware equity sampler. */
 export function percentileByRanks(r1: number, r2: number, suited: boolean): number {
-  ensureTable();
-  return _pctile!.get(handCodeFrom(r1, r2, suited)) ?? 0;
+  return _pctile.get(handCodeFrom(r1, r2, suited)) ?? 0;
+}
+
+/**
+ * STACK-OFF percentile (bots review 2026-11-04): the same combo-weighted scale,
+ * but ranked by equity vs a STRONG range (the top 15% by percentile) instead
+ * of vs a random hand. For use only where the bot is up against a strong range
+ * (4-bets, deep stack-offs), so AK / QQ rank above 88 / 77 there (vs a random
+ * hand small pairs outrank AK).
+ */
+export function getStackOffPercentile(holeCards: Card[]): number {
+  if (!holeCards || holeCards.length < 2) return 0;
+  return _stackOff.get(getHandCode(holeCards)) ?? 0;
 }
 
 // ── Position-bucketed range thresholds (solver-sized) ───────────────────────
@@ -149,8 +107,20 @@ export const THREEBET_THRESHOLD: Record<PosBucket, number> = {
   EP: 0.93, MP: 0.92, CO: 0.90, BTN: 0.88, SB: 0.91, BB: 0.90,
 };
 
-/** 4-bet-for-value threshold. */
-export const FOURBET_THRESHOLD = 0.965; // ~ QQ+/AK top
+/** 4-bet-for-value threshold on the getPreflopPercentile scale. Kept for
+ * non-Hold'em strengths (Omaha); the Hold'em 4-bet / stack-off line is
+ * FOURBET_STACKOFF_THRESHOLD below, on the stack-off scale (wired into
+ * AIPlayer by holdem-preflop C10). */
+export const FOURBET_THRESHOLD = 0.965; // equity-vs-random scale: AA-88 + AKs
+
+/**
+ * 4-bet-for-value / 5-bet threshold on the STACK-OFF scale
+ * (getStackOffPercentile): exactly JJ+, AKs, AKo (40 combos, 3.0%). Re-centred
+ * in the AKo (.97436) / TT (.96757) gap of the 50k-sim stack-off column
+ * (midpoint .970965), the widest margin on either side.
+ * tests/botPreflopTable.test.ts pins the set.
+ */
+export const FOURBET_STACKOFF_THRESHOLD = 0.971;
 
 /** How wide to flat/defend vs a single raise (call, not 3-bet), by position.
  * 2026-07-07 tuning: tightened the wide late-position flats (CO/BTN) — the bots
