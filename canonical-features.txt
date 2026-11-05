@@ -2062,3 +2062,13 @@ capSock.emit('serverAnnouncement'
 countsInRecord
 !context?.auto
 auto: autoAction
+# 2026-11-05 (bots review fix round 2, server lane) - crash guard: a hand the DEAL ran out to its payout whose payout
+# threw is settled from table.startChips (retried / finished / voided; held only with no capture) then broadcast and
+# dealt on, also when the heartbeat dealt it (SS-1); the turn clock and the 30 s draw clock are guarded like the bot
+# timers (kinds turn_clock / draw_clock).
+settleDealtShowdownAfterFault(
+settleHeartbeatDealFault(
+turnClockThrows
+drawClockThrows
+'turn_clock'
+'draw_clock'

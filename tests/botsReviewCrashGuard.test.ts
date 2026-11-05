@@ -54,7 +54,7 @@ function seedRandom(seed: number): () => void {
   return () => { Math.random = orig; };
 }
 const total = (t: PokerTable) => t.seats.reduce((a, s) => a + (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : 0), 0);
-const COUNTERS = ['actionThrows', 'drawThrows', 'autoStartThrows', 'heartbeatThrows', 'actedFor', 'turnAdvanced', 'stoodPat', 'autoStartRetried',
+const COUNTERS = ['actionThrows', 'drawThrows', 'autoStartThrows', 'heartbeatThrows', 'turnClockThrows', 'drawClockThrows', 'actedFor', 'turnAdvanced', 'stoodPat', 'autoStartRetried',
   'showdownFaults', 'showdownResolved', 'showdownPaidFinished', 'showdownVoided', 'showdownHeld', 'recoveryThrows', 'logLinesSuppressed'];
 
 interface WorldOpts {
