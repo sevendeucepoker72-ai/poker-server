@@ -899,6 +899,14 @@ studDrawFirstRound
 # 2026-11-05 (bots review fix round 2, VA-2) - studDrawEquity: an opponent start that never reaches his range
 # in MAX_TRIES deals drops the whole simulation (it was scored as dealt: a random hand in a tight range).
 if (tr >= MAX_TRIES) {
+# 2026-11-05 (bots review fix round 2, VA-1 + item 4) - studDrawFirstRound: Five Card Draw (no-limit) continues
+# a lone all-in / stack-committing call only with the stack-off range (premiums always), every jam passes it
+# (NEW-5), calls narrow with the raise size (B4), an opener defends a 3-bet by its price (B8), push/fold counts
+# the live players (B16); every game's value set (pre-noise percentile) never folds to one completion / one
+# non-committing raise.
+STUD_DRAW_VALUE_PCTILE
+FIVE_DRAW_STACKOFF_PREMIUM
+FOLD_VS_RAISE
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as
