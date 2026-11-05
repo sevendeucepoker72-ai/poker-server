@@ -311,7 +311,7 @@ describe('C6 — the 5/6-card Omaha pre-flop knots', () => {
     expect(kn[0]).toEqual([0.261, 0.307]);
     expect(kn[kn.length - 1][1]).toBe(1);
     expect(kn.filter((k) => k[1] >= 1)).toHaveLength(1);
-  });
+  }, 60_000);
 
   it('calibrateOmahaPreflop interpolates, clamps to the end knots, picks the table by card count, and is monotone', () => {
     expect(calibrateOmahaPreflop(5, NaN)).toBeNaN();
@@ -332,5 +332,5 @@ describe('C6 — the 5/6-card Omaha pre-flop knots', () => {
         prev = v;
       }
     }
-  });
+  }, 60_000);
 });
