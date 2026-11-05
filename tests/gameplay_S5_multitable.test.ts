@@ -903,6 +903,7 @@ describe('F62 — one socket never holds two seats (two hands) at one table', ()
       isUserBanned: async () => false, isTournamentTable: () => false, isPublicCashTable: () => true, joinTableRefusalReason: () => null,
       clubJoinGrants: new WeakSet(), challengeTables: new Map(), isFixedRosterTable: () => false,
       seatNameForSocket: () => 'Alice', sanitizeSeatAvatar: () => undefined, takeAiSeatForJoin: () => -1, aiSeatTakeableNow: () => false,
+      planAiSeatForJoin: () => -1, takePlannedAiSeat: () => true,
       ensureChipsForBuyIn: async () => 1_000_000, deductChips: async (_u: number, n: number) => { deducts.push(n); return true; },
       addChipsToUser: async () => true, auditLog() {}, clearGhostSeatsForUser: () => 0, detachSocketFromOtherTables() {},
       uuidv4: () => `u${Math.random().toString(36).slice(2, 8)}`, progressionManager: { getOrCreateProgress() {} },
@@ -965,7 +966,7 @@ describe('F62 — one socket never holds two seats (two hands) at one table', ()
   });
 
   it('wiring: joinAdditionalTable refuses before the AI stand-up and the deduct; joinTable before the leave; quickPlay skips such a table', () => {
-    expect(JOIN_EXTRA.indexOf(EXTRA_REFUSAL)).toBeLessThan(JOIN_EXTRA.indexOf('takeAiSeatForJoin('));
+    expect(JOIN_EXTRA.indexOf(EXTRA_REFUSAL)).toBeLessThan(JOIN_EXTRA.indexOf('planAiSeatForJoin('));
     expect(JOIN_EXTRA).toContain('notSeatedAt: tableId');
     expect(JOIN_TABLE.indexOf("code: 'already_seated'")).toBeLessThan(JOIN_TABLE.indexOf('handlePlayerLeave(socket)'));
     expect(JOIN_TABLE).toContain('mainSession: null, notSeatedAt: tableId');

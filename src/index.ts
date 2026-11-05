@@ -1192,6 +1192,8 @@ const CHIP_VELOCITY_DECAY_MS = 24 * 60 * 60 * 1000; // 24h quiet → count -= 1
 // ANTHROPIC_API_KEY is set (same gate as session recap / coachHand).
 const tableCommentaryLastEmit = new Map<string, number>();
 const TABLE_COMMENTARY_MIN_INTERVAL_MS = 25_000;
+// Bots review 2026-11-04 (A-commentary) — what the commentary did; GET /api/health engine.commentary (counts only, never the key).
+const tableCommentaryStats = { calls: 0, delivered: 0, emptyReplies: 0, failed: 0, skippedNoAudience: 0 };
 
 function incrementChipVelocityAlert(userId: number): number {
   const now = Date.now();
@@ -1581,7 +1583,8 @@ function seatBoughtInBy(seat: { playerId?: string | null }, userId: number): boo
  * tournament stack itself). Callers own sessions, rooms and broadcasts.
  */
 type SeatTeardownOutcome = 'deferred' | 'stood_up' | 'none';
-const seatTeardownStats = { deferred: 0, stoodUp: 0, allInKept: 0, foldedOnClock: 0, foldedOutOfTurn: 0, awardedUncontested: 0, departureKept: 0 };
+// Bots review 2026-11-04 — lastHumanBotStrips: stripBotsIfLastHumanLeft ran (the last human's seat ended outside handlePlayerLeave).
+const seatTeardownStats = { deferred: 0, stoodUp: 0, allInKept: 0, foldedOnClock: 0, foldedOutOfTurn: 0, awardedUncontested: 0, departureKept: 0, lastHumanBotStrips: 0 };
 
 /**
  * 2026-10-21 (gameplay F143) — the wallet credits of seats a teardown stood up,
@@ -1722,7 +1725,10 @@ function aiSeatTakeableNow(table: PokerTable, seatIndex: number): boolean {
   return (s.totalInvestedThisHand || 0) === 0 && (s.folded || s.holeCards.length === 0);
 }
 
-/** R2 (GAME-15) — free one takeable AI seat for a join (stood up, profile dropped); -1 when none. */
+/**
+ * R2 (GAME-15) — free one takeable AI seat for a join (stood up, profile dropped); -1 when none.
+ * Called by planAiSeatForJoin between hands; mid-hand a join only plans the seat.
+ */
 function takeAiSeatForJoin(table: PokerTable, tableId: string): number {
   // R3 (S1-1) — only a seat the joiner can then take: below the table's cap.
   const seatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
@@ -1733,6 +1739,42 @@ function takeAiSeatForJoin(table: PokerTable, tableId: string): number {
     return i;
   }
   return -1;
+}
+
+/**
+ * Bots review 2026-11-04 (A-vanish) — a join's PICK of a bot's seat. Between
+ * hands the bot is stood up now (takeAiSeatForJoin, as before: no hand is
+ * affected). MID-HAND the takeable seat is only PLANNED — the bot stays seated
+ * with its profile through the join's awaited balance read / deduct, and is
+ * stood up at the join's COMMIT (takePlannedAiSeat, the last statement before
+ * sitDown). Every join path used to stand the bot up at the pick, so any refusal
+ * during the awaits (chips, a dropped socket, a failed deduct) left an empty
+ * seat mid-hand with the bot's profile gone. -1 = no seat.
+ */
+function planAiSeatForJoin(table: PokerTable, tableId: string): number {
+  if (aiSeatsMutableNow(table)) return takeAiSeatForJoin(table, tableId);   // between hands: stood up now, as before
+  const seatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
+  for (let i = 0; i < seatCap; i++) if (aiSeatTakeableNow(table, i)) return i;   // mid-hand: planned only
+  return -1;
+}
+/** plannedBotTaken = freed at a commit; plannedBotLost = dealt into a new hand meanwhile (join refused + refunded); preCheckRefused = joinAdditionalTable refused for chips before any seat was touched. */
+const joinSeatStats = { plannedBotTaken: 0, plannedBotLost: 0, preCheckRefused: 0 };
+/**
+ * Bots review 2026-11-04 — the COMMIT of a planned seat (nothing awaited between
+ * this and sitDown). An empty seat → true (the plan already freed it, or the bot
+ * left). A bot still takeable → stood up (profile dropped) → true. A bot that is
+ * IN the hand now (the hand ended and the next one dealt it in during the
+ * awaits) or a human → false: the caller refuses and refunds ('planned_seat_lost').
+ */
+function takePlannedAiSeat(table: PokerTable, tableId: string, seatIndex: number): boolean {
+  const s = table.seats[seatIndex];
+  if (!s) return false;
+  if (s.state === 'empty') return true;
+  if (!s.isAI || !aiSeatTakeableNow(table, seatIndex)) { joinSeatStats.plannedBotLost++; return false; }
+  table.standUp(seatIndex);
+  aiProfiles.get(tableId)?.delete(seatIndex);
+  joinSeatStats.plannedBotTaken++;
+  return true;
 }
 
 /**
@@ -1771,6 +1813,24 @@ function stripBotsWhenNoHumans(tableId: string, table: PokerTable): void {
   // The table is empty: no hand to start (the heartbeat re-seeds it).
   const pendingStart = pendingAutoStartTimers.get(tableId);
   if (pendingStart) { clearTimeout(pendingStart); pendingAutoStartTimers.delete(tableId); }
+}
+/**
+ * Bots review 2026-11-04 — the LAST HUMAN's seat at this table just ended by a
+ * path other than handlePlayerLeave (a reservation's end — reserve_expiry /
+ * reserve_hand_limit / reserve_displaced via endCashReservation —, an extra
+ * table left, an extra-table cash-out on departure): the bots go too
+ * (GAME-17), or at the hand's end when a seat is still waiting for it. They
+ * used to stay and deal to each other forever (live: Shark Tank, 4 bots, no
+ * human). A COPY of handlePlayerLeave's GAME-17 block (many harnesses slice
+ * handlePlayerLeave without this helper) — keep the two identical.
+ */
+function stripBotsIfLastHumanLeft(tableId: string, table: PokerTable): void {
+  const pendingHere = pendingSeatRemovalAfterHand.get(tableId);
+  const humansStaying = table.seats.some((s) => s.state === 'occupied' && !s.isAI && !pendingHere?.has(s.seatIndex));
+  if (humansStaying) return;
+  seatTeardownStats.lastHumanBotStrips++;
+  stripBotsWhenNoHumans(tableId, table);
+  if (pendingHere && pendingHere.size > 0) botStripAfterHand.add(tableId);
 }
 function stripBotsAfterHandIfMarked(tableId: string): void {
   if (!botStripAfterHand.has(tableId)) return;
@@ -3296,6 +3356,16 @@ app.get('/api/health', async (_req, res) => {
         sitOutLimit: { ...sitOutLimitStats, hands: SIT_OUT_HANDS_LIMIT },
         reservationsDisplaced: reservationsDisplaced.count,
         chipVelocity: { ...chipVelocityStats, autoBan: CHIP_VELOCITY_AUTOBAN },
+        // Bots review 2026-11-04 (A-vanish) — a join that takes a bot's seat mid-hand
+        // plans it at the pick and frees it at the commit: plannedBotTaken = freed at
+        // the commit, plannedBotLost = the bot was dealt into a new hand meanwhile
+        // (the join refused + refunded), preCheckRefused = joinAdditionalTable refused
+        // for chips before any seat was touched.
+        joinSeats: { ...joinSeatStats },
+        // Bots review 2026-11-04 (A-commentary) — the LLM table commentary: keyConfigured
+        // (a boolean, never the key), model calls / lines delivered / empty replies /
+        // failures, and notable hands skipped because nobody was in the table's room.
+        commentary: { keyConfigured: !!process.env.ANTHROPIC_API_KEY, minIntervalMs: TABLE_COMMENTARY_MIN_INTERVAL_MS, ...tableCommentaryStats },
       },
       // 2026-10-11 (.online R2, S1) — tournaments, qualifiers, quick games,
       // home games, staking, the prize ledger. Counts only, no ids.
@@ -3362,6 +3432,10 @@ app.get('/api/health', async (_req, res) => {
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
+        // Bots review 2026-11-04 — club runtime tables: recreateSkippedNotMember = a
+        // getClubTables from a non-member that would have (re)created a table (the list
+        // is still answered); idleDealsSkipped = a club table nobody sits at not dealt.
+        clubTables: { ...clubTableRuntimeStats },
       },
     });
   } catch (e: any) {
@@ -4372,7 +4446,7 @@ function internalTokenMatches(given: unknown, expected: string): boolean {
 // Review fix-up (2026-10-22) — the overflow cap / kill switch at runtime, no
 // restart: POST {max: N >= 0 | "unlimited"} (2026-10-23: no upper clamp) with X-Internal-Token (the INTERNAL_NOTIFY_TOKEN
 // this server and the master share). FAILS CLOSED: no token configured → 403
-// (unlike /api/tournament/simulate). Answers {success, previous, cap, live};
+// (as /api/tournament/simulate since 2026-11-04). Answers {success, previous, cap, live};
 // GET /api/health r2Play.qualifiers.overflow.cap shows the value in force.
 app.post('/api/qualifiers/overflow', (req, res) => {
   const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
@@ -5011,7 +5085,9 @@ async function createClubRuntimeTable(clubId: number, cfg: { tableName: string; 
  * (inactive) table or an invalid stored config gets none.
  */
 const clubTablesRecreating = new Map<number, Promise<string | null>>();
-const clubTableRuntimeStats = { recreated: 0, refusedInvalid: 0, closedUnbound: 0 };
+// Bots review 2026-11-04 — recreateSkippedNotMember (getClubTables from a non-member: listed, not
+// re-created) and idleDealsSkipped (a club table nobody sits at is not dealt: autoStartNextHand).
+const clubTableRuntimeStats = { recreated: 0, refusedInvalid: 0, closedUnbound: 0, recreateSkippedNotMember: 0, idleDealsSkipped: 0 };
 /**
  * 2026-10-21 (gameplay F104 fix-up) — a runtime table made for a club table
  * whose row could NOT be pointed at it (updateClubTableId threw: a DB error) is
@@ -8407,20 +8483,29 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         const winner = (data.results || []).slice().sort((a, b) => (b?.chipsWon || 0) - (a?.chipsWon || 0))[0];
         const pot = (data.results || []).reduce((s, r) => s + (r?.chipsWon > 0 ? r.chipsWon : 0), 0);
         const notable = winner && (pot >= 2000 || table.wentToShowdown);
+        // Bots review 2026-11-04 — the line goes to this table's room only (seated players and spectators); nobody there = never sent, the throttle not consumed.
+        const audience = notable ? (io.sockets?.adapter?.rooms?.get(`table:${tableId}`)?.size ?? 0) : 0;
+        if (notable && audience === 0) tableCommentaryStats.skippedNoAudience++;
         const lastEmit = tableCommentaryLastEmit.get(tableId) || 0;
-        if (notable && Date.now() - lastEmit >= TABLE_COMMENTARY_MIN_INTERVAL_MS) {
+        if (notable && audience > 0 && Date.now() - lastEmit >= TABLE_COMMENTARY_MIN_INTERVAL_MS) {
           tableCommentaryLastEmit.set(tableId, Date.now());
           const winnerName = String(winner.playerName || 'A player').slice(0, 24);
           const handName = String(winner.handName || '').slice(0, 40);
           const showdown = table.wentToShowdown ? 'at showdown' : 'when everyone folded';
           const prompt = `You are a witty, concise poker table commentator. In ONE short sentence (max 18 words), react to this hand: ${winnerName} won a ${pot}-chip pot ${showdown}${handName ? ` with ${handName}` : ''}. Be fun and punchy, no emojis, no hashtags.`;
+          tableCommentaryStats.calls++;
           new Anthropic({ apiKey }).messages
             .create({ model: 'claude-haiku-4-5-20251001', max_tokens: 120, messages: [{ role: 'user', content: prompt }] })
             .then((resp: any) => {
               const text = resp?.content?.[0]?.type === 'text' ? resp.content[0].text?.trim() : '';
-              if (text) io.to(`table:${tableId}`).emit('tableCommentary', { text, type: 'llm' });
+              if (text) {
+                tableCommentaryStats.delivered++;
+                io.to(`table:${tableId}`).emit('tableCommentary', { text, type: 'llm' });
+              } else {
+                tableCommentaryStats.emptyReplies++;
+              }
             })
-            .catch(() => {});
+            .catch(() => { tableCommentaryStats.failed++; });
         }
       }
     } catch { /* commentary is best-effort — never let it disrupt the hand */ }
@@ -8648,8 +8733,13 @@ const CASH_TABLE_TARGET_OCCUPIED = 5;
 // during a live hand) makes opponents appear to vanish / "change seats" while a
 // hand is in progress. The seat GEOMETRY is stable — confirmed by instrumenting
 // the live client (zero mid-hand seat-position moves over 300+ samples); the
-// churn was the only cause. Every AI seat add/remove path funnels through this
-// guard so the on-table roster is frozen from the deal through HandComplete.
+// churn was the only cause. Bots are ADDED and TRIMMED only between hands
+// (fillWithAI, trimExcessAI, backfillAIToMin, stripBotsWhenNoHumans check this
+// guard). ONE exception (R2 GAME-15, 2026-10-11): a join at a table with no empty
+// seat may take the seat of a bot OUT of the hand being played (folded with
+// nothing in the pot, or not dealt in: aiSeatTakeableNow). Since 2026-11-04 it
+// does so only at that join's commit (planAiSeatForJoin / takePlannedAiSeat). A
+// bot still in the hand is never removed mid-hand.
 // autoStartNextHand only runs at HandComplete, so the between-hands top-up to
 // target (CASH_TABLE_TARGET_OCCUPIED) still fires normally.
 function aiSeatsMutableNow(table: PokerTable): boolean {
@@ -8719,10 +8809,12 @@ function fillWithAI(
 }
 
 // Trim excess AI when a table is over the occupancy cap.
-// BETWEEN HANDS ONLY — never mid-hand. Removing a bot during a live hand (even
-// a folded one) makes opponents appear to vanish / change seats, which is the
-// "players changing seats mid-hand" report. Deferred to the HandComplete window
-// (autoStartNextHand + the heartbeat both trim there). Never touches humans.
+// BETWEEN HANDS ONLY — trimExcessAI never removes a bot mid-hand (a JOIN may take
+// a folded, nothing-invested bot's seat mid-hand at its commit: aiSeatTakeableNow,
+// R2 GAME-15). A trim during a live hand made opponents appear to vanish / change
+// seats (the "players changing seats mid-hand" report), so it is deferred to the
+// HandComplete window (autoStartNextHand + the heartbeat both trim there). Never
+// touches humans.
 function trimExcessAI(
   table: PokerTable,
   tableId: string,
@@ -9611,6 +9703,12 @@ function autoStartNextHand(tableId: string): void {
     if (!fed) balanceQualifierTables(tId, tableId, table);
   }
 
+  // Bots review 2026-11-04 — a CLUB table nobody sits at is never dealt bots-only
+  // (ensureCashTableRunning's rule; this stops a loop already running, e.g. after
+  // an admin removal). The boundary steps above still ran; a member's join deals
+  // (dealAfterJoin / scheduleAutoStart). Never a refused start: not logged or re-tried.
+  if (clubTableIds.has(tableId) && !tableHasHumanSeat(table)) { clubTableRuntimeStats.idleDealsSkipped++; return; }
+
   // Start new hand
   const started = table.startNewHand();
   if (started) {
@@ -9838,6 +9936,8 @@ function ensureCashTableRunning(tableId: string): void {
   // running with bots (it is removed PRIVATE_TABLE_IDLE_MS after the last human
   // leaves — sweepIdlePrivateTables); every one used to become a 24/7 bot table.
   if (privateTableIds.has(tableId) && !tableHasHumanSeat(table)) return;
+  // Bots review 2026-11-04 — a CLUB table nobody sits at keeps its bot floor (a member who sits down finds the same table) but is never DEALT bots-only; a join deals (dealAfterJoin).
+  const idleClubTable = clubTableIds.has(tableId) && !tableHasHumanSeat(table);
 
   // Trim excess AI FIRST so we don't flip-flop: if autoStartNextHand /
   // legacy fillWithAI packed the table to 9/9, drop back to the target
@@ -9848,6 +9948,7 @@ function ensureCashTableRunning(tableId: string): void {
   if (table.getOccupiedSeatCount() < LIVE_ROOM_MIN_OCCUPIED) {
     backfillAIToMin(table, tableId, LIVE_ROOM_MIN_OCCUPIED);
   }
+  if (idleClubTable) return;
 
   // 2026-10-11 (R2, GAME-17) — a table resting in HandComplete with NO start
   // scheduled is frozen: its hand-boundary timer already ran and dealt nothing
@@ -10227,6 +10328,10 @@ function endCashReservation(
   }
   const chips = seatNow.chipCount;
   const outcome = teardownSeat(reserved.tableId, t, reserved.seatIndex, { userId, username }, reason, teardownOpts);
+  // Bots review 2026-11-04 — the last human's reservation ended (reserve_expiry /
+  // reserve_hand_limit / reserve_displaced): its bots go too (handlePlayerLeave's
+  // GAME-17 rule; mid-hand, at the hand's end). Never a quick game's fixed roster.
+  if (!quickTables.has(reserved.tableId)) stripBotsIfLastHumanLeft(reserved.tableId, t);
   syncSitOutToTable(reserved.tableId);
   broadcastGameState(reserved.tableId);
   return outcome === 'stood_up' ? chips : 0;
@@ -16774,8 +16879,18 @@ Give feedback in this JSON format:
   socket.on('getClubTables', async (data: { clubId: number }) => {
     const result = await getClubTables(data.clubId);
     // R2 (CLUBS-4) — a table a redeploy dropped is re-created for the list (a joinable id).
-    for (const t of result.tables || []) {
-      try { await ensureClubRuntimeTable(t); } catch (e: any) { console.warn('[Clubs] club table re-create failed:', e?.message || e); }
+    // Bots review 2026-11-04 — only for an active MEMBER (the only caller, poker-3d
+    // ClubsPanel, opens clubs from getMyClubs). The LIST stays open to any socket;
+    // a non-member / signed-out socket no longer creates runtime tables or re-points
+    // club_tables.tableid. joinClubTable still re-creates on a member's join.
+    const auth = authSessions.get(socket.id);
+    const member = !!auth && result.success === true && await isClubMember(data.clubId, auth.userId);
+    if (member) {
+      for (const t of result.tables || []) {
+        try { await ensureClubRuntimeTable(t); } catch (e: any) { console.warn('[Clubs] club table re-create failed:', e?.message || e); }
+      }
+    } else if ((result.tables || []).some((t) => !(t.tableId && tableManager.getTable(t.tableId)))) {
+      clubTableRuntimeStats.recreateSkippedNotMember++;
     }
     socket.emit('clubTables', result);
   });
@@ -17635,8 +17750,10 @@ Give feedback in this JSON format:
       // at the table he was playing, and left his client on a frozen view of
       // it. Decided here, with nothing changed yet:
       //   (a) a seat the join can take — an empty seat below the cap, or a bot
-      //       not in the hand (a pure lookup: the bot is stood up only after the
-      //       leave). A seat of HIS at this table (a seat change, a ghost seat)
+      //       not in the hand (a pure lookup: the bot is touched only after the
+      //       leave — bots review 2026-11-04: between hands its seat is freed at
+      //       the pick; mid-hand it is planned at the pick and freed at the
+      //       commit). A seat of HIS at this table (a seat change, a ghost seat)
       //       that the leave / ghost clear frees AT ONCE: then the search after
       //       them decides, as before. S7 fix-up — one with chips in the live
       //       pot is only folded and freed at the hand's end (accountHoldsSeatAt
@@ -17731,21 +17848,18 @@ Give feedback in this JSON format:
           }
         }
         // If no empty seat, try taking an AI seat — R2 (GAME-15): never one in
-        // the hand being played (its pot chips were erased with it).
-        if (seatIndex === -1) seatIndex = takeAiSeatForJoin(table, tableId);
+        // the hand being played (its pot chips were erased with it). Bots review
+        // 2026-11-04 — between hands its seat is freed at the pick; mid-hand it is
+        // planned here and freed at the commit (takePlannedAiSeat, before sitDown).
+        if (seatIndex === -1) seatIndex = planAiSeatForJoin(table, tableId);
         if (seatIndex === -1) {
           socket.emit('error', afterLeave({ message: 'No seats available', code: 'no_seat_available' }));
           return;
         }
       }
-
-      // If chosen seat is occupied by AI, remove the AI first (R2: only a bot
-      // not in the hand in progress — else sitDown below refuses the seat).
-      if (aiSeatTakeableNow(table, seatIndex)) {
-        table.standUp(seatIndex);
-        const profiles = aiProfiles.get(tableId);
-        if (profiles) profiles.delete(seatIndex);
-      }
+      // (Bots review 2026-11-04 — the "chosen seat is occupied by AI → stand it
+      // up" block that stood here is gone: the seat above is always empty or a
+      // PLANNED bot seat, which only the commit frees.)
 
       // (The banned check that used to sit here now runs at the top of the
       // handler, before any side effect.)
@@ -17817,7 +17931,9 @@ Give feedback in this JSON format:
       }
 
       const playerId = `player-${uuidv4()}`;
-      const success = table.sitDown(
+      // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+      const seatFree = !table.seats[seatIndex]?.isAI || takePlannedAiSeat(table, tableId, seatIndex);
+      const success = seatFree && table.sitDown(
         seatIndex,
         playerName,
         buyIn,
@@ -17838,10 +17954,10 @@ Give feedback in this JSON format:
           } catch (e) {
             refunded = false;
           }
-          auditLog(authForJoin.username, refunded ? 'BUY_IN_REFUND' : 'BUY_IN_REFUND_FAILED', { tableId, buyIn, reason: 'sitDown_failed' });
+          auditLog(authForJoin.username, refunded ? 'BUY_IN_REFUND' : 'BUY_IN_REFUND_FAILED', { tableId, buyIn, reason: seatFree ? 'sitDown_failed' : 'planned_seat_lost' });
         }
         mySlots.delete(`${socket.id}:${tableSlotKey}`);
-        socket.emit('error', afterLeave({ message: 'Could not sit down at that seat' }));
+        socket.emit('error', afterLeave(seatFree ? { message: 'Could not sit down at that seat' } : { message: 'No seats available', code: 'no_seat_available' }));
         return;
       }
 
@@ -17980,11 +18096,13 @@ Give feedback in this JSON format:
           if (table.seats[i].state === 'empty') { targetSeat = i; break; }
         }
         // R2 (GAME-15) — an AI seat only when it is not in the hand being played.
-        if (targetSeat === -1) targetSeat = takeAiSeatForJoin(table, candidate.tableId);
+        // Bots review 2026-11-04 — between hands its seat is freed at the pick;
+        // mid-hand it is planned here and freed at the commit (takePlannedAiSeat).
+        if (targetSeat === -1) targetSeat = planAiSeatForJoin(table, candidate.tableId);
         if (targetSeat === -1) continue;
         // Re-check right before commit — if another call has already claimed
-        // this seat since we found it, try the next table.
-        if (table.seats[targetSeat].state !== 'empty') continue;
+        // this seat since we found it, try the next table (a planned bot seat still takeable stays chosen).
+        if (table.seats[targetSeat].state !== 'empty' && !aiSeatTakeableNow(table, targetSeat)) continue;
         chosen = { tableId: candidate.tableId, table, targetSeat };
         break;
       }
@@ -18031,7 +18149,9 @@ Give feedback in this JSON format:
         const authNow = authSessions.get(socket.id);
         if (authNow) clearGhostSeatsForUser(authNow.userId, chosenTableId, socket.id, targetSeat);
       }
-      const success = table.sitDown(
+      // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+      const seatFree = !table.seats[targetSeat]?.isAI || takePlannedAiSeat(table, chosenTableId, targetSeat);
+      const success = seatFree && table.sitDown(
         targetSeat,
         playerName,
         buyIn,
@@ -18044,7 +18164,7 @@ Give feedback in this JSON format:
         if (chipsDeducted && authForJoin) {
           try {
             await addChipsToUser(authForJoin.userId, buyIn);
-            auditLog(authForJoin.username, 'QUICKPLAY_REFUND', { tableId: chosenTableId, buyIn, reason: 'sitDown_failed' });
+            auditLog(authForJoin.username, 'QUICKPLAY_REFUND', { tableId: chosenTableId, buyIn, reason: seatFree ? 'sitDown_failed' : 'planned_seat_lost' });
           } catch (e) {
             // Refund failed AFTER the deduction succeeded. The user now
             // owes `buyIn` that the DB didn't credit back. Don't swallow —
@@ -18055,7 +18175,7 @@ Give feedback in this JSON format:
             auditLog(authForJoin.username, 'QUICKPLAY_REFUND_FAILED', { tableId: chosenTableId, buyIn, error: String(e) });
           }
         }
-        socket.emit('error', { message: 'Could not join table' });
+        socket.emit('error', { message: seatFree ? 'Could not join table' : 'No seats available' });
         return;
       }
 
@@ -19674,7 +19794,9 @@ Give feedback in this JSON format:
           }
         }
         // R2 (GAME-15) — an AI seat only when it is not in the hand being played.
-        if (targetSeat === -1) targetSeat = takeAiSeatForJoin(table, bestTable.tableId);
+        // Bots review 2026-11-04 — between hands its seat is freed at the pick;
+        // mid-hand it is planned here and freed at the commit (takePlannedAiSeat).
+        if (targetSeat === -1) targetSeat = planAiSeatForJoin(table, bestTable.tableId);
         if (targetSeat === -1) {
           failWaitlist('handler_exception', 'No seats available', { stage: 'no_seats' });
           return;
@@ -19725,7 +19847,9 @@ Give feedback in this JSON format:
           }, wlState)) return;
         }
 
-        const success = table.sitDown(
+        // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+        const seatFree = !table.seats[targetSeat]?.isAI || takePlannedAiSeat(table, bestTable.tableId, targetSeat);
+        const success = seatFree && table.sitDown(
           targetSeat,
           playerName,
           waitlistBuyIn,
@@ -19737,12 +19861,12 @@ Give feedback in this JSON format:
           if (authNow) {
             try {
               await addChipsToUser(authNow.userId, waitlistBuyIn);
-              auditLog(authNow.username, 'BUY_IN_REFUND', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, reason: 'waitlist_sitDown_failed' });
+              auditLog(authNow.username, 'BUY_IN_REFUND', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, reason: seatFree ? 'waitlist_sitDown_failed' : 'planned_seat_lost' });
             } catch (e) {
               auditLog(authNow.username, 'BUY_IN_REFUND_FAILED', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, error: String(e) });
             }
           }
-          failWaitlist('handler_exception', 'Could not join table', { stage: 'sit_down_failed' });
+          failWaitlist('handler_exception', seatFree ? 'Could not join table' : 'No seats available', { stage: seatFree ? 'sit_down_failed' : 'no_seats' });
           return;
         }
 
@@ -21402,7 +21526,9 @@ Give feedback in this JSON format:
       aiProfiles.set(tableId, new Map());
     }
     const profiles = aiProfiles.get(tableId)!;
-    const aiProfile = generateRandomProfile('hard');
+    // Bots review 2026-11-04 — never the player's own name (Spin & Go and All-In or Fold seed their used names with it; this pick did not); bounded re-roll as fillWithAI's.
+    let aiProfile = generateRandomProfile('hard');
+    for (let attempts = 0; aiProfile.botName === playerName && attempts < 50; attempts++) aiProfile = generateRandomProfile('hard');
     const aiPlayerId = `ai-${uuidv4()}`;
     table.sitDown(1, aiProfile.botName, 1000, aiPlayerId, true);
     profiles.set(1, aiProfile);
@@ -22736,13 +22862,14 @@ Give feedback in this JSON format:
       return;
     }
 
-    // Find empty seat — R2 (GAME-15): an empty seat FIRST (this loop used to
-    // take whichever came first, a bot at seat 0 before an empty seat 5), and
-    // an AI seat only when it is not in the hand being played.
-    let targetSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < table.maxOccupiableSeats);
-    if (targetSeat === -1) targetSeat = takeAiSeatForJoin(table, tableId);
-
-    if (targetSeat === -1) {
+    // Bots review 2026-11-04 — (a) a PURE seat lookup first (joinTable's F143
+    // rule): an empty seat below the cap or a bot not in the hand. A request that
+    // ends in 'No seats available' never reads the wallet (no
+    // UNLIMITED_CHIPS_TESTING top-up) and touches no bot.
+    const addSeatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
+    let seatPossible = false;
+    for (let i = 0; i < addSeatCap && !seatPossible; i++) seatPossible = table.seats[i].state === 'empty' || aiSeatTakeableNow(table, i);
+    if (!seatPossible) {
       socket.emit('error', { message: 'No seats available' });
       return;
     }
@@ -22759,12 +22886,35 @@ Give feedback in this JSON format:
       Math.min(buyIn || table.config.minBuyIn, table.config.minBuyIn * 10, table.maxBuyInSetting ?? Infinity)
     );
     const authAdd = authSessions.get(socket.id);
-    if (authAdd) {
-      // P3 (2026-10-10) — still this account and still this live table.
-      const addState: BuyInExpectation = { userId: authAdd.userId, notSeatedAt: tableId, table: { tableId, table } };
+    // P3 (2026-10-10) — still this account and still this live table.
+    const addState: BuyInExpectation | null = authAdd ? { userId: authAdd.userId, notSeatedAt: tableId, table: { tableId, table } } : null;
+    if (authAdd && addState) {
+      // Bots review 2026-11-04 — (b) the affordability check BEFORE the pick: an
+      // under-funded request used to stand a bot up (one per request) and then
+      // refuse 'Insufficient chips' with the seat left empty.
       const dbChips = await ensureChipsForBuyIn(authAdd.userId, authAdd.username, effectiveBuyIn);
       if (await buyInSocketGone(socket, 'joinAdditionalTable', 'balance_read', undefined, addState)) return; // F3 — nothing deducted yet
-      if (effectiveBuyIn > dbChips) { socket.emit('error', { message: 'Insufficient chips for the additional-table buy-in' }); return; }
+      if (effectiveBuyIn > dbChips) {
+        joinSeatStats.preCheckRefused++;
+        socket.emit('error', { message: 'Insufficient chips for the additional-table buy-in' });
+        return;
+      }
+    }
+
+    // Find empty seat — R2 (GAME-15): an empty seat FIRST (this loop used to
+    // take whichever came first, a bot at seat 0 before an empty seat 5), and
+    // an AI seat only when it is not in the hand being played. Bots review
+    // 2026-11-04 — (c) between hands a bot's seat is freed at this pick; mid-hand
+    // it is planned here and freed at the commit (takePlannedAiSeat).
+    let targetSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < table.maxOccupiableSeats);
+    if (targetSeat === -1) targetSeat = planAiSeatForJoin(table, tableId);
+
+    if (targetSeat === -1) {
+      socket.emit('error', { message: 'No seats available' });
+      return;
+    }
+
+    if (authAdd && addState) {
       if (!(await deductChips(authAdd.userId, effectiveBuyIn))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN', { tableId, buyIn: effectiveBuyIn });
       // F3 — the socket dropped during the deduct (its multi-table sessions
@@ -22780,14 +22930,16 @@ Give feedback in this JSON format:
       const authNow = authSessions.get(socket.id);
       if (authNow) clearGhostSeatsForUser(authNow.userId, tableId, socket.id, targetSeat);
     }
-    const success = table.sitDown(targetSeat, playerName, effectiveBuyIn, playerId, false);
+    // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+    const seatFree = !table.seats[targetSeat]?.isAI || takePlannedAiSeat(table, tableId, targetSeat);
+    const success = seatFree && table.sitDown(targetSeat, playerName, effectiveBuyIn, playerId, false);
     if (!success) {
       // Refund the buy-in we just deducted — we never seated them.
       if (authAdd) {
         await addChipsToUser(authAdd.userId, effectiveBuyIn);
-        auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN_REFUND', { tableId, buyIn: effectiveBuyIn });
+        auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN_REFUND', { tableId, buyIn: effectiveBuyIn, ...(seatFree ? {} : { reason: 'planned_seat_lost' }) });
       }
-      socket.emit('error', { message: 'Could not join table' });
+      socket.emit('error', { message: seatFree ? 'Could not join table' : 'No seats available' });
       return;
     }
 
@@ -22848,6 +23000,8 @@ Give feedback in this JSON format:
       if (leavingSeat && leavingSeat.state === 'occupied' && !leavingSeat.isAI) {
         teardownSeat(session.tableId, table, session.seatIndex,
           auth ? { userId: auth.userId, username: auth.username } : null, 'leave_additional_table');
+        // Bots review 2026-11-04 — the last human gone: the bots go too (GAME-17).
+        stripBotsIfLastHumanLeft(session.tableId, table);
       }
       broadcastGameState(session.tableId);
     }
@@ -23150,8 +23304,10 @@ Give feedback in this JSON format:
       table.seats.some((s, i) => i < inviteSeatCap && s.state === 'occupied' && s.isAI)
         ? { message: 'Every seat is in this hand — a seat opens when it ends. Try again in a moment.', code: 'seat_opens_after_hand' }
         : { message: 'Table is full.', code: 'table_full' });
-    // 2026-10-21 (gameplay F143) — the seat (a pure lookup here: a bot is stood
-    // up only after the leave below) and the buy-in are decided BEFORE the
+    // 2026-10-21 (gameplay F143) — the seat (a pure lookup here: a bot is touched
+    // only after the leave below — bots review 2026-11-04: between hands its seat
+    // is freed at the pick, mid-hand it is planned at the pick and freed at the
+    // commit) and the buy-in are decided BEFORE the
     // socket leaves its seat: a refusal after the leave ("Insufficient chips
     // for this table.") cost him his seat and hand at his current table. A seat
     // of HIS at this table that the leave / the ghost clear frees AT ONCE
@@ -23210,15 +23366,17 @@ Give feedback in this JSON format:
     if (authAtInvite) clearGhostSeatsForUser(authAtInvite.userId, tableId, socket.id);
 
     // R3 (S1-1 / XL-1 / K3-1) — a seat BELOW the home game's cap (maxSeats):
-    // the first empty one, else a bot's seat freed for him (never a bot in the
-    // hand being played — takeAiSeatForJoin), before any chip moves (F143: the
+    // the first empty one, else a bot's seat for him (never a bot in the
+    // hand being played — planAiSeatForJoin; bots review 2026-11-04: between
+    // hands its seat is freed at this pick, mid-hand it is planned here and
+    // freed at the commit), before any chip moves (F143: the
     // same pure lookup above refused before the leave). It used to take the first empty
     // seat of all nine — past the cap once the bots filled the rest: the
     // buy-in was deducted, sitDown refused, and the invitee was refunded and
     // told 'Could not seat you' on every attempt. 'Table is full.' only when no
     // seat can be freed at all.
     let openSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < inviteSeatCap);
-    if (openSeat === -1) openSeat = takeAiSeatForJoin(table, tableId);
+    if (openSeat === -1) openSeat = planAiSeatForJoin(table, tableId);
     if (openSeat === -1) {
       socket.emit('joinError', afterLeave(noInviteSeat()));
       return;
@@ -23263,7 +23421,9 @@ Give feedback in this JSON format:
       if (authNow) clearGhostSeatsForUser(authNow.userId, tableId, socket.id, openSeat);
     }
     const playerId = `player-${uuidv4()}`;
-    const success = table.sitDown(openSeat, playerName, actualBuyIn, playerId, false);
+    // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+    const seatFree = !table.seats[openSeat]?.isAI || takePlannedAiSeat(table, tableId, openSeat);
+    const success = seatFree && table.sitDown(openSeat, playerName, actualBuyIn, playerId, false);
 
     if (!success) {
       if (chipsDeducted && authForJoin) {
@@ -23271,9 +23431,9 @@ Give feedback in this JSON format:
         // throw): a refund that did not land is audited as FAILED, never as done.
         let refunded = false;
         try { refunded = await addChipsToUser(authForJoin.userId, actualBuyIn); } catch { refunded = false; }
-        auditLog(authForJoin.username, refunded ? 'INVITE_REFUND' : 'INVITE_REFUND_FAILED', { tableId, buyIn: actualBuyIn, reason: 'sitDown_failed' });
+        auditLog(authForJoin.username, refunded ? 'INVITE_REFUND' : 'INVITE_REFUND_FAILED', { tableId, buyIn: actualBuyIn, reason: seatFree ? 'sitDown_failed' : 'planned_seat_lost' });
       }
-      socket.emit('joinError', afterLeave({ message: 'Could not seat you at that table.' }));
+      socket.emit('joinError', afterLeave(seatFree ? { message: 'Could not seat you at that table.' } : noInviteSeat()));
       return;
     }
 
@@ -23849,6 +24009,8 @@ function cashOutAdditionalSeatsOnDeparture(socket: Socket, authSession: SocketAu
           teardownSeat(ms.tableId, mt, ms.seatIndex,
             authSession ? { userId: authSession.userId, username: authSession.username } : null, reason,
             { keepHandOnDeparture: true });   // F85
+          // Bots review 2026-11-04 — the last human gone: the bots go too (GAME-17; mid-hand, at the hand's end).
+          stripBotsIfLastHumanLeft(ms.tableId, mt);
         }
       }
       socket.leave(`table:${ms.tableId}`);
@@ -29990,11 +30152,10 @@ setInterval(sweepTournamentRebalances, 5000);
 app.post('/api/tournament/simulate', (req, res) => {
   // 2026-06-19 fix: this was unauthenticated with an UNCAPPED playerCount —
   // a single POST with playerCount:100000 would spin up an enormous multi-table
-  // tournament (resource-exhaustion DoS). Clamp to a sane range, and require the
-  // internal token when one is configured (no-op if the env var is unset, so a
-  // legit dev/admin caller without it still works in non-prod).
-  const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
-  if (tok && req.headers['x-internal-token'] !== tok) {
+  // tournament (resource-exhaustion DoS). Clamp to a sane range.
+  // Bots review 2026-11-04 (A-simulate) — FAILS CLOSED like /api/qualifiers/overflow: no INTERNAL_NOTIFY_TOKEN → 403; trimmed, constant-time (internalTokenMatches).
+  const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
+  if (!internalTokenMatches(req.headers['x-internal-token'], tok)) {
     res.status(403).json({ error: 'forbidden' });
     return;
   }

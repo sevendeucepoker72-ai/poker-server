@@ -269,7 +269,9 @@ describe('HT5 — tableCommentary is never generated for a qualifier table', () 
     const code = `${HELP}\nfunction commentary(table, tableId, data) {\n${BLOCK}\n}`;
     const { exports: m } = load(code, {
       ...w.scope, process: { env: { ANTHROPIC_API_KEY: 'k' } }, Anthropic, tableCommentaryLastEmit: new Map(), TABLE_COMMENTARY_MIN_INTERVAL_MS: 0,
-      io: { to: (r: string) => ({ emit: (ev: string, d: any) => roomEmits.push([r, ev, d]) }) },
+      // Bots review 2026-11-04 — the line goes only to a room someone is in (C1 has one socket).
+      tableCommentaryStats: { calls: 0, delivered: 0, emptyReplies: 0, failed: 0, skippedNoAudience: 0 },
+      io: { to: (r: string) => ({ emit: (ev: string, d: any) => roomEmits.push([r, ev, d]) }), sockets: { adapter: { rooms: new Map([['table:C1', new Set(['S1'])]]) } } },
     }, '{ commentary, qualifierHelpToolsOff }');
     return { m, created, roomEmits };
   }
