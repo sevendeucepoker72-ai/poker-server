@@ -44,6 +44,19 @@ describe('VA-2: range narrowing never scores a start outside the range', () => {
     process.stdout.write(`VA-2 floor 0.92: studDrawEquity - reference = ${b.toFixed(2)} points\n`);
     expect(b).toBeLessThan(1.0);
   }, 120_000);
+  it('GUARD: ranges the cards left cannot meet together never collapse the estimate (8-handed Razz, 6th street, seven narrowed opponents)', () => {
+    let st = 11; const rnd = () => ((st = (Math.imul(st, 1664525) + 1013904223) >>> 0) / 4294967296);
+    for (let k = 0; k < 5; k++) {
+      const d: any[] = []; for (let su = 0; su < 4; su++) for (let r = 2; r <= 14; r++) d.push({ rank: r, suit: su });
+      for (let i = d.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const z = d[i]; d[i] = d[j]; d[j] = z; }
+      const mine = d.slice(0, 6); const opps: any[] = [];
+      for (let i = 0; i < 7; i++) { const c = d.slice(6 + 6 * i, 12 + 6 * i); opps.push({ known: c.slice(2, 6), total: 6, floor: i === 0 ? 0.92 : 0.72 }); }
+      const stats = { sims: 0 };
+      const eq = SDS.studDrawEquity({ kind: 'razz', mine, dead: [], shared: [], opps, drawsLeft: 0 }, 400, 0, stats);
+      expect(stats.sims).toBeGreaterThanOrEqual(200);
+      expect(eq).toBeGreaterThanOrEqual(0); expect(eq).toBeLessThanOrEqual(1);
+    }
+  });
   it('GUARD: no narrowing (floor 0) is untouched: the same spot gives the same pot share, and a lone opponent at floor 0 is never dropped', () => {
     const spot = { kind: 'draw-hi', mine: [{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }, { rank: 13, suit: 2 }, { rank: 7, suit: 3 }, { rank: 3, suit: 0 }], dead: [], shared: [], opps: [{ known: [], total: 5, floor: 0 }], drawsLeft: 1 };
     const st1 = { sims: 0 }, st2 = { sims: 0 };

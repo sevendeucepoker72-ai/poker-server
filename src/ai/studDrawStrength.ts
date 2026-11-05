@@ -313,7 +313,7 @@ export function studDrawEquity(s: StudDrawSpot, maxSims = STUD_DRAW_MAX_SIMS, bu
   });
 
   const deadline = budgetMs > 0 ? Date.now() + budgetMs : Infinity;
-  let total = 0, n = 0;
+  let total = 0, n = 0, dropped = 0, keepMisses = false;
   const hands: Card[][] = new Array(nOpp + 1);
   for (let sim = 0; sim < maxSims; sim++) {
     if (sim >= STUD_DRAW_MIN_SIMS && (sim & 15) === 0 && Date.now() > deadline) break;
@@ -324,9 +324,16 @@ export function studDrawEquity(s: StudDrawSpot, maxSims = STUD_DRAW_MAX_SIMS, bu
       let d = dealStart(o);
       // Fix round 2 (VA-2): a start still outside his range after MAX_TRIES deals drops the
       // whole simulation. It used to be scored as dealt: a random hand in a tight range
-      // (~7% of them at floor 0.90) put the bot's pot share 1-3 points too high.
+      // (~7% of them at floor 0.90) put the bot's pot share 1-3 points too high. A spot
+      // whose ranges the cards left cannot meet together (more than 3 drops per kept
+      // simulation after 48: seven narrowed Razz opponents on 6th street) keeps the
+      // last deal from then on, as before, so it is never priced on a handful of draws.
       for (let tr = 1; scorer[i] && scorer[i]!(d.start) < thr[i]; tr++) {
-        if (tr >= MAX_TRIES) { ok = false; break; }
+        if (tr >= MAX_TRIES) {
+          if (!keepMisses && dropped >= 48 && dropped > 3 * n) keepMisses = true;
+          if (!keepMisses) { ok = false; dropped++; }
+          break;
+        }
         pos -= d.unk.length;                               // rejected: re-deal the same slots
         d = dealStart(o);
       }
