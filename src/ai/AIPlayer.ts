@@ -9,6 +9,9 @@ import {
   ARCHETYPE_RANGE_FACTOR, adjustThreshold,
 } from './preflopRanges';
 import { inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB, stackOffCallWidth } from './pushFoldSolver';
+import {
+  StudDrawKind, studDrawKindOf, isStudKind, studDrawEquity, firstRoundEquity, equityToPercentile, drawsLeftAt,
+} from './studDrawStrength';
 
 export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
 export type Personality =
@@ -383,66 +386,70 @@ function getOmahaPreflopStrength(hole: Card[]): number {
 }
 
 /**
- * Generic hand-strength estimator for non-community-card variants.
- * Used for stud (3rd-7th street), razz, draw games, and badugi — where the
- * Hold'em-centric chen formula and Monte Carlo flop equity don't apply.
- *
- * Returns 0 (weak) to 1 (strong) regardless of variant. Lowball variants
- * invert the scale so the AI treats a low hand as "strong".
+ * 2026-11 (bots review B1/B2/B11) — Stud / Draw hand strength from PUBLIC information
+ * only: the bot's own cards, every opponent's FACE-UP cards (getFaceUpCards reads only
+ * the face-up slots) and how many cards each holds. Never an opponent's down card, the
+ * deck or the seed. First round: the percentile of the heads-up pot share among that
+ * game's starting hands (the baked CDF in studDrawCdf.ts). Later rounds: the Monte
+ * Carlo pot share vs the active opponents. Replaces the pre-2026-11 static variant
+ * heuristic, which was not on the engine's hand order (AA-K folded to a Stud completion).
  */
-function getVariantHandStrength(holeCards: Card[], variantId: string, isLowball: boolean): number {
-  if (!holeCards || holeCards.length === 0) return 0;
-
-  // Lowball variants: count cards ≤ 8 and penalize pairs (badugi: penalize
-  // duplicate suits). Higher low-card count = better expected low hand.
-  if (isLowball) {
-    const ranks = holeCards.map((c) => c.rank);
-    const suits = holeCards.map((c) => c.suit);
-    const uniqueLowRanks = new Set(ranks.filter((r) => r <= 8 || r === 14)).size; // Rank.Ace === 14
-    const pairs = ranks.length - new Set(ranks).size;
-    const dupSuits = suits.length - new Set(suits).size;
-    if (variantId === 'badugi') {
-      // Best badugi = 4 unique suits + 4 unique low ranks
-      const uniqueSuits = new Set(suits).size;
-      const score = (uniqueLowRanks * 0.12) + (uniqueSuits * 0.15) - (pairs * 0.05);
-      return Math.max(0, Math.min(1, score));
-    }
-    if (variantId === 'triple-draw') {
-      // 2-7 lowball: no aces (ace is HIGH), no straights/flushes, no pairs
-      const lowNoAce = ranks.filter((r) => r >= 2 && r <= 7).length;
-      const score = (lowNoAce * 0.13) - (pairs * 0.12) - (dupSuits >= 4 ? 0.15 : 0);
-      return Math.max(0, Math.min(1, score + 0.2));
-    }
-    // razz: best 5 of 7 low, A-2-3-4-5 is nuts
-    const score = (uniqueLowRanks * 0.12) - (pairs * 0.08);
-    return Math.max(0, Math.min(1, score + 0.1));
+function studDrawHandStrength(table: PokerTable, seatIndex: number, kind: StudDrawKind, firstRound: boolean): number {
+  const t: any = table;
+  const stud = isStudKind(kind);
+  const mine = table.seats[seatIndex].holeCards;
+  const up = (i: number): Card[] => (stud && typeof t.getFaceUpCards === 'function' ? t.getFaceUpCards(i) : []);
+  const dead: Card[] = [];
+  const opps: { known: Card[]; total: number; floor: number }[] = [];
+  const streetBets = Number(t.raisesThisStreet) || 0;
+  for (const s of table.seats) {
+    if (s.seatIndex === seatIndex || s.state !== 'occupied' || s.holeCards.length === 0) continue;
+    const vis = up(s.seatIndex);
+    if (s.folded || s.eliminated) { dead.push(...vis); continue; }
+    opps.push({ known: vis, total: s.holeCards.length, floor: firstRound ? 0 : studDrawRangeFloor(s, streetBets, t.lastAggressorSeat) });
   }
+  const shared = stud ? [...table.communityCards] : [];
+  const drawsLeft = stud ? 0 : drawsLeftAt(kind, table.currentPhase);
+  if (firstRound) {
+    const allDead = dead.concat(...opps.map((o) => o.known));
+    return equityToPercentile(kind, firstRoundEquity(kind, mine, allDead, drawsLeft, BOT_EQUITY_BUDGET_MS));
+  }
+  return studDrawEquity({ kind, mine, dead, shared, opps, drawsLeft }, undefined, BOT_EQUITY_BUDGET_MS);
+}
 
-  // High-card variants (seven-card-stud, seven-card-stud-hi-lo, five-card-draw).
-  // Use pair structure + high cards as a rough strength signal.
-  const ranks = holeCards.map((c) => c.rank);
-  const uniqueRanks = new Set(ranks).size;
-  const pairs = ranks.length - uniqueRanks;
-  const avgRank = ranks.reduce((a, b) => a + b, 0) / ranks.length; // Rank.Ace=14, Two=2
-  // Flush / three-of-a-kind bonus (crude)
-  const suitCounts: Record<string, number> = {};
-  for (const c of holeCards) suitCounts[c.suit] = (suitCounts[c.suit] || 0) + 1;
-  const maxSuit = Math.max(...Object.values(suitCounts));
-  const flushDraw = maxSuit >= 4 ? 0.15 : maxSuit >= 3 ? 0.08 : 0;
+/**
+ * 2026-11 (bots review B2) — how far an opponent's STARTING range is narrowed by HIS OWN
+ * action this round (public): the bet / last raise 0.62 / 0.80 (Hold'em's facing-a-bet /
+ * -raise floors), a caller 0.45, not yet in this round 0 — then his session read, as
+ * Hold'em (nit +0.10, tag +0.05, station / fish -0.22, maniac -0.15). Per opponent rather
+ * than Hold'em's one table-wide floor: a player who has not acted this round has shown
+ * nothing yet.
+ */
+function studDrawRangeFloor(s: Seat, streetBets: number, lastAggressor: number): number {
+  let f = 0;
+  if (s.lastAction === PlayerAction.Raise || s.lastAction === PlayerAction.AllIn) f = streetBets >= 2 && s.seatIndex === lastAggressor ? 0.80 : 0.62;
+  else if (s.lastAction === PlayerAction.Call) f = 0.45;
+  if (f === 0) return 0;
+  const cat = categorizeOpponent(opponentModelKey(s));
+  if (cat === 'nit') f = Math.min(0.92, f + 0.10);
+  else if (cat === 'tag') f = Math.min(0.88, f + 0.05);
+  else if (cat === 'station' || cat === 'fish') f = Math.max(0, f - 0.22);
+  else if (cat === 'maniac') f = Math.max(0, f - 0.15);
+  return f;
+}
 
-  const rankCounts: Record<number, number> = {};
-  for (const r of ranks) rankCounts[r] = (rankCounts[r] || 0) + 1;
-  const maxSame = Math.max(...Object.values(rankCounts));
-  let handBonus = 0;
-  if (maxSame >= 4) handBonus = 0.85;          // quads
-  else if (maxSame === 3 && pairs >= 1) handBonus = 0.75; // full house (if 7 cards + pair)
-  else if (maxSame === 3) handBonus = 0.55;    // trips
-  else if (pairs >= 2) handBonus = 0.40;       // two pair
-  else if (pairs === 1) handBonus = 0.25;      // one pair
-
-  const highCardBonus = (avgRank - 7) * 0.03;  // favors high average rank
-  const score = handBonus + flushDraw + highCardBonus;
-  return Math.max(0.05, Math.min(1, score));
+/** 2026-11 (bots review B12) — the Hold'em street a Stud / Draw betting round plays like (identity elsewhere). */
+export function holdemEquivalentStreet(phase: GamePhase, kind: StudDrawKind | null): GamePhase {
+  if (!kind) return phase;
+  switch (phase) {
+    case GamePhase.FourthStreet: return GamePhase.Flop;
+    case GamePhase.FifthStreet: case GamePhase.SixthStreet: return GamePhase.Turn;
+    case GamePhase.SeventhStreet: return GamePhase.River;
+    case GamePhase.Bet2: return kind === 'draw-hi' ? GamePhase.River : GamePhase.Flop;
+    case GamePhase.Bet3: return GamePhase.Turn;
+    case GamePhase.Bet4: return GamePhase.River;
+    default: return phase;
+  }
 }
 
 // ============================================================
@@ -847,7 +854,6 @@ export function decideAction(
     table.currentPhase === GamePhase.Bet3 ||
     table.currentPhase === GamePhase.Bet4;
   const variantId: string = (table as any).variantId || 'texas-holdem';
-  const isLowball = variantId === 'razz' || variantId === 'triple-draw' || variantId === 'badugi';
   // 2026-10-11 (.online R2, GAME-8) — plain Seven Card Stud's variantId is
   // 'seven-stud' (SevenStudTable), which this list missed: its bots ran the
   // Hold'em Monte Carlo on 4-7 hole cards (~1s of blocking CPU per decision,
@@ -864,7 +870,16 @@ export function decideAction(
   const totalPot = table.getTotalPot();
   const potOdds = totalPot > 0 ? callAmount / (totalPot + callAmount) : 0;
   const bigBlind = table.config.bigBlind;
+  // 2026-11 (bots review, stud-draw B1/B2/B12): the Stud / Draw family's game, and —
+  // Stud — the bot's own up cards (there is no community board to tell a story with).
+  const sdKind: StudDrawKind | null = (isStudFamily || isDrawFamily || isDrawBet)
+    ? (studDrawKindOf(variantId, table) ?? (isStudFamily ? 'stud-hi' : 'draw-hi')) : null;
+  const myUpCards: Card[] = sdKind && isStudKind(sdKind) && typeof (table as any).getFaceUpCards === 'function'
+    ? (table as any).getFaceUpCards(seatIndex) : [];
   const board = analyzeBoardTexture(table.communityCards);
+  // B12 — Stud: the bot's own up cards are the board its bets tell a story with (postFlopStrategy
+  // only: bluff / thin-value / sizing). decideAction's own wet-board penalty keeps `board`.
+  const storyBoard = sdKind && isStudKind(sdKind) ? analyzeBoardTexture(myUpCards) : board;
   const opponents = modelOpponents(table, seatIndex);
 
   // Count active non-folded opponents
@@ -905,10 +920,14 @@ export function decideAction(
   let stackOff: number | null = null;
 
   const isOmahaFamily = /omaha/i.test(variantId);
-  if (isStudFamily || isDrawFamily || isDrawBet) {
-    // Non-community-card variants: use a generic hand-strength heuristic based
-    // on the variant's own evaluator (or a lowball-aware one for razz/badugi/2-7).
-    handStrength = getVariantHandStrength(seat.holeCards, variantId, isLowball);
+  if (sdKind) {
+    // 2026-11 (bots review B1/B2/B11): the engine's own hand order, from public
+    // information only — the first round as a PERCENTILE of that game's starting
+    // hands (heads-up pot share vs a random holding, through the baked CDF: the
+    // Hold'em percentile's definition), later rounds as the Monte Carlo pot share
+    // vs the active opponents (Hold'em's post-flop equity), each opponent's
+    // starting range narrowed by his own action.
+    handStrength = studDrawHandStrength(table, seatIndex, sdKind, isPreFlop);
   } else if (isPreFlop) {
     // Omaha uses a 4-card preflop model; Hold'em uses the equity-ranked percentile.
     handStrength = isOmahaFamily
@@ -944,8 +963,10 @@ export function decideAction(
   handStrength = Math.min(1.0, Math.max(0.0, handStrength + noise));
   if (stackOff !== null) stackOff = Math.min(1.0, Math.max(0.0, stackOff + noise));   // same noise draw
 
-  // Outs and implied odds for draw decisions
-  const outs = isPreFlop ? 0 : countOuts(seat.holeCards, table.communityCards);
+  // Outs and implied odds for draw decisions. 2026-11: Stud / Draw equity already
+  // prices every card still to come (and the 8-handed shared 7th-street card made
+  // countOuts count a dead "draw").
+  const outs = (isPreFlop || sdKind) ? 0 : countOuts(seat.holeCards, table.communityCards);
   const rawImplied = isPreFlop ? 0 : getImpliedOdds(
     handStrength, outs, totalPot, seat.chipCount, table.currentPhase
   );
@@ -969,8 +990,10 @@ export function decideAction(
   // taken before them ON PURPOSE: hard/expert strength is Monte Carlo equity
   // (calculateEquity) already run against every live opponent (numOpponents) and
   // an action-narrowed range (oppMinPctile), so x0.92 multiway / x0.85 wet /
-  // -0.05 aggression would count the same thing twice. Stud / draw static
-  // strengths: the stud-draw-lowball change set owns whether they apply there.
+  // -0.05 aggression would count the same thing twice. Stud / draw strengths are
+  // the same kind of Monte Carlo pot share vs the active opponents
+  // (studDrawHandStrength), so they stay out of the decision there too; `board`
+  // stays the community cards (the bot's own up cards go to postFlopStrategy only).
   const preAdjustStrength = handStrength;
 
   // ============================================================
@@ -1005,13 +1028,13 @@ export function decideAction(
   // ============================================================
   // GAME-9 (R2) — every decision passes the raise-war limiter last.
   if (isPreFlop) {
-    // 2026-11 — Stud and draw first rounds keep their pre-2026-11 routing
-    // (legacyStudDrawFirstRound, the old preFlopStrategy verbatim): their
-    // strengths are not on the percentile scale (variant group, B1).
-    const pre = (isStudFamily || isDrawFamily)
-      ? legacyStudDrawFirstRound(
+    // 2026-11 — Stud (Third Street) and draw first rounds have their own routing
+    // (studDrawFirstRound: no blinds in Stud, a completion is a raise, fixed-limit
+    // has no push/fold); Hold'em / Omaha / Short Deck / Pineapple use preFlopStrategy.
+    const pre = sdKind
+      ? studDrawFirstRound(
         handStrength, callAmount, totalPot, seat, table, profile,
-        myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true)
+        myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true, isStudKind(sdKind) ? 'stud' : 'draw')
       : preFlopStrategy(
         handStrength, callAmount, totalPot, seat, table, profile,
         myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true,
@@ -1024,7 +1047,8 @@ export function decideAction(
   // ============================================================
   const post = postFlopStrategy(
     effectiveStrength, handStrength, callAmount, totalPot, potOdds,
-    seat, table, profile, board, opponents, outs, bigBlind, numOpponents, oppCategory
+    seat, table, profile, storyBoard, opponents, outs, bigBlind, numOpponents, oppCategory,
+    holdemEquivalentStreet(table.currentPhase, sdKind)
   );
   return limitBotRaiseWar(table, seat, post, false, effectiveStrength);
 }
@@ -1353,19 +1377,29 @@ function preFlopStrategy(
 }
 
 // ============================================================
-// LEGACY first-round logic — Stud (Third Street) and draw (first betting round).
-// The 0dc1b96 preFlopStrategy, VERBATIM: Stud / draw strengths are not on the
-// Hold'em percentile scale (bots review B1/B2, owned by the stud-draw-lowball
-// change set). It shares only the fixed getEffectiveStackBB (NEW-1).
-// STILL PRESENT ON THIS PATH (fixed for Hold'em / Omaha in preFlopStrategy, NOT
-// here): B4 (raise size ignored), B5 (callAmount===0 open branches reachable only
-// by the big blind / bring-in), B8 (3-bet size ignored), B9 (facingRaise =
-// callAmount > bigBlind), CALLING_STATION playing 100%, B16 (playersYetToAct =
-// min(3, totalActive-1)), NEW-5 (MANIAC 0.7-of-stack jam).
-// TODO(stud-draw-lowball): move Stud / draw onto preFlopStrategy once their
-// first-round strength is a percentile, then DELETE this copy.
+// Stud (Third Street) and draw (first betting round) first-round logic.
+// 2026-11 (bots review, stud-draw-lowball SD4): replaces the 0dc1b96 copy of
+// preFlopStrategy these games used. The strength is a real percentile of the
+// game's own starting hands (studDrawHandStrength), and on this path:
+//  - Stud has no blinds: every Third Street seat uses the MP ranges, the
+//    bring-in seat (it acts first) EP;
+//  - a completion (exactly one big blind) or any voluntary raise this round is
+//    a raise (B1 / B9), and nobody-raised-yet is "unopened" for every seat (B5);
+//  - facing one Stud completion the flat range is the button's facing an open;
+//  - a fixed-limit game never consults the no-limit Nash push/fold chart;
+//  - NIT / ROCK / FISH open normally, CALLING_STATION plays ~56% (CS_PLAY_BASE)
+//    unopened and calls CS_CALL_WIDTH vs a raise (it played 100%).
+// It shares the fixed getEffectiveStackBB (hand-start stacks, NEW-1).
+// STILL OPEN ON THIS PATH, Five Card Draw only (the one no-limit game here; the
+// Stud family, 2-7 Triple Draw and Badugi are fixed-limit): B4 (the size of the
+// raise faced is ignored), B8 (an opener defends a 3-bet regardless of its
+// size), NEW-5 (MANIAC jams at 0.7 of its stack with any hand) and B16 (push/fold
+// assumes min(3, totalActive - 1) players behind).
+// TODO(bots review follow-up): route Five Card Draw's first round through
+// preFlopStrategy (its stack-off, sizing and B16 fixes) and keep this function
+// for the fixed-limit games only.
 // ============================================================
-function legacyStudDrawFirstRound(
+function studDrawFirstRound(
   handStrength: number,
   callAmount: number,
   totalPot: number,
@@ -1376,7 +1410,8 @@ function legacyStudDrawFirstRound(
   totalActive: number,
   opponents: OpponentModel,
   bigBlind: number,
-  allInOrFold = false
+  allInOrFold: boolean,
+  variantFirstRound: 'stud' | 'draw'
 ): AIDecision {
   // 2026-07-07 AI overhaul: `handStrength` is now a real preflop PERCENTILE
   // (1.0 = AA, 0.85 = top 15%). Thresholds come from the solver-sized position
@@ -1386,16 +1421,30 @@ function legacyStudDrawFirstRound(
   // tighten, and the vestigial openLimpFreq knob now actually matters.
   const params = ARCHETYPE_PARAMS[profile.archetype];
   const pctile = handStrength;
-  const bucket = posBucket(position, totalActive);
+  // B1: Stud has no blinds — the SB/BB buckets (a posted blind, BB defence 0.55)
+  // made the last two Third Street seats play ~45% of hands. Every Third Street
+  // seat uses the MP ranges except the bring-in seat, which acts FIRST (G168): EP.
+  const bucket: PosBucket = variantFirstRound === 'stud'
+    ? (position === 0 ? 'EP' : 'MP')
+    : posBucket(position, totalActive);
   const factor = ARCHETYPE_RANGE_FACTOR[profile.archetype] ?? 1.0;
   const effBB = getEffectiveStackBB(table, seat.seatIndex);
   const stackMult = getStackDepthMultiplier(effBB);
   const huFactor = totalActive <= 2 ? 0.55 : 1.0; // heads-up plays FAR wider
-  const facingRaise = callAmount > bigBlind;
   // GAME-9 (R2) — the table's own count of this round's raises: with each
   // opponent's LAST action only, two bots re-raising each other each saw "one
   // raise" forever and never reached the 4-bet / fold logic.
   const streetRaises = Number((table as any).raisesThisStreet) || 0;
+  // B1: a Stud completion is exactly one big blind (the bring-in is posted, not a
+  // raise), so `callAmount > bigBlind` read it as a limp. In Stud and the draw
+  // games the round's own raise count says whether a raise was made.
+  const facingRaise = callAmount > bigBlind || (streetRaises >= 1 && callAmount > 0);
+  // B5 / CS: nobody has raised this round and there is a bet to call (the big blind,
+  // the bring-in, a limp). Every seat but the big blind / bring-in faces one, so the
+  // per-archetype `callAmount === 0` open branches were reachable only there (NIT
+  // shoved or folded, ROCK limped AA, FISH shoved 100 BB in Five Card Draw,
+  // CALLING_STATION played 100%).
+  const unopened = !facingRaise && callAmount > 0;
   const facingThreeBet = Math.max(opponents.raiseCount, streetRaises) >= 2;
   // A re-raise is sized off the bet it faces (currentBetToMatch), not off the
   // increment still to call: "3x the call" made every 3-bet a near min-raise.
@@ -1405,7 +1454,11 @@ function legacyStudDrawFirstRound(
   // Model-derived, archetype/stack/heads-up-adjusted thresholds (percentile scale).
   const openTh = adjustThreshold(adjustThreshold(adjustThreshold(OPEN_THRESHOLD[bucket], factor), stackMult), huFactor);
   const threeBetTh = adjustThreshold(adjustThreshold(THREEBET_THRESHOLD[bucket], factor), huFactor);
-  const callVsRaiseTh = adjustThreshold(adjustThreshold(adjustThreshold(CALL_VS_RAISE_THRESHOLD[bucket], factor), stackMult), huFactor);
+  // B1x: facing a single Stud COMPLETION the price is the Hold'em button's facing
+  // an open (one small bet to win the antes, the bring-in and the completion), so
+  // the flat range is the BTN one; the bring-in / limp decisions keep their own bucket.
+  const callBucket: PosBucket = variantFirstRound === 'stud' && facingRaise && !facingThreeBet ? 'BTN' : bucket;
+  const callVsRaiseTh = adjustThreshold(adjustThreshold(adjustThreshold(CALL_VS_RAISE_THRESHOLD[callBucket], factor), stackMult), huFactor);
   const fourBetTh = FOURBET_THRESHOLD;
 
   const raiseOrAllIn = (amount: number): AIDecision =>
@@ -1415,18 +1468,20 @@ function legacyStudDrawFirstRound(
 
   // ── Short-stack push/fold: shove-or-fold from the BAKED Nash lookup
   //    (pushFoldSolver.ts — an offline-solved HU equilibrium, multiway-tightened
-  //    and validated vs published charts). Replaces the old too-tight heuristic
-  //    (which shoved only ~top 35% at 10bb; Nash is ~top 56%). The HU-vs-multiway
-  //    axis is handled by the lookup itself (playersYetToAct), so we do NOT apply
-  //    huFactor here — only the archetype `factor` as a personality overlay.
-  //    Stations still flat; nobody limps a short stack. ──
+  //    and validated vs published charts). The HU-vs-multiway axis is handled by
+  //    the lookup itself (playersYetToAct), so we do NOT apply huFactor here —
+  //    only the archetype `factor` as a personality overlay. Stations still flat;
+  //    nobody limps a short stack. ──
   const playersYetToAct = Math.min(3, Math.max(1, totalActive - 1));
   // F49 (2026-10-21) — an All-In or Fold table plays this branch at ANY depth
   // and for every archetype (a call there is a shove too): the stack is read as
   // at most the deepest baked one, and a bet above the big blind is a shove to
   // CALL (the Nash call threshold), never one to re-shove over on push odds.
   const pfBB = allInOrFold ? Math.min(effBB, PUSH_FOLD_MAX_BB) : effBB;
-  if (allInOrFold || (inPushFoldZone(effBB, playersYetToAct) && profile.archetype !== 'CALLING_STATION')) {
+  // The Nash push/fold chart is a no-limit Hold'em shove; a fixed-limit game
+  // (Stud family, 2-7 Triple Draw, Badugi) has no shove (All-In is capped at one bet).
+  const pushFoldGame = table.bettingStructure !== 'fixed-limit';
+  if (allInOrFold || (pushFoldGame && inPushFoldZone(effBB, playersYetToAct) && profile.archetype !== 'CALLING_STATION')) {
     const nashPush = nashPushPctile(pfBB, playersYetToAct);
     if (nashPush !== null) {
       if ((callAmount >= seat.chipCount && callAmount > 0) || (allInOrFold && callAmount > bigBlind)) {
@@ -1443,14 +1498,15 @@ function legacyStudDrawFirstRound(
     }
   }
 
-  // ── CALLING_STATION: calls almost everything, never raises. ──
+  // ── CALLING_STATION: loose and passive (Hold'em's CS_PLAY_BASE / CS_CALL_WIDTH), never raises. ──
   if (profile.archetype === 'CALLING_STATION') {
     if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
+    if (unopened) return pctile >= adjustThreshold(CS_PLAY_BASE, factor) ? { action: PlayerAction.Call, raiseAmount: 0 } : { action: PlayerAction.Fold, raiseAmount: 0 };
     if (callAmount > seat.chipCount * 0.30 && pctile < 0.35) return { action: PlayerAction.Fold, raiseAmount: 0 };
     if (callAmount >= seat.chipCount) {
       return pctile >= 0.40 ? { action: PlayerAction.AllIn, raiseAmount: 0 } : { action: PlayerAction.Fold, raiseAmount: 0 };
     }
-    return { action: PlayerAction.Call, raiseAmount: 0 };
+    return pctile >= 1 - CS_CALL_WIDTH ? { action: PlayerAction.Call, raiseAmount: 0 } : { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
   // ── MANIAC: raises/3-bets almost anything. ──
@@ -1473,18 +1529,26 @@ function legacyStudDrawFirstRound(
       if (pctile >= openTh && Math.random() >= params.openLimpFreq) return raiseOrAllIn(Math.round(bigBlind * 3));
       return { action: PlayerAction.Check, raiseAmount: 0 }; // limp / check back
     }
-    if (pctile >= 0.90) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    if (unopened) {
+      // B5 — the hands it used to SHOVE (top 10%) are a 3 BB raise; the rest of its range limps.
+      if (pctile >= 0.90) return raiseOrAllIn(Math.round(bigBlind * 3));
+      return pctile >= adjustThreshold(0.55, factor) ? { action: PlayerAction.Call, raiseAmount: 0 } : { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
+    // Its "weird raise": a 3-bet, never a jam and never a 4-bet.
+    if (!facingThreeBet && pctile >= 0.90) return raiseOrAllIn(roundToBB(Math.round(betToMatch * 3), bigBlind));
     if (pctile >= adjustThreshold(0.55, factor) && callAmount <= seat.chipCount * 0.12) return { action: PlayerAction.Call, raiseAmount: 0 };
     if (pctile >= callVsRaiseTh) return { action: PlayerAction.Call, raiseAmount: 0 };
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
-  // ── ROCK: tight-passive; calls down, almost never raises preflop. ──
+  // ── ROCK: tight-passive; calls down, raises only premiums. ──
   if (profile.archetype === 'ROCK') {
     if (callAmount === 0) {
       if (pctile >= adjustThreshold(0.94, huFactor)) return raiseOrAllIn(Math.round(bigBlind * 2.5));
       return { action: PlayerAction.Check, raiseAmount: 0 };
     }
+    // B5 — premiums raise from ANY seat (it limped AA everywhere but the big blind).
+    if (unopened && pctile >= adjustThreshold(0.94, huFactor)) return raiseOrAllIn(Math.round(bigBlind * 2.5));
     if (pctile >= callVsRaiseTh) return { action: PlayerAction.Call, raiseAmount: 0 };
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
@@ -1495,8 +1559,13 @@ function legacyStudDrawFirstRound(
       if (pctile >= openTh) return raiseOrAllIn(Math.round(bigBlind * 2.5));
       return { action: PlayerAction.Check, raiseAmount: 0 };
     }
+    if (unopened) {
+      // B1 / B5 — NIT opens its own range (openTh: the one it already uses in the big blind) from
+      // ANY seat: it used to shove the top 3.5% and fold the rest (Five Card Draw AA-K folded 88%).
+      return pctile >= openTh ? raiseOrAllIn(Math.round(bigBlind * 2.5)) : { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
     if (facingThreeBet && pctile < fourBetTh) return { action: PlayerAction.Fold, raiseAmount: 0 };
-    if (pctile >= fourBetTh) return { action: PlayerAction.AllIn, raiseAmount: 0 };
+    if (pctile >= fourBetTh) return facingThreeBet ? { action: PlayerAction.AllIn, raiseAmount: 0 } : raiseOrAllIn(roundToBB(Math.round(betToMatch * 3), bigBlind));
     if (pctile >= threeBetTh) return { action: PlayerAction.Call, raiseAmount: 0 };
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
@@ -1540,7 +1609,7 @@ function legacyStudDrawFirstRound(
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
 
-  // Facing only the big blind (limped pot / SB complete): raise in range, else complete/fold.
+  // Facing only the big blind / the bring-in (limped pot / SB complete): raise in range, else complete/fold.
   if (pctile >= openTh) {
     const target = roundToBB(Math.round(bigBlind * (2.5 + Math.random() * 0.5)), bigBlind);
     return raiseOrAllIn(target);
@@ -1567,9 +1636,13 @@ function postFlopStrategy(
   outs: number,
   bigBlind: number,
   numOpponents: number,
-  oppCategory: OpponentCategory
+  oppCategory: OpponentCategory,
+  // 2026-11 (bots review B12): the Hold'em street this betting round plays like
+  // (identity in the board games): Stud 4th = Flop, 5th/6th = Turn, 7th = River;
+  // Triple Draw / Badugi Bet2 = Flop, Bet3 = Turn, Bet4 = River; Five Card Draw Bet2 = River.
+  street: GamePhase = table.currentPhase
 ): AIDecision {
-  const isRiver = table.currentPhase === GamePhase.River;
+  const isRiver = street === GamePhase.River;
   const params = ARCHETYPE_PARAMS[profile.archetype];
   const oppNames = getActiveOpponentKeys(table, seat.seatIndex);   // R3 (GAME-P3-10) — player ids
   // GAME-9 (R2) — a RAISE facing a bet is sized off that bet: call it, then add
@@ -1589,7 +1662,7 @@ function postFlopStrategy(
   //  • callDownAdj: the once-dead callDownTendency knob now actually widens/
   //    narrows how light we call; we also call lighter vs a known maniac (bluffs).
   //  • stickyPool/foldyPool drive exploitative value/bluff deviations below.
-  const streetCaution = isRiver ? 0.06 : (table.currentPhase === GamePhase.Turn ? 0.03 : 0);
+  const streetCaution = isRiver ? 0.06 : (street === GamePhase.Turn ? 0.03 : 0);
   const callDownAdj = (params.callDownTendency - 0.5) * 0.20 + (oppCategory === 'maniac' ? 0.10 : 0);
   const stickyPool = oppCategory === 'station' || oppCategory === 'fish';
   const foldyPool = oppCategory === 'nit' || oppCategory === 'tag';
@@ -1737,14 +1810,14 @@ function postFlopStrategy(
     // Value bet — thinner vs sticky (station/fish) pools that call too much.
     const valueTh = stickyPool ? 0.58 : 0.65;
     if (effectiveStrength > valueTh) {
-      const betSize = getGTOBetSize(rawStrength, totalPot, bigBlind, seat.chipCount, board, table.currentPhase, profile);
+      const betSize = getGTOBetSize(rawStrength, totalPot, bigBlind, seat.chipCount, board, street, profile);
       if (betSize >= minRaise) return { action: PlayerAction.Raise, raiseAmount: betSize };
     }
 
     // Medium hand: mostly pot-control, but take a THIN VALUE bet when the wired
     // river logic says it's +EV (loose opponents, safe board, difficulty-scaled).
     if (effectiveStrength > 0.4) {
-      if (shouldThinValueBet(rawStrength, table.currentPhase, board, oppNames, profile)) {
+      if (shouldThinValueBet(rawStrength, street, board, oppNames, profile)) {
         const betSize = Math.max(minRaise, Math.round(totalPot * (0.33 + Math.random() * 0.12)));
         if (betSize <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: betSize };
       }
@@ -1754,12 +1827,12 @@ function postFlopStrategy(
     // Weak hand: BALANCED bluff decision (hand-strength band + board "story" +
     // opponent pool aware). This wires shouldBluffBalanced as the real bluff
     // engine, replacing the old raw coin-flip on effectiveBluffFreq.
-    if (shouldBluffBalanced(rawStrength, board, table.currentPhase, profile, oppNames)) {
+    if (shouldBluffBalanced(rawStrength, board, street, profile, oppNames)) {
       // 2026-07-07 review fix: both map to getGTOBetSize's BIG (polarized) band,
       // and the semi-bluff value (0.9) is additionally overbet-eligible, so
       // semi-bluffs bet a touch bigger than pure bluffs (was inverted).
       const bluffSizeStrength = outs >= 8 ? 0.9 : 0.5;
-      const betSize = getGTOBetSize(bluffSizeStrength, totalPot, bigBlind, seat.chipCount, board, table.currentPhase, profile);
+      const betSize = getGTOBetSize(bluffSizeStrength, totalPot, bigBlind, seat.chipCount, board, street, profile);
       if (betSize >= minRaise && betSize <= seat.chipCount * 0.5) {
         return { action: PlayerAction.Raise, raiseAmount: betSize };
       }
@@ -1789,7 +1862,7 @@ function postFlopStrategy(
   const valueRaiseTh = stickyPool ? 0.70 : 0.75;
   if (effectiveStrength > valueRaiseTh) {
     const raiseSize = Math.max(minRaise, table.currentBetToMatch +
-      getGTOBetSize(rawStrength, potAfterCall, bigBlind, seat.chipCount, board, table.currentPhase, profile));
+      getGTOBetSize(rawStrength, potAfterCall, bigBlind, seat.chipCount, board, street, profile));
     if (chipsFor(raiseSize) <= seat.chipCount) {
       return { action: PlayerAction.Raise, raiseAmount: raiseSize };
     }
@@ -1819,7 +1892,7 @@ function postFlopStrategy(
 
   // Balanced bluff-RAISE line, gated by shouldBluffBalanced — never into sticky
   // pools, more vs foldy ones. Not on the river (no fold-equity draws left).
-  if (!isRiver && shouldBluffBalanced(rawStrength, board, table.currentPhase, profile, oppNames)) {
+  if (!isRiver && shouldBluffBalanced(rawStrength, board, street, profile, oppNames)) {
     if (board.hasHighCards || board.isPaired || board.isDry) {
       const raiseSize = raiseTo(0.6);
       if (chipsFor(raiseSize) <= seat.chipCount * 0.30) return { action: PlayerAction.Raise, raiseAmount: raiseSize };

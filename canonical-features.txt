@@ -892,6 +892,10 @@ MIN_BUDGETED_SIMULATIONS = 64
 # (src/ai/studDrawStrength.ts + the baked src/ai/studDrawCdf.ts).
 chooseBotDiscards
 studDrawEquity
+# SD3-SD5: decideAction prices Stud / Draw from public cards only, the first
+# round has its own routing, and later rounds play as the Hold'em-equivalent street.
+holdemEquivalentStreet
+studDrawFirstRound
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as
