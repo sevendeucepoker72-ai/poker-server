@@ -251,6 +251,64 @@ d('economy on a real Postgres', () => {
     });
   });
 
+  describe('scratch cards from hands: the daily cap (bots review 2026-11-04, E7)', () => {
+    const cap = am.SCRATCH_CARDS_PER_DAY;
+    const per = am.SCRATCH_HANDS_PER_CARD;
+    const scratchRow = async (id: number) => (await pool.query(
+      `SELECT hands_since_last_scratch AS hs, scratch_cards_available AS cards, scratch_earned_today AS today_n,
+              to_char(scratch_earned_on, 'YYYY-MM-DD') AS earned_on
+         FROM users WHERE id = $1`, [id])).rows[0];
+    const ticks = async (id: number, n: number) => { const out: any[] = []; for (let i = 0; i < n; i++) out.push(await am.tickScratchProgress(id)); return out; };
+
+    (cap === 0 || cap >= 2 ? it : it.skip)('(a) 40 ticks bank 2 cards; the day count and the Denver day are stamped', async () => {
+      const id = await mkUser();
+      const out = await ticks(id, 2 * per);
+      expect(out.filter((t) => t.awarded)).toHaveLength(2);
+      expect(out.every((t) => t.capped === false)).toBe(true);
+      expect(await scratchRow(id)).toEqual({ hs: 0, cards: 2, today_n: 2, earned_on: await denver() });
+    });
+
+    (cap >= 2 ? it : it.skip)('(b) two cards left today: 60 ticks bank 2, then the counter holds at 20 and the tick says capped', async () => {
+      // The cap is a module constant (env SCRATCH_CARDS_PER_DAY, default 10): "cap at 2" = cap - 2 already banked today.
+      const id = await mkUser({ scratch_earned_on: await denver(), scratch_earned_today: cap - 2 });
+      const out = await ticks(id, 3 * per);
+      expect(out.filter((t) => t.awarded)).toHaveLength(2);
+      expect(out[3 * per - 1]).toMatchObject({ awarded: false, capped: true, scratchCardsAvailable: 2 });
+      expect(out.slice(0, 3 * per - 1).every((t) => t.capped === false)).toBe(true);
+      expect(await scratchRow(id)).toEqual({ hs: per, cards: 2, today_n: cap, earned_on: await denver() });
+      const more = await ticks(id, 5);                                  // still held, still capped, nothing banked
+      expect(more.every((t) => t.capped === true && t.awarded === false)).toBe(true);
+      expect(await scratchRow(id)).toMatchObject({ hs: per, cards: 2, today_n: cap });
+    });
+
+    (cap >= 1 ? it : it.skip)('(c) capped yesterday: the next tick banks (a new Denver day; no card owed for the held hands)', async () => {
+      const id = await mkUser({ hands_since_last_scratch: per, scratch_earned_on: await denver(-1), scratch_earned_today: cap });
+      expect(await am.tickScratchProgress(id)).toMatchObject({ awarded: true, capped: false, scratchCardsAvailable: 1 });
+      expect(await scratchRow(id)).toEqual({ hs: 0, cards: 1, today_n: 1, earned_on: await denver() });
+    });
+
+    it('(d) a NULL scratch_earned_on (never banked since the column was added) banks at 20', async () => {
+      const id = await mkUser({ hands_since_last_scratch: per - 1 });
+      expect((await scratchRow(id)).earned_on).toBeNull();
+      expect(await am.tickScratchProgress(id)).toMatchObject({ awarded: true, capped: false, scratchCardsAvailable: 1 });
+      expect(await scratchRow(id)).toEqual({ hs: 0, cards: 1, today_n: 1, earned_on: await denver() });
+    });
+
+    it('(e) two concurrent ticks at hands_since 19 bank exactly ONE card (the row lock; the condition reads the OLD row)', async () => {
+      const id = await mkUser({ hands_since_last_scratch: per - 1 });
+      const both = await Promise.all([am.tickScratchProgress(id), am.tickScratchProgress(id)]);
+      expect(both.filter((t: any) => t.awarded)).toHaveLength(1);
+      expect(await scratchRow(id)).toMatchObject({ hs: 1, cards: 1, today_n: 1 });
+    });
+
+    (cap >= 1 ? it : it.skip)('(e) at the cap boundary two concurrent ticks bank exactly one: the day count never passes the cap', async () => {
+      const id = await mkUser({ hands_since_last_scratch: per - 1, scratch_earned_on: await denver(), scratch_earned_today: cap - 1 });
+      const both = await Promise.all([am.tickScratchProgress(id), am.tickScratchProgress(id)]);
+      expect(both.filter((t: any) => t.awarded)).toHaveLength(1);
+      expect(await scratchRow(id)).toMatchObject({ hs: 1, cards: 1, today_n: cap });
+    });
+  });
+
   describe('purchases (C7 / C8 / ECON-16)', () => {
     it('cosmetic: stars deducted then granted; not enough stars → nothing; already owned → no charge; 4 concurrent buys of one item charge ONCE', async () => {
       const id = await mkUser({ stars: 1000 });

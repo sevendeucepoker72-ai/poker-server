@@ -1113,6 +1113,14 @@ code: 'server_restarting'
 # date and the scratch-card count; season badges render from owned items.
 lastLoginClaimDate: progress.lastLoginClaimDate ?? null
 scratchCardsAvailable: progress.scratchCardsAvailable ?? 0
+# 2026-11-04 (bots review, economy E1 / E5 / E12 / E7): the Spin & Go prize
+# odds live in ONE exported table (mean 2.90x); per-hand rewards stop from the
+# 30th idle hand in a row (no voluntary chip); hand XP drops to 1 past the
+# daily full-XP limit; scratch cards from hands are capped per Denver day.
+SPIN_GO_MULTIPLIER_ODDS
+IDLE_HANDS_REWARD_LIMIT
+HAND_XP_AFTER_CAP
+scratch_earned_today
 badges: owned.filter((k) => k.startsWith('badge:'))
 # ECON-10 / APPUI-11: an achievement pays only when ITS ledger row is inserted.
 INSERT INTO user_achievements (user_id, ach_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING 1
