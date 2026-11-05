@@ -1207,6 +1207,19 @@ export const AOF_ARCHETYPE_DAMP = 0.5;
  * games, 20/40, 1,000 chips, live mix), the fixed .85 / .88 one ~-0.5%, a hard bot ~+1.8%.
  */
 export const AOF_NOISE_KEEP = 0.5;
+/**
+ * MANIAC-RTF (fix round 3) — no-limit (Hold'em, Short Deck, Pineapple): a MANIAC re-raise by a hand
+ * that fails the stack-off range is made only when it is at most this share of the street stack;
+ * larger, the hand calls (top 70%) or folds instead. It re-raised ~93% of hands to 2.5-4x the bet (25-59
+ * BB over a 10 BB open) and the stack-off gate then folded ~89% of them to a shove: opening 10 BB with any
+ * two and shoving over every re-raise won ~+1,500 BB/100 at a one-MANIAC table, +1,900 with 3-bets too
+ * (live 0dc1b96: -266 / -329). Measured on the whole line (real engine, 100 BB, hard, vs five MANIACs,
+ * 1,500 hands): re-raising TO the cap left a 2.5 / 3 BB open at +66 / +67 BB/100 with 0.06; refusing a
+ * larger one (this rule) put a 2 BB open at -192 / -28 / +32 / +82 with 0.05 / 0.06 / 0.07 / 0.08 and a
+ * 2.5 BB open at -196 / -196 / -44 / +85. At 100 BB no light re-raise is left (a min-raise's 2.5x is 5 BB);
+ * 200 BB deep it still re-raises light up to 10 BB.
+ */
+export const HOLDEM_LIGHT_RERAISE_FRACTION = 0.05;
 
 export interface PreflopCtx {
   /** Live (not folded) opponents in the hand: the players who can still call a shove or are in it (B16). */
@@ -1475,7 +1488,9 @@ function preFlopStrategy(
   }
 
   // ── MANIAC: raises/3-bets almost anything — but a raise that would be a jam is a
-  //    stack-off (NEW-5: it called 100 BB off with 91% of hands). ──
+  //    stack-off (NEW-5: it called 100 BB off with 91% of hands), and facing a raise, a hand
+  //    that fails the stack-off range re-raises only up to HOLDEM_LIGHT_RERAISE_FRACTION of
+  //    the stack (MANIAC-RTF: a bigger one was folded to the shove it invited). ──
   if (profile.archetype === 'MANIAC') {
     const wantRaise = pctile >= 0.15 || Math.random() < 0.55;
     if (wantRaise) {
@@ -1486,8 +1501,12 @@ function preFlopStrategy(
         if (Math.max(minRaise, target) >= seat.chipCount * 0.7) return ALLIN;
         return raiseOrAllIn(target);
       }
-      const r = raiseOrJam(target);
-      if (r) return r;
+      const tooBigLight = facingRaise && !stackOffOK(effBB)
+        && Math.max(minRaise, target) > (seat.chipCount + seat.currentBet) * HOLDEM_LIGHT_RERAISE_FRACTION;
+      if (!tooBigLight) {
+        const r = raiseOrJam(target);
+        if (r) return r;
+      }
     }
     if (callAmount === 0) return CHECK;
     return pctile >= 0.30 ? CALL : FOLD;
