@@ -7059,6 +7059,10 @@ function getGameStateForPlayer(
       // (some subclasses only set it on config). Excludes pineapple (Hold'em-like).
       const vId = String((table as any).config?.variantId || (table as any).variantId || '').toLowerCase();
       const isOmaha = vId.includes('omaha');
+      // 2026-11 (bots review, equity C7) — Omaha Hi-Lo's coach prices the expected POT SHARE
+      // (high and low halves), not the high-only win chance (A-2-3-K on 5-6-8 showed 26%,
+      // a hand that wins about 62% of the pot). variant.isHiLo covers 'omaha-6' hi-lo tables.
+      const isHiLo = isOmaha && ((table as any).variant?.isHiLo === true || vId.includes('hi-lo'));
 
       try {
         stateObj.trainingData = getFullTrainingData(
@@ -7069,7 +7073,8 @@ function getGameStateForPlayer(
           potSize,
           chipStack,
           table.currentPhase,
-          isOmaha
+          isOmaha,
+          isHiLo
         );
       } catch (e) {
         // Training data calculation failed, skip
