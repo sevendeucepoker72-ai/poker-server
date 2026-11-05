@@ -4,12 +4,16 @@
  * Real PokerTable + real decideAction, seeded Math.random (the LCG of tests/botPreflopFixes.test.ts), at the
  * difficulties the live formats seat: cash tables 'hard', career / Spin & Go / All-In or Fold 'easy', 'medium'
  * and 'hard' (expert where it is cheap). Every block fails on d1ec56a (fix round 1) and passes with the fix.
+ * The fix round 3 blocks (end of file) also pin each round-2/3 mechanism on its own: reverting only the
+ * multiway cap, the size floor, its taper or the All-In or Fold archetype damping fails at least one of them.
  */
 import { PokerTable, PlayerAction } from '../src/game/PokerTable';
 import { ShortDeckTable } from '../src/game/variants/ShortDeckTable';
 import { decideAction } from '../src/ai/AIPlayer';
+import * as AI from '../src/ai/AIPlayer';
 import * as PR from '../src/ai/preflopRanges';
 import { PREFLOP_TABLE } from '../src/ai/preflopTable';
+import * as PF from '../src/ai/pushFoldSolver';
 
 const BB = 100;
 function seedRandom(seed: number): () => void {
@@ -276,5 +280,92 @@ describe('HAI-1 / HAI-2 on Short Deck (no-limit, its own pre-flop table)', () =>
   ];
   it.each(['easy', 'medium', 'hard'])('%s: AA, KK and QQ never fold', (diff) => {
     expect(premiumFolds(spots, diff, ['AA', 'KK', 'QQ'], ['TAG', 'LAG', 'NIT', 'ROCK', 'FISH'])).toEqual([]);
+  });
+});
+
+describe('Fix round 3 (review of the round-2 lane) — pins for the multiway cap, the size floor and its taper', () => {
+  /** UTG opens to `sz` BB at 100 BB; MP decides. */
+  const openMp = (sz: number): Spot => () => { const t = mk(6); expect(t.playerRaise(3, sz * BB)).toBe(true); return { t, me: 4 }; };
+
+  it.each([['TAG', 'hard'], ['NIT', 'hard'], ['TAG', 'medium']])(
+    'HAI-1 cap, %s/%s: a 22 BB UTG shove is called as at 6-max with 7 players behind (not only AA-JJ / AK)', (a, d) => {
+      // CALL_WIDTH_MAX_PLAYERS: uncapped (8 live at 9-max) the width falls to ~4%, on d1ec56a ~1% (AA-QQ).
+      const r9 = rate(utgShove(9, 22), prof(a, d), cont, 3000);
+      const r6 = rate(utgShove(6, 22), prof(a, d), cont, 3000);
+      expect(Math.abs(r9 - r6)).toBeLessThanOrEqual(0.003);
+      expect(r9).toBeGreaterThanOrEqual(0.065);
+    });
+
+  it.each([['TAG', 'hard'], ['NIT', 'hard']])(
+    'HAI-2 floor, %s/%s: vs a 15 BB UTG open MP keeps 88 / 99 / TT (the call line stops at the top ~5.4%%)', (a, d) => {
+      // Without SIZE_NARROW_MAX_TH the line narrows to ~0.98: 3-4% continue, 88 19-62%.
+      expect(rate(openMp(15), prof(a, d), cont, 3000)).toBeGreaterThanOrEqual(0.05);
+      for (const c of ['88', '99', 'TT']) expect([c, rate(openMp(15), prof(a, d), cont, 200, c) >= 0.95]).toEqual([c, true]);
+      for (const c of ['K9o', 'QTo']) expect([c, rate(openMp(15), prof(a, d), cont, 100, c)]).toEqual([c, 0]);
+    });
+
+  it.each([['TAG', 'hard'], ['NIT', 'hard'], ['TAG', 'medium'], ['LAG', 'easy']])(
+    'size taper, %s/%s: vs 15-60 BB opens the range narrows smoothly into the 1/3-stack stack-off range', (a, d) => {
+      // Without the taper: flat 5.4% to 33 BB, then 3.3% at 34 BB (a 2 pp cliff; 77 / 88 / AJs flat a third of
+      // the stack). Without the floor, or on d1ec56a, the range WIDENS at the commit line and AA-JJ fold to it.
+      const sizes = [15, 17, 20, 22, 25, 28, 30, 32, 33, 34, 36, 40, 60];
+      const r = sizes.map((sz) => rate(openMp(sz), prof(a, d), cont, 3000));
+      for (let i = 1; i < r.length; i++) expect([sizes[i], r[i] - r[i - 1] <= 0.003]).toEqual([sizes[i], true]);
+      expect(r[sizes.indexOf(33)] - r[sizes.indexOf(34)]).toBeLessThanOrEqual(0.006);
+      for (const sz of sizes) for (const c of ['AA', 'KK', 'QQ', 'JJ', 'AKo']) {
+        expect([sz, c, rate(openMp(sz), prof(a, d), isFold, 100, c)]).toEqual([sz, c, 0]);
+      }
+      if (d === 'hard') for (const c of ['77', '88', 'AJs']) expect([c, rate(openMp(33), prof(a, d), cont, 200, c) <= 0.05]).toEqual([c, true]);
+    });
+});
+
+describe('Fix round 3 — All-In or Fold calibration (the economy target)', () => {
+  /** UTG (seat 3) observed voluntarily in `vpip` of `hands` hands, then shoves; MP decides with 4 others live. */
+  const aofObservedShove = (hands: number, vpip: number): Spot => () => {
+    const t = aof();
+    const key = AI.opponentModelKey(t.seats[3]);
+    for (let h = 1; h <= hands; h++) { AI.recordOpponentObservation(key, 'hand_start', { handNumber: 1000 + h }); if (h <= vpip) AI.recordOpponentObservation(key, 'vpip'); }
+    expect(t.playerAllIn(3)).toBe(true);
+    return { t, me: 4 };
+  };
+
+  it('HAI-1 cap in All-In or Fold: vs a shover seen in 12 of 30 hands, MP (4 others live) calls as with 2 others live', () => {
+    // aofCallPctile(25, ~0.32, CALL_WIDTH_MAX_PLAYERS - 1): ~7.5% for a hard TAG; uncapped (4 others) ~5%.
+    const r = rate(aofObservedShove(30, 12), prof('TAG', 'hard'), cont, 3000, undefined, AOF);
+    expect(r).toBeGreaterThanOrEqual(0.065);
+    expect(r).toBeLessThanOrEqual(0.095);
+  });
+
+  it('AOF_ARCHETYPE_DAMP: a loose archetype shoves and calls at most ~1.45x a TAG\'s width (it was 1.67-1.77x)', () => {
+    const spots: Array<[string, Spot]> = [
+      ['UTG unopened (5 behind)', () => ({ t: aof(), me: 3 })],
+      ['BB vs an SB shove', () => { const t = aof(); for (const s of [3, 4, 5, 0]) t.playerFold(s); expect(t.playerAllIn(1)).toBe(true); return { t, me: 2 }; }],
+    ];
+    for (const [label, build] of spots) {
+      const tag = rate(build, prof('TAG', 'hard'), cont, 4000, undefined, AOF);
+      for (const a of ['MANIAC', 'FISH', 'CALLING_STATION', 'LAG']) {
+        const r = rate(build, prof(a, 'hard'), cont, 4000, undefined, AOF);
+        expect([label, a, r / tag <= 1.45]).toEqual([label, a, true]);
+        expect([label, a, r / tag >= 1.0]).toEqual([label, a, true]);   // the personality stays: never tighter than a TAG
+      }
+      const nit = rate(build, prof('NIT', 'hard'), cont, 4000, undefined, AOF);
+      expect([label, nit <= tag && nit / tag >= 0.85]).toEqual([label, true]);
+    }
+  });
+
+  it('AOF_NOISE_KEEP: an easy bot\'s All-In or Fold shove is never more than half its noise (0.0625) off its line', () => {
+    // UTG unopened, 5 behind. Undamped, an easy bot shoved hands 0.07-0.115 under its line 4-22% of the time
+    // and folded hands as far above it.
+    const damp = (AI as any).AOF_ARCHETYPE_DAMP ?? 1;
+    const line = PR.adjustThreshold(PF.aofPushPctile(25, 5) as number, Math.pow(PR.ARCHETYPE_RANGE_FACTOR.TAG, damp));
+    const codes = PREFLOP_TABLE.map((r) => r[0] as string);
+    const pct = (c: string) => PR.getPreflopPercentile(hand(c));
+    const below = codes.filter((c) => pct(c) > line - 0.115 && pct(c) < line - 0.07);
+    const above = codes.filter((c) => pct(c) > line + 0.07 && pct(c) < line + 0.115);
+    expect(below.length).toBeGreaterThan(3);
+    expect(above.length).toBeGreaterThan(0);
+    const shoves = (c: string) => rate(() => ({ t: aof(), me: 3 }), prof('TAG', 'easy'), (d) => d.action === PlayerAction.AllIn, 200, c, AOF);
+    for (const c of below) expect([c, shoves(c)]).toEqual([c, 0]);
+    for (const c of above) expect([c, shoves(c)]).toEqual([c, 1]);
   });
 });
