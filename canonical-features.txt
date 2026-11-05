@@ -892,6 +892,10 @@ MIN_BUDGETED_SIMULATIONS = 64
 # (src/ai/studDrawStrength.ts + the baked src/ai/studDrawCdf.ts).
 chooseBotDiscards
 studDrawEquity
+# SD3-SD5: decideAction prices Stud / Draw from public cards only, the first
+# round has its own routing, and later rounds play as the Hold'em-equivalent street.
+holdemEquivalentStreet
+studDrawFirstRound
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as
@@ -900,6 +904,27 @@ studDrawEquity
 # 4-bets and deep stack-offs.
 preflop-table-v1
 FOURBET_STACKOFF_THRESHOLD
+# holdem-preflop C2-C14 - a lone all-in is priced at the hand-start depth
+# (NEW-1), deep stack-offs and jams use the stack-off width, a short all-in
+# with players behind is routed like a raise, and a micro all-in the call
+# closes is always called.
+shoverFaced
+stackOffCallWidth
+pureAllInCall
+MICRO_CALL_NEED
+# economy E3 - All-In or Fold bot calibration: the open-shove width shrinks
+# per player behind, and a call is priced against the shover's seat range
+# blended with his observed VPIP (pushFoldSolver + AIPlayer).
+aofPushPctile
+aofCallPctile
+function aofShoverWidth(
+
+# 2026-11 bots review, equity-variants C4/C8/C10 (AIPlayer wiring): Short Deck
+# bots rank hands in the 6+ order and read their own pre-flop table; Omaha Hi-Lo
+# bots price a split pot; exact Omaha outs; Crazy Pineapple bots price the pair
+# they keep. (The other equity tokens are in the equity block.)
+function shortDeckStaticStrength(
+const isHiLoSplit = isOmahaFamily &&
 
 # 2026-10-11 (.online R2, S2 table lifecycle) — GAME-15/16 + Addendum: ONE seat
 # teardown (pot chips of a folded / all-in / extra-table / ghost seat wait for
