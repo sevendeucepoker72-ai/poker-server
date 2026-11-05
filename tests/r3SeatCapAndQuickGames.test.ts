@@ -289,7 +289,7 @@ describe('S1-1 / XL-1 / K3-1 — a home game seats its invitees up to its maxSea
       .replace(/\n  targetMaxOccupied = Math\.max\(0, Math\.min\(targetMaxOccupied, [^\n]*\n/, '\n')
       .replace('emptySeats.slice(0, Math.min(needed, Math.max(0, emptySeats.length - 1)))', 'emptySeats.slice(0, needed)');
     const prePick = H.joinByInviteCode.replace(
-      "let openSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < inviteSeatCap);\n    if (openSeat === -1) openSeat = takeAiSeatForJoin(table, tableId);",
+      "let openSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < inviteSeatCap);\n    if (openSeat === -1) openSeat = planAiSeatForJoin(table, tableId);",
       "let openSeat = table.seats.findIndex((s) => s.state === 'empty');",
     // 2026-10-21 (gameplay F143) — the pre-leave seat lookup (inside the cap) is the R3 rule too: not in the pre-R3 text.
     ).replace(

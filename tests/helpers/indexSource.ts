@@ -183,3 +183,20 @@ export const MUCK_SHOWS_SRC: string = slice('const shownMuckedHands = new Set<st
  * isTournamentReservation, seatPlayedByAnotherAccount.
  */
 export const JOIN_PRECHECK_SRC: string = slice('// ========== Join pre-checks', '// ========== end join pre-checks ==========\n');
+
+/**
+ * Bots review 2026-11-04 (economy-farming E5 / E6 / E7 / E9 / E12) — the ONE
+ * hand-rewards + bot-flow block of index.ts, right before
+ * ensureTableProgressListener: handParticipation / noteHandParticipation /
+ * takeHandParticipation (the voluntary-chip record the 'playerAction' listener
+ * fills and handleHandComplete takes), handRewardStats, scratchCapNotified,
+ * HAND_XP_FULL_PER_DAY / handXpForHand, and botFlowStats / botFlowFormat /
+ * recordBotFlow. A harness that slices the listener or handleHandComplete and
+ * wants the reward gate appends this (without it, takeHandParticipation is an
+ * inert stub: every dealt-in seat counts as participating, as before). Scope it
+ * reads: progressionManager, HAND_XP, tableKindOf, dealtInSeatAccount.
+ */
+export const HAND_REWARDS_SRC: string = slice(
+  '// ===== Hand rewards + bot flow (bots review 2026-11-04) =====',
+  '// ===== end hand rewards + bot flow =====\n',
+);

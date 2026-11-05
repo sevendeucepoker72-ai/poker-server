@@ -48,7 +48,8 @@ import {
   recordOpponentObservation,
   opponentModelKey,
 } from './ai/AIPlayer';
-import { ProgressionManager, lifetimeAchievementsUnlockedByLevel, maxXpAtLevel } from './progression/ProgressionManager';
+import { chooseBotDiscards, studDrawKindOf } from './ai/studDrawStrength';
+import { ProgressionManager, lifetimeAchievementsUnlockedByLevel, maxXpAtLevel, IDLE_HANDS_REWARD_LIMIT, HAND_XP } from './progression/ProgressionManager';
 import { sanitizeClientProgressSave, PAYOUT_KEYS_FROM_CLIENT } from './progression/clientProgressSave';
 import { progressionHandRank } from './progression/progressionHandRank';
 import { HandRank } from './game/HandEvaluator';
@@ -68,7 +69,7 @@ import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import type { PineappleTable } from './game/variants/PineappleTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims, loadBroadcastOptOuts } from './auth/authManager';
+import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims, loadBroadcastOptOuts, SCRATCH_CARDS_PER_DAY } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus, getIntrospectionStats } from './auth/oauthValidator';
 import {
   resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
@@ -1192,6 +1193,8 @@ const CHIP_VELOCITY_DECAY_MS = 24 * 60 * 60 * 1000; // 24h quiet → count -= 1
 // ANTHROPIC_API_KEY is set (same gate as session recap / coachHand).
 const tableCommentaryLastEmit = new Map<string, number>();
 const TABLE_COMMENTARY_MIN_INTERVAL_MS = 25_000;
+// Bots review 2026-11-04 (A-commentary) — what the commentary did; GET /api/health engine.commentary (counts only, never the key).
+const tableCommentaryStats = { calls: 0, delivered: 0, emptyReplies: 0, failed: 0, skippedNoAudience: 0 };
 
 function incrementChipVelocityAlert(userId: number): number {
   const now = Date.now();
@@ -1441,7 +1444,7 @@ function scheduleAutoStart(tableId: string, delayMs = 1500): void {
   if (existing) clearTimeout(existing);
   const t = setTimeout(() => {
     pendingAutoStartTimers.delete(tableId);
-    autoStartNextHand(tableId);
+    try { autoStartNextHand(tableId); } catch (err) { recoverAutoStartThrow(tableId, err); }   // A-crash (bots review 2026-11-04)
   }, delayMs);
   pendingAutoStartTimers.set(tableId, t);
 }
@@ -1581,7 +1584,8 @@ function seatBoughtInBy(seat: { playerId?: string | null }, userId: number): boo
  * tournament stack itself). Callers own sessions, rooms and broadcasts.
  */
 type SeatTeardownOutcome = 'deferred' | 'stood_up' | 'none';
-const seatTeardownStats = { deferred: 0, stoodUp: 0, allInKept: 0, foldedOnClock: 0, foldedOutOfTurn: 0, awardedUncontested: 0, departureKept: 0 };
+// Bots review 2026-11-04 — lastHumanBotStrips: stripBotsIfLastHumanLeft ran (the last human's seat ended outside handlePlayerLeave).
+const seatTeardownStats = { deferred: 0, stoodUp: 0, allInKept: 0, foldedOnClock: 0, foldedOutOfTurn: 0, awardedUncontested: 0, departureKept: 0, lastHumanBotStrips: 0 };
 
 /**
  * 2026-10-21 (gameplay F143) — the wallet credits of seats a teardown stood up,
@@ -1722,17 +1726,58 @@ function aiSeatTakeableNow(table: PokerTable, seatIndex: number): boolean {
   return (s.totalInvestedThisHand || 0) === 0 && (s.folded || s.holeCards.length === 0);
 }
 
-/** R2 (GAME-15) — free one takeable AI seat for a join (stood up, profile dropped); -1 when none. */
+/**
+ * R2 (GAME-15) — free one takeable AI seat for a join (stood up, profile dropped); -1 when none.
+ * Called by planAiSeatForJoin between hands; mid-hand a join only plans the seat.
+ */
 function takeAiSeatForJoin(table: PokerTable, tableId: string): number {
   // R3 (S1-1) — only a seat the joiner can then take: below the table's cap.
   const seatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
   for (let i = 0; i < seatCap; i++) {
     if (!aiSeatTakeableNow(table, i)) continue;
+    noteBotStackRemoved(tableId, table, i, 'seat_taken');   // E10
     table.standUp(i);
     aiProfiles.get(tableId)?.delete(i);
     return i;
   }
   return -1;
+}
+
+/**
+ * Bots review 2026-11-04 (A-vanish) — a join's PICK of a bot's seat. Between
+ * hands the bot is stood up now (takeAiSeatForJoin, as before: no hand is
+ * affected). MID-HAND the takeable seat is only PLANNED — the bot stays seated
+ * with its profile through the join's awaited balance read / deduct, and is
+ * stood up at the join's COMMIT (takePlannedAiSeat, the last statement before
+ * sitDown). Every join path used to stand the bot up at the pick, so any refusal
+ * during the awaits (chips, a dropped socket, a failed deduct) left an empty
+ * seat mid-hand with the bot's profile gone. -1 = no seat.
+ */
+function planAiSeatForJoin(table: PokerTable, tableId: string): number {
+  if (aiSeatsMutableNow(table)) return takeAiSeatForJoin(table, tableId);   // between hands: stood up now, as before
+  const seatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
+  for (let i = 0; i < seatCap; i++) if (aiSeatTakeableNow(table, i)) return i;   // mid-hand: planned only
+  return -1;
+}
+/** plannedBotTaken = freed at a commit; plannedBotLost = dealt into a new hand meanwhile (join refused + refunded); preCheckRefused = joinAdditionalTable refused for chips before any seat was touched. */
+const joinSeatStats = { plannedBotTaken: 0, plannedBotLost: 0, preCheckRefused: 0 };
+/**
+ * Bots review 2026-11-04 — the COMMIT of a planned seat (nothing awaited between
+ * this and sitDown). An empty seat → true (the plan already freed it, or the bot
+ * left). A bot still takeable → stood up (profile dropped) → true. A bot that is
+ * IN the hand now (the hand ended and the next one dealt it in during the
+ * awaits) or a human → false: the caller refuses and refunds ('planned_seat_lost').
+ */
+function takePlannedAiSeat(table: PokerTable, tableId: string, seatIndex: number): boolean {
+  const s = table.seats[seatIndex];
+  if (!s) return false;
+  if (s.state === 'empty') return true;
+  if (!s.isAI || !aiSeatTakeableNow(table, seatIndex)) { joinSeatStats.plannedBotLost++; return false; }
+  noteBotStackRemoved(tableId, table, seatIndex, 'seat_taken');   // E10
+  table.standUp(seatIndex);
+  aiProfiles.get(tableId)?.delete(seatIndex);
+  joinSeatStats.plannedBotTaken++;
+  return true;
 }
 
 /**
@@ -1763,7 +1808,7 @@ function stripBotsWhenNoHumans(tableId: string, table: PokerTable): void {
   }
   botStripAfterHand.delete(tableId);
   for (let i = 0; i < MAX_SEATS; i++) {
-    if (table.seats[i].state === 'occupied' && table.seats[i].isAI) table.standUp(i);
+    if (table.seats[i].state === 'occupied' && table.seats[i].isAI) { noteBotStackRemoved(tableId, table, i, 'strip'); table.standUp(i); }   // E10
   }
   aiProfiles.delete(tableId);
   const aiT = aiTimeouts.get(tableId);
@@ -1771,6 +1816,24 @@ function stripBotsWhenNoHumans(tableId: string, table: PokerTable): void {
   // The table is empty: no hand to start (the heartbeat re-seeds it).
   const pendingStart = pendingAutoStartTimers.get(tableId);
   if (pendingStart) { clearTimeout(pendingStart); pendingAutoStartTimers.delete(tableId); }
+}
+/**
+ * Bots review 2026-11-04 — the LAST HUMAN's seat at this table just ended by a
+ * path other than handlePlayerLeave (a reservation's end — reserve_expiry /
+ * reserve_hand_limit / reserve_displaced via endCashReservation —, an extra
+ * table left, an extra-table cash-out on departure): the bots go too
+ * (GAME-17), or at the hand's end when a seat is still waiting for it. They
+ * used to stay and deal to each other forever (live: Shark Tank, 4 bots, no
+ * human). A COPY of handlePlayerLeave's GAME-17 block (many harnesses slice
+ * handlePlayerLeave without this helper) — keep the two identical.
+ */
+function stripBotsIfLastHumanLeft(tableId: string, table: PokerTable): void {
+  const pendingHere = pendingSeatRemovalAfterHand.get(tableId);
+  const humansStaying = table.seats.some((s) => s.state === 'occupied' && !s.isAI && !pendingHere?.has(s.seatIndex));
+  if (humansStaying) return;
+  seatTeardownStats.lastHumanBotStrips++;
+  stripBotsWhenNoHumans(tableId, table);
+  if (pendingHere && pendingHere.size > 0) botStripAfterHand.add(tableId);
 }
 function stripBotsAfterHandIfMarked(tableId: string): void {
   if (!botStripAfterHand.has(tableId)) return;
@@ -3114,6 +3177,9 @@ app.get('/api/health', async (_req, res) => {
       crashSafety: {
         socketListeners: { ...socketGuardStats },
         process: { ...processCrashStats },
+        // Bots review 2026-11-04 (A-crash) — a recovered throw on a game timer (bot action / draw,
+        // a scheduled deal, the heartbeat). Counts only; the event is in the [game-timer-error] line.
+        gameTimers: { ...gameTimerGuardStats },
       },
       // 2026-10-10 — one person, one local row (auth/accountMerge.ts). Counts
       // only, no ids: the identity gate, the master-first resolver (splitSeen
@@ -3268,6 +3334,16 @@ app.get('/api/health', async (_req, res) => {
         insuranceRefund: insuranceRefundOutcome
           ? { status: insuranceRefundOutcome.status, recipients: insuranceRefundOutcome.recipients, chips: insuranceRefundOutcome.chips, missing: insuranceRefundOutcome.missing.length }
           : null,
+        // 2026-11 (bots review E9) — what humans took from bots per format since boot (no ids).
+        // totalHumanNet == engine.botStacks.humansTookFromBots at hand boundaries (E10).
+        botFlow: {
+          since: botFlowStats.since,
+          totalHumanNet: [...botFlowStats.formats.values()].reduce((a, e) => a + e.humanNet, 0),
+          totalAccountNet: [...botFlowStats.formats.values()].reduce((a, e) => a + e.accountNet, 0),
+          formats: Object.fromEntries(botFlowStats.formats),
+        },
+        // 2026-11 (bots review E5 / E6 / E7 / E12) — the per-hand reward gate and its limits.
+        handRewards: { ...handRewardStats, idleHandsLimit: IDLE_HANDS_REWARD_LIMIT, scratchCardsPerDay: SCRATCH_CARDS_PER_DAY, handXpFullPerDay: HAND_XP_FULL_PER_DAY },
       },
       // 2026-10-11 (.online R2, S2 engine lane) — table lifecycle counters:
       // seatTeardown (GAME-15/16: stand-ups deferred to the hand's end, all-in
@@ -3278,7 +3354,12 @@ app.get('/api/health', async (_req, res) => {
       // sitOutLimit (GAME-11), reservationsDisplaced (APPUI-21), chipVelocity.
       engine: {
         seatTeardown: { ...seatTeardownStats, pendingTables: pendingSeatRemovalAfterHand.size },
-        botStacks: { ...botStackStats, capBuyIns: BOT_STACK_CAP_BUYINS },
+        // 2026-11 (bots review E10) — humansTookFromBots = seated + minted - burned - removed - live:
+        // what humans (and the house's removals) took from bots; == economy.botFlow.totalHumanNet at hand boundaries.
+        botStacks: ((live: number) => ({
+          ...botStackStats, capBuyIns: BOT_STACK_CAP_BUYINS, liveChips: live,
+          humansTookFromBots: botStackStats.seatedChips + botStackStats.minted - botStackStats.burned - botStackStats.removedChips - live,
+        }))(liveBotChips()),
         // 2026-10-26 (owner: "After 1") - tournament timeout sit-out + stale-table Sit Out / I'm back fallbacks.
         tournamentTimeoutSitOut: { ...tournamentTimeoutSitOutStats },
         // 2026-10-28 — handComplete is NOT a freeze count: it includes the
@@ -3296,6 +3377,16 @@ app.get('/api/health', async (_req, res) => {
         sitOutLimit: { ...sitOutLimitStats, hands: SIT_OUT_HANDS_LIMIT },
         reservationsDisplaced: reservationsDisplaced.count,
         chipVelocity: { ...chipVelocityStats, autoBan: CHIP_VELOCITY_AUTOBAN },
+        // Bots review 2026-11-04 (A-vanish) — a join that takes a bot's seat mid-hand
+        // plans it at the pick and frees it at the commit: plannedBotTaken = freed at
+        // the commit, plannedBotLost = the bot was dealt into a new hand meanwhile
+        // (the join refused + refunded), preCheckRefused = joinAdditionalTable refused
+        // for chips before any seat was touched.
+        joinSeats: { ...joinSeatStats },
+        // Bots review 2026-11-04 (A-commentary) — the LLM table commentary: keyConfigured
+        // (a boolean, never the key), model calls / lines delivered / empty replies /
+        // failures, and notable hands skipped because nobody was in the table's room.
+        commentary: { keyConfigured: !!process.env.ANTHROPIC_API_KEY, minIntervalMs: TABLE_COMMENTARY_MIN_INTERVAL_MS, ...tableCommentaryStats },
       },
       // 2026-10-11 (.online R2, S1) — tournaments, qualifiers, quick games,
       // home games, staking, the prize ledger. Counts only, no ids.
@@ -3362,6 +3453,10 @@ app.get('/api/health', async (_req, res) => {
         },
         quickGames: { ...quickGameStats, live: quickGames.size },
         privateTables: { ...privateTableStats },
+        // Bots review 2026-11-04 — club runtime tables: recreateSkippedNotMember = a
+        // getClubTables from a non-member that would have (re)created a table (the list
+        // is still answered); idleDealsSkipped = a club table nobody sits at not dealt.
+        clubTables: { ...clubTableRuntimeStats },
       },
     });
   } catch (e: any) {
@@ -4372,7 +4467,7 @@ function internalTokenMatches(given: unknown, expected: string): boolean {
 // Review fix-up (2026-10-22) — the overflow cap / kill switch at runtime, no
 // restart: POST {max: N >= 0 | "unlimited"} (2026-10-23: no upper clamp) with X-Internal-Token (the INTERNAL_NOTIFY_TOKEN
 // this server and the master share). FAILS CLOSED: no token configured → 403
-// (unlike /api/tournament/simulate). Answers {success, previous, cap, live};
+// (as /api/tournament/simulate since 2026-11-04). Answers {success, previous, cap, live};
 // GET /api/health r2Play.qualifiers.overflow.cap shows the value in force.
 app.post('/api/qualifiers/overflow', (req, res) => {
   const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
@@ -5011,7 +5106,9 @@ async function createClubRuntimeTable(clubId: number, cfg: { tableName: string; 
  * (inactive) table or an invalid stored config gets none.
  */
 const clubTablesRecreating = new Map<number, Promise<string | null>>();
-const clubTableRuntimeStats = { recreated: 0, refusedInvalid: 0, closedUnbound: 0 };
+// Bots review 2026-11-04 — recreateSkippedNotMember (getClubTables from a non-member: listed, not
+// re-created) and idleDealsSkipped (a club table nobody sits at is not dealt: autoStartNextHand).
+const clubTableRuntimeStats = { recreated: 0, refusedInvalid: 0, closedUnbound: 0, recreateSkippedNotMember: 0, idleDealsSkipped: 0 };
 /**
  * 2026-10-21 (gameplay F104 fix-up) — a runtime table made for a club table
  * whose row could NOT be pointed at it (updateClubTableId threw: a DB error) is
@@ -5026,7 +5123,7 @@ function closeUnboundClubRuntimeTable(tableId: string): boolean {
   const table = tableManager.getTable(tableId);
   if (table && tableHasHumanSeat(table)) return false;
   endTableViewsAndTimers(tableId);
-  if (table) for (const s of table.seats) if (s.state === 'occupied') table.standUp(s.seatIndex);
+  if (table) for (const s of table.seats) if (s.state === 'occupied') { if (s.isAI) noteBotStackRemoved(tableId, table, s.seatIndex, 'table_closed'); table.standUp(s.seatIndex); }   // E10
   tableManager.removeTable(tableId);
   tableProgressListeners.delete(tableId);
   clubTableIds.delete(tableId);
@@ -6962,6 +7059,10 @@ function getGameStateForPlayer(
       // (some subclasses only set it on config). Excludes pineapple (Hold'em-like).
       const vId = String((table as any).config?.variantId || (table as any).variantId || '').toLowerCase();
       const isOmaha = vId.includes('omaha');
+      // 2026-11 (bots review, equity C7) — Omaha Hi-Lo's coach prices the expected POT SHARE
+      // (high and low halves), not the high-only win chance (A-2-3-K on 5-6-8 showed 26%,
+      // a hand that wins about 62% of the pot). variant.isHiLo covers 'omaha-6' hi-lo tables.
+      const isHiLo = isOmaha && ((table as any).variant?.isHiLo === true || vId.includes('hi-lo'));
 
       try {
         stateObj.trainingData = getFullTrainingData(
@@ -6972,7 +7073,8 @@ function getGameStateForPlayer(
           potSize,
           chipStack,
           table.currentPhase,
-          isOmaha
+          isOmaha,
+          isHiLo
         );
       } catch (e) {
         // Training data calculation failed, skip
@@ -8193,14 +8295,17 @@ function recordChipVelocity(tableId: string, table: PokerTable, results: any[]):
   for (const r of Array.isArray(results) ? results : []) {
     if (r && !r.isAI && Number(r.chipsWon) > 0) wonSeats.add(r.seatIndex);
   }
-  for (const [sid, session] of playerSessions) {
-    if (session.tableId !== tableId) continue;
+  // 2026-11 (bots review E8) — every human seat dealt in here: a MAIN session and an
+  // EXTRA-table seat (multiTableSessions). An extra table's hands count toward the paid
+  // season chips-won (dealtInSeatAccount) but never reached this alert.
+  const consider = (sid: string, session: PlayerSession | undefined): void => {
+    if (!session || session.tableId !== tableId) return;
     const seat = table.seats[session.seatIndex];
-    if (!seat || seat.state !== 'occupied' || seat.isAI || seat.holeCards.length === 0) continue;
+    if (!seat || seat.state !== 'occupied' || seat.isAI || seat.holeCards.length === 0) return;
     const auth = authSessions.get(sid);
-    if (!auth) continue;
+    if (!auth) return;
     const start = table.startChips.get(session.seatIndex);
-    if (start === undefined) continue;
+    if (start === undefined) return;
     const userId = auth.userId;
     let vel = chipVelocity.get(userId);
     if (!vel) {
@@ -8211,7 +8316,7 @@ function recordChipVelocity(tableId: string, table: PokerTable, results: any[]):
     vel.netWon = (vel.netWon || 0) + (seat.chipCount - start);
     vel.lastActionMs = [now];
     const threshold = Math.max(vel.chipsAtStart, table.config.minBuyIn) * CHIP_VELOCITY_MULTIPLE;
-    if (vel.alerted || !wonSeats.has(session.seatIndex) || vel.handsThisSession < CHIP_VELOCITY_MIN_HANDS || vel.netWon <= threshold) continue;
+    if (vel.alerted || !wonSeats.has(session.seatIndex) || vel.handsThisSession < CHIP_VELOCITY_MIN_HANDS || vel.netWon <= threshold) return;
     vel.alerted = true;
     chipVelocityStats.alerts++;
     const alertCount = incrementChipVelocityAlert(userId);
@@ -8232,8 +8337,103 @@ function recordChipVelocity(tableId: string, table: PokerTable, results: any[]):
       }
       chipVelocityAlerts.delete(userId);
     }
-  }
+  };
+  for (const [sid, session] of playerSessions) consider(sid, session);
+  multiTableSessions.forEach((list, sid) => { for (const ms of (Array.isArray(list) ? list : [])) consider(sid, ms); });
 }
+
+// ===== Hand rewards + bot flow (bots review 2026-11-04) =====
+// economy-farming E5 / E6 / E7 / E9 / E12 — every helper the 'playerAction' listener and
+// handleHandComplete read for the per-hand reward gate and the bot chip-flow monitor, in ONE
+// block (tests/helpers/indexSource.ts HAND_REWARDS_SRC slices exactly this). Function
+// declarations and consts read at call time.
+/**
+ * E5 — the seats that VOLUNTARILY put chips in this hand: a call, bet, raise or all-in on ANY
+ * street, in any variant. Blinds, antes, the Stud bring-in (SevenStudTable.postBringIn emits
+ * 'blindPosted'), dead blinds and a straddle post outside 'playerAction' and never count. A
+ * server auto-action never counts either: PokerTable.markAutoAction stamps that log entry
+ * `auto` (a turn timeout, an absent tournament seat's limp, autoActForSeat). Filled by the
+ * listener; taken and dropped synchronously by handleHandComplete.
+ */
+const handParticipation = new Map<string, { handNumber: number; seats: Set<number> }>();
+function noteHandParticipation(tableId: string, handNumber: number, seatIndex: number): void {
+  let hp = handParticipation.get(tableId);
+  if (!hp || hp.handNumber !== handNumber) { hp = { handNumber, seats: new Set() }; handParticipation.set(tableId, hp); }
+  hp.seats.add(seatIndex);
+}
+function takeHandParticipation(tableId: string, handNumber: number): Set<number> {
+  const hp = handParticipation.get(tableId);
+  handParticipation.delete(tableId);
+  return hp && hp.handNumber === handNumber ? hp.seats : new Set<number>();
+}
+/** E5 / E6 / E7 / E12 — counts only (health economy.handRewards). */
+const handRewardStats = { xpSkipped: 0, xpReduced: 0, scratchTicksSkipped: 0, walksNotCounted: 0, scratchAwarded: 0, scratchCapped: 0, capNotices: 0 };
+/** E7 — userId -> the Denver day the daily scratch-card limit notice was sent (at most one per day per boot). */
+const scratchCapNotified = new Map<number, string>();
+/**
+ * E12 — rewarded hands per day at full hand XP (HAND_XP); past it a rewarded hand earns
+ * HAND_XP_AFTER_CAP. The day is the account's existing dailyStats window (UTC: it rolls at
+ * 5-6 PM Denver). Env HAND_XP_FULL_PER_DAY (a non-negative integer); default 1000; 0 = off.
+ */
+const HAND_XP_FULL_PER_DAY: number = ((raw: string | undefined): number => {
+  const n = Number(raw);
+  return raw !== undefined && raw.trim() !== '' && Number.isInteger(n) && n >= 0 ? n : 1000;
+})(process.env.HAND_XP_FULL_PER_DAY);
+/** E12 — the XP of one rewarded hand (called right after recordHandPlayed, which rolled the day window). */
+function handXpForHand(playerId: string): number {
+  const xp = progressionManager.handXpFor(playerId, HAND_XP_FULL_PER_DAY);
+  if (xp < HAND_XP) handRewardStats.xpReduced++;
+  return xp;
+}
+/**
+ * E9 — what humans take from bots, per format (since boot, no ids): ring tables by variant
+ * ('cash:<variant>'), private, club, headsup, aof, career. Never a tournament or Spin & Go
+ * (not wallet chips). health economy.botFlow; totalHumanNet must equal
+ * engine.botStacks.humansTookFromBots (E10) at hand boundaries.
+ */
+const botFlowStats = {
+  since: new Date().toISOString(),
+  formats: new Map<string, { hands: number; humanNet: number; humanWon: number; humanLost: number; accountNet: number; guestNet: number }>(),
+};
+function botFlowFormat(tableId: string, table: PokerTable): string | null {
+  const kind = tableKindOf(tableId);
+  if (kind === 'tournament' || kind === 'spingo') return null;   // not wallet chips
+  return kind === 'cash' ? `cash:${String((table as any).config?.variantId || (table as any).variantId || 'texas-holdem')}` : kind;
+}
+/**
+ * E9 — per hand with at least one human AND one bot dealt in: humanNet = minus the bots' net
+ * (chips are conserved in a hand; no rake). accountNet = the net of seats with an account
+ * (dealtInSeatAccount !== null: the only flow that reaches users.chips); guestNet = the
+ * wallet-isolated guest seats. Called right after settleInsuranceForHand (synchronous).
+ */
+function recordBotFlow(tableId: string, table: PokerTable, dealtInSeats: Set<number>): void {
+  let humans = 0, bots = 0, botNet = 0, accountNet = 0, guestNet = 0;
+  for (const i of dealtInSeats) {
+    const st = table.seats[i];
+    const start = table.startChips.get(i);
+    if (!st || st.state !== 'occupied' || start === undefined) continue;
+    const net = (st.chipCount || 0) - start;
+    if (st.isAI) { bots++; botNet += net; continue; }
+    humans++;
+    if (dealtInSeatAccount(tableId, st) !== null) accountNet += net; else guestNet += net;
+  }
+  if (humans === 0 || bots === 0) return;
+  const key = botFlowFormat(tableId, table);
+  if (!key) return;
+  let e = botFlowStats.formats.get(key);
+  if (!e) {
+    if (botFlowStats.formats.size >= 64) return;
+    e = { hands: 0, humanNet: 0, humanWon: 0, humanLost: 0, accountNet: 0, guestNet: 0 };
+    botFlowStats.formats.set(key, e);
+  }
+  const humanNet = -botNet;
+  e.hands++;
+  e.humanNet += humanNet;
+  if (humanNet > 0) e.humanWon += humanNet; else e.humanLost -= humanNet;
+  e.accountNet += accountNet;
+  e.guestNet += guestNet;
+}
+// ===== end hand rewards + bot flow =====
 
 function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   if (tableProgressListeners.has(tableId)) return;
@@ -8295,6 +8495,12 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // the hand was committed). Keyed by table + hand (an account can be in two
     // hands at once). AI seats have no progress record (no-op).
     if (s.playerId && !s.isAI) {
+      // 2026-11 (bots review E5) — a VOLUNTARY chip this hand (never a server auto-action: its
+      // log entry, pushed right before this emit, is stamped `auto`). Feeds the reward gate.
+      if (a === PlayerAction.Call || a === PlayerAction.Raise || a === PlayerAction.AllIn) {
+        const last: any = table.actionLog[table.actionLog.length - 1];
+        if (!(last && last.seatIndex === d.seatIndex && last.auto)) noteHandParticipation(tableId, hn, d.seatIndex);
+      }
       const progressAction = a === PlayerAction.Fold ? 'fold' : a === PlayerAction.Check ? 'check'
         : a === PlayerAction.Call ? 'call' : a === PlayerAction.Raise ? 'raise' : a === PlayerAction.AllIn ? 'allIn' : '';
       if (progressAction) {
@@ -8304,7 +8510,13 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
       }
     }
 
-    if (table.currentPhase === GamePhase.PreFlop) {
+    // Bots review 2026-11-04 (B11) — Seven Card Stud's first betting round is
+    // Third Street (the draw games' is PreFlop): a call / completion there is
+    // voluntary too (the bring-in posts as 'blindPosted', not here). Every Stud
+    // opponent used to read as a nit (vpip = pfr = 0). The HUD 3-bet context
+    // below stays Hold'em / draw PreFlop only.
+    const firstBettingRound = table.currentPhase === GamePhase.PreFlop || table.currentPhase === GamePhase.ThirdStreet;
+    if (firstBettingRound) {
       const voluntary = a === PlayerAction.Call || aggressive;
       if (voluntary && !obsVpip.has(oppKey)) { obsVpip.add(oppKey); recordOpponentObservation(oppKey, 'vpip'); }
       if (aggressive && !obsPfr.has(oppKey)) { obsPfr.add(oppKey); recordOpponentObservation(oppKey, 'pfr'); }
@@ -8319,7 +8531,7 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
       // 3-bet%: a prior preflop raise already in front = a 3-bet spot; raising
       // in that spot is a 3-bet+. preflopRaiseCount reflects raises BEFORE this
       // action (the event fires post-apply), so increment after evaluating.
-      if (s.playerId) {
+      if (s.playerId && table.currentPhase === GamePhase.PreFlop) {
         const facingRaise = preflopRaiseCount >= 1;
         const isReraise = aggressive && preflopRaiseCount >= 1;
         if (facingRaise || isReraise) {
@@ -8407,20 +8619,29 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
         const winner = (data.results || []).slice().sort((a, b) => (b?.chipsWon || 0) - (a?.chipsWon || 0))[0];
         const pot = (data.results || []).reduce((s, r) => s + (r?.chipsWon > 0 ? r.chipsWon : 0), 0);
         const notable = winner && (pot >= 2000 || table.wentToShowdown);
+        // Bots review 2026-11-04 — the line goes to this table's room only (seated players and spectators); nobody there = never sent, the throttle not consumed.
+        const audience = notable ? (io.sockets?.adapter?.rooms?.get(`table:${tableId}`)?.size ?? 0) : 0;
+        if (notable && audience === 0) tableCommentaryStats.skippedNoAudience++;
         const lastEmit = tableCommentaryLastEmit.get(tableId) || 0;
-        if (notable && Date.now() - lastEmit >= TABLE_COMMENTARY_MIN_INTERVAL_MS) {
+        if (notable && audience > 0 && Date.now() - lastEmit >= TABLE_COMMENTARY_MIN_INTERVAL_MS) {
           tableCommentaryLastEmit.set(tableId, Date.now());
           const winnerName = String(winner.playerName || 'A player').slice(0, 24);
           const handName = String(winner.handName || '').slice(0, 40);
           const showdown = table.wentToShowdown ? 'at showdown' : 'when everyone folded';
           const prompt = `You are a witty, concise poker table commentator. In ONE short sentence (max 18 words), react to this hand: ${winnerName} won a ${pot}-chip pot ${showdown}${handName ? ` with ${handName}` : ''}. Be fun and punchy, no emojis, no hashtags.`;
+          tableCommentaryStats.calls++;
           new Anthropic({ apiKey }).messages
             .create({ model: 'claude-haiku-4-5-20251001', max_tokens: 120, messages: [{ role: 'user', content: prompt }] })
             .then((resp: any) => {
               const text = resp?.content?.[0]?.type === 'text' ? resp.content[0].text?.trim() : '';
-              if (text) io.to(`table:${tableId}`).emit('tableCommentary', { text, type: 'llm' });
+              if (text) {
+                tableCommentaryStats.delivered++;
+                io.to(`table:${tableId}`).emit('tableCommentary', { text, type: 'llm' });
+              } else {
+                tableCommentaryStats.emptyReplies++;
+              }
             })
-            .catch(() => {});
+            .catch(() => { tableCommentaryStats.failed++; });
         }
       }
     } catch { /* commentary is best-effort — never let it disrupt the hand */ }
@@ -8648,8 +8869,13 @@ const CASH_TABLE_TARGET_OCCUPIED = 5;
 // during a live hand) makes opponents appear to vanish / "change seats" while a
 // hand is in progress. The seat GEOMETRY is stable — confirmed by instrumenting
 // the live client (zero mid-hand seat-position moves over 300+ samples); the
-// churn was the only cause. Every AI seat add/remove path funnels through this
-// guard so the on-table roster is frozen from the deal through HandComplete.
+// churn was the only cause. Bots are ADDED and TRIMMED only between hands
+// (fillWithAI, trimExcessAI, backfillAIToMin, stripBotsWhenNoHumans check this
+// guard). ONE exception (R2 GAME-15, 2026-10-11): a join at a table with no empty
+// seat may take the seat of a bot OUT of the hand being played (folded with
+// nothing in the pot, or not dealt in: aiSeatTakeableNow). Since 2026-11-04 it
+// does so only at that join's commit (planAiSeatForJoin / takePlannedAiSeat). A
+// bot still in the hand is never removed mid-hand.
 // autoStartNextHand only runs at HandComplete, so the between-hands top-up to
 // target (CASH_TABLE_TARGET_OCCUPIED) still fires normally.
 function aiSeatsMutableNow(table: PokerTable): boolean {
@@ -8713,16 +8939,18 @@ function fillWithAI(
     usedNames.add(profile.botName);
 
     const aiPlayerId = `ai-${uuidv4()}`;
-    table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true);
+    if (table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true)) noteBotSeated(tableId, table.config.minBuyIn, 'ring');   // E10
     profiles.set(i, profile);
   }
 }
 
 // Trim excess AI when a table is over the occupancy cap.
-// BETWEEN HANDS ONLY — never mid-hand. Removing a bot during a live hand (even
-// a folded one) makes opponents appear to vanish / change seats, which is the
-// "players changing seats mid-hand" report. Deferred to the HandComplete window
-// (autoStartNextHand + the heartbeat both trim there). Never touches humans.
+// BETWEEN HANDS ONLY — trimExcessAI never removes a bot mid-hand (a JOIN may take
+// a folded, nothing-invested bot's seat mid-hand at its commit: aiSeatTakeableNow,
+// R2 GAME-15). A trim during a live hand made opponents appear to vanish / change
+// seats (the "players changing seats mid-hand" report), so it is deferred to the
+// HandComplete window (autoStartNextHand + the heartbeat both trim there). Never
+// touches humans.
 function trimExcessAI(
   table: PokerTable,
   tableId: string,
@@ -8748,6 +8976,7 @@ function trimExcessAI(
   const profiles = aiProfiles.get(tableId);
   for (let k = 0; k < toRemove; k++) {
     const i = aiSeats[k];
+    noteBotStackRemoved(tableId, table, i, 'trim');   // E10
     table.standUp(i);
     if (profiles) profiles.delete(i);
   }
@@ -8885,6 +9114,175 @@ function standPatAbsentDrawers(tableId: string): void {
 }
 // ===== end absent drawers =====
 
+// ===== Game timer crash guard (bots review 2026-11-04, A-crash) =====
+// A throw on a game TIMER path (a bot's action or draw, a scheduled deal) used to
+// reach processGuards (flush, then exit(1)) and void every running qualifier; the
+// same code reached by a human is caught by socketGuard. Each of those timers now
+// catches, logs `[game-timer-error]`, counts (health crashSafety.gameTimers) and
+// moves the table on:
+//   • a bot action that threw before it acted is checked or folded for it; one that
+//     acted (a 'playerAction' listener threw) has its turn advanced;
+//   • a bot draw that threw stands that bot pat;
+//   • a deal that threw is retried ONCE, 3 s later (the heartbeat owns the rest);
+//   • a hand left in Showdown is a faulted determineWinners (Showdown is never a
+//     resting state): retried once if nothing was paid, finished if the pot was paid
+//     in full, VOIDED (every stake back, like a misdeal) if it was part-paid or the
+//     retry threw too, and HELD — never re-paid by the wedge watchdog — otherwise.
+// The normal path adds only the stake mark per bot action / draw; no new
+// identifier is resolved there (every helper below runs only after a throw).
+const GAME_TIMER_ERROR_TAG = '[game-timer-error]';
+const AUTO_START_RETRY_AFTER_FAULT_MS = 3000;
+const gameTimerGuardStats = {
+  actionThrows: 0, drawThrows: 0, autoStartThrows: 0, heartbeatThrows: 0,
+  actedFor: 0, turnAdvanced: 0, stoodPat: 0, autoStartRetried: 0,
+  showdownFaults: 0, showdownResolved: 0, showdownPaidFinished: 0, showdownVoided: 0, showdownHeld: 0,
+  recoveryThrows: 0, logLinesSuppressed: 0, lastAt: null as string | null,
+};
+let gameTimerLogWindowStart = 0;
+let gameTimerLogLines = 0;
+/** One `[game-timer-error]` line (at most 60 per minute; the rest are only counted) + Sentry. Never throws. */
+function logGameTimerError(kind: string, tableId: string, seatIndex: number, err: unknown, extra?: Record<string, unknown>): void {
+  try {
+    const now = Date.now();
+    gameTimerGuardStats.lastAt = new Date(now).toISOString();
+    if (now - gameTimerLogWindowStart >= 60_000) { gameTimerLogWindowStart = now; gameTimerLogLines = 0; }
+    if (gameTimerLogLines >= 60) { gameTimerGuardStats.logLinesSuppressed++; return; }
+    gameTimerLogLines++;
+    const e = err as { message?: unknown; stack?: unknown } | null | undefined;
+    const stack = e && typeof e === 'object' && typeof e.stack === 'string' ? e.stack : '';
+    const frame = stack.split('\n').slice(1).find((l) => l.trim().startsWith('at '));
+    const message = String(e && typeof e === 'object' && 'message' in e ? e.message : err).slice(0, 300);
+    console.error(`${GAME_TIMER_ERROR_TAG} ${JSON.stringify({ kind, tableId, seatIndex, error: message, where: frame ? frame.trim().slice(0, 200) : null, ...(extra || {}) })}`);
+    if (Sentry) Sentry.captureException(err, { tags: { area: `game.${kind}` } });
+  } catch (_) { /* logging never throws */ }
+}
+/**
+ * The table as a bot's timer found it. stakes[i] = chipCount + totalInvestedThisHand
+ * of an occupied seat (-1 otherwise): constant per seat through a hand until the
+ * payout (bets, uncalled-bet refunds and dead money move chips between those two
+ * fields of the same seat), so after a fault it says exactly what was paid.
+ */
+type BotTurnMark = { hand: number; version: number; log: number; phase: GamePhase; stakes: number[]; ids: string[] };
+/** Hands held in Showdown after a fault (table -> handNumber): the wedge watchdog never advances them. */
+const gameShowdownHold = new WeakMap<PokerTable, number>();
+function gameShowdownHeld(table: PokerTable): boolean {
+  return gameShowdownHold.get(table) === table.handNumber && table.currentPhase === GamePhase.Showdown;
+}
+/** A hand found in Showdown after a fault: retry / finish / void / hold (see the block comment). */
+function settleShowdownAfterFault(tableId: string, t: PokerTable, mark: BotTurnMark): void {
+  gameTimerGuardStats.showdownFaults++;
+  let outcome: 'resolved' | 'paid_finished' | 'voided' | 'held' = 'held';
+  let tried: 'resolved' | 'paid_finished' | 'voided' | null = null;
+  let pot = 0;
+  let credited: number | null = null;
+  // Chips credited since the mark; null = the seats are not the ones the mark saw
+  // (a seat changed hands, a seat not in the mark has chips in the pot, a seat lost chips).
+  const creditedSinceMark = (): number | null => {
+    let c = 0;
+    for (let i = 0; i < t.seats.length; i++) {
+      const s = t.seats[i];
+      const was = mark.stakes[i] ?? -1;
+      if (was < 0) { if (s.state === 'occupied' && (s.totalInvestedThisHand || 0) > 0) return null; continue; }
+      if (s.state !== 'occupied' || s.playerId !== mark.ids[i]) return null;
+      const d = s.chipCount + (s.totalInvestedThisHand || 0) - was;
+      if (d < 0) return null;
+      c += d;
+    }
+    return c;
+  };
+  try {
+    credited = creditedSinceMark();
+    if (credited === 0) {
+      // Nothing paid yet: the engine's own showdown, once (from an unpaid state it pays at most once).
+      tried = 'resolved';
+      try { (t as any).determineWinners(); } catch (e) { logGameTimerError('showdown_retry', tableId, -1, e); }
+      if (t.currentPhase === GamePhase.Showdown) { tried = null; credited = creditedSinceMark(); }
+    }
+    if (tried === null && credited !== null) {
+      pot = t.seats.reduce((a, s) => a + (s.state === 'occupied' ? (s.totalInvestedThisHand || 0) : 0), 0);
+      if (pot > 0 && credited === pot) { tried = 'paid_finished'; t.completeHandAfterFault(); }
+      else { tried = 'voided'; t.completeHandAfterFault(mark.stakes); }
+    }
+  } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('showdown_settle', tableId, -1, e); }
+  if (t.handNumber === mark.hand && t.currentPhase === GamePhase.Showdown) { gameShowdownHold.set(t, t.handNumber); outcome = 'held'; }
+  else if (tried) outcome = tried;
+  if (outcome === 'resolved') gameTimerGuardStats.showdownResolved++;
+  else if (outcome === 'paid_finished') gameTimerGuardStats.showdownPaidFinished++;
+  else if (outcome === 'voided') gameTimerGuardStats.showdownVoided++;
+  else gameTimerGuardStats.showdownHeld++;
+  logGameTimerError('showdown', tableId, -1, new Error('hand resting in Showdown after a fault'), { outcome, pot, credited });
+}
+/** After a recovered fault: tell the clients, then the next deal (hand over) or the next bot turn. */
+function continueAfterGameFault(tableId: string, t: PokerTable, seatIndex: number, kind: string, moveOn: boolean): void {
+  try { broadcastGameState(tableId); } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError(`${kind}_broadcast`, tableId, seatIndex, e); }
+  try {
+    if (t.currentPhase === GamePhase.HandComplete) { if (!pendingAutoStartTimers.has(tableId)) scheduleAutoStart(tableId); }
+    else if (moveOn) scheduleAIAction(tableId);
+  } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError(`${kind}_next`, tableId, seatIndex, e); }
+}
+/** A bot's action timer threw (decideAction, the engine, a listener, a broadcast). */
+function recoverBotActionThrow(tableId: string, seatIndex: number, mark: BotTurnMark | null, err: unknown): void {
+  gameTimerGuardStats.actionThrows++;
+  logGameTimerError('action', tableId, seatIndex, err);
+  const t = tableManager.getTable(tableId);
+  if (!t) return;
+  // stateVersion moves on turnChanged / phaseChanged / handStarted BEFORE any listener runs,
+  // so the same turn is only ever "never acted" or "acted, not advanced".
+  const sameTurn = !!mark && t.isHandInProgress() && t.handNumber === mark.hand && t.stateVersion === mark.version
+    && t.currentPhase === mark.phase && t.currentPhase !== GamePhase.Showdown && !DrawPhases.includes(t.currentPhase)
+    && t.activeSeatIndex === seatIndex && !!t.seats[seatIndex]?.isAI;
+  if (sameTurn && mark) {
+    try {
+      if (t.actionLog.length === mark.log) {
+        if (t.playerCheck(seatIndex) || t.playerFold(seatIndex)) gameTimerGuardStats.actedFor++;
+        else { (t as any).advanceTurn(); gameTimerGuardStats.turnAdvanced++; }
+      } else { (t as any).advanceTurn(); gameTimerGuardStats.turnAdvanced++; }
+    } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('action_recovery', tableId, seatIndex, e); }
+  }
+  if (mark && t.handNumber === mark.hand && t.currentPhase === GamePhase.Showdown) settleShowdownAfterFault(tableId, t, mark);
+  continueAfterGameFault(tableId, t, seatIndex, 'action', true);
+}
+/** A bot's draw timer threw: that bot stands pat (the round can never wait on it). */
+function recoverBotDrawThrow(tableId: string, drawTable: FiveCardDrawTable, seatIndex: number, armedHand: number, dphase: GamePhase, mark: BotTurnMark | null, err: unknown): void {
+  gameTimerGuardStats.drawThrows++;
+  logGameTimerError('draw', tableId, seatIndex, err);
+  try {
+    const s = drawTable.seats[seatIndex];
+    if (drawTable.handNumber === armedHand && drawTable.currentPhase === dphase && !drawTable.drawsCompleted.has(seatIndex)
+        && s && s.isAI && s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0) {
+      if (drawTable.playerDraw(seatIndex, [])) gameTimerGuardStats.stoodPat++;
+    }
+  } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('draw_recovery', tableId, seatIndex, e); }
+  if (mark && drawTable.handNumber === mark.hand && drawTable.currentPhase === GamePhase.Showdown) settleShowdownAfterFault(tableId, drawTable, mark);
+  continueAfterGameFault(tableId, drawTable, seatIndex, 'draw', drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase);
+}
+/** Tables whose deal was already retried after a fault (table -> the hand it followed): once per hand. */
+const autoStartRetriedHand = new WeakMap<PokerTable, number>();
+/** A scheduled deal (autoStartNextHand) threw. */
+function recoverAutoStartThrow(tableId: string, err: unknown): void {
+  gameTimerGuardStats.autoStartThrows++;
+  logGameTimerError('autostart', tableId, -1, err);
+  const t = tableManager.getTable(tableId);
+  if (!t) return;
+  try {
+    // The deal itself ran the hand out (a bomb pot with every stack all-in) and faulted: hold it.
+    if (t.currentPhase === GamePhase.Showdown) { gameShowdownHold.set(t, t.handNumber); gameTimerGuardStats.showdownHeld++; return; }
+    if (t.isHandInProgress()) {
+      // The throw came from inside or after the deal: the hand is live, carry on.
+      try { broadcastGameState(tableId); } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('autostart_broadcast', tableId, -1, e); }
+      scheduleAIAction(tableId);
+      return;
+    }
+    if (t.currentPhase === GamePhase.HandComplete && !pendingAutoStartTimers.has(tableId) && autoStartRetriedHand.get(t) !== t.handNumber) {
+      // Once per hand; after that the heartbeat revives a cash table, a director pause / resume a tournament one.
+      autoStartRetriedHand.set(t, t.handNumber);
+      gameTimerGuardStats.autoStartRetried++;
+      scheduleAutoStart(tableId, AUTO_START_RETRY_AFTER_FAULT_MS);
+    }
+  } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('autostart_recovery', tableId, -1, e); }
+}
+// ===== end game timer crash guard =====
+
 function scheduleAIAction(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) { console.log('[AI] No table found'); return; }
@@ -8903,9 +9301,11 @@ function scheduleAIAction(tableId: string): void {
     const drawTable = table as FiveCardDrawTable;
     const armedHand = drawTable.handNumber;
     const dphase = drawTable.currentPhase;
-    // Schedule AI draws for all AI players who haven't drawn yet
-    const profiles = aiProfiles.get(tableId);
-    if (profiles) {
+    // Schedule AI draws for all AI players who haven't drawn yet.
+    // Bots review 2026-11-04 (A-drawhang) — never gated on the table's
+    // aiProfiles map (the draw reads no profile): with the map missing, no bot
+    // ever drew and the hand hung in the draw round.
+    {
       for (const seat of drawTable.seats) {
         // F27 (2026-10-21) — an all-in bot draws too: the engine waits for
         // every seat in the hand (all-in ends the betting, not the drawing).
@@ -8913,79 +9313,36 @@ function scheduleAIAction(tableId: string): void {
           if (!drawTable.drawsCompleted.has(seat.seatIndex)) {
             const delay = 500 + Math.floor(Math.random() * 1000);
             setTimeout(() => {
-              // F44 (2026-10-21) — a draw scheduled for an earlier round (or
-              // hand) does nothing: a betting round nobody can bet in is now
-              // skipped, so the NEXT draw round can already be open when it
-              // fires; that round's own scheduling draws for it.
-              if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) return;
-              if (drawTable.drawsCompleted.has(seat.seatIndex)) return;
-              // 2026-06-19 fix: discard the WORST cards deterministically.
-              // 2026-07-07 fix: LOWBALL-aware. The old rule kept pairs + the two
-              // HIGHEST cards — correct for high draw, but exactly BACKWARDS for
-              // 2-7 triple draw and badugi (lowball), where low, unpaired,
-              // off-suit cards are best. The bots were drawing to the worst hands.
-              const cards = seat.holeCards;
-              const variantId = ((drawTable as any).variantId as string) || '';
-              const isBadugi = variantId === 'badugi';
-              const isLowball = isBadugi || variantId === 'triple-draw';
-              const keep = new Set<number>();
-              if (isBadugi) {
-                // Badugi: keep a LOW, RAINBOW, distinct-rank subset (best = A-2-3-4,
-                // four suits). Ace plays low. Greedily take low cards with an
-                // unseen rank AND unseen suit; draw everything else.
-                const aceLow = (c: any) => (c.rank === 14 ? 1 : c.rank); // Ace plays LOW in badugi
-                const order = [...cards.keys()].sort((a, b) => aceLow(cards[a]) - aceLow(cards[b]));
-                const seenR = new Set<number>(), seenS = new Set<number>();
-                for (const i of order) {
-                  if (!seenR.has(cards[i].rank) && !seenS.has(cards[i].suit)) {
-                    keep.add(i); seenR.add(cards[i].rank); seenS.add(cards[i].suit);
-                  }
+              // A-crash (bots review 2026-11-04): a throw here used to exit the process (game timer crash guard).
+              const dmark = {
+                hand: drawTable.handNumber, version: drawTable.stateVersion, log: drawTable.actionLog.length, phase: drawTable.currentPhase,
+                stakes: drawTable.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1)),
+                ids: drawTable.seats.map((s) => s.playerId),
+              };
+              try {
+                // F44 (2026-10-21) — a draw scheduled for an earlier round (or
+                // hand) does nothing: a betting round nobody can bet in is now
+                // skipped, so the NEXT draw round can already be open when it
+                // fires; that round's own scheduling draws for it.
+                if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) return;
+                if (drawTable.drawsCompleted.has(seat.seatIndex)) return;
+                // B3 / B15 / Badugi subset (bots review 2026-11-04): the bot's draw by the
+                // engine's own hand order, round-aware (studDrawStrength.chooseBotDiscards) —
+                // pat straights / flushes stand, four-flushes and open-enders draw one, the
+                // best badugi subset is kept, a made 9- or 10-low stands pat on the last 2-7
+                // draw. (The old inline picker broke pat hands and kept a worse badugi 5.2%.)
+                const kind = studDrawKindOf(((drawTable as any).variantId as string) || '', drawTable);
+                const indices = kind ? chooseBotDiscards(kind, seat.holeCards, drawTable.currentPhase) : [];
+                drawTable.playerDraw(seat.seatIndex, indices);
+                broadcastGameState(tableId);
+                // After all draws, the table will advance and we need to schedule
+                // next AI action — F44: also when it went straight into the NEXT
+                // draw round (the betting round between was skipped).
+                if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) {
+                  scheduleAIAction(tableId);
                 }
-              } else if (isLowball) {
-                // 2-7 triple draw: ace is HIGH, so aces/pairs/high cards are the
-                // WORST. F116 (2026-10-21) — keep only LOW cards (8 or lower,
-                // never an ace) of distinct ranks; the old loop kept the lowest
-                // five distinct ranks, i.e. every unpaired hand (A-K high, a
-                // made straight) stood pat. A kept five that is a straight or a
-                // flush (bad in 2-7) breaks its highest card.
-                const dVal = (c: any) => c.rank; // 2-7: Ace(14) is HIGH → sorts last (worst)
-                const order = [...cards.keys()].sort((a, b) => dVal(cards[a]) - dVal(cards[b]));
-                const seenR = new Set<number>();
-                for (const i of order) {
-                  if (keep.size >= 5) break;
-                  if (cards[i].rank > 8) continue;
-                  if (!seenR.has(cards[i].rank)) { keep.add(i); seenR.add(cards[i].rank); }
-                }
-                if (keep.size === 5) {
-                  const kept = [...keep].map((i) => cards[i]);
-                  const ranks = kept.map((c: any) => c.rank);
-                  const straight = Math.max(...ranks) - Math.min(...ranks) === 4;
-                  const flush = kept.every((c: any) => c.suit === kept[0].suit);
-                  if (straight || flush) {
-                    const highest = [...keep].reduce((h, i) => (cards[i].rank > cards[h].rank ? i : h));
-                    keep.delete(highest);
-                  }
-                }
-              } else {
-                // High draw (five-card draw): keep pairs/trips/quads, else the two
-                // highest, draw the other three.
-                const byRank = new Map<number, number[]>();
-                cards.forEach((c: any, i: number) => { const a = byRank.get(c.rank) || []; a.push(i); byRank.set(c.rank, a); });
-                for (const idxs of byRank.values()) if (idxs.length >= 2) idxs.forEach((i) => keep.add(i));
-                if (keep.size === 0) {
-                  [...cards.keys()].sort((a, b) => cards[b].rank - cards[a].rank).slice(0, 2).forEach((i) => keep.add(i));
-                }
-              }
-              // F116 — 2-7 draws up to five (the old cap of 3 applied to every variant).
-              const maxDiscard = isLowball && !isBadugi ? 5 : 3;
-              const indices: number[] = [...cards.keys()].filter((i) => !keep.has(i)).slice(0, maxDiscard);
-              drawTable.playerDraw(seat.seatIndex, indices);
-              broadcastGameState(tableId);
-              // After all draws, the table will advance and we need to schedule
-              // next AI action — F44: also when it went straight into the NEXT
-              // draw round (the betting round between was skipped).
-              if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) {
-                scheduleAIAction(tableId);
+              } catch (err) {
+                recoverBotDrawThrow(tableId, drawTable, seat.seatIndex, armedHand, dphase, dmark, err);
               }
             }, delay);
           }
@@ -8996,8 +9353,8 @@ function scheduleAIAction(tableId: string): void {
     // 2026-06-11 audit R10: arm a draw-phase clock for HUMAN players (the AI
     // loop above auto-draws bots). One per (hand, phase) so the many
     // scheduleAIAction re-entries don't stack timers; on fire, stand-pat
-    // (draw 0) any non-AI player who hasn't drawn so the phase completes
-    // instead of hanging forever on an unresponsive human.
+    // (draw 0) any player who hasn't drawn (a human, or since 2026-11-04 a bot
+    // whose draw timer was lost) so the phase completes instead of hanging.
     const existingDraw = drawTimers.get(tableId);
     const sameDraw = !!existingDraw && existingDraw.handNumber === armedHand && existingDraw.phase === dphase;
     if (!sameDraw) {
@@ -9016,7 +9373,10 @@ function scheduleAIAction(tableId: string): void {
           // next draw round at once: never stand anyone pat in THAT one.
           if (t.handNumber !== armedHand || t.currentPhase !== dphase) break;
           // F27 (2026-10-21) — an all-in human who has not drawn is stood pat too.
-          if (!s.isAI && s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0 && !t.drawsCompleted.has(s.seatIndex)) {
+          // Bots review 2026-11-04 (A-drawhang) — and a BOT still undrawn at the
+          // deadline (its draw timer lost): the clock used to stand only humans
+          // pat, so the round waited forever.
+          if (s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0 && !t.drawsCompleted.has(s.seatIndex)) {
             t.playerDraw(s.seatIndex, []); // stand pat — timed out
             forced = true;
           }
@@ -9043,8 +9403,14 @@ function scheduleAIAction(tableId: string): void {
   // console.log(`[AI] Active seat ${activeSeat}: ${seat.playerName}, isAI=${seat.isAI}, state=${seat.state}`);
   if (!seat.isAI) { return; }
 
-  const profiles = aiProfiles.get(tableId);
-  if (!profiles) { console.log('[AI] No profiles found'); return; }
+  // Bots review 2026-11-04 (A-drawhang review) — a missing profile MAP is
+  // recreated (the per-seat profile is synthesized below), not a return: every
+  // bot action used to wait for the 20 s wedge watchdog.
+  if (!aiProfiles.has(tableId)) {
+    console.warn(`[AI] Missing profile map for ${tableId} — recreating`);
+    aiProfiles.set(tableId, new Map());
+  }
+  const profiles = aiProfiles.get(tableId)!;
 
   let profile = profiles.get(activeSeat);
   if (!profile) {
@@ -9102,7 +9468,18 @@ function scheduleAIAction(tableId: string): void {
   const handle = setTimeout(() => {
     aiTimeouts.delete(timeoutKey);
     // console.log(`[AI] Executing action for seat ${activeSeat}`);
-    executeAIAction(tableId, activeSeat, profile);
+    // A-crash (bots review 2026-11-04): a throw here used to exit the process (game timer crash guard).
+    const before = tableManager.getTable(tableId);
+    const mark = before ? {
+      hand: before.handNumber, version: before.stateVersion, log: before.actionLog.length, phase: before.currentPhase,
+      stakes: before.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1)),
+      ids: before.seats.map((s) => s.playerId),
+    } : null;
+    try {
+      executeAIAction(tableId, activeSeat, profile);
+    } catch (err) {
+      recoverBotActionThrow(tableId, activeSeat, mark, err);
+    }
   }, delay);
 
   aiTimeouts.set(timeoutKey, { handle, seatIndex: activeSeat });
@@ -9119,6 +9496,9 @@ function executeAIAction(
   // Verify it's still this AI's turn
   if (table.activeSeatIndex !== seatIndex) return;
   if (!table.seats[seatIndex].isAI) return;
+  // A-crash (bots review 2026-11-04): a hand resting in Showdown is a faulted payout (the guard
+  // settles or holds it); the fallback below would advanceTurn -> determineWinners on a paid pot.
+  if (table.currentPhase === GamePhase.Showdown) return;
 
   // 2026-10-21 (gameplay F49) — an All-In or Fold table holds its bots to the
   // format too: shove-or-fold decisions (decideAction's allInOrFold mode), then
@@ -9185,7 +9565,7 @@ function executeAIAction(
       if (existing) clearTimeout(existing);
       const t = setTimeout(() => {
         pendingAutoStartTimers.delete(tableId);
-        autoStartNextHand(tableId);
+        try { autoStartNextHand(tableId); } catch (err) { recoverAutoStartThrow(tableId, err); }   // A-crash
       }, 1500);
       pendingAutoStartTimers.set(tableId, t);
     } else {
@@ -9283,6 +9663,7 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
 
   // Evict an AI from the target if any.
   if (dst.state === 'occupied' && dst.isAI) {
+    noteBotStackRemoved(tableId, table, target, 'seat_taken');   // E10
     table.standUp(target);
     const profiles = aiProfiles.get(tableId);
     if (profiles) profiles.delete(target);
@@ -9379,7 +9760,40 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
  * back on at that many buy-ins; unset, 0 or junk = no cap.
  */
 const BOT_STACK_CAP_BUYINS: number = ((n: number) => (Number.isInteger(n) && n >= 1 ? n : 0))(Number(process.env.BOT_STACK_CAP_BUYINS));
-const botStackStats = { reloads: 0, minted: 0, caps: 0, burned: 0, fixedRosterReloadsSkipped: 0 };
+const botStackStats = {
+  reloads: 0, minted: 0, caps: 0, burned: 0, fixedRosterReloadsSkipped: 0,
+  // 2026-11 (bots review E10) — every chip a bot holds on a wallet-chip table is created (seated,
+  // reloaded) and destroyed (capped, its seat removed) at an explicit point; `burned` stays the cap only.
+  seatedChips: 0, seatedBy: { ring: 0, quick: 0 } as Record<string, number>,
+  removedChips: 0, removedBy: { strip: 0, seat_taken: 0, trim: 0, quick_end: 0, table_closed: 0 } as Record<string, number>,
+};
+/** E10 — a bot sat down with `chips` on a wallet-chip table (never a tournament / Spin & Go). */
+function noteBotSeated(tableId: string, chips: number, kind: 'ring' | 'quick'): void {
+  if (isTournamentTable(tableId) || isPrizeFormatTable(tableId) || !(chips > 0)) return;
+  botStackStats.seatedChips += chips;
+  botStackStats.seatedBy[kind] += chips;
+}
+/** E10 — a bot's seat is about to be stood up: its stack (and, mid-hand, what it has in the pot) leaves play. Call BEFORE standUp. */
+function noteBotStackRemoved(tableId: string, table: PokerTable, seatIndex: number, why: 'strip' | 'seat_taken' | 'trim' | 'quick_end' | 'table_closed'): void {
+  const s = table.seats[seatIndex];
+  if (!s || s.state !== 'occupied' || !s.isAI) return;
+  if (isTournamentTable(tableId) || isPrizeFormatTable(tableId)) return;
+  const chips = Math.max(0, s.chipCount || 0) + (table.isHandInProgress() ? Math.max(0, s.totalInvestedThisHand || 0) : 0);
+  botStackStats.removedChips += chips;
+  botStackStats.removedBy[why] += chips;
+}
+/** E10 — what every seated bot holds now on wallet-chip tables (health: humansTookFromBots). */
+function liveBotChips(): number {
+  let sum = 0;
+  for (const id of tableManager.getAllTableIds()) {
+    if (isTournamentTable(id) || isPrizeFormatTable(id)) continue;
+    const t = tableManager.getTable(id);
+    if (!t) continue;
+    const inHand = t.isHandInProgress();
+    for (const st of t.seats) if (st.state === 'occupied' && st.isAI) sum += (st.chipCount || 0) + (inHand ? (st.totalInvestedThisHand || 0) : 0);
+  }
+  return sum;
+}
 
 /**
  * GAME-18 — the hand-boundary bot step (autoStartNextHand, never a tournament
@@ -9611,6 +10025,12 @@ function autoStartNextHand(tableId: string): void {
     if (!fed) balanceQualifierTables(tId, tableId, table);
   }
 
+  // Bots review 2026-11-04 — a CLUB table nobody sits at is never dealt bots-only
+  // (ensureCashTableRunning's rule; this stops a loop already running, e.g. after
+  // an admin removal). The boundary steps above still ran; a member's join deals
+  // (dealAfterJoin / scheduleAutoStart). Never a refused start: not logged or re-tried.
+  if (clubTableIds.has(tableId) && !tableHasHumanSeat(table)) { clubTableRuntimeStats.idleDealsSkipped++; return; }
+
   // Start new hand
   const started = table.startNewHand();
   if (started) {
@@ -9682,7 +10102,7 @@ function noteRefusedCashStart(tableId: string, table: PokerTable): void {
       retryInMs = streak === 1 ? CASH_START_RETRY_FIRST_MS : CASH_START_RETRY_MS;
       const t = setTimeout(() => {
         pendingAutoStartTimers.delete(tableId);
-        autoStartNextHand(tableId);
+        try { autoStartNextHand(tableId); } catch (err) { recoverAutoStartThrow(tableId, err); }   // A-crash (bots review 2026-11-04)
       }, retryInMs);
       pendingAutoStartTimers.set(tableId, t);
       cashStartRefusals.rescheduled++;
@@ -9821,7 +10241,7 @@ function backfillAIToMin(table: PokerTable, tableId: string, min: number): void 
     }
     usedNames.add(profile.botName);
     const aiPlayerId = `ai-${uuidv4()}`;
-    table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true);
+    if (table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true)) noteBotSeated(tableId, table.config.minBuyIn, 'ring');   // E10
     profiles.set(i, profile);
   }
 }
@@ -9838,6 +10258,8 @@ function ensureCashTableRunning(tableId: string): void {
   // running with bots (it is removed PRIVATE_TABLE_IDLE_MS after the last human
   // leaves — sweepIdlePrivateTables); every one used to become a 24/7 bot table.
   if (privateTableIds.has(tableId) && !tableHasHumanSeat(table)) return;
+  // Bots review 2026-11-04 — a CLUB table nobody sits at keeps its bot floor (a member who sits down finds the same table) but is never DEALT bots-only; a join deals (dealAfterJoin).
+  const idleClubTable = clubTableIds.has(tableId) && !tableHasHumanSeat(table);
 
   // Trim excess AI FIRST so we don't flip-flop: if autoStartNextHand /
   // legacy fillWithAI packed the table to 9/9, drop back to the target
@@ -9848,6 +10270,7 @@ function ensureCashTableRunning(tableId: string): void {
   if (table.getOccupiedSeatCount() < LIVE_ROOM_MIN_OCCUPIED) {
     backfillAIToMin(table, tableId, LIVE_ROOM_MIN_OCCUPIED);
   }
+  if (idleClubTable) return;
 
   // 2026-10-11 (R2, GAME-17) — a table resting in HandComplete with NO start
   // scheduled is frozen: its hand-boundary timer already ran and dealt nothing
@@ -9895,7 +10318,8 @@ setInterval(() => {
     let trimmedTables = 0;
     for (const t of tables) {
       const before = tableManager.getTable(t.tableId)?.getOccupiedSeatCount() ?? 0;
-      ensureCashTableRunning(t.tableId);
+      // A-crash (bots review 2026-11-04) — per table: one table's throw used to abort the tick for every table after it.
+      try { ensureCashTableRunning(t.tableId); } catch (err) { gameTimerGuardStats.heartbeatThrows++; logGameTimerError('heartbeat', t.tableId, -1, err); }
       const after = tableManager.getTable(t.tableId)?.getOccupiedSeatCount() ?? 0;
       if (before !== after) trimmedTables++;
     }
@@ -9973,6 +10397,12 @@ setInterval(() => {
       // mid-discard, on the stale pre-draw currentBetToMatch. Skip + reset the
       // tracker so a long (but legitimate) draw isn't seen as a wedge.
       if (DrawPhases.includes(table.currentPhase)) {
+        wedgeWatchdog.delete(t.tableId);
+        continue;
+      }
+      // A-crash (bots review 2026-11-04) — a faulted payout the game timer crash guard HOLDS in
+      // Showdown: advanceTurn would run determineWinners on a pot that may already be paid.
+      if (table.currentPhase === GamePhase.Showdown && gameShowdownHeld(table)) {
         wedgeWatchdog.delete(t.tableId);
         continue;
       }
@@ -10227,6 +10657,10 @@ function endCashReservation(
   }
   const chips = seatNow.chipCount;
   const outcome = teardownSeat(reserved.tableId, t, reserved.seatIndex, { userId, username }, reason, teardownOpts);
+  // Bots review 2026-11-04 — the last human's reservation ended (reserve_expiry /
+  // reserve_hand_limit / reserve_displaced): its bots go too (handlePlayerLeave's
+  // GAME-17 rule; mid-hand, at the hand's end). Never a quick game's fixed roster.
+  if (!quickTables.has(reserved.tableId)) stripBotsIfLastHumanLeft(reserved.tableId, t);
   syncSitOutToTable(reserved.tableId);
   broadcastGameState(reserved.tableId);
   return outcome === 'stood_up' ? chips : 0;
@@ -10283,6 +10717,12 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // was an ELO loss).
   const dealtInSeats = new Set<number>();
   for (const s of table.seats) if (s.state === 'occupied' && s.holeCards.length > 0) dealtInSeats.add(s.seatIndex);
+  // 2026-11 (bots review E5) — the seats that put a chip in VOLUNTARILY this hand (the
+  // 'playerAction' listener's record), taken before any await. null (a world without the
+  // hand-rewards block) = every dealt-in seat participated, as before.
+  const participatedSeats: Set<number> | null = takeHandParticipation(tableId, table.handNumber) || null;
+  /** E5 — the sockets whose hand EARNS its per-hand rewards (their scratch tick runs below). */
+  const rewardSockets = new Set<string>();
 
   // Collect the human players dealt into this hand
   const humanSessions: PlayerSession[] = [];
@@ -10310,6 +10750,8 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // it so the insured seat ends with exactly `cashout` (R1 2026-10-11: only
   // this hand's records, never a seat that changed hands or forfeited).
   settleInsuranceForHand(tableId, table, totalWonPerSeat);
+  // 2026-11 (bots review E9) — what humans took from bots this hand, per format (health economy.botFlow).
+  recordBotFlow(tableId, table, dealtInSeats);
 
   // R3 (S3-2) — chips won / club stats are recorded per dealt-in HUMAN SEAT, by
   // ACCOUNT, and read HERE: after the insurance settlement, before anything can
@@ -10366,12 +10808,22 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   }
 
   for (const session of humanSessions) {
-    // Everyone who played gets recordHandPlayed + 5 XP. Pass variantId
-    // so lifetime "all_variants" + daily/weekly variety achievements
-    // can track it.
+    // Everyone who played gets recordHandPlayed (+ hand XP when the hand earns). Pass
+    // variantId so lifetime "all_variants" + daily/weekly variety achievements can track it.
+    // 2026-11 (bots review E5 / E12) — a dealt-in hand EARNS its per-hand rewards (hand XP,
+    // the scratch tick below, the 'played' windows / missions) unless it is the
+    // IDLE_HANDS_REWARD_LIMIT-th (or later) hand in a row with no voluntary chip; past
+    // HAND_XP_FULL_PER_DAY rewarded hands in a day, the hand XP is HAND_XP_AFTER_CAP.
     const variantId: string | undefined = (table as any).config?.variantId || (table as any).variantId;
-    progressionManager.recordHandPlayed(session.playerId, variantId, handRef);
-    progressionManager.addXP(session.playerId, 5);
+    const participated = participatedSeats ? participatedSeats.has(session.seatIndex) : true;
+    const earns = progressionManager.recordHandPlayed(session.playerId, variantId, handRef, true, participated) !== false;
+    if (earns) {
+      const xp = handXpForHand(session.playerId);
+      progressionManager.addXP(session.playerId, typeof xp === 'number' ? xp : 5);   // 5 = a world without the block
+      rewardSockets.add(session.socketId);
+    } else {
+      handRewardStats.xpSkipped++;
+    }
 
     const seat = table.seats[session.seatIndex];
     const isWinner = winnerSeatIndices.has(session.seatIndex);
@@ -10399,7 +10851,15 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     else if (relativePos <= Math.floor(totalOccupied / 3)) posCategory = 'early';
     else if (relativePos >= totalOccupied - 2) posCategory = 'late';
 
-    if (isWinner) {
+    // 2026-11 (bots review E6) — a WALK (won with no voluntary chip and no showdown: the big
+    // blind / the Stud bring-in everyone folded to) is not a won hand for rewards. A steal
+    // after a voluntary bet, a contested showdown won and a pot won from a bot still count.
+    // Chips are untouched (the season's chips-won row above still records it).
+    const walk = isWinner && !participated && !(table as any).wentToShowdown;
+    if (walk) {
+      handRewardStats.walksNotCounted++;
+      progressionManager.recordPositionResult(session.playerId, posCategory, true);
+    } else if (isWinner) {
       const potSize = totalWonPerSeat.get(session.seatIndex) || 0;
       // 2026-10-21 (gameplay F42) — a STANDARD high-hand rank, or none: a
       // lowball "badness", a Badugi size, a hi-lo low half, Short Deck's own
@@ -10532,9 +10992,31 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
           // The scratch-card tick (a dealt-in seat only — the gate above). The
           // same UPDATE returns the wallet: the progress record mirrors the DB
           // (C5 — e.g. a buy-in or cash-out at another table since the last push).
-          const tick: any = await tickScratchProgress(authSession.userId).catch(() => false);
+          // 2026-11 (bots review E5) — only a hand that EARNS ticks it (an idle hand past the
+          // window does not; the push then reads the wallet fresh, as before).
+          let tick: any = false;
+          if (rewardSockets.has(socketId)) tick = await tickScratchProgress(authSession.userId).catch(() => false);
+          else handRewardStats.scratchTicksSkipped++;
           if (tick && typeof tick === 'object') {
             try { progressionManager.applyWallet(authSession.userId, tick); walletRefreshed = true; } catch { /* best-effort */ }
+            // E7 — the daily cap on cards banked from hands (authManager SCRATCH_CARDS_PER_DAY,
+            // a Denver day): counted, and the player told ONCE a day (serverAnnouncement, which
+            // poker-3d shows as a system notice) instead of silently getting no card.
+            if (tick.awarded === true) handRewardStats.scratchAwarded++;
+            else if (tick.capped === true) {
+              handRewardStats.scratchCapped++;
+              const day = denverDateKey();
+              if (scratchCapNotified.get(authSession.userId) !== day) {
+                if (scratchCapNotified.size >= 20_000) scratchCapNotified.clear();
+                scratchCapNotified.set(authSession.userId, day);
+                handRewardStats.capNotices++;
+                io.sockets.sockets.get(socketId)?.emit('serverAnnouncement', {
+                  kind: 'scratch_daily_limit',
+                  message: `Daily scratch card limit reached: ${SCRATCH_CARDS_PER_DAY} cards from hands today. Hands bank cards again tomorrow.`,
+                  at: Date.now(),
+                });
+              }
+            }
           }
           if (tick === true || (tick && tick.awarded === true)) {
             const s = io.sockets.sockets.get(socketId);
@@ -11901,7 +12383,7 @@ function removeIdlePrivateTable(tableId: string): void {
   if (table && tableHasHumanSeat(table)) return;   // someone sat down meanwhile
   io.to(`table:${tableId}`).emit('tableClosed', { tableId, reason: 'private_table_idle' });
   endTableViewsAndTimers(tableId);
-  if (table) for (let i = 0; i < MAX_SEATS; i++) if (table.seats[i].state === 'occupied') table.standUp(i);
+  if (table) for (let i = 0; i < MAX_SEATS; i++) if (table.seats[i].state === 'occupied') { if (table.seats[i].isAI) noteBotStackRemoved(tableId, table, i, 'table_closed'); table.standUp(i); }   // E10
   tableManager.removeTable(tableId);
   tableProgressListeners.delete(tableId);
   privateTableIds.delete(tableId);
@@ -11949,6 +12431,7 @@ function endTableViewsAndTimers(tableId: string): void {
   clearPineappleDiscardHold(tableId);   // F16
   drawStartedAtMap.delete(tableId);     // G169
   dropPendingMuckShows(tableId);        // F21
+  handParticipation.delete(tableId);    // bots review E5
 }
 
 /** C12 — every minute: a private table with no human seat for PRIVATE_TABLE_IDLE_MS is removed. */
@@ -13182,6 +13665,13 @@ const quickGames = new Map<string, QuickGameState>();
 const quickGameStats = {
   started: 0, ended: 0, humanWins: 0, spinGoPrizes: 0, spinGoForfeits: 0, entryFeesRefunded: 0,
   cleanedNoHuman: 0, cashedOut: 0,
+  // 2026-11 (bots review E11) — per-format fairness: games started and won by the human, and the
+  // Spin & Go house result (spinGoFeesIn - spinGoPrizesOut - spinGoRefunded; prize chips, not wallet chips).
+  byFormat: {
+    headsUp: { started: 0, humanWins: 0 }, spinGo: { started: 0, humanWins: 0 }, allInOrFold: { started: 0, humanWins: 0 },
+    career: { started: 0, humanWins: 0 }, challenge: { started: 0, humanWins: 0 },
+  } as Record<string, { started: number; humanWins: number }>,
+  spinGoFeesIn: 0, spinGoPrizesOut: 0, spinGoRefunded: 0,
 };
 const QUICK_GAME_RESULT_DELAY_MS = 1000;   // the final hand is seen before the result
 const QUICK_GAME_CLEANUP_DELAY_MS = 5000;  // the result is seen before the table goes
@@ -13197,6 +13687,8 @@ function isPrizeFormatTable(tableId: string): boolean {
 function registerQuickGame(tableId: string, table: PokerTable, state: Omit<QuickGameState, 'ended' | 'settlement' | 'createdAt' | 'started'>): void {
   quickGames.set(tableId, { ...state, ended: false, settlement: 'open', createdAt: Date.now(), started: state.format !== 'challenge' });
   quickGameStats.started++;
+  if (quickGameStats.byFormat[state.format]) quickGameStats.byFormat[state.format].started++;   // E11
+  if (state.format === 'spinGo') quickGameStats.spinGoFeesIn += state.entryFee || 0;
   table.on('handResult', () => {
     try { quickGameEndCheck(tableId, 'hand_result'); } catch (e: any) {
       console.error(`[QuickGame] end check failed on ${tableId}:`, e?.message || e);
@@ -13268,7 +13760,10 @@ function quickGameEndCheck(tableId: string, via: string): boolean {
   if (!outcome.over) return false;
   qg.ended = true;
   quickGameStats.ended++;
-  if (outcome.humanWon && qg.format !== 'challenge') quickGameStats.humanWins++;
+  if (outcome.humanWon && qg.format !== 'challenge') {
+    quickGameStats.humanWins++;
+    if (quickGameStats.byFormat[qg.format]) quickGameStats.byFormat[qg.format].humanWins++;   // E11
+  }
   // F105 — the winner's name and stack, before the bot stand-up below empties a bot winner's seat.
   const winnerSeatNow = outcome.winnerSeat !== null ? table.seats[outcome.winnerSeat] : undefined;
   const winnerName = winnerSeatNow && winnerSeatNow.state === 'occupied' ? winnerSeatNow.playerName : '';
@@ -13276,6 +13771,7 @@ function quickGameEndCheck(tableId: string, via: string): boolean {
   if (qg.format !== 'challenge') {
     for (const s of table.seats) {
       if (s.state !== 'occupied' || !s.isAI) continue;
+      noteBotStackRemoved(tableId, table, s.seatIndex, 'quick_end');   // E10
       table.standUp(s.seatIndex);
       aiProfiles.get(tableId)?.delete(s.seatIndex);
     }
@@ -13366,6 +13862,7 @@ function finishQuickGame(tableId: string, outcome: QuickGameOutcome): void {
       if (won) {
         qg.settlement = 'won';
         quickGameStats.spinGoPrizes++;
+        quickGameStats.spinGoPrizesOut += prize;   // E11
         const ownerUserId = qg.ownerUserId as number;
         void prizeLedger.settle({
           label: `spingo:${tableId}`,
@@ -13425,6 +13922,7 @@ function refundQuickEntryFee(tableId: string, qg: QuickGameState, reason: string
   if (qg.settlement !== 'open' || qg.ownerUserId === null || !(qg.entryFee > 0)) return Promise.resolve();
   qg.settlement = 'refunded';
   quickGameStats.entryFeesRefunded++;
+  if (qg.format === 'spinGo') quickGameStats.spinGoRefunded += qg.entryFee;   // E11
   const ownerUserId = qg.ownerUserId;
   return prizeLedger.settle({
     label: `quickfee:${tableId}`,
@@ -13557,6 +14055,7 @@ function cleanupQuickTable(tableId: string): void {
           auditLog(owner.username, 'SPINGO_STACK_NOT_CASHED', { userId: owner.userId, tableId, chips: seat.chipCount, settlement: qg?.settlement ?? null });
         }
       }
+      if (seat.isAI) noteBotStackRemoved(tableId, table, i, 'quick_end');   // E10
       table.standUp(i);
     }
   }
@@ -16339,6 +16838,7 @@ Give feedback in this JSON format:
           auditLog(owner ? owner.username : '', 'TOURNAMENT_STACK_NOT_CASHED', { userId: owner?.userId ?? null, tableId: data.tableId, reason: 'admin_force_close' });
         }
       }
+      if (seat.isAI) noteBotStackRemoved(data.tableId, table, i, 'table_closed');   // E10
       table.standUp(i);
     }
     // F147 (2026-10-21) — the seated / watching clients are told the table is
@@ -16774,8 +17274,18 @@ Give feedback in this JSON format:
   socket.on('getClubTables', async (data: { clubId: number }) => {
     const result = await getClubTables(data.clubId);
     // R2 (CLUBS-4) — a table a redeploy dropped is re-created for the list (a joinable id).
-    for (const t of result.tables || []) {
-      try { await ensureClubRuntimeTable(t); } catch (e: any) { console.warn('[Clubs] club table re-create failed:', e?.message || e); }
+    // Bots review 2026-11-04 — only for an active MEMBER (the only caller, poker-3d
+    // ClubsPanel, opens clubs from getMyClubs). The LIST stays open to any socket;
+    // a non-member / signed-out socket no longer creates runtime tables or re-points
+    // club_tables.tableid. joinClubTable still re-creates on a member's join.
+    const auth = authSessions.get(socket.id);
+    const member = !!auth && result.success === true && await isClubMember(data.clubId, auth.userId);
+    if (member) {
+      for (const t of result.tables || []) {
+        try { await ensureClubRuntimeTable(t); } catch (e: any) { console.warn('[Clubs] club table re-create failed:', e?.message || e); }
+      }
+    } else if ((result.tables || []).some((t) => !(t.tableId && tableManager.getTable(t.tableId)))) {
+      clubTableRuntimeStats.recreateSkippedNotMember++;
     }
     socket.emit('clubTables', result);
   });
@@ -17635,8 +18145,10 @@ Give feedback in this JSON format:
       // at the table he was playing, and left his client on a frozen view of
       // it. Decided here, with nothing changed yet:
       //   (a) a seat the join can take — an empty seat below the cap, or a bot
-      //       not in the hand (a pure lookup: the bot is stood up only after the
-      //       leave). A seat of HIS at this table (a seat change, a ghost seat)
+      //       not in the hand (a pure lookup: the bot is touched only after the
+      //       leave — bots review 2026-11-04: between hands its seat is freed at
+      //       the pick; mid-hand it is planned at the pick and freed at the
+      //       commit). A seat of HIS at this table (a seat change, a ghost seat)
       //       that the leave / ghost clear frees AT ONCE: then the search after
       //       them decides, as before. S7 fix-up — one with chips in the live
       //       pot is only folded and freed at the hand's end (accountHoldsSeatAt
@@ -17731,21 +18243,18 @@ Give feedback in this JSON format:
           }
         }
         // If no empty seat, try taking an AI seat — R2 (GAME-15): never one in
-        // the hand being played (its pot chips were erased with it).
-        if (seatIndex === -1) seatIndex = takeAiSeatForJoin(table, tableId);
+        // the hand being played (its pot chips were erased with it). Bots review
+        // 2026-11-04 — between hands its seat is freed at the pick; mid-hand it is
+        // planned here and freed at the commit (takePlannedAiSeat, before sitDown).
+        if (seatIndex === -1) seatIndex = planAiSeatForJoin(table, tableId);
         if (seatIndex === -1) {
           socket.emit('error', afterLeave({ message: 'No seats available', code: 'no_seat_available' }));
           return;
         }
       }
-
-      // If chosen seat is occupied by AI, remove the AI first (R2: only a bot
-      // not in the hand in progress — else sitDown below refuses the seat).
-      if (aiSeatTakeableNow(table, seatIndex)) {
-        table.standUp(seatIndex);
-        const profiles = aiProfiles.get(tableId);
-        if (profiles) profiles.delete(seatIndex);
-      }
+      // (Bots review 2026-11-04 — the "chosen seat is occupied by AI → stand it
+      // up" block that stood here is gone: the seat above is always empty or a
+      // PLANNED bot seat, which only the commit frees.)
 
       // (The banned check that used to sit here now runs at the top of the
       // handler, before any side effect.)
@@ -17817,7 +18326,9 @@ Give feedback in this JSON format:
       }
 
       const playerId = `player-${uuidv4()}`;
-      const success = table.sitDown(
+      // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+      const seatFree = !table.seats[seatIndex]?.isAI || takePlannedAiSeat(table, tableId, seatIndex);
+      const success = seatFree && table.sitDown(
         seatIndex,
         playerName,
         buyIn,
@@ -17838,10 +18349,10 @@ Give feedback in this JSON format:
           } catch (e) {
             refunded = false;
           }
-          auditLog(authForJoin.username, refunded ? 'BUY_IN_REFUND' : 'BUY_IN_REFUND_FAILED', { tableId, buyIn, reason: 'sitDown_failed' });
+          auditLog(authForJoin.username, refunded ? 'BUY_IN_REFUND' : 'BUY_IN_REFUND_FAILED', { tableId, buyIn, reason: seatFree ? 'sitDown_failed' : 'planned_seat_lost' });
         }
         mySlots.delete(`${socket.id}:${tableSlotKey}`);
-        socket.emit('error', afterLeave({ message: 'Could not sit down at that seat' }));
+        socket.emit('error', afterLeave(seatFree ? { message: 'Could not sit down at that seat' } : { message: 'No seats available', code: 'no_seat_available' }));
         return;
       }
 
@@ -17980,11 +18491,13 @@ Give feedback in this JSON format:
           if (table.seats[i].state === 'empty') { targetSeat = i; break; }
         }
         // R2 (GAME-15) — an AI seat only when it is not in the hand being played.
-        if (targetSeat === -1) targetSeat = takeAiSeatForJoin(table, candidate.tableId);
+        // Bots review 2026-11-04 — between hands its seat is freed at the pick;
+        // mid-hand it is planned here and freed at the commit (takePlannedAiSeat).
+        if (targetSeat === -1) targetSeat = planAiSeatForJoin(table, candidate.tableId);
         if (targetSeat === -1) continue;
         // Re-check right before commit — if another call has already claimed
-        // this seat since we found it, try the next table.
-        if (table.seats[targetSeat].state !== 'empty') continue;
+        // this seat since we found it, try the next table (a planned bot seat still takeable stays chosen).
+        if (table.seats[targetSeat].state !== 'empty' && !aiSeatTakeableNow(table, targetSeat)) continue;
         chosen = { tableId: candidate.tableId, table, targetSeat };
         break;
       }
@@ -18031,7 +18544,9 @@ Give feedback in this JSON format:
         const authNow = authSessions.get(socket.id);
         if (authNow) clearGhostSeatsForUser(authNow.userId, chosenTableId, socket.id, targetSeat);
       }
-      const success = table.sitDown(
+      // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+      const seatFree = !table.seats[targetSeat]?.isAI || takePlannedAiSeat(table, chosenTableId, targetSeat);
+      const success = seatFree && table.sitDown(
         targetSeat,
         playerName,
         buyIn,
@@ -18044,7 +18559,7 @@ Give feedback in this JSON format:
         if (chipsDeducted && authForJoin) {
           try {
             await addChipsToUser(authForJoin.userId, buyIn);
-            auditLog(authForJoin.username, 'QUICKPLAY_REFUND', { tableId: chosenTableId, buyIn, reason: 'sitDown_failed' });
+            auditLog(authForJoin.username, 'QUICKPLAY_REFUND', { tableId: chosenTableId, buyIn, reason: seatFree ? 'sitDown_failed' : 'planned_seat_lost' });
           } catch (e) {
             // Refund failed AFTER the deduction succeeded. The user now
             // owes `buyIn` that the DB didn't credit back. Don't swallow —
@@ -18055,7 +18570,7 @@ Give feedback in this JSON format:
             auditLog(authForJoin.username, 'QUICKPLAY_REFUND_FAILED', { tableId: chosenTableId, buyIn, error: String(e) });
           }
         }
-        socket.emit('error', { message: 'Could not join table' });
+        socket.emit('error', { message: seatFree ? 'Could not join table' : 'No seats available' });
         return;
       }
 
@@ -19674,7 +20189,9 @@ Give feedback in this JSON format:
           }
         }
         // R2 (GAME-15) — an AI seat only when it is not in the hand being played.
-        if (targetSeat === -1) targetSeat = takeAiSeatForJoin(table, bestTable.tableId);
+        // Bots review 2026-11-04 — between hands its seat is freed at the pick;
+        // mid-hand it is planned here and freed at the commit (takePlannedAiSeat).
+        if (targetSeat === -1) targetSeat = planAiSeatForJoin(table, bestTable.tableId);
         if (targetSeat === -1) {
           failWaitlist('handler_exception', 'No seats available', { stage: 'no_seats' });
           return;
@@ -19725,7 +20242,9 @@ Give feedback in this JSON format:
           }, wlState)) return;
         }
 
-        const success = table.sitDown(
+        // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+        const seatFree = !table.seats[targetSeat]?.isAI || takePlannedAiSeat(table, bestTable.tableId, targetSeat);
+        const success = seatFree && table.sitDown(
           targetSeat,
           playerName,
           waitlistBuyIn,
@@ -19737,12 +20256,12 @@ Give feedback in this JSON format:
           if (authNow) {
             try {
               await addChipsToUser(authNow.userId, waitlistBuyIn);
-              auditLog(authNow.username, 'BUY_IN_REFUND', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, reason: 'waitlist_sitDown_failed' });
+              auditLog(authNow.username, 'BUY_IN_REFUND', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, reason: seatFree ? 'waitlist_sitDown_failed' : 'planned_seat_lost' });
             } catch (e) {
               auditLog(authNow.username, 'BUY_IN_REFUND_FAILED', { tableId: bestTable.tableId, buyIn: waitlistBuyIn, error: String(e) });
             }
           }
-          failWaitlist('handler_exception', 'Could not join table', { stage: 'sit_down_failed' });
+          failWaitlist('handler_exception', seatFree ? 'Could not join table' : 'No seats available', { stage: seatFree ? 'sit_down_failed' : 'no_seats' });
           return;
         }
 
@@ -20418,7 +20937,7 @@ Give feedback in this JSON format:
         const tid = session.tableId;
         const t = setTimeout(() => {
           pendingAutoStartTimers.delete(tid);
-          autoStartNextHand(tid);
+          try { autoStartNextHand(tid); } catch (err) { recoverAutoStartThrow(tid, err); }   // A-crash (bots review 2026-11-04)
         }, 3000);
         pendingAutoStartTimers.set(tid, t);
       } else {
@@ -21402,9 +21921,11 @@ Give feedback in this JSON format:
       aiProfiles.set(tableId, new Map());
     }
     const profiles = aiProfiles.get(tableId)!;
-    const aiProfile = generateRandomProfile('hard');
+    // Bots review 2026-11-04 — never the player's own name (Spin & Go and All-In or Fold seed their used names with it; this pick did not); bounded re-roll as fillWithAI's.
+    let aiProfile = generateRandomProfile('hard');
+    for (let attempts = 0; aiProfile.botName === playerName && attempts < 50; attempts++) aiProfile = generateRandomProfile('hard');
     const aiPlayerId = `ai-${uuidv4()}`;
-    table.sitDown(1, aiProfile.botName, 1000, aiPlayerId, true);
+    if (table.sitDown(1, aiProfile.botName, 1000, aiPlayerId, true)) noteBotSeated(tableId, 1000, 'quick');   // E10
     profiles.set(1, aiProfile);
 
     // R2 (TOURNEY-6 / money review P2) — a real END: a bust is game over (the
@@ -21478,7 +21999,7 @@ Give feedback in this JSON format:
       }, authSGState)) return;
     }
 
-    // Random multiplier: 2x (60%), 3x (25%), 5x (10%), 10x (4%), 25x (1%)
+    // Random multiplier (quickGames SPIN_GO_MULTIPLIER_ODDS): 2x 67%, 3x 22%, 5x 7%, 10x 3%, 25x 1% (mean 2.90x)
     const multiplier = spinGoMultiplierFor(Math.random() * 100);
 
     const tableId = tableManager.createQuickTable(
@@ -21586,6 +22107,9 @@ Give feedback in this JSON format:
     // 2026-06-11 audit C2: real buy-in (1000). Authed players pay from the
     // wallet (credited back on leave); guests stay wallet-isolated.
     const AOF_BUYIN = 1000;
+    // 2026-11 (bots review): 1,000 = 25 BB, the deepest stack the bots' push/fold table covers (PUSH_FOLD_MAX_BB = 25). At 10/20 (50 BB) every bot decision was clamped to 25 BB.
+    const AOF_SMALL_BLIND = 20;
+    const AOF_BIG_BLIND = 40;
     const authAOF = authSessions.get(socket.id);
     if (authAOF) {
       // P3 (2026-10-10) — still this account, and still no seat on this socket
@@ -21606,8 +22130,8 @@ Give feedback in this JSON format:
     const tableId = tableManager.createQuickTable(
       'All-In or Fold',
       6,
-      10,
-      20,
+      AOF_SMALL_BLIND,
+      AOF_BIG_BLIND,
       AOF_BUYIN
     );
     quickTables.add(tableId); // #5: exclude from ring AI fill/heartbeat
@@ -21647,7 +22171,7 @@ Give feedback in this JSON format:
       }
       usedNames.add(aiProfile.botName);
       const aiPlayerId = `ai-${uuidv4()}`;
-      table.sitDown(i, aiProfile.botName, 1000, aiPlayerId, true);
+      if (table.sitDown(i, aiProfile.botName, 1000, aiPlayerId, true)) noteBotSeated(tableId, 1000, 'quick');   // E10
       profiles.set(i, aiProfile);
     }
 
@@ -21799,7 +22323,7 @@ Give feedback in this JSON format:
       }
       usedNames.add(aiProfile.botName);
       const aiPlayerId = `ai-${uuidv4()}`;
-      table.sitDown(i, aiProfile.botName, config.buyIn, aiPlayerId, true);
+      if (table.sitDown(i, aiProfile.botName, config.buyIn, aiPlayerId, true)) noteBotSeated(tableId, config.buyIn, 'quick');   // E10
       profiles.set(i, aiProfile);
     }
 
@@ -22736,13 +23260,14 @@ Give feedback in this JSON format:
       return;
     }
 
-    // Find empty seat — R2 (GAME-15): an empty seat FIRST (this loop used to
-    // take whichever came first, a bot at seat 0 before an empty seat 5), and
-    // an AI seat only when it is not in the hand being played.
-    let targetSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < table.maxOccupiableSeats);
-    if (targetSeat === -1) targetSeat = takeAiSeatForJoin(table, tableId);
-
-    if (targetSeat === -1) {
+    // Bots review 2026-11-04 — (a) a PURE seat lookup first (joinTable's F143
+    // rule): an empty seat below the cap or a bot not in the hand. A request that
+    // ends in 'No seats available' never reads the wallet (no
+    // UNLIMITED_CHIPS_TESTING top-up) and touches no bot.
+    const addSeatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
+    let seatPossible = false;
+    for (let i = 0; i < addSeatCap && !seatPossible; i++) seatPossible = table.seats[i].state === 'empty' || aiSeatTakeableNow(table, i);
+    if (!seatPossible) {
       socket.emit('error', { message: 'No seats available' });
       return;
     }
@@ -22759,12 +23284,35 @@ Give feedback in this JSON format:
       Math.min(buyIn || table.config.minBuyIn, table.config.minBuyIn * 10, table.maxBuyInSetting ?? Infinity)
     );
     const authAdd = authSessions.get(socket.id);
-    if (authAdd) {
-      // P3 (2026-10-10) — still this account and still this live table.
-      const addState: BuyInExpectation = { userId: authAdd.userId, notSeatedAt: tableId, table: { tableId, table } };
+    // P3 (2026-10-10) — still this account and still this live table.
+    const addState: BuyInExpectation | null = authAdd ? { userId: authAdd.userId, notSeatedAt: tableId, table: { tableId, table } } : null;
+    if (authAdd && addState) {
+      // Bots review 2026-11-04 — (b) the affordability check BEFORE the pick: an
+      // under-funded request used to stand a bot up (one per request) and then
+      // refuse 'Insufficient chips' with the seat left empty.
       const dbChips = await ensureChipsForBuyIn(authAdd.userId, authAdd.username, effectiveBuyIn);
       if (await buyInSocketGone(socket, 'joinAdditionalTable', 'balance_read', undefined, addState)) return; // F3 — nothing deducted yet
-      if (effectiveBuyIn > dbChips) { socket.emit('error', { message: 'Insufficient chips for the additional-table buy-in' }); return; }
+      if (effectiveBuyIn > dbChips) {
+        joinSeatStats.preCheckRefused++;
+        socket.emit('error', { message: 'Insufficient chips for the additional-table buy-in' });
+        return;
+      }
+    }
+
+    // Find empty seat — R2 (GAME-15): an empty seat FIRST (this loop used to
+    // take whichever came first, a bot at seat 0 before an empty seat 5), and
+    // an AI seat only when it is not in the hand being played. Bots review
+    // 2026-11-04 — (c) between hands a bot's seat is freed at this pick; mid-hand
+    // it is planned here and freed at the commit (takePlannedAiSeat).
+    let targetSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < table.maxOccupiableSeats);
+    if (targetSeat === -1) targetSeat = planAiSeatForJoin(table, tableId);
+
+    if (targetSeat === -1) {
+      socket.emit('error', { message: 'No seats available' });
+      return;
+    }
+
+    if (authAdd && addState) {
       if (!(await deductChips(authAdd.userId, effectiveBuyIn))) { socket.emit('error', { message: 'Could not deduct chips — try again' }); return; }
       auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN', { tableId, buyIn: effectiveBuyIn });
       // F3 — the socket dropped during the deduct (its multi-table sessions
@@ -22780,14 +23328,16 @@ Give feedback in this JSON format:
       const authNow = authSessions.get(socket.id);
       if (authNow) clearGhostSeatsForUser(authNow.userId, tableId, socket.id, targetSeat);
     }
-    const success = table.sitDown(targetSeat, playerName, effectiveBuyIn, playerId, false);
+    // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+    const seatFree = !table.seats[targetSeat]?.isAI || takePlannedAiSeat(table, tableId, targetSeat);
+    const success = seatFree && table.sitDown(targetSeat, playerName, effectiveBuyIn, playerId, false);
     if (!success) {
       // Refund the buy-in we just deducted — we never seated them.
       if (authAdd) {
         await addChipsToUser(authAdd.userId, effectiveBuyIn);
-        auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN_REFUND', { tableId, buyIn: effectiveBuyIn });
+        auditLog(authAdd.username, 'ADDITIONAL_TABLE_BUYIN_REFUND', { tableId, buyIn: effectiveBuyIn, ...(seatFree ? {} : { reason: 'planned_seat_lost' }) });
       }
-      socket.emit('error', { message: 'Could not join table' });
+      socket.emit('error', { message: seatFree ? 'Could not join table' : 'No seats available' });
       return;
     }
 
@@ -22848,6 +23398,8 @@ Give feedback in this JSON format:
       if (leavingSeat && leavingSeat.state === 'occupied' && !leavingSeat.isAI) {
         teardownSeat(session.tableId, table, session.seatIndex,
           auth ? { userId: auth.userId, username: auth.username } : null, 'leave_additional_table');
+        // Bots review 2026-11-04 — the last human gone: the bots go too (GAME-17).
+        stripBotsIfLastHumanLeft(session.tableId, table);
       }
       broadcastGameState(session.tableId);
     }
@@ -23150,8 +23702,10 @@ Give feedback in this JSON format:
       table.seats.some((s, i) => i < inviteSeatCap && s.state === 'occupied' && s.isAI)
         ? { message: 'Every seat is in this hand — a seat opens when it ends. Try again in a moment.', code: 'seat_opens_after_hand' }
         : { message: 'Table is full.', code: 'table_full' });
-    // 2026-10-21 (gameplay F143) — the seat (a pure lookup here: a bot is stood
-    // up only after the leave below) and the buy-in are decided BEFORE the
+    // 2026-10-21 (gameplay F143) — the seat (a pure lookup here: a bot is touched
+    // only after the leave below — bots review 2026-11-04: between hands its seat
+    // is freed at the pick, mid-hand it is planned at the pick and freed at the
+    // commit) and the buy-in are decided BEFORE the
     // socket leaves its seat: a refusal after the leave ("Insufficient chips
     // for this table.") cost him his seat and hand at his current table. A seat
     // of HIS at this table that the leave / the ghost clear frees AT ONCE
@@ -23210,15 +23764,17 @@ Give feedback in this JSON format:
     if (authAtInvite) clearGhostSeatsForUser(authAtInvite.userId, tableId, socket.id);
 
     // R3 (S1-1 / XL-1 / K3-1) — a seat BELOW the home game's cap (maxSeats):
-    // the first empty one, else a bot's seat freed for him (never a bot in the
-    // hand being played — takeAiSeatForJoin), before any chip moves (F143: the
+    // the first empty one, else a bot's seat for him (never a bot in the
+    // hand being played — planAiSeatForJoin; bots review 2026-11-04: between
+    // hands its seat is freed at this pick, mid-hand it is planned here and
+    // freed at the commit), before any chip moves (F143: the
     // same pure lookup above refused before the leave). It used to take the first empty
     // seat of all nine — past the cap once the bots filled the rest: the
     // buy-in was deducted, sitDown refused, and the invitee was refunded and
     // told 'Could not seat you' on every attempt. 'Table is full.' only when no
     // seat can be freed at all.
     let openSeat = table.seats.findIndex((s, i) => s.state === 'empty' && i < inviteSeatCap);
-    if (openSeat === -1) openSeat = takeAiSeatForJoin(table, tableId);
+    if (openSeat === -1) openSeat = planAiSeatForJoin(table, tableId);
     if (openSeat === -1) {
       socket.emit('joinError', afterLeave(noInviteSeat()));
       return;
@@ -23263,7 +23819,9 @@ Give feedback in this JSON format:
       if (authNow) clearGhostSeatsForUser(authNow.userId, tableId, socket.id, openSeat);
     }
     const playerId = `player-${uuidv4()}`;
-    const success = table.sitDown(openSeat, playerName, actualBuyIn, playerId, false);
+    // Bots review 2026-11-04 — the COMMIT of a bot seat planned mid-hand (nothing awaited from here to sitDown).
+    const seatFree = !table.seats[openSeat]?.isAI || takePlannedAiSeat(table, tableId, openSeat);
+    const success = seatFree && table.sitDown(openSeat, playerName, actualBuyIn, playerId, false);
 
     if (!success) {
       if (chipsDeducted && authForJoin) {
@@ -23271,9 +23829,9 @@ Give feedback in this JSON format:
         // throw): a refund that did not land is audited as FAILED, never as done.
         let refunded = false;
         try { refunded = await addChipsToUser(authForJoin.userId, actualBuyIn); } catch { refunded = false; }
-        auditLog(authForJoin.username, refunded ? 'INVITE_REFUND' : 'INVITE_REFUND_FAILED', { tableId, buyIn: actualBuyIn, reason: 'sitDown_failed' });
+        auditLog(authForJoin.username, refunded ? 'INVITE_REFUND' : 'INVITE_REFUND_FAILED', { tableId, buyIn: actualBuyIn, reason: seatFree ? 'sitDown_failed' : 'planned_seat_lost' });
       }
-      socket.emit('joinError', afterLeave({ message: 'Could not seat you at that table.' }));
+      socket.emit('joinError', afterLeave(seatFree ? { message: 'Could not seat you at that table.' } : noInviteSeat()));
       return;
     }
 
@@ -23849,6 +24407,8 @@ function cashOutAdditionalSeatsOnDeparture(socket: Socket, authSession: SocketAu
           teardownSeat(ms.tableId, mt, ms.seatIndex,
             authSession ? { userId: authSession.userId, username: authSession.username } : null, reason,
             { keepHandOnDeparture: true });   // F85
+          // Bots review 2026-11-04 — the last human gone: the bots go too (GAME-17; mid-hand, at the hand's end).
+          stripBotsIfLastHumanLeft(ms.tableId, mt);
         }
       }
       socket.leave(`table:${ms.tableId}`);
@@ -29990,11 +30550,10 @@ setInterval(sweepTournamentRebalances, 5000);
 app.post('/api/tournament/simulate', (req, res) => {
   // 2026-06-19 fix: this was unauthenticated with an UNCAPPED playerCount —
   // a single POST with playerCount:100000 would spin up an enormous multi-table
-  // tournament (resource-exhaustion DoS). Clamp to a sane range, and require the
-  // internal token when one is configured (no-op if the env var is unset, so a
-  // legit dev/admin caller without it still works in non-prod).
-  const tok = process.env.INTERNAL_NOTIFY_TOKEN || '';
-  if (tok && req.headers['x-internal-token'] !== tok) {
+  // tournament (resource-exhaustion DoS). Clamp to a sane range.
+  // Bots review 2026-11-04 (A-simulate) — FAILS CLOSED like /api/qualifiers/overflow: no INTERNAL_NOTIFY_TOKEN → 403; trimmed, constant-time (internalTokenMatches).
+  const tok = (process.env.INTERNAL_NOTIFY_TOKEN || '').trim();
+  if (!internalTokenMatches(req.headers['x-internal-token'], tok)) {
     res.status(403).json({ error: 'forbidden' });
     return;
   }

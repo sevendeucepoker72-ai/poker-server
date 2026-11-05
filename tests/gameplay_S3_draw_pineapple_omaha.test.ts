@@ -34,6 +34,7 @@ import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
 import { ShortDeckTable } from '../src/game/variants/ShortDeckTable';
 import { Card, cardToString } from '../src/game/Card';
+import { studDrawKindOf, chooseBotDiscards } from '../src/ai/studDrawStrength';
 import { slice, fnSrc, handlerSrc, load, SEAT_IDENTITY_SRC, SEAT_SESSION_FOR_SRC } from './helpers/indexSource';
 
 const RANKS: Record<string, number> = { '2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9, T: 10, J: 11, Q: 12, K: 13, A: 14 };
@@ -386,7 +387,7 @@ describe('G169 — the draw clock is sent, and the stand-pat fires at its deadli
     const broadcasts: number[] = [];
     const scope: Record<string, unknown> = {
       ...STATE_SCOPE(),
-      tableManager: { getTable: () => t }, drawTimers: new Map(),
+      tableManager: { getTable: () => t }, drawTimers: new Map(), studDrawKindOf, chooseBotDiscards,
       aiProfiles: new Map(ai.length ? [[T, new Map()]] : []),
       broadcastGameState: () => broadcasts.push(Date.now()),
     };
@@ -481,7 +482,7 @@ describe('F116 — 2-7 bots draw to a low', () => {
     const { exports: schedule } = load(fnSrc('function scheduleAIAction('), {
       tableManager: { getTable: () => t }, GamePhase, DrawPhases: DRAWS, FiveCardDrawTable, drawTimers: new Map(),
       aiProfiles: new Map([[T, new Map()]]), TURN_TIMEOUT_MS: 30000, drawClockStart: () => Date.now(),
-      broadcastGameState() {},
+      broadcastGameState() {}, studDrawKindOf, chooseBotDiscards,
     }, 'scheduleAIAction');
     schedule(T);
     jest.advanceTimersByTime(2000);
@@ -812,7 +813,7 @@ describe('S3 fix-up — a draw round never sits out the 30s clock for a seat nob
     t.playerDraw = (seat: number, idx: number[]) => { const ph = t.currentPhase; const ok = real(seat, idx); if (ok) drew.push([seat, ph, Date.now() - t0]); return ok; };
     const { exports: schedule, stubbed } = load(absentSrc(), {
       tableManager: { getTable: (id: string) => (id === T ? t : undefined) }, GamePhase, DrawPhases: DRAWS, FiveCardDrawTable, MAX_SEATS,
-      drawTimers: new Map(), aiProfiles: new Map(opts.bots ? [[T, new Map()]] : []), TURN_TIMEOUT_MS: 30000,
+      drawTimers: new Map(), aiProfiles: new Map(opts.bots ? [[T, new Map()]] : []), TURN_TIMEOUT_MS: 30000, studDrawKindOf, chooseBotDiscards,
       playerSessions, multiTableSessions, reservedSeats, broadcastGameState() {},
       isTournamentTable: () => !!opts.tournament, isTournamentReservation: (r: any) => !!r.tournament,
       console: { log: (s: unknown) => logs.push(String(s)), warn() {}, error() {} },

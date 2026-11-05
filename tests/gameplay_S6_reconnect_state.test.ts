@@ -719,6 +719,7 @@ function seatWorld(opts: { disconnect?: string; join?: string; autoStart?: strin
     seatNameForSocket: (_s: unknown, n: string) => n, sanitizeSeatAvatar: () => undefined, ipSeatedSlots: new Map(), clientIp: '10.0.0.1',
     noteSameNetworkSeat() {}, uuidv4: () => 'new', challengeTables: new Map(), ensureTableProgressListener() {}, fillWithAI() {},
     isFixedRosterTable: () => false, sendProgressToPlayer() {}, takeAiSeatForJoin: () => -1, aiSeatTakeableNow: () => false,
+    planAiSeatForJoin: () => -1, takePlannedAiSeat: () => true,
     releaseSeatedSlot() {}, reconnectTournamentFields: () => ({}),
     // autoStartNextHand's side steps
     reloadAndCapBotStacks() {}, isFixedRosterQuickTable: () => false, trimExcessAI() {}, dealersChoiceState: new Map(),
