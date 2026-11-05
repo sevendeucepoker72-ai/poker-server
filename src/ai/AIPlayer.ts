@@ -1565,8 +1565,8 @@ export const FIVE_DRAW_STACKOFF_PREMIUM = 0.965;
 export const FIVE_DRAW_LIGHT_RERAISE_FRACTION = 0.10;
 
 /**
- * Fix round 2 follow-up — Five Card Draw's value set also holds every A PAIR OF ACES
- * OR BETTER by its made-hand class (two pair+ 7.6% of deals, a pair of aces 3.3%):
+ * Fix round 2 follow-up — Five Card Draw's value set also holds every pair of aces
+ * or better by its made-hand class (two pair+ 7.6% of deals, a pair of aces 3.3%):
  * the 600-sim percentile is noisy at the top and ranks low two pair (3-3-2-2-K
  * 0.85-0.90) and some pairs of aces (from 0.87) under the 0.90 cut, so a NIT still
  * folded them to one 3 BB open. The bot's own five cards only.
@@ -1672,7 +1672,7 @@ function studDrawFirstRound(
   // or better by class) facing ONE completion / raise, or only the bring-in / big blind,
   // calls instead of folding. No-limit: a FIVE_DRAW_STACKOFF_PREMIUM hand never folds to
   // a 3-bet or a short all-in that does not commit it (the B4 sizing put ROCK / FISH's
-  // threshold at 0.98: they folded full houses 17-43% to a 25-32 BB 3-bet).
+  // threshold at 0.98: they folded full houses 17-47% to a 25-32 BB 3-bet).
   const inValueSet = raw >= STUD_DRAW_VALUE_PCTILE[kind] || (kind === 'draw-hi' && fiveDrawAcesOrBetter(seat.holeCards));
   const FOLD_VS_RAISE: AIDecision = ((unopened || (facingRaise && !facingThreeBet)) && inValueSet)
     || (noLimit && facingThreeBet && raw >= FIVE_DRAW_STACKOFF_PREMIUM) ? CALL : FOLD;
