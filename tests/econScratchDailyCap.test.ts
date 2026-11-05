@@ -166,3 +166,93 @@ describe('E7 — tickScratchProgress: one atomic UPDATE with the Denver-day cap'
     expect(await am.tickScratchProgress(7)).toBe(false);
   });
 });
+
+/**
+ * Fix round 2 (2026-11-05, ECON-R2 / SCD-1) — the cap's two columns come from two boot
+ * ALTERs whose errors initDB used to swallow (`.catch(() => {})`): if they did not apply
+ * (a lock wait past the pool's 8 s statement_timeout in a deploy overlap), every tick's
+ * UPDATE failed with 42703 for the whole boot — no hand moved anyone toward a card, and
+ * nothing said so. Now the failure is logged `[scratch-cap-columns]` and flagged
+ * (scratchCapColumnState, health economy.handRewards.scratchCapColumns), and a tick that
+ * finds a column missing runs the pre-cap UPDATE (0dc1b96's: no daily cap).
+ * Fails on d1ec56a: no scratchCapColumnState; the 42703 tick returns false.
+ */
+describe('fix round 2 (ECON-R2 / SCD-1) — a missing cap column never stops scratch progress', () => {
+  const undefinedColumn = () => Object.assign(new Error('column "scratch_earned_on" does not exist'), { code: '42703' });
+  const tagged = (spy: jest.SpyInstance) => spy.mock.calls.map((c) => String(c[0])).filter((l) => l.startsWith('[scratch-cap-columns] '))
+    .map((l) => JSON.parse(l.slice('[scratch-cap-columns] '.length)));
+  let err: jest.SpyInstance;
+  beforeEach(() => { err = jest.spyOn(console, 'error').mockImplementation(() => {}); });
+  afterEach(() => err.mockRestore());
+
+  it('initDB: each failed scratch_earned_* ALTER is logged (tagged, naming the column) and flagged; initDB still resolves; a clean boot flags nothing', async () => {
+    const am = loadWith(undefined);
+    mockPg.reply = (sql) => (/ADD COLUMN IF NOT EXISTS scratch_earned_/.test(sql) ? Object.assign(new Error('canceling statement due to statement timeout'), { code: '57014' }) : undefined);
+    await expect(initFake(am)).resolves.toBeUndefined();
+    expect(am.scratchCapColumnState).toMatchObject({ alterFailed: true, alterFailures: 2, uncappedTicks: 0, lastError: 'canceling statement due to statement timeout' });
+    expect(tagged(err)).toEqual([
+      { event: 'alter_failed', column: 'scratch_earned_on', code: '57014', error: 'canceling statement due to statement timeout' },
+      { event: 'alter_failed', column: 'scratch_earned_today', code: '57014', error: 'canceling statement due to statement timeout' },
+    ]);
+
+    const clean = loadWith(undefined);
+    mockPg.reply = null;
+    err.mockClear();
+    await initFake(clean);
+    expect(clean.scratchCapColumnState).toEqual({ alterFailed: false, alterFailures: 0, uncappedTicks: 0, lastError: null });
+    expect(tagged(err)).toEqual([]);
+  });
+
+  it('a tick whose capped UPDATE fails with 42703 runs the pre-cap UPDATE (no scratch_earned_*, params [userId, 20]) and returns its tick (capped:false); counted, logged once', async () => {
+    const am = loadWith(undefined);
+    await initFake(am);
+    mockPg.queries = [];
+    mockPg.reply = (sql) => (/scratch_earned/.test(sql) ? undefinedColumn()
+      : /hands_since_last_scratch\s*=/.test(sql) ? { rows: [{ hands_since_last_scratch: 0, chips: '777', stars: 3, scratch_cards_available: 2 }], rowCount: 1 } : undefined);
+    expect(await am.tickScratchProgress(7)).toEqual({ awarded: true, chips: 777, stars: 3, scratchCardsAvailable: 2, capped: false });
+    const ticks = mockPg.queries.filter((q) => /hands_since_last_scratch\s*=/.test(q.sql));
+    expect(ticks).toHaveLength(2);
+    expect(ticks[0].sql).toContain('scratch_earned_on');              // the capped statement first
+    const fallback = ticks[1].sql.replace(/\s+/g, ' ');
+    expect(fallback).not.toContain('scratch_earned');
+    expect(fallback).toContain('hands_since_last_scratch = CASE WHEN hands_since_last_scratch + 1 >= $2 THEN 0 ELSE hands_since_last_scratch + 1 END');
+    expect(fallback).toContain('scratch_cards_available = scratch_cards_available + CASE WHEN hands_since_last_scratch + 1 >= $2 THEN 1 ELSE 0 END');
+    expect(fallback).toMatch(/WHERE id = \$1 RETURNING hands_since_last_scratch, chips, stars, scratch_cards_available$/);
+    expect(ticks[1].params).toEqual([7, 20]);
+    await am.tickScratchProgress(7);
+    expect(am.scratchCapColumnState.uncappedTicks).toBe(2);
+    expect(tagged(err).map((l) => l.event)).toEqual(['uncapped_tick']);   // the first one (then every 1000th)
+  });
+
+  it('20 ticks with the columns missing bank exactly ONE card (a stateful row); d1ec56a banked none and every tick returned false', async () => {
+    const am = loadWith(undefined);
+    await initFake(am);
+    const row = { hands_since_last_scratch: 0, chips: 1000, stars: 0, scratch_cards_available: 0 };
+    mockPg.reply = (sql, params) => {
+      if (/scratch_earned/.test(sql)) return undefinedColumn();
+      if (!/hands_since_last_scratch\s*=/.test(sql)) return undefined;
+      const per = Number((params as unknown[])[1]);
+      const hit = row.hands_since_last_scratch + 1 >= per;
+      row.scratch_cards_available += hit ? 1 : 0;
+      row.hands_since_last_scratch = hit ? 0 : row.hands_since_last_scratch + 1;
+      return { rows: [{ ...row }], rowCount: 1 };
+    };
+    const out: any[] = [];
+    for (let i = 0; i < 20; i++) out.push(await am.tickScratchProgress(7));
+    expect(out.every((t) => t && typeof t === 'object' && t.capped === false)).toBe(true);
+    expect(out.filter((t) => t.awarded)).toHaveLength(1);
+    expect(out[19].awarded).toBe(true);
+    expect(row).toMatchObject({ hands_since_last_scratch: 0, scratch_cards_available: 1 });
+    expect(am.scratchCapColumnState.uncappedTicks).toBe(20);
+  });
+
+  it('any other error is no fallback: false, one statement (a missing row / a pool error is not a missing column)', async () => {
+    const am = loadWith(undefined);
+    await initFake(am);
+    mockPg.queries = [];
+    mockPg.reply = (sql) => (/hands_since_last_scratch\s*=/.test(sql) ? Object.assign(new Error('connection terminated'), { code: '57P01' }) : undefined);
+    expect(await am.tickScratchProgress(7)).toBe(false);
+    expect(mockPg.queries.filter((q) => /hands_since_last_scratch\s*=/.test(q.sql))).toHaveLength(1);
+    expect(am.scratchCapColumnState.uncappedTicks).toBe(0);
+  });
+});

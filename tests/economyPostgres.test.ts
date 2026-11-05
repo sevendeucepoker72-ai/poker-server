@@ -307,6 +307,29 @@ d('economy on a real Postgres', () => {
       expect(both.filter((t: any) => t.awarded)).toHaveLength(1);
       expect(await scratchRow(id)).toMatchObject({ hs: 1, cards: 1, today_n: cap });
     });
+
+    it('(f) fix round 2 (ECON-R2 / SCD-1): the two columns MISSING (their boot ALTER failed) — 20 ticks still bank one card (the pre-cap UPDATE, 42703 fallback); the columns back, the cap is back', async () => {
+      const id = await mkUser();
+      const uncappedBefore = am.scratchCapColumnState.uncappedTicks;
+      await pool.query('ALTER TABLE users DROP COLUMN scratch_earned_on, DROP COLUMN scratch_earned_today');
+      const warn = jest.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const out = await ticks(id, per);
+        expect(out.every((t) => t && t.capped === false)).toBe(true);
+        expect(out.filter((t) => t.awarded)).toHaveLength(1);
+        expect(out[per - 1]).toMatchObject({ awarded: true, scratchCardsAvailable: 1 });
+        expect(am.scratchCapColumnState.uncappedTicks - uncappedBefore).toBe(per);
+      } finally {
+        warn.mockRestore();
+        // initDB's own two ALTERs put the columns back (as the next boot would)
+        await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS scratch_earned_on DATE');
+        await pool.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS scratch_earned_today INTEGER NOT NULL DEFAULT 0');
+      }
+      const back = await ticks(id, per);
+      expect(back.filter((t) => t.awarded)).toHaveLength(1);
+      expect(await scratchRow(id)).toEqual({ hs: 0, cards: 2, today_n: 1, earned_on: await denver() });
+      expect(am.scratchCapColumnState.uncappedTicks - uncappedBefore).toBe(per);   // the capped statement again
+    });
   });
 
   describe('purchases (C7 / C8 / ECON-16)', () => {

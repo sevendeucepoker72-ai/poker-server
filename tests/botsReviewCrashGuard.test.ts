@@ -54,7 +54,7 @@ function seedRandom(seed: number): () => void {
   return () => { Math.random = orig; };
 }
 const total = (t: PokerTable) => t.seats.reduce((a, s) => a + (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : 0), 0);
-const COUNTERS = ['actionThrows', 'drawThrows', 'autoStartThrows', 'heartbeatThrows', 'actedFor', 'turnAdvanced', 'stoodPat', 'autoStartRetried',
+const COUNTERS = ['actionThrows', 'drawThrows', 'autoStartThrows', 'heartbeatThrows', 'turnClockThrows', 'drawClockThrows', 'actedFor', 'turnAdvanced', 'stoodPat', 'autoStartRetried',
   'showdownFaults', 'showdownResolved', 'showdownPaidFinished', 'showdownVoided', 'showdownHeld', 'recoveryThrows', 'logLinesSuppressed'];
 
 interface WorldOpts {
@@ -506,7 +506,7 @@ describe('C1 — a throw on a bot timer is recovered, never left to the process 
     const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'index.ts'), 'utf8');
     expect(src.split('try { autoStartNextHand(').length - 1).toBe(4);
     expect(src).toContain('if (table.currentPhase === GamePhase.Showdown && gameShowdownHeld(table)) {');
-    expect(src).toContain('gameTimers: { ...gameTimerGuardStats },');
+    expect(src).toContain("gameTimers: healthSection('crashSafety.gameTimers', () => ({ ...gameTimerGuardStats })),");
     expect(src).toContain("try { ensureCashTableRunning(t.tableId); } catch (err) { gameTimerGuardStats.heartbeatThrows++;");
   });
 });

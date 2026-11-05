@@ -119,6 +119,7 @@ describe('table commentary: only to a room somebody is in; counted', () => {
   });
 
   it('(7) /api/health engine.commentary: the key as a boolean only, the interval and the counts', () => {
-    expect(SRC).toContain('commentary: { keyConfigured: !!process.env.ANTHROPIC_API_KEY, minIntervalMs: TABLE_COMMENTARY_MIN_INTERVAL_MS, ...tableCommentaryStats }');
+    // Fix round 2 — built fail-safe (healthSection: a throw answers { error } for this section only).
+    expect(SRC).toContain("commentary: healthSection('engine.commentary', () => ({ keyConfigured: !!process.env.ANTHROPIC_API_KEY, minIntervalMs: TABLE_COMMENTARY_MIN_INTERVAL_MS, ...tableCommentaryStats }))");
   });
 });

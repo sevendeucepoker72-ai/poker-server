@@ -267,13 +267,20 @@ describe('HT5 — tableCommentary is never generated for a qualifier table', () 
     class Anthropic { messages = { create: async () => { created.push('create'); return { content: [{ type: 'text', text: 'What a pot!' }] }; } }; }
     const roomEmits: Array<[string, string, any]> = [];
     const code = `${HELP}\nfunction commentary(table, tableId, data) {\n${BLOCK}\n}`;
+    const tableCommentaryStats = { calls: 0, delivered: 0, emptyReplies: 0, failed: 0, skippedNoAudience: 0 };
     const { exports: m } = load(code, {
       ...w.scope, process: { env: { ANTHROPIC_API_KEY: 'k' } }, Anthropic, tableCommentaryLastEmit: new Map(), TABLE_COMMENTARY_MIN_INTERVAL_MS: 0,
       // Bots review 2026-11-04 — the line goes only to a room someone is in (C1 has one socket).
-      tableCommentaryStats: { calls: 0, delivered: 0, emptyReplies: 0, failed: 0, skippedNoAudience: 0 },
-      io: { to: (r: string) => ({ emit: (ev: string, d: any) => roomEmits.push([r, ev, d]) }), sockets: { adapter: { rooms: new Map([['table:C1', new Set(['S1'])]]) } } },
+      // Fix round 2 (TI-1) — the qualifier rooms are OCCUPIED too (a live qualifier table always
+      // has seated players), so the qualifier gate — not the audience rule — is what keeps the
+      // model calls at 0 there: dropping the gate fails this test on its own.
+      tableCommentaryStats,
+      io: {
+        to: (r: string) => ({ emit: (ev: string, d: any) => roomEmits.push([r, ev, d]) }),
+        sockets: { adapter: { rooms: new Map([['table:C1', new Set(['S1'])], ['table:QS1', new Set(['QS1-sock'])], ['table:QOV', new Set(['QOV-sock'])]]) } },
+      },
     }, '{ commentary, qualifierHelpToolsOff }');
-    return { m, created, roomEmits };
+    return { m, created, roomEmits, tableCommentaryStats };
   }
   it('a notable hand at the qualifier start table and its overflow table: 0 model calls, nothing emitted; at a cash table: 1 call, the line emitted (9c37499: called at the qualifier table)', async () => {
     const w = world();
@@ -285,6 +292,8 @@ describe('HT5 — tableCommentary is never generated for a qualifier table', () 
     expect(x.created).toEqual([]);
     expect(x.roomEmits).toEqual([]);
     expect(x.m.qualifierHelpToolsOff.commentarySkipped).toBe(2);
+    // the audience rule was never reached at a qualifier table (both rooms have someone in them)
+    expect(x.tableCommentaryStats).toEqual({ calls: 0, delivered: 0, emptyReplies: 0, failed: 0, skippedNoAudience: 0 });
     x.m.commentary(w.tables.get('C1'), 'C1', notable);
     await flush();
     expect(x.created).toEqual(['create']);
