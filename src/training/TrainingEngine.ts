@@ -1,11 +1,14 @@
 import { Card, Rank, Suit } from '../game/Card';
 import { CardDeck } from '../game/CardDeck';
-import { evaluateHand, compareTo, HandRank, HandResult } from '../game/HandEvaluator';
-import { evaluateOmahaHand } from '../game/HandEvaluatorExtensions';
+import { evaluateHand, compareTo, HandRank } from '../game/HandEvaluator';
+import { evaluateShortDeckHand } from '../game/HandEvaluatorExtensions';
+import { pineappleDiscardIndex } from '../game/variants/pineappleKeep';
 import { percentileByRanks } from '../ai/preflopRanges';
+import { shortDeckPercentileByRanks } from '../ai/shortDeckPreflop';
+import { cardCode, omahaHighScore, omahaLowScore, boardAllowsLow, NO_LOW } from './fastOmahaEval';
 
 export interface TrainingData {
-  equity: number; // 0-100 win probability
+  equity: number; // 0-100: win probability; at Omaha Hi-Lo the expected share of the pot
   potOdds: number; // pot odds as percentage
   suggestedAction: string; // 'fold' | 'check' | 'call' | 'raise'
   suggestedRaiseAmount?: number;
@@ -68,46 +71,27 @@ function shuffleArray<T>(arr: T[]): void {
   }
 }
 
-/** Evaluate a hand, upgrading the SHORT-DECK ace-low wheel A-6-7-8-9 to a
- * 9-high straight (the standard evaluator only wheels A-2-3-4-5, which don't
- * exist in short-deck). Only fires when the normal result is below a straight. */
-function evaluateMaybeShortDeck(cards: Card[], shortDeck: boolean): HandResult {
-  const r = evaluateHand(cards);
-  if (!shortDeck || r.handRank >= HandRank.Straight) return r;
-  const ranks = new Set(cards.map((c) => c.rank));
-  const hasWheel = ranks.has(Rank.Ace) && ranks.has(Rank.Six) && ranks.has(Rank.Seven) && ranks.has(Rank.Eight) && ranks.has(Rank.Nine);
-  if (!hasWheel) return r;
-  // Straight flush if the five wheel ranks share one suit.
-  const bySuit = new Map<number, Set<number>>();
-  for (const c of cards) { let s = bySuit.get(c.suit); if (!s) { s = new Set(); bySuit.set(c.suit, s); } s.add(c.rank); }
-  for (const [, rs] of bySuit) {
-    if (rs.has(Rank.Ace) && rs.has(Rank.Six) && rs.has(Rank.Seven) && rs.has(Rank.Eight) && rs.has(Rank.Nine)) {
-      return { handRank: HandRank.StraightFlush, primaryValue: Rank.Nine, kickers: [], bestFiveCards: [], handName: '9-high Straight Flush' };
-    }
-  }
-  return { handRank: HandRank.Straight, primaryValue: Rank.Nine, kickers: [], bestFiveCards: [], handName: '9-high Straight' };
-}
-
-/** Compare two hands, applying the short-deck rule that a FLUSH beats a FULL
- * HOUSE (the only ranking swap vs standard Hold'em). */
-function compareShortDeck(a: HandResult, b: HandResult, shortDeck: boolean): number {
-  if (shortDeck) {
-    const aF = a.handRank === HandRank.Flush, aFH = a.handRank === HandRank.FullHouse;
-    const bF = b.handRank === HandRank.Flush, bFH = b.handRank === HandRank.FullHouse;
-    if (aF && bFH) return 1;
-    if (aFH && bF) return -1;
-  }
-  return compareTo(a, b);
-}
-
 /**
- * 2026-10-11 (.online R2, GAME-8) — the two hole cards a HOLD'EM-style hand
- * plays when it holds more: a (Crazy) Pineapple seat keeps all but its weakest
- * card (PineappleTable.autoDiscardOne drops the lowest rank, ties to the lowest
- * suit). calculateEquity's Hold'em model is only ever run on these two.
+ * The two hole cards a HOLD'EM-style hand plays when it holds more
+ * (2026-10-11 .online R2, GAME-8; bots review 2026-11-04, B7).
+ * calculateEquity's Hold'em model is only ever run on these two.
+ *
+ * - 2 cards or fewer: the hole, unchanged.
+ * - Exactly 3 cards (a (Crazy) Pineapple seat): the two that
+ *   pineappleDiscardIndex keeps — the ONE keep rule the engine's no-pick
+ *   fallback also uses. Before the flop that is the pair with the best
+ *   pre-flop percentile (77K keeps 77); with `board` of 3 or more cards
+ *   (the Crazy Pineapple flop) the card whose loss leaves the best hand is
+ *   dropped. Card order is kept, as the engine's splice keeps it.
+ * - More than 3 cards (a Stud bot's 7): drop the lowest rank (ties to the
+ *   lowest suit) until two remain.
  */
-export function keptHoldemHoleCards(hole: Card[]): Card[] {
+export function keptHoldemHoleCards(hole: Card[], board: Card[] = []): Card[] {
   if (!hole || hole.length <= 2) return hole;
+  if (hole.length === 3) {
+    const d = pineappleDiscardIndex(hole, board);
+    return hole.filter((_c, i) => i !== d);
+  }
   const cards = hole.slice();
   while (cards.length > 2) {
     let worst = 0;
@@ -133,37 +117,48 @@ const MIN_BUDGETED_SIMULATIONS = 64;
  * `maxMs` (> 0) bounds the wall-clock time: the loop stops after at least
  * MIN_BUDGETED_SIMULATIONS once the budget is spent (the bots pass one). The
  * result is over the simulations actually run.
+ * Bots review 2026-11-04 (equity-variants C2): Omaha runs in omahaEquity
+ * (opponents hold the hero's card count; Hi-Lo is the expected pot share), and
+ * Short Deck uses the engine's own Short Deck evaluator and pre-flop table.
  */
 export function calculateEquity(
   holeCards: Card[],
   communityCards: Card[],
   numOpponents: number,
   // 2026-06-19: Omaha awareness (default false → unchanged Hold'em path). Omaha
-  // uses exactly-2-hole + 3-board and 4-card opponents; the old any-5/2-card
-  // model made Omaha equity meaningless.
+  // uses exactly 2 hole + 3 board cards; the old any-5/2-card model made Omaha
+  // equity meaningless. 2026-11-04 (B6): every opponent holds as many cards as
+  // the hero (4, 5 or 6) — see omahaEquity.
   omaha: boolean = false,
   // 2026-07-07 AI overhaul: RANGE-AWARE equity. When > 0, each opponent's hole
   // cards are reject-sampled to a hand with preflop percentile >= oppMinPctile,
   // instead of a uniformly-random hand. This models the fact that an opponent
   // who has bet/raised has a STRONGER-than-random range, so the bot no longer
   // systematically over-estimates its equity against aggression. Hold'em only
-  // (Omaha keeps the 4-random-card model). Default 0 = unchanged random-range.
+  // (Omaha opponents stay random hands). Default 0 = unchanged random-range.
   oppMinPctile: number = 0,
   // 2026-07-07 AI overhaul: SHORT-DECK (6+ Hold'em). Removes 2-5 (36-card deck)
-  // so straight/flush frequencies are realistic, and applies the short-deck rule
-  // that a FLUSH beats a FULL HOUSE. Was previously mis-modeled on a full 52-card
-  // deck with standard rankings, making short-deck equity simply wrong.
+  // so straight/flush frequencies are realistic. 2026-11-04 (B13): hands are
+  // ranked by the engine's own evaluateShortDeckHand (the one ShortDeckTable's
+  // showdown uses: trips beat a straight, a flush beats a full house, A-6-7-8-9
+  // is a straight) and the range sampler reads the Short Deck pre-flop table.
   shortDeck: boolean = false,
-  maxMs: number = 0
+  maxMs: number = 0,
+  // 2026-11-04 (bots review, Omaha Hi-Lo): with `omaha`, the result is the
+  // hero's expected SHARE of the pot (half to the best high, half to the best
+  // 8-or-better low, ties split, the high scoops when no low qualifies) instead
+  // of a high-only win probability. Ignored without `omaha`.
+  hiLo: boolean = false
 ): number {
   if (holeCards.length < 2) return 50;
   if (numOpponents < 1) return 100;
-  if (!omaha && holeCards.length > 2) holeCards = keptHoldemHoleCards(holeCards);
+  if (omaha) return omahaEquity(holeCards, communityCards, numOpponents, maxMs, hiLo);
+  if (holeCards.length > 2) holeCards = keptHoldemHoleCards(holeCards, communityCards);
 
   const NUM_SIMULATIONS = 500;
   const deadline = maxMs > 0 ? Date.now() + maxMs : 0;
   let simsRun = 0;
-  const narrow = oppMinPctile > 0 && !omaha;
+  const narrow = oppMinPctile > 0;
   let wins = 0;
   let ties = 0;
 
@@ -177,7 +172,7 @@ export function calculateEquity(
   const remainingDeck = fullDeck.filter((c) => !knownSet.has(cardKey(c)) && (!shortDeck || c.rank >= Rank.Six));
 
   const communityNeeded = 5 - communityCards.length;
-  const holePerOpp = omaha ? 4 : 2;
+  const holePerOpp = 2;
   const cardsNeeded = communityNeeded + numOpponents * holePerOpp;
 
   for (let sim = 0; sim < NUM_SIMULATIONS; sim++) {
@@ -197,11 +192,11 @@ export function calculateEquity(
       simCommunity.push(remainingDeck[idx++]);
     }
 
-    // Evaluate player's hand (Omaha uses the 2-of-hole + 3-of-board evaluator;
-    // short-deck upgrades the A-6-7-8-9 wheel to a straight).
-    const playerResult = omaha
-      ? evaluateOmahaHand(holeCards, simCommunity)
-      : evaluateMaybeShortDeck([...holeCards, ...simCommunity], shortDeck);
+    // Evaluate player's hand (Short Deck: the engine's Short Deck evaluator,
+    // the one ShortDeckTable's showdown uses).
+    const playerResult = shortDeck
+      ? evaluateShortDeckHand([...holeCards, ...simCommunity])
+      : evaluateHand([...holeCards, ...simCommunity]);
 
     // Deal and evaluate opponent hands
     let playerWins = true;
@@ -221,7 +216,7 @@ export function calculateEquity(
           const j = (idx + 1) + Math.floor(Math.random() * (len - idx - 1));
           const tmp2 = remainingDeck[idx + 1]; remainingDeck[idx + 1] = remainingDeck[j]; remainingDeck[j] = tmp2;
           const c1 = remainingDeck[idx], c2 = remainingDeck[idx + 1];
-          if (percentileByRanks(c1.rank, c2.rank, c1.suit === c2.suit) >= oppMinPctile) { qualified = true; break; }
+          if ((shortDeck ? shortDeckPercentileByRanks : percentileByRanks)(c1.rank, c2.rank, c1.suit === c2.suit) >= oppMinPctile) { qualified = true; break; }
         }
         // 2026-07-07 review fix: if 32 tries never met a very tight range floor,
         // do NOT leave the last RANDOM pair (that biases our equity UPWARD, since
@@ -243,11 +238,11 @@ export function calculateEquity(
       }
       const oppHole: Card[] = [];
       for (let h = 0; h < holePerOpp; h++) oppHole.push(remainingDeck[idx++]);
-      const oppResult = omaha
-        ? evaluateOmahaHand(oppHole, simCommunity)
-        : evaluateMaybeShortDeck([...oppHole, ...simCommunity], shortDeck);
+      const oppResult = shortDeck
+        ? evaluateShortDeckHand([...oppHole, ...simCommunity])
+        : evaluateHand([...oppHole, ...simCommunity]);
 
-      const cmp = compareShortDeck(playerResult, oppResult, shortDeck);
+      const cmp = compareTo(playerResult, oppResult);
       if (cmp < 0) {
         playerWins = false;
         isTie = false;
@@ -268,6 +263,117 @@ export function calculateEquity(
   // budgeted run may stop early; a deck too small for the field runs none).
   if (simsRun === 0) return 50;
   const equity = ((wins + ties / 2) / simsRun) * 100;
+  return Math.round(equity * 10) / 10;
+}
+
+/**
+ * Omaha-family equity (bots review 2026-11-04, equity-variants C2: B6 and
+ * Omaha Hi-Lo). Exactly 2 hole + 3 board cards, scored with the allocation-free
+ * fastOmahaEval (the engine's showdown is untouched).
+ *
+ * - B6: every opponent holds as many cards as the hero (4, 5 or 6) — 5- and
+ *   6-card Omaha opponents used to be modelled with 4 cards (+9 / +16 equity
+ *   points). Seat caps keep the deck sufficient (omaha-6: 6 seats, 41 cards;
+ *   omaha-5: 8 seats, 45 cards).
+ * - hiLo = false: a win beats everyone; tying the best counts 1/2; the loop
+ *   stops at the first opponent who beats the hero. For 4-card hands this is
+ *   bit-identical to the engine-evaluator loop it replaces, under the same seed.
+ * - hiLo = true: the hero's expected SHARE of the pot, as
+ *   OmahaTable.determineWinners pays it: half to the best high (ties split
+ *   1/nHi), half to the best 8-or-better low (ties split 1/nLo), the high
+ *   scoops when no low qualifies. The odd chip is ignored.
+ *
+ * Consumes Math.random exactly as the engine-evaluator loop did: the remaining
+ * deck in buildFullDeck order, one shuffle per simulation (before the deck-size
+ * check), the board dealt first, then each opponent in order. The time budget
+ * is calculateEquity's (MIN_BUDGETED_SIMULATIONS, checked every 16).
+ */
+function omahaEquity(
+  holeCards: Card[],
+  communityCards: Card[],
+  numOpponents: number,
+  maxMs: number,
+  hiLo: boolean
+): number {
+  const NUM_SIMULATIONS = 500;
+  const deadline = maxMs > 0 ? Date.now() + maxMs : 0;
+
+  const known = new Uint8Array(64);
+  for (const c of holeCards) known[cardCode(c)] = 1;
+  for (const c of communityCards) known[cardCode(c)] = 1;
+  const remaining: number[] = [];
+  for (const c of buildFullDeck()) {
+    const code = cardCode(c);
+    if (!known[code]) remaining.push(code);
+  }
+
+  const hero = holeCards.map(cardCode);
+  const hn = hero.length;
+  const holePerOpp = Math.max(4, hn);
+  const boardKnown = Math.min(5, communityCards.length);
+  const communityNeeded = 5 - boardKnown;
+  const cardsNeeded = communityNeeded + numOpponents * holePerOpp;
+  const board: number[] = [0, 0, 0, 0, 0];
+  for (let i = 0; i < boardKnown; i++) board[i] = cardCode(communityCards[i]);
+  const opp: number[] = new Array(holePerOpp).fill(0);
+
+  let simsRun = 0;
+  let wins = 0;
+  let ties = 0;
+  let share = 0;
+
+  for (let sim = 0; sim < NUM_SIMULATIONS; sim++) {
+    if (deadline && sim >= MIN_BUDGETED_SIMULATIONS && (sim & 15) === 0 && Date.now() > deadline) break;
+    shuffleArray(remaining);
+    if (remaining.length < cardsNeeded) break;
+    simsRun++;
+
+    let idx = 0;
+    for (let i = boardKnown; i < 5; i++) board[i] = remaining[idx++];
+    const hHi = omahaHighScore(hero, hn, board);
+
+    if (!hiLo) {
+      let playerWins = true;
+      let isTie = false;
+      for (let o = 0; o < numOpponents; o++) {
+        for (let h = 0; h < holePerOpp; h++) opp[h] = remaining[idx++];
+        const oHi = omahaHighScore(opp, holePerOpp, board);
+        if (oHi > hHi) {
+          playerWins = false;
+          isTie = false;
+          break;
+        } else if (oHi === hHi) {
+          isTie = true;
+        }
+      }
+      if (playerWins && !isTie) wins++;
+      else if (playerWins && isTie) ties++;
+      continue;
+    }
+
+    const lowLive = boardAllowsLow(board);
+    const hLo = lowLive ? omahaLowScore(hero, hn, board) : NO_LOW;
+    let bestHi = hHi;
+    let nHi = 1;
+    let bestLo = hLo;
+    let nLo = hLo === NO_LOW ? 0 : 1;
+    for (let o = 0; o < numOpponents; o++) {
+      for (let h = 0; h < holePerOpp; h++) opp[h] = remaining[idx++];
+      const oHi = omahaHighScore(opp, holePerOpp, board);
+      if (oHi > bestHi) { bestHi = oHi; nHi = 1; } else if (oHi === bestHi) nHi++;
+      if (lowLive) {
+        const oLo = omahaLowScore(opp, holePerOpp, board);
+        if (oLo !== NO_LOW) {
+          if (oLo < bestLo) { bestLo = oLo; nLo = 1; } else if (oLo === bestLo) nLo++;
+        }
+      }
+    }
+    const heroHi = hHi === bestHi ? 1 / nHi : 0;
+    share += bestLo === NO_LOW ? heroHi : 0.5 * heroHi + (hLo === bestLo ? 0.5 / nLo : 0);
+  }
+
+  if (simsRun === 0) return 50;
+  const equity = hiLo ? (share / simsRun) * 100 : ((wins + ties / 2) / simsRun) * 100;
   return Math.round(equity * 10) / 10;
 }
 
@@ -604,11 +710,14 @@ export function getFullTrainingData(
   potSize: number,
   chipStack: number,
   phase: string,
-  isOmaha: boolean = false
+  isOmaha: boolean = false,
+  // 2026-11-04 (bots review C7): at Omaha Hi-Lo the coach's equity is the
+  // expected share of the split pot, not a high-only win probability.
+  isHiLo: boolean = false
 ): TrainingData {
   // Omaha changes both equity (must use exactly 2 of 4 hole cards) and out
   // counting — without the flag the coach graded Omaha hands as Hold'em.
-  const equity = calculateEquity(holeCards, communityCards, numOpponents, isOmaha);
+  const equity = calculateEquity(holeCards, communityCards, numOpponents, isOmaha, 0, false, 0, isHiLo);
   const potOdds = calculatePotOdds(callAmount, potSize);
   const { outs, drawType } = countOuts(holeCards, communityCards, isOmaha);
   const handStrength = describeHandStrength(holeCards, communityCards);
