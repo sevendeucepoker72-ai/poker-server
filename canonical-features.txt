@@ -915,6 +915,30 @@ seat_teardown_deferred
 takeAiSeatForJoin(
 aiSeatTakeableNow(
 stripBotsAfterHandIfMarked(tableId);
+# 2026-11-04 (bots review, server lane: server-stability C1-C9, stud-draw SD6-SD8, equity C7, economy E3/E5-E12)
+# - A-crash: a throw on a game timer is recovered ([game-timer-error]); a faulted Showdown is finished / voided /
+#   held, never re-paid (PokerTable.completeHandAfterFault). A-vanish: a join PLANS a mid-hand bot seat and takes it
+#   at its commit. The last human leaving by any path strips the bots. Commentary only to a room someone is in;
+#   club tables re-created for members only, never dealt with nobody seated. Draw tables never stall on a missing
+#   profile map; Stud Third Street feeds the opponent model. The Omaha Hi-Lo coach prices the pot share.
+#   Economy: AoF at 20/40; the idle-hand reward gate (30), walks not wins, the daily scratch notice; bot flow tally.
+[game-timer-error]
+completeHandAfterFault(
+planAiSeatForJoin(
+takePlannedAiSeat(
+stripBotsIfLastHumanLeft(
+skippedNoAudience
+recreateSkippedNotMember
+idleDealsSkipped
+const isHiLo = isOmaha &&
+firstBettingRound
+Missing profile map for
+scratch_daily_limit
+function recordBotFlow(
+takeHandParticipation(
+humansTookFromBots
+walksNotCounted
+AOF_BIG_BLIND
 heartbeatRestarts.handComplete++;
 reloadAndCapBotStacks(table, tableId, isFixedRosterQuickTable(tableId));
 # 2026-10-24 (owner: "No limit at all") — the 3-buy-in bot reset is RETIRED:
