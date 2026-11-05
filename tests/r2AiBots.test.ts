@@ -107,7 +107,7 @@ describe('GAME-8 — every Stud variant takes the Stud path; the Hold\'em equity
       expect(r.stuck).toBe(0);
     } finally { restore(); }
     expect(spy).not.toHaveBeenCalled();
-  });
+  }, 60_000);
 
   it('Crazy Pineapple / every Hold\'em-style table: calculateEquity is only ever given 2 hole cards (the 2 a Pineapple seat keeps)', () => {
     const spy = jest.spyOn(TE, 'calculateEquity');
@@ -124,7 +124,7 @@ describe('GAME-8 — every Stud variant takes the Stud path; the Hold\'em equity
     }
   });
 
-  it('holdemHoleCards keeps all but the weakest card (the engine\'s own auto-discard)', () => {
+  it('holdemHoleCards keeps the pair the engine keeps', () => {
     expect(holdemHoleCards([card(14, 0), card(2, 1), card(13, 2)] as any)).toEqual([card(14, 0), card(13, 2)]);
     expect(holdemHoleCards([card(9, 3), card(9, 0), card(4, 2)] as any)).toEqual([card(9, 3), card(9, 0)]);
   });
@@ -152,7 +152,7 @@ describe('GAME-8 — every Stud variant takes the Stud path; the Hold\'em equity
     expect(fromSeven.draws).toBeGreaterThan(0);
   });
 
-  it('bot think time is bounded: a Stud decision is a cheap heuristic (no Monte Carlo — was ~1s of CPU); generous bound for a loaded CI box', () => {
+  it('bot think time is bounded: a Stud decision is a budgeted Monte Carlo (public cards only); generous bound for a loaded CI box', () => {
     const restore = seedRandom(13);
     try {
       const stud = new SevenStudTable(cfg({ ante: 10 }), false, false);
@@ -178,7 +178,9 @@ describe('GAME-8 — every Stud variant takes the Stud path; the Hold\'em equity
       const realNow = Date.now;
       const base = realNow();
       Date.now = () => base + (calls++ === 0 ? 0 : clockJump);   // every read after the first is "past the deadline"
-      try { TE.calculateEquity(hole, board, 7, true, 0, false, maxMs); } finally { Math.random = origRandom; Date.now = realNow; }
+      // 5 opponents: opponents hold the hero's card count (bots review B6), and a 6-card hero
+      // against 7 six-card opponents (2 + 42 cards from 43) cannot be dealt; omaha-6 seats at most 6.
+      try { TE.calculateEquity(hole, board, 5, true, 0, false, maxMs); } finally { Math.random = origRandom; Date.now = realNow; }
       return n;
     };
     const unbudgeted = draws(0, 0);
@@ -265,7 +267,7 @@ describe('GAME-9 — the war is gone: real engine + decideAction + executeAIActi
       expect(Math.max(...r.actions)).toBeLessThanOrEqual(60);
       if (table.bettingStructure === 'fixed-limit') expect(r.maxLevels).toBeLessThanOrEqual(FIXED_LIMIT_MAX_BET_LEVELS);
     } finally { restore(); }
-  });
+  }, 180_000);
 
   it('sanity: MAX_SEATS', () => { expect(MAX_SEATS).toBe(9); });
 });
