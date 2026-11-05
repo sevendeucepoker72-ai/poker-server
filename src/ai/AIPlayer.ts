@@ -1132,7 +1132,7 @@ export const STACKOFF_COMMIT_FRACTION = 1 / 3;
 /** A pre-flop RAISE to at least this share of the street stack is made as an all-in instead. */
 export const RAISE_JAM_FRACTION = 0.6;
 /** The open size (in BB) the facing-a-raise thresholds were tuned against (no-limit). */
-export const REF_OPEN_BB = 3;
+export const OPEN_REFERENCE_BB = 3;
 /** A raise smaller than the reference widens the CALL range by at most this factor (never the 3-bet range). */
 export const SIZE_WIDEN_MAX = 1.3;
 /** B8 — share of its own opening range an opener keeps vs a 3-bet, by the price it is laid. */
@@ -1244,7 +1244,7 @@ function preFlopStrategy(
   // A UTG straddle is this hand's effective big blind (PokerTable.straddle): the reference open is 3 straddles.
   const refBB = table.actionLog.some(e => e.street === table.currentPhase && e.action === 'straddle') ? 2 * bigBlind : bigBlind;
   const sizeFactor = facingRaise && noLimit
-    ? Math.min(bucket === 'BB' ? SIZE_WIDEN_MAX : 1, (REF_OPEN_BB * refBB) / Math.max(betToMatch, refBB))
+    ? Math.min(bucket === 'BB' ? SIZE_WIDEN_MAX : 1, (OPEN_REFERENCE_BB * refBB) / Math.max(betToMatch, refBB))
     : 1;
   const sized = (th: number, f: number): number => (f === 1 ? th : Math.min(0.99, Math.max(0.30, 1 - (1 - th) * f)));
   const callVsRaiseThS = sized(callVsRaiseTh, sizeFactor);

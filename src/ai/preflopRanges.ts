@@ -42,13 +42,13 @@ export function getHandCode(holeCards: Card[]): string {
 }
 
 // ── Percentile tables (B10 / NEW-2, bots review 2026-11-04): COMMITTED ──────
-// The table used to be Monte-Carlo-built lazily, synchronously and with
-// Math.random on the first bot decision after every boot (169 hands x 600
-// runs, ~710k Math.random calls): a 7-21 s whole-server freeze, and bot ranges
+// The table used to be Monte-Carlo-built lazily, synchronously and from the
+// unseeded global RNG on the first bot decision after every boot (169 hands x
+// 600 runs, ~710k random draws): a 7-21 s whole-server freeze, and bot ranges
 // that reshuffled on every deploy. It is now generated ONCE offline by
 // gen-preflop-table.ts (repo root, fixed seed; VERIFY=1 re-checks it) and
 // committed as preflopTable.ts. Loading it is two Map fills (169 rows, < 1 ms),
-// zero Math.random calls, identical on every boot.
+// zero random draws, identical on every boot.
 const _pctile: Map<string, number> = new Map();
 const _stackOff: Map<string, number> = new Map();
 for (const [code, , pctile, stackOff] of PREFLOP_TABLE) { _pctile.set(code, pctile); _stackOff.set(code, stackOff); }
