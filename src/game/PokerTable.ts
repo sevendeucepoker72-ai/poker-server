@@ -3285,6 +3285,46 @@ export class PokerTable extends EventEmitter {
   }
 
   /**
+   * Bots review 2026-11-04 (A-crash) — the end of a hand whose showdown code THREW
+   * (index.ts game timer crash guard). It never pays: the caller has already put
+   * every stack right. `refundTo` (per seat index, -1 = none) voids the hand: each
+   * listed occupied seat goes back to that stake and a dead blind it posted is owed
+   * again (restoreRefundedDeadBlind). Then it is determineWinners' own tail with no
+   * result rows, as the all-fold refund: totals reset, HandComplete, the hand
+   * announced through emitHandCompletion (the deck seed is revealed; startNewHand
+   * is refused meanwhile). Returns false — and changes nothing — outside Showdown.
+   */
+  public completeHandAfterFault(refundTo?: ReadonlyArray<number>): boolean {
+    if (this.currentPhase !== GamePhase.Showdown) return false;
+    if (refundTo) {
+      for (const seat of this.seats) {
+        const to = refundTo[seat.seatIndex];
+        if (seat.state === 'occupied' && typeof to === 'number' && to >= 0) {
+          seat.chipCount = to;
+          this.restoreRefundedDeadBlind(seat);
+        }
+      }
+    }
+    for (const seat of this.seats) {
+      seat.totalInvestedThisHand = 0;
+      seat.deadMoneyThisHand = 0;
+      seat.currentBet = 0;
+    }
+    this.lastHandResult = {
+      handNumber: this.handNumber,
+      winners: [],
+      showdownHands: [],
+      communityCards: [...this.communityCards],
+      pots: [],
+    };
+    this.currentPhase = GamePhase.HandComplete;
+    this.activeSeatIndex = -1;
+    this.emitHandCompletion([], null);
+    this.emit('phaseChanged', { phase: this.currentPhase });
+    return true;
+  }
+
+  /**
    * The ONE way a finished hand is announced — the base determineWinners AND
    * the Omaha / Stud hi-lo overrides (2026-10-10). Before this the hi-lo
    * overrides emitted 'handResult' themselves and never revealed the deck

@@ -1444,7 +1444,7 @@ function scheduleAutoStart(tableId: string, delayMs = 1500): void {
   if (existing) clearTimeout(existing);
   const t = setTimeout(() => {
     pendingAutoStartTimers.delete(tableId);
-    autoStartNextHand(tableId);
+    try { autoStartNextHand(tableId); } catch (err) { recoverAutoStartThrow(tableId, err); }   // A-crash (bots review 2026-11-04)
   }, delayMs);
   pendingAutoStartTimers.set(tableId, t);
 }
@@ -3175,6 +3175,9 @@ app.get('/api/health', async (_req, res) => {
       crashSafety: {
         socketListeners: { ...socketGuardStats },
         process: { ...processCrashStats },
+        // Bots review 2026-11-04 (A-crash) — a recovered throw on a game timer (bot action / draw,
+        // a scheduled deal, the heartbeat). Counts only; the event is in the [game-timer-error] line.
+        gameTimers: { ...gameTimerGuardStats },
       },
       // 2026-10-10 — one person, one local row (auth/accountMerge.ts). Counts
       // only, no ids: the identity gate, the master-first resolver (splitSeen
@@ -8984,6 +8987,175 @@ function standPatAbsentDrawers(tableId: string): void {
 }
 // ===== end absent drawers =====
 
+// ===== Game timer crash guard (bots review 2026-11-04, A-crash) =====
+// A throw on a game TIMER path (a bot's action or draw, a scheduled deal) used to
+// reach processGuards (flush, then exit(1)) and void every running qualifier; the
+// same code reached by a human is caught by socketGuard. Each of those timers now
+// catches, logs `[game-timer-error]`, counts (health crashSafety.gameTimers) and
+// moves the table on:
+//   • a bot action that threw before it acted is checked or folded for it; one that
+//     acted (a 'playerAction' listener threw) has its turn advanced;
+//   • a bot draw that threw stands that bot pat;
+//   • a deal that threw is retried ONCE, 3 s later (the heartbeat owns the rest);
+//   • a hand left in Showdown is a faulted determineWinners (Showdown is never a
+//     resting state): retried once if nothing was paid, finished if the pot was paid
+//     in full, VOIDED (every stake back, like a misdeal) if it was part-paid or the
+//     retry threw too, and HELD — never re-paid by the wedge watchdog — otherwise.
+// The normal path adds only the stake mark per bot action / draw; no new
+// identifier is resolved there (every helper below runs only after a throw).
+const GAME_TIMER_ERROR_TAG = '[game-timer-error]';
+const AUTO_START_RETRY_AFTER_FAULT_MS = 3000;
+const gameTimerGuardStats = {
+  actionThrows: 0, drawThrows: 0, autoStartThrows: 0, heartbeatThrows: 0,
+  actedFor: 0, turnAdvanced: 0, stoodPat: 0, autoStartRetried: 0,
+  showdownFaults: 0, showdownResolved: 0, showdownPaidFinished: 0, showdownVoided: 0, showdownHeld: 0,
+  recoveryThrows: 0, logLinesSuppressed: 0, lastAt: null as string | null,
+};
+let gameTimerLogWindowStart = 0;
+let gameTimerLogLines = 0;
+/** One `[game-timer-error]` line (at most 60 per minute; the rest are only counted) + Sentry. Never throws. */
+function logGameTimerError(kind: string, tableId: string, seatIndex: number, err: unknown, extra?: Record<string, unknown>): void {
+  try {
+    const now = Date.now();
+    gameTimerGuardStats.lastAt = new Date(now).toISOString();
+    if (now - gameTimerLogWindowStart >= 60_000) { gameTimerLogWindowStart = now; gameTimerLogLines = 0; }
+    if (gameTimerLogLines >= 60) { gameTimerGuardStats.logLinesSuppressed++; return; }
+    gameTimerLogLines++;
+    const e = err as { message?: unknown; stack?: unknown } | null | undefined;
+    const stack = e && typeof e === 'object' && typeof e.stack === 'string' ? e.stack : '';
+    const frame = stack.split('\n').slice(1).find((l) => l.trim().startsWith('at '));
+    const message = String(e && typeof e === 'object' && 'message' in e ? e.message : err).slice(0, 300);
+    console.error(`${GAME_TIMER_ERROR_TAG} ${JSON.stringify({ kind, tableId, seatIndex, error: message, where: frame ? frame.trim().slice(0, 200) : null, ...(extra || {}) })}`);
+    if (Sentry) Sentry.captureException(err, { tags: { area: `game.${kind}` } });
+  } catch (_) { /* logging never throws */ }
+}
+/**
+ * The table as a bot's timer found it. stakes[i] = chipCount + totalInvestedThisHand
+ * of an occupied seat (-1 otherwise): constant per seat through a hand until the
+ * payout (bets, uncalled-bet refunds and dead money move chips between those two
+ * fields of the same seat), so after a fault it says exactly what was paid.
+ */
+type BotTurnMark = { hand: number; version: number; log: number; phase: GamePhase; stakes: number[]; ids: string[] };
+/** Hands held in Showdown after a fault (table -> handNumber): the wedge watchdog never advances them. */
+const gameShowdownHold = new WeakMap<PokerTable, number>();
+function gameShowdownHeld(table: PokerTable): boolean {
+  return gameShowdownHold.get(table) === table.handNumber && table.currentPhase === GamePhase.Showdown;
+}
+/** A hand found in Showdown after a fault: retry / finish / void / hold (see the block comment). */
+function settleShowdownAfterFault(tableId: string, t: PokerTable, mark: BotTurnMark): void {
+  gameTimerGuardStats.showdownFaults++;
+  let outcome: 'resolved' | 'paid_finished' | 'voided' | 'held' = 'held';
+  let tried: 'resolved' | 'paid_finished' | 'voided' | null = null;
+  let pot = 0;
+  let credited: number | null = null;
+  // Chips credited since the mark; null = the seats are not the ones the mark saw
+  // (a seat changed hands, a seat not in the mark has chips in the pot, a seat lost chips).
+  const creditedSinceMark = (): number | null => {
+    let c = 0;
+    for (let i = 0; i < t.seats.length; i++) {
+      const s = t.seats[i];
+      const was = mark.stakes[i] ?? -1;
+      if (was < 0) { if (s.state === 'occupied' && (s.totalInvestedThisHand || 0) > 0) return null; continue; }
+      if (s.state !== 'occupied' || s.playerId !== mark.ids[i]) return null;
+      const d = s.chipCount + (s.totalInvestedThisHand || 0) - was;
+      if (d < 0) return null;
+      c += d;
+    }
+    return c;
+  };
+  try {
+    credited = creditedSinceMark();
+    if (credited === 0) {
+      // Nothing paid yet: the engine's own showdown, once (from an unpaid state it pays at most once).
+      tried = 'resolved';
+      try { (t as any).determineWinners(); } catch (e) { logGameTimerError('showdown_retry', tableId, -1, e); }
+      if (t.currentPhase === GamePhase.Showdown) { tried = null; credited = creditedSinceMark(); }
+    }
+    if (tried === null && credited !== null) {
+      pot = t.seats.reduce((a, s) => a + (s.state === 'occupied' ? (s.totalInvestedThisHand || 0) : 0), 0);
+      if (pot > 0 && credited === pot) { tried = 'paid_finished'; t.completeHandAfterFault(); }
+      else { tried = 'voided'; t.completeHandAfterFault(mark.stakes); }
+    }
+  } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('showdown_settle', tableId, -1, e); }
+  if (t.handNumber === mark.hand && t.currentPhase === GamePhase.Showdown) { gameShowdownHold.set(t, t.handNumber); outcome = 'held'; }
+  else if (tried) outcome = tried;
+  if (outcome === 'resolved') gameTimerGuardStats.showdownResolved++;
+  else if (outcome === 'paid_finished') gameTimerGuardStats.showdownPaidFinished++;
+  else if (outcome === 'voided') gameTimerGuardStats.showdownVoided++;
+  else gameTimerGuardStats.showdownHeld++;
+  logGameTimerError('showdown', tableId, -1, new Error('hand resting in Showdown after a fault'), { outcome, pot, credited });
+}
+/** After a recovered fault: tell the clients, then the next deal (hand over) or the next bot turn. */
+function continueAfterGameFault(tableId: string, t: PokerTable, seatIndex: number, kind: string, moveOn: boolean): void {
+  try { broadcastGameState(tableId); } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError(`${kind}_broadcast`, tableId, seatIndex, e); }
+  try {
+    if (t.currentPhase === GamePhase.HandComplete) { if (!pendingAutoStartTimers.has(tableId)) scheduleAutoStart(tableId); }
+    else if (moveOn) scheduleAIAction(tableId);
+  } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError(`${kind}_next`, tableId, seatIndex, e); }
+}
+/** A bot's action timer threw (decideAction, the engine, a listener, a broadcast). */
+function recoverBotActionThrow(tableId: string, seatIndex: number, mark: BotTurnMark | null, err: unknown): void {
+  gameTimerGuardStats.actionThrows++;
+  logGameTimerError('action', tableId, seatIndex, err);
+  const t = tableManager.getTable(tableId);
+  if (!t) return;
+  // stateVersion moves on turnChanged / phaseChanged / handStarted BEFORE any listener runs,
+  // so the same turn is only ever "never acted" or "acted, not advanced".
+  const sameTurn = !!mark && t.isHandInProgress() && t.handNumber === mark.hand && t.stateVersion === mark.version
+    && t.currentPhase === mark.phase && t.currentPhase !== GamePhase.Showdown && !DrawPhases.includes(t.currentPhase)
+    && t.activeSeatIndex === seatIndex && !!t.seats[seatIndex]?.isAI;
+  if (sameTurn && mark) {
+    try {
+      if (t.actionLog.length === mark.log) {
+        if (t.playerCheck(seatIndex) || t.playerFold(seatIndex)) gameTimerGuardStats.actedFor++;
+        else { (t as any).advanceTurn(); gameTimerGuardStats.turnAdvanced++; }
+      } else { (t as any).advanceTurn(); gameTimerGuardStats.turnAdvanced++; }
+    } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('action_recovery', tableId, seatIndex, e); }
+  }
+  if (mark && t.handNumber === mark.hand && t.currentPhase === GamePhase.Showdown) settleShowdownAfterFault(tableId, t, mark);
+  continueAfterGameFault(tableId, t, seatIndex, 'action', true);
+}
+/** A bot's draw timer threw: that bot stands pat (the round can never wait on it). */
+function recoverBotDrawThrow(tableId: string, drawTable: FiveCardDrawTable, seatIndex: number, armedHand: number, dphase: GamePhase, mark: BotTurnMark | null, err: unknown): void {
+  gameTimerGuardStats.drawThrows++;
+  logGameTimerError('draw', tableId, seatIndex, err);
+  try {
+    const s = drawTable.seats[seatIndex];
+    if (drawTable.handNumber === armedHand && drawTable.currentPhase === dphase && !drawTable.drawsCompleted.has(seatIndex)
+        && s && s.isAI && s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0) {
+      if (drawTable.playerDraw(seatIndex, [])) gameTimerGuardStats.stoodPat++;
+    }
+  } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('draw_recovery', tableId, seatIndex, e); }
+  if (mark && drawTable.handNumber === mark.hand && drawTable.currentPhase === GamePhase.Showdown) settleShowdownAfterFault(tableId, drawTable, mark);
+  continueAfterGameFault(tableId, drawTable, seatIndex, 'draw', drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase);
+}
+/** Tables whose deal was already retried after a fault (table -> the hand it followed): once per hand. */
+const autoStartRetriedHand = new WeakMap<PokerTable, number>();
+/** A scheduled deal (autoStartNextHand) threw. */
+function recoverAutoStartThrow(tableId: string, err: unknown): void {
+  gameTimerGuardStats.autoStartThrows++;
+  logGameTimerError('autostart', tableId, -1, err);
+  const t = tableManager.getTable(tableId);
+  if (!t) return;
+  try {
+    // The deal itself ran the hand out (a bomb pot with every stack all-in) and faulted: hold it.
+    if (t.currentPhase === GamePhase.Showdown) { gameShowdownHold.set(t, t.handNumber); gameTimerGuardStats.showdownHeld++; return; }
+    if (t.isHandInProgress()) {
+      // The throw came from inside or after the deal: the hand is live, carry on.
+      try { broadcastGameState(tableId); } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('autostart_broadcast', tableId, -1, e); }
+      scheduleAIAction(tableId);
+      return;
+    }
+    if (t.currentPhase === GamePhase.HandComplete && !pendingAutoStartTimers.has(tableId) && autoStartRetriedHand.get(t) !== t.handNumber) {
+      // Once per hand; after that the heartbeat revives a cash table, a director pause / resume a tournament one.
+      autoStartRetriedHand.set(t, t.handNumber);
+      gameTimerGuardStats.autoStartRetried++;
+      scheduleAutoStart(tableId, AUTO_START_RETRY_AFTER_FAULT_MS);
+    }
+  } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('autostart_recovery', tableId, -1, e); }
+}
+// ===== end game timer crash guard =====
+
 function scheduleAIAction(tableId: string): void {
   const table = tableManager.getTable(tableId);
   if (!table) { console.log('[AI] No table found'); return; }
@@ -9014,26 +9186,36 @@ function scheduleAIAction(tableId: string): void {
           if (!drawTable.drawsCompleted.has(seat.seatIndex)) {
             const delay = 500 + Math.floor(Math.random() * 1000);
             setTimeout(() => {
-              // F44 (2026-10-21) — a draw scheduled for an earlier round (or
-              // hand) does nothing: a betting round nobody can bet in is now
-              // skipped, so the NEXT draw round can already be open when it
-              // fires; that round's own scheduling draws for it.
-              if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) return;
-              if (drawTable.drawsCompleted.has(seat.seatIndex)) return;
-              // B3 / B15 / Badugi subset (bots review 2026-11-04): the bot's draw by the
-              // engine's own hand order, round-aware (studDrawStrength.chooseBotDiscards) —
-              // pat straights / flushes stand, four-flushes and open-enders draw one, the
-              // best badugi subset is kept, a made 9- or 10-low stands pat on the last 2-7
-              // draw. (The old inline picker broke pat hands and kept a worse badugi 5.2%.)
-              const kind = studDrawKindOf(((drawTable as any).variantId as string) || '', drawTable);
-              const indices = kind ? chooseBotDiscards(kind, seat.holeCards, drawTable.currentPhase) : [];
-              drawTable.playerDraw(seat.seatIndex, indices);
-              broadcastGameState(tableId);
-              // After all draws, the table will advance and we need to schedule
-              // next AI action — F44: also when it went straight into the NEXT
-              // draw round (the betting round between was skipped).
-              if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) {
-                scheduleAIAction(tableId);
+              // A-crash (bots review 2026-11-04): a throw here used to exit the process (game timer crash guard).
+              const dmark = {
+                hand: drawTable.handNumber, version: drawTable.stateVersion, log: drawTable.actionLog.length, phase: drawTable.currentPhase,
+                stakes: drawTable.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1)),
+                ids: drawTable.seats.map((s) => s.playerId),
+              };
+              try {
+                // F44 (2026-10-21) — a draw scheduled for an earlier round (or
+                // hand) does nothing: a betting round nobody can bet in is now
+                // skipped, so the NEXT draw round can already be open when it
+                // fires; that round's own scheduling draws for it.
+                if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) return;
+                if (drawTable.drawsCompleted.has(seat.seatIndex)) return;
+                // B3 / B15 / Badugi subset (bots review 2026-11-04): the bot's draw by the
+                // engine's own hand order, round-aware (studDrawStrength.chooseBotDiscards) —
+                // pat straights / flushes stand, four-flushes and open-enders draw one, the
+                // best badugi subset is kept, a made 9- or 10-low stands pat on the last 2-7
+                // draw. (The old inline picker broke pat hands and kept a worse badugi 5.2%.)
+                const kind = studDrawKindOf(((drawTable as any).variantId as string) || '', drawTable);
+                const indices = kind ? chooseBotDiscards(kind, seat.holeCards, drawTable.currentPhase) : [];
+                drawTable.playerDraw(seat.seatIndex, indices);
+                broadcastGameState(tableId);
+                // After all draws, the table will advance and we need to schedule
+                // next AI action — F44: also when it went straight into the NEXT
+                // draw round (the betting round between was skipped).
+                if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) {
+                  scheduleAIAction(tableId);
+                }
+              } catch (err) {
+                recoverBotDrawThrow(tableId, drawTable, seat.seatIndex, armedHand, dphase, dmark, err);
               }
             }, delay);
           }
@@ -9159,7 +9341,18 @@ function scheduleAIAction(tableId: string): void {
   const handle = setTimeout(() => {
     aiTimeouts.delete(timeoutKey);
     // console.log(`[AI] Executing action for seat ${activeSeat}`);
-    executeAIAction(tableId, activeSeat, profile);
+    // A-crash (bots review 2026-11-04): a throw here used to exit the process (game timer crash guard).
+    const before = tableManager.getTable(tableId);
+    const mark = before ? {
+      hand: before.handNumber, version: before.stateVersion, log: before.actionLog.length, phase: before.currentPhase,
+      stakes: before.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1)),
+      ids: before.seats.map((s) => s.playerId),
+    } : null;
+    try {
+      executeAIAction(tableId, activeSeat, profile);
+    } catch (err) {
+      recoverBotActionThrow(tableId, activeSeat, mark, err);
+    }
   }, delay);
 
   aiTimeouts.set(timeoutKey, { handle, seatIndex: activeSeat });
@@ -9176,6 +9369,9 @@ function executeAIAction(
   // Verify it's still this AI's turn
   if (table.activeSeatIndex !== seatIndex) return;
   if (!table.seats[seatIndex].isAI) return;
+  // A-crash (bots review 2026-11-04): a hand resting in Showdown is a faulted payout (the guard
+  // settles or holds it); the fallback below would advanceTurn -> determineWinners on a paid pot.
+  if (table.currentPhase === GamePhase.Showdown) return;
 
   // 2026-10-21 (gameplay F49) — an All-In or Fold table holds its bots to the
   // format too: shove-or-fold decisions (decideAction's allInOrFold mode), then
@@ -9242,7 +9438,7 @@ function executeAIAction(
       if (existing) clearTimeout(existing);
       const t = setTimeout(() => {
         pendingAutoStartTimers.delete(tableId);
-        autoStartNextHand(tableId);
+        try { autoStartNextHand(tableId); } catch (err) { recoverAutoStartThrow(tableId, err); }   // A-crash
       }, 1500);
       pendingAutoStartTimers.set(tableId, t);
     } else {
@@ -9745,7 +9941,7 @@ function noteRefusedCashStart(tableId: string, table: PokerTable): void {
       retryInMs = streak === 1 ? CASH_START_RETRY_FIRST_MS : CASH_START_RETRY_MS;
       const t = setTimeout(() => {
         pendingAutoStartTimers.delete(tableId);
-        autoStartNextHand(tableId);
+        try { autoStartNextHand(tableId); } catch (err) { recoverAutoStartThrow(tableId, err); }   // A-crash (bots review 2026-11-04)
       }, retryInMs);
       pendingAutoStartTimers.set(tableId, t);
       cashStartRefusals.rescheduled++;
@@ -9961,7 +10157,8 @@ setInterval(() => {
     let trimmedTables = 0;
     for (const t of tables) {
       const before = tableManager.getTable(t.tableId)?.getOccupiedSeatCount() ?? 0;
-      ensureCashTableRunning(t.tableId);
+      // A-crash (bots review 2026-11-04) — per table: one table's throw used to abort the tick for every table after it.
+      try { ensureCashTableRunning(t.tableId); } catch (err) { gameTimerGuardStats.heartbeatThrows++; logGameTimerError('heartbeat', t.tableId, -1, err); }
       const after = tableManager.getTable(t.tableId)?.getOccupiedSeatCount() ?? 0;
       if (before !== after) trimmedTables++;
     }
@@ -10039,6 +10236,12 @@ setInterval(() => {
       // mid-discard, on the stale pre-draw currentBetToMatch. Skip + reset the
       // tracker so a long (but legitimate) draw isn't seen as a wedge.
       if (DrawPhases.includes(table.currentPhase)) {
+        wedgeWatchdog.delete(t.tableId);
+        continue;
+      }
+      // A-crash (bots review 2026-11-04) — a faulted payout the game timer crash guard HOLDS in
+      // Showdown: advanceTurn would run determineWinners on a pot that may already be paid.
+      if (table.currentPhase === GamePhase.Showdown && gameShowdownHeld(table)) {
         wedgeWatchdog.delete(t.tableId);
         continue;
       }
@@ -20507,7 +20710,7 @@ Give feedback in this JSON format:
         const tid = session.tableId;
         const t = setTimeout(() => {
           pendingAutoStartTimers.delete(tid);
-          autoStartNextHand(tid);
+          try { autoStartNextHand(tid); } catch (err) { recoverAutoStartThrow(tid, err); }   // A-crash (bots review 2026-11-04)
         }, 3000);
         pendingAutoStartTimers.set(tid, t);
       } else {
