@@ -1,4 +1,4 @@
-import { inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB } from '../src/ai/pushFoldSolver';
+import { inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB, stackOffCallWidth } from '../src/ai/pushFoldSolver';
 
 // Guards the baked offline Nash push/fold table (pushFoldSolver.ts). If someone
 // re-solves and re-bakes, these invariants must still hold or the AI's short-
@@ -44,5 +44,20 @@ describe('push/fold Nash lookup', () => {
     expect(inPushFoldZone(16, 1)).toBe(true); // HU cutoff
     expect(inPushFoldZone(16, 3)).toBe(false); // multiway breaks down sooner
     expect(inPushFoldZone(40, 1)).toBe(false); // deep => normal play
+  });
+});
+
+describe('stackOffCallWidth (2026-11, NEW-1 / B4) — deep stack-off width continues the baked table', () => {
+  it('starts where the baked Nash call ends (25 BB: 1 - NASH[25].call = 0.17)', () => {
+    expect(stackOffCallWidth(25, 1)).toBeCloseTo(1 - nashCallPctile(25, 1), 10);
+  });
+  it('narrows with depth and flattens at 100 BB+', () => {
+    let prev = 1;
+    for (let bb = 25; bb <= 200; bb += 5) { const w = stackOffCallWidth(bb, 1); expect(w).toBeLessThanOrEqual(prev + 1e-12); prev = w; }
+    expect(stackOffCallWidth(100, 1)).toBeCloseTo(0.06, 10);
+    expect(stackOffCallWidth(200, 1)).toBeCloseTo(0.06, 10);
+  });
+  it('divides by (1 + 0.5 per extra player)', () => {
+    expect(stackOffCallWidth(100, 3)).toBeCloseTo(0.03, 10);
   });
 });

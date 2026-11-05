@@ -900,6 +900,14 @@ studDrawEquity
 # 4-bets and deep stack-offs.
 preflop-table-v1
 FOURBET_STACKOFF_THRESHOLD
+# holdem-preflop C2-C14 - a lone all-in is priced at the hand-start depth
+# (NEW-1), deep stack-offs and jams use the stack-off width, a short all-in
+# with players behind is routed like a raise, and a micro all-in the call
+# closes is always called.
+shoverFaced
+stackOffCallWidth
+pureAllInCall
+MICRO_CALL_NEED
 
 # 2026-10-11 (.online R2, S2 table lifecycle) — GAME-15/16 + Addendum: ONE seat
 # teardown (pot chips of a folded / all-in / extra-table / ghost seat wait for

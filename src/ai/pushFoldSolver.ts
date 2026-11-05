@@ -97,3 +97,27 @@ export function nashCallPctile(effBB: number, playersYetToAct: number = 1): numb
   const extra = Math.max(0, playersYetToAct - 1);
   return Math.min(0.99, base + extra * 0.05);
 }
+
+/**
+ * 2026-11 (NEW-1 / B4 / NEW-5) — DEEP stack-off width: the fraction of all
+ * starting hands (combo-weighted) that continues when a pre-flop decision puts
+ * the whole stack at risk at an effective depth ABOVE the baked push/fold table
+ * (> PUSH_FOLD_MAX_BB): calling an all-in, calling a bet that commits the stack,
+ * or a re-raise that would be a jam. Read against getStackOffPercentile (equity
+ * vs a strong range), threshold = 1 - width. Anchored on the baked Nash call at
+ * 25 BB (1 - 0.83 = top 17%) and narrowing to top 6% at 100 BB+; each extra
+ * player in the pot or still to act divides the width by (1 + 0.5 per player).
+ */
+const STACKOFF_WIDTH: Array<[number, number]> = [[25, 0.17], [40, 0.10], [60, 0.075], [100, 0.06]];
+export function stackOffCallWidth(effBB: number, players: number = 1): number {
+  let w = STACKOFF_WIDTH[STACKOFF_WIDTH.length - 1][1];
+  if (effBB <= STACKOFF_WIDTH[0][0]) w = STACKOFF_WIDTH[0][1];
+  else {
+    for (let i = 1; i < STACKOFF_WIDTH.length; i++) {
+      const [b0, w0] = STACKOFF_WIDTH[i - 1], [b1, w1] = STACKOFF_WIDTH[i];
+      if (effBB <= b1) { w = w0 + (w1 - w0) * (effBB - b0) / (b1 - b0); break; }
+    }
+  }
+  const extra = Math.max(0, players - 1);
+  return w / (1 + 0.5 * extra);
+}

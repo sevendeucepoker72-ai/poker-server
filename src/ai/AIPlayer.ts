@@ -4,11 +4,11 @@ import { evaluateOmahaHand } from '../game/HandEvaluatorExtensions';
 import { PokerTable, Seat, PlayerAction, GamePhase } from '../game/PokerTable';
 import { calculateEquity, keptHoldemHoleCards } from '../training/TrainingEngine';
 import {
-  getPreflopPercentile, posBucket, PosBucket,
-  OPEN_THRESHOLD, THREEBET_THRESHOLD, FOURBET_THRESHOLD, CALL_VS_RAISE_THRESHOLD,
+  getPreflopPercentile, getStackOffPercentile, posBucket, PosBucket,
+  OPEN_THRESHOLD, THREEBET_THRESHOLD, FOURBET_THRESHOLD, FOURBET_STACKOFF_THRESHOLD, CALL_VS_RAISE_THRESHOLD,
   ARCHETYPE_RANGE_FACTOR, adjustThreshold,
 } from './preflopRanges';
-import { inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB } from './pushFoldSolver';
+import { inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB, stackOffCallWidth } from './pushFoldSolver';
 
 export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
 export type Personality =
@@ -550,7 +550,7 @@ function getImpliedOdds(
 // Counting outs (from TrainingEngine, simplified inline)
 // ============================================================
 
-function countOuts(holeCards: Card[], communityCards: Card[]): number {
+export function countOuts(holeCards: Card[], communityCards: Card[]): number {
   if (communityCards.length === 0 || communityCards.length >= 5) return 0;
 
   const allCards = [...holeCards, ...communityCards];
@@ -567,16 +567,20 @@ function countOuts(holeCards: Card[], communityCards: Card[]): number {
   const ranks = new Set<number>(allCards.map(c => c.rank as number));
   if (allCards.some(c => c.rank === Rank.Ace)) ranks.add(1);
 
+  // 2026-11 fix: count the distinct RANKS that complete a straight (a 5-rank
+  // window holding 4 of them). One rank = a gutshot (4 outs); two = an
+  // open-ender or a double gutter (8 outs). Every gutshot used to score 8.
+  const completing = new Set<number>();
   for (let start = 1; start <= 10; start++) {
     let have = 0;
+    let missing = 0;
     for (let r = start; r < start + 5; r++) {
-      if (ranks.has(r)) have++;
+      if (ranks.has(r)) have++; else missing = r;
     }
-    if (have === 4) {
-      outs += outs >= 9 ? 6 : 8; // reduce if already have flush draw (overlap)
-      break;
-    }
+    if (have === 4) completing.add(missing === 1 ? Rank.Ace : missing);
   }
+  if (completing.size >= 2) outs += outs >= 9 ? 6 : 8;      // open-ended / double gutter (flush-draw overlap as before)
+  else if (completing.size === 1) outs += outs >= 9 ? 3 : 4; // gutshot
 
   // Overcard outs
   if (communityCards.length >= 3) {
@@ -897,6 +901,8 @@ export function decideAction(
   }
 
   let handStrength: number;
+  // 2026-11 — Hold'em-family pre-flop also reads the STACK-OFF percentile (4-bets, deep all-ins).
+  let stackOff: number | null = null;
 
   const isOmahaFamily = /omaha/i.test(variantId);
   if (isStudFamily || isDrawFamily || isDrawBet) {
@@ -908,6 +914,7 @@ export function decideAction(
     handStrength = isOmahaFamily
       ? getOmahaPreflopStrength(seat.holeCards)
       : getPreFlopHandRank(holdemHoleCards(seat.holeCards));
+    if (!isOmahaFamily) stackOff = getStackOffPercentile(holdemHoleCards(seat.holeCards));
   } else {
     // GAME-8 — the Hold'em equity is never fed more than 2 hole cards: a
     // (Crazy) Pineapple seat still holding 3 is priced on the 2 it keeps.
@@ -935,6 +942,7 @@ export function decideAction(
   const rawNoise = (Math.random() - 0.5) * noiseMap[profile.difficulty];
   const noise = isFinite(rawNoise) ? rawNoise : 0;
   handStrength = Math.min(1.0, Math.max(0.0, handStrength + noise));
+  if (stackOff !== null) stackOff = Math.min(1.0, Math.max(0.0, stackOff + noise));   // same noise draw
 
   // Outs and implied odds for draw decisions
   const outs = isPreFlop ? 0 : countOuts(seat.holeCards, table.communityCards);
@@ -954,7 +962,16 @@ export function decideAction(
   // hit" premium there; easy/medium (static made-hand lookup, no draw awareness)
   // still get the full draw bonus so they don't misprice draws entirely.
   const mcTier = profile.difficulty === 'expert' || profile.difficulty === 'hard';
-  const effectiveStrength = handStrength + impliedOdds * (mcTier ? 0.35 : 1.0);
+  const impliedTerm = impliedOdds * (mcTier ? 0.35 : 1.0);
+  // 2026-11 (bots review, "dead adjustments"): the hard/expert adjustments below
+  // change the RAW strength only (rawStrength: getGTOBetSize, shouldBluffBalanced,
+  // shouldThinValueBet; and pre-flop the percentile). The DECISION strength is
+  // taken before them ON PURPOSE: hard/expert strength is Monte Carlo equity
+  // (calculateEquity) already run against every live opponent (numOpponents) and
+  // an action-narrowed range (oppMinPctile), so x0.92 multiway / x0.85 wet /
+  // -0.05 aggression would count the same thing twice. Stud / draw static
+  // strengths: the stud-draw-lowball change set owns whether they apply there.
+  const preAdjustStrength = handStrength;
 
   // ============================================================
   // Expert-level adjustments
@@ -981,16 +998,24 @@ export function decideAction(
       handStrength *= 0.85;
     }
   }
+  const effectiveStrength = preAdjustStrength + impliedTerm;   // == 0dc1b96 for every variant
 
   // ============================================================
   // PREFLOP STRATEGY
   // ============================================================
   // GAME-9 (R2) — every decision passes the raise-war limiter last.
   if (isPreFlop) {
-    const pre = preFlopStrategy(
-      handStrength, callAmount, totalPot, seat, table, profile,
-      myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true
-    );
+    // 2026-11 — Stud and draw first rounds keep their pre-2026-11 routing
+    // (legacyStudDrawFirstRound, the old preFlopStrategy verbatim): their
+    // strengths are not on the percentile scale (variant group, B1).
+    const pre = (isStudFamily || isDrawFamily)
+      ? legacyStudDrawFirstRound(
+        handStrength, callAmount, totalPot, seat, table, profile,
+        myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true)
+      : preFlopStrategy(
+        handStrength, callAmount, totalPot, seat, table, profile,
+        myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true,
+        { liveOpponents: numOpponents, stackOff });
     return limitBotRaiseWar(table, seat, pre, true, handStrength);
   }
 
@@ -1008,7 +1033,339 @@ export function decideAction(
 // Preflop decision logic
 // ============================================================
 
+// 2026-11 pre-flop fix round (bots review 11-04: NEW-1, B4, B5, B8, B9, B16, NEW-3..5, CS).
+/** A pre-flop CALL of at least this share of the chips behind is a stack-off (continue = all-in). */
+export const STACKOFF_COMMIT_FRACTION = 1 / 3;
+/** A pre-flop RAISE to at least this share of the street stack is made as an all-in instead. */
+export const RAISE_JAM_FRACTION = 0.6;
+/** The open size (in BB) the facing-a-raise thresholds were tuned against (no-limit). */
+export const REF_OPEN_BB = 3;
+/** A raise smaller than the reference widens the CALL range by at most this factor (never the 3-bet range). */
+export const SIZE_WIDEN_MAX = 1.3;
+/** B8 — share of its own opening range an opener keeps vs a 3-bet, by the price it is laid. */
+export const DEF3B_KEEP_AT_MIN = 0.60;   // at DEF3B_MIN_NEED needed equity (a min 3-bet ~ 19%)
+export const DEF3B_MIN_NEED = 0.19;
+export const DEF3B_SLOPE = 1.15;         // less per unit of extra needed equity
+export const DEF3B_KEEP_MAX = 0.75;
+/** CALLING_STATION — unopened it plays adjustThreshold(CS_PLAY_BASE) (~56%); it calls CS_CALL_WIDTH of hands vs a standard raise. */
+export const CS_PLAY_BASE = 0.55;
+export const CS_CALL_WIDTH = 0.60;
+/** A call that CLOSES the action against an all-in at this needed equity or less (a micro all-in) is always made. */
+export const MICRO_CALL_NEED = 0.25;
+
+export interface PreflopCtx {
+  /** Live (not folded) opponents in the hand: the players who can still call a shove or are in it (B16). */
+  liveOpponents: number;
+  /** Hold'em-family stack-off percentile (getStackOffPercentile + the same noise); null = use the strength itself. */
+  stackOff: number | null;
+}
+
+/** NEW-1 — a seat's stack at the START of this hand (what it holds + what it has put in). */
+export function handStartStack(s: Seat): number {
+  return (s.chipCount || 0) + (s.totalInvestedThisHand || 0);
+}
+
+/** NEW-1 — the live opponent whose ALL-IN set the bet this seat faces (null when the bet was made by a seat with chips left). */
+export function shoverFaced(table: PokerTable, seat: Seat): Seat | null {
+  if (table.getCallAmount(seat) <= 0) return null;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
+    if (s.allIn && s.currentBet === table.currentBetToMatch) return s;
+  }
+  return null;
+}
+
+/** B8 — raises this seat has made on the current street (its own open / 3-bet), from the table's action log. */
+function ownRaisesThisStreet(table: PokerTable, seat: Seat): number {
+  let n = 0;
+  for (const e of table.actionLog) {
+    if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && OWN_RAISE_RE.test(e.action)) n++;
+  }
+  return n;
+}
+
 function preFlopStrategy(
+  handStrength: number,
+  callAmount: number,
+  totalPot: number,
+  seat: Seat,
+  table: PokerTable,
+  profile: AIPlayerProfile,
+  position: number,
+  totalActive: number,
+  opponents: OpponentModel,
+  bigBlind: number,
+  allInOrFold = false,
+  ctx: PreflopCtx = { liveOpponents: Math.max(1, totalActive - 1), stackOff: null },
+): AIDecision {
+  const params = ARCHETYPE_PARAMS[profile.archetype];
+  const pctile = handStrength;
+  const bucket = posBucket(position, totalActive);
+  const factor = ARCHETYPE_RANGE_FACTOR[profile.archetype] ?? 1.0;
+  const effBB = getEffectiveStackBB(table, seat.seatIndex);   // NEW-1: start-of-hand stacks
+  const stackMult = getStackDepthMultiplier(effBB);
+  const huFactor = totalActive <= 2 ? 0.55 : 1.0;
+  const streetRaises = Number((table as any).raisesThisStreet) || 0;
+  // B5 / B9 — routed by the table's own count of VOLUNTARY raises this street
+  // (blinds are not raises). Every seat but the big blind faces a call of one
+  // big blind in an unopened pot; the big blind facing a min-raise faces one too.
+  const unopened = streetRaises === 0;
+  const facingRaise = streetRaises >= 1 && callAmount > 0;
+  const facingThreeBet = Math.max(opponents.raiseCount, streetRaises) >= 2;
+  const betToMatch = table.currentBetToMatch;
+  const minRaise = table.getMinRaise();
+  // Hold'em: value 4-bets and deep stack-offs read the stack-off percentile (QQ+/AK on top);
+  // Omaha keeps its own strength on the old vs-random threshold.
+  const so = ctx.stackOff ?? pctile;
+  const fourBetValue = ctx.stackOff !== null ? so >= FOURBET_STACKOFF_THRESHOLD : pctile >= FOURBET_THRESHOLD;
+
+  // Model-derived, archetype/stack/heads-up-adjusted thresholds (percentile scale) — unchanged.
+  const openTh = adjustThreshold(adjustThreshold(adjustThreshold(OPEN_THRESHOLD[bucket], factor), stackMult), huFactor);
+  const threeBetTh = adjustThreshold(adjustThreshold(THREEBET_THRESHOLD[bucket], factor), huFactor);
+  const callVsRaiseTh = adjustThreshold(adjustThreshold(adjustThreshold(CALL_VS_RAISE_THRESHOLD[bucket], factor), stackMult), huFactor);
+
+  // B4 / NEW-4 — the size of the bet faced: a bigger bet narrows every call and
+  // 3-bet range in proportion (REF / size); a smaller one widens CALLS only.
+  // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha cannot be raised past the pot
+  // pre-flop and keeps its tuned ranges. Only the big blind (last to act, best price) widens vs a
+  // small raise (NEW-4); every seat narrows vs a big one.
+  const noLimit = table.bettingStructure === 'no-limit';
+  // A UTG straddle is this hand's effective big blind (PokerTable.straddle): the reference open is 3 straddles.
+  const refBB = table.actionLog.some(e => e.street === table.currentPhase && e.action === 'straddle') ? 2 * bigBlind : bigBlind;
+  const sizeFactor = facingRaise && noLimit
+    ? Math.min(bucket === 'BB' ? SIZE_WIDEN_MAX : 1, (REF_OPEN_BB * refBB) / Math.max(betToMatch, refBB))
+    : 1;
+  const sized = (th: number, f: number): number => (f === 1 ? th : Math.min(0.99, Math.max(0.30, 1 - (1 - th) * f)));
+  const callVsRaiseThS = sized(callVsRaiseTh, sizeFactor);
+  const threeBetThS = sized(threeBetTh, Math.min(1, sizeFactor));
+
+  const raiseOrAllIn = (amount: number): AIDecision => {
+    const to = Math.max(minRaise, amount);
+    // No-limit only: a pot-limit "all-in" is capped at a pot raise by the engine, so PLO keeps 0dc1b96 sizing.
+    return to >= seat.chipCount || (noLimit && to >= (seat.chipCount + seat.currentBet) * RAISE_JAM_FRACTION)
+      ? { action: PlayerAction.AllIn, raiseAmount: 0 }
+      : { action: PlayerAction.Raise, raiseAmount: to };
+  };
+  const FOLD: AIDecision = { action: PlayerAction.Fold, raiseAmount: 0 };
+  const CHECK: AIDecision = { action: PlayerAction.Check, raiseAmount: 0 };
+  const CALL: AIDecision = { action: PlayerAction.Call, raiseAmount: 0 };
+  const ALLIN: AIDecision = { action: PlayerAction.AllIn, raiseAmount: 0 };
+
+  // B16 — the players who can still call / are in: every live opponent (UTG
+  // 6-handed: 5; the small blind folded to: 1). Used where B16 was measured
+  // (unopened pots) and where the bot is alone against all-in player(s).
+  const pyta = Math.max(1, ctx.liveOpponents);
+  // Every other spot (facing a raise that is not a lone all-in) keeps the
+  // 0dc1b96 seat-independent count, so its push/fold zone membership is unchanged.
+  const headPyta = Math.min(3, Math.max(1, totalActive - 1));
+  // NEW-1 — the all-in that SET the bet this seat faces, and the depth at risk
+  // against it (min of the two hand-start stacks), never the shover's 0 left.
+  const shover = callAmount > 0 ? shoverFaced(table, seat) : null;
+  const shoveBB = shover ? Math.max(1, Math.round(Math.min(handStartStack(seat), handStartStack(shover)) / bigBlind)) : 0;
+  // Review fix — price a spot as "calling the shove" ONLY when nobody else can
+  // still act: pureCall = a call closes the action; pureAllInCall = no other live
+  // opponent has chips (it is this seat against the all-in player(s) alone).
+  // A short all-in with deep players still to act is routed like any other raise.
+  let othersWithChips = 0, othersToAct = 0;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
+    othersWithChips++;
+    if (s.currentBet < table.currentBetToMatch) othersToAct++;
+  }
+  const pureCall = !!shover && othersToAct === 0;
+  const pureAllInCall = !!shover && othersWithChips === 0;
+  const zonePlayers = unopened || pureAllInCall ? pyta : headPyta;
+
+  // Price floor — a micro all-in that this call closes (<= 25% equity needed:
+  // e.g. the big blind vs a 1.5 BB shove needs 14%) is called with any two cards.
+  if (shover && table.bettingStructure !== 'fixed-limit' && (allInOrFold ? pureAllInCall : pureCall)
+      && callAmount / (totalPot + callAmount) <= MICRO_CALL_NEED) {
+    return allInOrFold || callAmount >= seat.chipCount ? ALLIN : CALL;
+  }
+
+  // ── Short-stack push/fold (and every All-In or Fold decision): the baked Nash lookup. ──
+  const pfBB = allInOrFold ? Math.min(pureAllInCall ? shoveBB : effBB, PUSH_FOLD_MAX_BB) : effBB;
+  if (allInOrFold || (inPushFoldZone(effBB, zonePlayers) && profile.archetype !== 'CALLING_STATION')) {
+    const nashPush = nashPushPctile(pfBB, zonePlayers);
+    if (nashPush !== null) {
+      if (pureAllInCall || (callAmount >= seat.chipCount && callAmount > 0) || (allInOrFold && callAmount > bigBlind)) {
+        const callBB = pureAllInCall ? Math.min(shoveBB, pfBB) : pfBB;
+        const callTh = adjustThreshold(nashCallPctile(callBB, zonePlayers), factor);
+        return pctile >= callTh ? ALLIN : FOLD;
+      }
+      const shoveTh = adjustThreshold(nashPush, factor);
+      if (pctile >= shoveTh) return ALLIN;
+      if (callAmount === 0) return CHECK;
+      return FOLD;
+    }
+  }
+
+  // ── NEW-1 / B4 / NEW-5 — STACK-OFF: facing an all-in, or a call that commits a
+  //    third of the stack. Continue only with the stack-off range for the depth
+  //    actually at risk (the baked Nash call up to 25 BB, then top 17% -> 6% at
+  //    100 BB+, tighter with more players in); continuing = calling the all-in /
+  //    moving in. Every archetype, CALLING_STATION and MANIAC included. ──
+  const committing = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
+  const stackOffOK = (depthBB: number): boolean => depthBB <= PUSH_FOLD_MAX_BB
+    ? pctile >= adjustThreshold(nashCallPctile(depthBB, pyta), factor)
+    : so >= adjustThreshold(1 - stackOffCallWidth(depthBB, pyta), factor);
+  // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
+  // (its NEW-1 case, the push/fold zone misfire, is fixed by the hand-start effective stack above).
+  if (!allInOrFold && noLimit && (pureCall || committing)) {
+    if (!stackOffOK(pureCall ? shoveBB : effBB)) return FOLD;
+    return pureCall && callAmount < seat.chipCount ? CALL : ALLIN;
+  }
+  /** A re-raise; when it would be a jam it must pass the stack-off range too (null = not this hand: fall through). */
+  const raiseOrJam = (amount: number): AIDecision | null => {
+    const d = raiseOrAllIn(amount);
+    return d.action === PlayerAction.AllIn && noLimit && !stackOffOK(effBB) ? null : d;
+  };
+
+  // ── CALLING_STATION: loose and passive — plays ~56% unopened, calls ~60% vs a
+  //    standard raise, narrowing with the size; never raises. (Was 100% of hands.) ──
+  if (profile.archetype === 'CALLING_STATION') {
+    if (callAmount === 0) return CHECK;
+    if (unopened) return pctile >= adjustThreshold(CS_PLAY_BASE, factor) ? CALL : FOLD;
+    return pctile >= Math.max(0.30, 1 - CS_CALL_WIDTH * sizeFactor) ? CALL : FOLD;
+  }
+
+  // ── MANIAC: raises/3-bets almost anything — but a raise that would be a jam is a
+  //    stack-off (NEW-5: it called 100 BB off with 91% of hands). ──
+  if (profile.archetype === 'MANIAC') {
+    const wantRaise = pctile >= 0.15 || Math.random() < 0.55;
+    if (wantRaise) {
+      const target = callAmount === 0
+        ? Math.round(bigBlind * (2.5 + Math.random() * 2.5))
+        : Math.round(betToMatch * (2.5 + Math.random() * 1.5));
+      if (!noLimit) {   // pot-limit: 0dc1b96 exactly (an all-in there is a pot raise)
+        if (Math.max(minRaise, target) >= seat.chipCount * 0.7) return ALLIN;
+        return raiseOrAllIn(target);
+      }
+      const r = raiseOrJam(target);
+      if (r) return r;
+    }
+    if (callAmount === 0) return CHECK;
+    return pctile >= 0.30 ? CALL : FOLD;
+  }
+
+  // ── FISH: loose-passive; LIMPS its playables (openLimpFreq), calls too wide. ──
+  if (profile.archetype === 'FISH') {
+    if (callAmount === 0) {   // the big blind option: unchanged
+      if (pctile >= openTh && Math.random() >= params.openLimpFreq) return raiseOrAllIn(Math.round(bigBlind * 3));
+      return CHECK;
+    }
+    if (unopened) {
+      // B5 — the hands it used to SHOVE for 100 BB (top 10%) are now a 3 BB raise;
+      // the rest of its range limps as before (same VPIP and PFR).
+      if (pctile >= 0.90) return raiseOrAllIn(Math.round(bigBlind * 3));
+      return pctile >= adjustThreshold(0.55, factor) ? CALL : FOLD;   // limp
+    }
+    // Its "weird raise": a 3-bet, not a 100 BB jam; never a 4-bet.
+    if (!facingThreeBet && pctile >= 0.90) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
+    if (pctile >= adjustThreshold(0.55, factor) && callAmount <= seat.chipCount * 0.12) return CALL;
+    if (pctile >= callVsRaiseThS) return CALL;
+    return FOLD;
+  }
+
+  // ── ROCK: tight-passive; limps its playables, RAISES only premiums. ──
+  if (profile.archetype === 'ROCK') {
+    if (unopened) {
+      // B5 — premiums raise from ANY seat (AA used to be limped everywhere but the big blind).
+      if (pctile >= adjustThreshold(0.94, huFactor)) return raiseOrAllIn(Math.round(bigBlind * 2.5));
+      if (callAmount === 0) return CHECK;
+      return pctile >= callVsRaiseTh ? CALL : FOLD;                  // limp (unchanged range)
+    }
+    return pctile >= callVsRaiseThS ? CALL : FOLD;
+  }
+
+  // ── NIT: only premiums; folds to 3-bets without a 4-bet-worthy hand. ──
+  if (profile.archetype === 'NIT') {
+    if (unopened) {
+      // B5 — a normal open from ANY seat (was a 100 BB shove with AA-88), never a limp.
+      // Off the big blind it opens the range it already played there (its 3-bet
+      // range: ~6% EP to ~11% BTN); the big blind keeps its old raise range.
+      const nitOpenTh = callAmount === 0 ? openTh : Math.max(openTh, threeBetTh);
+      if (pctile >= nitOpenTh) return raiseOrAllIn(Math.round(bigBlind * 2.5));
+      return callAmount === 0 ? CHECK : FOLD;
+    }
+    if (facingThreeBet) return fourBetValue ? ALLIN : FOLD;
+    if (fourBetValue) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }   // 3-bet, not a jam
+    if (pctile >= threeBetThS) return CALL;
+    return FOLD;
+  }
+
+  // ── LAG / TAG (aggressive, range-based): the default balanced path. ──
+  if (unopened) {
+    if (pctile >= openTh) {
+      let size: number;
+      const limpers = table.seats.some(s => s.seatIndex !== seat.seatIndex && s.state === 'occupied'
+        && !s.folded && s.lastAction === PlayerAction.Call);
+      if (callAmount > 0 && !limpers && noLimit) {
+        // NEW-3 — a first-in open: position-sized (EP 2.5-3x, late 2-2.6x), rounded
+        // UP to a small blind (a whole big blind made every open 3 BB).
+        const unit = Math.max(1, Math.min(bigBlind, table.config.smallBlind || Math.round(bigBlind / 2)));
+        const mult = position < 3 ? 2.5 + Math.random() * 0.5 : 2.0 + Math.random() * 0.6;
+        size = Math.ceil(Math.round(bigBlind * mult) / unit) * unit;
+      } else if (callAmount === 0) {
+        const mult = position < 3 ? 2.5 + Math.random() * 0.5 : 2.0 + Math.random() * 0.6;
+        size = roundToBB(Math.round(bigBlind * mult), bigBlind);                     // big blind's raise (as before)
+      } else {
+        size = roundToBB(Math.round(bigBlind * (2.5 + Math.random() * 0.5)), bigBlind); // over limpers (as before)
+      }
+      return raiseOrAllIn(size);
+    }
+    if (callAmount === 0) return CHECK;
+    if (pctile >= callVsRaiseTh) return CALL;   // over-limp (unchanged)
+    return FOLD;
+  }
+
+  // Facing a 3-bet+: 4-bet premiums, defend by price after opening (B8), else the old flat range.
+  if (facingThreeBet) {
+    if (fourBetValue) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 2.3), bigBlind)); if (r) return r; }
+    let contTh = threeBetTh;
+    if (noLimit && streetRaises === 2 && callAmount > 0 && ownRaisesThisStreet(table, seat) > 0) {
+      const need = callAmount / (totalPot + callAmount);
+      const keep = Math.max(0, Math.min(DEF3B_KEEP_MAX, DEF3B_KEEP_AT_MIN - DEF3B_SLOPE * (need - DEF3B_MIN_NEED)));
+      contTh = Math.min(contTh, 1 - (1 - openTh) * keep);
+    }
+    if (pctile >= contTh) return CALL;
+    if (profile.difficulty === 'expert' && Math.random() < profile.bluffFrequency * 0.3) {
+      const target = roundToBB(Math.round(betToMatch * 2.2), bigBlind);
+      if (Math.max(minRaise, target) <= seat.chipCount * 0.35) return raiseOrAllIn(target);
+    }
+    return FOLD;
+  }
+
+  // Facing a single raise (B9: the big blind vs a min-raise lands here now): 3-bet, flat, or fold.
+  if (facingRaise) {
+    if (pctile >= threeBetThS) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
+    if (pctile >= callVsRaiseThS) return CALL;
+    // Cheap speculative flat in late position.
+    if ((bucket === 'BTN' || bucket === 'CO') && pctile >= adjustThreshold(0.45, factor) && callAmount <= seat.chipCount * 0.06) {
+      return CALL;
+    }
+    return FOLD;
+  }
+
+  // A raised pot with nothing to call (a straddler's option): raise in range, else check.
+  if (pctile >= openTh) return raiseOrAllIn(roundToBB(Math.round(bigBlind * 3), bigBlind));
+  return CHECK;
+}
+
+// ============================================================
+// LEGACY first-round logic — Stud (Third Street) and draw (first betting round).
+// The 0dc1b96 preFlopStrategy, VERBATIM: Stud / draw strengths are not on the
+// Hold'em percentile scale (bots review B1/B2, owned by the stud-draw-lowball
+// change set). It shares only the fixed getEffectiveStackBB (NEW-1).
+// STILL PRESENT ON THIS PATH (fixed for Hold'em / Omaha in preFlopStrategy, NOT
+// here): B4 (raise size ignored), B5 (callAmount===0 open branches reachable only
+// by the big blind / bring-in), B8 (3-bet size ignored), B9 (facingRaise =
+// callAmount > bigBlind), CALLING_STATION playing 100%, B16 (playersYetToAct =
+// min(3, totalActive-1)), NEW-5 (MANIAC 0.7-of-stack jam).
+// TODO(stud-draw-lowball): move Stud / draw onto preFlopStrategy once their
+// first-round strength is a percentile, then DELETE this copy.
+// ============================================================
+function legacyStudDrawFirstRound(
   handStrength: number,
   callAmount: number,
   totalPot: number,
@@ -1690,13 +2047,16 @@ export function getEffectiveStackBB(table: PokerTable, mySeat: number): number {
   const seat = table.seats[mySeat];
   if (!seat) return 100;
   const bb = table.config.bigBlind || 50;
+  // NEW-1 (2026-11): HAND-START stacks (chips behind + chips put in this hand).
+  // It read the chips LEFT, so an all-in opponent counted 0 and every lone
+  // 100 BB shove looked like a 1 BB stack (push/fold call floor: ~65% of hands).
   let largestOpp = 0;
   for (const s of table.seats) {
     if (s.seatIndex === mySeat) continue;
     if (s.state !== 'occupied' || s.folded || s.eliminated) continue;
-    if (s.chipCount > largestOpp) largestOpp = s.chipCount;
+    largestOpp = Math.max(largestOpp, handStartStack(s));
   }
-  const effective = Math.min(seat.chipCount, largestOpp);
+  const effective = Math.min(handStartStack(seat), largestOpp);
   return Math.max(1, Math.round(effective / bb));
 }
 
