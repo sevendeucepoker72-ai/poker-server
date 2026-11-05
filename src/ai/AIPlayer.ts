@@ -1613,7 +1613,9 @@ function preFlopStrategy(
 //    by class, fiveDrawAcesOrBetter) never folds to one completion, one raise
 //    that does not commit the stack, or only the bring-in / big blind, for every
 //    archetype (NIT folded Razz A-2-3 27%, Stud 8 A-2-3 suited 30%, Five Card
-//    Draw A-A-K 41% and 3-3-2-2-K 86% to one; easy bots folded them unopened).
+//    Draw A-A-K 41% and 3-3-2-2-K 86% to one; easy bots folded them unopened);
+//    fix round 3: "one" by the table's own raise count, so a short stack's
+//    all-in call or a lone short all-in is not a 3-bet (SD2-1 / SD2-2).
 // Five Card Draw is the one no-limit game here. The Stud family, 2-7 Triple Draw
 // and Badugi are fixed-limit and take none of the following (fix round 2, VA-1:
 // preFlopStrategy's no-limit fixes, read on the 5CD percentile):
@@ -1633,7 +1635,8 @@ function preFlopStrategy(
 //  - B4: the call and 3-bet ranges narrow with the size of the raise faced
 //    (the big blind widens its calls vs a small one); a FIVE_DRAW_STACKOFF_PREMIUM
 //    hand never folds to a 3-bet or short all-in that does not commit it (the
-//    sized line folded ROCK / FISH full houses 17-47%). MANIAC keeps its flat
+//    sized line folded ROCK / FISH full houses 17-47%), and a value-set hand
+//    never folds to a lone short all-in that does not commit it. MANIAC keeps its flat
 //    call (top 70%) at every size, as preFlopStrategy's;
 //  - B8: an opener facing a 3-bet keeps a share of its opening range by the
 //    price (never narrower than its old flat range: the stack-off gate prices
@@ -1782,8 +1785,15 @@ function studDrawFirstRound(
   // calls instead of folding. No-limit: a FIVE_DRAW_STACKOFF_PREMIUM hand never folds to
   // a 3-bet or a short all-in that does not commit it (the B4 sizing put ROCK / FISH's
   // threshold at 0.98: they folded full houses 17-47% to a 25-32 BB 3-bet).
+  // Fix round 3 (SD2-1 / SD2-2) — "one" is the table's own count of this round's raises:
+  // modelOpponents reads every all-in as two raises, so a short stack's all-in CALL (every
+  // game) or a lone short all-in (under the Stud completion; a no-limit shove that does not
+  // commit this seat) read as a 3-bet, and the value set folded (Five Card Draw ROCK / FISH
+  // aces and two pair 95-100% to a 15-25 BB shove, Razz NIT A-2-3 58% beside an all-in
+  // call). A call that commits the stack never gets here: the stack-off gate prices it first.
   const inValueSet = raw >= STUD_DRAW_VALUE_PCTILE[kind] || (kind === 'draw-hi' && fiveDrawAcesOrBetter(seat.holeCards));
-  const FOLD_VS_RAISE: AIDecision = ((unopened || (facingRaise && !facingThreeBet)) && inValueSet)
+  const facingOneRaise = facingRaise && streetRaises <= 1;
+  const FOLD_VS_RAISE: AIDecision = ((unopened || facingOneRaise) && inValueSet)
     || (noLimit && facingThreeBet && raw >= FIVE_DRAW_STACKOFF_PREMIUM) ? CALL : FOLD;
   const raiseOrAllIn = (amount: number): AIDecision => {
     const to = Math.max(minRaise, amount);
@@ -1851,14 +1861,17 @@ function studDrawFirstRound(
   //    to 25 BB, then top 17% -> 6% at 100 BB+, narrower with up to 3 players in),
   //    read on the 5CD percentile, whose top 6% is two pair or better: the hands that
   //    beat the one-pair part of any shoving range. Premiums (aces up, trips, pat
-  //    hands) always. Continuing = calling the all-in / moving in. Every archetype. ──
+  //    hands) always. Continuing = calling the all-in / moving in. Every archetype.
+  //    Fix round 3 (SD2-1): a value-set hand closing the action on ONE all-in that does
+  //    not commit it calls (on the noisy percentile easy / medium bots folded aces and
+  //    two pair 5-25% to a 20-25 BB shove, hard ones 10-20% at 33 BB). ──
   const committing = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
   const soPlayers = Math.min(3, pyta);
   const stackOffOK = (depthBB: number): boolean => raw >= FIVE_DRAW_STACKOFF_PREMIUM || (depthBB <= PUSH_FOLD_MAX_BB
     ? pctile >= adjustThreshold(nashCallPctile(depthBB, soPlayers), factor)
     : pctile >= adjustThreshold(1 - stackOffCallWidth(depthBB, soPlayers), factor));
   if (noLimit && !allInOrFold && (pureCall || committing)) {
-    if (!stackOffOK(pureCall ? shoveBB : effBB)) return FOLD;
+    if (!stackOffOK(pureCall ? shoveBB : effBB) && !(!committing && facingOneRaise && inValueSet)) return FOLD;
     return pureCall && callAmount < seat.chipCount ? CALL : ALLIN;
   }
   /**
