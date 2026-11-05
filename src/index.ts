@@ -8380,7 +8380,13 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
       }
     }
 
-    if (table.currentPhase === GamePhase.PreFlop) {
+    // Bots review 2026-11-04 (B11) — Seven Card Stud's first betting round is
+    // Third Street (the draw games' is PreFlop): a call / completion there is
+    // voluntary too (the bring-in posts as 'blindPosted', not here). Every Stud
+    // opponent used to read as a nit (vpip = pfr = 0). The HUD 3-bet context
+    // below stays Hold'em / draw PreFlop only.
+    const firstBettingRound = table.currentPhase === GamePhase.PreFlop || table.currentPhase === GamePhase.ThirdStreet;
+    if (firstBettingRound) {
       const voluntary = a === PlayerAction.Call || aggressive;
       if (voluntary && !obsVpip.has(oppKey)) { obsVpip.add(oppKey); recordOpponentObservation(oppKey, 'vpip'); }
       if (aggressive && !obsPfr.has(oppKey)) { obsPfr.add(oppKey); recordOpponentObservation(oppKey, 'pfr'); }
@@ -8395,7 +8401,7 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
       // 3-bet%: a prior preflop raise already in front = a 3-bet spot; raising
       // in that spot is a 3-bet+. preflopRaiseCount reflects raises BEFORE this
       // action (the event fires post-apply), so increment after evaluating.
-      if (s.playerId) {
+      if (s.playerId && table.currentPhase === GamePhase.PreFlop) {
         const facingRaise = preflopRaiseCount >= 1;
         const isReraise = aggressive && preflopRaiseCount >= 1;
         if (facingRaise || isReraise) {
@@ -8995,9 +9001,11 @@ function scheduleAIAction(tableId: string): void {
     const drawTable = table as FiveCardDrawTable;
     const armedHand = drawTable.handNumber;
     const dphase = drawTable.currentPhase;
-    // Schedule AI draws for all AI players who haven't drawn yet
-    const profiles = aiProfiles.get(tableId);
-    if (profiles) {
+    // Schedule AI draws for all AI players who haven't drawn yet.
+    // Bots review 2026-11-04 (A-drawhang) — never gated on the table's
+    // aiProfiles map (the draw reads no profile): with the map missing, no bot
+    // ever drew and the hand hung in the draw round.
+    {
       for (const seat of drawTable.seats) {
         // F27 (2026-10-21) — an all-in bot draws too: the engine waits for
         // every seat in the hand (all-in ends the betting, not the drawing).
@@ -9088,8 +9096,8 @@ function scheduleAIAction(tableId: string): void {
     // 2026-06-11 audit R10: arm a draw-phase clock for HUMAN players (the AI
     // loop above auto-draws bots). One per (hand, phase) so the many
     // scheduleAIAction re-entries don't stack timers; on fire, stand-pat
-    // (draw 0) any non-AI player who hasn't drawn so the phase completes
-    // instead of hanging forever on an unresponsive human.
+    // (draw 0) any player who hasn't drawn (a human, or since 2026-11-04 a bot
+    // whose draw timer was lost) so the phase completes instead of hanging.
     const existingDraw = drawTimers.get(tableId);
     const sameDraw = !!existingDraw && existingDraw.handNumber === armedHand && existingDraw.phase === dphase;
     if (!sameDraw) {
@@ -9108,7 +9116,10 @@ function scheduleAIAction(tableId: string): void {
           // next draw round at once: never stand anyone pat in THAT one.
           if (t.handNumber !== armedHand || t.currentPhase !== dphase) break;
           // F27 (2026-10-21) — an all-in human who has not drawn is stood pat too.
-          if (!s.isAI && s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0 && !t.drawsCompleted.has(s.seatIndex)) {
+          // Bots review 2026-11-04 (A-drawhang) — and a BOT still undrawn at the
+          // deadline (its draw timer lost): the clock used to stand only humans
+          // pat, so the round waited forever.
+          if (s.state === 'occupied' && !s.folded && !s.eliminated && s.holeCards.length > 0 && !t.drawsCompleted.has(s.seatIndex)) {
             t.playerDraw(s.seatIndex, []); // stand pat — timed out
             forced = true;
           }
@@ -9135,8 +9146,14 @@ function scheduleAIAction(tableId: string): void {
   // console.log(`[AI] Active seat ${activeSeat}: ${seat.playerName}, isAI=${seat.isAI}, state=${seat.state}`);
   if (!seat.isAI) { return; }
 
-  const profiles = aiProfiles.get(tableId);
-  if (!profiles) { console.log('[AI] No profiles found'); return; }
+  // Bots review 2026-11-04 (A-drawhang review) — a missing profile MAP is
+  // recreated (the per-seat profile is synthesized below), not a return: every
+  // bot action used to wait for the 20 s wedge watchdog.
+  if (!aiProfiles.has(tableId)) {
+    console.warn(`[AI] Missing profile map for ${tableId} — recreating`);
+    aiProfiles.set(tableId, new Map());
+  }
+  const profiles = aiProfiles.get(tableId)!;
 
   let profile = profiles.get(activeSeat);
   if (!profile) {
