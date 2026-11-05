@@ -893,6 +893,14 @@ MIN_BUDGETED_SIMULATIONS = 64
 chooseBotDiscards
 studDrawEquity
 
+# 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
+# percentile table is generated offline (gen-preflop-table.ts) and committed as
+# src/ai/preflopTable.ts: no boot-time Monte Carlo, no Math.random, identical
+# ranges every boot; plus a stack-off scale (getStackOffPercentile) for
+# 4-bets and deep stack-offs.
+preflop-table-v1
+FOURBET_STACKOFF_THRESHOLD
+
 # 2026-10-11 (.online R2, S2 table lifecycle) — GAME-15/16 + Addendum: ONE seat
 # teardown (pot chips of a folded / all-in / extra-table / ghost seat wait for
 # the hand's end, the next bot acts now); never an AI seat taken mid-hand.
