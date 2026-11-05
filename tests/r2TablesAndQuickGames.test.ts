@@ -789,10 +789,12 @@ describe('quick games END — heads-up / all-in-or-fold / career cash out once; 
     expect(quickGameOutcome('spinGo', [seat(0, 0, false, 'empty'), seat(1, 900, true), seat(2, 600, true)])).toMatchObject({ over: true, humanWon: false });
     expect(quickGameOutcome('challenge', [seat(0, 4000, false), seat(1, 0, false)])).toMatchObject({ over: true, winnerSeat: 0, humanWon: true });
     expect(quickGameOutcome('challenge', [seat(0, 4000, false), seat(1, 0, false, 'empty')])).toMatchObject({ over: true, winnerSeat: 0 });
+    // 2026-11 (bots review, E1): 25x 1 / 10x 3 / 5x 7 / 3x 22 / 2x 67 (mean 2.90x).
     expect(spinGoMultiplierFor(0.5)).toBe(25);
-    expect(spinGoMultiplierFor(4.9)).toBe(10);
-    expect(spinGoMultiplierFor(14)).toBe(5);
-    expect(spinGoMultiplierFor(39)).toBe(3);
+    expect(spinGoMultiplierFor(3.9)).toBe(10);
+    expect(spinGoMultiplierFor(10.9)).toBe(5);
+    expect(spinGoMultiplierFor(32.9)).toBe(3);
+    expect(spinGoMultiplierFor(33)).toBe(2);
     expect(spinGoMultiplierFor(99)).toBe(2);
   });
 });

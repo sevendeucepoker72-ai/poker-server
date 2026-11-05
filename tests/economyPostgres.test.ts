@@ -246,7 +246,7 @@ d('economy on a real Postgres', () => {
 
     it('tickScratchProgress returns the wallet with the tick (the hand-complete push is DB-fresh)', async () => {
       const id = await mkUser({ chips: 777, stars: 3, hands_since_last_scratch: 19, scratch_cards_available: 1 });
-      expect(await am.tickScratchProgress(id)).toEqual({ awarded: true, chips: 777, stars: 3, scratchCardsAvailable: 2 });
+      expect(await am.tickScratchProgress(id)).toEqual({ awarded: true, chips: 777, stars: 3, scratchCardsAvailable: 2, capped: false });
       expect(await am.tickScratchProgress(id)).toMatchObject({ awarded: false, scratchCardsAvailable: 2 });
     });
   });

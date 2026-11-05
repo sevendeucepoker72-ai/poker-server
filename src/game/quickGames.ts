@@ -56,11 +56,32 @@ export function quickGameOutcome(format: QuickFormat, seats: QuickSeatView[]): Q
   return { over: false };
 }
 
-/** The Spin & Go prize multiplier for a roll in [0, 100): 2x 60%, 3x 25%, 5x 10%, 10x 4%, 25x 1%. */
+/**
+ * Spin & Go prize odds (percent of a roll in [0, 100)), top prize first.
+ * 2026-11 (bots review, E1): mean 2.90x = 1 / 34.4%, the best simple
+ * strategy's win rate against the merged bots (Nash push/fold). HEAD was
+ * 2x 60 / 3x 25 / 5x 10 / 10x 4 / 25x 1 (mean 3.10x), which paid that strategy
+ * +6.6% per game. The multipliers {2, 3, 5, 10, 25} and the 1% top prize the
+ * lobby advertises are unchanged. The pct values sum to 100.
+ */
+export const SPIN_GO_MULTIPLIER_ODDS: ReadonlyArray<{ multiplier: number; pct: number }> = [
+  { multiplier: 25, pct: 1 },
+  { multiplier: 10, pct: 3 },
+  { multiplier: 5, pct: 7 },
+  { multiplier: 3, pct: 22 },
+  { multiplier: 2, pct: 67 },
+];
+
+/**
+ * The Spin & Go prize multiplier for a roll in [0, 100), from
+ * SPIN_GO_MULTIPLIER_ODDS: below 1 gives 25x, below 4 gives 10x, below 11
+ * gives 5x, below 33 gives 3x, otherwise 2x.
+ */
 export function spinGoMultiplierFor(roll: number): number {
-  if (roll < 1) return 25;
-  if (roll < 5) return 10;
-  if (roll < 15) return 5;
-  if (roll < 40) return 3;
+  let edge = 0;
+  for (const o of SPIN_GO_MULTIPLIER_ODDS) {
+    edge += o.pct;
+    if (roll < edge) return o.multiplier;
+  }
   return 2;
 }
