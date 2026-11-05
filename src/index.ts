@@ -48,6 +48,7 @@ import {
   recordOpponentObservation,
   opponentModelKey,
 } from './ai/AIPlayer';
+import { chooseBotDiscards, studDrawKindOf } from './ai/studDrawStrength';
 import { ProgressionManager, lifetimeAchievementsUnlockedByLevel, maxXpAtLevel } from './progression/ProgressionManager';
 import { sanitizeClientProgressSave, PAYOUT_KEYS_FROM_CLIENT } from './progression/clientProgressSave';
 import { progressionHandRank } from './progression/progressionHandRank';
@@ -9019,66 +9020,13 @@ function scheduleAIAction(tableId: string): void {
               // fires; that round's own scheduling draws for it.
               if (drawTable.handNumber !== armedHand || drawTable.currentPhase !== dphase) return;
               if (drawTable.drawsCompleted.has(seat.seatIndex)) return;
-              // 2026-06-19 fix: discard the WORST cards deterministically.
-              // 2026-07-07 fix: LOWBALL-aware. The old rule kept pairs + the two
-              // HIGHEST cards — correct for high draw, but exactly BACKWARDS for
-              // 2-7 triple draw and badugi (lowball), where low, unpaired,
-              // off-suit cards are best. The bots were drawing to the worst hands.
-              const cards = seat.holeCards;
-              const variantId = ((drawTable as any).variantId as string) || '';
-              const isBadugi = variantId === 'badugi';
-              const isLowball = isBadugi || variantId === 'triple-draw';
-              const keep = new Set<number>();
-              if (isBadugi) {
-                // Badugi: keep a LOW, RAINBOW, distinct-rank subset (best = A-2-3-4,
-                // four suits). Ace plays low. Greedily take low cards with an
-                // unseen rank AND unseen suit; draw everything else.
-                const aceLow = (c: any) => (c.rank === 14 ? 1 : c.rank); // Ace plays LOW in badugi
-                const order = [...cards.keys()].sort((a, b) => aceLow(cards[a]) - aceLow(cards[b]));
-                const seenR = new Set<number>(), seenS = new Set<number>();
-                for (const i of order) {
-                  if (!seenR.has(cards[i].rank) && !seenS.has(cards[i].suit)) {
-                    keep.add(i); seenR.add(cards[i].rank); seenS.add(cards[i].suit);
-                  }
-                }
-              } else if (isLowball) {
-                // 2-7 triple draw: ace is HIGH, so aces/pairs/high cards are the
-                // WORST. F116 (2026-10-21) — keep only LOW cards (8 or lower,
-                // never an ace) of distinct ranks; the old loop kept the lowest
-                // five distinct ranks, i.e. every unpaired hand (A-K high, a
-                // made straight) stood pat. A kept five that is a straight or a
-                // flush (bad in 2-7) breaks its highest card.
-                const dVal = (c: any) => c.rank; // 2-7: Ace(14) is HIGH → sorts last (worst)
-                const order = [...cards.keys()].sort((a, b) => dVal(cards[a]) - dVal(cards[b]));
-                const seenR = new Set<number>();
-                for (const i of order) {
-                  if (keep.size >= 5) break;
-                  if (cards[i].rank > 8) continue;
-                  if (!seenR.has(cards[i].rank)) { keep.add(i); seenR.add(cards[i].rank); }
-                }
-                if (keep.size === 5) {
-                  const kept = [...keep].map((i) => cards[i]);
-                  const ranks = kept.map((c: any) => c.rank);
-                  const straight = Math.max(...ranks) - Math.min(...ranks) === 4;
-                  const flush = kept.every((c: any) => c.suit === kept[0].suit);
-                  if (straight || flush) {
-                    const highest = [...keep].reduce((h, i) => (cards[i].rank > cards[h].rank ? i : h));
-                    keep.delete(highest);
-                  }
-                }
-              } else {
-                // High draw (five-card draw): keep pairs/trips/quads, else the two
-                // highest, draw the other three.
-                const byRank = new Map<number, number[]>();
-                cards.forEach((c: any, i: number) => { const a = byRank.get(c.rank) || []; a.push(i); byRank.set(c.rank, a); });
-                for (const idxs of byRank.values()) if (idxs.length >= 2) idxs.forEach((i) => keep.add(i));
-                if (keep.size === 0) {
-                  [...cards.keys()].sort((a, b) => cards[b].rank - cards[a].rank).slice(0, 2).forEach((i) => keep.add(i));
-                }
-              }
-              // F116 — 2-7 draws up to five (the old cap of 3 applied to every variant).
-              const maxDiscard = isLowball && !isBadugi ? 5 : 3;
-              const indices: number[] = [...cards.keys()].filter((i) => !keep.has(i)).slice(0, maxDiscard);
+              // B3 / B15 / Badugi subset (bots review 2026-11-04): the bot's draw by the
+              // engine's own hand order, round-aware (studDrawStrength.chooseBotDiscards) —
+              // pat straights / flushes stand, four-flushes and open-enders draw one, the
+              // best badugi subset is kept, a made 9- or 10-low stands pat on the last 2-7
+              // draw. (The old inline picker broke pat hands and kept a worse badugi 5.2%.)
+              const kind = studDrawKindOf(((drawTable as any).variantId as string) || '', drawTable);
+              const indices = kind ? chooseBotDiscards(kind, seat.holeCards, drawTable.currentPhase) : [];
               drawTable.playerDraw(seat.seatIndex, indices);
               broadcastGameState(tableId);
               // After all draws, the table will advance and we need to schedule

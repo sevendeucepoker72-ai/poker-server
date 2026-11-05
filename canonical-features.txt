@@ -1341,7 +1341,7 @@ no betting round when at most one player can still bet
 const isBigBetRound =
 function drawClockStart(
 stateObj.drawStartedAt = drawClockStart(
-const maxDiscard = isLowball && !isBadugi ? 5 : 3;
+chooseBotDiscards)(kind, seat.holeCards, drawTable.currentPhase)
 discardHoldDecider
 PINEAPPLE_DISCARD_WINDOW_MS = 10000
 fallbackDiscardIndex(
