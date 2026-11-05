@@ -907,6 +907,15 @@ if (tr >= MAX_TRIES) {
 STUD_DRAW_VALUE_PCTILE
 FIVE_DRAW_STACKOFF_PREMIUM
 FOLD_VS_RAISE
+# 2026-11-05 (bots review fix round 2, second review) - studDrawFirstRound: Five Card Draw's value set also holds
+# every pair of aces or better by class; a value-set hand never folds facing only the bring-in / big blind either;
+# a re-raise to a third of the stack is a stack-off (an all-in that passes the range), and a hand that fails the
+# range re-raises at most FIVE_DRAW_LIGHT_RERAISE_FRACTION of the stack (MANIAC raise-then-fold); a premium never
+# folds to a 3-bet / short all-in that does not commit it. studDrawEquity: the 40 ms budget's minimum counts
+# scored simulations (dropped ones are not samples).
+fiveDrawAcesOrBetter
+FIVE_DRAW_LIGHT_RERAISE_FRACTION
+n >= exports.STUD_DRAW_MIN_SIMS
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

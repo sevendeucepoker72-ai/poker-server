@@ -316,7 +316,8 @@ export function studDrawEquity(s: StudDrawSpot, maxSims = STUD_DRAW_MAX_SIMS, bu
   let total = 0, n = 0, dropped = 0, keepMisses = false;
   const hands: Card[][] = new Array(nOpp + 1);
   for (let sim = 0; sim < maxSims; sim++) {
-    if (sim >= STUD_DRAW_MIN_SIMS && (sim & 15) === 0 && Date.now() > deadline) break;
+    // The minimum counts SCORED simulations (n): a dropped one (VA-2) is not a sample.
+    if (n >= STUD_DRAW_MIN_SIMS && (sim & 15) === 0 && Date.now() > deadline) break;
     pos = 0;
     let ok = true;
     for (let i = 0; i < nOpp; i++) {

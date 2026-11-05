@@ -7,6 +7,9 @@
  * The reference is independent of studDrawEquity: Five Card Draw after the draw (Bet2, no draws to come),
  * the opponent's dealt hand drawn by plain rejection (no cap) from the cards the bot cannot see until it
  * reaches the FLOOR quantile of hiValue among such hands, then one draw by the bots' keep rule. Seeded.
+ * Follow-up (second review): the 40 ms budget's floor of STUD_DRAW_MIN_SIMS counted every simulation
+ * started, dropped ones too, so a busy CPU priced a narrowed multiway spot on 16-33 scored draws
+ * (98e2568). The floor now counts scored simulations.
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
 const SDS = require('../src/ai/studDrawStrength');
@@ -56,6 +59,25 @@ describe('VA-2: range narrowing never scores a start outside the range', () => {
       expect(stats.sims).toBeGreaterThanOrEqual(200);
       expect(eq).toBeGreaterThanOrEqual(0); expect(eq).toBeLessThanOrEqual(1);
     }
+  });
+  it('with the budget already spent, a narrowed spot still scores STUD_DRAW_MIN_SIMS simulations (98e2568: dropped ones counted)', () => {
+    const now = Date.now; let calls = 0;
+    Date.now = () => 1_700_000_000_000 + (calls++ === 0 ? 0 : 1_000_000);   // every check after the first is past the deadline
+    try {
+      let st = 21; const rnd = () => ((st = (Math.imul(st, 1664525) + 1013904223) >>> 0) / 4294967296);
+      let minN = Infinity;
+      for (let k = 0; k < 30; k++) {
+        const d: any[] = []; for (let su = 0; su < 4; su++) for (let r = 2; r <= 14; r++) d.push({ rank: r, suit: su });
+        for (let i = d.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const z = d[i]; d[i] = d[j]; d[j] = z; }
+        const opps = [0.92, 0.92, 0.92, 0.92].map((floor) => ({ known: [], total: 5, floor }));
+        const stats = { sims: 0 }; calls = 0;
+        SDS.studDrawEquity({ kind: 'deuce7', mine: d.slice(0, 5), dead: [], shared: [], opps, drawsLeft: 2 }, 400, 40, stats);
+        minN = Math.min(minN, stats.sims);
+      }
+      process.stdout.write(`VA-2 budget floor: fewest scored simulations over 30 spent-budget spots = ${minN}
+`);
+      expect(minN).toBeGreaterThanOrEqual(SDS.STUD_DRAW_MIN_SIMS);
+    } finally { Date.now = now; }
   });
   it('GUARD: no narrowing (floor 0) is untouched: the same spot gives the same pot share, and a lone opponent at floor 0 is never dropped', () => {
     const spot = { kind: 'draw-hi', mine: [{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }, { rank: 13, suit: 2 }, { rank: 7, suit: 3 }, { rank: 3, suit: 0 }], dead: [], shared: [], opps: [{ known: [], total: 5, floor: 0 }], drawsLeft: 1 };

@@ -8,6 +8,11 @@
  * Math.random, frozen Date.now, seeded deck). Each spot is a freshly dealt 5-handed table; the hand's
  * pre-noise percentile in THAT deal (the door cards showing move it in Stud) is computed with the same
  * public-information functions the bot uses, and only deals at or above the cut are asserted.
+ * Follow-up (second review): Five Card Draw's set also holds every pair of aces or better by class
+ * (AIPlayer fiveDrawAcesOrBetter: the 0.90 cut on the noisy percentile left out most low two pairs and
+ * ~12% of pairs of aces, and a NIT folded 3-3-2-2-K 70% / 7-7-3-3-A 40% to one 3 BB open on 98e2568,
+ * 86% / 64% on d1ec56a), and a value-set hand facing only the bring-in / big blind never folds either
+ * (easy / medium bots folded A-A-K-7-3 in Five Card Draw up to 24%, Razz 2-4-6 10%, Stud 8 A-2-3 suited 12%).
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
 const { PlayerAction } = require('../src/game/PokerTable');
@@ -48,6 +53,19 @@ function spot(v: string, h: string): { t: any; me: number; raw: number } | null 
   if (stud) { t.playerCheck(t.activeSeatIndex); t.playerRaise(t.activeSeatIndex, t.getMinRaise()); }   // the bring-in stays, the next seat completes
   else t.playerRaise(t.activeSeatIndex, kind === 'draw-hi' ? 150 : t.getMinRaise());                     // a 3 BB open / one fixed-limit bet
   const me = t.activeSeatIndex; const hand = C(h);
+  const doors: any[] = []; if (stud) for (const x of t.seats) if (x.seatIndex !== me && x.state === 'occupied') doors.push(...t.getFaceUpCards(x.seatIndex));
+  if (doors.some((c) => hand.some((y: any) => same(y, c)))) return null;
+  t.seats[me].holeCards = hand;
+  const raw = SDS.equityToPercentile(kind, SDS.firstRoundEquity(kind, hand, doors, SDS.drawsLeftAt(kind, t.currentPhase), 0));
+  return { t, me, raw };
+}
+/** The same table with nobody in yet: the seat to act faces only the bring-in (Stud family) or the big blind (draw games). */
+function unopened(v: string, h: string): { t: any; me: number; raw: number } | null {
+  const t = make[v](); for (let i = 0; i < 5; i++) t.sitDown(i, 'P' + i, 5000, `ai-v-${i}`, true); t.startNewHand();
+  const kind = SDS.studDrawKindOf(t.variantId, t); const stud = SDS.isStudKind(kind);
+  if (stud) t.playerCheck(t.activeSeatIndex);   // the bring-in seat keeps its forced bet
+  const me = t.activeSeatIndex; const hand = C(h);
+  if (t.getCallAmount(t.seats[me]) <= 0 || (Number(t.raisesThisStreet) || 0) > 0) return null;
   const doors: any[] = []; if (stud) for (const x of t.seats) if (x.seatIndex !== me && x.state === 'occupied') doors.push(...t.getFaceUpCards(x.seatIndex));
   if (doors.some((c) => hand.some((y: any) => same(y, c)))) return null;
   t.seats[me].holeCards = hand;
@@ -96,6 +114,77 @@ describe('item 4: a value-set hand never folds to one completion / one non-commi
           }
         }
       }
+    } finally { restore(); }
+  }, 180_000);
+  it.each(SPOTS)('%s %s: facing only the bring-in / big blind, NIT / TAG / ROCK at medium and easy never fold it in the set', (v, h) => {
+    const restore = detEnv(44);
+    try {
+      let inSet = 0, deals = 0;
+      for (let g = 0; deals < 6 && g < 40; g++) {
+        const r = unopened(v, h); if (!r) continue; deals++;
+        const kind = SDS.studDrawKindOf(r.t.variantId, r.t);
+        if (r.raw < CUT[kind]) continue;
+        inSet++;
+        for (const a of ['NIT', 'TAG', 'ROCK']) for (const diff of ['medium', 'easy']) {
+          const p = prof(a, diff); let folds = 0;
+          for (let i = 0; i < 8; i++) if (AI.decideAction(r.t, r.me, p).action === PlayerAction.Fold) folds++;
+          expect([v, h, a, diff, folds]).toEqual([v, h, a, diff, 0]);
+        }
+      }
+      expect(inSet).toBeGreaterThanOrEqual(3);
+    } finally { restore(); }
+  }, 120_000);
+  it('Five Card Draw: fiveDrawAcesOrBetter is exactly "a pair of aces or better" (hiValue >= A-A-4-3-2) over 20,000 random hands', () => {
+    let s = 9; const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+    const floor = SDS.hiValue(C('As Ah 4d 3c 2s'));
+    let yes = 0;
+    for (let k = 0; k < 20000; k++) {
+      const deck: any[] = []; for (let su = 0; su < 4; su++) for (let r = 2; r <= 14; r++) deck.push({ rank: r, suit: su });
+      for (let i = 0; i < 5; i++) { const j = i + Math.floor(rnd() * (52 - i)); const z = deck[i]; deck[i] = deck[j]; deck[j] = z; }
+      const h = deck.slice(0, 5); const want = SDS.hiValue(h) >= floor;
+      if (want) yes++;
+      if (AI.fiveDrawAcesOrBetter(h) !== want) expect([h, want]).toEqual([h, !want]);
+    }
+    expect(yes / 20000).toBeGreaterThan(0.09);
+    expect(yes / 20000).toBeLessThan(0.13);
+  });
+  it('Five Card Draw: a NIT never folds any two pair or any pair of aces (random suits and kickers) to one 3 BB open or first in, hard / medium / easy', () => {
+    const restore = detEnv(45);
+    try {
+      let s = 17; const rnd = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+      const pick = (n: number) => Math.floor(rnd() * n);
+      /** A random five-card hand of the class: two pair (kind 0) or a pair of aces with three odd kickers (kind 1). */
+      const make5 = (cls: number): any[] => {
+        for (;;) {
+          const deck: any[] = []; for (let su = 0; su < 4; su++) for (let r = 2; r <= 14; r++) deck.push({ rank: r, suit: su });
+          const take = (pred: (c: any) => boolean) => { const ok = deck.filter(pred); const c = ok[pick(ok.length)]; deck.splice(deck.indexOf(c), 1); return c; };
+          let h: any[];
+          if (cls === 0) {
+            const a = 2 + pick(13); let b = 2 + pick(13); while (b === a) b = 2 + pick(13);
+            h = [take((c) => c.rank === a), take((c) => c.rank === a), take((c) => c.rank === b), take((c) => c.rank === b), take((c) => c.rank !== a && c.rank !== b)];
+          } else {
+            h = [take((c) => c.rank === 14), take((c) => c.rank === 14)];
+            while (h.length < 5) h.push(take((c) => c.rank !== 14 && !h.some((x: any) => x.rank === c.rank)));
+          }
+          if (cls === 1 && h.every((c) => c.suit === h[0].suit)) continue;   // keep it a plain pair of aces
+          return h;
+        }
+      };
+      let n = 0;
+      for (let k = 0; k < 40; k++) {
+        const hand = make5(k % 2);
+        expect(SDS.hiValue(hand) >= SDS.hiValue(C('As Ah 4d 3c 2s'))).toBe(true);
+        for (const first of [false, true]) {
+          const t = make['five-card-draw'](); for (let i = 0; i < 5; i++) t.sitDown(i, 'P' + i, 5000, `ai-v-${i}`, true); t.startNewHand();
+          if (!first) t.playerRaise(t.activeSeatIndex, 150);
+          const me = t.activeSeatIndex; t.seats[me].holeCards = hand;
+          for (const diff of ['hard', 'medium', 'easy']) {
+            const p = prof('NIT', diff);
+            for (let i = 0; i < 3; i++) { n++; expect([hand.map((c: any) => c.rank).join('-'), first, diff, AI.decideAction(t, me, p).action === PlayerAction.Fold]).toEqual([hand.map((c: any) => c.rank).join('-'), first, diff, false]); }
+          }
+        }
+      }
+      expect(n).toBe(720);
     } finally { restore(); }
   }, 180_000);
   it('GUARD: below the cut a NIT still folds (Badugi A-2-3 with a king, a 3-card hand vs an open)', () => {

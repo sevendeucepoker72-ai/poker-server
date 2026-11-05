@@ -99,9 +99,17 @@ describe('VA-1 / NEW-1: Five Card Draw facing a lone 100 BB pre-draw shove', () 
           if (cont) expect([a, h, m[PlayerAction.Fold] || 0]).toEqual([a, h, 0]);
           else expect([a, h, m[PlayerAction.Fold] || 0]).toEqual([a, h, 40]);
         }
+        // the premium floor (FIVE_DRAW_STACKOFF_PREMIUM, read before the noise): no difficulty folds them
+        for (const diff of ['medium', 'easy']) {
+          for (const h of ['Kh Kd Kc 7s 7h', 'Ah Jh 8h 5h 2h', '9h 8d 7c 6s 5h', 'Qh Qd Qc 7s 2h', 'Ah Ad Kc Ks 3h']) {
+            const t = table(); deal(t); const bb = loneShoveToBB(t); expect(bb).toBeGreaterThanOrEqual(0);
+            t.seats[bb].holeCards = C(h);
+            expect([a, diff, h, dist(t, bb, prof(a, diff), 12)[PlayerAction.Fold] || 0]).toEqual([a, diff, h, 0]);
+          }
+        }
       }
     } finally { restore(); }
-  }, 120_000);
+  }, 300_000);
 
   it('a seeded shove-the-top-10% line loses chips: UTG 100 BB shoves vs [ROCK, CALLING_STATION, FISH, MANIAC], all-in equity EV < 0', () => {
     const restore = detEnv(33);
@@ -157,7 +165,7 @@ describe('VA-1 / NEW-1: Five Card Draw facing a lone 100 BB pre-draw shove', () 
 });
 
 describe('NEW-5: MANIAC never jams a hand that does not pass the stack-off range', () => {
-  it('first in, and over a 20 BB / 30 BB open (neither commits it), junk and middling hands are never moved all-in', () => {
+  it('first in, and over a 20 BB / 30 BB open (neither commits it), junk and middling hands are never moved all-in, nor raised to a third of the stack', () => {
     const restore = detEnv(34);
     try {
       for (const X of [0, 20, 30]) {
@@ -166,8 +174,12 @@ describe('NEW-5: MANIAC never jams a hand that does not pass the stack-off range
           if (X) t.playerRaise(t.activeSeatIndex, X * 50);
           const me = t.activeSeatIndex; const hand = C(h);
           t.seats[me].holeCards = hand;
-          const m = dist(t, me, prof('MANIAC'), 60);
-          expect([X, h, m[PlayerAction.AllIn] || 0]).toEqual([X, h, 0]);
+          let big = 0; const m: Record<string, number> = {};
+          for (let i = 0; i < 60; i++) {
+            const d = AI.decideAction(t, me, prof('MANIAC')); m[d.action] = (m[d.action] || 0) + 1;
+            if (d.action === PlayerAction.Raise && d.raiseAmount >= 5000 * AI.STACKOFF_COMMIT_FRACTION) big++;
+          }
+          expect([X, h, m[PlayerAction.AllIn] || 0, big]).toEqual([X, h, 0, 0]);
         }
       }
     } finally { restore(); }

@@ -1500,9 +1500,11 @@ function preFlopStrategy(
 //  - NIT / ROCK / FISH open normally, CALLING_STATION plays ~56% (CS_PLAY_BASE)
 //    unopened and calls CS_CALL_WIDTH vs a raise (it played 100%);
 //  - fix round 2: a hand in its game's value set (STUD_DRAW_VALUE_PCTILE, read
-//    BEFORE the difficulty noise) never folds to one completion or one raise
-//    that does not commit the stack, for every archetype (NIT folded Razz A-2-3
-//    27%, Stud 8 A-2-3 suited 30%, Five Card Draw A-A-K 41% to one).
+//    BEFORE the difficulty noise; Five Card Draw also a pair of aces or better
+//    by class, fiveDrawAcesOrBetter) never folds to one completion, one raise
+//    that does not commit the stack, or only the bring-in / big blind, for every
+//    archetype (NIT folded Razz A-2-3 27%, Stud 8 A-2-3 suited 30%, Five Card
+//    Draw A-A-K 41% and 3-3-2-2-K 86% to one; easy bots folded them unopened).
 // Five Card Draw is the one no-limit game here. The Stud family, 2-7 Triple Draw
 // and Badugi are fixed-limit and take none of the following (fix round 2, VA-1:
 // preFlopStrategy's no-limit fixes, read on the 5CD percentile):
@@ -1513,10 +1515,17 @@ function preFlopStrategy(
 //    or better), narrower with up to 3 players in; FIVE_DRAW_STACKOFF_PREMIUM
 //    hands (aces up, trips, pat hands) always. It called a lone 100 BB shove
 //    with 35-91% of hands;
-//  - NEW-5: a raise to RAISE_JAM_FRACTION of the stack is an all-in, and every
-//    jam must pass that range (MANIAC moved in at 0.7 of its stack with any hand);
+//  - NEW-5: a raise to RAISE_JAM_FRACTION of the stack is an all-in; a re-raise
+//    to a third of it is a stack-off too (made as an all-in), and every jam must
+//    pass that range (MANIAC moved in at 0.7 of its stack with any hand); a
+//    hand that fails it re-raises at most FIVE_DRAW_LIGHT_RERAISE_FRACTION of
+//    the stack (MANIAC re-raised 91% of hands to 33-59% of its stack, then
+//    folded 89% of them to a shove);
 //  - B4: the call and 3-bet ranges narrow with the size of the raise faced
-//    (the big blind widens its calls vs a small one);
+//    (the big blind widens its calls vs a small one); a FIVE_DRAW_STACKOFF_PREMIUM
+//    hand never folds to a 3-bet or short all-in that does not commit it (the
+//    sized line folded ROCK / FISH full houses 17-47%). MANIAC keeps its flat
+//    call (top 70%) at every size, as preFlopStrategy's;
 //  - B8: an opener facing a 3-bet keeps a share of its opening range by the
 //    price (never narrower than its old flat range: the stack-off gate prices
 //    the 3-bets that commit it);
@@ -1545,6 +1554,37 @@ export const STUD_DRAW_VALUE_PCTILE: Record<StudDrawKind, number> = {
 };
 /** Five Card Draw: a first-round percentile this high before the noise (aces up, trips, pat hands: top ~3%) always continues a stack-off. */
 export const FIVE_DRAW_STACKOFF_PREMIUM = 0.965;
+/**
+ * Five Card Draw: a re-raise by a hand that fails the stack-off range is made only up
+ * to this share of the street stack (10 BB of 100: a 3-bet of a 2.5-3 BB open). Larger,
+ * it is a call / fold instead: a hand that folds to the shove it invites risks little.
+ * Opening 3 / 4 BB with any two and shoving over every re-raise vs four MANIACs (who
+ * re-raise ~91% and fold ~89% of it to a shove) measured -63 / -273 BB/100 with 0.10,
+ * +78 / +32 with 0.125 (2,000 hands, se ~47).
+ */
+export const FIVE_DRAW_LIGHT_RERAISE_FRACTION = 0.10;
+
+/**
+ * Fix round 2 follow-up — Five Card Draw's value set also holds every A PAIR OF ACES
+ * OR BETTER by its made-hand class (two pair+ 7.6% of deals, a pair of aces 3.3%):
+ * the 600-sim percentile is noisy at the top and ranks low two pair (3-3-2-2-K
+ * 0.85-0.90) and some pairs of aces (from 0.87) under the 0.90 cut, so a NIT still
+ * folded them to one 3 BB open. The bot's own five cards only.
+ */
+export function fiveDrawAcesOrBetter(cards: Card[]): boolean {
+  if (!cards || cards.length !== 5) return false;
+  const cnt = new Map<number, number>();
+  for (const c of cards) cnt.set(c.rank, (cnt.get(c.rank) || 0) + 1);
+  const groups = [...cnt.values()].sort((a, b) => b - a);
+  if (groups[0] >= 3 || (groups[0] === 2 && groups[1] === 2)) return true;   // trips, quads, full house, two pair
+  if ((cnt.get(14) || 0) >= 2) return true;                                   // a pair of aces
+  if (cards.every((c) => c.suit === cards[0].suit)) return true;              // flush
+  if (groups.length === 5) {                                                  // straight (A-2-3-4-5 too)
+    const r = cards.map((c) => c.rank).sort((a, b) => a - b);
+    if (r[4] - r[0] === 4 || (r[4] === 14 && r[3] === 5)) return true;
+  }
+  return false;
+}
 
 function studDrawFirstRound(
   handStrength: number,
@@ -1628,8 +1668,14 @@ function studDrawFirstRound(
   const CHECK: AIDecision = { action: PlayerAction.Check, raiseAmount: 0 };
   const CALL: AIDecision = { action: PlayerAction.Call, raiseAmount: 0 };
   const ALLIN: AIDecision = { action: PlayerAction.AllIn, raiseAmount: 0 };
-  // Item 4 — a value-set hand (pre-noise percentile) facing ONE completion / raise calls instead of folding.
-  const FOLD_VS_RAISE: AIDecision = facingRaise && !facingThreeBet && raw >= STUD_DRAW_VALUE_PCTILE[kind] ? CALL : FOLD;
+  // Item 4 — a value-set hand (pre-noise percentile; Five Card Draw also a pair of aces
+  // or better by class) facing ONE completion / raise, or only the bring-in / big blind,
+  // calls instead of folding. No-limit: a FIVE_DRAW_STACKOFF_PREMIUM hand never folds to
+  // a 3-bet or a short all-in that does not commit it (the B4 sizing put ROCK / FISH's
+  // threshold at 0.98: they folded full houses 17-43% to a 25-32 BB 3-bet).
+  const inValueSet = raw >= STUD_DRAW_VALUE_PCTILE[kind] || (kind === 'draw-hi' && fiveDrawAcesOrBetter(seat.holeCards));
+  const FOLD_VS_RAISE: AIDecision = ((unopened || (facingRaise && !facingThreeBet)) && inValueSet)
+    || (noLimit && facingThreeBet && raw >= FIVE_DRAW_STACKOFF_PREMIUM) ? CALL : FOLD;
   const raiseOrAllIn = (amount: number): AIDecision => {
     const to = Math.max(minRaise, amount);
     // NEW-5 (no-limit) — a raise to RAISE_JAM_FRACTION of the stack is made as an all-in.
@@ -1706,17 +1752,28 @@ function studDrawFirstRound(
     if (!stackOffOK(pureCall ? shoveBB : effBB)) return FOLD;
     return pureCall && callAmount < seat.chipCount ? CALL : ALLIN;
   }
-  /** A re-raise; at no-limit a jam must pass the stack-off range too (null = not this hand: fall through). */
+  /**
+   * A re-raise. No-limit: one that would put STACKOFF_COMMIT_FRACTION of the street
+   * stack in is a stack-off — made as an all-in, and only with a hand that passes the
+   * stack-off range (null = not this hand: fall through to the call / fold line). A
+   * MANIAC re-raised 91% of hands to 33-59% of its stack, then folded 89% of them to
+   * a shove: any two cards profited by shoving over it.
+   */
   const raiseOrJam = (amount: number): AIDecision | null => {
     const d = raiseOrAllIn(amount);
-    return d.action === PlayerAction.AllIn && noLimit && !stackOffOK(effBB) ? null : d;
+    if (!noLimit) return d;
+    const to = Math.max(minRaise, amount), street = seat.chipCount + seat.currentBet;
+    if (d.action === PlayerAction.AllIn || to >= street * STACKOFF_COMMIT_FRACTION) return stackOffOK(effBB) ? ALLIN : null;
+    // ... and a re-raise of a hand that would fold to the shove it invites stays small.
+    if (facingRaise && to > street * FIVE_DRAW_LIGHT_RERAISE_FRACTION && !stackOffOK(effBB)) return null;
+    return d;
   };
 
   // ── CALLING_STATION: loose and passive (Hold'em's CS_PLAY_BASE / CS_CALL_WIDTH, the
   //    width narrowing with the size of a no-limit raise), never raises. ──
   if (profile.archetype === 'CALLING_STATION') {
     if (callAmount === 0) return CHECK;
-    if (unopened) return pctile >= adjustThreshold(CS_PLAY_BASE, factor) ? CALL : FOLD;
+    if (unopened) return pctile >= adjustThreshold(CS_PLAY_BASE, factor) ? CALL : FOLD_VS_RAISE;
     if (callAmount > seat.chipCount * 0.30 && pctile < 0.35) return FOLD_VS_RAISE;
     if (callAmount >= seat.chipCount) return pctile >= 0.40 ? ALLIN : FOLD_VS_RAISE;   // fixed limit only (no-limit: the gate above)
     return pctile >= Math.max(0.30, 1 - CS_CALL_WIDTH * sizeFactor) ? CALL : FOLD_VS_RAISE;
@@ -1750,7 +1807,7 @@ function studDrawFirstRound(
     if (unopened) {
       // B5 — the hands it used to SHOVE (top 10%) are a 3 BB raise; the rest of its range limps.
       if (pctile >= 0.90) return raiseOrAllIn(Math.round(bigBlind * 3));
-      return pctile >= adjustThreshold(0.55, factor) ? { action: PlayerAction.Call, raiseAmount: 0 } : { action: PlayerAction.Fold, raiseAmount: 0 };
+      return pctile >= adjustThreshold(0.55, factor) ? { action: PlayerAction.Call, raiseAmount: 0 } : FOLD_VS_RAISE;
     }
     // Its "weird raise": a 3-bet, never a jam and never a 4-bet.
     if (!facingThreeBet && pctile >= 0.90) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
@@ -1780,9 +1837,10 @@ function studDrawFirstRound(
     if (unopened) {
       // B1 / B5 — NIT opens its own range (openTh: the one it already uses in the big blind) from
       // ANY seat: it used to shove the top 3.5% and fold the rest (Five Card Draw AA-K folded 88%).
-      return pctile >= openTh ? raiseOrAllIn(Math.round(bigBlind * 2.5)) : { action: PlayerAction.Fold, raiseAmount: 0 };
+      // Item 4 — a value-set hand the noise put under openTh opens too (a NIT never limps).
+      return pctile >= openTh || inValueSet ? raiseOrAllIn(Math.round(bigBlind * 2.5)) : { action: PlayerAction.Fold, raiseAmount: 0 };
     }
-    if (facingThreeBet && pctile < fourBetTh) return FOLD;
+    if (facingThreeBet && pctile < fourBetTh) return FOLD_VS_RAISE;
     if (pctile >= fourBetTh) {
       if (facingThreeBet) return ALLIN;
       const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind));
@@ -1819,9 +1877,9 @@ function studDrawFirstRound(
     if (pctile >= contTh) return CALL;
     if (profile.difficulty === 'expert' && Math.random() < profile.bluffFrequency * 0.3) {
       const target = roundToBB(Math.round(betToMatch * 2.2), bigBlind);
-      if (Math.max(minRaise, target) <= seat.chipCount * 0.35) return raiseOrAllIn(target);
+      if (Math.max(minRaise, target) <= seat.chipCount * 0.35) { const r = raiseOrJam(target); if (r) return r; }
     }
-    return FOLD;
+    return FOLD_VS_RAISE;
   }
 
   // Facing a single raise: 3-bet, flat, or fold.
@@ -1845,7 +1903,7 @@ function studDrawFirstRound(
     return raiseOrAllIn(target);
   }
   if (pctile >= callVsRaiseTh) return { action: PlayerAction.Call, raiseAmount: 0 };
-  return { action: PlayerAction.Fold, raiseAmount: 0 };
+  return FOLD_VS_RAISE;
 }
 
 // ============================================================
