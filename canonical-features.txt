@@ -919,6 +919,13 @@ aofPushPctile
 aofCallPctile
 function aofShoverWidth(
 
+# 2026-11 bots review, equity-variants C4/C8/C10 (AIPlayer wiring): Short Deck
+# bots rank hands in the 6+ order and read their own pre-flop table; Omaha Hi-Lo
+# bots price a split pot; exact Omaha outs; Crazy Pineapple bots price the pair
+# they keep. (The other equity tokens are in the equity block.)
+function shortDeckStaticStrength(
+const isHiLoSplit = isOmahaFamily &&
+
 # 2026-10-11 (.online R2, S2 table lifecycle) — GAME-15/16 + Addendum: ONE seat
 # teardown (pot chips of a folded / all-in / extra-table / ghost seat wait for
 # the hand's end, the next bot acts now); never an AI seat taken mid-hand.

@@ -1,6 +1,6 @@
 import { Card, Rank, Suit } from '../game/Card';
 import { evaluateHand, compareTo, HandRank, HandResult } from '../game/HandEvaluator';
-import { evaluateOmahaHand } from '../game/HandEvaluatorExtensions';
+import { evaluateOmahaHand, evaluateShortDeckHand, ShortDeckHandRank } from '../game/HandEvaluatorExtensions';
 import { PokerTable, Seat, PlayerAction, GamePhase } from '../game/PokerTable';
 import { calculateEquity, keptHoldemHoleCards } from '../training/TrainingEngine';
 import {
@@ -15,6 +15,9 @@ import {
 import {
   StudDrawKind, studDrawKindOf, isStudKind, studDrawEquity, firstRoundEquity, equityToPercentile, drawsLeftAt,
 } from './studDrawStrength';
+import { getShortDeckPreflopPercentile } from './shortDeckPreflop';
+import { calibrateOmahaPreflop } from './omahaPreflopCalibration';
+import { countOmahaDrawOuts } from '../training/fastOmahaEval';
 
 export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
 export type Personality =
@@ -108,14 +111,18 @@ export const DRAW_VARIANT_IDS: ReadonlySet<string> = new Set(['five-card-draw', 
 
 /**
  * GAME-8 — the two hole cards a HOLD'EM-style hand plays. A (Crazy) Pineapple
- * seat holds 3 until its discard; the bot's discard is the engine's automatic
- * one (PineappleTable.autoDiscardOne: the lowest rank, ties to the lowest
- * suit), so these are exactly the two it keeps. calculateEquity / the preflop
+ * seat holds 3 until its discard, and a bot never picks one: the engine's
+ * no-pick fallback discards for it with the ONE keep rule
+ * (pineappleKeep.pineappleDiscardIndex: before the flop the pair with the best
+ * pre-flop percentile, 77K keeps 77; on the Crazy Pineapple flop, with `board`,
+ * the card whose loss leaves the best hand). keptHoldemHoleCards applies the
+ * same rule, so these are exactly the two cards the bot keeps (2026-11 bots
+ * review B7; it priced the lowest-rank pair). calculateEquity / the pre-flop
  * percentile are only ever given two cards (a 7-card Stud hand fed to the
  * Hold'em Monte Carlo cost ~1s of blocking CPU per decision).
  */
-export function holdemHoleCards(hole: Card[]): Card[] {
-  return keptHoldemHoleCards(hole);
+export function holdemHoleCards(hole: Card[], board: Card[] = []): Card[] {
+  return keptHoldemHoleCards(hole, board);
 }
 
 /**
@@ -346,7 +353,10 @@ function getPreFlopHandRank(holeCards: Card[]): number {
 // Replaces feeding Omaha hands into the 2-card Chen formula, which ignored two
 // of the four cards. Returns 0..1 (calibrated to the same rough scale as the
 // Hold'em percentile so the shared preflop thresholds still apply).
-function getOmahaPreflopStrength(hole: Card[]): number {
+// 2026-11 (bots review, equity C6): 5- and 6-card hands go through
+// calibrateOmahaPreflop, which maps them onto the 4-card distribution (they
+// scored higher, so every threshold cleared 2-5 times the 4-card share).
+export function getOmahaPreflopStrength(hole: Card[]): number {
   if (!hole || hole.length < 4) {
     return hole && hole.length >= 2 ? getPreFlopHandRank(hole.slice(0, 2)) : 0.3;
   }
@@ -385,7 +395,12 @@ function getOmahaPreflopStrength(hole: Card[]): number {
   // AAKKds→~1.0, AKQJds→~0.92 (EP-open), big rundowns→~0.77 (CO/MP), KKxx→~0.73
   // (CO/BTN), junk→~0.45 (fold). Without this, only aces cleared EP/MP and Omaha
   // bots massively over-folded out of position.
-  return Math.max(0.10, Math.min(1, score * 1.15 + 0.10));
+  const u = score * 1.15 + 0.10;
+  if (hole.length >= 5) {
+    const m = calibrateOmahaPreflop(hole.length, u);
+    if (isFinite(m)) return Math.max(0.10, Math.min(1, m));
+  }
+  return Math.max(0.10, Math.min(1, u));
 }
 
 /**
@@ -459,7 +474,7 @@ export function holdemEquivalentStreet(phase: GamePhase, kind: StudDrawKind | nu
 // Post-flop hand strength with Monte Carlo equity
 // ============================================================
 
-function getPostFlopStrength(
+export function getPostFlopStrength(
   holeCards: Card[],
   communityCards: Card[],
   numOpponents: number,
@@ -473,7 +488,10 @@ function getPostFlopStrength(
   // narrowed) range instead of vs uniformly-random hands.
   oppMinPctile: number = 0,
   // 2026-07-07: short-deck (6+ Hold'em) — 36-card deck + flush > full house.
-  shortDeck: boolean = false
+  shortDeck: boolean = false,
+  // 2026-11 (bots review, equity hi-lo): Omaha Hi-Lo — the equity is the
+  // expected share of a split pot (calculateEquity's hiLo), not a high-only win.
+  hiLo: boolean = false
 ): number {
   // Expert and Hard AI use actual Monte Carlo equity (but fewer sims for speed)
   if (difficulty === 'expert' || difficulty === 'hard') {
@@ -484,13 +502,17 @@ function getPostFlopStrength(
       isOmaha,
       oppMinPctile,
       shortDeck,
-      BOT_EQUITY_BUDGET_MS // GAME-8 (R2) — bounded think time
+      BOT_EQUITY_BUDGET_MS, // GAME-8 (R2) — bounded think time
+      hiLo
     );
     return equity / 100; // normalize to 0-1
   }
 
   // Medium/Easy use simplified evaluation
   const allCards = [...holeCards, ...communityCards];
+  // 2026-11 (bots review B13): Short Deck ranks hands its own way (trips beat a
+  // straight, a flush beats a full house, A-6-7-8-9 is a straight).
+  if (shortDeck && !isOmaha) return shortDeckStaticStrength(allCards, communityCards);
   const result = (isOmaha && communityCards.length >= 3)
     ? evaluateOmahaHand(holeCards, communityCards)
     : evaluateHand(allCards);
@@ -519,6 +541,37 @@ function getPostFlopStrength(
     }
   }
 
+  return Math.min(1.0, Math.max(0.0, score));
+}
+
+/**
+ * 2026-11 (bots review B13) — the medium/easy static strength for Short Deck:
+ * the Hold'em ladder above re-slotted to the 6+ hand order under the engine's
+ * own evaluateShortDeckHand (it ranked a straight above trips, a full house
+ * above a flush, and missed A-6-7-8-9: A6 on 789 scored 0.16).
+ */
+function shortDeckStaticStrength(allCards: Card[], communityCards: Card[]): number {
+  const r = evaluateShortDeckHand(allCards);
+  const pv = r.primaryValue / Rank.Ace;
+  let score: number;
+  switch (r.handRank as number) {
+    case ShortDeckHandRank.HighCard:      score = 0.08 + pv * 0.08; break;
+    case ShortDeckHandRank.OnePair:       score = 0.22 + pv * 0.12; break;
+    case ShortDeckHandRank.TwoPair:       score = 0.42 + pv * 0.08; break;
+    case ShortDeckHandRank.Straight:      score = 0.58 + pv * 0.06; break;
+    case ShortDeckHandRank.ThreeOfAKind:  score = 0.70 + pv * 0.04; break;
+    case ShortDeckHandRank.FullHouse:     score = 0.78 + pv * 0.04; break;
+    case ShortDeckHandRank.Flush:         score = 0.85 + pv * 0.04; break;
+    case ShortDeckHandRank.FourOfAKind:   score = 0.93; break;
+    case ShortDeckHandRank.StraightFlush: score = 0.97; break;
+    case ShortDeckHandRank.RoyalFlush:    score = 1.00; break;
+    default: score = 0.05;
+  }
+  // Playing the board (same rank and primary value as the 5 community cards) = very weak.
+  if (communityCards.length >= 5) {
+    const b = evaluateShortDeckHand(communityCards);
+    if (b.handRank === r.handRank && b.primaryValue === r.primaryValue) score *= 0.4;
+  }
   return Math.min(1.0, Math.max(0.0, score));
 }
 
@@ -560,8 +613,11 @@ function getImpliedOdds(
 // Counting outs (from TrainingEngine, simplified inline)
 // ============================================================
 
-export function countOuts(holeCards: Card[], communityCards: Card[]): number {
+export function countOuts(holeCards: Card[], communityCards: Card[], omaha = false): number {
   if (communityCards.length === 0 || communityCards.length >= 5) return 0;
+  // 2026-11 (bots review B14): Omaha plays exactly 2 hole + 3 board cards; the
+  // Hold'em counter below pooled all 4-6 hole cards (mean 5.9-9.4 outs vs 2.9-5.0 true).
+  if (omaha && holeCards.length > 2) return countOmahaDrawOuts(holeCards, communityCards);
 
   const allCards = [...holeCards, ...communityCards];
   let outs = 0;
@@ -919,10 +975,16 @@ export function decideAction(
   }
 
   let handStrength: number;
-  // 2026-11 — Hold'em-family pre-flop also reads the STACK-OFF percentile (4-bets, deep all-ins).
-  let stackOff: number | null = null;
 
   const isOmahaFamily = /omaha/i.test(variantId);
+  // 2026-11 (bots review B13 / hi-lo): Short Deck (6+) has its own hand order and
+  // pre-flop table; Omaha Hi-Lo prices a split pot. OmahaTable(cfg, true, 6) has
+  // the id 'omaha-6', so its public variant.isHiLo is read too.
+  const isShortDeck = !isOmahaFamily && /short|six.?plus|6.?plus/i.test(variantId);
+  const isHiLoSplit = isOmahaFamily && ((table as any).variant?.isHiLo === true || /hi.?lo/i.test(variantId));
+  // 2026-11 — Hold'em pre-flop also reads the STACK-OFF percentile (4-bets, deep
+  // all-ins). Never Omaha or Short Deck: null falls back to their own strength.
+  let stackOff: number | null = null;
   if (sdKind) {
     // 2026-11 (bots review B1/B2/B11): the engine's own hand order, from public
     // information only — the first round as a PERCENTILE of that game's starting
@@ -932,18 +994,21 @@ export function decideAction(
     // starting range narrowed by his own action.
     handStrength = studDrawHandStrength(table, seatIndex, sdKind, isPreFlop);
   } else if (isPreFlop) {
-    // Omaha uses a 4-card preflop model; Hold'em uses the equity-ranked percentile.
+    // Omaha uses its pre-flop model (5/6 cards calibrated); Short Deck its own
+    // equity-ranked table; Hold'em the equity-ranked percentile.
     handStrength = isOmahaFamily
       ? getOmahaPreflopStrength(seat.holeCards)
+      : isShortDeck ? (getShortDeckPreflopPercentile(seat.holeCards) || getPreFlopHandRank(seat.holeCards))
       : getPreFlopHandRank(holdemHoleCards(seat.holeCards));
-    if (!isOmahaFamily) stackOff = getStackOffPercentile(holdemHoleCards(seat.holeCards));
+    if (!isOmahaFamily && !isShortDeck) stackOff = getStackOffPercentile(holdemHoleCards(seat.holeCards));
   } else {
     // GAME-8 — the Hold'em equity is never fed more than 2 hole cards: a
-    // (Crazy) Pineapple seat still holding 3 is priced on the 2 it keeps.
+    // (Crazy) Pineapple seat still holding 3 is priced on the 2 it keeps
+    // (board-aware on the Crazy Pineapple flop: B7).
     handStrength = getPostFlopStrength(
-      isOmahaFamily ? seat.holeCards : holdemHoleCards(seat.holeCards),
+      isOmahaFamily ? seat.holeCards : holdemHoleCards(seat.holeCards, table.communityCards),
       table.communityCards, numOpponents, profile.difficulty,
-      isOmahaFamily, oppMinPctile, /short|six.?plus|6.?plus/i.test(variantId)
+      isOmahaFamily, oppMinPctile, isShortDeck, isHiLoSplit
     );
   }
 
@@ -968,8 +1033,9 @@ export function decideAction(
 
   // Outs and implied odds for draw decisions. 2026-11: Stud / Draw equity already
   // prices every card still to come (and the 8-handed shared 7th-street card made
-  // countOuts count a dead "draw").
-  const outs = (isPreFlop || sdKind) ? 0 : countOuts(seat.holeCards, table.communityCards);
+  // countOuts count a dead "draw"); Omaha counts exact 2+3 outs (B14); Hold'em-style
+  // tables count the two cards they keep.
+  const outs = (isPreFlop || sdKind || isStudFamily || isDrawFamily || isDrawBet) ? 0 : countOuts(isOmahaFamily ? seat.holeCards : holdemHoleCards(seat.holeCards, table.communityCards), table.communityCards, isOmahaFamily);
   const rawImplied = isPreFlop ? 0 : getImpliedOdds(
     handStrength, outs, totalPot, seat.chipCount, table.currentPhase
   );
