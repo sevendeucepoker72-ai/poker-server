@@ -77,7 +77,7 @@ describe('F49 — All-In or Fold holds the BOTS to the format too', () => {
     return log;
   }
 
-  /** 6 bots at the quickAllInOrFold numbers (10/20, 1000 = 50 BB) through the REAL executeAIAction. */
+  /** 6 bots through the REAL executeAIAction at 10/20, 1000 = 50 BB (this test's own engine config; quickAllInOrFold itself deals 20/40 = 25 BB since the 2026-11 bots review, E3). */
   function play(exec: string, aof: boolean, hands: number) {
     const table = new PokerTable(cfg('aof'));
     const diffs: Difficulty[] = ['easy', 'medium', 'medium', 'hard', 'easy', 'hard'];

@@ -1735,6 +1735,7 @@ function takeAiSeatForJoin(table: PokerTable, tableId: string): number {
   const seatCap = Math.min(MAX_SEATS, table.maxOccupiableSeats || MAX_SEATS);
   for (let i = 0; i < seatCap; i++) {
     if (!aiSeatTakeableNow(table, i)) continue;
+    noteBotStackRemoved(tableId, table, i, 'seat_taken');   // E10
     table.standUp(i);
     aiProfiles.get(tableId)?.delete(i);
     return i;
@@ -1772,6 +1773,7 @@ function takePlannedAiSeat(table: PokerTable, tableId: string, seatIndex: number
   if (!s) return false;
   if (s.state === 'empty') return true;
   if (!s.isAI || !aiSeatTakeableNow(table, seatIndex)) { joinSeatStats.plannedBotLost++; return false; }
+  noteBotStackRemoved(tableId, table, seatIndex, 'seat_taken');   // E10
   table.standUp(seatIndex);
   aiProfiles.get(tableId)?.delete(seatIndex);
   joinSeatStats.plannedBotTaken++;
@@ -1806,7 +1808,7 @@ function stripBotsWhenNoHumans(tableId: string, table: PokerTable): void {
   }
   botStripAfterHand.delete(tableId);
   for (let i = 0; i < MAX_SEATS; i++) {
-    if (table.seats[i].state === 'occupied' && table.seats[i].isAI) table.standUp(i);
+    if (table.seats[i].state === 'occupied' && table.seats[i].isAI) { noteBotStackRemoved(tableId, table, i, 'strip'); table.standUp(i); }   // E10
   }
   aiProfiles.delete(tableId);
   const aiT = aiTimeouts.get(tableId);
@@ -3342,7 +3344,12 @@ app.get('/api/health', async (_req, res) => {
       // sitOutLimit (GAME-11), reservationsDisplaced (APPUI-21), chipVelocity.
       engine: {
         seatTeardown: { ...seatTeardownStats, pendingTables: pendingSeatRemovalAfterHand.size },
-        botStacks: { ...botStackStats, capBuyIns: BOT_STACK_CAP_BUYINS },
+        // 2026-11 (bots review E10) — humansTookFromBots = seated + minted - burned - removed - live:
+        // what humans (and the house's removals) took from bots; == economy.botFlow.totalHumanNet at hand boundaries.
+        botStacks: ((live: number) => ({
+          ...botStackStats, capBuyIns: BOT_STACK_CAP_BUYINS, liveChips: live,
+          humansTookFromBots: botStackStats.seatedChips + botStackStats.minted - botStackStats.burned - botStackStats.removedChips - live,
+        }))(liveBotChips()),
         // 2026-10-26 (owner: "After 1") - tournament timeout sit-out + stale-table Sit Out / I'm back fallbacks.
         tournamentTimeoutSitOut: { ...tournamentTimeoutSitOutStats },
         // 2026-10-28 — handComplete is NOT a freeze count: it includes the
@@ -5106,7 +5113,7 @@ function closeUnboundClubRuntimeTable(tableId: string): boolean {
   const table = tableManager.getTable(tableId);
   if (table && tableHasHumanSeat(table)) return false;
   endTableViewsAndTimers(tableId);
-  if (table) for (const s of table.seats) if (s.state === 'occupied') table.standUp(s.seatIndex);
+  if (table) for (const s of table.seats) if (s.state === 'occupied') { if (s.isAI) noteBotStackRemoved(tableId, table, s.seatIndex, 'table_closed'); table.standUp(s.seatIndex); }   // E10
   tableManager.removeTable(tableId);
   tableProgressListeners.delete(tableId);
   clubTableIds.delete(tableId);
@@ -8273,14 +8280,17 @@ function recordChipVelocity(tableId: string, table: PokerTable, results: any[]):
   for (const r of Array.isArray(results) ? results : []) {
     if (r && !r.isAI && Number(r.chipsWon) > 0) wonSeats.add(r.seatIndex);
   }
-  for (const [sid, session] of playerSessions) {
-    if (session.tableId !== tableId) continue;
+  // 2026-11 (bots review E8) — every human seat dealt in here: a MAIN session and an
+  // EXTRA-table seat (multiTableSessions). An extra table's hands count toward the paid
+  // season chips-won (dealtInSeatAccount) but never reached this alert.
+  const consider = (sid: string, session: PlayerSession | undefined): void => {
+    if (!session || session.tableId !== tableId) return;
     const seat = table.seats[session.seatIndex];
-    if (!seat || seat.state !== 'occupied' || seat.isAI || seat.holeCards.length === 0) continue;
+    if (!seat || seat.state !== 'occupied' || seat.isAI || seat.holeCards.length === 0) return;
     const auth = authSessions.get(sid);
-    if (!auth) continue;
+    if (!auth) return;
     const start = table.startChips.get(session.seatIndex);
-    if (start === undefined) continue;
+    if (start === undefined) return;
     const userId = auth.userId;
     let vel = chipVelocity.get(userId);
     if (!vel) {
@@ -8291,7 +8301,7 @@ function recordChipVelocity(tableId: string, table: PokerTable, results: any[]):
     vel.netWon = (vel.netWon || 0) + (seat.chipCount - start);
     vel.lastActionMs = [now];
     const threshold = Math.max(vel.chipsAtStart, table.config.minBuyIn) * CHIP_VELOCITY_MULTIPLE;
-    if (vel.alerted || !wonSeats.has(session.seatIndex) || vel.handsThisSession < CHIP_VELOCITY_MIN_HANDS || vel.netWon <= threshold) continue;
+    if (vel.alerted || !wonSeats.has(session.seatIndex) || vel.handsThisSession < CHIP_VELOCITY_MIN_HANDS || vel.netWon <= threshold) return;
     vel.alerted = true;
     chipVelocityStats.alerts++;
     const alertCount = incrementChipVelocityAlert(userId);
@@ -8312,7 +8322,9 @@ function recordChipVelocity(tableId: string, table: PokerTable, results: any[]):
       }
       chipVelocityAlerts.delete(userId);
     }
-  }
+  };
+  for (const [sid, session] of playerSessions) consider(sid, session);
+  multiTableSessions.forEach((list, sid) => { for (const ms of (Array.isArray(list) ? list : [])) consider(sid, ms); });
 }
 
 function ensureTableProgressListener(table: PokerTable, tableId: string): void {
@@ -8813,7 +8825,7 @@ function fillWithAI(
     usedNames.add(profile.botName);
 
     const aiPlayerId = `ai-${uuidv4()}`;
-    table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true);
+    if (table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true)) noteBotSeated(tableId, table.config.minBuyIn, 'ring');   // E10
     profiles.set(i, profile);
   }
 }
@@ -8850,6 +8862,7 @@ function trimExcessAI(
   const profiles = aiProfiles.get(tableId);
   for (let k = 0; k < toRemove; k++) {
     const i = aiSeats[k];
+    noteBotStackRemoved(tableId, table, i, 'trim');   // E10
     table.standUp(i);
     if (profiles) profiles.delete(i);
   }
@@ -9536,6 +9549,7 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
 
   // Evict an AI from the target if any.
   if (dst.state === 'occupied' && dst.isAI) {
+    noteBotStackRemoved(tableId, table, target, 'seat_taken');   // E10
     table.standUp(target);
     const profiles = aiProfiles.get(tableId);
     if (profiles) profiles.delete(target);
@@ -9632,7 +9646,40 @@ function executePendingMove(tableId: string, session: PlayerSession): boolean {
  * back on at that many buy-ins; unset, 0 or junk = no cap.
  */
 const BOT_STACK_CAP_BUYINS: number = ((n: number) => (Number.isInteger(n) && n >= 1 ? n : 0))(Number(process.env.BOT_STACK_CAP_BUYINS));
-const botStackStats = { reloads: 0, minted: 0, caps: 0, burned: 0, fixedRosterReloadsSkipped: 0 };
+const botStackStats = {
+  reloads: 0, minted: 0, caps: 0, burned: 0, fixedRosterReloadsSkipped: 0,
+  // 2026-11 (bots review E10) — every chip a bot holds on a wallet-chip table is created (seated,
+  // reloaded) and destroyed (capped, its seat removed) at an explicit point; `burned` stays the cap only.
+  seatedChips: 0, seatedBy: { ring: 0, quick: 0 } as Record<string, number>,
+  removedChips: 0, removedBy: { strip: 0, seat_taken: 0, trim: 0, quick_end: 0, table_closed: 0 } as Record<string, number>,
+};
+/** E10 — a bot sat down with `chips` on a wallet-chip table (never a tournament / Spin & Go). */
+function noteBotSeated(tableId: string, chips: number, kind: 'ring' | 'quick'): void {
+  if (isTournamentTable(tableId) || isPrizeFormatTable(tableId) || !(chips > 0)) return;
+  botStackStats.seatedChips += chips;
+  botStackStats.seatedBy[kind] += chips;
+}
+/** E10 — a bot's seat is about to be stood up: its stack (and, mid-hand, what it has in the pot) leaves play. Call BEFORE standUp. */
+function noteBotStackRemoved(tableId: string, table: PokerTable, seatIndex: number, why: 'strip' | 'seat_taken' | 'trim' | 'quick_end' | 'table_closed'): void {
+  const s = table.seats[seatIndex];
+  if (!s || s.state !== 'occupied' || !s.isAI) return;
+  if (isTournamentTable(tableId) || isPrizeFormatTable(tableId)) return;
+  const chips = Math.max(0, s.chipCount || 0) + (table.isHandInProgress() ? Math.max(0, s.totalInvestedThisHand || 0) : 0);
+  botStackStats.removedChips += chips;
+  botStackStats.removedBy[why] += chips;
+}
+/** E10 — what every seated bot holds now on wallet-chip tables (health: humansTookFromBots). */
+function liveBotChips(): number {
+  let sum = 0;
+  for (const id of tableManager.getAllTableIds()) {
+    if (isTournamentTable(id) || isPrizeFormatTable(id)) continue;
+    const t = tableManager.getTable(id);
+    if (!t) continue;
+    const inHand = t.isHandInProgress();
+    for (const st of t.seats) if (st.state === 'occupied' && st.isAI) sum += (st.chipCount || 0) + (inHand ? (st.totalInvestedThisHand || 0) : 0);
+  }
+  return sum;
+}
 
 /**
  * GAME-18 — the hand-boundary bot step (autoStartNextHand, never a tournament
@@ -10080,7 +10127,7 @@ function backfillAIToMin(table: PokerTable, tableId: string, min: number): void 
     }
     usedNames.add(profile.botName);
     const aiPlayerId = `ai-${uuidv4()}`;
-    table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true);
+    if (table.sitDown(i, profile.botName, table.config.minBuyIn, aiPlayerId, true)) noteBotSeated(tableId, table.config.minBuyIn, 'ring');   // E10
     profiles.set(i, profile);
   }
 }
@@ -12174,7 +12221,7 @@ function removeIdlePrivateTable(tableId: string): void {
   if (table && tableHasHumanSeat(table)) return;   // someone sat down meanwhile
   io.to(`table:${tableId}`).emit('tableClosed', { tableId, reason: 'private_table_idle' });
   endTableViewsAndTimers(tableId);
-  if (table) for (let i = 0; i < MAX_SEATS; i++) if (table.seats[i].state === 'occupied') table.standUp(i);
+  if (table) for (let i = 0; i < MAX_SEATS; i++) if (table.seats[i].state === 'occupied') { if (table.seats[i].isAI) noteBotStackRemoved(tableId, table, i, 'table_closed'); table.standUp(i); }   // E10
   tableManager.removeTable(tableId);
   tableProgressListeners.delete(tableId);
   privateTableIds.delete(tableId);
@@ -13455,6 +13502,13 @@ const quickGames = new Map<string, QuickGameState>();
 const quickGameStats = {
   started: 0, ended: 0, humanWins: 0, spinGoPrizes: 0, spinGoForfeits: 0, entryFeesRefunded: 0,
   cleanedNoHuman: 0, cashedOut: 0,
+  // 2026-11 (bots review E11) — per-format fairness: games started and won by the human, and the
+  // Spin & Go house result (spinGoFeesIn - spinGoPrizesOut - spinGoRefunded; prize chips, not wallet chips).
+  byFormat: {
+    headsUp: { started: 0, humanWins: 0 }, spinGo: { started: 0, humanWins: 0 }, allInOrFold: { started: 0, humanWins: 0 },
+    career: { started: 0, humanWins: 0 }, challenge: { started: 0, humanWins: 0 },
+  } as Record<string, { started: number; humanWins: number }>,
+  spinGoFeesIn: 0, spinGoPrizesOut: 0, spinGoRefunded: 0,
 };
 const QUICK_GAME_RESULT_DELAY_MS = 1000;   // the final hand is seen before the result
 const QUICK_GAME_CLEANUP_DELAY_MS = 5000;  // the result is seen before the table goes
@@ -13470,6 +13524,8 @@ function isPrizeFormatTable(tableId: string): boolean {
 function registerQuickGame(tableId: string, table: PokerTable, state: Omit<QuickGameState, 'ended' | 'settlement' | 'createdAt' | 'started'>): void {
   quickGames.set(tableId, { ...state, ended: false, settlement: 'open', createdAt: Date.now(), started: state.format !== 'challenge' });
   quickGameStats.started++;
+  if (quickGameStats.byFormat[state.format]) quickGameStats.byFormat[state.format].started++;   // E11
+  if (state.format === 'spinGo') quickGameStats.spinGoFeesIn += state.entryFee || 0;
   table.on('handResult', () => {
     try { quickGameEndCheck(tableId, 'hand_result'); } catch (e: any) {
       console.error(`[QuickGame] end check failed on ${tableId}:`, e?.message || e);
@@ -13541,7 +13597,10 @@ function quickGameEndCheck(tableId: string, via: string): boolean {
   if (!outcome.over) return false;
   qg.ended = true;
   quickGameStats.ended++;
-  if (outcome.humanWon && qg.format !== 'challenge') quickGameStats.humanWins++;
+  if (outcome.humanWon && qg.format !== 'challenge') {
+    quickGameStats.humanWins++;
+    if (quickGameStats.byFormat[qg.format]) quickGameStats.byFormat[qg.format].humanWins++;   // E11
+  }
   // F105 — the winner's name and stack, before the bot stand-up below empties a bot winner's seat.
   const winnerSeatNow = outcome.winnerSeat !== null ? table.seats[outcome.winnerSeat] : undefined;
   const winnerName = winnerSeatNow && winnerSeatNow.state === 'occupied' ? winnerSeatNow.playerName : '';
@@ -13549,6 +13608,7 @@ function quickGameEndCheck(tableId: string, via: string): boolean {
   if (qg.format !== 'challenge') {
     for (const s of table.seats) {
       if (s.state !== 'occupied' || !s.isAI) continue;
+      noteBotStackRemoved(tableId, table, s.seatIndex, 'quick_end');   // E10
       table.standUp(s.seatIndex);
       aiProfiles.get(tableId)?.delete(s.seatIndex);
     }
@@ -13639,6 +13699,7 @@ function finishQuickGame(tableId: string, outcome: QuickGameOutcome): void {
       if (won) {
         qg.settlement = 'won';
         quickGameStats.spinGoPrizes++;
+        quickGameStats.spinGoPrizesOut += prize;   // E11
         const ownerUserId = qg.ownerUserId as number;
         void prizeLedger.settle({
           label: `spingo:${tableId}`,
@@ -13698,6 +13759,7 @@ function refundQuickEntryFee(tableId: string, qg: QuickGameState, reason: string
   if (qg.settlement !== 'open' || qg.ownerUserId === null || !(qg.entryFee > 0)) return Promise.resolve();
   qg.settlement = 'refunded';
   quickGameStats.entryFeesRefunded++;
+  if (qg.format === 'spinGo') quickGameStats.spinGoRefunded += qg.entryFee;   // E11
   const ownerUserId = qg.ownerUserId;
   return prizeLedger.settle({
     label: `quickfee:${tableId}`,
@@ -13830,6 +13892,7 @@ function cleanupQuickTable(tableId: string): void {
           auditLog(owner.username, 'SPINGO_STACK_NOT_CASHED', { userId: owner.userId, tableId, chips: seat.chipCount, settlement: qg?.settlement ?? null });
         }
       }
+      if (seat.isAI) noteBotStackRemoved(tableId, table, i, 'quick_end');   // E10
       table.standUp(i);
     }
   }
@@ -16612,6 +16675,7 @@ Give feedback in this JSON format:
           auditLog(owner ? owner.username : '', 'TOURNAMENT_STACK_NOT_CASHED', { userId: owner?.userId ?? null, tableId: data.tableId, reason: 'admin_force_close' });
         }
       }
+      if (seat.isAI) noteBotStackRemoved(data.tableId, table, i, 'table_closed');   // E10
       table.standUp(i);
     }
     // F147 (2026-10-21) — the seated / watching clients are told the table is
@@ -21698,7 +21762,7 @@ Give feedback in this JSON format:
     let aiProfile = generateRandomProfile('hard');
     for (let attempts = 0; aiProfile.botName === playerName && attempts < 50; attempts++) aiProfile = generateRandomProfile('hard');
     const aiPlayerId = `ai-${uuidv4()}`;
-    table.sitDown(1, aiProfile.botName, 1000, aiPlayerId, true);
+    if (table.sitDown(1, aiProfile.botName, 1000, aiPlayerId, true)) noteBotSeated(tableId, 1000, 'quick');   // E10
     profiles.set(1, aiProfile);
 
     // R2 (TOURNEY-6 / money review P2) — a real END: a bust is game over (the
@@ -21772,7 +21836,7 @@ Give feedback in this JSON format:
       }, authSGState)) return;
     }
 
-    // Random multiplier: 2x (60%), 3x (25%), 5x (10%), 10x (4%), 25x (1%)
+    // Random multiplier (quickGames SPIN_GO_MULTIPLIER_ODDS): 2x 67%, 3x 22%, 5x 7%, 10x 3%, 25x 1% (mean 2.90x)
     const multiplier = spinGoMultiplierFor(Math.random() * 100);
 
     const tableId = tableManager.createQuickTable(
@@ -21880,6 +21944,9 @@ Give feedback in this JSON format:
     // 2026-06-11 audit C2: real buy-in (1000). Authed players pay from the
     // wallet (credited back on leave); guests stay wallet-isolated.
     const AOF_BUYIN = 1000;
+    // 2026-11 (bots review): 1,000 = 25 BB, the deepest stack the bots' push/fold table covers (PUSH_FOLD_MAX_BB = 25). At 10/20 (50 BB) every bot decision was clamped to 25 BB.
+    const AOF_SMALL_BLIND = 20;
+    const AOF_BIG_BLIND = 40;
     const authAOF = authSessions.get(socket.id);
     if (authAOF) {
       // P3 (2026-10-10) — still this account, and still no seat on this socket
@@ -21900,8 +21967,8 @@ Give feedback in this JSON format:
     const tableId = tableManager.createQuickTable(
       'All-In or Fold',
       6,
-      10,
-      20,
+      AOF_SMALL_BLIND,
+      AOF_BIG_BLIND,
       AOF_BUYIN
     );
     quickTables.add(tableId); // #5: exclude from ring AI fill/heartbeat
@@ -21941,7 +22008,7 @@ Give feedback in this JSON format:
       }
       usedNames.add(aiProfile.botName);
       const aiPlayerId = `ai-${uuidv4()}`;
-      table.sitDown(i, aiProfile.botName, 1000, aiPlayerId, true);
+      if (table.sitDown(i, aiProfile.botName, 1000, aiPlayerId, true)) noteBotSeated(tableId, 1000, 'quick');   // E10
       profiles.set(i, aiProfile);
     }
 
@@ -22093,7 +22160,7 @@ Give feedback in this JSON format:
       }
       usedNames.add(aiProfile.botName);
       const aiPlayerId = `ai-${uuidv4()}`;
-      table.sitDown(i, aiProfile.botName, config.buyIn, aiPlayerId, true);
+      if (table.sitDown(i, aiProfile.botName, config.buyIn, aiPlayerId, true)) noteBotSeated(tableId, config.buyIn, 'quick');   // E10
       profiles.set(i, aiProfile);
     }
 
