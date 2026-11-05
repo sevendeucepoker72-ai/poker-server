@@ -49,7 +49,7 @@ import {
   opponentModelKey,
 } from './ai/AIPlayer';
 import { chooseBotDiscards, studDrawKindOf } from './ai/studDrawStrength';
-import { ProgressionManager, lifetimeAchievementsUnlockedByLevel, maxXpAtLevel } from './progression/ProgressionManager';
+import { ProgressionManager, lifetimeAchievementsUnlockedByLevel, maxXpAtLevel, IDLE_HANDS_REWARD_LIMIT, HAND_XP } from './progression/ProgressionManager';
 import { sanitizeClientProgressSave, PAYOUT_KEYS_FROM_CLIENT } from './progression/clientProgressSave';
 import { progressionHandRank } from './progression/progressionHandRank';
 import { HandRank } from './game/HandEvaluator';
@@ -69,7 +69,7 @@ import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
 import { SevenStudTable } from './game/variants/SevenStudTable';
 import type { PineappleTable } from './game/variants/PineappleTable';
 import { VariantType } from './game/variants/PokerVariant';
-import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims, loadBroadcastOptOuts } from './auth/authManager';
+import { initDB, registerUser, isUsernameTaken, getUserFromToken, saveProgress, loadProgress, isUserAdmin, isUserBanned, getUserChips, deductChips, bumpTokenVersion, getAllUsers, banUser as banUserDB, unbanUser as unbanUserDB, addChipsToUser, getTotalUsers, getLeaderboard, searchUsers, mergeUserStats, setDisplayName, getPool, loadInventory, grantItem as dbGrantItem, equipItem as dbEquipItem, hasClaimedToday, recordDailyClaim, updateLoginStreak, tickScratchProgress, consumeScratchCard, claimBattlePassTier as dbClaimBattlePassTier, loadBattlePassClaims, upsertCareerProgress, loadCareerProgress, claimCareerReward, persistCustomization, persistPreferences, recordHand, loadHandHistory, persistStars as dbPersistStars, addStarsToUser, deductStars, refillBrokeUser, loadDurableProgress, findUsersByDisplayName, getPublicNames, DEFAULT_CHIPS, DEFAULT_LEVEL, DEFAULT_XP, getScopedSigningKey, verifyLegacyTokenClaims, loadBroadcastOptOuts, SCRATCH_CARDS_PER_DAY } from './auth/authManager';
 import { validateOAuthToken, preflightIntrospection, getPreflightStatus, getIntrospectionStats } from './auth/oauthValidator';
 import {
   resolveLoginIdentity, buildLoginFailure, normalizeRequestId,
@@ -3334,6 +3334,16 @@ app.get('/api/health', async (_req, res) => {
         insuranceRefund: insuranceRefundOutcome
           ? { status: insuranceRefundOutcome.status, recipients: insuranceRefundOutcome.recipients, chips: insuranceRefundOutcome.chips, missing: insuranceRefundOutcome.missing.length }
           : null,
+        // 2026-11 (bots review E9) — what humans took from bots per format since boot (no ids).
+        // totalHumanNet == engine.botStacks.humansTookFromBots at hand boundaries (E10).
+        botFlow: {
+          since: botFlowStats.since,
+          totalHumanNet: [...botFlowStats.formats.values()].reduce((a, e) => a + e.humanNet, 0),
+          totalAccountNet: [...botFlowStats.formats.values()].reduce((a, e) => a + e.accountNet, 0),
+          formats: Object.fromEntries(botFlowStats.formats),
+        },
+        // 2026-11 (bots review E5 / E6 / E7 / E12) — the per-hand reward gate and its limits.
+        handRewards: { ...handRewardStats, idleHandsLimit: IDLE_HANDS_REWARD_LIMIT, scratchCardsPerDay: SCRATCH_CARDS_PER_DAY, handXpFullPerDay: HAND_XP_FULL_PER_DAY },
       },
       // 2026-10-11 (.online R2, S2 engine lane) — table lifecycle counters:
       // seatTeardown (GAME-15/16: stand-ups deferred to the hand's end, all-in
@@ -8327,6 +8337,99 @@ function recordChipVelocity(tableId: string, table: PokerTable, results: any[]):
   multiTableSessions.forEach((list, sid) => { for (const ms of (Array.isArray(list) ? list : [])) consider(sid, ms); });
 }
 
+// ===== Hand rewards + bot flow (bots review 2026-11-04) =====
+// economy-farming E5 / E6 / E7 / E9 / E12 — every helper the 'playerAction' listener and
+// handleHandComplete read for the per-hand reward gate and the bot chip-flow monitor, in ONE
+// block (tests/helpers/indexSource.ts HAND_REWARDS_SRC slices exactly this). Function
+// declarations and consts read at call time.
+/**
+ * E5 — the seats that VOLUNTARILY put chips in this hand: a call, bet, raise or all-in on ANY
+ * street, in any variant. Blinds, antes, the Stud bring-in (SevenStudTable.postBringIn emits
+ * 'blindPosted'), dead blinds and a straddle post outside 'playerAction' and never count. A
+ * server auto-action never counts either: PokerTable.markAutoAction stamps that log entry
+ * `auto` (a turn timeout, an absent tournament seat's limp, autoActForSeat). Filled by the
+ * listener; taken and dropped synchronously by handleHandComplete.
+ */
+const handParticipation = new Map<string, { handNumber: number; seats: Set<number> }>();
+function noteHandParticipation(tableId: string, handNumber: number, seatIndex: number): void {
+  let hp = handParticipation.get(tableId);
+  if (!hp || hp.handNumber !== handNumber) { hp = { handNumber, seats: new Set() }; handParticipation.set(tableId, hp); }
+  hp.seats.add(seatIndex);
+}
+function takeHandParticipation(tableId: string, handNumber: number): Set<number> {
+  const hp = handParticipation.get(tableId);
+  handParticipation.delete(tableId);
+  return hp && hp.handNumber === handNumber ? hp.seats : new Set<number>();
+}
+/** E5 / E6 / E7 / E12 — counts only (health economy.handRewards). */
+const handRewardStats = { xpSkipped: 0, xpReduced: 0, scratchTicksSkipped: 0, walksNotCounted: 0, scratchAwarded: 0, scratchCapped: 0, capNotices: 0 };
+/** E7 — userId -> the Denver day the daily scratch-card limit notice was sent (at most one per day per boot). */
+const scratchCapNotified = new Map<number, string>();
+/**
+ * E12 — rewarded hands per day at full hand XP (HAND_XP); past it a rewarded hand earns
+ * HAND_XP_AFTER_CAP. The day is the account's existing dailyStats window (UTC: it rolls at
+ * 5-6 PM Denver). Env HAND_XP_FULL_PER_DAY (a non-negative integer); default 1000; 0 = off.
+ */
+const HAND_XP_FULL_PER_DAY: number = ((raw: string | undefined): number => {
+  const n = Number(raw);
+  return raw !== undefined && raw.trim() !== '' && Number.isInteger(n) && n >= 0 ? n : 1000;
+})(process.env.HAND_XP_FULL_PER_DAY);
+/** E12 — the XP of one rewarded hand (called right after recordHandPlayed, which rolled the day window). */
+function handXpForHand(playerId: string): number {
+  const xp = progressionManager.handXpFor(playerId, HAND_XP_FULL_PER_DAY);
+  if (xp < HAND_XP) handRewardStats.xpReduced++;
+  return xp;
+}
+/**
+ * E9 — what humans take from bots, per format (since boot, no ids): ring tables by variant
+ * ('cash:<variant>'), private, club, headsup, aof, career. Never a tournament or Spin & Go
+ * (not wallet chips). health economy.botFlow; totalHumanNet must equal
+ * engine.botStacks.humansTookFromBots (E10) at hand boundaries.
+ */
+const botFlowStats = {
+  since: new Date().toISOString(),
+  formats: new Map<string, { hands: number; humanNet: number; humanWon: number; humanLost: number; accountNet: number; guestNet: number }>(),
+};
+function botFlowFormat(tableId: string, table: PokerTable): string | null {
+  const kind = tableKindOf(tableId);
+  if (kind === 'tournament' || kind === 'spingo') return null;   // not wallet chips
+  return kind === 'cash' ? `cash:${String((table as any).config?.variantId || (table as any).variantId || 'texas-holdem')}` : kind;
+}
+/**
+ * E9 — per hand with at least one human AND one bot dealt in: humanNet = minus the bots' net
+ * (chips are conserved in a hand; no rake). accountNet = the net of seats with an account
+ * (dealtInSeatAccount !== null: the only flow that reaches users.chips); guestNet = the
+ * wallet-isolated guest seats. Called right after settleInsuranceForHand (synchronous).
+ */
+function recordBotFlow(tableId: string, table: PokerTable, dealtInSeats: Set<number>): void {
+  let humans = 0, bots = 0, botNet = 0, accountNet = 0, guestNet = 0;
+  for (const i of dealtInSeats) {
+    const st = table.seats[i];
+    const start = table.startChips.get(i);
+    if (!st || st.state !== 'occupied' || start === undefined) continue;
+    const net = (st.chipCount || 0) - start;
+    if (st.isAI) { bots++; botNet += net; continue; }
+    humans++;
+    if (dealtInSeatAccount(tableId, st) !== null) accountNet += net; else guestNet += net;
+  }
+  if (humans === 0 || bots === 0) return;
+  const key = botFlowFormat(tableId, table);
+  if (!key) return;
+  let e = botFlowStats.formats.get(key);
+  if (!e) {
+    if (botFlowStats.formats.size >= 64) return;
+    e = { hands: 0, humanNet: 0, humanWon: 0, humanLost: 0, accountNet: 0, guestNet: 0 };
+    botFlowStats.formats.set(key, e);
+  }
+  const humanNet = -botNet;
+  e.hands++;
+  e.humanNet += humanNet;
+  if (humanNet > 0) e.humanWon += humanNet; else e.humanLost -= humanNet;
+  e.accountNet += accountNet;
+  e.guestNet += guestNet;
+}
+// ===== end hand rewards + bot flow =====
+
 function ensureTableProgressListener(table: PokerTable, tableId: string): void {
   if (tableProgressListeners.has(tableId)) return;
   tableProgressListeners.add(tableId);
@@ -8387,6 +8490,12 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // the hand was committed). Keyed by table + hand (an account can be in two
     // hands at once). AI seats have no progress record (no-op).
     if (s.playerId && !s.isAI) {
+      // 2026-11 (bots review E5) — a VOLUNTARY chip this hand (never a server auto-action: its
+      // log entry, pushed right before this emit, is stamped `auto`). Feeds the reward gate.
+      if (a === PlayerAction.Call || a === PlayerAction.Raise || a === PlayerAction.AllIn) {
+        const last: any = table.actionLog[table.actionLog.length - 1];
+        if (!(last && last.seatIndex === d.seatIndex && last.auto)) noteHandParticipation(tableId, hn, d.seatIndex);
+      }
       const progressAction = a === PlayerAction.Fold ? 'fold' : a === PlayerAction.Check ? 'check'
         : a === PlayerAction.Call ? 'call' : a === PlayerAction.Raise ? 'raise' : a === PlayerAction.AllIn ? 'allIn' : '';
       if (progressAction) {
@@ -10603,6 +10712,12 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // was an ELO loss).
   const dealtInSeats = new Set<number>();
   for (const s of table.seats) if (s.state === 'occupied' && s.holeCards.length > 0) dealtInSeats.add(s.seatIndex);
+  // 2026-11 (bots review E5) — the seats that put a chip in VOLUNTARILY this hand (the
+  // 'playerAction' listener's record), taken before any await. null (a world without the
+  // hand-rewards block) = every dealt-in seat participated, as before.
+  const participatedSeats: Set<number> | null = takeHandParticipation(tableId, table.handNumber) || null;
+  /** E5 — the sockets whose hand EARNS its per-hand rewards (their scratch tick runs below). */
+  const rewardSockets = new Set<string>();
 
   // Collect the human players dealt into this hand
   const humanSessions: PlayerSession[] = [];
@@ -10630,6 +10745,8 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // it so the insured seat ends with exactly `cashout` (R1 2026-10-11: only
   // this hand's records, never a seat that changed hands or forfeited).
   settleInsuranceForHand(tableId, table, totalWonPerSeat);
+  // 2026-11 (bots review E9) — what humans took from bots this hand, per format (health economy.botFlow).
+  recordBotFlow(tableId, table, dealtInSeats);
 
   // R3 (S3-2) — chips won / club stats are recorded per dealt-in HUMAN SEAT, by
   // ACCOUNT, and read HERE: after the insurance settlement, before anything can
@@ -10686,12 +10803,22 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   }
 
   for (const session of humanSessions) {
-    // Everyone who played gets recordHandPlayed + 5 XP. Pass variantId
-    // so lifetime "all_variants" + daily/weekly variety achievements
-    // can track it.
+    // Everyone who played gets recordHandPlayed (+ hand XP when the hand earns). Pass
+    // variantId so lifetime "all_variants" + daily/weekly variety achievements can track it.
+    // 2026-11 (bots review E5 / E12) — a dealt-in hand EARNS its per-hand rewards (hand XP,
+    // the scratch tick below, the 'played' windows / missions) unless it is the
+    // IDLE_HANDS_REWARD_LIMIT-th (or later) hand in a row with no voluntary chip; past
+    // HAND_XP_FULL_PER_DAY rewarded hands in a day, the hand XP is HAND_XP_AFTER_CAP.
     const variantId: string | undefined = (table as any).config?.variantId || (table as any).variantId;
-    progressionManager.recordHandPlayed(session.playerId, variantId, handRef);
-    progressionManager.addXP(session.playerId, 5);
+    const participated = participatedSeats ? participatedSeats.has(session.seatIndex) : true;
+    const earns = progressionManager.recordHandPlayed(session.playerId, variantId, handRef, true, participated) !== false;
+    if (earns) {
+      const xp = handXpForHand(session.playerId);
+      progressionManager.addXP(session.playerId, typeof xp === 'number' ? xp : 5);   // 5 = a world without the block
+      rewardSockets.add(session.socketId);
+    } else {
+      handRewardStats.xpSkipped++;
+    }
 
     const seat = table.seats[session.seatIndex];
     const isWinner = winnerSeatIndices.has(session.seatIndex);
@@ -10719,7 +10846,15 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
     else if (relativePos <= Math.floor(totalOccupied / 3)) posCategory = 'early';
     else if (relativePos >= totalOccupied - 2) posCategory = 'late';
 
-    if (isWinner) {
+    // 2026-11 (bots review E6) — a WALK (won with no voluntary chip and no showdown: the big
+    // blind / the Stud bring-in everyone folded to) is not a won hand for rewards. A steal
+    // after a voluntary bet, a contested showdown won and a pot won from a bot still count.
+    // Chips are untouched (the season's chips-won row above still records it).
+    const walk = isWinner && !participated && !(table as any).wentToShowdown;
+    if (walk) {
+      handRewardStats.walksNotCounted++;
+      progressionManager.recordPositionResult(session.playerId, posCategory, true);
+    } else if (isWinner) {
       const potSize = totalWonPerSeat.get(session.seatIndex) || 0;
       // 2026-10-21 (gameplay F42) — a STANDARD high-hand rank, or none: a
       // lowball "badness", a Badugi size, a hi-lo low half, Short Deck's own
@@ -10852,9 +10987,31 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
           // The scratch-card tick (a dealt-in seat only — the gate above). The
           // same UPDATE returns the wallet: the progress record mirrors the DB
           // (C5 — e.g. a buy-in or cash-out at another table since the last push).
-          const tick: any = await tickScratchProgress(authSession.userId).catch(() => false);
+          // 2026-11 (bots review E5) — only a hand that EARNS ticks it (an idle hand past the
+          // window does not; the push then reads the wallet fresh, as before).
+          let tick: any = false;
+          if (rewardSockets.has(socketId)) tick = await tickScratchProgress(authSession.userId).catch(() => false);
+          else handRewardStats.scratchTicksSkipped++;
           if (tick && typeof tick === 'object') {
             try { progressionManager.applyWallet(authSession.userId, tick); walletRefreshed = true; } catch { /* best-effort */ }
+            // E7 — the daily cap on cards banked from hands (authManager SCRATCH_CARDS_PER_DAY,
+            // a Denver day): counted, and the player told ONCE a day (serverAnnouncement, which
+            // poker-3d shows as a system notice) instead of silently getting no card.
+            if (tick.awarded === true) handRewardStats.scratchAwarded++;
+            else if (tick.capped === true) {
+              handRewardStats.scratchCapped++;
+              const day = denverDateKey();
+              if (scratchCapNotified.get(authSession.userId) !== day) {
+                if (scratchCapNotified.size >= 20_000) scratchCapNotified.clear();
+                scratchCapNotified.set(authSession.userId, day);
+                handRewardStats.capNotices++;
+                io.sockets.sockets.get(socketId)?.emit('serverAnnouncement', {
+                  kind: 'scratch_daily_limit',
+                  message: `Daily scratch card limit reached: ${SCRATCH_CARDS_PER_DAY} cards from hands today. Hands bank cards again tomorrow.`,
+                  at: Date.now(),
+                });
+              }
+            }
           }
           if (tick === true || (tick && tick.awarded === true)) {
             const s = io.sockets.sockets.get(socketId);
@@ -12269,6 +12426,7 @@ function endTableViewsAndTimers(tableId: string): void {
   clearPineappleDiscardHold(tableId);   // F16
   drawStartedAtMap.delete(tableId);     // G169
   dropPendingMuckShows(tableId);        // F21
+  handParticipation.delete(tableId);    // bots review E5
 }
 
 /** C12 — every minute: a private table with no human seat for PRIVATE_TABLE_IDLE_MS is removed. */

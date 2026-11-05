@@ -16,7 +16,7 @@
  */
 import fs from 'fs';
 import path from 'path';
-import { SRC, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_IDENTITY_SRC, INSURANCE_HISTORY_SRC, MUCK_SHOWS_SRC } from './helpers/indexSource';
+import { SRC, fnSrc, handlerSrc, load, flush, deferred, SEAT_TEARDOWN_SRC, SEAT_IDENTITY_SRC, INSURANCE_HISTORY_SRC, MUCK_SHOWS_SRC, HAND_REWARDS_SRC } from './helpers/indexSource';
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
 import { HandRank } from '../src/game/HandEvaluator';
 import { Card, cardToString } from '../src/game/Card';
@@ -317,6 +317,7 @@ const HAND_CODE = [
   INSURANCE_HISTORY_SRC,   // G165 — the listener's player rows go through withInsuranceSettlement
   MUCK_SHOWS_SRC,   // F21 (2026-10-21) — the listener reveals the folded seats' queued Show Hand first
   fnSrc('async function handleHandComplete('),
+  HAND_REWARDS_SRC,   // bots review 2026-11-04 (E5 / E9) — the reward gate + bot-flow helpers the listener and handleHandComplete read
 ].join('\n');
 
 /**
@@ -417,8 +418,10 @@ describe('S3-2 — chips won is recorded per dealt-in human SEAT, by account', (
     expect([w.table.seats[1].chipCount, w.table.seats[2].chipCount]).toEqual([4000, 0]);
     expect(w.chipsWon).toEqual([{ userId: 7, net: 2000 }, { userId: 8, net: -2000 }]);
     // only the side monitors are inert in this world — every path the assertions rely on is real
-    expect([...w.stubbed].filter((n) => !n.includes('.')).sort()).toEqual(['handRecordKindOf', 'opponentModelKey', 'recordChipVelocity', 'recordHandHistoryCopiesForEverySeat', 'recordRevealedCommitment', 'seedHeldFieldsFor', 'standUpSeatsPastSitOutLimit']);   // 2026-10-24 (Sit & Go fix-all F11): + the copies for seats with no live session (none here: both play live); C2 review fix-up: + the record's table-kind stamp (inert here)
+    expect([...w.stubbed].filter((n) => !n.includes('.')).sort()).toEqual(['HAND_XP', 'handRecordKindOf', 'opponentModelKey', 'recordChipVelocity', 'recordHandHistoryCopiesForEverySeat', 'recordRevealedCommitment', 'seedHeldFieldsFor', 'standUpSeatsPastSitOutLimit', 'tableKindOf']);   // 2026-10-24 (Sit & Go fix-all F11): + the copies for seats with no live session (none here: both play live); C2 review fix-up: + the record's table-kind stamp (inert here)
       // + the AI opponent-model key (R3 GAME-P3-10, imported from AIPlayer); + the deck commitment's seedHeld helper (2026-10-24: a cash table answers {})
+      // + bots review 2026-11-04 (HAND_REWARDS_SRC): HAND_XP (handXpForHand's import; this world's progressionManager answers no XP) and
+      //   tableKindOf (recordBotFlow's format key: unknown here, so the bot flow records nothing) — side monitors only
   });
 
   it('Bob taps Leave during the runout hold (his seat kept for the hand): his −2,000 is STILL recorded', async () => {

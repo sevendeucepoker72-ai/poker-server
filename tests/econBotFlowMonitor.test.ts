@@ -18,12 +18,15 @@
  * quickGameEndCheck, finishQuickGame, refundQuickEntryFee), on REAL
  * PokerTables.
  *
- * Fails on 0dc1b96: none of noteBotSeated / noteBotStackRemoved / liveBotChips
+ * E9: recordBotFlow (the hand-rewards block, HAND_REWARDS_SRC) — per hand, what humans
+ * took from bots by format; its total must equal the E10 tally at hand boundaries.
+ *
+ * Fails on 0dc1b96: none of noteBotSeated / noteBotStackRemoved / liveBotChips / recordBotFlow
  * / quickGameStats.byFormat exist.
  */
 import { PokerTable, GamePhase, MAX_SEATS } from '../src/game/PokerTable';
 import { quickGameOutcome } from '../src/game/quickGames';
-import { slice, fnSrc, load, SEAT_TEARDOWN_SRC } from './helpers/indexSource';
+import { slice, fnSrc, load, SEAT_TEARDOWN_SRC, HAND_REWARDS_SRC } from './helpers/indexSource';
 
 const BOT_FLOW_SRC = [
   slice('const botStackStats = {', '\n};\n'),
@@ -43,7 +46,7 @@ const QUICK_SRC = [
   fnSrc('function refundQuickEntryFee('),
 ].join('\n');
 
-function world(opts: { tournamentTables?: string[]; prizeTables?: string[] } = {}) {
+function world(opts: { tournamentTables?: string[]; prizeTables?: string[]; kinds?: Record<string, string>; guests?: string[] } = {}) {
   const tables = new Map<string, PokerTable>();
   const mk = (id: string, buyIn: number) => {
     const t = new PokerTable({ tableId: id, tableName: id, smallBlind: buyIn / 100, bigBlind: buyIn / 50, ante: 0, minBuyIn: buyIn } as any);
@@ -69,12 +72,25 @@ function world(opts: { tournamentTables?: string[]; prizeTables?: string[] } = {
     tableHasHumanSeat: (t: PokerTable) => t.seats.some((s) => s.state === 'occupied' && !s.isAI),
     prizeLedger: { settle: async (x: any) => { settled.push(x); return { status: 'committed', attempts: 1 }; } },
     auditLog() {}, emitQuickGameEvent() {}, cleanupQuickTable() {}, resolveChallenge: async () => {},
+    // E9 (the hand-rewards block's bot flow): the table kind, and the seat's account (null = a guest seat)
+    tableKindOf: (id: string) => opts.kinds?.[id] ?? 'cash',
+    dealtInSeatAccount: (_t: string, seat: any) => (opts.guests?.includes(seat.playerId) ? null : 7),
   };
-  const { exports: m, stubbed } = load(`${BOT_FLOW_SRC}\n${QUICK_SRC}`, scope,
-    '{ botStackStats, noteBotSeated, noteBotStackRemoved, liveBotChips, reloadAndCapBotStacks, takeAiSeatForJoin, takePlannedAiSeat, stripBotsWhenNoHumans, fillWithAI, trimExcessAI, quickGameStats, registerQuickGame, quickGameEndCheck, finishQuickGame, refundQuickEntryFee }');
+  const { exports: m, stubbed } = load(`${BOT_FLOW_SRC}\n${QUICK_SRC}\n${HAND_REWARDS_SRC}`, scope,
+    '{ botStackStats, noteBotSeated, noteBotStackRemoved, liveBotChips, reloadAndCapBotStacks, takeAiSeatForJoin, takePlannedAiSeat, stripBotsWhenNoHumans, fillWithAI, trimExcessAI, quickGameStats, registerQuickGame, quickGameEndCheck, finishQuickGame, refundQuickEntryFee, recordBotFlow, botFlowStats }');
   const took = () => m.botStackStats.seatedChips + m.botStackStats.minted - m.botStackStats.burned - m.botStackStats.removedChips - m.liveBotChips();
   const runTimers = () => { while (timers.length) timers.shift()!(); };
-  return { m, stubbed, mk, tables, took, quickGames, settled, runTimers, scope };
+  const flow = (key: string) => m.botFlowStats.formats.get(key);
+  const totalHumanNet = () => [...m.botFlowStats.formats.values()].reduce((a: number, e: any) => a + e.humanNet, 0);
+  /** One scripted hand: every occupied seat dealt in at its current stack, `play` moves chips, then the hand-end bot flow. */
+  const scriptedHand = (t: PokerTable, id: string, play: () => void) => {
+    const dealt = new Set<number>();
+    t.startChips = new Map();
+    for (const s of t.seats) if (s.state === 'occupied') { dealt.add(s.seatIndex); t.startChips.set(s.seatIndex, s.chipCount); }
+    play();
+    m.recordBotFlow(id, t, dealt);
+  };
+  return { m, stubbed, mk, tables, took, quickGames, settled, runTimers, scope, flow, totalHumanNet, scriptedHand };
 }
 const bots = (t: PokerTable) => t.seats.filter((s) => s.state === 'occupied' && s.isAI);
 
@@ -152,13 +168,17 @@ describe('E10 — every bot chip on a wallet-chip table is created and destroyed
     const [b1, b2, b3] = bots(t);
     const human = t.seats[0];
     const move = (from: any, to: any, chips: number) => { from.chipCount -= chips; to.chipCount += chips; };
-    move(b1, human, 300);            // hand 1: +300
-    move(b2, human, 600);            // hand 2: +600
-    move(human, b3, 200);            // hand 3: -200
+    w.scriptedHand(t, 'ring', () => move(b1, human, 300));   // hand 1: +300
+    w.scriptedHand(t, 'ring', () => move(b2, human, 600));   // hand 2: +600
+    w.scriptedHand(t, 'ring', () => move(human, b3, 200));   // hand 3: -200
     const humanNet = human.chipCount - 5000;
     expect(humanNet).toBe(700);
     expect(w.took()).toBe(700);
-    move(b1, b2, b1.chipCount);      // bot-to-bot: b1 busts (no human flow)
+    // E9 cross-check: the hand-path tally agrees (health: botFlow.totalHumanNet == botStacks.humansTookFromBots)
+    expect(w.totalHumanNet()).toBe(700);
+    expect(w.flow('cash:holdem')).toEqual({ hands: 3, humanNet: 700, humanWon: 900, humanLost: 200, accountNet: 700, guestNet: 0 });
+    w.scriptedHand(t, 'ring', () => move(b1, b2, b1.chipCount));   // bot-to-bot: b1 busts (no human flow)
+    expect(w.totalHumanNet()).toBe(700);
     expect(w.m.reloadAndCapBotStacks(t, 'ring', false)).toMatchObject({ reloaded: 1, minted: 5000 });
     expect(w.took()).toBe(700);
     t.standUp(0);                    // the human leaves with his stack (a wallet cash-out, not a bot flow)
@@ -167,6 +187,7 @@ describe('E10 — every bot chip on a wallet-chip table is created and destroyed
     expect(w.m.botStackStats.removedBy.strip).toBe(5000 + (5000 - 600 + 4700) + 5200);
     const s = w.m.botStackStats;
     expect(s.seatedChips + s.minted - s.burned - s.removedChips - w.m.liveBotChips()).toBe(700);
+    expect(w.totalHumanNet()).toBe(700);
   });
 
   it('(4b) the identity holds MID-HAND (bots\' chips in the pot are still theirs) and after a real hand equals the humans\' net', () => {
@@ -179,6 +200,56 @@ describe('E10 — every bot chip on a wallet-chip table is created and destroyed
     for (let g = 0; g < 20 && t.isHandInProgress(); g++) t.playerFold(t.activeSeatIndex);
     expect(t.currentPhase).toBe(GamePhase.HandComplete);
     expect(w.took()).toBe(t.seats[0].chipCount - 5000);
+    w.m.recordBotFlow('ring', t, new Set([0, 1, 2, 3]));
+    expect(w.totalHumanNet()).toBe(w.took());
+  });
+});
+
+describe('E9 — the per-format bot flow (recordBotFlow, health economy.botFlow)', () => {
+  function heads(w: ReturnType<typeof world>, id: string, humanId = 'p-h') {
+    const t = w.mk(id, 1000);
+    t.sitDown(0, 'Human', 1000, humanId, false);
+    t.sitDown(1, 'Bot', 1000, 'ai-1', true);
+    return t;
+  }
+  it('(1) an account human wins 300 from a bot: cash:holdem {hands 1, humanNet 300, humanWon 300, humanLost 0, accountNet 300, guestNet 0}', () => {
+    const w = world();
+    const t = heads(w, 'ring');
+    w.scriptedHand(t, 'ring', () => { t.seats[1].chipCount -= 300; t.seats[0].chipCount += 300; });
+    expect(w.flow('cash:holdem')).toEqual({ hands: 1, humanNet: 300, humanWon: 300, humanLost: 0, accountNet: 300, guestNet: 0 });
+  });
+  it('(1) the same hand won by a GUEST seat (dealtInSeatAccount null): guestNet 300, accountNet 0', () => {
+    const w = world({ guests: ['p-guest'] });
+    const t = heads(w, 'ring', 'p-guest');
+    w.scriptedHand(t, 'ring', () => { t.seats[1].chipCount -= 300; t.seats[0].chipCount += 300; });
+    expect(w.flow('cash:holdem')).toEqual({ hands: 1, humanNet: 300, humanWon: 300, humanLost: 0, accountNet: 0, guestNet: 300 });
+  });
+  it('(1) 2 humans + 1 bot: A takes 500 from B and 100 from the bot -> humanNet 100 (what humans took from the bot only)', () => {
+    const w = world();
+    const t = w.mk('ring', 1000);
+    t.sitDown(0, 'A', 1000, 'p-a', false);
+    t.sitDown(1, 'B', 1000, 'p-b', false);
+    t.sitDown(2, 'Bot', 1000, 'ai-2', true);
+    w.scriptedHand(t, 'ring', () => { t.seats[1].chipCount -= 500; t.seats[2].chipCount -= 100; t.seats[0].chipCount += 600; });
+    expect(w.flow('cash:holdem')).toMatchObject({ hands: 1, humanNet: 100, humanWon: 100, humanLost: 0 });
+  });
+  it('(1) a bot-only hand records nothing; aof keys \'aof\'; Spin & Go and tournament tables record nothing; the variant names a ring key', () => {
+    const w = world({ kinds: { aof: 'aof', sng: 'spingo', tour: 'tournament' } });
+    const b = w.mk('botsOnly', 1000);
+    b.sitDown(0, 'B0', 1000, 'ai-0', true);
+    b.sitDown(1, 'B1', 1000, 'ai-1', true);
+    w.scriptedHand(b, 'botsOnly', () => { b.seats[0].chipCount -= 100; b.seats[1].chipCount += 100; });
+    expect(w.m.botFlowStats.formats.size).toBe(0);
+    for (const id of ['aof', 'sng', 'tour']) {
+      const t = heads(w, id);
+      w.scriptedHand(t, id, () => { t.seats[1].chipCount -= 50; t.seats[0].chipCount += 50; });
+    }
+    expect([...w.m.botFlowStats.formats.keys()]).toEqual(['aof']);
+    expect(w.flow('aof')).toMatchObject({ hands: 1, humanNet: 50 });
+    const plo = heads(w, 'plo');
+    (plo as any).variantId = 'omaha';
+    w.scriptedHand(plo, 'plo', () => { plo.seats[0].chipCount -= 40; plo.seats[1].chipCount += 40; });
+    expect(w.flow('cash:omaha')).toMatchObject({ hands: 1, humanNet: -40, humanWon: 0, humanLost: 40 });
   });
 });
 
