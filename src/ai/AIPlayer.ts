@@ -1167,6 +1167,14 @@ export const SIZE_WIDEN_MAX = 1.3;
  * 3-bet line keeps narrowing; the value set is held whatever the size (preFlopStrategy).
  */
 export const SIZE_NARROW_MAX_TH = 0.946;
+/**
+ * Fix round 3 (review of HAI-2) — from a call of this share of the commit line
+ * (STACKOFF_COMMIT_FRACTION: 1/2 x 1/3 = a sixth of the stack) the size floor slides linearly
+ * to the stack-off width at the depth, which is what the call faces at the commit line. A
+ * 30-33 BB open at 100 BB was flatted with 77 / AJs (5.6%) and the range fell to the stack-off
+ * 3.5% at 34 BB; it now narrows smoothly into it.
+ */
+export const SIZE_FLOOR_TAPER_FROM = 0.5;
 /** HAI-1 — the multiway count the stack-off and all-in call widths were tuned for (0dc1b96's min(3, ...)): more players count as this many. */
 export const CALL_WIDTH_MAX_PLAYERS = 3;
 /** B8 — share of its own opening range an opener keeps vs a 3-bet, by the price it is laid. */
@@ -1182,6 +1190,23 @@ export const CS_CALL_WIDTH = 0.60;
  * HAI-3 (fix round 2): per opponent in the pot — the cutoff is MICRO_CALL_NEED / the live opponents.
  */
 export const MICRO_CALL_NEED = 0.25;
+/**
+ * Fix round 3 (All-In or Fold economy) — in All-In or Fold every decision is a stack-off, so an
+ * archetype's range factor applies as factor ^ AOF_ARCHETYPE_DAMP there (MANIAC 0.60 -> 0.77, FISH
+ * 0.78 -> 0.88, NIT 1.10 -> 1.05): the personalities stay, at half the width spread. The full spread
+ * (a MANIAC shoving and calling 1.67x the table's widths) was a large leak: alone, this damping took
+ * a position-aware human from +6.5% to +3.3% per game and the best one found from +8.7% to +6.5%.
+ */
+export const AOF_ARCHETYPE_DAMP = 0.5;
+/**
+ * Fix round 3 (All-In or Fold economy) — in All-In or Fold the difficulty noise on the strength
+ * applies at this share of its amplitude (easy +-0.125 -> +-0.0625, medium +-0.06 -> +-0.03, hard
+ * +-0.025 -> +-0.0125). Every All-In or Fold decision is one shove / call line for the whole stack,
+ * so each noise draw past the line was a whole-stack mistake. With both, the best human strategy
+ * found (position-aware shoves, tighter calls with players behind) measures ~+3.8% per game (100k
+ * games, 20/40, 1,000 chips, live mix), the fixed .85 / .88 one ~-0.5%, a hard bot ~+1.8%.
+ */
+export const AOF_NOISE_KEEP = 0.5;
 
 export interface PreflopCtx {
   /** Live (not folded) opponents in the hand: the players who can still call a shove or are in it (B16). */
@@ -1302,11 +1327,26 @@ function preFlopStrategy(
     ? Math.min(bucket === 'BB' ? SIZE_WIDEN_MAX : 1, (OPEN_REFERENCE_BB * refBB) / Math.max(betToMatch, refBB))
     : 1;
   const sized = (th: number, f: number): number => (f === 1 ? th : Math.min(0.99, Math.max(0.30, 1 - (1 - th) * f)));
-  // HAI-2 — a CALL line is never narrowed past SIZE_NARROW_MAX_TH (it was pushed to the 0.96-0.99
-  // noise band of AA/KK); `base` is the unscaled line, never widened by the floor.
-  const callFloor = (th: number, base: number): number => Math.min(th, Math.max(base, SIZE_NARROW_MAX_TH));
-  const callVsRaiseThS = callFloor(sized(callVsRaiseTh, sizeFactor), callVsRaiseTh);
+  const callVsRaiseThS = sized(callVsRaiseTh, sizeFactor);
   const threeBetThS = sized(threeBetTh, Math.min(1, sizeFactor));
+  // HAI-2 — a CALL line (th: sized; base: unscaled) is never narrowed past SIZE_NARROW_MAX_TH (it
+  // was pushed to the 0.96-0.99 noise band of AA/KK), nor widened by it. Fix round 3: where the
+  // stack-off line at this depth is narrower than that floor (deep stacks, ~36 BB+ multiway), from
+  // a call of SIZE_FLOOR_TAPER_FROM of the commit line the floor rises to it and the strength it
+  // reads slides to the stack-off percentile (so): at a third of the stack it is the stack-off
+  // decision, with no cliff and no 77 / AJs flat of 30 BB. Shallower, nothing changes.
+  const commitShare = noLimit && callAmount > 0 ? callAmount / Math.max(1, seat.chipCount * STACKOFF_COMMIT_FRACTION) : 0;
+  const soLineTh = commitShare > SIZE_FLOOR_TAPER_FROM
+    ? adjustThreshold(1 - stackOffCallWidth(effBB, Math.min(CALL_WIDTH_MAX_PLAYERS, Math.max(1, ctx.liveOpponents))), factor)
+    : 0;
+  const floorTaper = soLineTh > SIZE_NARROW_MAX_TH
+    ? Math.min(1, (commitShare - SIZE_FLOOR_TAPER_FROM) / (1 - SIZE_FLOOR_TAPER_FROM))
+    : 0;
+  const sizeFloorTh = SIZE_NARROW_MAX_TH + floorTaper * (soLineTh - SIZE_NARROW_MAX_TH);
+  const callsSized = (th: number, base: number): boolean => {
+    const floorTh = Math.max(base, sizeFloorTh);
+    return th <= floorTh ? pctile >= th : pctile + floorTaper * (so - pctile) >= floorTh;
+  };
 
   const raiseOrAllIn = (amount: number): AIDecision => {
     const to = Math.max(minRaise, amount);
@@ -1378,6 +1418,11 @@ function preFlopStrategy(
   const pfBB = allInOrFold ? Math.min(pureAllInCall ? shoveBB : effBB, PUSH_FOLD_MAX_BB) : effBB;
   if (allInOrFold || (inPushFoldZone(effBB, zonePlayers) && profile.archetype !== 'CALLING_STATION')) {
     const nashPush = nashPushPctile(pfBB, zonePlayers);
+    const pfFactor = allInOrFold ? Math.pow(factor, AOF_ARCHETYPE_DAMP) : factor;
+    // All-In or Fold: the strength with AOF_NOISE_KEEP of the difficulty noise (the value set never below its raw strength).
+    const pfP = allInOrFold && ctx.rawPctile !== undefined
+      ? Math.max(ctx.rawPctile + (handStrength - ctx.rawPctile) * AOF_NOISE_KEEP, valueHand ? ctx.rawPctile : 0)
+      : pctile;
     if (nashPush !== null) {
       if (pureAllInCall || (callAmount >= seat.chipCount && callAmount > 0) || (allInOrFold && callAmount > bigBlind)) {
         const callBB = pureAllInCall ? Math.min(shoveBB, pfBB) : pfBB;
@@ -1385,12 +1430,12 @@ function preFlopStrategy(
         // from his seat (and his observed VPIP), narrower with more players live.
         const callTh = adjustThreshold(allInOrFold
           ? aofCallPctile(callBB, aofShoverWidth(table, shover, callBB), callPyta - 1)
-          : nashCallPctile(callBB, Math.min(CALL_WIDTH_MAX_PLAYERS, zonePlayers)), factor);
-        return pctile >= callTh ? ALLIN : FOLD;
+          : nashCallPctile(callBB, Math.min(CALL_WIDTH_MAX_PLAYERS, zonePlayers)), pfFactor);
+        return pfP >= callTh ? ALLIN : FOLD;
       }
       // E3 (All-In or Fold only): the open-shove width shrinks x0.7 per extra player behind.
-      const shoveTh = adjustThreshold(allInOrFold ? (aofPushPctile(pfBB, zonePlayers) ?? nashPush) : nashPush, factor);
-      if (pctile >= shoveTh) return ALLIN;
+      const shoveTh = adjustThreshold(allInOrFold ? (aofPushPctile(pfBB, zonePlayers) ?? nashPush) : nashPush, pfFactor);
+      if (pfP >= shoveTh) return ALLIN;
       if (callAmount === 0) return CHECK;
       return FOLD;
     }
@@ -1424,7 +1469,7 @@ function preFlopStrategy(
   if (profile.archetype === 'CALLING_STATION') {
     if (callAmount === 0) return CHECK;
     if (unopened) return pctile >= adjustThreshold(CS_PLAY_BASE, factor) ? CALL : FOLD;
-    return pctile >= callFloor(Math.max(0.30, 1 - CS_CALL_WIDTH * sizeFactor), 1 - CS_CALL_WIDTH) ? CALL : FOLD;
+    return callsSized(Math.max(0.30, 1 - CS_CALL_WIDTH * sizeFactor), 1 - CS_CALL_WIDTH) ? CALL : FOLD;
   }
 
   // ── MANIAC: raises/3-bets almost anything — but a raise that would be a jam is a
@@ -1461,7 +1506,7 @@ function preFlopStrategy(
     // Its "weird raise": a 3-bet, not a 100 BB jam; never a 4-bet.
     if (!facingThreeBet && pctile >= 0.90) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
     if (pctile >= adjustThreshold(0.55, factor) && callAmount <= seat.chipCount * 0.12) return CALL;
-    if (pctile >= callVsRaiseThS) return CALL;
+    if (callsSized(callVsRaiseThS, callVsRaiseTh)) return CALL;
     return FOLD;
   }
 
@@ -1473,7 +1518,7 @@ function preFlopStrategy(
       if (callAmount === 0) return CHECK;
       return pctile >= callVsRaiseTh ? CALL : FOLD;                  // limp (unchanged range)
     }
-    return pctile >= callVsRaiseThS ? CALL : FOLD;
+    return callsSized(callVsRaiseThS, callVsRaiseTh) ? CALL : FOLD;
   }
 
   // ── NIT: only premiums; folds to 3-bets without a 4-bet-worthy hand. ──
@@ -1488,7 +1533,7 @@ function preFlopStrategy(
     }
     if (facingThreeBet) return fourBetValue ? ALLIN : FOLD;
     if (fourBetValue) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }   // 3-bet, not a jam
-    if (pctile >= callFloor(threeBetThS, threeBetTh)) return CALL;   // NIT flats its 3-bet range
+    if (callsSized(threeBetThS, threeBetTh)) return CALL;   // NIT flats its 3-bet range
     return FOLD;
   }
 
@@ -1537,7 +1582,7 @@ function preFlopStrategy(
   // Facing a single raise (B9: the big blind vs a min-raise lands here now): 3-bet, flat, or fold.
   if (facingRaise) {
     if (pctile >= threeBetThS) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
-    if (pctile >= callVsRaiseThS) return CALL;
+    if (callsSized(callVsRaiseThS, callVsRaiseTh)) return CALL;
     // Cheap speculative flat in late position.
     if ((bucket === 'BTN' || bucket === 'CO') && pctile >= adjustThreshold(0.45, factor) && callAmount <= seat.chipCount * 0.06) {
       return CALL;

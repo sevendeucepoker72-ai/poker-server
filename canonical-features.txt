@@ -927,6 +927,12 @@ CALL_WIDTH_MAX_PLAYERS
 SIZE_NARROW_MAX_TH
 MICRO_CALL_NEED / pyta
 function decideActionForSeat(
+# 2026-11-05 (fix round 3) - the size floor tapers into the stack-off range as a call nears a third of the
+# stack; in All-In or Fold an archetype's range factor applies at half its spread and the difficulty noise
+# at half its amplitude (the economy target).
+SIZE_FLOOR_TAPER_FROM
+AOF_ARCHETYPE_DAMP
+AOF_NOISE_KEEP
 
 # 2026-11 bots review, equity-variants C4/C8/C10 (AIPlayer wiring): Short Deck
 # bots rank hands in the 6+ order and read their own pre-flop table; Omaha Hi-Lo
