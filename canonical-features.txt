@@ -2113,3 +2113,7 @@ drawClockThrows
 [health-section-error]
 healthSectionErrors
 scratchCapColumns:
+# 2026-11-05 (bots review fix round 3, holdem lane, HR2-1) - preFlopStrategy: an opponent is "in for the bet" only when he
+# MATCHES it; an all-in for less (a blind posted all-in short, a small shove under a bigger one) no longer turns a single
+# shove into the multiway stack-off line (All-In or Fold AKo folded 95-100% there).
+if (s.currentBet >= table.currentBetToMatch)

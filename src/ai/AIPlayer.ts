@@ -1392,11 +1392,13 @@ function preFlopStrategy(
   // single bet (one opponent in for it: an open of any size, a 3-bet, a 4-bet, a shove), and AA /
   // KK never fold at all; they continue instead (all-in when the call is a stack-off). With two or
   // more opponents already in for the bet, QQ / JJ / AK play the stack-off ranges like any hand
-  // (on their pre-noise strength).
+  // (on their pre-noise strength). HR2-1 (fix round 3): in for the bet = matching it. An all-in
+  // for less (a blind posted all-in short, a 2 BB shove under a 25 BB one) is not: counting it
+  // folded All-In-or-Fold AKo 95-100% to one real shove (live 0dc1b96: 0-27%).
   let inForBet = 0;
   for (const s of table.seats) {
     if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
-    if (s.allIn || s.currentBet >= table.currentBetToMatch) inForBet++;
+    if (s.currentBet >= table.currentBetToMatch) inForBet++;
   }
   const held = valueHand && callAmount > 0 && ((rawValue as number) >= PREMIUM_STACKOFF_THRESHOLD || inForBet <= 1);
   const FOLD: AIDecision = !held ? { action: PlayerAction.Fold, raiseAmount: 0 }
