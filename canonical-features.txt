@@ -2051,3 +2051,14 @@ registry_loading
 surnameSafeName
 SURNAME_PREFIXES
 21+ to enter.
+# 2026-11-05 (bots review fix round 2, server lane) - economy: a failed boot ALTER of the daily scratch cap's two
+# columns is logged [scratch-cap-columns] and flagged, and a tick that finds a column missing (Postgres 42703) runs
+# the pre-cap UPDATE so scratch progress never stops (ECON-R2 / SCD-1); the once-a-day scratch_daily_limit notice is
+# marked sent only once it went to a connected socket (SCD-2); a hand past the idle window is out of the HUD sample
+# (VPIP / PFR / 3-bet) and the lifetime hands won, and a server auto-action is never VPIP / PFR (ECON-R1).
+[scratch-cap-columns]
+uncappedTicks
+capSock.emit('serverAnnouncement'
+countsInRecord
+!context?.auto
+auto: autoAction

@@ -8497,15 +8497,17 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     if (s.playerId && !s.isAI) {
       // 2026-11 (bots review E5) — a VOLUNTARY chip this hand (never a server auto-action: its
       // log entry, pushed right before this emit, is stamped `auto`). Feeds the reward gate.
-      if (a === PlayerAction.Call || a === PlayerAction.Raise || a === PlayerAction.AllIn) {
-        const last: any = table.actionLog[table.actionLog.length - 1];
-        if (!(last && last.seatIndex === d.seatIndex && last.auto)) noteHandParticipation(tableId, hn, d.seatIndex);
+      const lastEntry: any = table.actionLog[table.actionLog.length - 1];
+      const autoAction = !!(lastEntry && lastEntry.seatIndex === d.seatIndex && lastEntry.auto);
+      if ((a === PlayerAction.Call || a === PlayerAction.Raise || a === PlayerAction.AllIn) && !autoAction) {
+        noteHandParticipation(tableId, hn, d.seatIndex);
       }
       const progressAction = a === PlayerAction.Fold ? 'fold' : a === PlayerAction.Check ? 'check'
         : a === PlayerAction.Call ? 'call' : a === PlayerAction.Raise ? 'raise' : a === PlayerAction.AllIn ? 'allIn' : '';
       if (progressAction) {
+        // Fix round 2 (ECON-R1) — `auto`: a server auto-action is no VPIP / PFR either (not voluntary).
         progressionManager.recordAction(s.playerId, progressAction, {
-          phase: table.currentPhase === GamePhase.PreFlop ? 'PreFlop' : undefined, tableId, handNumber: hn,
+          phase: table.currentPhase === GamePhase.PreFlop ? 'PreFlop' : undefined, tableId, handNumber: hn, auto: autoAction,
         });
       }
     }
@@ -10873,7 +10875,9 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
       // F5 — at a tournament / Spin & Go table the pot size is 0 here: the win
       // counts (handsWon, streaks, rare hands, 10 base XP) but no pot mission,
       // pot achievement, biggest pot or XP pot bonus.
-      progressionManager.recordHandWon(session.playerId, potRewards ? potSize : 0, handRank, wasAllIn);
+      // Fix round 2 (ECON-R1) — `earns`: a hand past the idle window is not in the
+      // lifetime hands played (E13), so it is not in the lifetime hands won either.
+      progressionManager.recordHandWon(session.playerId, potRewards ? potSize : 0, handRank, wasAllIn, earns);
       progressionManager.recordPositionResult(session.playerId, posCategory, true);
 
       // Live activity ticker: surface notable real wins (big pots, rare hands).
@@ -11006,11 +11010,15 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
             else if (tick.capped === true) {
               handRewardStats.scratchCapped++;
               const day = denverDateKey();
-              if (scratchCapNotified.get(authSession.userId) !== day) {
+              // Fix round 2 (SCD-2) — the socket as it is NOW, after the awaited tick: one that
+              // dropped meanwhile gets nothing and the day stays unmarked, so the next capped
+              // hand (on the reconnected socket) tells him. It used to be marked sent first.
+              const capSock = scratchCapNotified.get(authSession.userId) !== day ? io.sockets.sockets.get(socketId) : undefined;
+              if (capSock) {
                 if (scratchCapNotified.size >= 20_000) scratchCapNotified.clear();
                 scratchCapNotified.set(authSession.userId, day);
                 handRewardStats.capNotices++;
-                io.sockets.sockets.get(socketId)?.emit('serverAnnouncement', {
+                capSock.emit('serverAnnouncement', {
                   kind: 'scratch_daily_limit',
                   message: `Daily scratch card limit reached: ${SCRATCH_CARDS_PER_DAY} cards from hands today. Hands bank cards again tomorrow.`,
                   at: Date.now(),

@@ -191,8 +191,11 @@ export async function initDB(): Promise<void> {
   // 2026-11 (bots review, E7) — the daily scratch-card cap from hands
   // (tickScratchProgress): the Denver day of the last card banked from hands,
   // and how many were banked that day.
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS scratch_earned_on DATE`).catch(() => {});
-  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS scratch_earned_today INTEGER NOT NULL DEFAULT 0`).catch(() => {});
+  // Fix round 2 (ECON-R2 / SCD-1, 2026-11-05) — a failure is logged and flagged,
+  // never swallowed (scratchCapColumnState): with a column missing every tick
+  // used to fail for the whole boot; it now runs the pre-cap UPDATE instead.
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS scratch_earned_on DATE`).catch((e) => noteScratchCapAlterFailed('scratch_earned_on', e));
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS scratch_earned_today INTEGER NOT NULL DEFAULT 0`).catch((e) => noteScratchCapAlterFailed('scratch_earned_today', e));
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS customization JSONB NOT NULL DEFAULT '{}'`).catch(() => {});
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences   JSONB NOT NULL DEFAULT '{}'`).catch(() => {});
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_users_stars ON users(stars)`).catch(() => {});
@@ -1439,6 +1442,24 @@ export const SCRATCH_CARDS_PER_DAY: number = ((raw: string | undefined): number 
 })(process.env.SCRATCH_CARDS_PER_DAY);
 
 /**
+ * Fix round 2 (ECON-R2 / SCD-1, 2026-11-05) — the E7 columns at this boot (health
+ * economy.handRewards.scratchCapColumns). alterFailed / alterFailures: initDB's ADD
+ * COLUMN for users.scratch_earned_on / scratch_earned_today failed (a lock wait past
+ * the 8 s statement_timeout in a deploy overlap, …; logged `[scratch-cap-columns]`).
+ * uncappedTicks: ticks whose capped UPDATE found a column missing (Postgres 42703)
+ * and ran the pre-cap UPDATE instead (0dc1b96's: no daily cap) — scratch progress
+ * never stops; the cap is back at the first boot whose ALTER succeeds.
+ */
+export const scratchCapColumnState = { alterFailed: false, alterFailures: 0, uncappedTicks: 0, lastError: null as string | null };
+const SCRATCH_CAP_COLUMNS_TAG = '[scratch-cap-columns]';
+function noteScratchCapAlterFailed(column: string, e: any): void {
+  scratchCapColumnState.alterFailed = true;
+  scratchCapColumnState.alterFailures++;
+  scratchCapColumnState.lastError = String(e?.message || e).slice(0, 200);
+  console.error(`${SCRATCH_CAP_COLUMNS_TAG} ${JSON.stringify({ event: 'alter_failed', column, code: e?.code || null, error: scratchCapColumnState.lastError })}`);
+}
+
+/**
  * Increment hands_since_last_scratch; when it reaches SCRATCH_HANDS_PER_CARD,
  * bank a card and reset the counter, unless the user already banked
  * SCRATCH_CARDS_PER_DAY cards from hands today (Denver) — then the counter
@@ -1497,7 +1518,41 @@ export async function tickScratchProgress(userId: number): Promise<ScratchTick |
       capped: rows[0].capped === true,
     };
   } catch (e: any) {
+    // ECON-R2 / SCD-1 — a scratch_earned_* column is missing (its boot ALTER failed): the
+    // pre-cap tick, so the hand still counts toward a card (the cap is off meanwhile).
+    if (e?.code === '42703') return tickScratchProgressUncapped(userId, e);
     console.warn(`[tickScratchProgress ${userId}]`, e.message);
+    return false;
+  }
+}
+
+/** The 0dc1b96 tick (no daily cap): one atomic UPDATE, never `capped`. Only after a 42703 above. */
+async function tickScratchProgressUncapped(userId: number, cause: any): Promise<ScratchTick | false> {
+  scratchCapColumnState.uncappedTicks++;
+  scratchCapColumnState.lastError = String(cause?.message || cause).slice(0, 200);
+  const n = scratchCapColumnState.uncappedTicks;
+  if (n === 1 || n % 1000 === 0) {
+    console.error(`${SCRATCH_CAP_COLUMNS_TAG} ${JSON.stringify({ event: 'uncapped_tick', uncappedTicks: n, error: scratchCapColumnState.lastError })}`);
+  }
+  try {
+    const { rows } = await pool.query(
+      `UPDATE users SET
+         hands_since_last_scratch = CASE WHEN hands_since_last_scratch + 1 >= $2 THEN 0 ELSE hands_since_last_scratch + 1 END,
+         scratch_cards_available = scratch_cards_available + CASE WHEN hands_since_last_scratch + 1 >= $2 THEN 1 ELSE 0 END
+       WHERE id = $1
+       RETURNING hands_since_last_scratch, chips, stars, scratch_cards_available`,
+      [userId, SCRATCH_HANDS_PER_CARD]
+    );
+    if (rows.length === 0) return false;
+    return {
+      awarded: Number(rows[0].hands_since_last_scratch) === 0,
+      chips: Number(rows[0].chips) || 0,
+      stars: Number(rows[0].stars) || 0,
+      scratchCardsAvailable: Number(rows[0].scratch_cards_available) || 0,
+      capped: false,
+    };
+  } catch (e: any) {
+    console.warn(`[tickScratchProgress ${userId}] (uncapped)`, e.message);
     return false;
   }
 }

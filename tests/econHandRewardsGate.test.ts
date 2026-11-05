@@ -75,7 +75,12 @@ function world(opts: Opts = {}) {
   const realHandXpFor = pm.handXpFor.bind(pm);
   pm.handXpFor = (id: string, full: number) => { const x = realHandXpFor(id, full); handXp.push(x); return x; };
   const announcements: any[] = [];
-  const sock = { id: 'SA', connected: true, emit: (ev: string, d: any) => { if (ev === 'serverAnnouncement') announcements.push(d); } };
+  // fix round 2 (SCD-2) — every announcement's socket, and the socket map a test can drop a socket from
+  const announcedTo: string[] = [];
+  const mkSock = (sid: string) => ({ id: sid, connected: true, emit: (ev: string, d: any) => { if (ev === 'serverAnnouncement') { announcements.push(d); announcedTo.push(sid); } } });
+  const ioSockets = new Map<string, any>([['SA', mkSock('SA')]]);
+  /** fix round 2 (SCD-2) — runs inside each awaited scratch tick (the DB round trip). */
+  let onTick: (() => void) | null = null;
   let day = '2026-11-04';
   const scope: Record<string, unknown> = {
     tableManager: { getTable: () => table }, playerSessions, authSessions, progressionManager: pm,
@@ -89,18 +94,33 @@ function world(opts: Opts = {}) {
     recordChipWins: async () => {}, recordClubHand() {}, publicNameOf, PUBLIC_NAME_FALLBACK, recordHand: async () => {},
     progressionHandRank, pushActivity() {},
     mergeUserStats: async () => {}, saveProgress: async () => true,
-    tickScratchProgress: async (uid: number) => { ticks.push(uid); return { awarded: false, chips: 1, stars: 2, scratchCardsAvailable: 0, capped: !!opts.capped }; },
+    tickScratchProgress: async (uid: number) => {
+      ticks.push(uid);
+      await new Promise((r) => setImmediate(r));                      // the DB round trip
+      if (onTick) onTick();
+      return { awarded: false, chips: 1, stars: 2, scratchCardsAvailable: 0, capped: !!opts.capped };
+    },
     sendProgressToPlayer() {},
-    io: { sockets: { sockets: new Map([['SA', sock]]) }, to: () => ({ emit() {} }), emit() {} },
+    io: { sockets: { sockets: ioSockets }, to: () => ({ emit() {} }), emit() {} },
     multiTableSessions: new Map(), reservedSeats: new Map(), pendingSeatRemovalAfterHand: new Map(),
     // the hand-rewards block's reads
     HAND_XP, IDLE_HANDS_REWARD_LIMIT, SCRATCH_CARDS_PER_DAY: 10, tableKindOf: () => 'cash',
     console: { log() {}, warn() {}, error() {} },
   };
   const code = `${LISTENER}\n${HAND_COMPLETE}\n${R3_HELPERS}${block ? `\n${HAND_REWARDS_SRC}` : ''}`;
-  const { exports: m, stubbed } = load(code, scope, block ? '{ ensureTableProgressListener, handleHandComplete, handRewardStats, botFlowStats }' : '{ ensureTableProgressListener, handleHandComplete }');
+  const { exports: m, stubbed } = load(code, scope, block ? '{ ensureTableProgressListener, handleHandComplete, handRewardStats, botFlowStats, scratchCapNotified }' : '{ ensureTableProgressListener, handleHandComplete }');
   m.ensureTableProgressListener(table, 'T1');
-  return { m, pm, table, ticks, handXp, announcements, stubbed, setDay: (d: string) => { day = d; } };
+  /** fix round 2 (SCD-2) — the account reconnects on socket `sid` (its seat restored to the new session). */
+  const reconnect = (from: string, sid: string) => {
+    const sess = playerSessions.get(from); const auth = authSessions.get(from);
+    playerSessions.delete(from); authSessions.delete(from); ioSockets.delete(from);
+    playerSessions.set(sid, { ...sess, socketId: sid }); authSessions.set(sid, auth);
+    ioSockets.set(sid, mkSock(sid));
+  };
+  return {
+    m, pm, table, ticks, handXp, announcements, announcedTo, stubbed, setDay: (d: string) => { day = d; },
+    ioSockets, reconnect, setOnTick: (f: (() => void) | null) => { onTick = f; },
+  };
 }
 type W = ReturnType<typeof world>;
 
@@ -318,4 +338,79 @@ describe('E7 — the daily scratch-card limit is told once per Denver day', () =
     expect(w.announcements).toHaveLength(2);
     expect(w.m.handRewardStats).toMatchObject({ scratchCapped: 3, capNotices: 2, scratchAwarded: 0 });
   }, 60_000);
+});
+
+describe('fix round 2 (SCD-2) — the daily-limit notice is marked sent only once it went to a connected socket', () => {
+  it('the socket drops inside the first capped tick: nothing sent, the day NOT marked; the next capped hand on the reconnected socket sends it once (d1ec56a: marked, never sent that day)', async () => {
+    const w = world({ capped: true });
+    await flush();
+    // socket.io removes a closing socket from io.sockets before 'disconnect' fires: gone mid-await
+    w.setOnTick(() => { w.setOnTick(null); w.ioSockets.delete('SA'); });
+    await hand(w, 'call');
+    expect(w.ticks).toHaveLength(1);
+    expect(w.announcements).toHaveLength(0);
+    expect(w.m.scratchCapNotified.has(7)).toBe(false);
+    expect(w.m.handRewardStats).toMatchObject({ scratchCapped: 1, capNotices: 0 });
+    w.reconnect('SA', 'SB');
+    for (let i = 0; i < 3; i++) await hand(w, 'call');
+    expect(w.ticks).toHaveLength(4);
+    expect(w.announcedTo).toEqual(['SB']);
+    expect(w.announcements[0]).toMatchObject({ kind: 'scratch_daily_limit' });
+    expect(w.m.scratchCapNotified.get(7)).toBe('2026-11-04');
+    expect(w.m.handRewardStats).toMatchObject({ scratchCapped: 4, capNotices: 1 });
+  }, 60_000);
+});
+
+describe('fix round 2 (ECON-R1) — the HUD ratios stay inside the idle window: VPIP / PFR / win rate never over 100%', () => {
+  /** A real hand where the human posts / checks / folds, except: 'auto' = his pre-flop call is a server auto-action. */
+  const stats = (w: W) => w.pm.getDetailedStats('player-A') as any;
+
+  it('(a) 29 idle hands, then 40 more where his pre-flop call is a SERVER auto-action: vpipHands 0, totalHandsPlayed 29 — VPIP 0% (d1ec56a: vpipHands 40 over 29 = 137.9%)', async () => {
+    const w = world();
+    await flush();
+    await hands(w, 29);
+    for (let i = 0; i < 40; i++) await hand(w, 'auto');
+    expect(w.table.actionLog.some((e: any) => e.seatIndex === HUMAN && /^called/.test(e.action) && e.auto)).toBe(true);
+    const s = stats(w);
+    expect(A(w).totalHandsPlayed).toBe(29);
+    expect(A(w).vpipHands).toBe(0);
+    expect(A(w).pfrHands).toBe(0);
+    expect(s.vpip).toBeLessThanOrEqual(100);
+    expect(s.pfr).toBeLessThanOrEqual(100);
+    expect(A(w).handsWon).toBeLessThanOrEqual(A(w).totalHandsPlayed);
+    expect(s.winRate).toBeLessThanOrEqual(100);
+  }, 120_000);
+
+  it('(b) his own (voluntary) pre-flop calls still count: 10 called hands = 10 VPIP hands over 10', async () => {
+    const w = world();
+    await flush();
+    for (let i = 0; i < 10; i++) await hand(w, 'call');
+    expect(A(w).totalHandsPlayed).toBe(10);
+    expect(A(w).vpipHands).toBe(10);
+    expect(stats(w).vpip).toBe(100);
+  }, 60_000);
+
+  it('(c) a checked-down big blind WON past the idle window: handsWon unchanged (it is not in totalHandsPlayed either); the win\'s own rewards (daily / weekly windows) unchanged; a win inside the window still counts', async () => {
+    const w = world();
+    await flush();
+    await hands(w, 29);
+    // the 30th idle hand in a row: his checked-down big blind wins a contested showdown
+    await dealHumanBigBlind(w);
+    rigHumanWins(w.table);
+    const before = won(w);
+    const handsBefore = A(w).totalHandsPlayed;
+    await finish(w, 'limp');
+    expect((w.table as any).wentToShowdown).toBe(true);
+    expect(A(w).totalHandsPlayed).toBe(handsBefore);
+    expect(A(w).handsWon).toBe(before.total);                         // d1ec56a: +1 over a frozen denominator
+    expect(won(w)).toEqual({ total: before.total, weekly: before.weekly + 1, daily: before.daily + 1 });
+    expect(stats(w).winRate).toBeLessThanOrEqual(100);
+    // CONTROL — a voluntary chip resets the window; the next won check-down counts in the record
+    await hand(w, 'call');
+    await dealHumanBigBlind(w);
+    rigHumanWins(w.table);
+    const b2 = won(w);
+    await finish(w, 'limp');
+    expect(won(w).total).toBe(b2.total + 1);
+  }, 120_000);
 });

@@ -421,6 +421,11 @@ export const HAND_XP_AFTER_CAP = 1;
 interface RecordInternals {
   handFlags: Map<string, HandFlags>;
   committedHands: string[];
+  /**
+   * Fix round 2 (ECON-R1, 2026-11-05) — the committed hands that were past the idle
+   * window (bounded like committedHands): a late action of one moves no HUD numerator.
+   */
+  idleHands: string[];
   /** `${category}:${id}:${window}` payouts in flight (never re-triggered meanwhile). */
   pendingAch: Set<string>;
   /** achievement payout retry back-off after a DB error (id → epoch ms). */
@@ -500,7 +505,7 @@ export class ProgressionManager {
     let i = this.internals.get(p);
     if (!i) {
       i = {
-        handFlags: new Map(), committedHands: [], pendingAch: new Set(), achRetryAfter: new Map(), pendChips: 0, pendStars: 0,
+        handFlags: new Map(), committedHands: [], idleHands: [], pendingAch: new Set(), achRetryAfter: new Map(), pendChips: 0, pendStars: 0,
         pendingLevels: new Map(), levelRetryAfter: 0, levelRetryTimer: null,
       };
       this.internals.set(p, i);
@@ -1353,9 +1358,12 @@ export class ProgressionManager {
    * the per-hand rewards: false from the IDLE_HANDS_REWARD_LIMIT-th idle hand
    * in a row on (and for a hand not dealt in). A hand that does not earn ticks
    * no 'played' window, no play_hands mission and no lifetime hands-played
-   * count; the caller skips its hand XP and scratch tick. The HUD flags and
-   * lastHandAt are recorded either way. No record: true (unchanged). The
-   * defaults keep every caller that passes neither flag unchanged.
+   * count; the caller skips its hand XP and scratch tick. lastHandAt is
+   * recorded either way. Fix round 2 (ECON-R1): such a hand is out of the HUD
+   * sample too — its VPIP / PFR / 3-bet flags are dropped with its denominator
+   * (the caller passes `earns` to recordHandWon for the lifetime hands won), so
+   * no HUD ratio over totalHandsPlayed can pass 100%. No record: true
+   * (unchanged). The defaults keep every caller that passes neither flag unchanged.
    */
   recordHandPlayed(playerId: string, variantId?: string, ref?: HandRef, dealtIn = true, participated = true): boolean {
     const progress = this.rec(playerId);
@@ -1385,10 +1393,17 @@ export class ProgressionManager {
     progress.lastHandAt = this.now();
 
     const f = this.takeFlags(progress, ref);
-    if (f.vpip) progress.vpipHands = (progress.vpipHands || 0) + 1;
-    if (f.pfr) progress.pfrHands = (progress.pfrHands || 0) + 1;
-    if (f.faced3bet) progress.threeBetOpps = (progress.threeBetOpps || 0) + 1;
-    if (f.did3bet) progress.threeBets = (progress.threeBets || 0) + 1;
+    if (earns) {
+      if (f.vpip) progress.vpipHands = (progress.vpipHands || 0) + 1;
+      if (f.pfr) progress.pfrHands = (progress.pfrHands || 0) + 1;
+      if (f.faced3bet) progress.threeBetOpps = (progress.threeBetOpps || 0) + 1;
+      if (f.did3bet) progress.threeBets = (progress.threeBets || 0) + 1;
+    } else {
+      // ECON-R1 — out of the HUD sample with its denominator (a late action of it too).
+      const key = handKeyOf(ref);
+      const idle = this.inner(progress).idleHands;
+      if (key) { idle.push(key); if (idle.length > 20) idle.shift(); }
+    }
     // Remembered for recordShowdownResult of the same hand (called right after).
     this.inner(progress).handFlags.set(`sd|${handKeyOf(ref)}`, { ...emptyFlags(), foldedPreflop: f.foldedPreflop });
 
@@ -1431,6 +1446,7 @@ export class ProgressionManager {
     const progress = this.rec(playerId);
     if (!progress) return;
     if (this.handCommitted(progress, ref)) {
+      if (this.inner(progress).idleHands.includes(handKeyOf(ref))) return;   // ECON-R1 — out of the HUD sample
       if (facingRaise) progress.threeBetOpps = (progress.threeBetOpps || 0) + 1;
       if (isReraise) progress.threeBets = (progress.threeBets || 0) + 1;
       return;
@@ -1487,16 +1503,25 @@ export class ProgressionManager {
     this.checkAchievements(playerId);
   }
 
+  /**
+   * A won hand. Fix round 2 (ECON-R1) — `countsInRecord` false (a hand past the
+   * idle window: recordHandPlayed returned false) leaves the lifetime handsWon —
+   * the HUD / leaderboard win rate's numerator over totalHandsPlayed, and the
+   * hands_won achievements — where it is, like totalHandsPlayed. Everything else
+   * a win records (streak, rare hands, the daily / weekly windows, win XP,
+   * missions) is unchanged. Default true: every other caller unchanged.
+   */
   recordHandWon(
     playerId: string,
     potSize: number,
     handRank?: number,
-    wasAllIn?: boolean
+    wasAllIn?: boolean,
+    countsInRecord = true,
   ): void {
     const progress = this.rec(playerId);
     if (!progress) return;
 
-    progress.handsWon++;
+    if (countsInRecord) progress.handsWon++;
     progress.currentStreak++;
     if (progress.currentStreak > progress.bestStreak) {
       progress.bestStreak = progress.currentStreak;
@@ -1683,7 +1708,7 @@ export class ProgressionManager {
   recordAction(
     playerId: string,
     action: string,
-    context?: { phase?: string; handRank?: number; tableId?: string; handNumber?: number }
+    context?: { phase?: string; handRank?: number; tableId?: string; handNumber?: number; auto?: boolean }
   ): void {
     const progress = this.rec(playerId);
     if (!progress) return;
@@ -1697,11 +1722,14 @@ export class ProgressionManager {
       ? { tableId: context.tableId, handNumber: context.handNumber } : undefined;
     const late = this.handCommitted(progress, ref);
     const preflop = context?.phase === 'PreFlop';
-    const voluntary = action === 'call' || action === 'raise' || action === 'allIn';
-    const raised = action === 'raise' || action === 'allIn';
+    // Fix round 2 (ECON-R1) — a server auto-action (context.auto: the absent seat's limp)
+    // is never VOLUNTARY: no VPIP / PFR (E5 already never counts it as participation).
+    const voluntary = !context?.auto && (action === 'call' || action === 'raise' || action === 'allIn');
+    const raised = !context?.auto && (action === 'raise' || action === 'allIn');
     if (late) {
-      if (preflop && voluntary) progress.vpipHands = (progress.vpipHands || 0) + 1;
-      if (preflop && raised) progress.pfrHands = (progress.pfrHands || 0) + 1;
+      const idle = this.inner(progress).idleHands.includes(handKeyOf(ref));   // ECON-R1 — out of the HUD sample
+      if (preflop && voluntary && !idle) progress.vpipHands = (progress.vpipHands || 0) + 1;
+      if (preflop && raised && !idle) progress.pfrHands = (progress.pfrHands || 0) + 1;
       if (action === 'allIn') this.advanceMissions(progress, { allIns: 1 });
     } else if (action !== 'chat') {
       const f = this.flagsFor(progress, ref);
