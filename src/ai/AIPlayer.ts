@@ -1022,6 +1022,11 @@ export function decideAction(
   if (!isPreFlop) handStrength *= positionMult;
   if (!isFinite(handStrength)) handStrength = 0.3;
 
+  // 2026-11 (bots review fix round 2): the first-round strength BEFORE the
+  // difficulty noise, for the decisions a premium hand must never get wrong.
+  const rawStrength = isFinite(handStrength) ? Math.max(0, Math.min(1, handStrength)) : 0.3;
+  const rawStackOff = stackOff;
+
   // Difficulty-based noise (expert has almost none)
   const noiseMap: Record<Difficulty, number> = {
     easy: 0.25, medium: 0.12, hard: 0.05, expert: 0.02
@@ -1103,11 +1108,12 @@ export function decideAction(
     const pre = sdKind
       ? studDrawFirstRound(
         handStrength, callAmount, totalPot, seat, table, profile,
-        myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true, isStudKind(sdKind) ? 'stud' : 'draw')
+        myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true, isStudKind(sdKind) ? 'stud' : 'draw',
+        { liveOpponents: numOpponents, rawPctile: rawStrength })
       : preFlopStrategy(
         handStrength, callAmount, totalPot, seat, table, profile,
         myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true,
-        { liveOpponents: numOpponents, stackOff });
+        { liveOpponents: numOpponents, stackOff, rawPctile: rawStrength, rawStackOff });
     return limitBotRaiseWar(table, seat, pre, true, handStrength);
   }
 
@@ -1151,6 +1157,18 @@ export interface PreflopCtx {
   liveOpponents: number;
   /** Hold'em-family stack-off percentile (getStackOffPercentile + the same noise); null = use the strength itself. */
   stackOff: number | null;
+  /** The strength before the difficulty noise (undefined = the noisy strength). */
+  rawPctile?: number;
+  /** The stack-off percentile before the difficulty noise (undefined = the noisy one). */
+  rawStackOff?: number | null;
+}
+
+/** Stud / draw first-round context: who is live, and the strength before the difficulty noise. */
+export interface StudDrawFirstCtx {
+  /** Live (not folded) opponents in the hand. */
+  liveOpponents: number;
+  /** The first-round percentile before the difficulty noise. */
+  rawPctile: number;
 }
 
 /** NEW-1 — a seat's stack at the START of this hand (what it holds + what it has put in). */
@@ -1503,7 +1521,8 @@ function studDrawFirstRound(
   opponents: OpponentModel,
   bigBlind: number,
   allInOrFold: boolean,
-  variantFirstRound: 'stud' | 'draw'
+  variantFirstRound: 'stud' | 'draw',
+  ctx: StudDrawFirstCtx = { liveOpponents: Math.max(1, totalActive - 1), rawPctile: handStrength },
 ): AIDecision {
   // 2026-07-07 AI overhaul: `handStrength` is now a real preflop PERCENTILE
   // (1.0 = AA, 0.85 = top 15%). Thresholds come from the solver-sized position
