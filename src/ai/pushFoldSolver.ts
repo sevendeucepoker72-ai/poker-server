@@ -121,3 +121,37 @@ export function stackOffCallWidth(effBB: number, players: number = 1): number {
   const extra = Math.max(0, players - 1);
   return w / (1 + 0.5 * extra);
 }
+
+/**
+ * 2026-11 (bots review, economy E3, All-In or Fold only): each extra player
+ * still to act behind an OPEN shove multiplies the heads-up push WIDTH by this
+ * (25 BB, UTG with 5 behind: 35.3% x 0.7^4 = 8.5%; nashPushPctile's +0.045 per
+ * player gives 17.3%).
+ */
+export const AOF_PUSH_WIDTH_PER_PLAYER = 0.7;
+/** Hands of prior weight the shover's seat-implied range keeps against his observed VPIP (All-In or Fold). */
+export const AOF_OBS_PRIOR_HANDS = 10;
+
+/** All-In or Fold: the percentile threshold to OPEN-SHOVE with playersYetToAct behind (null above the baked table). */
+export function aofPushPctile(effBB: number, playersYetToAct: number): number | null {
+  const hu = nashPushPctile(effBB, 1);
+  if (hu === null) return null;
+  return Math.min(0.99, 1 - (1 - hu) * Math.pow(AOF_PUSH_WIDTH_PER_PLAYER, Math.max(0, playersYetToAct - 1)));
+}
+
+/**
+ * All-In or Fold: the CALL threshold vs an all-in from a range of width
+ * shoverWidth — the heads-up Nash call width scaled by shoverWidth / the
+ * heads-up push width (never wider than the heads-up call), divided by
+ * (1 + 0.5 per other live player), the multiway rule of stackOffCallWidth.
+ * The width is floored at 0.5% of hands. The base is not capped at 0.99:
+ * adjustThreshold caps the final threshold, and the calibration was measured
+ * that way (a 0.99 cap here would WIDEN a loose archetype's call in the rare
+ * spots where the width is under 1%).
+ */
+export function aofCallPctile(effBB: number, shoverWidth: number, otherPlayers: number): number {
+  const huPushW = 1 - (nashPushPctile(effBB, 1) ?? 0.9);
+  const huCallW = 1 - nashCallPctile(effBB, 1);
+  const w = huCallW * Math.min(1, Math.max(0, shoverWidth) / Math.max(0.01, huPushW)) / (1 + 0.5 * Math.max(0, otherPlayers));
+  return 1 - Math.max(0.005, w);
+}

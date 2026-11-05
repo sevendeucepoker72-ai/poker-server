@@ -8,7 +8,10 @@ import {
   OPEN_THRESHOLD, THREEBET_THRESHOLD, FOURBET_THRESHOLD, FOURBET_STACKOFF_THRESHOLD, CALL_VS_RAISE_THRESHOLD,
   ARCHETYPE_RANGE_FACTOR, adjustThreshold,
 } from './preflopRanges';
-import { inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB, stackOffCallWidth } from './pushFoldSolver';
+import {
+  inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB, stackOffCallWidth,
+  aofPushPctile, aofCallPctile, AOF_OBS_PRIOR_HANDS,
+} from './pushFoldSolver';
 import {
   StudDrawKind, studDrawKindOf, isStudKind, studDrawEquity, firstRoundEquity, equityToPercentile, drawsLeftAt,
 } from './studDrawStrength';
@@ -1108,6 +1111,24 @@ function ownRaisesThisStreet(table: PokerTable, seat: Seat): number {
   return n;
 }
 
+/**
+ * 2026-11 (bots review, economy E3, All-In or Fold): the width the all-in player
+ * is read to shove. It is the AoF push width for the seat he shoved from (the
+ * players behind him then), blended with his VPIP observed this game at
+ * AOF_OBS_PRIOR_HANDS hands of prior weight. Every voluntary AoF action is an
+ * all-in. The opponent model is the existing session feed (index.ts
+ * ensureTableProgressListener); quick tables seat player-<uuid>, so a read
+ * starts empty each game. Public information only (seats, the action feed).
+ */
+function aofShoverWidth(table: PokerTable, shover: Seat | null, effBB: number): number {
+  const huW = 1 - (nashPushPctile(effBB, 1) ?? 0.9);
+  if (!shover) return huW;   // = the heads-up Nash call (the pre-2026-11 behaviour)
+  const sp = seatPositions(table, shover.seatIndex);
+  const prior = 1 - (aofPushPctile(effBB, Math.max(1, sp.total - 1 - sp.preflop)) ?? 1 - huW);
+  const obs = getOpponentProfile(opponentModelKey(shover));
+  return obs && obs.handsSeen > 0 ? (obs.vpipHands + AOF_OBS_PRIOR_HANDS * prior) / (obs.handsSeen + AOF_OBS_PRIOR_HANDS) : prior;
+}
+
 function preFlopStrategy(
   handStrength: number,
   callAmount: number,
@@ -1214,10 +1235,15 @@ function preFlopStrategy(
     if (nashPush !== null) {
       if (pureAllInCall || (callAmount >= seat.chipCount && callAmount > 0) || (allInOrFold && callAmount > bigBlind)) {
         const callBB = pureAllInCall ? Math.min(shoveBB, pfBB) : pfBB;
-        const callTh = adjustThreshold(nashCallPctile(callBB, zonePlayers), factor);
+        // E3 (All-In or Fold only): call vs the range the shover is read to shove
+        // from his seat (and his observed VPIP), narrower with more players live.
+        const callTh = adjustThreshold(allInOrFold
+          ? aofCallPctile(callBB, aofShoverWidth(table, shover, callBB), pyta - 1)
+          : nashCallPctile(callBB, zonePlayers), factor);
         return pctile >= callTh ? ALLIN : FOLD;
       }
-      const shoveTh = adjustThreshold(nashPush, factor);
+      // E3 (All-In or Fold only): the open-shove width shrinks x0.7 per extra player behind.
+      const shoveTh = adjustThreshold(allInOrFold ? (aofPushPctile(pfBB, zonePlayers) ?? nashPush) : nashPush, factor);
       if (pctile >= shoveTh) return ALLIN;
       if (callAmount === 0) return CHECK;
       return FOLD;
