@@ -2113,3 +2113,30 @@ drawClockThrows
 [health-section-error]
 healthSectionErrors
 scratchCapColumns:
+# 2026-11-05 (bots review fix round 3, server lane) - crash guard round 3: the engine records each hand's payout-start
+# stakes (PokerTable.payoutStartMark, also in the Stud 8 hi-lo award, now paid IN Showdown); a hand resting in
+# Showdown that no timer's mark covers - a human path's payout fault (socket action / draw, a sit-out / AFK / leave /
+# departure fold) or the wedge watchdog's find - is settled from it, never run again (SR2-2); the turn clock returns
+# in Showdown and a recovery never settles from a mark taken there or a held hand (SR2-1) and applies the timeout's
+# consequences; every other engine timer is guarded (500 ms auto-act, absent stand-pat, runout-hold releases, Spin &
+# Go deal, reservation expiry, rebalance cascade / sweep); a draw round a recovery left open is stood pat again; every
+# deal settles a deal-time payout fault (settleDealThrow).
+payoutStartMark
+markPayoutStart()
+settleFromPayoutMark(
+settleRestingShowdown(
+settleHumanPathThrow(
+settleDealThrow(
+settleShowdownAfterTimerThrow(
+recoverAbsentActThrow(
+recoverAbsentStandPatThrow(
+recoverHoldReleaseThrow(
+recoverTimerThrow(
+standPatDrawRoundAfterFault(
+wedge_watchdog_showdown
+humanPathShowdowns
+watchdogShowdowns
+dealPayoutFaults
+drawRoundRetries
+'human_action'
+'reservation_expiry'

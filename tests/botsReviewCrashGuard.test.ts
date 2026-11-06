@@ -18,8 +18,9 @@
  * are injected the way guard_v2 injected them.
  *
  * Fails on 0dc1b96: the guard block, PokerTable.completeHandAfterFault and the
- * timers' try/catch do not exist there (CONTROL cases (g) and (k) run the
- * 0dc1b96 behaviour and show the exit / the double payment).
+ * timers' try/catch do not exist there (CONTROL case (g) runs the 0dc1b96
+ * behaviour and shows the exit; until fix round 3 (k) also showed the wedge
+ * watchdog paying an un-held faulted Showdown twice — it now settles it).
  */
 import fs from 'fs';
 import os from 'os';
@@ -55,7 +56,10 @@ function seedRandom(seed: number): () => void {
 }
 const total = (t: PokerTable) => t.seats.reduce((a, s) => a + (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : 0), 0);
 const COUNTERS = ['actionThrows', 'drawThrows', 'autoStartThrows', 'heartbeatThrows', 'turnClockThrows', 'drawClockThrows', 'actedFor', 'turnAdvanced', 'stoodPat', 'autoStartRetried',
-  'showdownFaults', 'showdownResolved', 'showdownPaidFinished', 'showdownVoided', 'showdownHeld', 'recoveryThrows', 'logLinesSuppressed'];
+  'showdownFaults', 'showdownResolved', 'showdownPaidFinished', 'showdownVoided', 'showdownHeld', 'recoveryThrows', 'logLinesSuppressed',
+  // fix round 3 (2026-11-05) — additive
+  'absentActThrows', 'absentStandPatThrows', 'holdReleaseThrows', 'dealThrows', 'tournamentTimerThrows', 'reservationTimerThrows',
+  'humanPathShowdowns', 'watchdogShowdowns', 'dealPayoutFaults', 'drawRoundRetries'];
 
 interface WorldOpts {
   /** decideAction stand-in (default: the real one). */
@@ -461,7 +465,7 @@ describe('C1 — a throw on a bot timer is recovered, never left to the process 
     return advanced;
   }
 
-  it('(k) a seat changed under the mark: HELD — the wedge watchdog never advances it, executeAIAction returns at once (CONTROL: un-held, the watchdog re-pays)', () => {
+  it('(k) a seat changed under the mark: HELD — the wedge watchdog never advances it, executeAIAction returns at once (un-held: fix round 3 — the watchdog settles it from the payout mark, never re-pays)', () => {
     const { t, w, mark } = faultedFoldShowdown();
     t.seats[1].playerId = 'someone-else';         // the seat is not the one the mark saw
     w.m.settleShowdownAfterFault(T, t, mark);
@@ -478,10 +482,32 @@ describe('C1 — a throw on a bot timer is recovered, never left to the process 
     expect(w.c.decide).toBe(decides);           // returned before deciding
     expect(t.seats.map((s) => s.chipCount)).toEqual(chips);
 
-    // CONTROL (the pre-existing hazard): the same resting Showdown NOT held — the watchdog advances it and pays the pot AGAIN
+    // The same resting Showdown NOT held. Up to fix round 2 this was the CONTROL of the pre-existing
+    // hazard: the watchdog advanced it and paid the pot AGAIN (> 20000). Fix round 3 (SR2-2): the
+    // watchdog never advances a Showdown — seen there at two ticks, it settles it from the engine's
+    // payout-start mark: PAID_FINISHED, the pot never paid twice, the next deal scheduled.
     const c2 = faultedFoldShowdown();
-    expect(watchdogTicks(c2.t, () => false, 3)).toBeGreaterThan(0);
-    expect(c2.t.seats.reduce((a, s) => a + s.chipCount, 0)).toBeGreaterThan(20000);
+    let advanced = 0;
+    const realAdvance = (c2.t as any).advanceTurn.bind(c2.t);
+    (c2.t as any).advanceTurn = () => { advanced++; return realAdvance(); };
+    let tick: (() => void) | null = null;
+    let wnow = 2_000_000;
+    const wscope: any = {
+      ...c2.w.scope,
+      tableManager: { getTable: (id: string) => (id === T ? c2.t : undefined), getTableList: () => [{ tableId: T }] },
+      turnTimers: new Map(), turnStartedAtMap: new Map(), turnStartedSeatMap: new Map(), turnStartedHandMap: new Map(), turnStartedPhaseMap: new Map(),
+      setInterval: (fn: () => void) => { tick = fn; return 1; },
+      Date: class FakeDate extends Date { static now() { return wnow; } },
+    };
+    const { exports: wm, stubbed: wstub } = load(`${GUARD}\n${SAS}\n${WATCHDOG}`, wscope, '{ gameTimerGuardStats, gameShowdownHeld }');
+    for (let i = 0; i < 3; i++) { wnow += 15_000; tick!(); }
+    expect(advanced).toBe(0);
+    expect(c2.t.currentPhase).toBe(GamePhase.HandComplete);
+    expect(c2.t.seats.reduce((a, s) => a + s.chipCount, 0)).toBe(20000);   // 0dc1b96 / round 2: > 20000
+    expect(c2.t.seats.every((s) => (s.totalInvestedThisHand || 0) === 0)).toBe(true);
+    expect(wm.gameTimerGuardStats).toMatchObject({ watchdogShowdowns: 1, showdownFaults: 1, showdownPaidFinished: 1, showdownResolved: 0, showdownVoided: 0, showdownHeld: 0 });
+    expect(wm.gameShowdownHeld(c2.t)).toBe(false);
+    expect([...wstub].filter((n) => /settle|gameTimer|gameShowdown|continueAfter|scheduleAutoStart/.test(n))).toEqual([]);
   });
 
   it('(l) heartbeat: the first table\'s ensureCashTableRunning throws, the second table is still processed (0dc1b96: the tick aborted)', () => {
@@ -504,7 +530,9 @@ describe('C1 — a throw on a bot timer is recovered, never left to the process 
 
   it('GUARD — every timer that runs autoStartNextHand catches its throw; the wedge watchdog skips a held Showdown; health reports the counts', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'index.ts'), 'utf8');
-    expect(src.split('try { autoStartNextHand(').length - 1).toBe(4);
+    // 4 timers + (fix round 3) the 'startHand' handler's deal, whose catch settles a deal-time payout fault
+    expect(src.split('try { autoStartNextHand(').length - 1).toBe(5);
+    expect(src).toContain("try { autoStartNextHand(session.tableId); } catch (err) { settleDealThrow(session.tableId, table, 'start_hand', err); }");
     expect(src).toContain('if (table.currentPhase === GamePhase.Showdown && gameShowdownHeld(table)) {');
     expect(src).toContain("gameTimers: healthSection('crashSafety.gameTimers', () => ({ ...gameTimerGuardStats })),");
     expect(src).toContain("try { ensureCashTableRunning(t.tableId); } catch (err) { gameTimerGuardStats.heartbeatThrows++;");
