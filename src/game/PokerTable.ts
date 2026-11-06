@@ -431,6 +431,28 @@ export class PokerTable extends EventEmitter {
   /** Starting chip counts at beginning of hand (for hand history) */
   public startChips: Map<number, number> = new Map();
 
+  /**
+   * Bots review fix round 3 (2026-11-05, SR2-2) — the table as this hand's PAYOUT began:
+   * per seat chipCount + totalInvestedThisHand (-1 = not occupied) and its playerId, taken
+   * ONCE per hand on the first entry into determineWinners (the base or a hi-lo override),
+   * before any chip moves. Until then bets, refunds and dead money only move chips between
+   * those two fields of the same seat, so after a payout fault it says exactly what was
+   * paid, whatever path ran the payout (a timer, a socket action, a fold for a leaver, a
+   * deal). index.ts settles a hand found resting in Showdown from it and never runs a
+   * payout again blind. null until this hand's payout starts; cleared at every deal.
+   */
+  public payoutStartMark: { hand: number; stakes: number[]; ids: string[] } | null = null;
+
+  /** SR2-2 — take this hand's payoutStartMark (first call per hand only). */
+  protected markPayoutStart(): void {
+    if (this.payoutStartMark && this.payoutStartMark.hand === this.handNumber) return;
+    this.payoutStartMark = {
+      hand: this.handNumber,
+      stakes: this.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1)),
+      ids: this.seats.map((s) => s.playerId),
+    };
+  }
+
   /** TDA Rule 16: Track last aggressor seat for showdown order */
   public lastAggressorSeat: number = -1;
 
@@ -949,6 +971,8 @@ export class PokerTable extends EventEmitter {
     this.clearBetIncreases();             // F22 fix-up — a new betting round
     this.wentToShowdown = false; // set true only on a contested showdown (>= 2 tabled)
     this._runoutHeld = false;    // R1 insurance window — never carried into a new hand
+
+    this.payoutStartMark = null;  // SR2-2 (fix round 3) — taken again by this hand's payout
 
     // Capture starting chip counts for hand history
     this.startChips = new Map();
@@ -2939,6 +2963,7 @@ export class PokerTable extends EventEmitter {
 
   protected determineWinners(): void {
     this.currentPhase = GamePhase.Showdown;
+    this.markPayoutStart();   // SR2-2 (fix round 3) — before any chip moves
 
     // Refund any uncalled top-stack excess BEFORE calculating pots.
     this.refundUncalledBets();

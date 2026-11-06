@@ -389,6 +389,12 @@ export class SevenStudTable extends PokerTable {
     // between the high winner(s) and qualifying low winner(s) using the same
     // evaluation as Omaha Hi-Lo.
 
+    // Fix round 3 (2026-11-05) — in Showdown before any chip moves, as the base and the
+    // Omaha hi-lo award: a fold-won pot reaches here from a betting street (advanceTurn,
+    // awardIfUncontested), and a payout that threw there left the hand on that street, paid,
+    // where any recovery's advanceTurn ran this payout again.
+    this.currentPhase = GamePhase.Showdown;
+    this.markPayoutStart();   // SR2-2 (fix round 3) — before any chip moves
     this.refundUncalledBets();
     const { evaluateLowHand, compareLowHands } = require('../HandEvaluatorExtensions');
 

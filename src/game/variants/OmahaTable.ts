@@ -109,6 +109,7 @@ export class OmahaTable extends PokerTable {
 
     // Omaha Hi-Lo: split pots between best high and best qualifying low
     this.currentPhase = GamePhase.Showdown;
+    this.markPayoutStart();   // SR2-2 (fix round 3) — before any chip moves
 
     // TDA Rule 41: refund uncalled top-stack excess before pot calculation
     this.refundUncalledBets();
