@@ -1950,7 +1950,7 @@ function studDrawFirstRound(
     return FOLD_VS_RAISE;
   }
 
-  // ── NIT: only premiums; folds to 3-bets without a 4-bet-worthy hand. ──
+  // ── NIT: only premiums; folds to 3-bets without a 4-bet-worthy hand (an opener keeps a share). ──
   if (profile.archetype === 'NIT') {
     if (callAmount === 0) {
       if (pctile >= openTh) return raiseOrAllIn(Math.round(bigBlind * 2.5));
@@ -1962,7 +1962,24 @@ function studDrawFirstRound(
       // Item 4 — a value-set hand the noise put under openTh opens too (a NIT never limps).
       return pctile >= openTh || inValueSet ? raiseOrAllIn(Math.round(bigBlind * 2.5)) : { action: PlayerAction.Fold, raiseAmount: 0 };
     }
-    if (facingThreeBet && pctile < fourBetTh) return FOLD_VS_RAISE;
+    // Fix round 3 — an opener facing ONE re-raise (B8's spot) keeps a share of its opening range:
+    // no-limit by the price (B8's DEF3B_* rule), fixed limit all of it (one more bet into ~6 is no
+    // fold for a hand that opened), a value-set hand always; read on the noisy percentile or the
+    // pre-noise one (the open passed on one draw of the noise). It folded every open under fourBetTh
+    // to a single 3-bet: 3-betting any two cards won +59 BB/100 vs NIT x4 in Five Card Draw (live
+    // -4) and +80 in Badugi (live +2).
+    if (facingThreeBet && pctile < fourBetTh) {
+      if (streetRaises === 2 && callAmount > 0 && ownRaisesThisStreet(table, seat) > 0) {
+        let keepTh = openTh;
+        if (noLimit) {
+          const need = callAmount / (totalPot + callAmount);
+          const keep = Math.max(0, Math.min(DEF3B_KEEP_MAX, DEF3B_KEEP_AT_MIN - DEF3B_SLOPE * (need - DEF3B_MIN_NEED)));
+          keepTh = 1 - (1 - openTh) * keep;
+        }
+        if (Math.max(pctile, raw) >= keepTh || inValueSet) return CALL;
+      }
+      return FOLD_VS_RAISE;
+    }
     if (pctile >= fourBetTh) {
       if (facingThreeBet) return ALLIN;
       const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind));

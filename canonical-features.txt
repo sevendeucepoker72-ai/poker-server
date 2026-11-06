@@ -921,6 +921,10 @@ n >= exports.STUD_DRAW_MIN_SIMS
 # value-set hand closing the action on one all-in that does not commit it calls too (the gate prices the rest).
 const facingOneRaise = facingRaise && streetRaises <= 1;
 !committing && facingOneRaise && inValueSet
+# 2026-11-05 (bots review fix round 3, full-line sweep) - studDrawFirstRound: a NIT that opened keeps a share of
+# its opening range facing ONE re-raise (fixed limit all of it, no-limit by the price, the value set always); it
+# folded every open under the 4-bet threshold, so 3-betting any two cards beat NIT tables.
+if (Math.max(pctile, raw) >= keepTh || inValueSet)
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as
