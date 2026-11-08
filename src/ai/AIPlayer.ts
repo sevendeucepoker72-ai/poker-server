@@ -1820,6 +1820,26 @@ function fullRaisesThisRound(table: PokerTable, variantFirstRound: 'stud' | 'dra
   return Math.max(0, Math.min(streetRaises, levels - (variantFirstRound === 'draw' ? 1 : 0)));
 }
 
+/**
+ * Fix round 4 (unequal stacks) — Five Card Draw: has this seat RE-raised this round (a raise of its own made
+ * after another seat's raise / all-in) and put in more than FIVE_DRAW_LIGHT_RERAISE_FRACTION of the depth at
+ * risk against the all-in it now faces (the smaller hand-start stack)? The light re-raise cap is a share of the
+ * seat's OWN stack: "a hand that folds to the shove it invites risks little" holds only against a shove as
+ * deep. Against a shorter all-in the re-raise is priced in, and folding it gave it away: a MANIAC re-raised a
+ * 40 BB human's 3 BB open to ~10 BB and folded ~90% of those to his 40 BB shove (call 30 to win 51), so
+ * opening 3 BB with any five cards and shoving over every re-raise won +98 +- 22 BB/100 vs MANIAC x4
+ * (live 0dc1b96 +4 +- 32; it came with fix round 2's stack-off gate: e92bc52 -21, 2b5ac52 +122).
+ */
+function reRaisePricedIn(table: PokerTable, seat: Seat, shover: Seat | null): boolean {
+  if (!shover || seat.currentBet <= FIVE_DRAW_LIGHT_RERAISE_FRACTION * Math.min(handStartStack(seat), handStartStack(shover))) return false;
+  let raised = false;
+  for (const e of table.actionLog) {
+    if (e.street !== table.currentPhase) continue;
+    if (e.seatIndex !== seat.seatIndex) { if (OWN_RAISE_RE.test(e.action)) raised = true; } else if (raised && OWN_RAISE_RE.test(e.action)) return true;
+  }
+  return false;
+}
+
 function studDrawFirstRound(
   handStrength: number,
   callAmount: number,
@@ -2000,7 +2020,9 @@ function studDrawFirstRound(
   //    calls (it does not move in its deeper stack). Fix round 4: for a LONE shove only (the
   //    round's one raise); in a raise war the seat's own stack prices it, as before (a 400 BB
   //    MANIAC folded its light re-raises, and its cold calls, to a 100 BB shove over them).
-  //    Review MEAS-3: premiums by class. ──
+  //    Review MEAS-3: premiums by class.
+  //    Fix round 4 (unequal stacks): a seat whose own re-raise is more than the light share of
+  //    the depth at risk against a SHORTER all-in calls it (reRaisePricedIn). ──
   const ownCommit = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
   const committing = ownCommit
     || (callAmount > 0 && !!shover && shoveBB >= FIVE_DRAW_ALLIN_COMMIT_BB && streetRaises <= 1);
@@ -2009,7 +2031,9 @@ function studDrawFirstRound(
     ? pctile >= adjustThreshold(nashCallPctile(depthBB, soPlayers), factor)
     : pctile >= adjustThreshold(1 - stackOffCallWidth(depthBB, soPlayers), factor));
   if (noLimit && !allInOrFold && (pureCall || committing)) {
-    if (!stackOffOK(pureCall ? shoveBB : effBB) && !(!committing && facingOneRaise && inValueSet)) return FOLD;
+    if (!stackOffOK(pureCall ? shoveBB : effBB) && !(!committing && facingOneRaise && inValueSet)) {
+      return reRaisePricedIn(table, seat, shover) ? (callAmount < seat.chipCount ? CALL : ALLIN) : FOLD;
+    }
     return (pureCall || !ownCommit) && callAmount < seat.chipCount ? CALL : ALLIN;
   }
   /**

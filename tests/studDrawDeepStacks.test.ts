@@ -6,6 +6,9 @@
  * and shoving over every re-raise won +894 BB/100 vs MANIAC x4 at 400 BB (cdb31dd -88, live 0dc1b96 -165), measured
  * over whole hands. Now the depth rule is for a lone shove (the round's one raise); in a raise war a seat prices the
  * shove on its own stack, as cdb31dd did (the same line: -146). Real tables and the real decideAction, deterministic.
+ * The other way round (a human SHORTER than the bots): a bot's re-raise above the light share of the depth at risk
+ * is priced in against his all-in (reRaisePricedIn). A MANIAC re-raised a 40 BB human's 3 BB open to ~10 BB and
+ * folded ~90% to his shove: the same any-two line won +98 BB/100 vs MANIAC x4 (live 0dc1b96 +4; since fix round 2).
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
 const { PlayerAction } = require('../src/game/PokerTable');
@@ -67,5 +70,75 @@ describe('fix round 4 (unequal stacks): in a raise war a deep bot prices a 100 B
 
   it('CONTROL: at 100 BB the same shove commits its own stack, and the stack-off range prices it (folds most)', () => {
     expect(foldShare(4302, 100, true, 'shove over its own re-raise')).toBeGreaterThan(0.75);
+  }, 120_000);
+});
+
+/**
+ * Fix round 4 (unequal stacks, the other way round): seat 3 is a human with `heroBB`, every bot 100 BB. The human
+ * opens to 3 BB, seat 4 (a bot of `arch`, its own random cards) re-raises to `reBB`, everyone else folds, the human
+ * moves all-in and seat 4 decides, closing the action.
+ */
+function shortShoveOverReRaise(heroBB: number, reBB: number, arch: string, diff: string): any {
+  const t = new FiveCardDrawTable({ tableId: 'short', tableName: 'short', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 5000 }, false);
+  for (let i = 0; i < 6; i++) t.sitDown(i, 'P' + i, 5000, (i === 3 ? 'human-short-' : 'ai-short-') + i, i !== 3);
+  t.seats[3].chipCount = heroBB * 50;
+  t.startNewHand();
+  expect(t.activeSeatIndex).toBe(3);
+  expect(t.playerRaise(3, 150)).toBe(true);
+  expect(t.playerRaise(4, reBB * 50)).toBe(true);
+  let g = 0; while (g++ < 10 && t.activeSeatIndex >= 0 && t.activeSeatIndex !== 3) t.playerFold(t.activeSeatIndex);
+  expect(t.activeSeatIndex).toBe(3);
+  expect(t.playerAllIn(3)).toBe(true);
+  expect(t.activeSeatIndex).toBe(4);
+  return AI.decideAction(t, 4, { ...AI.generateRandomProfile(diff), archetype: arch, difficulty: diff });
+}
+function shortShoveFolds(seed: number, heroBB: number, reBB: number, archs: string[], perCell: number): { folds: number; n: number } {
+  const restore = detEnv(seed);
+  try {
+    let folds = 0, n = 0;
+    for (const arch of archs) for (const diff of DIFFS) for (let k = 0; k < perCell; k++) {
+      n++; if (shortShoveOverReRaise(heroBB, reBB, arch, diff).action === PlayerAction.Fold) folds++;
+    }
+    process.stdout.write(`${heroBB} BB human shoves over a ${reBB} BB re-raise (${archs.join('/')}): folds ${folds}/${n}\n`);
+    return { folds, n };
+  } finally { restore(); }
+}
+
+describe('fix round 4 (unequal stacks): a bot\'s re-raise is priced in against a SHORTER all-in over it (reRaisePricedIn)', () => {
+  const ARCH = ['TAG', 'LAG', 'NIT', 'ROCK', 'FISH', 'MANIAC', 'CALLING_STATION'];
+  it('a 100 BB bot that re-raised a 40 / 60 BB human\'s 3 BB open to 10 BB never folds to his all-in, every archetype and difficulty (2b5ac52 to 05248ab: a MANIAC folded ~90% of its light re-raises)', () => {
+    const r40 = shortShoveFolds(4311, 40, 10, ARCH, 6);
+    const r60 = shortShoveFolds(4312, 60, 10, ARCH, 6);
+    expect([r40.n, r60.n]).toEqual([168, 168]);
+    expect([r40.folds, r60.folds]).toEqual([0, 0]);
+  }, 300_000);
+
+  it('CONTROL: at 100 BB a light 10 BB re-raise is the light share of the depth at risk, and the stack-off range prices the shove (a MANIAC folds most)', () => {
+    const r = shortShoveFolds(4313, 100, 10, ['MANIAC'], 40);
+    expect(r.n).toBe(160);
+    expect(r.folds / r.n).toBeGreaterThan(0.75);
+  }, 120_000);
+
+  it('CONTROL: an OPEN is not a re-raise: a MANIAC\'s 5 BB open facing a 40 BB human\'s all-in is still priced by the stack-off range (folds most)', () => {
+    const restore = detEnv(4314);
+    try {
+      let folds = 0, n = 0;
+      for (const diff of DIFFS) for (let k = 0; k < 40; k++) {
+        const t = new FiveCardDrawTable({ tableId: 'open', tableName: 'open', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 5000 }, false);
+        for (let i = 0; i < 6; i++) t.sitDown(i, 'P' + i, 5000, (i === 4 ? 'human-open-' : 'ai-open-') + i, i !== 4);
+        t.seats[4].chipCount = 40 * 50;
+        t.startNewHand();
+        expect(t.activeSeatIndex).toBe(3);
+        expect(t.playerRaise(3, 250)).toBe(true);   // the bot opens to 5 BB (more than a tenth of 40 BB)
+        expect(t.playerAllIn(4)).toBe(true);
+        let g = 0; while (g++ < 10 && t.activeSeatIndex >= 0 && t.activeSeatIndex !== 3) t.playerFold(t.activeSeatIndex);
+        expect(t.activeSeatIndex).toBe(3);
+        n++;
+        if (AI.decideAction(t, 3, { ...AI.generateRandomProfile(diff), archetype: 'MANIAC', difficulty: diff }).action === PlayerAction.Fold) folds++;
+      }
+      process.stdout.write(`40 BB human shoves over a MANIAC's 5 BB open: folds ${folds}/${n}\n`);
+      expect(n).toBe(160);
+      expect(folds / n).toBeGreaterThan(0.6);
+    } finally { restore(); }
   }, 120_000);
 });
