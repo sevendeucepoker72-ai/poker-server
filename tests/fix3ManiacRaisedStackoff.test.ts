@@ -205,5 +205,5 @@ describe('MANIAC-RTF parts 1 + 2 — 3-handed 25 BB against two MANIACs, any two
     const r = play3(line as string, N, seed as number);
     rows.push(`${line}: ${r.bb100.toFixed(1)} (${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
     expect([line, r.hands, r.drift, r.bb100 < 0]).toEqual([line, N, 0, true]);
-  }, 120_000);
+  }, 300_000);   // 1,000 hands each: 37-117 s under load (round-3 review); 120 s was close
 });

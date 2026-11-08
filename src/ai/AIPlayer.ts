@@ -1451,7 +1451,9 @@ function preFlopStrategy(
   // more opponents already in for the bet, QQ / JJ / AK play the stack-off ranges like any hand
   // (on their pre-noise strength). HR2-1 (fix round 3): in for the bet = matching it. An all-in
   // for less (a blind posted all-in short, a 2 BB shove under a 25 BB one) is not: counting it
-  // folded All-In-or-Fold AKo 95-100% to one real shove (live 0dc1b96: 0-27%).
+  // folded All-In-or-Fold AKo 95-100% to one real shove (live 0dc1b96: 0-27%). So two real shoves
+  // count as two only when the smaller matches the larger: QQ / JJ / AK hold against 25 + 24 BB
+  // all-ins and take the multiway line against 25 + 25 (disclosed in fix round 4).
   let inForBet = 0;
   for (const s of table.seats) {
     if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
