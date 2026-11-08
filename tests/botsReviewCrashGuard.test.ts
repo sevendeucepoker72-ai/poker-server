@@ -486,8 +486,9 @@ describe('C1 — a throw on a bot timer is recovered, never left to the process 
 
     // The same resting Showdown NOT held. Up to fix round 2 this was the CONTROL of the pre-existing
     // hazard: the watchdog advanced it and paid the pot AGAIN (> 20000). Fix round 3 (SR2-2): the
-    // watchdog never advances a Showdown — seen there at two ticks, it settles it from the engine's
-    // payout-start mark: PAID_FINISHED, the pot never paid twice, the next deal scheduled.
+    // watchdog never advances a Showdown — at the first tick that sees it (the fix round 3 review;
+    // two ticks before), it settles it from the engine's payout-start mark: PAID_FINISHED, the pot
+    // never paid twice, the next deal scheduled.
     const c2 = faultedFoldShowdown();
     let advanced = 0;
     const realAdvance = (c2.t as any).advanceTurn.bind(c2.t);

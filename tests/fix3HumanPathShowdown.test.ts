@@ -13,9 +13,9 @@
  * The fix, both halves:
  *   - a choke point: the engine records each hand's payout-start stakes
  *     (PokerTable.payoutStartMark, taken once per hand on the first entry into
- *     determineWinners); the wedge watchdog never folds / checks / advances a Showdown — seen
- *     there at two ticks it settles it from that mark (resolved / paid_finished / voided /
- *     held), so ANY path, named or not, is safe;
+ *     determineWinners); the wedge watchdog never folds / checks / advances a Showdown — at the
+ *     first tick that sees it (two ticks until the fix round 3 review) it settles it from that
+ *     mark (resolved / paid_finished / voided / held), so ANY path, named or not, is safe;
  *   - promptness: each named human path catches its throw, settles a Showdown at once from the
  *     same mark (settleHumanPathThrow), then RETHROWS so socketGuard still logs and reports it.
  * A wedged hand whose payout never started is still recovered by the watchdog as before.
