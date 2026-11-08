@@ -2125,3 +2125,8 @@ HOLDEM_LIGHT_RERAISE_FRACTION
 # this street continues a stack-off with MANIAC_RAISED_STACKOFF_WIDEN (2) x the width; it folded ~80-90% of its any-two
 # raises to a shove (3-handed 25 BB squeeze over its open +32 BB/100, Short Deck limp-shove +32; live -75 / -97).
 MANIAC_RAISED_STACKOFF_WIDEN
+# 2026-11-08 (bots review fix round 3, holdem lane, PLO NEW-1 check) - preFlopStrategy (pot-limit Omaha): the 0dc1b96
+# chips-left depth (chipsLeftEffectiveStackBB; round 1's hand-start depth folded 96% to a 20 BB pot 3-bet and 97% to the
+# last all-in of a pot war), and a lone all-in the call closes is called with any hand at <= PLO_LONE_ALLIN_CALL_NEED (30%).
+PLO_LONE_ALLIN_CALL_NEED
+function chipsLeftEffectiveStackBB(

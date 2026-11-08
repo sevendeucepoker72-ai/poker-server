@@ -1191,6 +1191,16 @@ export const CS_CALL_WIDTH = 0.60;
  */
 export const MICRO_CALL_NEED = 0.25;
 /**
+ * Fix round 3 (PLO NEW-1 check) — pot-limit Omaha: a lone all-in the call closes is called with any hand at this
+ * needed equity or less per opponent. Four-card hands run close (a random hand has 34% against AAxx on average,
+ * p25 31%; 47% against the top 41%), and a pot-limit all-in never needs more than about a third. The round-1
+ * hand-start depth (NEW-1) sent short lone all-ins into the Hold'em Nash call on the Omaha scale: a TAG that
+ * pot-opened the button folded 43% of its opening range to an 8 BB shove needing 26.5% (live 0dc1b96: 0%).
+ * PLO now keeps the 0dc1b96 depth too (chipsLeftEffectiveStackBB); this floor also keeps the push/fold
+ * zone's bottom-of-range folds (NIT 0.7% there at 0dc1b96) out of such a spot.
+ */
+export const PLO_LONE_ALLIN_CALL_NEED = 0.30;
+/**
  * Fix round 3 (All-In or Fold economy) — in All-In or Fold every decision is a stack-off, so an
  * archetype's range factor applies as factor ^ AOF_ARCHETYPE_DAMP there (MANIAC 0.60 -> 0.77, FISH
  * 0.78 -> 0.88, NIT 1.10 -> 1.05): the personalities stay, at half the width spread. The full spread
@@ -1320,7 +1330,9 @@ function preFlopStrategy(
   const pctile = valueHand ? Math.max(handStrength, ctx.rawPctile ?? handStrength) : handStrength;
   const bucket = posBucket(position, totalActive);
   const factor = ARCHETYPE_RANGE_FACTOR[profile.archetype] ?? 1.0;
-  const effBB = getEffectiveStackBB(table, seat.seatIndex);   // NEW-1: start-of-hand stacks
+  // NEW-1: start-of-hand stacks. Pot-limit Omaha keeps the 0dc1b96 chips-left depth (fix round 3).
+  const effBB = table.bettingStructure === 'pot-limit' && !allInOrFold
+    ? chipsLeftEffectiveStackBB(table, seat.seatIndex) : getEffectiveStackBB(table, seat.seatIndex);
   const stackMult = getStackDepthMultiplier(effBB);
   const huFactor = totalActive <= 2 ? 0.55 : 1.0;
   const streetRaises = Number((table as any).raisesThisStreet) || 0;
@@ -1436,9 +1448,11 @@ function preFlopStrategy(
   // Price floor — a micro all-in that this call closes is called with any two cards: at most
   // MICRO_CALL_NEED of equity needed PER OPPONENT in the pot (the big blind vs a 1.5 BB shove
   // needs 14%). HAI-3: 0.25 flat let three 100 BB all-ins' dead money price in 72o (24.7%
-  // needed; 72o has 12-15% 4-way); at 0.25 / 3 = 8.3% it never fires there.
+  // needed; 72o has 12-15% 4-way); at 0.25 / 3 = 8.3% it never fires there. Pot-limit Omaha
+  // uses PLO_LONE_ALLIN_CALL_NEED (fix round 3).
+  const floorNeed = noLimit || allInOrFold ? MICRO_CALL_NEED / pyta : PLO_LONE_ALLIN_CALL_NEED / pyta;
   if (shover && table.bettingStructure !== 'fixed-limit' && (allInOrFold ? pureAllInCall : pureCall)
-      && callAmount / (totalPot + callAmount) <= MICRO_CALL_NEED / pyta) {
+      && callAmount / (totalPot + callAmount) <= floorNeed) {
     return allInOrFold || callAmount >= seat.chipCount ? ALLIN : CALL;
   }
 
@@ -1485,7 +1499,7 @@ function preFlopStrategy(
     return (depthBB <= PUSH_FOLD_MAX_BB ? pctile : so) >= (widen === 1 ? th : 1 - (1 - th) * widen);
   };
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
-  // (its NEW-1 case, the push/fold zone misfire, is fixed by the hand-start effective stack above).
+  // (and, fix round 3, its 0dc1b96 chips-left depth: chipsLeftEffectiveStackBB).
   if (!allInOrFold && noLimit && (pureCall || committing)) {
     // MANIAC-RTF part 2 (fix round 3): a MANIAC that raised this street (its any-two open, isolation
     // or light 3-bet) continues with MANIAC_RAISED_STACKOFF_WIDEN x the width; it folded ~80-90% of them.
@@ -2569,6 +2583,27 @@ export function getEffectiveStackBB(table: PokerTable, mySeat: number): number {
   }
   const effective = Math.min(handStartStack(seat), largestOpp);
   return Math.max(1, Math.round(effective / bb));
+}
+
+/**
+ * Fix round 3 (PLO NEW-1 check) — pot-limit Omaha's pre-flop depth: the 0dc1b96 effective stack, from the chips
+ * LEFT (mine vs the largest opponent's). A short all-in, or a pot raise that leaves the raiser little behind, is in
+ * the push/fold zone again, as live. The hand-start depth (NEW-1, a Hold'em fix) sent those spots into the deep
+ * Omaha ranges, which fold far too much for four-card equities: against five TAGs a 20 BB human who limps then
+ * pots / jams any four won +172 BB/100, and pot-3-bets any four over an open +91 (live 0dc1b96: +21 / -7; with
+ * this depth +34 / -4, whole line, real engine, 1,200 hands). Hold'em, Short Deck and Pineapple keep NEW-1.
+ */
+function chipsLeftEffectiveStackBB(table: PokerTable, mySeat: number): number {
+  const seat = table.seats[mySeat];
+  if (!seat) return 100;
+  const bb = table.config.bigBlind || 50;
+  let largestOpp = 0;
+  for (const s of table.seats) {
+    if (s.seatIndex === mySeat) continue;
+    if (s.state !== 'occupied' || s.folded || s.eliminated) continue;
+    if (s.chipCount > largestOpp) largestOpp = s.chipCount;
+  }
+  return Math.max(1, Math.round(Math.min(seat.chipCount, largestOpp) / bb));
 }
 
 /** Enumerate the non-folded opponents' opponent-model keys on a table.
