@@ -919,12 +919,23 @@ n >= exports.STUD_DRAW_MIN_SIMS
 # 2026-11-05 (bots review fix round 3, SD2-1 / SD2-2) - studDrawFirstRound: the value set's "one raise" is the
 # table's own count (raisesThisStreet), so a short stack's all-in call or a lone short all-in is not a 3-bet; a
 # value-set hand closing the action on one all-in that does not commit it calls too (the gate prices the rest).
-const facingOneRaise = facingRaise && streetRaises <= 1;
+# SUPERSEDED 2026-11-08 by the review REG-1 line below (same feature, counted on FULL raises; never shipped):
+# const facingOneRaise = facingRaise && streetRaises <= 1;
 !committing && facingOneRaise && inValueSet
 # 2026-11-05 (bots review fix round 3, full-line sweep) - studDrawFirstRound: a NIT that opened keeps a share of
 # its opening range facing ONE re-raise (fixed limit all of it, no-limit by the price, the value set always); it
 # folded every open under the 4-bet threshold, so 3-betting any two cards beat NIT tables.
 if (Math.max(pctile, raw) >= keepTh || inValueSet)
+# 2026-11-08 (bots review fix round 3, review fix-ups) - studDrawFirstRound: "one raise" counts FULL raises (an
+# all-in for less than a full raise is none: REG-1); against an all-in a call that commits a third of a 100 BB
+# stack on the depth at risk is a stack-off however deep the bot (REG-2); Five Card Draw stack-off premiums by
+# made-hand class (MEAS-3); a fixed-limit ROCK big blind defends its pot-odds range vs one raise (EXPLOIT-3).
+const facingOneRaise = facingRaise && fullRaises <= 1;
+fullRaisesThisRound
+FIVE_DRAW_ALLIN_COMMIT_BB
+return (pureCall || !ownCommit) && callAmount < seat.chipCount ? CALL : ALLIN;
+fiveDrawStackOffPremium
+STUD_DRAW_FL_ROCK_BB_DEFEND
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

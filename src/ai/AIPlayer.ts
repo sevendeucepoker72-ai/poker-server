@@ -1614,8 +1614,9 @@ function preFlopStrategy(
 //    that does not commit the stack, or only the bring-in / big blind, for every
 //    archetype (NIT folded Razz A-2-3 27%, Stud 8 A-2-3 suited 30%, Five Card
 //    Draw A-A-K 41% and 3-3-2-2-K 86% to one; easy bots folded them unopened);
-//    fix round 3: "one" by the table's own raise count, so a short stack's
-//    all-in call or a lone short all-in is not a 3-bet (SD2-1 / SD2-2).
+//    fix round 3: "one" by the table's own count of FULL raises, so a short
+//    stack's all-in call, an all-in for less than a full raise, or a lone short
+//    all-in is not a 3-bet (SD2-1 / SD2-2, review REG-1).
 // Five Card Draw is the one no-limit game here. The Stud family, 2-7 Triple Draw
 // and Badugi are fixed-limit and take none of the following (fix round 2, VA-1:
 // preFlopStrategy's no-limit fixes, read on the 5CD percentile):
@@ -1624,8 +1625,11 @@ function preFlopStrategy(
 //    only with the stack-off range for the depth at risk (the smaller hand-start
 //    stack): the Nash call up to 25 BB, then top 17% -> 6% at 100 BB+ (two pair
 //    or better), narrower with up to 3 players in; FIVE_DRAW_STACKOFF_PREMIUM
-//    hands (aces up, trips, pat hands) always. It called a lone 100 BB shove
-//    with 35-91% of hands;
+//    hands (aces up, trips, pat hands; fix round 3 review: also by made-hand
+//    class, fiveDrawStackOffPremium) always. It called a lone 100 BB shove
+//    with 35-91% of hands. Fix round 3 review: against an all-in a call that
+//    commits a third of a 100 BB stack on the depth at risk is one too, however
+//    deep the bot (FIVE_DRAW_ALLIN_COMMIT_BB);
 //  - NEW-5: a raise to RAISE_JAM_FRACTION of the stack is an all-in; a re-raise
 //    to a third of it is a stack-off too (made as an all-in), and every jam must
 //    pass that range (MANIAC moved in at 0.7 of its stack with any hand); a
@@ -1698,6 +1702,67 @@ export function fiveDrawAcesOrBetter(cards: Card[]): boolean {
   return false;
 }
 
+/**
+ * Five Card Draw made-hand class of the bot's own five cards (fix round 3 review / fix round 4):
+ * 0 no pair, 1 one pair, 2 two pair below aces up, 3 two pair aces up, 4 trips, 5 a straight or
+ * better (flush, full house, quads, straight flush; A-2-3-4-5 is a straight).
+ */
+export function fiveDrawMadeClass(cards: Card[]): number {
+  if (!cards || cards.length !== 5) return 0;
+  const cnt = new Map<number, number>();
+  for (const c of cards) cnt.set(c.rank, (cnt.get(c.rank) || 0) + 1);
+  const groups = [...cnt.values()].sort((a, b) => b - a);
+  if (groups[0] >= 4 || (groups[0] === 3 && groups[1] === 2)) return 5;      // quads, full house
+  if (groups[0] === 3) return 4;                                             // trips
+  if (groups[0] === 2) return groups[1] !== 2 ? 1 : (cnt.get(14) || 0) === 2 ? 3 : 2;
+  if (cards.every((c) => c.suit === cards[0].suit)) return 5;                // flush
+  const r = cards.map((c) => c.rank).sort((a, b) => a - b);
+  return r[4] - r[0] === 4 || (r[4] === 14 && r[3] === 5) ? 5 : 0;           // straight
+}
+
+/**
+ * Fix round 3 review (MEAS-3) — Five Card Draw's stack-off PREMIUMS by made-hand class: two pair
+ * aces up, trips, or a pat straight / flush / full house / quads (hiValue >= A-A-2-2-3). The bot's
+ * own five cards only. FIVE_DRAW_STACKOFF_PREMIUM alone read them on the 600-sim percentile, whose
+ * Monte Carlo seed is the cards themselves: by suit combination A-A-K-K-3 read 0.956-0.980, A-A-2-2-3
+ * and 2-2-2-3-4 down to 0.95, and 6-21% of their suit combinations folded to a lone 100 BB shove.
+ */
+export function fiveDrawStackOffPremium(cards: Card[]): boolean {
+  return fiveDrawMadeClass(cards) >= 3;
+}
+
+/**
+ * Fix round 3 review (REG-2) — Five Card Draw: facing an ALL-IN, a call is a stack-off when the depth
+ * at risk against it (the smaller hand-start stack) reaches a third of a 100 BB stack, however deep
+ * this seat is. On its own stack alone a 400 BB bot facing a lone 100 BB shove was not "committing":
+ * the value-set hold called it with a pair of aces (continue 9-15% vs 5-10% at 100 BB), and a deep
+ * MANIAC with players behind called it with its whole flat range (65%).
+ */
+export const FIVE_DRAW_ALLIN_COMMIT_BB = 100 * STACKOFF_COMMIT_FRACTION;
+
+/**
+ * Fix round 3 review (EXPLOIT-3) — fixed-limit draw games (2-7 Triple Draw, Badugi): a ROCK in the big
+ * blind facing ONE raise calls with this first-round percentile or better (the top 70%: one small bet
+ * more into 3.5 is a pot-odds call; live 0dc1b96 defended ~71%). On its flat range (callVsRaiseTh, top
+ * 42%) it folded 58%, and completing / raising any hand first in, then folding to any bet, beat ROCK x4
+ * in Badugi: +11.6 +- 3.9 BB/100 (live -139); with this, -7.8 +- 4.1 (2 seeds x 1,500 hands).
+ */
+export const STUD_DRAW_FL_ROCK_BB_DEFEND = 0.30;
+
+/**
+ * Fix round 3 review (REG-1) — this first round's FULL raises: the table's bet levels (a full raise,
+ * or the Stud completion, is one; an all-in for less than a full raise reopens nothing and is none),
+ * above the posted big blind in a draw game (Stud has no blind level: the bring-in is not one).
+ * raisesThisStreet counts that incomplete all-in as a raise, so one completion / one open with a short
+ * all-in made before or after it read as two, and the value set folded (Razz A-2-3, Stud 8 A-2-3
+ * suited, Five Card Draw aces 39-100% for a hard NIT).
+ */
+function fullRaisesThisRound(table: PokerTable, variantFirstRound: 'stud' | 'draw', streetRaises: number): number {
+  const levels = Number((table as any).betLevelsThisStreet);
+  if (!Number.isFinite(levels)) return streetRaises;
+  return Math.max(0, Math.min(streetRaises, levels - (variantFirstRound === 'draw' ? 1 : 0)));
+}
+
 function studDrawFirstRound(
   handStrength: number,
   callAmount: number,
@@ -1735,6 +1800,8 @@ function studDrawFirstRound(
   // opponent's LAST action only, two bots re-raising each other each saw "one
   // raise" forever and never reached the 4-bet / fold logic.
   const streetRaises = Number((table as any).raisesThisStreet) || 0;
+  // Fix round 3 review (REG-1): the FULL raises among them (an incomplete all-in raise is none).
+  const fullRaises = fullRaisesThisRound(table, variantFirstRound, streetRaises);
   // B1: a Stud completion is exactly one big blind (the bring-in is posted, not a
   // raise), so `callAmount > bigBlind` read it as a limp. In Stud and the draw
   // games the round's own raise count says whether a raise was made.
@@ -1785,16 +1852,21 @@ function studDrawFirstRound(
   // calls instead of folding. No-limit: a FIVE_DRAW_STACKOFF_PREMIUM hand never folds to
   // a 3-bet or a short all-in that does not commit it (the B4 sizing put ROCK / FISH's
   // threshold at 0.98: they folded full houses 17-47% to a 25-32 BB 3-bet).
-  // Fix round 3 (SD2-1 / SD2-2) — "one" is the table's own count of this round's raises:
-  // modelOpponents reads every all-in as two raises, so a short stack's all-in CALL (every
-  // game) or a lone short all-in (under the Stud completion; a no-limit shove that does not
-  // commit this seat) read as a 3-bet, and the value set folded (Five Card Draw ROCK / FISH
-  // aces and two pair 95-100% to a 15-25 BB shove, Razz NIT A-2-3 58% beside an all-in
-  // call). A call that commits the stack never gets here: the stack-off gate prices it first.
+  // Fix round 3 (SD2-1 / SD2-2) — "one" is the table's own count of this round's FULL raises
+  // (fullRaises; review REG-1: an all-in for less than a full raise is none, before or after
+  // the completion / open): modelOpponents reads every all-in as two raises, so a short
+  // stack's all-in CALL (every game), an incomplete all-in raise, or a lone short all-in
+  // (under the Stud completion; a no-limit shove that does not commit this seat) read as a
+  // 3-bet, and the value set folded (Five Card Draw ROCK / FISH aces and two pair 95-100% to
+  // a 15-25 BB shove, Razz NIT A-2-3 58% beside an all-in call). A no-limit call that commits
+  // a third of the stack, or of a 100 BB stack against an all-in (FIVE_DRAW_ALLIN_COMMIT_BB),
+  // never gets here: the stack-off gate prices it first.
   const inValueSet = raw >= STUD_DRAW_VALUE_PCTILE[kind] || (kind === 'draw-hi' && fiveDrawAcesOrBetter(seat.holeCards));
-  const facingOneRaise = facingRaise && streetRaises <= 1;
+  // Review MEAS-3 — a stack-off premium by percentile OR by made-hand class (Five Card Draw).
+  const premium = raw >= FIVE_DRAW_STACKOFF_PREMIUM || (kind === 'draw-hi' && fiveDrawStackOffPremium(seat.holeCards));
+  const facingOneRaise = facingRaise && fullRaises <= 1;
   const FOLD_VS_RAISE: AIDecision = ((unopened || facingOneRaise) && inValueSet)
-    || (noLimit && facingThreeBet && raw >= FIVE_DRAW_STACKOFF_PREMIUM) ? CALL : FOLD;
+    || (noLimit && facingThreeBet && premium) ? CALL : FOLD;
   const raiseOrAllIn = (amount: number): AIDecision => {
     const to = Math.max(minRaise, amount);
     // NEW-5 (no-limit) — a raise to RAISE_JAM_FRACTION of the stack is made as an all-in.
@@ -1864,15 +1936,20 @@ function studDrawFirstRound(
   //    hands) always. Continuing = calling the all-in / moving in. Every archetype.
   //    Fix round 3 (SD2-1): a value-set hand closing the action on ONE all-in that does
   //    not commit it calls (on the noisy percentile easy / medium bots folded aces and
-  //    two pair 5-25% to a 20-25 BB shove, hard ones 10-20% at 33 BB). ──
-  const committing = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
+  //    two pair 5-25% to a 20-25 BB shove, hard ones 10-20% at 33 BB).
+  //    Review REG-2: facing an all-in, a call that commits a third of a 100 BB stack
+  //    (FIVE_DRAW_ALLIN_COMMIT_BB, on the depth at risk) is a stack-off too, however deep
+  //    this seat is; when only that makes it one, a continuing hand with players behind
+  //    calls (it does not move in its deeper stack). Review MEAS-3: premiums by class. ──
+  const ownCommit = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
+  const committing = ownCommit || (callAmount > 0 && !!shover && shoveBB >= FIVE_DRAW_ALLIN_COMMIT_BB);
   const soPlayers = Math.min(3, pyta);
-  const stackOffOK = (depthBB: number): boolean => raw >= FIVE_DRAW_STACKOFF_PREMIUM || (depthBB <= PUSH_FOLD_MAX_BB
+  const stackOffOK = (depthBB: number): boolean => premium || (depthBB <= PUSH_FOLD_MAX_BB
     ? pctile >= adjustThreshold(nashCallPctile(depthBB, soPlayers), factor)
     : pctile >= adjustThreshold(1 - stackOffCallWidth(depthBB, soPlayers), factor));
   if (noLimit && !allInOrFold && (pureCall || committing)) {
     if (!stackOffOK(pureCall ? shoveBB : effBB) && !(!committing && facingOneRaise && inValueSet)) return FOLD;
-    return pureCall && callAmount < seat.chipCount ? CALL : ALLIN;
+    return (pureCall || !ownCommit) && callAmount < seat.chipCount ? CALL : ALLIN;
   }
   /**
    * A re-raise. No-limit: one that would put STACKOFF_COMMIT_FRACTION of the street
@@ -1946,6 +2023,8 @@ function studDrawFirstRound(
     }
     // B5 — premiums raise from ANY seat (it limped AA everywhere but the big blind).
     if (unopened && pctile >= adjustThreshold(0.94, huFactor)) return raiseOrAllIn(Math.round(bigBlind * 2.5));
+    // Review EXPLOIT-3 — fixed limit: the big blind facing ONE raise defends its pot-odds range.
+    if (!noLimit && bucket === 'BB' && facingOneRaise && pctile >= STUD_DRAW_FL_ROCK_BB_DEFEND) return CALL;
     if (pctile >= callVsRaiseThS) return CALL;
     return FOLD_VS_RAISE;
   }
@@ -1969,7 +2048,7 @@ function studDrawFirstRound(
     // to a single 3-bet: 3-betting any two cards won +59 BB/100 vs NIT x4 in Five Card Draw (live
     // -4) and +80 in Badugi (live +2).
     if (facingThreeBet && pctile < fourBetTh) {
-      if (streetRaises === 2 && callAmount > 0 && ownRaisesThisStreet(table, seat) > 0) {
+      if (fullRaises === 2 && callAmount > 0 && ownRaisesThisStreet(table, seat) > 0) {   // review REG-1: full raises
         let keepTh = openTh;
         if (noLimit) {
           const need = callAmount / (totalPot + callAmount);
@@ -2007,8 +2086,9 @@ function studDrawFirstRound(
     if (pctile >= fourBetTh) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 2.3), bigBlind)); if (r) return r; }
     // B8 (no-limit) — an opener facing a 3-bet keeps a share of its opening range by
     // the price it is laid (preFlopStrategy's DEF3B line); never narrower than the old flat range.
+    // Review REG-1: counted on FULL raises (an incomplete all-in raise in the round is none).
     let contTh = threeBetTh;
-    if (noLimit && streetRaises === 2 && callAmount > 0 && ownRaisesThisStreet(table, seat) > 0) {
+    if (noLimit && fullRaises === 2 && callAmount > 0 && ownRaisesThisStreet(table, seat) > 0) {
       const need = callAmount / (totalPot + callAmount);
       const keep = Math.max(0, Math.min(DEF3B_KEEP_MAX, DEF3B_KEEP_AT_MIN - DEF3B_SLOPE * (need - DEF3B_MIN_NEED)));
       contTh = Math.min(contTh, 1 - (1 - openTh) * keep);
