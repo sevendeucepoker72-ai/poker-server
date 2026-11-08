@@ -1168,6 +1168,15 @@ export const SIZE_WIDEN_MAX = 1.3;
  */
 export const SIZE_NARROW_MAX_TH = 0.946;
 /**
+ * Fix round 4 — no-limit, deeper than the push/fold zone: a NIT's flat range (its 3-bet range) facing a
+ * single raise narrows by the B4 size factor only past this multiple of the reference open (2 x 3 BB =
+ * 6 BB), then reaches the SIZE_NARROW_MAX_TH floor by ~10 BB as before (B4's 15 / 60 BB rows unchanged).
+ * Its range is only the top ~6-9%: narrowed in proportion it continued 5.6% against a 4-6 BB open (6.2-9.2%
+ * against 3 BB; live 0dc1b96 6.2-9.0% at every size), and opening 5 / 6 BB with any two and folding to a
+ * re-raise won +28 to +30 / +22 BB/100 against five NITs (live +6 to +19 / -10 to +6). Now +11 to +14 / 0.
+ */
+export const NIT_SIZE_NARROW_SLACK = 2;
+/**
  * Fix round 3 (review of HAI-2) — from a call of this share of the commit line
  * (STACKOFF_COMMIT_FRACTION: 1/2 x 1/3 = a sixth of the stack) the size floor slides linearly
  * to the stack-off width at the depth, which is what the call faces at the commit line. A
@@ -1633,7 +1642,10 @@ function preFlopStrategy(
     }
     if (facingThreeBet) return fourBetValue ? ALLIN : FOLD;
     if (fourBetValue) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }   // 3-bet, not a jam
-    if (callsSized(threeBetThS, threeBetTh)) return CALL;   // NIT flats its 3-bet range
+    // NIT flats its 3-bet range; deeper than the push/fold zone it is narrowed by the open size only past
+    // NIT_SIZE_NARROW_SLACK x the reference (fix round 4; 25 BB and shallower are unchanged).
+    const nitSlack = effBB > PUSH_FOLD_MAX_BB ? NIT_SIZE_NARROW_SLACK : 1;
+    if (callsSized(sized(threeBetTh, Math.min(1, nitSlack * sizeFactor)), threeBetTh)) return CALL;
     return FOLD;
   }
 

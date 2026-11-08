@@ -2143,3 +2143,8 @@ function lightReraiseDepth(
 function ownCallsThisStreet(
 maniacWiden(soDepth)
 !stackOffOK(shoveBB, maniacWiden(shoveBB))
+# 2026-11-08 (bots review fix round 4, holdem lane, NIT steal size) - preFlopStrategy (no-limit, deeper than 25 BB): a NIT's flat range
+# narrows by the B4 open-size factor only past NIT_SIZE_NARROW_SLACK (2) x the 3 BB reference open (it continued 5.6% vs a 4-6 BB
+# open, live 6.2-9.0%; a 5 BB any-two steal vs five NITs won +28 to +30 BB/100, live +6 to +19).
+NIT_SIZE_NARROW_SLACK
+Math.min(1, nitSlack * sizeFactor)
