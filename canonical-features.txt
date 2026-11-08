@@ -2121,3 +2121,7 @@ if (s.currentBet >= table.currentBetToMatch)
 # that fails the stack-off range re-raises only up to HOLDEM_LIGHT_RERAISE_FRACTION (5%) of the street stack, else calls
 # (top 70%) / folds; it re-raised 25-59 BB and folded ~89% of it to a shove (an any-two-cards +600..+1,900 BB/100 line).
 HOLDEM_LIGHT_RERAISE_FRACTION
+# 2026-11-08 (bots review fix round 3, holdem lane, MANIAC-RTF part 2) - preFlopStrategy (no-limit): a MANIAC that raised
+# this street continues a stack-off with MANIAC_RAISED_STACKOFF_WIDEN (2) x the width; it folded ~80-90% of its any-two
+# raises to a shove (3-handed 25 BB squeeze over its open +32 BB/100, Short Deck limp-shove +32; live -75 / -97).
+MANIAC_RAISED_STACKOFF_WIDEN

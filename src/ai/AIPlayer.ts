@@ -1220,6 +1220,19 @@ export const AOF_NOISE_KEEP = 0.5;
  * 200 BB deep it still re-raises light up to 10 BB.
  */
 export const HOLDEM_LIGHT_RERAISE_FRACTION = 0.05;
+/**
+ * MANIAC-RTF part 2 (fix round 3) — no-limit: a MANIAC that has raised this street (an any-two open, an
+ * isolation raise over limpers, a light 3-bet) and then faces a stack-off continues with this multiple of the
+ * stack-off width. It raises ~93% of hands and folded ~80-90% of those raises to a shove. With part 1
+ * (HOLDEM_LIGHT_RERAISE_FRACTION) a MANIAC flat-calls the opens it used to re-raise light, and two any-two
+ * lines paid on the whole hand (real engine, hard, 5,000 hands): 3-handed at 25 BB (the Spin & Go start) a
+ * squeeze all-in over a MANIAC open and a MANIAC flat +32 BB/100, and in Short Deck limp, then shove over its
+ * isolation raise +32 (live 0dc1b96: -75 / -97). At 2x they are -25 / -57; every other line measured stays
+ * as negative or more. Continuing after its own raise, heads-up: a 100 BB shove 12% -> 24% of hands (live
+ * called ~91%, NEW-5), the 25 BB squeeze 17% -> 31%, the Short Deck re-shove 10% -> 21%. 3x (-52 / -132)
+ * only calls wider still. A MANIAC that has not raised keeps the stack-off width (lone 100 BB shove ~9%).
+ */
+export const MANIAC_RAISED_STACKOFF_WIDEN = 2;
 
 export interface PreflopCtx {
   /** Live (not folded) opponents in the hand: the players who can still call a shove or are in it (B16). */
@@ -1464,13 +1477,20 @@ function preFlopStrategy(
   const committing = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
   // HAI-1 — up to 25 BB the Nash call is never narrower than the deep width at the 25 BB anchor
   // (with 3 players in, 0.93 vs 0.915: 23-25 BB continued less than 26 BB).
-  const stackOffOK = (depthBB: number): boolean => depthBB <= PUSH_FOLD_MAX_BB
-    ? pctile >= adjustThreshold(Math.min(nashCallPctile(depthBB, callPyta), 1 - stackOffCallWidth(depthBB, callPyta)), factor)
-    : so >= adjustThreshold(1 - stackOffCallWidth(depthBB, callPyta), factor);
+  // `widen` (MANIAC-RTF part 2) multiplies the continuing width; 1 = the range as it was.
+  const stackOffOK = (depthBB: number, widen = 1): boolean => {
+    const th = depthBB <= PUSH_FOLD_MAX_BB
+      ? adjustThreshold(Math.min(nashCallPctile(depthBB, callPyta), 1 - stackOffCallWidth(depthBB, callPyta)), factor)
+      : adjustThreshold(1 - stackOffCallWidth(depthBB, callPyta), factor);
+    return (depthBB <= PUSH_FOLD_MAX_BB ? pctile : so) >= (widen === 1 ? th : 1 - (1 - th) * widen);
+  };
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
   // (its NEW-1 case, the push/fold zone misfire, is fixed by the hand-start effective stack above).
   if (!allInOrFold && noLimit && (pureCall || committing)) {
-    if (!stackOffOK(pureCall ? shoveBB : effBB)) return FOLD;
+    // MANIAC-RTF part 2 (fix round 3): a MANIAC that raised this street (its any-two open, isolation
+    // or light 3-bet) continues with MANIAC_RAISED_STACKOFF_WIDEN x the width; it folded ~80-90% of them.
+    const widen = profile.archetype === 'MANIAC' && ownRaisesThisStreet(table, seat) > 0 ? MANIAC_RAISED_STACKOFF_WIDEN : 1;
+    if (!stackOffOK(pureCall ? shoveBB : effBB, widen)) return FOLD;
     return pureCall && callAmount < seat.chipCount ? CALL : ALLIN;
   }
   /** A re-raise; when it would be a jam it must pass the stack-off range too (null = not this hand: fall through). */
