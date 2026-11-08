@@ -2130,3 +2130,9 @@ MANIAC_RAISED_STACKOFF_WIDEN
 # last all-in of a pot war), and a lone all-in the call closes is called with any hand at <= PLO_LONE_ALLIN_CALL_NEED (30%).
 PLO_LONE_ALLIN_CALL_NEED
 function chipsLeftEffectiveStackBB(
+# 2026-11-08 (bots review fix round 4, holdem lane, HOLDEM-R3-REG-1) - preFlopStrategy (no-limit): the MANIAC light re-raise
+# cap is HOLDEM_LIGHT_RERAISE_FRACTION (5%) of the DEPTH AT RISK, lightReraiseDepth (the smallest street stack that can still
+# shove over it: its own and every live opponent's with chips), not of its own stack. Bots have no stack cap; a 200-1,000 BB
+# MANIAC re-raised a 100 BB opener light again and folded ~78% to his shove (any two +55..+445 BB/100, live negative).
+function lightReraiseDepth(
+> lightReraiseDepth(table, seat) *

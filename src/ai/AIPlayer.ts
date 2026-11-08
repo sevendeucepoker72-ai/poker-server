@@ -1219,15 +1219,16 @@ export const AOF_ARCHETYPE_DAMP = 0.5;
 export const AOF_NOISE_KEEP = 0.5;
 /**
  * MANIAC-RTF (fix round 3) — no-limit (Hold'em, Short Deck, Pineapple): a MANIAC re-raise by a hand
- * that fails the stack-off range is made only when it is at most this share of the street stack;
- * larger, the hand calls (top 70%) or folds instead. It re-raised ~93% of hands to 2.5-4x the bet (25-59
+ * that fails the stack-off range is made only when it is at most this share of the depth at risk
+ * (lightReraiseDepth: the smallest street stack that can shove over it, fix round 4; round 3 used the
+ * MANIAC's own); larger, the hand calls (top 70%) or folds instead. It re-raised ~93% of hands to 2.5-4x the bet (25-59
  * BB over a 10 BB open) and the stack-off gate then folded ~89% of them to a shove: opening 10 BB with any
  * two and shoving over every re-raise won ~+1,500 BB/100 at a one-MANIAC table, +1,900 with 3-bets too
  * (live 0dc1b96: -266 / -329). Measured on the whole line (real engine, 100 BB, hard, vs five MANIACs,
  * 1,500 hands): re-raising TO the cap left a 2.5 / 3 BB open at +66 / +67 BB/100 with 0.06; refusing a
  * larger one (this rule) put a 2 BB open at -192 / -28 / +32 / +82 with 0.05 / 0.06 / 0.07 / 0.08 and a
  * 2.5 BB open at -196 / -196 / -44 / +85. At 100 BB no light re-raise is left (a min-raise's 2.5x is 5 BB);
- * 200 BB deep it still re-raises light up to 10 BB.
+ * with every live stack 200 BB deep it still re-raises light up to 10 BB, but not against a 100 BB player.
  */
 export const HOLDEM_LIGHT_RERAISE_FRACTION = 0.05;
 /**
@@ -1276,6 +1277,24 @@ export function shoverFaced(table: PokerTable, seat: Seat): Seat | null {
     if (s.allIn && s.currentBet === table.currentBetToMatch) return s;
   }
   return null;
+}
+
+/**
+ * MANIAC-RTF, fix round 4 (HOLDEM-R3-REG-1) — the depth a light re-raise is measured against: the smallest
+ * street stack (chips + this street's bet) that can still shove over it. That is this seat's own and every live
+ * opponent's with chips behind: the raiser, the callers (they act again) and the players still to act. Round 3
+ * measured it against the MANIAC's own stack. Bots have no stack cap and only grow, while a human buys in for
+ * at most 100 BB, so a 200-1,000 BB MANIAC re-raised a 100 BB opener light again (93% of hands, to 8-33 BB) and
+ * folded ~78% of them to his 100 BB shove: any two won +55 to +445 BB/100 where live 0dc1b96 loses. The
+ * largest opponent's stack (a review candidate) still let a second deep stack at the table re-open it.
+ */
+function lightReraiseDepth(table: PokerTable, seat: Seat): number {
+  let depth = seat.chipCount + seat.currentBet;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
+    depth = Math.min(depth, s.chipCount + s.currentBet);
+  }
+  return depth;
 }
 
 /** B8 — raises this seat has made on the current street (its own open / 3-bet), from the table's action log. */
@@ -1524,7 +1543,7 @@ function preFlopStrategy(
   // ── MANIAC: raises/3-bets almost anything — but a raise that would be a jam is a
   //    stack-off (NEW-5: it called 100 BB off with 91% of hands), and facing a raise, a hand
   //    that fails the stack-off range re-raises only up to HOLDEM_LIGHT_RERAISE_FRACTION of
-  //    the stack (MANIAC-RTF: a bigger one was folded to the shove it invited). ──
+  //    the depth at risk, lightReraiseDepth (MANIAC-RTF: a bigger one was folded to the shove it invited). ──
   if (profile.archetype === 'MANIAC') {
     const wantRaise = pctile >= 0.15 || Math.random() < 0.55;
     if (wantRaise) {
@@ -1536,7 +1555,7 @@ function preFlopStrategy(
         return raiseOrAllIn(target);
       }
       const tooBigLight = facingRaise && !stackOffOK(effBB)
-        && Math.max(minRaise, target) > (seat.chipCount + seat.currentBet) * HOLDEM_LIGHT_RERAISE_FRACTION;
+        && Math.max(minRaise, target) > lightReraiseDepth(table, seat) * HOLDEM_LIGHT_RERAISE_FRACTION;
       if (!tooBigLight) {
         const r = raiseOrJam(target);
         if (r) return r;
