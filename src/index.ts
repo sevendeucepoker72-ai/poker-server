@@ -7691,7 +7691,10 @@ function broadcastGameState(tableId: string): void {
         const t = tableManager.getTable(tableId);
         // Skip during draw phases — the draw clock stands the player pat; a
         // fold/check here would fire on the stale pre-draw bet-to-match (#4).
-        if (t && t.activeSeatIndex === activeIdx && t.isHandInProgress() && !DrawPhases.includes(t.currentPhase)) {
+        // Fix round 3 review (SERVER-R3-REG-2) — nor in Showdown (as the turn clock and a bot's turn): a
+        // hand resting there is a faulted payout, settled from its payout-start mark (its own path / the
+        // wedge watchdog); acting there could only ever throw into a re-settle.
+        if (t && t.activeSeatIndex === activeIdx && t.isHandInProgress() && !DrawPhases.includes(t.currentPhase) && t.currentPhase !== GamePhase.Showdown) {
           // RECONNECT GUARD (P0 2026-07-06): `shouldAutoAct` was decided up to
           // 500ms ago from a `hasLiveSession` snapshot taken at broadcast time.
           // A socket that dropped mid-turn and reconnected within that window has
@@ -9215,6 +9218,8 @@ const gameTimerGuardStats = {
   // fix round 3 — additive
   absentActThrows: 0, absentStandPatThrows: 0, holdReleaseThrows: 0, dealThrows: 0, tournamentTimerThrows: 0, reservationTimerThrows: 0,
   humanPathShowdowns: 0, watchdogShowdowns: 0, dealPayoutFaults: 0, drawRoundRetries: 0,
+  // fix round 3 review — additive
+  absentStandPatGiveUps: 0, spinGoDealRetries: 0,
   actedFor: 0, turnAdvanced: 0, stoodPat: 0, autoStartRetried: 0,
   showdownFaults: 0, showdownResolved: 0, showdownPaidFinished: 0, showdownVoided: 0, showdownHeld: 0,
   recoveryThrows: 0, logLinesSuppressed: 0, lastAt: null as string | null,
@@ -9243,7 +9248,7 @@ function logGameTimerError(kind: string, tableId: string, seatIndex: number, err
  * payout (bets, uncalled-bet refunds and dead money move chips between those two
  * fields of the same seat), so after a fault it says exactly what was paid.
  */
-type BotTurnMark = { hand: number; version: number; log: number; phase: GamePhase; stakes: number[]; ids: string[] };
+type BotTurnMark = { hand: number; version: number; log: number; phase: GamePhase; stakes: number[]; ids: string[]; payable?: boolean[] };
 /** Hands held in Showdown after a fault (table -> handNumber): the wedge watchdog never advances them. */
 const gameShowdownHold = new WeakMap<PokerTable, number>();
 function gameShowdownHeld(table: PokerTable): boolean {
@@ -9258,11 +9263,17 @@ function settleShowdownAfterFault(tableId: string, t: PokerTable, mark: BotTurnM
   let credited: number | null = null;
   // Chips credited since the mark; null = the seats are not the ones the mark saw
   // (a seat changed hands, a seat not in the mark has chips in the pot, a seat lost chips).
+  // Fix round 3 review (SERVER-R3-FAULT-1) — the PAYOUT mark (payoutStartMark) also says which
+  // seats the payout can credit at all (payable): one it cannot (a joiner sat out of the hand, a
+  // fold with nothing in) is skipped — it may leave, be taken or change in the settle's wait; it
+  // used to make the hand HELD (frozen until a restart, its pot credited again by the shutdown flush).
+  const payable = (i: number): boolean => !mark.payable || mark.payable[i] === true;
   const creditedSinceMark = (): number | null => {
     let c = 0;
     for (let i = 0; i < t.seats.length; i++) {
       const s = t.seats[i];
       const was = mark.stakes[i] ?? -1;
+      if (mark.payable && (was < 0 || !payable(i))) continue;
       if (was < 0) { if (s.state === 'occupied' && (s.totalInvestedThisHand || 0) > 0) return null; continue; }
       if (s.state !== 'occupied' || s.playerId !== mark.ids[i]) return null;
       const d = s.chipCount + (s.totalInvestedThisHand || 0) - was;
@@ -9280,9 +9291,10 @@ function settleShowdownAfterFault(tableId: string, t: PokerTable, mark: BotTurnM
       if (t.currentPhase === GamePhase.Showdown) { tried = null; credited = creditedSinceMark(); }
     }
     if (tried === null && credited !== null) {
-      pot = t.seats.reduce((a, s) => a + (s.state === 'occupied' ? (s.totalInvestedThisHand || 0) : 0), 0);
+      pot = t.seats.reduce((a, s, i) => a + (s.state === 'occupied' && payable(i) ? (s.totalInvestedThisHand || 0) : 0), 0);
       if (pot > 0 && credited === pot) { tried = 'paid_finished'; t.completeHandAfterFault(); }
-      else { tried = 'voided'; t.completeHandAfterFault(mark.stakes); }
+      // A void puts back only the stakes the payout could touch (a skipped seat may be someone else's now).
+      else { tried = 'voided'; t.completeHandAfterFault(mark.payable ? mark.stakes.map((v, i) => (payable(i) ? v : -1)) : mark.stakes); }
     }
   } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('showdown_settle', tableId, -1, e); }
   if (t.handNumber === mark.hand && t.currentPhase === GamePhase.Showdown) { gameShowdownHold.set(t, t.handNumber); outcome = 'held'; }
@@ -9513,8 +9525,10 @@ function recoverAutoStartThrow(tableId: string, err: unknown): void {
  * settled from the ENGINE's payout-start mark (PokerTable.payoutStartMark: every seat's chipCount
  * + totalInvestedThisHand the moment this hand's payout began, whatever path ran it) exactly like
  * a timer's: nothing paid → the engine's showdown once, paid in full → finished, part-paid →
- * voided, the seats changed → held. No mark for this hand (its payout never began, e.g. a
- * restored table) → HELD. A held hand is left alone. Never runs a payout blind; never throws.
+ * voided, a PAYABLE seat changed → held (a seat the payout cannot credit — no chips in, not
+ * contesting — is skipped: fix round 3 review, SERVER-R3-FAULT-1). No mark for this hand (its
+ * payout never began, e.g. a restored table) → HELD. A held hand is left alone. Never runs a
+ * payout blind; never throws.
  */
 function settleFromPayoutMark(tableId: string, t: PokerTable, kind: string): void {
   try {
@@ -9528,6 +9542,7 @@ function settleFromPayoutMark(tableId: string, t: PokerTable, kind: string): voi
     }
     settleShowdownAfterFault(tableId, t, {
       hand: p.hand, version: t.stateVersion, log: t.actionLog.length, phase: GamePhase.Showdown, stakes: [...p.stakes], ids: [...p.ids],
+      payable: Array.isArray(p.payable) ? [...p.payable] : undefined,
     });
   } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError(`${kind}_settle`, tableId, -1, e); }
 }
@@ -9540,7 +9555,9 @@ function settleRestingShowdown(tableId: string, t: PokerTable, kind: string): vo
 /**
  * Fix round 3 (2026-11-05, SR2-2) — a HUMAN path threw: the socket 'action' / 'playerDraw', the
  * fold / stand-pat for a seat that sits out or goes AFK, a leave's / departure's fold
- * (teardownSeat, reserveSeatForDeparture, a kept tournament seat). The caller rethrows, so
+ * (teardownSeat, reserveSeatForDeparture, a kept tournament seat); since the fix round 3 review
+ * (SERVER-R3-FAULT-1) also the runout a hold release ran: the Crazy Pineapple discard pick
+ * ('selectPineappleDiscard') and the insurance accept / decline. The caller rethrows, so
  * socketGuard still logs `[socket-handler-error]` and reports it; a hand the throw left resting
  * in Showdown (its payout threw) is settled HERE at once — it used to rest un-held until the
  * wedge watchdog ran the payout again: the pot paid twice, a sticky fault once per tick. A throw
@@ -9591,12 +9608,21 @@ function recoverAbsentActThrow(tableId: string, seatIndex: number, mark: BotTurn
  * stood pat once more, each on its own (one that throws again is the 30 s draw clock's, which
  * stands every undrawn seat pat and retries), a full round is completed, a hand found in
  * Showdown is settled from the payout-start mark; then the clients and the next turn.
+ * Fix round 3 review (SERVER-R3-REG-1) — "the next turn" (scheduleAIAction) re-arms this same
+ * 500 ms stand-pat, so a seat whose stand-pat ALWAYS throws looped at 2 Hz without end (120
+ * throws, 60 Sentry events a minute; the shared log budget spent). A round still open is
+ * re-armed at most ABSENT_STAND_PAT_REARMS times per (hand, draw round) — a transient throw
+ * still completes the round within a second or two — and then left to the 30 s draw clock (its
+ * own bounded retry); counted absentStandPatGiveUps.
  */
+const ABSENT_STAND_PAT_REARMS = 3;
+const absentStandPatRearms = new WeakMap<PokerTable, { hand: number; phase: GamePhase; n: number }>();
 function recoverAbsentStandPatThrow(tableId: string, err: unknown): void {
   gameTimerGuardStats.absentStandPatThrows++;
   logGameTimerError('absent_stand_pat', tableId, -1, err);
   const t = tableManager.getTable(tableId);
   if (!t) return;
+  let moveOn = true;
   if (t instanceof FiveCardDrawTable && DrawPhases.includes(t.currentPhase)) {
     const hand = t.handNumber;
     const phase = t.currentPhase;
@@ -9611,9 +9637,15 @@ function recoverAbsentStandPatThrow(tableId: string, err: unknown): void {
       } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('absent_stand_pat_recovery', tableId, s.seatIndex, e); }
     }
     try { if (t.handNumber === hand && t.currentPhase === phase) t.completeDrawRoundIfDone(); } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('absent_stand_pat_recovery', tableId, -1, e); }
+    if (t.handNumber === hand && t.currentPhase === phase) {
+      const r = absentStandPatRearms.get(t);
+      const n = r && r.hand === hand && r.phase === phase ? r.n + 1 : 1;
+      absentStandPatRearms.set(t, { hand, phase, n });
+      if (n > ABSENT_STAND_PAT_REARMS) { moveOn = false; gameTimerGuardStats.absentStandPatGiveUps++; }
+    }
   }
   settleFromPayoutMark(tableId, t, 'absent_stand_pat');
-  continueAfterGameFault(tableId, t, -1, 'absent_stand_pat', true);
+  continueAfterGameFault(tableId, t, -1, 'absent_stand_pat', moveOn);
 }
 /**
  * Fix round 3 (2026-11-05) — a runout-hold release timer threw (the insurance window's
@@ -10764,8 +10796,6 @@ const wedgeWatchdog = new Map<string, {
   /** seat -> the first turn it was seen on since pot/phase/hand last moved */
   potPhaseTurns: Map<number, string>;
 }>();
-/** Fix round 3 (SR2-2) — the hand a table was last seen resting in Showdown at (settled at the next tick). */
-const wedgeShowdownSeen = new WeakMap<PokerTable, number>();
 setInterval(() => {
   try {
     const now = Date.now();
@@ -10794,19 +10824,17 @@ setInterval(() => {
       // Fix round 3 (2026-11-05, SR2-2) — ANY hand resting in Showdown is a faulted payout no guard
       // settled (Showdown is never a resting state). It is never folded / checked / advanced here:
       // advanceTurn ran determineWinners again on a pot already paid (a human's faulted river check
-      // was paid twice; a sticky fault once per tick, without end). Seen in Showdown at two ticks in
-      // a row (same hand), it is settled from the engine's payout-start mark (settleRestingShowdown:
-      // resolved / paid_finished / voided / held), then the clients and the next deal.
+      // was paid twice; a sticky fault once per tick, without end). It is settled from the engine's
+      // payout-start mark (settleRestingShowdown: resolved / paid_finished / voided / held), then the
+      // clients and the next deal — at the FIRST tick that sees it (fix round 3 review,
+      // SERVER-R3-FAULT-1: nothing ever rests there legitimately — every Showdown assignment runs
+      // determineWinners synchronously, and no hold or timer waits in Showdown — so a second tick
+      // only widened the window in which the table changes underneath the settle).
       if (table.currentPhase === GamePhase.Showdown) {
         wedgeWatchdog.delete(t.tableId);
-        if (wedgeShowdownSeen.get(table) === table.handNumber) {
-          wedgeShowdownSeen.delete(table);
-          gameTimerGuardStats.watchdogShowdowns++;
-          console.error(JSON.stringify({ event: 'wedge_watchdog_showdown', tableId: t.tableId, handNumber: table.handNumber, ts: Date.now() }));
-          settleRestingShowdown(t.tableId, table, 'watchdog_showdown');
-        } else {
-          wedgeShowdownSeen.set(table, table.handNumber);
-        }
+        gameTimerGuardStats.watchdogShowdowns++;
+        console.error(JSON.stringify({ event: 'wedge_watchdog_showdown', tableId: t.tableId, handNumber: table.handNumber, ts: Date.now() }));
+        settleRestingShowdown(t.tableId, table, 'watchdog_showdown');
         continue;
       }
       const activeSeat = table.activeSeatIndex;
@@ -10933,6 +10961,12 @@ setInterval(() => {
           wedgeWatchdog.delete(t.tableId);
         } catch (err) {
           console.error(`[WedgeWatchdog] recovery failed for ${t.tableId}:`, (err as Error).message);
+          // Fix round 3 review (SERVER-R3-FAULT-1) — the forced fold / check / advance ran the payout
+          // and it threw: settled at once from the payout-start mark (never at a later tick).
+          if ((table.currentPhase as GamePhase) === GamePhase.Showdown && !gameShowdownHeld(table)) {
+            gameTimerGuardStats.watchdogShowdowns++;
+            settleRestingShowdown(t.tableId, table, 'watchdog_forced');
+          }
         }
       }
     }
@@ -20814,7 +20848,8 @@ Give feedback in this JSON format:
     if (ok) {
       broadcastGameState(session.tableId);
       // F16 — an all-in runout held for the discard goes on once everyone it waits for has picked.
-      releasePineappleDiscardHoldIfDecided(session.tableId, table.handNumber);
+      // Fix round 3 review (SERVER-R3-FAULT-1) — a runout payout that threw is settled at once, then rethrown.
+      try { releasePineappleDiscardHoldIfDecided(session.tableId, table.handNumber); } catch (err) { settleHumanPathThrow(session.tableId, table, session.seatIndex, 'pineapple_discard', err); throw err; }
     }
   });
 
@@ -22498,19 +22533,30 @@ Give feedback in this JSON format:
     socket.emit('spinReveal', { multiplier });
 
     // Start hand after reveal delay (3 seconds)
-    setTimeout(() => {
-      // Fix round 3 (2026-11-05) — a throw here used to exit the process (game timer crash guard).
+    // Fix round 3 (2026-11-05) — a throw here used to exit the process (game timer crash guard).
+    // Fix round 3 review (SERVER-R3-MEAS-1) — a deal that threw BEFORE dealing (the table still
+    // waiting, no hand dealt) is tried once more 3 s later, as a scheduled deal is; it used to wait
+    // for the player's own Deal now (a player who left instead forfeited the entry).
+    const spinGoFirstDeal = (retry: boolean): void => {
+      let handBefore = -1;
       try {
         const t = tableManager.getTable(tableId);
         if (!t) return;
+        handBefore = t.handNumber;
         try { t.startNewHand(); } catch (err) { if (!settleDealThrow(tableId, t, 'spin_go', err)) throw err; }
         broadcastGameState(tableId);
         sendProgressToPlayer(socket.id);
         scheduleAIAction(tableId);
       } catch (err) {
         recoverTimerThrow('spin_go_deal', 'dealThrows', tableId, err);
+        const t = tableManager.getTable(tableId);
+        if (retry && t && t.handNumber === handBefore && t.currentPhase === GamePhase.WaitingForPlayers) {
+          gameTimerGuardStats.spinGoDealRetries++;
+          setTimeout(() => spinGoFirstDeal(false), AUTO_START_RETRY_AFTER_FAULT_MS);
+        }
       }
-    }, 3500);
+    };
+    setTimeout(() => spinGoFirstDeal(true), 3500);
 
     // Hyper-turbo blinds: double every 45 seconds
     const blindInterval = setInterval(() => {
@@ -23237,7 +23283,8 @@ Give feedback in this JSON format:
     });
     socket.emit('insuranceAccepted', { cashout: quote.cashout, equityPct: quote.equityPct, tableId: session.tableId, handNumber });
     broadcastGameState(session.tableId); // the quote leaves this seat's state
-    releaseInsuranceHoldIfDecided(session.tableId, handNumber);
+    // Fix round 3 review (SERVER-R3-FAULT-1) — a runout payout that threw is settled at once, then rethrown.
+    try { releaseInsuranceHoldIfDecided(session.tableId, handNumber); } catch (err) { settleHumanPathThrow(session.tableId, table, session.seatIndex, 'insurance_decision', err); throw err; }
   });
 
   // Optional (additive to contract #1): the player waved the offer away — his
@@ -23254,7 +23301,8 @@ Give feedback in this JSON format:
     offer.decided.add(session.seatIndex);
     insuranceStats.declined++;
     broadcastGameState(session.tableId);
-    releaseInsuranceHoldIfDecided(session.tableId, handNumber);
+    // Fix round 3 review (SERVER-R3-FAULT-1) — a runout payout that threw is settled at once, then rethrown.
+    try { releaseInsuranceHoldIfDecided(session.tableId, handNumber); } catch (err) { settleHumanPathThrow(session.tableId, table, session.seatIndex, 'insurance_decision', err); throw err; }
   });
 
   // ========== Straddle ==========

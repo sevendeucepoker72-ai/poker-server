@@ -2140,3 +2140,18 @@ dealPayoutFaults
 drawRoundRetries
 'human_action'
 'reservation_expiry'
+# 2026-11-08 (bots review fix round 3 review fix-up, server lane) - the payout-start mark records which seats the
+# payout can credit (a mid-hand joiner / a fold with nothing in is skipped by the settle, never makes it HELD); the
+# wedge watchdog settles a resting Showdown at its FIRST tick and a payout its own forced action ran in that tick;
+# the Crazy Pineapple discard pick and the insurance accept / decline settle their runout's payout fault at once;
+# no dead blind is posted in Showdown; the 500 ms auto-act returns in Showdown; the absent-drawer stand-pat re-arm is
+# bounded per hand and draw round; the Spin & Go first deal is retried once.
+mark.payable
+'watchdog_forced'
+'pineapple_discard'
+'insurance_decision'
+ABSENT_STAND_PAT_REARMS
+absentStandPatGiveUps
+spinGoFirstDeal
+spinGoDealRetries
+payable: this.seats.map(

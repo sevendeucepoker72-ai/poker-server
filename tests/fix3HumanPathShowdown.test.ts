@@ -345,11 +345,11 @@ describe('SR2-2 — the choke point: the wedge watchdog never runs a Showdown pa
   it('sticky post-payment fault, 5 minutes of watchdog ticks: 0 advances, settled ONCE from the payout mark (paid_finished), 10000 stays 10000', () => {
     const w = bareFault('sticky');
     expect(stacks(w.t)).toBe(10000);                             // paid, the 200 still counted in the pot
-    w.advance(45_000);
+    w.advance(15_000);                                           // the watchdog's first tick (fix round 3 review: settled at once)
     expect(w.t.currentPhase).not.toBe(GamePhase.Showdown);
     expect(w.stats()).toMatchObject({ watchdogShowdowns: 1, showdownPaidFinished: 1, showdownResolved: 0, showdownVoided: 0 });
     expect(stacks(w.t) + invested(w.t)).toBe(10000);
-    w.advance(255_000);                                          // the sticky fault faults every later payout too (each settled by its own path)
+    w.advance(285_000);                                          // the sticky fault faults every later payout too (each settled by its own path)
     expect(w.c.escaped).toBe(0);
     expect(w.c.advancedInShowdown).toBe(0);                      // 2b5ac52: advanced every tick, +200 each
     expect(w.watchdogFired()).toBe(0);
@@ -358,12 +358,12 @@ describe('SR2-2 — the choke point: the wedge watchdog never runs a Showdown pa
     expect(w.t.handNumber).toBeGreaterThan(1);                   // play went on
   });
 
-  it('post-payment fault once: settled at the second tick it sees the Showdown (15-30 s), never at the first', () => {
+  it('post-payment fault once: settled at the FIRST tick that sees the Showdown (fix round 3 review, SERVER-R3-FAULT-1; 3691a70: the second, 15-30 s)', () => {
     const w = bareFault('post');
-    w.advance(14_000);
-    expect(w.t.currentPhase).toBe(GamePhase.Showdown);
-    w.advance(31_000);
+    const tick = w.c.errors.length;
+    w.advance(15_000);
     expect(w.t.currentPhase).not.toBe(GamePhase.Showdown);
+    expect(w.c.errors.slice(tick).filter((l) => l.startsWith('{"event":"wedge_watchdog_showdown"'))).toHaveLength(1);
     expect(w.c.advancedInShowdown).toBe(0);
     expect(stacks(w.t) + invested(w.t)).toBe(10000);
     expect(w.stats()).toMatchObject({ watchdogShowdowns: 1, showdownPaidFinished: 1 });
@@ -372,7 +372,7 @@ describe('SR2-2 — the choke point: the wedge watchdog never runs a Showdown pa
   it('the legitimate recovery stays: a PRE-payment fault (payout started, nothing credited) -> RESOLVED, paid exactly once', () => {
     const w = bareFault('pre');
     expect(stacks(w.t)).toBe(9800);
-    w.advance(45_000);
+    w.advance(15_000);
     expect(w.c.escaped).toBe(0);
     expect(stacks(w.t) + invested(w.t)).toBe(10000);
     expect(w.c.handResults).toBe(1);

@@ -46,7 +46,7 @@ const ORPHAN_BLOCK = slice('    if (shouldAutoAct) {', '      }, 500);\n    }\n'
 const ORPHAN = `function orphanAct(tableId, activeIdx) {\n  const shouldAutoAct = true;\n${ORPHAN_BLOCK}}\n`;
 const ABSENT_DRAWERS = slice('// ===== Absent drawers (gameplay S3 fix-up, 2026-10-21) =====', '// ===== end absent drawers =====\n');
 const PINEAPPLE = SRC.slice(SRC.indexOf('const PINEAPPLE_DISCARD_WINDOW_MS = '), SRC.indexOf('\n}\n', SRC.indexOf('function releasePineappleDiscardHoldIfDecided(')) + 3);
-const SPIN_GO = `function spinGoDeal(tableId, socket) {\n${slice('    // Start hand after reveal delay (3 seconds)', '    }, 3500);\n')}}\n`;
+const SPIN_GO = `function spinGoDeal(tableId, socket) {\n${slice('    // Start hand after reveal delay (3 seconds)', '    setTimeout(() => spinGoFirstDeal(true), 3500);\n')}}\n`;
 const total = (t: PokerTable) => t.seats.reduce((a, s) => a + (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : 0), 0);
 const stacks = (t: PokerTable) => t.seats.reduce((a, s) => a + (s.state === 'occupied' ? s.chipCount : 0), 0);
 

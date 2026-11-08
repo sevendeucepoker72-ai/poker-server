@@ -440,8 +440,12 @@ export class PokerTable extends EventEmitter {
    * paid, whatever path ran the payout (a timer, a socket action, a fold for a leaver, a
    * deal). index.ts settles a hand found resting in Showdown from it and never runs a
    * payout again blind. null until this hand's payout starts; cleared at every deal.
+   * `payable` (fix round 3 review, SERVER-R3-FAULT-1): the seats this payout can credit at
+   * all — chips in the pot (a folded seat's uncalled excess comes back to it) or still
+   * contesting it. A seat with neither (a joiner sat out of the hand, a fold with nothing in)
+   * is paid nothing, so its leaving or being taken afterwards never makes the result unreadable.
    */
-  public payoutStartMark: { hand: number; stakes: number[]; ids: string[] } | null = null;
+  public payoutStartMark: { hand: number; stakes: number[]; ids: string[]; payable: boolean[] } | null = null;
 
   /** SR2-2 — take this hand's payoutStartMark (first call per hand only). */
   protected markPayoutStart(): void {
@@ -450,6 +454,7 @@ export class PokerTable extends EventEmitter {
       hand: this.handNumber,
       stakes: this.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1)),
       ids: this.seats.map((s) => s.playerId),
+      payable: this.seats.map((s) => s.state === 'occupied' && ((s.totalInvestedThisHand || 0) > 0 || !s.folded)),
     };
   }
 
@@ -770,7 +775,10 @@ export class PokerTable extends EventEmitter {
     // chips deducted here would leave the stack and enter no pot — destroyed.
     // Leave the debt intact (don't clearDeadBlind); it's collected
     // automatically when the next hand deals. 2026-07-01 audit #8.
-    if (!this.isHandInProgress()) return { ok: false, reason: 'not_in_hand' };
+    // Fix round 3 review (SERVER-R3-FAULT-1) — nor in Showdown: the payout has begun (a hand
+    // only RESTS there after a payout fault, settled from payoutStartMark), so the chips would
+    // join a pot that is already being paid.
+    if (!this.isHandInProgress() || this.currentPhase === GamePhase.Showdown) return { ok: false, reason: 'not_in_hand' };
     // 2026-10-21 (gameplay F4) — never from a seat DEALT INTO this hand: a live
     // player could pick the hand (after seeing his cards) to add dead money,
     // and a stack equal to the debt went "all-in" on the clock without

@@ -59,7 +59,9 @@ const COUNTERS = ['actionThrows', 'drawThrows', 'autoStartThrows', 'heartbeatThr
   'showdownFaults', 'showdownResolved', 'showdownPaidFinished', 'showdownVoided', 'showdownHeld', 'recoveryThrows', 'logLinesSuppressed',
   // fix round 3 (2026-11-05) — additive
   'absentActThrows', 'absentStandPatThrows', 'holdReleaseThrows', 'dealThrows', 'tournamentTimerThrows', 'reservationTimerThrows',
-  'humanPathShowdowns', 'watchdogShowdowns', 'dealPayoutFaults', 'drawRoundRetries'];
+  'humanPathShowdowns', 'watchdogShowdowns', 'dealPayoutFaults', 'drawRoundRetries',
+  // fix round 3 review — additive
+  'absentStandPatGiveUps', 'spinGoDealRetries'];
 
 interface WorldOpts {
   /** decideAction stand-in (default: the real one). */
