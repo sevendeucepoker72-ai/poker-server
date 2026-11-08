@@ -172,8 +172,9 @@ describe('F49 — All-In or Fold holds the BOTS to the format too', () => {
 describe('F50 — a client deal at a hand END runs the hand-boundary step; a join deals only from WaitingForPlayers', () => {
   const START_HAND = handlerSrc('startHand', '\n  });\n');
   const F50_ROUTE = slice('    // 2026-10-21 (gameplay F50) — at a hand END every table', '      return;\n    }\n', SRC.indexOf("socket.on('startHand'"));
+  // Fix round 4 (SERVER-R3-FAULT-LENS-1) — the F50 bomb-pot line now sits inside the guarded deal's try.
   const PRE_F50 = without(without(START_HAND, F50_ROUTE),
-    '      // F50 — a bomb pot triggered while the table waited fires on this deal (E6).\n      activateBombPotIfPending(session.tableId, table);\n');
+    "      // F50 — a bomb pot triggered while the table waited fires on this deal (E6). Fix round 4\n      // (SERVER-R3-FAULT-LENS-1) — inside the guarded deal: its all-in runout's payout fault is settled here.\n      if (started) activateBombPotIfPending(session.tableId, table);\n");
   const AUTOSTART = fnSrc('function autoStartNextHand(');
   const BOT_STACKS = slice('const BOT_STACK_CAP_BUYINS: number = ', '  return isFixedRosterTable(tableId);\n}\n');
 

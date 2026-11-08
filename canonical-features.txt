@@ -2173,6 +2173,7 @@ heldResolvedByAdmin
 'unreadable_stakes'
 'departed_gain'
 TURN_ACT_RETRIES
-armAbsentActOnce(
+# SUPERSEDED 2026-11-08 by skipAbsentActArm( (same check, inverted: a harness that stubs it keeps the old 500 ms act) - armAbsentActOnce(
+skipAbsentActArm(
 absentActGiveUps
 botActionGiveUps

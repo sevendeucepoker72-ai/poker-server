@@ -7692,8 +7692,8 @@ function broadcastGameState(tableId: string): void {
 
     if (shouldAutoAct) {
       // Fix round 4 (SERVER-R3-REG-3) — one pending per (table, seat), none for a turn whose auto-act
-      // already threw TURN_ACT_RETRIES times (armAbsentActOnce: every broadcast used to add a chain).
-      if (armAbsentActOnce(tableId, activeIdx)) setTimeout(() => {
+      // already threw TURN_ACT_RETRIES times (skipAbsentActArm: every broadcast used to add a chain).
+      if (!skipAbsentActArm(tableId, activeIdx)) setTimeout(() => {
         absentActPending.delete(`${tableId}:${activeIdx}`);
         const t = tableManager.getTable(tableId);
         // Skip during draw phases — the draw clock stands the player pat; a
@@ -9222,7 +9222,7 @@ function standPatAbsentDrawers(tableId: string): void {
 // pot again (restingShowdownHoldings); an actor whose check / fold throws every time is not
 // re-armed for that turn after 3 throws; a bomb pot's runout is inside the guarded deal.
 // The normal path adds only the stake mark per bot action / draw and, for an absent seat's
-// turn, the one-pending check of its 500 ms auto-act (armAbsentActOnce); every other helper
+// turn, the one-pending check of its 500 ms auto-act (skipAbsentActArm); every other helper
 // below runs only after a throw.
 const GAME_TIMER_ERROR_TAG = '[game-timer-error]';
 const AUTO_START_RETRY_AFTER_FAULT_MS = 3000;
@@ -9660,7 +9660,7 @@ function recoverAbsentActThrow(tableId: string, seatIndex: number, mark: BotTurn
   if (!t) return;
   actForTurnAfterThrow(tableId, t, seatIndex, mark, 'away', 'absent_act');
   settleShowdownAfterTimerThrow(tableId, t, mark, 'absent_act');
-  // Fix round 4 (SERVER-R3-REG-3) — the broadcast below arms the next auto-act (armAbsentActOnce):
+  // Fix round 4 (SERVER-R3-REG-3) — the broadcast below arms the next auto-act (skipAbsentActArm):
   // none once this same turn's auto-act has thrown TURN_ACT_RETRIES times (absentActGiveUps).
   noteTurnActThrow(absentActTurnThrows, t, seatIndex, 'absentActGiveUps');
   continueAfterGameFault(tableId, t, seatIndex, 'absent_act', true);
@@ -9775,14 +9775,18 @@ function noteTurnActThrow(map: WeakMap<PokerTable, TurnActThrows>, t: PokerTable
   if (n === TURN_ACT_RETRIES) gameTimerGuardStats[counter]++;
   return n >= TURN_ACT_RETRIES;
 }
-/** broadcastGameState — arm the 500 ms auto-act for this seat? Not while one is pending for it, nor for a turn whose retries are spent. */
-function armAbsentActOnce(tableId: string, seatIndex: number): boolean {
+/**
+ * broadcastGameState — skip arming the 500 ms auto-act for this seat? true while one is pending for
+ * it, or when its turn's retries are spent; false = arm it (marked pending now; the timer unmarks it
+ * as it fires).
+ */
+function skipAbsentActArm(tableId: string, seatIndex: number): boolean {
   const t = tableManager.getTable(tableId);
-  if (t && turnActRetriesSpent(absentActTurnThrows, t, seatIndex)) return false;
+  if (t && turnActRetriesSpent(absentActTurnThrows, t, seatIndex)) return true;
   const key = `${tableId}:${seatIndex}`;
-  if (absentActPending.has(key)) return false;
+  if (absentActPending.has(key)) return true;
   absentActPending.add(key);
-  return true;
+  return false;
 }
 /**
  * Fix round 4 (SERVER-R3-REG-PAYABLE-1 (b)) — what each seat holds if a hand resting in Showdown is
