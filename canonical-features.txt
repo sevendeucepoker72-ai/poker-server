@@ -950,7 +950,13 @@ STUD_DRAW_FL_CALL_MARGIN
 flPotOddsCall
 # 2026-11-08 (bots review fix round 4, unequal stacks) - studDrawFirstRound: a Five Card Draw light re-raise is
 # sized against the shortest live stack whose shove commits the bot (lightRaiseDepth), not its own deep stack.
-lightRaiseDepth
+# SUPERSEDED 2026-11-08 by the own-raise line below (never shipped; lightRaiseDepth made MANIACs call a short
+# human's open instead of re-raising and the cheap post-draw spots it gave back profited +227 to +461 BB/100):
+# lightRaiseDepth
+# 2026-11-08 (bots review fix round 4, unequal stacks) - studDrawFirstRound: the REG-2 depth rule (a 100 BB shove
+# commits a deep bot) is for a LONE shove (the round's one raise); in a raise war a seat prices a shove on its own
+# stack, as cdb31dd did.
+FIVE_DRAW_ALLIN_COMMIT_BB && streetRaises <= 1);
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as
