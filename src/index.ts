@@ -9750,9 +9750,10 @@ function recoverTimerThrow(kind: string, counter: 'dealThrows' | 'tournamentTime
  * fold that throws EVERY time (a sticky engine fault) looped without end: the auto-act at 2 Hz — and
  * every broadcast meanwhile scheduled one MORE 500 ms auto-act, each a chain of its own (21 chains
  * after 20 broadcasts; 13,191 throws in 10 minutes) — a bot at its think delay. Now the auto-act is
- * armed once per (table, seat) at a time (absentActPending), and neither actor is re-armed for a turn
- * (same hand, decision point and seat) on which it already threw TURN_ACT_RETRIES times (counted
- * absentActGiveUps / botActionGiveUps once). That turn is then its turn clock's (one-shot) and the
+ * armed once per (table, seat) at a time (absentActPending) and never for a turn (same hand, decision
+ * point and seat) on which it already threw TURN_ACT_RETRIES times; a bot's action recovery stops
+ * re-arming the bot after that many throws on one turn (another path's scheduleAIAction still arms
+ * it once each). Counted absentActGiveUps / botActionGiveUps once. That turn is then its turn clock's (one-shot) and the
  * wedge watchdog's (a forced check / fold every 15 s once it is stuck; a payout it runs that throws
  * is settled at once) — the sticky outcome of every turn, as a sticky draw round's is the draw clock's.
  */
