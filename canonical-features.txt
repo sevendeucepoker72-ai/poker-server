@@ -2136,3 +2136,10 @@ function chipsLeftEffectiveStackBB(
 # MANIAC re-raised a 100 BB opener light again and folded ~78% to his shove (any two +55..+445 BB/100, live negative).
 function lightReraiseDepth(
 > lightReraiseDepth(table, seat) *
+# 2026-11-08 (bots review fix round 4, holdem lane, MANIAC call-then-fold) - preFlopStrategy (no-limit): a MANIAC that flat-called
+# this street, deeper than the push/fold zone, continues a stack-off at MANIAC_RAISED_STACKOFF_WIDEN x the width (as one that raised:
+# at the plain width it folded 72-90% of its flats to a squeeze / re-shove); a deep MANIAC facing an all-in it does not close plays
+# the stack-off range for the shover's depth (it called ~70% of them).
+function ownCallsThisStreet(
+maniacWiden(soDepth)
+!stackOffOK(shoveBB, maniacWiden(shoveBB))

@@ -1306,6 +1306,15 @@ function ownRaisesThisStreet(table: PokerTable, seat: Seat): number {
   return n;
 }
 
+/** Fix round 4 — calls this seat has made on the current street (a posted blind is not one), from the action log. */
+function ownCallsThisStreet(table: PokerTable, seat: Seat): number {
+  let n = 0;
+  for (const e of table.actionLog) {
+    if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && /^called /.test(e.action)) n++;
+  }
+  return n;
+}
+
 /**
  * 2026-11 (bots review, economy E3, All-In or Fold): the width the all-in player
  * is read to shove. It is the AoF push width for the seat he shoved from (the
@@ -1519,14 +1528,29 @@ function preFlopStrategy(
       : adjustThreshold(1 - stackOffCallWidth(depthBB, callPyta), factor);
     return (depthBB <= PUSH_FOLD_MAX_BB ? pctile : so) >= (widen === 1 ? th : 1 - (1 - th) * widen);
   };
+  // MANIAC-RTF part 2 (fix round 3): a MANIAC that raised this street (its any-two open, isolation
+  // or light 3-bet) continues with MANIAC_RAISED_STACKOFF_WIDEN x the width; it folded ~80-90% of them.
+  // Fix round 4: so does one that flat-called this street, deeper than the push/fold zone (it flats
+  // ~70% of opens). At the plain width it folded 72-90% of its flats to a squeeze or re-shove (live
+  // 0dc1b96 ~30-38%): with five 40 BB MANIACs, a squeeze all-in over an open and a flat with any two
+  // won +144 BB/100 (live +30), a re-shove +44 (live -2); 25 BB and shallower are unchanged.
+  const maniacWiden = (depthBB: number): number => profile.archetype === 'MANIAC' && (ownRaisesThisStreet(table, seat) > 0
+    || (depthBB > PUSH_FOLD_MAX_BB && ownCallsThisStreet(table, seat) > 0)) ? MANIAC_RAISED_STACKOFF_WIDEN : 1;
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
   // (and, fix round 3, its 0dc1b96 chips-left depth: chipsLeftEffectiveStackBB).
   if (!allInOrFold && noLimit && (pureCall || committing)) {
-    // MANIAC-RTF part 2 (fix round 3): a MANIAC that raised this street (its any-two open, isolation
-    // or light 3-bet) continues with MANIAC_RAISED_STACKOFF_WIDEN x the width; it folded ~80-90% of them.
-    const widen = profile.archetype === 'MANIAC' && ownRaisesThisStreet(table, seat) > 0 ? MANIAC_RAISED_STACKOFF_WIDEN : 1;
-    if (!stackOffOK(pureCall ? shoveBB : effBB, widen)) return FOLD;
+    const soDepth = pureCall ? shoveBB : effBB;
+    if (!stackOffOK(soDepth, maniacWiden(soDepth))) return FOLD;
     return pureCall && callAmount < seat.chipCount ? CALL : ALLIN;
+  }
+  // Fix round 4 — a MANIAC deeper than the push/fold zone facing an all-in it does not close (players
+  // still to act) for less than a third of ITS stack skipped the gate above, and the MANIAC branch below
+  // called it with ~70% of hands (63-72% vs a 40 BB shove at 500 BB). Against the shover the call is a
+  // stack-off for the depth at risk (his stack): the stack-off range for shoveBB, by calling. A 40 BB
+  // re-shove with any two over five 500 BB MANIACs won +250 BB/100 (live 0dc1b96 -138).
+  if (!allInOrFold && noLimit && shover && profile.archetype === 'MANIAC' && effBB > PUSH_FOLD_MAX_BB) {
+    if (!stackOffOK(shoveBB, maniacWiden(shoveBB))) return FOLD;
+    return callAmount < seat.chipCount ? CALL : ALLIN;
   }
   /** A re-raise; when it would be a jam it must pass the stack-off range too (null = not this hand: fall through). */
   const raiseOrJam = (amount: number): AIDecision | null => {
