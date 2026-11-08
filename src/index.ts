@@ -1249,8 +1249,9 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // Batch 5 admin actions — chip/privilege/ban mutations need a durable trail.
   'ADMIN_ADJUST_CHIPS', 'ADMIN_IP_BAN', 'ADMIN_TOGGLE_ADMIN',
   'ADMIN_FORCE_CLOSE_TABLE', 'ADMIN_KICK',
-  // Fix round 4 (bots review, 2026-11-08) — an admin ended a hand held in Showdown (chips set by hand: rare).
-  'ADMIN_RESOLVE_HELD_HAND',
+  // Fix round 4 (bots review, 2026-11-08) — an admin ended a hand held in Showdown (chips set by hand: rare),
+  // or tried to and the hand stayed held (fix-up: the attempt is durable too).
+  'ADMIN_RESOLVE_HELD_HAND', 'ADMIN_RESOLVE_HELD_HAND_FAILED',
   // 2026-08-17 — clearing an identity stamp makes a row adoptable by a
   // different master account, so it is an identity mutation and needs the
   // durable trail (the audit row carries the removed masterUserId, which is
@@ -1642,8 +1643,8 @@ function foldSeatOutOfHand(table: PokerTable, seatIndex: number): void {
     seatTeardownStats.foldedOnClock++;
     return;
   }
-  table.forceFoldSeat(seatIndex);
-  seatTeardownStats.foldedOutOfTurn++;
+  // Fix round 4 fix-up — counted only when it folded (forceFoldSeat refuses a live hand in Showdown).
+  if (table.forceFoldSeat(seatIndex)) seatTeardownStats.foldedOutOfTurn++;
   if (table instanceof FiveCardDrawTable) table.completeDrawRoundIfDone();
   if (table.awardIfUncontested()) seatTeardownStats.awardedUncontested++;
 }
@@ -1696,7 +1697,15 @@ function teardownSeat(
       }
     } else {
       try {
-        foldSeatOutOfHand(table, seatIndex);
+        // Fix round 4 fix-up (SERVER-R4-REGRESSION-2) — in a hand RESTING in Showdown (a payout fault,
+        // settled from the payout mark) only a DEAD hand is folded: a seat torn down at a tournament /
+        // fixed-roster table is out of the game, so the settle's retry must never pay it a pot that
+        // would leave play with it. A ring seat keeps its tabled hand (forceFoldSeat refuses there).
+        if (!leaverKeepsAllInHand(tableId) && table.currentPhase === GamePhase.Showdown) {
+          if (table.forceFoldSeat(seatIndex, { deadHand: true })) seatTeardownStats.foldedOutOfTurn++;
+        } else {
+          foldSeatOutOfHand(table, seatIndex);
+        }
       } catch (err) { settleHumanPathThrow(tableId, table, seatIndex, 'seat_teardown', err); throw err; }   // fix round 3 (SR2-2)
     }
   }
@@ -9837,23 +9846,33 @@ function heldShowdownsNow(): Array<{ tableId: string; handNumber: number; since:
  * an admin who has read its `[game-timer-error]` lines picks: 'finish' = the stacks stand as they
  * are (completeHandAfterFault(): no chip created) or 'void' = every payable seat still the mark's
  * back to its stake (no mark: chipCount + totalInvestedThisHand — nothing was paid). Then the clients
- * and the next deal. Never throws; null = not a held hand.
+ * and the next deal. Never throws; null = not a held hand (or it is still in Showdown).
  */
 function resolveHeldShowdown(tableId: string, t: PokerTable, resolution: 'finish' | 'void'): { before: number[]; after: number[] } | null {
+  let before: number[] | null = null;
+  let hand = -1;
   try {
     if (!gameShowdownHeld(t)) return null;
-    const before = t.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1));
+    hand = t.handNumber;
+    before = t.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1));
     const p = t.payoutStartMark && t.payoutStartMark.hand === t.handNumber ? t.payoutStartMark : null;
     const refund = resolution === 'finish' ? undefined
       : t.seats.map((s, i) => (s.state !== 'occupied' ? -1
         : !p ? s.chipCount + (s.totalInvestedThisHand || 0)
           : p.payable?.[i] === true && !p.left?.[i] && p.ids[i] === s.playerId && p.stakes[i] >= 0 ? p.stakes[i] : -1));
     if (!t.completeHandAfterFault(refund)) return null;
-    gameShowdownHold.delete(t);
-    gameTimerGuardStats.heldResolvedByAdmin++;
-    continueAfterGameFault(tableId, t, -1, 'admin_resolve_held', false);
-    return { before, after: t.seats.map((s) => (s.state === 'occupied' ? s.chipCount : -1)) };
-  } catch (e) { gameTimerGuardStats.recoveryThrows++; logGameTimerError('admin_resolve_held', tableId, -1, e); return null; }
+  } catch (e) {
+    gameTimerGuardStats.recoveryThrows++;
+    logGameTimerError('admin_resolve_held', tableId, -1, e);
+    // Fix round 4 fix-up (faults lens) — a throw AFTER completeHandAfterFault ended the hand (a
+    // 'handResult' listener) still ended it: answered as resolved, so the hold, the counter, the
+    // clients and the next deal follow (it used to answer 'not_resolved' and a retry 'not_held').
+    if (!before || t.handNumber !== hand || t.currentPhase === GamePhase.Showdown) return null;
+  }
+  gameShowdownHold.delete(t);
+  gameTimerGuardStats.heldResolvedByAdmin++;
+  continueAfterGameFault(tableId, t, -1, 'admin_resolve_held', false);
+  return { before: before as number[], after: t.seats.map((s) => (s.state === 'occupied' ? s.chipCount : -1)) };
 }
 // ===== end game timer crash guard =====
 
@@ -31746,10 +31765,13 @@ function claimSeatsForShutdown(): { credits: ShutdownSeatCredit[]; progress: Arr
   // ONCE before any seat is claimed: a paid pot is in the winners' stacks, and stack + what each
   // seat put in credited that pot a second time at every restart.
   const settledHoldings = new Map<string, number[]>();
-  for (const { tableId } of tableManager.getTableList()) {
-    const h = restingShowdownHoldings(tableManager.getTable(tableId));
-    if (h) settledHoldings.set(tableId, h);
-  }
+  // Fix-up: the ids only (no table summaries), and a throw here never aborts the claim.
+  try {
+    for (const tableId of tableManager.getAllTableIds()) {
+      const h = restingShowdownHoldings(tableManager.getTable(tableId));
+      if (h) settledHoldings.set(tableId, h);
+    }
+  } catch (e) { console.error('[shutdown] resting-Showdown pre-read failed:', e); }
   const take = (userId: number, tableId: string, seatIndex: number, via: string, expectPlayerId?: string, fallbackChips?: number): void => {
     const seatKey = `${tableId}:${seatIndex}`;
     if (creditedSeats.has(seatKey) || !(userId > 0)) return;

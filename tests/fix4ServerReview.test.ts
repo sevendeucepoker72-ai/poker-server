@@ -10,7 +10,9 @@
  *   payout mark reads it (restingShowdownHoldings: never stack + invested on a paid pot); a hand
  *   still unreadable stays HELD (no automatic choice is chip-safe there — see resolveHeldShowdown),
  *   visible in health (crashSafety.heldShowdowns) and ended by an admin ('adminResolveHeldHand').
- *   The engine never folds a leaver in Showdown (forceFoldSeat), so a settle's retry pays him.
+ *   The engine never folds a leaver in Showdown (forceFoldSeat), so a settle's retry pays him —
+ *   except a DEAD hand (fix-up, SERVER-R4-REGRESSION-2): a seat torn down at a tournament /
+ *   fixed-roster table is folded there, so the retry never pays a pot that leaves play with it.
  * SERVER-R3-REG-3 (P3) — a sticky check / fold throw looped the 500 ms orphan / sit-out auto-act at
  *   2 Hz without end, and every broadcast added one more chain; the same loop ran for a bot's action
  *   at its think delay. Now one pending auto-act per (table, seat), and neither actor is re-armed for
@@ -76,7 +78,7 @@ function injectFault(t: PokerTable, f: Fault): void {
 const OUTCOME: Record<Fault, string> = { pre: 'showdownResolved', post: 'showdownPaidFinished', mid: 'showdownVoided', sticky: 'showdownPaidFinished' };
 
 /** The socket / watchdog world (as fix3ReviewFixups'), with the teardown and the round-4 helpers exported. */
-function world(table: PokerTable, nSessions: number) {
+function world(table: PokerTable, nSessions: number, wopts: { tournament?: boolean } = {}) {
   const t = table;
   let now = 1_000_000; let nextId = 1;
   const jobs: Array<{ id: number; at: number; fn: () => void; every?: number }> = [];
@@ -106,7 +108,7 @@ function world(table: PokerTable, nSessions: number) {
     turnTimers: new Map(), turnWarningTimers: new Map(), turnStartedAtMap: new Map(), turnStartedSeatMap: new Map(),
     turnStartedHandMap: new Map(), turnStartedPhaseMap: new Map(), globalTurnId: 0,
     log: { debug() {}, info() {} },
-    isTournamentTable: () => false, isAbsentTournamentSeatPastHandLimit: () => false, absentSeatOnShortClock: () => false,
+    isTournamentTable: () => !!wopts.tournament, isAbsentTournamentSeatPastHandLimit: () => false, absentSeatOnShortClock: () => false,
     clearAbsentTimeoutStreak() {}, noteAbsentTimeout() {}, sitOutTournamentSeatAfterTimeout: () => false,
     tournamentTimeoutSitOutStats: { shortClockRearmed: 0 }, tournamentSeatForStaleTable: () => undefined,
     isFixedRosterQuickTable: () => false, isPrizeFormatTable: () => false, noteBotStackRemoved() {}, endStaleSessionsAtSeat() {},
@@ -123,7 +125,7 @@ function world(table: PokerTable, nSessions: number) {
     WATCHDOG,
   ].join('\n');
   const { exports: m, stubbed } = load(code, scope,
-    '{ armTurnTimer, scheduleAutoStart, processPendingSeatRemovals, teardownSeat, gameTimerGuardStats, gameShowdownHeld, wire, makeGuardOpts, restingShowdownHoldings, heldShowdownsNow, resolveHeldShowdown }');
+    '{ armTurnTimer, scheduleAutoStart, processPendingSeatRemovals, teardownSeat, gameTimerGuardStats, gameShowdownHeld, wire, makeGuardOpts, restingShowdownHoldings, heldShowdownsNow, resolveHeldShowdown, seatTeardownStats }');
   scope.scheduleAutoStart = m.scheduleAutoStart;
   const wired = new Set<any>();
   scope.broadcastGameState = (id: string) => {
@@ -186,12 +188,12 @@ function toRiver(w: W): number {
 }
 
 /** A hand left resting in Showdown by a path with no settle of its own (the engine called bare, as a pending bomb pot's runout was): the watchdog's. */
-function restingShowdown(fault: Fault, opts: { busted?: boolean; seats?: number } = {}) {
+function restingShowdown(fault: Fault, opts: { busted?: boolean; seats?: number; tournament?: boolean } = {}) {
   const t = new PokerTable(cfg);
   const n = opts.seats ?? 2;
   for (let i = 0; i < n; i++) t.sitDown(i, `H${i}`, 5000, `player-${i}`, false);
   if (opts.busted) { expect(t.sitDown(n, `H${n}`, 100, `player-${n}`, false)).toBe(true); t.seats[n].chipCount = 0; }   // a cash seat at 0, waiting to rebuy / leave
-  const w = world(t, n + (opts.busted ? 1 : 0));
+  const w = world(t, n + (opts.busted ? 1 : 0), { tournament: opts.tournament });
   w.deal();
   const start = total(t);
   const closer = toRiver(w);
@@ -240,6 +242,73 @@ describe('SERVER-R3-REG-PAYABLE-1 — the engine: payoutStartMark.payable is exa
     expect(u.startNewHand()).toBe(true);
     const off = [0, 1, 2].find((i) => i !== u.activeSeatIndex)!;
     expect(u.forceFoldSeat(off)).toBe(true);
+  });
+
+  it('fix-up (SERVER-R4-REGRESSION-2): a DEAD hand (opts.deadHand) IS folded in Showdown; the mark (payable, stakes) does not move (ebe27e6: refused)', () => {
+    const { t } = restingShowdown('pre', { seats: 3 });
+    const p = t.payoutStartMark!;
+    const mark = JSON.stringify({ payable: p.payable, stakes: p.stakes, ids: p.ids });
+    const chips = total(t);
+    expect(t.forceFoldSeat(0, { deadHand: true })).toBe(true);
+    expect(t.seats[0].folded).toBe(true);
+    expect(JSON.stringify({ payable: p.payable, stakes: p.stakes, ids: p.ids })).toBe(mark);
+    expect(total(t)).toBe(chips);                                          // a fold moves no chip
+    expect(t.currentPhase).toBe(GamePhase.Showdown);
+    expect(t.forceFoldSeat(1)).toBe(false);                               // a live hand still is not
+  });
+});
+
+describe('fix-up (SERVER-R4-REGRESSION-2) — a seat torn down at a TOURNAMENT table while the hand rests in Showdown: its hand is dead (ebe27e6: kept, and the settle\'s retry paid it 13 pots in 40)', () => {
+  /** 3-handed, a fault before / after / during the payout; a seat still holding cards is torn down (an admin's disqualification). */
+  function dq(fault: Fault, tournament: boolean) {
+    const { w, t, start } = restingShowdown(fault, { seats: 3, tournament });
+    const leaver = [0, 1, 2].find((i) => i !== t.activeSeatIndex && t.seats[i].holeCards.length > 0 && !t.seats[i].folded)!;
+    const outcome = w.m.teardownSeat(T, t, leaver, { userId: 9, username: 'dq' }, 'admin_away_disqualified');
+    const folded = t.seats[leaver].folded;
+    w.advance(16_000);
+    const res = (t as any).lastHandResult;
+    return { w, t, start, leaver, outcome, folded, won: !!res && res.winners.some((x: any) => x.seatIndex === leaver) };
+  }
+
+  it("'pre' fault, 40 deals: the leaver is folded at once, never paid, the hand settled at the first tick, chips conserved", () => {
+    const agg = { folded: 0, won: 0, held: 0, inShowdown: 0, notConserved: 0, deferred: 0 };
+    for (let k = 0; k < 40; k++) {
+      const r = dq('pre', true);
+      if (r.folded) agg.folded++;
+      if (r.won) agg.won++;
+      if (r.w.m.gameShowdownHeld(r.t)) agg.held++;
+      if (r.t.currentPhase === GamePhase.Showdown) agg.inShowdown++;
+      if (r.outcome === 'deferred') agg.deferred++;
+      if (total(r.t) + r.w.credited() !== r.start) agg.notConserved++;
+      expect(r.w.c.escaped).toBe(0);
+      expect(r.w.stats()).toMatchObject({ watchdogShowdowns: 1, showdownResolved: 1, showdownHeld: 0 });
+    }
+    expect(agg).toEqual({ folded: 40, won: 0, held: 0, inShowdown: 0, notConserved: 0, deferred: 40 });   // ebe27e6: folded 0
+  });
+
+  it.each<[Fault]>([['post'], ['mid'], ['sticky']])("'%s' fault: folded as well; the settle finishes / voids exactly as without the leave, chips conserved", (fault) => {
+    const r = dq(fault, true);
+    expect(r.folded).toBe(true);
+    expect(r.t.currentPhase).not.toBe(GamePhase.Showdown);
+    expect(r.w.stats()).toMatchObject({ watchdogShowdowns: 1, showdownHeld: 0, [OUTCOME[fault]]: 1 });
+    expect(total(r.t) + r.w.credited()).toBe(r.start);
+    expect(r.w.c.escaped).toBe(0);
+  });
+
+  it('CONTROL — the same leave at a RING table: he keeps his tabled hand (no decision left), deferred, and the stat counts no fold (ebe27e6: counted one)', () => {
+    const agg = { folded: 0, won: 0, notConserved: 0 };
+    let foldedStat = 0;
+    for (let k = 0; k < 40; k++) {
+      const r = dq('pre', false);
+      if (r.folded) agg.folded++;
+      if (r.won) agg.won++;
+      if (total(r.t) + r.w.credited() !== r.start) agg.notConserved++;
+      foldedStat += r.w.m.seatTeardownStats.foldedOutOfTurn;
+    }
+    expect(agg.folded).toBe(0);
+    expect(agg.won).toBeGreaterThan(0);                                   // a kept hand wins its share of the time
+    expect(agg.notConserved).toBe(0);
+    expect(foldedStat).toBe(0);
   });
 });
 
@@ -353,6 +422,36 @@ describe('SERVER-R3-REG-PAYABLE-1 (a) — a hand still unreadable stays HELD (no
     expect(w.m.resolveHeldShowdown(T, t, 'void')).toBeNull();
   });
 
+  it.each([['finish'], ['void']])("fix-up (faults lens): a 'handResult' listener that throws as the admin's '%s' ends the hand: answered resolved, the hold dropped, counted, the next deal follows (ebe27e6: null / not_resolved)", (res) => {
+    const { w, t } = unreadable();
+    w.advance(15_000);
+    expect(w.m.gameShowdownHeld(t)).toBe(true);
+    let left = 1;
+    t.on('handResult', () => { if (left > 0) { left--; throw new TypeError('listener fault'); } });
+    const r = w.m.resolveHeldShowdown(T, t, res as 'finish' | 'void');
+    expect(r).not.toBeNull();
+    expect(t.currentPhase).toBe(GamePhase.HandComplete);
+    expect(w.m.gameShowdownHeld(t)).toBe(false);
+    expect(w.m.heldShowdownsNow()).toEqual([]);
+    expect(w.stats()).toMatchObject({ heldResolvedByAdmin: 1 });
+    w.advance(5000);
+    expect(t.handNumber).toBe(2);
+    expect(w.c.escaped).toBe(0);
+  });
+
+  it('CONTROL — a throw that leaves the hand in Showdown (before it ended) is still not resolved: null, the hold kept', () => {
+    const { w, t } = unreadable();
+    w.advance(15_000);
+    const real = t.completeHandAfterFault.bind(t);
+    let left = 1;
+    t.completeHandAfterFault = (refund?: ReadonlyArray<number>) => { if (left > 0) { left--; throw new TypeError('early fault'); } return real(refund); };
+    expect(w.m.resolveHeldShowdown(T, t, 'finish')).toBeNull();
+    expect(t.currentPhase).toBe(GamePhase.Showdown);
+    expect(w.m.gameShowdownHeld(t)).toBe(true);
+    expect(w.stats()).toMatchObject({ heldResolvedByAdmin: 0 });
+    expect(w.m.resolveHeldShowdown(T, t, 'finish')).not.toBeNull();     // the admin's retry
+  });
+
   it('the socket handler: admins only, a resolution and a held hand required, audited', async () => {
     const { w, t } = unreadable();
     w.advance(15_000);
@@ -384,15 +483,20 @@ describe('SERVER-R3-REG-PAYABLE-1 (a) — a hand still unreadable stays HELD (no
     await send({ tableId: T, resolution: 'finish' });
     expect(emits.pop()).toMatchObject(['adminResolveHeldHandResult', { success: false, code: 'not_held' }]);
     expect(SRC).toContain("'ADMIN_RESOLVE_HELD_HAND',");                // a durable audit row
+    // fix-up: the failed attempt too
+    expect(slice('const DURABLE_AUDIT_ACTIONS = new Set([', ']);')).toContain("'ADMIN_RESOLVE_HELD_HAND_FAILED'");
   });
 });
 
 describe('SERVER-R3-REG-PAYABLE-1 (b) — the shutdown flush never credits a pot a second time (c97254b: stack + invested of every seat)', () => {
   /** claimSeatsForShutdown (REAL) over a heads-up table whose two seats have signed-in sessions. */
-  function flush(t: PokerTable) {
+  function flush(t: PokerTable, listsThrow = false) {
     const sessions = new Map<string, any>([['s0', { tableId: T, seatIndex: 0, playerId: 'player-0' }], ['s1', { tableId: T, seatIndex: 1, playerId: 'player-1' }]]);
+    const boom = () => { throw new TypeError('table list fault'); };
     const scope: Record<string, unknown> = {
-      tableManager: { getTable: (id: string) => (id === T ? t : undefined), getTableList: () => [{ tableId: T }], getAllTableIds: () => [T] },
+      tableManager: listsThrow
+        ? { getTable: (id: string) => (id === T ? t : undefined), getTableList: boom, getAllTableIds: boom }
+        : { getTable: (id: string) => (id === T ? t : undefined), getTableList: () => [{ tableId: T }], getAllTableIds: () => [T] },
       playerSessions: sessions, multiTableSessions: new Map(), reservedSeats: new Map(), pendingSeatRemovalAfterHand: new Map(),
       authSessions: new Map([['s0', { userId: 10, username: 'a' }], ['s1', { userId: 11, username: 'b' }]]),
       isTournamentTable: () => false, isPrizeFormatTable: () => false, isTournamentReservation: () => false,
@@ -421,6 +525,14 @@ describe('SERVER-R3-REG-PAYABLE-1 (b) — the shutdown flush never credits a pot
     expect(flush(t)).toBe(onTable);                                      // c97254b: onTable + pot
   });
 
+  it('fix-up: the table list throws: the pre-read is skipped, the claim still credits every seat a session holds (ebe27e6: the whole claim threw)', () => {
+    const t = new PokerTable(cfg);
+    t.sitDown(0, 'H0', 5000, 'player-0', false);
+    t.sitDown(1, 'H1', 5000, 'player-1', false);
+    expect(t.startNewHand()).toBe(true);
+    expect(flush(t, true)).toBe(10000);
+  });
+
   it('CONTROL — a live hand (not Showdown) is abandoned as before: stack + invested', () => {
     const t = new PokerTable(cfg);
     t.sitDown(0, 'H0', 5000, 'player-0', false);
@@ -441,7 +553,7 @@ describe('SERVER-R3-REG-PAYABLE-1 (b) — the shutdown flush never credits a pot
 });
 
 describe('SERVER-R3-REG-3 — a sticky check / fold throw: the 500 ms auto-act is bounded and never stacks (the reviewer\'s probe; c97254b: 1200 throws / 10 min, 21 chains after 20 broadcasts)', () => {
-  function run(extraBroadcasts: number, minutes: number, faults = Infinity) {
+  function run(extraBroadcasts: number, minutes: number, faults = Infinity, burst = 0) {
     const t = new PokerTable(cfg);
     t.sitDown(0, 'H0', 5000, 'player-0', false);
     t.sitDown(1, 'H1', 5000, 'player-1', false);
@@ -453,7 +565,7 @@ describe('SERVER-R3-REG-3 — a sticky check / fold throw: the 500 ms auto-act i
     t.playerCheck = (i: number) => { if (i === orphan && left > 0) { left--; engineThrows++; throw new TypeError('sticky check fault'); } return realCheck(i); };
     let now = 1_000_000; let nextId = 1;
     const jobs: Array<{ id: number; at: number; fn: () => void }> = [];
-    const c = { escaped: 0, broadcasts: 0, sentry: 0, maxPending: 0 };
+    const c = { escaped: 0, broadcasts: 0, sentry: 0, maxPending: 0, maxQueuedAfterBroadcast: 0 };
     const scope: Record<string, unknown> = {
       tableManager: { getTable: (id: string) => (id === T ? t : undefined) },
       GamePhase, DrawPhases: DRAWS, FiveCardDrawTable, MAX_SEATS, TURN_TIMEOUT_MS: TURN_MS,
@@ -484,6 +596,10 @@ describe('SERVER-R3-REG-3 — a sticky check / fold throw: the 500 ms auto-act i
       }
       now = until;
     };
+    // Fix-up (SERVER-R4-REGRESSION-1): broadcasts 50 ms apart INSIDE the first 500 ms of the turn, before any
+    // retry is spent — only the one-pending check keeps them from arming one auto-act each.
+    c.maxQueuedAfterBroadcast = jobs.length;
+    for (let b = 0; b < burst; b++) { advance(50); (scope.broadcastGameState as any)(T); c.maxQueuedAfterBroadcast = Math.max(c.maxQueuedAfterBroadcast, jobs.length); }
     const per = (minutes * 60_000) / (extraBroadcasts + 1);
     for (let k = 0; k <= extraBroadcasts; k++) { advance(per); if (k < extraBroadcasts) (scope.broadcastGameState as any)(T); }
     return { t, orphan, engineThrows, g: m.gameTimerGuardStats, c, pendingAtEnd: jobs.length };
@@ -505,6 +621,25 @@ describe('SERVER-R3-REG-3 — a sticky check / fold throw: the 500 ms auto-act i
     expect(r.c.maxPending).toBeLessThanOrEqual(1);                         // c97254b: 21
     expect(r.g).toMatchObject({ absentActThrows: 3, absentActGiveUps: 1 });
     expect(r.c.broadcasts).toBe(1 + 20 + 3);
+  });
+
+  it('fix-up (SERVER-R4-REGRESSION-1): 5 broadcasts in the first 250 ms of the turn: one auto-act pending, still 3 throws in all (no dedupe: 6 pending, 8 throws)', () => {
+    const r = run(0, 10, Infinity, 5);
+    expect(r.c.escaped).toBe(0);
+    expect(r.c.maxQueuedAfterBroadcast).toBe(1);
+    expect(r.c.maxPending).toBeLessThanOrEqual(1);
+    expect(r.g).toMatchObject({ absentActThrows: 3, absentActGiveUps: 1 });
+    expect(r.engineThrows).toBe(6);
+    expect(r.c.sentry).toBe(6);
+  });
+
+  it('fix-up CONTROL — the same burst with no fault: one auto-act pending, it acts once for the absent seat (the hand moves on)', () => {
+    const r = run(0, 1, 0, 5);
+    expect(r.c.escaped).toBe(0);
+    expect(r.c.maxQueuedAfterBroadcast).toBe(1);
+    expect(r.engineThrows).toBe(0);
+    expect(r.t.isHandInProgress() && r.t.activeSeatIndex === r.orphan).toBe(false);
+    expect(r.pendingAtEnd).toBe(0);
   });
 
   it('CONTROL — one transient throw: its recovery acts (checks / folds) and the turn moves on', () => {

@@ -1849,12 +1849,16 @@ export class PokerTable extends EventEmitter {
    * If it IS their turn, callers use playerFold() instead so the turn
    * advances normally. No-ops on an empty/already-folded seat.
    */
-  forceFoldSeat(seatIndex: number): boolean {
+  forceFoldSeat(seatIndex: number, opts: { deadHand?: boolean } = {}): boolean {
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
     // Fix round 4 (server review, faults lens) — never in Showdown: the betting is over and the
     // payout has begun (a hand only RESTS there after a payout fault, settled from
     // payoutStartMark); a leaver folded there lost his share of a pot the settle's retry then paid.
-    if (this.currentPhase === GamePhase.Showdown) return false;
+    // Fix round 4 fix-up (SERVER-R4-REGRESSION-2) — except a DEAD hand (opts.deadHand: a seat torn
+    // down at a tournament / fixed-roster table is out of the game, its hand dead even all-in): it is
+    // folded there as before, so the settle's retry never pays it a pot that would leave play with
+    // the seat. A fold moves no chip, and the mark fixed the payable seats and stakes first.
+    if (this.currentPhase === GamePhase.Showdown && !opts.deadHand) return false;
     const seat = this.seats[seatIndex];
     if (seat.state !== 'occupied' || seat.folded) return false;
     seat.folded = true;

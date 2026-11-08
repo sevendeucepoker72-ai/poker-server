@@ -2177,3 +2177,12 @@ TURN_ACT_RETRIES
 skipAbsentActArm(
 absentActGiveUps
 botActionGiveUps
+# 2026-11-08 (fix round 4 review fix-up, server lane) - a seat torn down at a tournament / fixed-roster table while
+# the hand rests in Showdown is folded (dead hand), never paid by the settle's retry; an admin's resolve that a
+# 'handResult' listener threw out of after the hand ended answers resolved; the failed attempt is durably audited;
+# the shutdown flush's resting-Showdown read never aborts the claim.
+!opts.deadHand
+forceFoldSeat(seatIndex, { deadHand: true })
+if (!before || t.handNumber !== hand
+'ADMIN_RESOLVE_HELD_HAND', 'ADMIN_RESOLVE_HELD_HAND_FAILED'
+resting-Showdown pre-read failed

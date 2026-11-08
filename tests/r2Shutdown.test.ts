@@ -58,7 +58,7 @@ function world(opts: { stuckStakingRefund?: boolean; flush?: string } = {}) {
   const ioEmits: Array<[string, any]> = [];
   const ledger = createPrizeLedger({ connect: () => db.pool.connect() as any, sleep: async () => {}, log: () => {}, backoffMs: [0] });
   const scope: Record<string, unknown> = {
-    tableManager: { getTable: (id: string) => tables.get(id), getTableList: () => [...tables.keys()].map((tableId) => ({ tableId })) },
+    tableManager: { getTable: (id: string) => tables.get(id), getTableList: () => [...tables.keys()].map((tableId) => ({ tableId })), getAllTableIds: () => [...tables.keys()] },
     tournamentManager: tm, tournamentTables: new Map<string, string>(),
     playerSessions: new Map<string, any>(), multiTableSessions: new Map<string, any[]>(), reservedSeats: new Map<number, any>(),
     pendingSeatRemovalAfterHand: new Map<string, Map<number, any>>(), authSessions: new Map<string, any>(),
