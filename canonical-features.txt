@@ -936,6 +936,18 @@ FIVE_DRAW_ALLIN_COMMIT_BB
 return (pureCall || !ownCommit) && callAmount < seat.chipCount ? CALL : ALLIN;
 fiveDrawStackOffPremium
 STUD_DRAW_FL_ROCK_BB_DEFEND
+# 2026-11-08 (bots review fix round 4, Stud / Draw rounds after the first; postFlopStrategy behind a Stud / Draw
+# check, Hold'em / Omaha / Short Deck / Pineapple unchanged) - Five Card Draw after the draw: a call of the pot or
+# more, or a bet / raise, that commits a third of the depth at risk needs a stack-off hand by made-hand class
+# (MEAS-1 / EXPLOIT-1); fixed limit: a NIT / ROCK / MANIAC facing ONE bet calls when its pot share clears the
+# price (MEAS-2 / EXPLOIT-2).
+fiveDrawMadeClass
+FIVE_DRAW_POST_STACKOFF_CLASS
+fiveDrawPostCommits
+postFlopStrategyCore
+studDrawKindOfTable
+STUD_DRAW_FL_CALL_MARGIN
+flPotOddsCall
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

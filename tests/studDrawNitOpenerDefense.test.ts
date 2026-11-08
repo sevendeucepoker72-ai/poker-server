@@ -96,37 +96,46 @@ describe('fix round 3: a NIT that opened does not fold most of its range to ONE 
     } finally { restore(); }
   }, 240_000);
 
-  it('Badugi, whole hands: re-raising any hand at every chance (then betting / raising every round) does not beat NIT x4 (300 hands, < +30 BB/100)', () => {
-    const restore = detEnv(3303);
-    try {
-      const t = make.badugi(); const profs: any[] = [null];
-      for (let i = 0; i < 5; i++) { t.sitDown(i, 'P' + i, 5000, (i === 0 ? 'human-nd-' : 'ai-nd-') + i, i !== 0); if (i) profs.push(nit()); }
-      const DRAW = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
-      let net = 0, hands = 0;
-      for (let h = 0; h < 300; h++) {
-        for (const x of t.seats) if (x.state === 'occupied') { x.chipCount = 5000; x.eliminated = false; x.sittingOut = false; }
-        if (!t.startNewHand()) break;
-        hands++;
-        let g = 0;
-        while (t.isHandInProgress() && g++ < 400) {
-          if (DRAW.includes(t.currentPhase)) {
-            for (const x of t.seats) if (x.state === 'occupied' && !x.folded && x.holeCards.length && !t.drawsCompleted.has(x.seatIndex)) {
-              t.playerDraw(x.seatIndex, SDS.chooseBotDiscards('badugi', x.holeCards, t.currentPhase));
-              if (!DRAW.includes(t.currentPhase)) break;
+  // Review REG-3: one 300-hand seed is noise (+-15 BB/100, cdb31dd -26..+52 over 7 seeds); this pins the 2b5ac52
+  // hole over 1,500 hands pooled. The bound held in 6 of 6 disjoint 5-seed groups (seeds 1-30) on the fix round 4
+  // head; with the fixed-limit pot-odds call (studDrawLaterRounds) the line loses there.
+  it('Badugi, whole hands: the 2b5ac52 hole stays closed - re-raising any hand at every chance vs NIT x4, pooled over 5 seeds x 300 hands, stays under +30 BB/100 (2b5ac52: +69)', () => {
+    let net = 0, hands = 0;
+    for (const seed of [3303, 3304, 3305, 3306, 3307]) {
+      const restore = detEnv(seed);
+      try {
+        const t = make.badugi(); const profs: any[] = [null];
+        for (let i = 0; i < 5; i++) { t.sitDown(i, 'P' + i, 5000, (i === 0 ? 'human-nd-' : 'ai-nd-') + i, i !== 0); if (i) profs.push(nit()); }
+        const DRAW = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
+        let seedNet = 0, seedHands = 0;
+        for (let h = 0; h < 300; h++) {
+          for (const x of t.seats) if (x.state === 'occupied') { x.chipCount = 5000; x.eliminated = false; x.sittingOut = false; }
+          if (!t.startNewHand()) break;
+          seedHands++;
+          let g = 0;
+          while (t.isHandInProgress() && g++ < 400) {
+            if (DRAW.includes(t.currentPhase)) {
+              for (const x of t.seats) if (x.state === 'occupied' && !x.folded && x.holeCards.length && !t.drawsCompleted.has(x.seatIndex)) {
+                t.playerDraw(x.seatIndex, SDS.chooseBotDiscards('badugi', x.holeCards, t.currentPhase));
+                if (!DRAW.includes(t.currentPhase)) break;
+              }
+              continue;
             }
-            continue;
+            const a = t.activeSeatIndex; if (a < 0) break;
+            if (a === 0) { if (!t.playerRaise(0, t.getMinRaise())) { if (!t.playerCall(0)) t.playerCheck(0) || t.playerFold(0); } continue; }
+            exec(t, a, AI.decideAction(t, a, profs[a]));
           }
-          const a = t.activeSeatIndex; if (a < 0) break;
-          if (a === 0) { if (!t.playerRaise(0, t.getMinRaise())) { if (!t.playerCall(0)) t.playerCheck(0) || t.playerFold(0); } continue; }
-          exec(t, a, AI.decideAction(t, a, profs[a]));
+          expect(t.seats.reduce((s: number, x: any) => s + x.chipCount, 0)).toBe(25000);   // chips conserved
+          seedNet += t.seats[0].chipCount - 5000;
         }
-        expect(t.seats.reduce((s: number, x: any) => s + x.chipCount, 0)).toBe(25000);   // chips conserved
-        net += t.seats[0].chipCount - 5000;
-      }
-      const bb100 = (100 * net) / hands / 50;
-      process.stdout.write(`Badugi raise-war any hand vs NIT x4: ${bb100.toFixed(1)} BB/100 over ${hands} hands\n`);
-      expect(hands).toBe(300);
-      expect(bb100).toBeLessThan(30);
-    } finally { restore(); }
-  }, 300_000);
+        process.stdout.write(`Badugi raise-war any hand vs NIT x4, seed ${seed}: ${((100 * seedNet) / seedHands / 50).toFixed(1)} BB/100 over ${seedHands} hands\n`);
+        expect(seedHands).toBe(300);
+        net += seedNet; hands += seedHands;
+      } finally { restore(); }
+    }
+    const bb100 = (100 * net) / hands / 50;
+    process.stdout.write(`Badugi raise-war any hand vs NIT x4, pooled: ${bb100.toFixed(1)} BB/100 over ${hands} hands\n`);
+    expect(hands).toBe(1500);
+    expect(bb100).toBeLessThan(30);
+  }, 1_200_000);
 });

@@ -1732,6 +1732,59 @@ export function fiveDrawStackOffPremium(cards: Card[]): boolean {
 }
 
 /**
+ * Fix round 4 (MEAS-1 / EXPLOIT-1) — Five Card Draw AFTER the draw: a call of at least the pot
+ * (potOdds >= 1/3) that commits a third of the depth at risk against the bet (the smaller of this
+ * seat's stack and the bet's this round: fiveDrawPostCommits) continues only with this made-hand
+ * class or better (fiveDrawMadeClass), by archetype: NIT / ROCK trips, TAG / LAG / MANIAC / FISH
+ * aces up, CALLING_STATION two pair. The later-round strength is the pot share vs each bettor's
+ * STARTING range (studDrawRangeFloor: 0.62 / 0.80 whatever the bet), so a 100 BB shove after the
+ * draw was priced like a small bet and a NIT called it with one pair (32 of 103 callers; live
+ * 0dc1b96, whose made-hand heuristic it replaced, 0 of 14): limping any five cards and shoving two
+ * pair or better after the draw won +180 BB/100 vs NIT x4 and MANIAC x4 (live -121 / -97). At two
+ * pair a MANIAC still lost +166 BB/100 to calling its raises up to 10 BB with any five cards and
+ * shoving two pair or better after the draw (live -220; aces up: -103), and a FISH +257 to opening
+ * the top 25% and shoving two pair or better after the draw (live +113; aces up: -45).
+ */
+export const FIVE_DRAW_POST_STACKOFF_CLASS: Record<Archetype, number> = {
+  NIT: 4, ROCK: 4, TAG: 3, LAG: 3, MANIAC: 3, FISH: 3, CALLING_STATION: 2,
+};
+
+/**
+ * Fix round 4 — after the draw: does calling `callAmount` commit a third of the depth at risk against the
+ * bet (this seat's stack this round, or the smallest stack among the seats that have put the whole bet in,
+ * an all-in shover's included, if smaller)?
+ */
+function fiveDrawPostCommits(table: PokerTable, seat: Seat, callAmount: number): boolean {
+  let bet = 0;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
+    if (s.currentBet >= table.currentBetToMatch) bet = bet === 0 ? s.chipCount + s.currentBet : Math.min(bet, s.chipCount + s.currentBet);
+  }
+  return bet > 0 && callAmount >= STACKOFF_COMMIT_FRACTION * Math.min(seat.chipCount + seat.currentBet, bet);
+}
+
+/**
+ * Fix round 4 (MEAS-2 / EXPLOIT-2) — fixed-limit Stud / Draw, the rounds after the first: facing ONE
+ * bet a bot whose pot share clears the price by this margin (callAmount / (pot + call) + margin)
+ * calls. The NIT branch folded everything under 0.55 to one bet, ROCK under 0.30, MANIAC under 0.25,
+ * whatever the pot laid (one small bet into 4-6 needs ~15-20%): calling the first round with any hand,
+ * then betting when checked to and folding to any bet, won +83 BB/100 vs NIT x4 in Badugi (live -49)
+ * and +119 in 2-7 Triple Draw (live +68); 3-betting the completion first, +15 to +33 in Stud / Razz /
+ * Stud 8 (live ~0).
+ */
+export const STUD_DRAW_FL_CALL_MARGIN = 0.05;
+
+/** Fix round 4 — the Stud / Draw game of a table, read as decideAction reads it; null for Hold'em, Omaha, Short Deck, Pineapple. */
+function studDrawKindOfTable(table: PokerTable): StudDrawKind | null {
+  const variantId: string = (table as any).variantId || 'texas-holdem';
+  const stud = STUD_VARIANT_IDS.has(variantId) || typeof (table as any).getStudFirstActor === 'function';
+  const draw = DRAW_VARIANT_IDS.has(variantId) || typeof (table as any).playerDraw === 'function';
+  const p = table.currentPhase;
+  const drawBet = p === GamePhase.Bet1 || p === GamePhase.Bet2 || p === GamePhase.Bet3 || p === GamePhase.Bet4;
+  return (stud || draw || drawBet) ? (studDrawKindOf(variantId, table) ?? (stud ? 'stud-hi' : 'draw-hi')) : null;
+}
+
+/**
  * Fix round 3 review (REG-2) — Five Card Draw: facing an ALL-IN, a call is a stack-off when the depth
  * at risk against it (the smaller hand-start stack) reaches a third of a 100 BB stack, however deep
  * this seat is. On its own stack alone a 400 BB bot facing a lone 100 BB shove was not "committing":
@@ -2129,7 +2182,49 @@ function studDrawFirstRound(
 // Post-flop decision logic
 // ============================================================
 
+/**
+ * Fix round 4 (bots review, studdraw MEAS-1 / EXPLOIT-1) — postFlopStrategyCore's decision, then, in Five
+ * Card Draw after the draw ONLY, a bet or raise that puts a third of the depth at risk in (the smaller of
+ * this seat's and the deepest live opponent's stack this round) needs the same stack-off class as a call
+ * (FIVE_DRAW_POST_STACKOFF_CLASS); a weaker hand checks / calls instead. In pots built big before the
+ * draw a MANIAC bet half its stack with any hand, then called a shove with one pair or folded its bet:
+ * calling its raises up to 10 BB with any five cards and shoving two pair or better after the draw won
+ * +462 BB/100 vs MANIAC x4 with the call rule alone (live 0dc1b96 -220; cdb31dd +1007 on one seed).
+ * Every other game: the core's decision, unchanged.
+ */
 function postFlopStrategy(
+  effectiveStrength: number,
+  rawStrength: number,
+  callAmount: number,
+  totalPot: number,
+  potOdds: number,
+  seat: Seat,
+  table: PokerTable,
+  profile: AIPlayerProfile,
+  board: BoardTexture,
+  opponents: OpponentModel,
+  outs: number,
+  bigBlind: number,
+  numOpponents: number,
+  oppCategory: OpponentCategory,
+  street: GamePhase = table.currentPhase
+): AIDecision {
+  const d = postFlopStrategyCore(effectiveStrength, rawStrength, callAmount, totalPot, potOdds, seat, table, profile,
+    board, opponents, outs, bigBlind, numOpponents, oppCategory, street);
+  if ((d.action !== PlayerAction.Raise && d.action !== PlayerAction.AllIn) || callAmount >= seat.chipCount) return d;
+  if (studDrawKindOfTable(table) !== 'draw-hi' || table.bettingStructure !== 'no-limit' || drawsLeftAt('draw-hi', table.currentPhase) !== 0) return d;
+  const put = d.action === PlayerAction.AllIn ? seat.chipCount : d.raiseAmount - seat.currentBet;
+  let deepest = 0;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
+    deepest = Math.max(deepest, s.chipCount + s.currentBet);
+  }
+  if (put < STACKOFF_COMMIT_FRACTION * Math.min(seat.chipCount + seat.currentBet, deepest)) return d;
+  if (fiveDrawMadeClass(seat.holeCards) >= (FIVE_DRAW_POST_STACKOFF_CLASS[profile.archetype] ?? 3)) return d;
+  return { action: callAmount > 0 ? PlayerAction.Call : PlayerAction.Check, raiseAmount: 0 };
+}
+
+function postFlopStrategyCore(
   effectiveStrength: number,
   rawStrength: number,
   callAmount: number,
@@ -2173,6 +2268,23 @@ function postFlopStrategy(
   const callDownAdj = (params.callDownTendency - 0.5) * 0.20 + (oppCategory === 'maniac' ? 0.10 : 0);
   const stickyPool = oppCategory === 'station' || oppCategory === 'fish';
   const foldyPool = oppCategory === 'nit' || oppCategory === 'tag';
+
+  // Fix round 4 (bots review, studdraw MEAS-1 / MEAS-2, EXPLOIT-1 / EXPLOIT-2) — Stud / Draw ONLY:
+  // sdKind is null on Hold'em, Omaha, Short Deck and Pineapple, whose decisions do not change.
+  //  - Five Card Draw after the draw: a call of the pot or more that commits a third of the depth
+  //    at risk needs a stack-off hand by made-hand class (FIVE_DRAW_POST_STACKOFF_CLASS).
+  //  - Fixed limit, the rounds after the first: facing ONE bet, a pot share that clears the price
+  //    (STUD_DRAW_FL_CALL_MARGIN) calls in the NIT / ROCK / MANIAC branches, which folded under a
+  //    flat 0.55 / 0.30 / 0.25 whatever the pot laid.
+  const sdKind = studDrawKindOfTable(table);
+  if (sdKind === 'draw-hi' && table.bettingStructure === 'no-limit' && callAmount > 0
+    && drawsLeftAt(sdKind, table.currentPhase) === 0 && potOdds >= 1 / 3
+    && fiveDrawPostCommits(table, seat, callAmount)
+    && fiveDrawMadeClass(seat.holeCards) < (FIVE_DRAW_POST_STACKOFF_CLASS[profile.archetype] ?? 3)) {
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
+  }
+  const flPotOddsCall = sdKind !== null && table.bettingStructure === 'fixed-limit' && callAmount > 0
+    && (Number((table as any).raisesThisStreet) || 0) <= 1 && effectiveStrength >= potOdds + STUD_DRAW_FL_CALL_MARGIN;
 
   // ============================================================
   // ARCHETYPE-SPECIFIC POSTFLOP BRANCHES
@@ -2221,7 +2333,7 @@ function postFlopStrategy(
         return { action: PlayerAction.Raise, raiseAmount: raiseSize };
       }
     }
-    if (effectiveStrength < 0.25) return { action: PlayerAction.Fold, raiseAmount: 0 };
+    if (effectiveStrength < 0.25 && !flPotOddsCall) return { action: PlayerAction.Fold, raiseAmount: 0 };
     return { action: PlayerAction.Call, raiseAmount: 0 };
   }
 
@@ -2234,8 +2346,8 @@ function postFlopStrategy(
       }
       return { action: PlayerAction.Check, raiseAmount: 0 };
     }
-    // Folds anything below top pair to a bet
-    if (effectiveStrength < 0.55) return { action: PlayerAction.Fold, raiseAmount: 0 };
+    // Folds anything below top pair to a bet (fix round 4: Stud / Draw fixed limit, one bet: by the price)
+    if (effectiveStrength < 0.55) return flPotOddsCall ? { action: PlayerAction.Call, raiseAmount: 0 } : { action: PlayerAction.Fold, raiseAmount: 0 };
     if (effectiveStrength > 0.85) {
       const raiseSize = raiseTo(0.7);
       if (chipsFor(raiseSize) <= seat.chipCount) return { action: PlayerAction.Raise, raiseAmount: raiseSize };
@@ -2252,7 +2364,7 @@ function postFlopStrategy(
       }
       return { action: PlayerAction.Check, raiseAmount: 0 };
     }
-    if (effectiveStrength < 0.30) return { action: PlayerAction.Fold, raiseAmount: 0 };
+    if (effectiveStrength < 0.30 && !flPotOddsCall) return { action: PlayerAction.Fold, raiseAmount: 0 };
     if (effectiveStrength > 0.92) {
       // Only raise with monsters
       const raiseSize = raiseTo(0.5);
