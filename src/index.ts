@@ -1701,7 +1701,9 @@ function teardownSeat(
         // settled from the payout mark) only a DEAD hand is folded: a seat torn down at a tournament /
         // fixed-roster table is out of the game, so the settle's retry must never pay it a pot that
         // would leave play with it. A ring seat keeps its tabled hand (forceFoldSeat refuses there).
-        if (!leaverKeepsAllInHand(tableId) && table.currentPhase === GamePhase.Showdown) {
+        // "Resting in Showdown" = a live hand whose payout began (determineWinners sets Showdown, then
+        // takes this hand's payoutStartMark); read first, so every other teardown runs exactly as before.
+        if (table.payoutStartMark?.hand === table.handNumber && !leaverKeepsAllInHand(tableId)) {
           if (table.forceFoldSeat(seatIndex, { deadHand: true })) seatTeardownStats.foldedOutOfTurn++;
         } else {
           foldSeatOutOfHand(table, seatIndex);
