@@ -532,7 +532,7 @@ describe('C1 — a throw on a bot timer is recovered, never left to the process 
     const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'index.ts'), 'utf8');
     // 4 timers + (fix round 3) the 'startHand' handler's deal, whose catch settles a deal-time payout fault
     expect(src.split('try { autoStartNextHand(').length - 1).toBe(5);
-    expect(src).toContain("try { autoStartNextHand(session.tableId); } catch (err) { settleDealThrow(session.tableId, table, 'start_hand', err); }");
+    expect(src).toContain("try { autoStartNextHand(session.tableId); } catch (err) { if (!settleDealThrow(session.tableId, table, 'start_hand', err)) throw err; }");
     expect(src).toContain('if (table.currentPhase === GamePhase.Showdown && gameShowdownHeld(table)) {');
     expect(src).toContain("gameTimers: healthSection('crashSafety.gameTimers', () => ({ ...gameTimerGuardStats })),");
     expect(src).toContain("try { ensureCashTableRunning(t.tableId); } catch (err) { gameTimerGuardStats.heartbeatThrows++;");
