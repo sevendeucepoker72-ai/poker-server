@@ -1794,6 +1794,24 @@ function studDrawKindOfTable(table: PokerTable): StudDrawKind | null {
 export const FIVE_DRAW_ALLIN_COMMIT_BB = 100 * STACKOFF_COMMIT_FRACTION;
 
 /**
+ * Fix round 4 (unequal stacks) — the stack a light Five Card Draw re-raise is sized against
+ * (FIVE_DRAW_LIGHT_RERAISE_FRACTION of it): this seat's street stack, or the smallest street stack
+ * among the live opponents who can still shove and whose shove commits it (hand-start stack at
+ * least FIVE_DRAW_ALLIN_COMMIT_BB), if smaller. On its own 400 BB alone a MANIAC re-raised light
+ * to 40 BB, then folded to a 100 BB shove (FIVE_DRAW_ALLIN_COMMIT_BB): opening 3 BB with any five
+ * cards and shoving over every re-raise won +894 BB/100 vs MANIAC x4 at 400 BB (cdb31dd -88, live
+ * 0dc1b96 -165). At equal stacks it is the seat's own street stack, as before.
+ */
+function lightRaiseDepth(table: PokerTable, seat: Seat, bigBlind: number): number {
+  let depth = seat.chipCount + seat.currentBet;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
+    if (handStartStack(s) >= FIVE_DRAW_ALLIN_COMMIT_BB * bigBlind) depth = Math.min(depth, s.chipCount + s.currentBet);
+  }
+  return depth;
+}
+
+/**
  * Fix round 3 review (EXPLOIT-3) — fixed-limit draw games (2-7 Triple Draw, Badugi): a ROCK in the big
  * blind facing ONE raise calls with this first-round percentile or better (the top 70%: one small bet
  * more into 3.5 is a pot-odds call; live 0dc1b96 defended ~71%). On its flat range (callVsRaiseTh, top
@@ -2016,8 +2034,9 @@ function studDrawFirstRound(
     if (!noLimit) return d;
     const to = Math.max(minRaise, amount), street = seat.chipCount + seat.currentBet;
     if (d.action === PlayerAction.AllIn || to >= street * STACKOFF_COMMIT_FRACTION) return stackOffOK(effBB) ? ALLIN : null;
-    // ... and a re-raise of a hand that would fold to the shove it invites stays small.
-    if (facingRaise && to > street * FIVE_DRAW_LIGHT_RERAISE_FRACTION && !stackOffOK(effBB)) return null;
+    // ... and a re-raise of a hand that would fold to the shove it invites stays small: small against
+    // the shortest live stack whose shove commits it (fix round 4, lightRaiseDepth).
+    if (facingRaise && to > lightRaiseDepth(table, seat, bigBlind) * FIVE_DRAW_LIGHT_RERAISE_FRACTION && !stackOffOK(effBB)) return null;
     return d;
   };
 

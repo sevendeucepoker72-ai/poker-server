@@ -948,6 +948,9 @@ postFlopStrategyCore
 studDrawKindOfTable
 STUD_DRAW_FL_CALL_MARGIN
 flPotOddsCall
+# 2026-11-08 (bots review fix round 4, unequal stacks) - studDrawFirstRound: a Five Card Draw light re-raise is
+# sized against the shortest live stack whose shove commits the bot (lightRaiseDepth), not its own deep stack.
+lightRaiseDepth
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as
