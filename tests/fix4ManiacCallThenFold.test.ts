@@ -9,7 +9,8 @@
  *  2. A deep MANIAC facing a short all-in it does not close (players still to act) skipped the stack-off gate
  *     (the call was under a third of ITS stack) and the MANIAC branch called with ~70% of hands. It now continues
  *     only with the stack-off range for the depth at risk (the shover's stack), by calling: a 40 BB re-shove with
- *     any two over five 500 BB MANIACs won +250 BB/100 (live -138).
+ *     any two over five 500 BB MANIACs won +250 BB/100 (live -138). A short all-in (within the push/fold zone,
+ *     25 BB) keeps the MANIAC branch, so it still isolates a micro shove.
  * Real PokerTable + real decideAction, seeded Math.random (the LCG of tests/botPremiumHold.test.ts). 6 seats at
  * 50/100: btn 0 (the human), sb 1, bb 2, utg 3, mp 4, co 5. The bounds below fail on 0bc7529 and on the
  * HOLDEM-R3-REG-1 commit alone (equal 40 / 60 / 100 BB: 19 / 13 / 10% continued; deep: 63-72%).
@@ -91,6 +92,24 @@ describe('MANIAC call-then-fold (fix round 4) — a MANIAC that flat-called does
       if (r > max) bad.push(`${diff} ${name}: continued ${(100 * r).toFixed(1)}% > ${100 * max}%`);
     }
     expect(bad).toEqual([]);
+  });
+
+  it('a short all-in (within the push/fold zone) keeps the MANIAC branch: a 100 BB MANIAC in MP facing a UTG 1.5 BB all-in with 4 deep behind still isolates it (re-raises >= 30%; 0bc7529 52%)', () => {
+    for (const diff of ['hard', 'medium']) {
+      let raises = 0;
+      const n = 300;
+      const restore = seedRandom(4242);
+      try {
+        for (let k = 0; k < n; k++) {
+          const t = table([100, 100, 100, 1.5, 100, 100]);
+          expect(t.playerAllIn(3)).toBe(true);
+          deal(t, 4);
+          expect(t.activeSeatIndex).toBe(4);
+          if (decideAction(t, 4, prof('MANIAC', diff)).action === PlayerAction.Raise) raises++;
+        }
+      } finally { restore(); }
+      expect([diff, raises / n >= 0.3]).toEqual([diff, true]);
+    }
   });
 
   it('it still plays: AA in the deep big-blind spot always continues, and 72o folds', () => {

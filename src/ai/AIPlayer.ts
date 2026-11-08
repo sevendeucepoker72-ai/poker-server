@@ -1556,8 +1556,9 @@ function preFlopStrategy(
   // still to act) for less than a third of ITS stack skipped the gate above, and the MANIAC branch below
   // called it with ~70% of hands (63-72% vs a 40 BB shove at 500 BB). Against the shover the call is a
   // stack-off for the depth at risk (his stack): the stack-off range for shoveBB, by calling. A 40 BB
-  // re-shove with any two over five 500 BB MANIACs won +250 BB/100 (live 0dc1b96 -138).
-  if (!allInOrFold && noLimit && shover && profile.archetype === 'MANIAC' && effBB > PUSH_FOLD_MAX_BB) {
+  // re-shove with any two over five 500 BB MANIACs won +250 BB/100 (live 0dc1b96 -138). A short all-in
+  // (shoveBB within the push/fold zone) keeps the MANIAC branch: it still isolates it.
+  if (!allInOrFold && noLimit && shover && profile.archetype === 'MANIAC' && effBB > PUSH_FOLD_MAX_BB && shoveBB > PUSH_FOLD_MAX_BB) {
     if (!stackOffOK(shoveBB, maniacWiden(shoveBB))) return FOLD;
     return callAmount < seat.chipCount ? CALL : ALLIN;
   }

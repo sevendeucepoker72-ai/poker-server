@@ -2148,3 +2148,6 @@ maniacWiden(soDepth)
 # open, live 6.2-9.0%; a 5 BB any-two steal vs five NITs won +28 to +30 BB/100, live +6 to +19).
 NIT_SIZE_NARROW_SLACK
 Math.min(1, nitSlack * sizeFactor)
+# 2026-11-08 (bots review fix round 4, holdem lane) - the deep-MANIAC all-in gate above applies only to an all-in deeper than the
+# push/fold zone (shoveBB > PUSH_FOLD_MAX_BB): a short all-in keeps the MANIAC branch (it isolates a 1.5 BB shove ~52%).
+&& shoveBB >
