@@ -61,7 +61,9 @@ const COUNTERS = ['actionThrows', 'drawThrows', 'autoStartThrows', 'heartbeatThr
   'absentActThrows', 'absentStandPatThrows', 'holdReleaseThrows', 'dealThrows', 'tournamentTimerThrows', 'reservationTimerThrows',
   'humanPathShowdowns', 'watchdogShowdowns', 'dealPayoutFaults', 'drawRoundRetries',
   // fix round 3 review — additive
-  'absentStandPatGiveUps', 'spinGoDealRetries'];
+  'absentStandPatGiveUps', 'spinGoDealRetries',
+  // fix round 4 — additive
+  'absentActGiveUps', 'botActionGiveUps', 'heldResolvedByAdmin'];
 
 interface WorldOpts {
   /** decideAction stand-in (default: the real one). */

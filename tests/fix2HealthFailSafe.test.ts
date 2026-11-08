@@ -36,6 +36,8 @@ function health(opts: Opts = {}) {
     pruneBrokenTournamentTables() {}, deployedCommitOf: () => null,
     tableManager: { getTableList: () => [{ tableId: 'T1' }, { tableId: 'T2' }], getAllTableIds: () => ['T1', 'T2'], getTable: () => undefined },
     gameTimerGuardStats: { actionThrows: 0, drawThrows: 0, autoStartThrows: 0, heartbeatThrows: 0, turnClockThrows: 0, drawClockThrows: 0, lastAt: null },
+    // fix round 4 — the hands held in Showdown now
+    heldShowdownsNow: () => [{ tableId: 'T1', handNumber: 7, since: '2026-11-08T00:00:00.000Z', reason: 'unreadable_stakes' }],
     botFlowStats: { since: '2026-11-05T00:00:00.000Z', formats },
     handRewardStats: { xpSkipped: 1, xpReduced: 0, scratchTicksSkipped: 1, walksNotCounted: 0, scratchAwarded: 2, scratchCapped: 0, capNotices: 0 },
     IDLE_HANDS_REWARD_LIMIT: 30, SCRATCH_CARDS_PER_DAY: 10, HAND_XP_FULL_PER_DAY: 1000,
@@ -70,6 +72,7 @@ describe('/api/health — the bots-review sections are built fail-safe; the depl
     expect(status).toBe(200);
     expect(body.status).toBe('ok');
     expect(body.crashSafety.gameTimers).toMatchObject({ turnClockThrows: 0, drawClockThrows: 0, autoStartThrows: 0 });
+    expect(body.crashSafety.heldShowdowns).toEqual([{ tableId: 'T1', handNumber: 7, since: '2026-11-08T00:00:00.000Z', reason: 'unreadable_stakes' }]);   // fix round 4
     expect(body.economy.botFlow).toEqual({ since: '2026-11-05T00:00:00.000Z', totalHumanNet: -50, totalAccountNet: -50, formats: { 'cash:texas-holdem': expect.objectContaining({ hands: 3, humanNet: -50 }) } });
     expect(body.economy.handRewards).toMatchObject({ idleHandsLimit: 30, scratchCardsPerDay: 10, handXpFullPerDay: 1000, scratchAwarded: 2,
       scratchCapColumns: { alterFailed: false, alterFailures: 0, uncappedTicks: 0, lastError: null } });

@@ -2155,3 +2155,24 @@ absentStandPatGiveUps
 spinGoFirstDeal
 spinGoDealRetries
 payable: this.seats.map(
+# 2026-11-08 (bots review fix round 4, server lane) - a busted seat is not payable (the mark mirrors determineWinners);
+# a seat of the mark stood up while its payout rests in Showdown is recorded on the mark (left) and read by the settle;
+# a hand still unreadable is HELD, listed in health crashSafety.heldShowdowns and ended by an admin
+# ('adminResolveHeldHand'); the shutdown flush / forced close / quick cleanup cash a resting Showdown out from its
+# payout mark (never a paid pot again); the engine never folds a leaver in Showdown; the 500 ms auto-act is one
+# pending per seat and neither it nor a bot is re-armed for a turn that threw 3 times; a bomb pot's runout is inside
+# the guarded deal at dealAfterJoin / 'startHand' / the club challenge sweep.
+left: this.seats.map(() => null)
+payoutSinceMark(
+restingShowdownHoldings(
+crashSafety.heldShowdowns
+adminResolveHeldHand
+adminResolveHeldHandResult
+ADMIN_RESOLVE_HELD_HAND
+heldResolvedByAdmin
+'unreadable_stakes'
+'departed_gain'
+TURN_ACT_RETRIES
+armAbsentActOnce(
+absentActGiveUps
+botActionGiveUps

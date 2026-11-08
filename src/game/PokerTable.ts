@@ -444,8 +444,14 @@ export class PokerTable extends EventEmitter {
    * all — chips in the pot (a folded seat's uncalled excess comes back to it) or still
    * contesting it. A seat with neither (a joiner sat out of the hand, a fold with nothing in)
    * is paid nothing, so its leaving or being taken afterwards never makes the result unreadable.
+   * Fix round 4 (SERVER-R3-REG-PAYABLE-1) — exactly determineWinners' own exclusions: an
+   * ELIMINATED seat (a busted 0-chip seat, dealt nothing) is never in its seat list, and a seat
+   * holding no cards counts as folded; such a seat was marked payable and its leave HELD the hand.
+   * `left` (fix round 4): what a seat of the mark held (chipCount + totalInvestedThisHand) when
+   * it was stood up while this payout rested in Showdown (a faulted payout, before its settle) —
+   * whatever path stood it up — so the settle still reads what the payout credited it.
    */
-  public payoutStartMark: { hand: number; stakes: number[]; ids: string[]; payable: boolean[] } | null = null;
+  public payoutStartMark: { hand: number; stakes: number[]; ids: string[]; payable: boolean[]; left: Array<{ holding: number; invested: number } | null> } | null = null;
 
   /** SR2-2 — take this hand's payoutStartMark (first call per hand only). */
   protected markPayoutStart(): void {
@@ -454,7 +460,9 @@ export class PokerTable extends EventEmitter {
       hand: this.handNumber,
       stakes: this.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1)),
       ids: this.seats.map((s) => s.playerId),
-      payable: this.seats.map((s) => s.state === 'occupied' && ((s.totalInvestedThisHand || 0) > 0 || !s.folded)),
+      payable: this.seats.map((s) => s.state === 'occupied' && !s.eliminated
+        && ((s.totalInvestedThisHand || 0) > 0 || (!s.folded && s.holeCards.length > 0))),
+      left: this.seats.map(() => null),
     };
   }
 
@@ -601,6 +609,14 @@ export class PokerTable extends EventEmitter {
     if (this.seats[seatIndex].state === 'empty') return false;
 
     const playerName = this.seats[seatIndex].playerName;
+    // Fix round 4 (SERVER-R3-REG-PAYABLE-1) — a seat of this hand's payout mark leaving while the
+    // payout rests in Showdown (a faulted payout, before its settle): what it held goes on the mark.
+    const mark = this.payoutStartMark;
+    const leaving = this.seats[seatIndex];
+    if (mark && mark.hand === this.handNumber && this.currentPhase === GamePhase.Showdown
+        && Array.isArray(mark.left) && !mark.left[seatIndex] && mark.ids[seatIndex] === leaving.playerId) {
+      mark.left[seatIndex] = { holding: leaving.chipCount + (leaving.totalInvestedThisHand || 0), invested: leaving.totalInvestedThisHand || 0 };
+    }
     this.seats[seatIndex] = createEmptySeat(seatIndex);
     // Defensively drop from the sitting-out set so a new occupant of
     // this index inherits a clean slate — belt-and-suspenders on top
@@ -1835,6 +1851,10 @@ export class PokerTable extends EventEmitter {
    */
   forceFoldSeat(seatIndex: number): boolean {
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
+    // Fix round 4 (server review, faults lens) — never in Showdown: the betting is over and the
+    // payout has begun (a hand only RESTS there after a payout fault, settled from
+    // payoutStartMark); a leaver folded there lost his share of a pot the settle's retry then paid.
+    if (this.currentPhase === GamePhase.Showdown) return false;
     const seat = this.seats[seatIndex];
     if (seat.state !== 'occupied' || seat.folded) return false;
     seat.folded = true;
