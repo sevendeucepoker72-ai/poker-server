@@ -2144,12 +2144,14 @@ function studDrawFirstRound(
   //    calls (it does not move in its deeper stack). Fix round 4: for a LONE shove only (the
   //    round's one raise); in a raise war the seat's own stack prices it, as before (a 400 BB
   //    MANIAC folded its light re-raises, and its cold calls, to a 100 BB shove over them).
+  //    Review fix-ups: the round's one FULL raise (fullRaises): a short all-in for less before the
+  //    shove does not make it a raise war.
   //    Review MEAS-3: premiums by class.
   //    Fix round 4 (unequal stacks): a seat whose own re-raise is more than the light share of
   //    the depth at risk against a SHORTER all-in calls it (reRaisePricedIn). ──
   const ownCommit = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
   const committing = ownCommit
-    || (callAmount > 0 && !!shover && shoveBB >= FIVE_DRAW_ALLIN_COMMIT_BB && streetRaises <= 1);
+    || (callAmount > 0 && !!shover && shoveBB >= FIVE_DRAW_ALLIN_COMMIT_BB && fullRaises <= 1);
   const soPlayers = Math.min(3, pyta);
   const stackOffOK = (depthBB: number): boolean => premium || (depthBB <= PUSH_FOLD_MAX_BB
     ? pctile >= adjustThreshold(nashCallPctile(depthBB, soPlayers), factor)

@@ -956,7 +956,10 @@ flPotOddsCall
 # 2026-11-08 (bots review fix round 4, unequal stacks) - studDrawFirstRound: the REG-2 depth rule (a 100 BB shove
 # commits a deep bot) is for a LONE shove (the round's one raise); in a raise war a seat prices a shove on its own
 # stack, as cdb31dd did.
-FIVE_DRAW_ALLIN_COMMIT_BB && streetRaises <= 1);
+# SUPERSEDED 2026-11-09 by the full-raise line below (never shipped; a short all-in for less before the shove
+# switched the lone-shove rule off):
+# FIVE_DRAW_ALLIN_COMMIT_BB && streetRaises <= 1);
+FIVE_DRAW_ALLIN_COMMIT_BB && fullRaises <= 1);
 # 2026-11-08 (bots review fix round 4, unequal stacks) - studDrawFirstRound: a seat that RE-raised and put in more
 # than the light share (FIVE_DRAW_LIGHT_RERAISE_FRACTION) of the depth at risk against a SHORTER all-in calls it; a
 # MANIAC folded ~90% of its light re-raises to a 40 BB human's shove and opening any five cards won +98 BB/100.

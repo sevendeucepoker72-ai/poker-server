@@ -234,6 +234,51 @@ describe('SD2-1: Five Card Draw - a value-set hand never folds to one short all-
       expect(diffs).toEqual([]);
     } finally { restore(); }
   }, 300_000);
+
+  // Fix round 4 review (regression lens, non-blocking): the lone-shove depth rule counts FULL raises. A short all-in
+  // for less than a full raise before the 100 BB shove (raisesThisStreet 2, one full raise) switched it off, and a
+  // 400 BB bot priced the shove on its own stack again.
+  it('review REG-2: a short all-in raise for less before the lone 100 BB shove does not switch the depth rule off (a 400 BB bot decides as a 100 BB bot does)', () => {
+    const restore = detEnv(3106);
+    try {
+      // seat 3: a human with 70 chips all-in (a raise of 20 over the 50 big blind: not a full raise); seat 4: a human
+      // with 100 BB shoves; the bots (seats 0-2, 5) hold `deep` BB; closer = the big blind (seat 2) closes.
+      const decide = (deep: number, closer: boolean, cards: any[], p: any, seed: number): any => {
+        const t = make['five-card-draw']();
+        for (let i = 0; i < 6; i++) t.sitDown(i, 'P' + i, 5000, (i === 3 || i === 4 ? 'human-vsai-' : 'ai-vsai-') + i, !(i === 3 || i === 4));
+        for (let i = 0; i < 6; i++) t.seats[i].chipCount = i === 3 ? 70 : i === 4 ? 100 * 50 : deep * 50;
+        t.startNewHand();
+        expect(t.activeSeatIndex).toBe(3);
+        expect(t.playerAllIn(3)).toBe(true);
+        expect(t.playerAllIn(4)).toBe(true);
+        expect([Number(t.raisesThisStreet), Number(t.betLevelsThisStreet)]).toEqual([2, 2]);
+        if (closer) { let g = 0; while (g++ < 10 && t.activeSeatIndex >= 0 && t.activeSeatIndex !== 2) t.playerFold(t.activeSeatIndex); }
+        const me = t.activeSeatIndex; expect(me).toBe(closer ? 2 : 5);
+        t.seats[me].holeCards = cards.map((c) => ({ ...c }));
+        const r = Math.random; let s = seed >>> 0;
+        Math.random = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+        try { return AI.decideAction(t, me, p); } finally { Math.random = r; }
+      };
+      const randomHand = (): any[] => {
+        const out: any[] = [];
+        while (out.length < 5) { const c = { rank: 2 + Math.floor(Math.random() * 13), suit: Math.floor(Math.random() * 4) }; if (!out.some((x) => same(x, c))) out.push(c); }
+        return out;
+      };
+      const diffs: string[] = []; let n = 0;
+      for (const closer of [true, false]) for (const a of ARCH) for (const diff of DIFFS) {
+        const p = prof(a, diff);
+        for (const cards of [ranks('AAK73'), ranks('QQJJ5'), ranks('JJ852'), randomHand(), randomHand(), randomHand()]) {
+          const seed = Math.floor(Math.random() * 4294967296);
+          const f100 = decide(100, closer, cards, p, seed).action === PlayerAction.Fold;
+          const f400 = decide(400, closer, cards, p, seed).action === PlayerAction.Fold;
+          n++;
+          if (f100 !== f400) diffs.push(`${closer ? 'closer' : 'behind'} ${a}/${diff} ${cards.map((c: any) => c.rank).join('-')}: 100 BB ${f100 ? 'fold' : 'continue'}, 400 BB ${f400 ? 'fold' : 'continue'}`);
+        }
+      }
+      expect(n).toBe(2 * 7 * 4 * 6);
+      expect(diffs).toEqual([]);
+    } finally { restore(); }
+  }, 300_000);
 });
 
 describe('review MEAS-3: Five Card Draw stack-off premiums by made-hand class', () => {
