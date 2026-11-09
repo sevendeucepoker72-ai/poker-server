@@ -1023,6 +1023,15 @@ FIVE_DRAW_POST_LOOSE_PO
 # 2026-11-09 (bots review fix round 4, re-review fix-ups) - betRaisingEntries: a UTG straddle is the first round's posted
 # blind, not a raise (R4F-REGRESSION-2: an all-in call for less than the straddle made the bot's open a re-raise).
 firstRound && e.action === 'straddle'
+# 2026-11-09 (bots review fix round 4, fix-up 3) - postFlopStrategy, Five Card Draw after the draw: a MANIAC with seats
+# still to act behind it also leads a share of its lower pairs and checks (traps) a share of its kings or better
+# (FIVE_DRAW_POST_MANIAC_MIX), so its check is no longer a capped range (RR2-EXPLOIT-1: shoving any hand on the button
+# once every MANIAC had checked won +66 BB/100); checked to by every seat (fiveDrawPostCheckedToLast) it bets as the core
+# MANIAC does (R4RR-REGRESSION-1: a short stack's checked hands reached showdown free); a capped lead under the minimum
+# bet is the bot's whole stack, not a check (R4RR-REGRESSION-2).
+FIVE_DRAW_POST_MANIAC_MIX
+fiveDrawPostCheckedToLast
+to < table.getMinRaise()
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

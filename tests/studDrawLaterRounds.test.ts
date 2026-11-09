@@ -511,7 +511,7 @@ describe('fix round 4 review (REGRESSION-3): Five Card Draw after the draw, the 
   it('heads-up, 40 BB pot, 80 BB behind, the bot first to act: a MANIAC / LAG with one pair or two pair below aces up never bets a third of the depth at risk (cdb31dd: MANIAC bet Q-Q every time); aces up still bets', () => {
     const restore = detEnv(4141);
     try {
-      const big: string[] = []; let n = 0, aBets = 0, aN = 0;
+      const big: string[] = []; let n = 0; const aBets: Record<string, number> = { MANIAC: 0, LAG: 0 }, aN: Record<string, number> = { MANIAC: 0, LAG: 0 };
       for (const a of ['MANIAC', 'LAG']) for (const diff of DIFFS) {
         for (const h of ['Qh Qd 9c 5s 2h', 'Ah Ad 9c 6s 3h', 'Kh Kd Qc Qs 3h']) {
           for (let k = 0, got = 0; got < 3 && k < 30; k++) {
@@ -523,15 +523,17 @@ describe('fix round 4 review (REGRESSION-3): Five Card Draw after the draw, the 
           }
         }
         for (let k = 0, got = 0; got < 3 && k < 30; k++) {
-          const r = headsUpPostDraw(C('Ah Ad Kc Ks 3h'), 'lead'); if (!r) continue; got++; aN++;
+          const r = headsUpPostDraw(C('Ah Ad Kc Ks 3h'), 'lead'); if (!r) continue; got++; aN[a]++;
           const d = AI.decideAction(r.t, r.me, prof(a, diff));
-          if (d.action === PlayerAction.Raise || d.action === PlayerAction.AllIn) aBets++;
+          if (d.action === PlayerAction.Raise || d.action === PlayerAction.AllIn) aBets[a]++;
         }
       }
       expect(n).toBe(2 * 4 * 3 * 3);
       expect(big).toEqual([]);
-      expect(aN).toBe(2 * 4 * 3);
-      expect(aBets / aN).toBeGreaterThanOrEqual(0.9);
+      expect([aN.MANIAC, aN.LAG]).toEqual([4 * 3, 4 * 3]);
+      expect(aBets.LAG / aN.LAG).toBeGreaterThanOrEqual(0.9);
+      // fix-up 3: a MANIAC first to act checks (traps) a share of its kings or better (FIVE_DRAW_POST_MANIAC_MIX)
+      expect(aBets.MANIAC / aN.MANIAC).toBeGreaterThanOrEqual(0.5);
     } finally { restore(); }
   }, 300_000);
 });
@@ -672,10 +674,10 @@ function postDrawShortLead(cards: any[], shape: 'hu' | 'third', behindBB: number
   return { t, me };
 }
 
-function leadShare(seed: number, spot: (c: any[]) => { t: any; me: number } | null, hands: string[], per: number): { bets: number; n: number; out: string[] } {
+function leadShare(seed: number, spot: (c: any[]) => { t: any; me: number } | null, hands: string[], per: number): { bets: number; n: number; out: string[]; by: Record<string, { bets: number; n: number }> } {
   const restore = detEnv(seed);
   try {
-    const out: string[] = []; let bets = 0, n = 0;
+    const out: string[] = []; let bets = 0, n = 0; const by: Record<string, { bets: number; n: number }> = { MANIAC: { bets: 0, n: 0 }, LAG: { bets: 0, n: 0 } };
     for (const h of hands) for (const a of ['MANIAC', 'LAG']) {
       let b = 0, m = 0;
       for (const diff of DIFFS) for (let k = 0, got = 0; got < per && k < per * 15; k++) {
@@ -683,9 +685,9 @@ function leadShare(seed: number, spot: (c: any[]) => { t: any; me: number } | nu
         const d = AI.decideAction(r.t, r.me, prof(a, diff));
         if (d.action === PlayerAction.Raise || d.action === PlayerAction.AllIn) b++;
       }
-      out.push(`${h} ${a} ${b}/${m}`); bets += b; n += m;
+      out.push(`${h} ${a} ${b}/${m}`); bets += b; n += m; by[a].bets += b; by[a].n += m;
     }
-    return { bets, n, out };
+    return { bets, n, out, by };
   } finally { restore(); }
 }
 
@@ -696,22 +698,24 @@ describe('re-review fix-ups (STUDDRAW-R4F-REGRESSION-1 / R4R-EXPLOIT-1 / RR1-MEA
     const r25 = leadShare(4172, (c) => postDrawShortLead(c, 'hu', 25), hands, 3);
     process.stdout.write(`HU short human, leads: 10 BB ${r10.out.join(', ')} | 25 BB ${r25.out.join(', ')}\n`);
     expect([r10.n, r25.n]).toEqual([3 * 2 * 4 * 3, 3 * 2 * 4 * 3]);
-    expect(r10.bets / r10.n).toBeGreaterThanOrEqual(0.9);
-    expect(r25.bets / r25.n).toBeGreaterThanOrEqual(0.9);
+    // the LAG leads them all; a MANIAC with seats behind it traps a share of these hands (fix-up 3, FIVE_DRAW_POST_MANIAC_MIX)
+    for (const r of [r10, r25]) expect([r.by.LAG.bets / r.by.LAG.n >= 0.9, r.by.MANIAC.bets / r.by.MANIAC.n >= 0.5]).toEqual([true, true]);
   }, 300_000);
 
   it('a 5-way pot with a 100 BB human and a THIRD seat left with 1 / 3 / 10 BB behind: a MANIAC / LAG still leads K-K-Q-Q (cdfc8a1: 0 of 90; c2b81d4 and live 28 of 90, MANIAC / LAG 13-15 of 15)', () => {
-    let bets = 0, n = 0; const out: string[] = [];
+    let n = 0; const out: string[] = []; const by: Record<string, { bets: number; n: number }> = { MANIAC: { bets: 0, n: 0 }, LAG: { bets: 0, n: 0 } };
     for (const [seed, bb] of [[4173, 1], [4174, 3], [4175, 10]]) {
       const r = leadShare(seed, (c) => postDrawShortLead(c, 'third', bb), ['Kh Kd Qc Qs 3h'], 3);
-      bets += r.bets; n += r.n; out.push(`${bb} BB: ${r.out.join(', ')}`);
+      n += r.n; out.push(`${bb} BB: ${r.out.join(', ')}`);
+      for (const a of ['MANIAC', 'LAG']) { by[a].bets += r.by[a].bets; by[a].n += r.by[a].n; }
     }
     process.stdout.write(`third seat short, K-K-Q-Q leads: ${out.join(' | ')}\n`);
     expect(n).toBe(3 * 2 * 4 * 3);
-    expect(bets / n).toBeGreaterThanOrEqual(0.9);
+    // the LAG leads it; a MANIAC with seats behind it traps a share of it (fix-up 3, FIVE_DRAW_POST_MANIAC_MIX)
+    expect([by.LAG.bets / by.LAG.n >= 0.75, by.MANIAC.bets / by.MANIAC.n >= 0.5]).toEqual([true, true]);
   }, 300_000);
 
-  it('a 5-way pot with a 40 BB human: one capped lead size for every hand; a LAG leads one pair and no pair too, a MANIAC leads a pair of kings or better and about half its no-pair hands, and checks the lower pairs (cdfc8a1: a big lead was aces up or better 473 times in 476; one pair never led, no pair never led)', () => {
+  it('a 5-way pot with a 40 BB human: one capped lead size for every hand; a LAG leads one pair and no pair too, a MANIAC (seats behind it) leads most of its kings or better, about half its lower pairs and a third of its no-pair hands (cdfc8a1: a big lead was aces up or better 473 times in 476; one pair never led, no pair never led; fix-up 3: 280dc09 checked every lower pair and led every K-K or better)', () => {
     const restore = detEnv(4176);
     try {
       const groups: Record<string, string[]> = { low: ['Qh Qd 9c 5s 2h', '7h 7d Ac 9s 4h'], air: ['Ah Kd 9c 7s 3h', 'Kh Qd 9c 6s 2h'], value: ['Kh Kd Ac 9s 4h', 'Ah Ad Kc Ks 3h', '2h 2d 2c 7s 3h'] };
@@ -734,16 +738,16 @@ describe('re-review fix-ups (STUDDRAW-R4F-REGRESSION-1 / R4R-EXPLOIT-1 / RR1-MEA
       process.stdout.write(`40 BB human, leads: ${Object.keys(st).map((k) => `${k} ${st[k].bets}/${st[k].n} (${mean(k).toFixed(3)})`).join(', ')}\n`);
       expect(over).toBe(0);
       expect([share('LAG low') >= 0.6, share('LAG air') >= 0.3, share('LAG value') >= 0.75]).toEqual([true, true, true]);
-      expect([share('MANIAC low'), share('MANIAC value')]).toEqual([0, 1]);
-      expect(share('MANIAC air')).toBeGreaterThanOrEqual(0.25);
-      expect(share('MANIAC air')).toBeLessThanOrEqual(0.75);
+      expect([share('MANIAC low') >= 0.2, share('MANIAC low') <= 0.8, share('MANIAC value') >= 0.5, share('MANIAC value') <= 0.95]).toEqual([true, true, true, true]);
+      expect(share('MANIAC air')).toBeGreaterThanOrEqual(0.1);
+      expect(share('MANIAC air')).toBeLessThanOrEqual(0.6);
       // every lead the same size: value and bluffs alike
-      for (const k of ['LAG low', 'LAG air', 'MANIAC air']) expect([k, Math.abs(mean(k) - mean(k.split(' ')[0] + ' value')) <= 0.03]).toEqual([k, true]);
+      for (const k of ['LAG low', 'LAG air', 'MANIAC low', 'MANIAC air']) expect([k, Math.abs(mean(k) - mean(k.split(' ')[0] + ' value')) <= 0.03]).toEqual([k, true]);
     } finally { restore(); }
   }, 300_000);
 
   it('the MANIAC lead rule and the checked-range price are pinned', () => {
-    expect([...AI.FIVE_DRAW_POST_MANIAC_LEAD]).toEqual([1 + 11 / 13, 0.5]);
+    expect([...AI.FIVE_DRAW_POST_MANIAC_LEAD]).toEqual([1 + 11 / 13, 0.35]);
     expect(AI.FIVE_DRAW_POST_CHECKED_PO).toEqual({ NIT: 0, ROCK: 0, TAG: 0, LAG: 0, MANIAC: 0.08, FISH: 0, CALLING_STATION: 0 });
   });
 
