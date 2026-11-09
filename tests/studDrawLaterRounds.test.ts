@@ -542,3 +542,55 @@ describe('fix round 4 review fix-ups (MEASUREMENT-2): Five Card Draw after the d
     } finally { restore(); }
   }, 300_000);
 });
+
+/**
+ * Review fix-ups (MEASUREMENT-2): Five Card Draw, 5 seats; seat 0 (a human with `heroBB`) opens to `openBB` BB, every bot
+ * calls, all stand pat; after the draw the first seat to act is a bot holding `cards` (nothing to call). null otherwise.
+ */
+function postDrawMultiLead(cards: any[], heroBB = 40, openBB = 5): { t: any; me: number } | null {
+  const t = make['five-card-draw']();
+  for (let i = 0; i < 5; i++) t.sitDown(i, 'P' + i, 5000, (i === 0 ? 'human-later-' : 'ai-later-') + i, i !== 0);
+  t.seats[0].chipCount = heroBB * 50;
+  if (!t.startNewHand()) return null;
+  let g = 0, opened = false;
+  while (t.currentPhase === GamePhase.PreFlop && g++ < 30) {
+    const a = t.activeSeatIndex; if (a < 0) return null;
+    if (a === 0 && !opened) { if (!t.playerRaise(0, openBB * 50)) return null; opened = true; continue; }
+    if (!t.playerCall(a)) t.playerCheck(a);
+  }
+  if (!opened) return null;
+  g = 0;
+  while (DRAW.includes(t.currentPhase) && g++ < 10) for (const x of t.seats) if (x.state === 'occupied' && !x.folded && x.holeCards.length && !t.drawsCompleted.has(x.seatIndex)) { t.playerDraw(x.seatIndex, []); if (!DRAW.includes(t.currentPhase)) break; }
+  if (t.currentPhase !== GamePhase.Bet2 || t.seats.some((x: any) => x.folded)) return null;
+  const me = t.activeSeatIndex; if (me <= 0) return null;
+  const spare = t.seats[me].holeCards.filter((c: any) => !cards.some((y: any) => same(y, c)));
+  for (const x of t.seats) if (x.seatIndex !== me) x.holeCards = x.holeCards.map((c: any) => (cards.some((y: any) => same(y, c)) ? spare.pop() : c));
+  t.seats[me].holeCards = cards.map((c) => ({ ...c }));
+  return { t, me };
+}
+
+describe('fix round 4 review fix-ups (MEASUREMENT-2): Five Card Draw after the draw, the bet gate measures the depth on the SHORTEST live opponent', () => {
+  it('a 5-way pot with a 40 BB human (35 BB behind) and 100 BB bots: a LAG / MANIAC first to act never bets a third of the human\'s depth with Q-Q, 9-9-5-5 or K-K-Q-Q (b8cca39: LAG 9-11 of 12, MANIAC 2-6 of 12); aces up and trips still bet', () => {
+    const restore = detEnv(4161);
+    try {
+      const big: string[] = []; let n = 0, strong = 0, sN = 0;
+      for (const a of ['LAG', 'MANIAC']) for (const diff of DIFFS) {
+        for (const h of ['Qh Qd 9c 5s 2h', '9h 9d 5c 5s Kh', 'Kh Kd Qc Qs 3h', 'Ah Ad Kc Ks 3h', '2h 2d 2c 7s 3h']) {
+          for (let k = 0, got = 0; got < 3 && k < 30; k++) {
+            const r = postDrawMultiLead(C(h)); if (!r) continue; got++;
+            const me = r.t.seats[r.me], hero = r.t.seats[0];
+            const depth = Math.min(me.chipCount + me.currentBet, hero.chipCount + hero.currentBet);
+            const d = AI.decideAction(r.t, r.me, prof(a, diff));
+            const put = d.action === PlayerAction.AllIn ? me.chipCount : d.action === PlayerAction.Raise ? d.raiseAmount - me.currentBet : 0;
+            if (h.startsWith('A') || h.startsWith('2')) { sN++; if (put >= depth / 3) strong++; continue; }
+            n++;
+            if (put >= depth / 3) big.push(`${h} ${a}/${diff} ${d.action} ${put}`);
+          }
+        }
+      }
+      expect([n, sN]).toEqual([2 * 4 * 3 * 3, 2 * 4 * 2 * 3]);
+      expect(big).toEqual([]);
+      expect(strong / sN).toBeGreaterThanOrEqual(0.7);
+    } finally { restore(); }
+  }, 300_000);
+});

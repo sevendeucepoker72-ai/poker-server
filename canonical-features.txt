@@ -1000,6 +1000,10 @@ betRaisingEntries
 # (FIVE_DRAW_POST_OVERCALL; MEASUREMENT-2: value bets into MANIAC-built multiway pots were paid by every caller).
 FIVE_DRAW_POST_OVERCALL
 fiveDrawPostOvercall
+# 2026-11-09 (bots review fix round 4, review fix-ups) - postFlopStrategy, the 5CD post-draw bet gate: the depth at
+# risk is the SHORTEST live opponent with chips behind (fiveDrawPostBetDepth), not the deepest: in multiway pots a
+# LAG / MANIAC bet a short human's whole stack with one pair / two pair and was then pot-committed to his shove.
+fiveDrawPostBetDepth
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

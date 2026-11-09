@@ -2381,7 +2381,8 @@ function studDrawFirstRound(
 /**
  * Fix round 4 (bots review, studdraw MEAS-1 / EXPLOIT-1) — postFlopStrategyCore's decision, then, in Five
  * Card Draw after the draw ONLY, a bet or raise that puts a third of the depth at risk in (the smaller of
- * this seat's and the deepest live opponent's stack this round) needs the same stack-off class as a call
+ * this seat's stack and the shortest live opponent's with chips behind this round, fiveDrawPostBetDepth;
+ * fix round 4 used the deepest opponent's) needs the same stack-off class as a call
  * (FIVE_DRAW_POST_STACKOFF_CLASS); a weaker hand checks / calls instead. In pots built big before the
  * draw a MANIAC bet half its stack with any hand, then called a shove with one pair or folded its bet:
  * calling its raises up to 10 BB with any five cards and shoving two pair or better after the draw won
@@ -2410,14 +2411,30 @@ function postFlopStrategy(
   if ((d.action !== PlayerAction.Raise && d.action !== PlayerAction.AllIn) || callAmount >= seat.chipCount) return d;
   if (studDrawKindOfTable(table) !== 'draw-hi' || table.bettingStructure !== 'no-limit' || drawsLeftAt('draw-hi', table.currentPhase) !== 0) return d;
   const put = d.action === PlayerAction.AllIn ? seat.chipCount : d.raiseAmount - seat.currentBet;
-  let deepest = 0;
-  for (const s of table.seats) {
-    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
-    deepest = Math.max(deepest, s.chipCount + s.currentBet);
-  }
-  if (put < STACKOFF_COMMIT_FRACTION * Math.min(seat.chipCount + seat.currentBet, deepest)) return d;
+  // Review fix-ups: the depth at risk is the SHORTEST live opponent with chips behind (fiveDrawPostBetDepth).
+  if (put < STACKOFF_COMMIT_FRACTION * Math.min(seat.chipCount + seat.currentBet, fiveDrawPostBetDepth(table, seat))) return d;
   if (fiveDrawMadeClass(seat.holeCards) >= (FIVE_DRAW_POST_STACKOFF_CLASS[profile.archetype] ?? 3)) return d;
   return { action: callAmount > 0 ? PlayerAction.Call : PlayerAction.Check, raiseAmount: 0 };
+}
+
+/**
+ * Fix round 4 review fix-ups (MEASUREMENT-2) — the depth at risk for the 5CD post-draw bet gate (chips): the
+ * SHORTEST live opponent that still has chips behind (his stack this round), whose shove over the bet would commit
+ * this seat; the deepest live opponent's stack when none has chips behind. Keyed on the deepest opponent, a LAG /
+ * MANIAC in a multiway pot bet a 40 BB human's whole remaining stack with one pair or two pair (the deep bots set
+ * the depth), then was pot-committed to his shove: calling raises up to 10 BB with any five cards, then betting two
+ * pair or better at 0.4 pot (shoving over any bet) won +58 BB/100 vs MANIAC x4 [6 seeds] (live 0dc1b96 about -215).
+ * Heads-up the two are the same seat.
+ */
+function fiveDrawPostBetDepth(table: PokerTable, seat: Seat): number {
+  let shortest = 0, deepest = 0;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
+    const st = s.chipCount + s.currentBet;
+    deepest = Math.max(deepest, st);
+    if (s.chipCount > 0) shortest = shortest === 0 ? st : Math.min(shortest, st);
+  }
+  return shortest > 0 ? shortest : deepest;
 }
 
 function postFlopStrategyCore(
