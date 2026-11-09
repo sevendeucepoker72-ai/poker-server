@@ -93,17 +93,17 @@ describe('fix-up 1 (HOLDEM-R4-EXPLOIT-1 / -2) — a MANIAC opener squeezed with 
     expect(bad).toEqual([]);
   });
 
-  it('a deep MANIAC facing a single open with a 40 BB player still to act flats only what continues against his squeeze (<= 30%; b4d567f ~65%); with a 100 BB player there it still flats ~65%', () => {
-    const flats = (bbBB: number): number => {
+  it('a deep MANIAC facing a single open with a 40 BB player still to act flats only what continues against his squeeze (<= 30%; b4d567f ~65%); with a 100 BB player there, or when it is less than twice as deep as the 40 BB player (60 BB), it still flats ~65%', () => {
+    const flats = (bbBB: number, maniacBB = 500): number => {
       let calls = 0;
       const n = 400;
-      const restore = seedAll(9100 + bbBB);
+      const restore = seedAll(9100 + bbBB + (maniacBB === 500 ? 0 : maniacBB));
       try {
         for (let k = 0; k < n; k++) {
-          // seats: 0 = big blind (the human, bbBB), 1 = UTG (a 500 BB bot) opens to 3 BB, 2 = MP (the 500 BB MANIAC) decides
+          // seats: 0 = big blind (the human, bbBB), 1 = UTG (a 500 BB bot) opens to 3 BB, 2 = MP (the maniacBB MANIAC) decides
           const t = new PokerTable({ tableId: 't', tableName: 't', smallBlind: 50, bigBlind: BB, ante: 0, minBuyIn: BB } as any);
           const id = tableNo++;
-          const stacks = [bbBB, 500, 500, 100, 100, 100];
+          const stacks = [bbBB, 500, maniacBB, 100, 100, 100];
           for (let i = 0; i < 6; i++) expect(t.sitDown(i, 'P' + i, stacks[i] * BB, (i === 0 ? 'player-mof-' : 'ai-mof-') + id + '-' + i, i !== 0)).toBe(true);
           (t as any).presetFirstButton(4);
           expect(t.startNewHand()).toBe(true);
@@ -114,8 +114,8 @@ describe('fix-up 1 (HOLDEM-R4-EXPLOIT-1 / -2) — a MANIAC opener squeezed with 
       } finally { restore(); }
       return calls / n;
     };
-    const short = flats(40), deep = flats(100);
-    expect([short <= 0.3, deep >= 0.5]).toEqual([true, true]);
+    const short = flats(40), deep = flats(100), similar = flats(40, 60);
+    expect([short <= 0.3, deep >= 0.5, similar >= 0.5]).toEqual([true, true, true]);
   });
 
   it('no flatter (its call closes the action): unchanged, the raised stack-off width (heads-up ~37% vs 40 BB, ~21% vs 100 BB)', () => {

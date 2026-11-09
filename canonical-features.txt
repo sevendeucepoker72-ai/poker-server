@@ -2164,3 +2164,6 @@ MANIAC_FLATTER_WIDEN * flatters
 # two for +20 BB/100 whatever the opener did (live -19).
 MANIAC_SQUEEZE_BEHIND_MAX_BB
 function shortestToActBB(
+# 2026-11-09 (fix-up 1) - the MANIAC flat rule above applies only to a MANIAC at least twice as deep (effective) as that 26-50 BB
+# player: with similar stacks (a tournament; five 40 BB MANIACs and a 40 BB human) the squeeze measured no leak and the flats stay.
+effBB >= 2 * behindBB
