@@ -1048,9 +1048,7 @@ function decideActionForSeat(
   const rawStackOff = stackOff;
 
   // Difficulty-based noise (expert has almost none)
-  const noiseMap: Record<Difficulty, number> = {
-    easy: 0.25, medium: 0.12, hard: 0.05, expert: 0.02
-  };
+  const noiseMap = DIFFICULTY_NOISE;
   const rawNoise = (Math.random() - 0.5) * noiseMap[profile.difficulty];
   const noise = isFinite(rawNoise) ? rawNoise : 0;
   handStrength = Math.min(1.0, Math.max(0.0, handStrength + noise));
@@ -1279,6 +1277,20 @@ export const MANIAC_FLATTER_WIDEN = 1;
  * 40 BB MANIACs and a 40 BB human) the squeeze measured no leak (+6 (18), live +31) and the flats stay.
  */
 export const MANIAC_SQUEEZE_BEHIND_MAX_BB = 50;
+/**
+ * Fix round 4, fix-up 1 (HOLDEM-R4-MEASUREMENT-1) — no-limit: the FISH "weird raise" (B5, rounds 1-2) is a 3x raise with
+ * its top 10% by strength against a random hand (pctile >= this), where 0dc1b96 moved all-in with them. Facing an
+ * all-in deeper than the push/fold zone after it raised this street, it continues with every hand it raises for: it
+ * folded 17-52% of them to a 100 BB shove (the 0.12-of-its-own-stack call rule and the size-narrowed call range read
+ * the shove as a big bet, or the stack-off range when its call closed the action), so opening 6-10 BB with any two and
+ * shoving over its 3-bet broke even against five 200-500 BB FISH (hard, BB/100: os:10 at 500 BB +9 (30), os:8 -1 (49),
+ * os:6 at 200 BB +14 (52); live 0dc1b96 -273 / -179 / -139, where it moved in instead; with this rule -602 / -587 / -600).
+ */
+export const FISH_RAISE_PCTILE = 0.90;
+/** Width of the per-decision strength noise by difficulty (decideAction draws +-half of it). */
+export const DIFFICULTY_NOISE: Record<Difficulty, number> = {
+  easy: 0.25, medium: 0.12, hard: 0.05, expert: 0.02
+};
 
 export interface PreflopCtx {
   /** Live (not folded) opponents in the hand: the players who can still call a shove or are in it (B16). */
@@ -1605,6 +1617,14 @@ function preFlopStrategy(
     if (!stackOffOK(shoveBB, MANIAC_RAISED_STACKOFF_WIDEN * (1 + MANIAC_FLATTER_WIDEN * flatters), others)) return FOLD;
     return raiseOrAllIn(Math.round(betToMatch * (2.5 + Math.random() * 1.5)));
   }
+  // Fix-up 1 (FISH_RAISE_PCTILE): a FISH that raised this street does not raise-then-fold an all-in deeper than the
+  // push/fold zone: every hand it raises for continues (before the commit gate, which read it as a stack-off). Read on the
+  // strength before this decision's noise, less half the noise width: the raise drew its own noise.
+  if (!allInOrFold && noLimit && shover && profile.archetype === 'FISH' && effBB > PUSH_FOLD_MAX_BB && shoveBB > PUSH_FOLD_MAX_BB
+    && ownRaisesThisStreet(table, seat) > 0
+    && (ctx.rawPctile ?? pctile) >= FISH_RAISE_PCTILE - (DIFFICULTY_NOISE[profile.difficulty] ?? 0) / 2) {
+    return callAmount < seat.chipCount ? CALL : ALLIN;
+  }
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
   // (and, fix round 3, its 0dc1b96 chips-left depth: chipsLeftEffectiveStackBB).
   if (!allInOrFold && noLimit && (pureCall || committing)) {
@@ -1680,11 +1700,11 @@ function preFlopStrategy(
     if (unopened) {
       // B5 — the hands it used to SHOVE for 100 BB (top 10%) are now a 3 BB raise;
       // the rest of its range limps as before (same VPIP and PFR).
-      if (pctile >= 0.90) return raiseOrAllIn(Math.round(bigBlind * 3));
+      if (pctile >= FISH_RAISE_PCTILE) return raiseOrAllIn(Math.round(bigBlind * 3));
       return pctile >= adjustThreshold(0.55, factor) ? CALL : FOLD;   // limp
     }
     // Its "weird raise": a 3-bet, not a 100 BB jam; never a 4-bet.
-    if (!facingThreeBet && pctile >= 0.90) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
+    if (!facingThreeBet && pctile >= FISH_RAISE_PCTILE) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
     if (pctile >= adjustThreshold(0.55, factor) && callAmount <= seat.chipCount * 0.12) return CALL;
     if (callsSized(callVsRaiseThS, callVsRaiseTh)) return CALL;
     return FOLD;

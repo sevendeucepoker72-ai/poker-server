@@ -2167,3 +2167,10 @@ function shortestToActBB(
 # 2026-11-09 (fix-up 1) - the MANIAC flat rule above applies only to a MANIAC at least twice as deep (effective) as that 26-50 BB
 # player: with similar stacks (a tournament; five 40 BB MANIACs and a 40 BB human) the squeeze measured no leak and the flats stay.
 effBB >= 2 * behindBB
+# 2026-11-09 (bots review fix round 4 fix-up 1, holdem lane, HOLDEM-R4-MEASUREMENT-1) - preFlopStrategy (no-limit): a FISH that
+# raised this street (B5: a 3x raise with its top 10%, FISH_RAISE_PCTILE) continues against an all-in deeper than 25 BB with every
+# hand it raises for, read on the pre-noise strength less half the difficulty's noise width (DIFFICULTY_NOISE): it folded 17-52%
+# of its 3-bets to a 100 BB shove and opening 6-10 BB with any two then shoving over them broke even (live -139..-273).
+FISH_RAISE_PCTILE
+DIFFICULTY_NOISE
+FISH_RAISE_PCTILE - (DIFFICULTY_NOISE[
