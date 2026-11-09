@@ -1148,10 +1148,15 @@ function decideActionForSeat(
   //  - The pre-flop price floor on the later streets: at most MICRO_CALL_NEED of equity per opponent needed, a FOLD is a call.
   //    The MANIAC "raise or fold" (and NIT / ROCK below a fixed strength) folded air to a human's last 2-5 BB in an 80-400 BB
   //    pot after flat-calling his near-all-in raise.
+  //  - A MANIAC continues only with its value hands (MANIAC_ALLIN_VALUE_STRENGTH) or above the price: its "raise" there is a
+  //    call, and it called 45% of its air at any price (MANIAC_ALLIN_VALUE_STRENGTH doc).
   const allInBettor = !sdKind && table.bettingStructure !== 'fixed-limit' && callAmount > 0
     ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
   if (allInBettor && potOdds <= MICRO_CALL_NEED / Math.max(1, numOpponents)) {
     if (post.action === PlayerAction.Fold) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
+  } else if (allInBettor && profile.archetype === 'MANIAC' && post.action !== PlayerAction.Fold
+      && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds) {
+    return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
   return limitBotRaiseWar(table, seat, post, false, effectiveStrength);
 }
@@ -1321,6 +1326,16 @@ export const MANIAC_SHORT_SHOVE_MAX_BB = 75;
  * alone left +75.
  */
 export const NEAR_ALLIN_LEFT_FRACTION = 0.5;
+/**
+ * Fix round 4, fix-up 3 — Hold'em family, after the flop: a MANIAC facing an all-in (or a bet that left its maker
+ * NEAR_ALLIN_LEFT_FRACTION of his stack or less) continues only with a strength above this (its raise-or-fold value line,
+ * postFlopStrategy) or above the price it is laid (pot odds); a micro price is always called (the price floor). Its
+ * "raise or fold" raised 45% of its air there at any price, and the raise is a call: a human who flat-called a MANIAC's
+ * raise with any two and moved in on the flop only with a pair or a draw won +41 (9) BB/100 against two 100 BB MANIACs and
+ * a 40 BB stack (hard, whole line; live 0dc1b96 -3 (10): its MANIACs re-raise the flat, round 3's MANIAC-RTF cap stops
+ * that at a 100 BB table, so the flop came twice as often). Priced, -15 (11); moving in on every flop stays -127.
+ */
+export const MANIAC_ALLIN_VALUE_STRENGTH = 0.55;
 /**
  * Fix round 4, fix-up 1 (HOLDEM-R4-MEASUREMENT-1) — no-limit: the FISH "weird raise" (B5, rounds 1-2) is a 3x raise with
  * its top 10% by strength against a random hand (pctile >= this), where 0dc1b96 moved all-in with them. Facing an

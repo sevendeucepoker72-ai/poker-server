@@ -2200,3 +2200,8 @@ pctile >= 0.30 ? CONT : FOLD
 pureCall && callAmount < seat.chipCount ? CONT : ALLIN
 shoverFaced(table, seat) ?? nearAllInRaiser(table, seat)
 MICRO_CALL_NEED / Math.max(1, numOpponents)
+# 2026-11-09 (fix-up 3, sweep finding) - decideAction (Hold'em family): a MANIAC facing an all-in (or a near-all-in bet) after the
+# flop continues only above MANIAC_ALLIN_VALUE_STRENGTH or above the price: its "raise or fold" called 45% of its air at any
+# price, and flatting a MANIAC raise with any two then moving in on the flop with a pair or a draw won +41 BB/100 (live -3).
+MANIAC_ALLIN_VALUE_STRENGTH
+MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds

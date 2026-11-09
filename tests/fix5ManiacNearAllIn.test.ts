@@ -11,7 +11,10 @@
  * against two 100 BB MANIACs, +1,285 (104) for a 100 BB human against five 300 BB MANIACs (live 0dc1b96 -28 / -131).
  * With NEAR_ALLIN_LEFT_FRACTION every pre-flop all-in rule reads such a raise as the all-in (deeper than the push/fold zone;
  * a bot that continues re-raises to cover him), and after the flop, in the Hold'em family, against an all-in or a bet that
- * leaves the bettor half his stack or less, a FOLD at no more than MICRO_CALL_NEED of equity per opponent becomes a call.
+ * leaves the bettor half his stack or less: a FOLD at no more than MICRO_CALL_NEED of equity per opponent becomes a call, and
+ * a MANIAC continues only with MANIAC_ALLIN_VALUE_STRENGTH or above the price (its "raise or fold" called 45% of its air
+ * there at any price: flat a MANIAC raise with any two, move in on the flop with a pair or a draw, won +41 (9) BB/100 with
+ * two 100 BB MANIACs and a 40 BB stack, live -3 (10)).
  * Real PokerTable + real decideAction; seeded Math.random, a seeded deck (crypto.randomBytes) and a frozen clock.
  * 6 seats at 50/100, button 4: small blind 5, big blind 0 (the human), UTG 1, MP 2, CO 3.
  */
@@ -103,6 +106,40 @@ function flopSpot(arch: string, difficulty: string, botBB: number, humanBB: numb
   return { spots, folds };
 }
 
+/**
+ * UTG (the MANIAC, seat 1, 100 BB) opens to 3 BB (forced), the others fold, the human (big blind, 40 BB) calls; on the flop
+ * he moves all-in (37 BB into 6.5 BB: 46% needed). The MANIAC's answers, by its hand on the flop: air (no pair with a hole
+ * card, no four-flush, no four to a straight) and strong (three of a kind or better with a hole card).
+ */
+function flopShoveVsManiac(difficulty: string, n: number, seed: number): { air: number; airCont: number; strong: number; strongCont: number } {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const HE = require('../src/game/HandEvaluator');
+  let air = 0, airCont = 0, strong = 0, strongCont = 0;
+  const restore = seedAll(seed);
+  try {
+    for (let k = 0; k < n; k++) {
+      const t = table([40, 100, 100, 100, 100, 100]);
+      expect(t.playerRaise(1, 3 * BB)).toBe(true);
+      for (const s of [2, 3, 4, 5]) expect(t.playerFold(s)).toBe(true);
+      expect(t.playerCall(0)).toBe(true);
+      expect(t.currentPhase).toBe(GamePhase.Flop);
+      expect(t.playerAllIn(0)).toBe(true);
+      expect(t.activeSeatIndex).toBe(1);
+      const hole = t.seats[1].holeCards, board = t.communityCards, all = [...hole, ...board];
+      const rank = HE.evaluateHand(all).handRank;
+      const pairWithHole = hole[0].rank === hole[1].rank || hole.some((c: any) => board.some((b: any) => b.rank === c.rank));
+      const fourFlush = [0, 1, 2, 3].some((su) => all.filter((c: any) => c.suit === su).length >= 4);
+      const ranks = new Set(all.map((c: any) => c.rank)); if (ranks.has(14)) ranks.add(1);
+      let fourStraight = false; for (let lo = 1; lo <= 11; lo++) { let m = 0; for (let r = lo; r < lo + 5; r++) if (ranks.has(r)) m++; if (m >= 4) fourStraight = true; }
+      const d = decideAction(t, 1, prof('MANIAC', difficulty));
+      const cont = d.action !== PlayerAction.Fold;
+      if (!pairWithHole && !fourFlush && !fourStraight) { air++; if (cont) airCont++; }
+      else if (pairWithHole && rank >= HE.HandRank.ThreeOfAKind) { strong++; if (cont) strongCont++; }
+    }
+  } finally { restore(); }
+  return { air, airCont, strong, strongCont };
+}
+
 describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all-in; a micro all-in is called on every street', () => {
   const log: string[] = [];
   afterAll(() => process.stdout.write(`fix5 MANIAC near all-in: ${log.join('; ')}\n`));
@@ -161,5 +198,16 @@ describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all
     const r = flopSpot('NIT', 'medium', 100, 40, 25, 0, 1, 120, 8500);
     log.push(`NIT 25 BB all-in: ${r.folds}/${r.spots} folds`);
     expect(r.folds > 0.3 * r.spots).toBe(true);
+  });
+
+  it('a MANIAC prices a flop all-in: against 37 BB into 6.5 BB it folds its air (>= 90%; 7740996 continued 61% / 72% of it, hard / medium: its "raise" there is a call) and keeps three of a kind or better (>= 90%, hard)', () => {
+    const bad: string[] = [];
+    for (const [diff, n] of [['hard', 400], ['medium', 300]] as Array<[string, number]>) {
+      const r = flopShoveVsManiac(diff, n, 8800);
+      log.push(`MANIAC ${diff} vs a 37 BB flop all-in: air ${r.airCont}/${r.air} continue, trips+ ${r.strongCont}/${r.strong}`);
+      if (r.air < 0.3 * n || r.airCont > 0.1 * r.air) bad.push(`${diff} air ${r.airCont}/${r.air}`);
+      if (diff === 'hard' && (r.strong < 5 || r.strongCont < 0.9 * r.strong)) bad.push(`${diff} trips+ ${r.strongCont}/${r.strong}`);
+    }
+    expect(bad).toEqual([]);
   });
 });
