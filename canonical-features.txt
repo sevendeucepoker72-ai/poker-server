@@ -2159,3 +2159,8 @@ Math.min(1, nitSlack * sizeFactor)
 MANIAC_FLATTER_WIDEN
 function flattersToAct(
 MANIAC_FLATTER_WIDEN * flatters
+# 2026-11-08 (fix-up 1, two deep MANIACs) - a deep MANIAC facing a single raise flats only what continues against the squeeze of
+# a 26-50 BB player still to act (MANIAC_SQUEEZE_BEHIND_MAX_BB): open + flat by two 500 BB MANIACs let a 40 BB human squeeze any
+# two for +20 BB/100 whatever the opener did (live -19).
+MANIAC_SQUEEZE_BEHIND_MAX_BB
+function shortestToActBB(

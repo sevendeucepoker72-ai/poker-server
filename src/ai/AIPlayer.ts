@@ -1266,6 +1266,17 @@ export const MANIAC_RAISED_STACKOFF_WIDEN = 2;
  * 4x, two: 6x the width) the opener continues ~71% / ~100% against a 40 BB squeeze, ~46% / ~65% against 100 BB.
  */
 export const MANIAC_FLATTER_WIDEN = 1;
+/**
+ * Fix round 4, fix-up 1 (HOLDEM-R4-EXPLOIT-1, two deep MANIACs) — no-limit: a MANIAC deeper than the push/fold zone
+ * that faces a single raise and does not re-raise it flat-calls only with the stack-off range (2x, as a flatter) for
+ * the depth of the shortest player still to act behind it, when that player has more than 25 and at most this many
+ * BB: his squeeze all-in over the raise and the flat leaves the flat as dead money. The light re-raise cap
+ * (lightReraiseDepth) turned a deep MANIAC's 93% light 3-bets into ~70% flats whenever a <= 100 BB player sat behind;
+ * with two 500 BB MANIACs (open, flat) a 40 BB human squeezing any two from the big blind won +20 BB/100 after the
+ * opener fix (live 0dc1b96 -18: the second MANIAC 3-bet instead), whatever the opener did (call / isolate / jam:
+ * +14..+39). With this rule +5 (n.s.). Measured squeeze value of the dead money: 40 BB +20, 60 BB ~0, 100 BB < 0.
+ */
+export const MANIAC_SQUEEZE_BEHIND_MAX_BB = 50;
 
 export interface PreflopCtx {
   /** Live (not folded) opponents in the hand: the players who can still call a shove or are in it (B16). */
@@ -1335,6 +1346,17 @@ function ownCallsThisStreet(table: PokerTable, seat: Seat): number {
     if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && /^called /.test(e.action)) n++;
   }
   return n;
+}
+
+/** Fix-up 1 — the shortest street stack (BB) among live opponents with chips still to act on this bet (Infinity: none). */
+function shortestToActBB(table: PokerTable, seat: Seat, bigBlind: number): number {
+  let d = Infinity;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
+    if (s.currentBet >= table.currentBetToMatch) continue;
+    d = Math.min(d, (s.chipCount + s.currentBet) / bigBlind);
+  }
+  return d;
 }
 
 /** Fix-up 1 — live opponents with chips still to act on this bet who have only CALLED this street (flat callers). */
@@ -1634,6 +1656,14 @@ function preFlopStrategy(
       }
     }
     if (callAmount === 0) return CHECK;
+    // Fix-up 1 (MANIAC_SQUEEZE_BEHIND_MAX_BB): a flat call in front of a 26-50 BB player still to act is dead money
+    // for his squeeze; flat only what continues against it. Plain raises only (a short all-in keeps the branch).
+    if (noLimit && facingRaise && !facingThreeBet && !shover && effBB > PUSH_FOLD_MAX_BB) {
+      const behindBB = Math.round(shortestToActBB(table, seat, bigBlind));
+      if (behindBB > PUSH_FOLD_MAX_BB && behindBB <= MANIAC_SQUEEZE_BEHIND_MAX_BB) {
+        return stackOffOK(behindBB, MANIAC_RAISED_STACKOFF_WIDEN) ? CALL : FOLD;
+      }
+    }
     return pctile >= 0.30 ? CALL : FOLD;
   }
 

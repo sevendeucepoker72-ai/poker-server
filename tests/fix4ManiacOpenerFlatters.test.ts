@@ -9,6 +9,10 @@
  * flatters are dead money: the opener reads the stack-off range for the shover's depth counting only the other
  * players, at (1 + 1 per flatter) x its raised width, and continues by an isolation re-raise (as the MANIAC branch
  * and 0dc1b96 do), never by a flat call (0bc7529 flat-called ~70%: the call-then-fold of fix round 4).
+ * Two deep MANIACs (one opens, the other flats behind: the light re-raise cap turned its 3-bets into flats) made the
+ * squeeze profitable whatever the opener did (+14..+39 BB/100 for a 40 BB human, live -20): with
+ * MANIAC_SQUEEZE_BEHIND_MAX_BB a MANIAC flats only what continues against the squeeze when a 26-50 BB player is still
+ * to act (the last test).
  * Real PokerTable + real decideAction; seeded Math.random and a seeded deck (crypto.randomBytes).
  * 6 seats at 50/100, button 4: small blind 5, big blind 0 (the human), UTG 1 (the MANIAC), MP 2, CO 3.
  */
@@ -87,6 +91,31 @@ describe('fix-up 1 (HOLDEM-R4-EXPLOIT-1 / -2) — a MANIAC opener squeezed with 
       if (r.cont < min * r.spots || r.calls > 0) bad.push(`MANIAC ${mbb} BB vs ${hbb} BB squeeze, 2 flatters: continued ${r.cont}/${r.spots}, flat-called ${r.calls}`);
     }
     expect(bad).toEqual([]);
+  });
+
+  it('a deep MANIAC facing a single open with a 40 BB player still to act flats only what continues against his squeeze (<= 30%; b4d567f ~65%); with a 100 BB player there it still flats ~65%', () => {
+    const flats = (bbBB: number): number => {
+      let calls = 0;
+      const n = 400;
+      const restore = seedAll(9100 + bbBB);
+      try {
+        for (let k = 0; k < n; k++) {
+          // seats: 0 = big blind (the human, bbBB), 1 = UTG (a 500 BB bot) opens to 3 BB, 2 = MP (the 500 BB MANIAC) decides
+          const t = new PokerTable({ tableId: 't', tableName: 't', smallBlind: 50, bigBlind: BB, ante: 0, minBuyIn: BB } as any);
+          const id = tableNo++;
+          const stacks = [bbBB, 500, 500, 100, 100, 100];
+          for (let i = 0; i < 6; i++) expect(t.sitDown(i, 'P' + i, stacks[i] * BB, (i === 0 ? 'player-mof-' : 'ai-mof-') + id + '-' + i, i !== 0)).toBe(true);
+          (t as any).presetFirstButton(4);
+          expect(t.startNewHand()).toBe(true);
+          expect(t.playerRaise(1, 3 * BB)).toBe(true);
+          expect(t.activeSeatIndex).toBe(2);
+          if (decideAction(t, 2, maniac()).action === PlayerAction.Call) calls++;
+        }
+      } finally { restore(); }
+      return calls / n;
+    };
+    const short = flats(40), deep = flats(100);
+    expect([short <= 0.3, deep >= 0.5]).toEqual([true, true]);
   });
 
   it('no flatter (its call closes the action): unchanged, the raised stack-off width (heads-up ~37% vs 40 BB, ~21% vs 100 BB)', () => {
