@@ -11,8 +11,8 @@
  * Real PokerTable + real decideAction, seeded Math.random (the LCG of tests/botPremiumHold.test.ts) AND a seeded
  * deck: PokerTable deals the other seats from crypto.randomBytes, and deal() rejection-samples against those
  * cards, so an unseeded deck changed the MANIAC's hands run to run (fixup 1 of round 4: test 1 failed ~1 run in
- * 11 on an unchanged tree). The re-raise bound is 25% (the head re-raises ~10-17%, 0bc7529 50-94%); the fold
- * bound (<= 10% of the re-raises; 0bc7529 77-81%) is the pin.
+ * 11 on an unchanged tree). The re-raise bound of test 1 is 25% (the head re-raises ~10-17%, 0bc7529 50-94%), of
+ * tests 2 and 3 15% (~7%); the fold bound (<= 10% of the re-raises; 0bc7529 77-81%) is the pin.
  */
 import { PokerTable, PlayerAction } from '../src/game/PokerTable';
 import { decideAction } from '../src/ai/AIPlayer';
@@ -115,7 +115,7 @@ describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the dep
     };
     const r = run(spot, 400);
     expect(r.folds).toBeLessThanOrEqual(0.1 * r.reraises);
-    expect(r.reraises).toBeLessThanOrEqual(0.25 * r.n);
+    expect(r.reraises).toBeLessThanOrEqual(0.15 * r.n);   // ~7% (28 of 400); the 25% loosening was for test 1 only
   });
 
   it('a short player still to act binds (the raisers\' stacks alone would not): a 500 BB LAG opens UTG, the 500 BB MANIAC on the cutoff decides, a 100 BB human in the big blind can cold-shove', () => {
@@ -132,7 +132,7 @@ describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the dep
     };
     const r = run(spot, 400);
     expect(r.folds).toBeLessThanOrEqual(0.1 * r.reraises);
-    expect(r.reraises).toBeLessThanOrEqual(0.25 * r.n);
+    expect(r.reraises).toBeLessThanOrEqual(0.15 * r.n);   // ~7% (28 of 400); the 25% loosening was for test 1 only
   });
 
   it('only LIVE opponents count: with everyone at the table 1,000 BB deep and a 100 BB player folded, a MANIAC still re-raises light (up to 50 BB, 5% of 1,000 BB) with a third of its weak hands or more', () => {
