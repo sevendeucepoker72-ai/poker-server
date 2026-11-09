@@ -387,6 +387,9 @@ describe('fix round 4 review (MEASUREMENT-1 / EXPLOIT-1): Five Card Draw after t
     // the all-in gate phases in with the depth (no step at 15 BB: cdfc8a1 folded A-A there and nothing at 14)
     for (const d of [13, 14, 15, 16]) expect([d, P('Th Td 9c 7s 3h', 1 / 3, 'TAG', true, d)]).toEqual([d, false]);
     expect(P('2h 2d 9c 7s 3h', 1 / 3, 'TAG', true, 29)).toBe(true);
+    // ... and is whole from 20 BB: a 25 BB all-in into 30 BB (price 0.31) folds the pairs under eights, jacks continue
+    // (ab51c1b ended the ramp at 33 BB: every pair continued, and shoving two pair or better with 30 BB won +54 BB/100 vs MANIAC x4)
+    for (const a of ['TAG', 'LAG', 'MANIAC']) expect([a, P('5h 5d 9c 7s 3h', 0.3125, a, true, 25), P('Jh Jd 9c 7s 3h', 0.3125, a, true, 25)]).toEqual([a, true, false]);
     // FISH / CALLING_STATION read the price lower (FIVE_DRAW_POST_LOOSE_PO): vs 0.75 pot sevens fold for a FISH, eights continue, any pair for a CALLING_STATION; TAG two pair
     expect([P('7h 7d 9c 5s 3h', 0.30, 'FISH'), P('8h 8d 9c 5s 3h', 0.30, 'FISH'), P('2h 2d 9c 5s 3h', 0.30, 'CALLING_STATION'), P('Ah Ad 9c 5s 3h', 0.30, 'TAG')]).toEqual([true, false, false, true]);
     expect(P('Ah Ad Kc Ks 3h', 0.44, 'NIT', true, 19)).toBe(false); // under FIVE_DRAW_ALLIN_COMMIT_BB: aces up is enough
@@ -400,7 +403,7 @@ describe('fix round 4 review (MEASUREMENT-1 / EXPLOIT-1): Five Card Draw after t
     expect([...AI.FIVE_DRAW_POST_CLASS_PO]).toEqual([0.36, 0.42, 0.46]);
     expect([...AI.FIVE_DRAW_POST_PAIR_PO]).toEqual([0.20, 0.30]);
     expect(AI.FIVE_DRAW_POST_SHALLOW_BB).toBe(15);
-    expect([...AI.FIVE_DRAW_POST_SHALLOW_RAMP_BB]).toEqual([12, 33]);
+    expect([...AI.FIVE_DRAW_POST_SHALLOW_RAMP_BB]).toEqual([12, 20]);
     expect([...AI.FIVE_DRAW_POST_COMMIT_RAMP]).toEqual([1 / 6, 1 / 3]);
     expect(AI.FIVE_DRAW_POST_LOOSE_PO).toEqual({ NIT: 0, ROCK: 0, TAG: 0, LAG: 0, MANIAC: 0, FISH: 0.06, CALLING_STATION: 0.10 });
   });

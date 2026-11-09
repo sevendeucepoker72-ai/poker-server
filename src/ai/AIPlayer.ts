@@ -1802,9 +1802,12 @@ export const FIVE_DRAW_POST_SHALLOW_BB = 15;
 /**
  * Re-review fix-ups (STUDDRAW-RR1-MEASUREMENT-1) — against an ALL-IN the made hand the gate asks phases in with the
  * depth at risk, from nothing at [0] big blinds to all of it at [1]. Fix round 4 switched it on whole at
- * FIVE_DRAW_POST_SHALLOW_BB: nothing was folded at 14 BB of depth, a pair of aces at 15.
+ * FIVE_DRAW_POST_SHALLOW_BB: nothing was folded at 14 BB of depth, a pair of aces at 15. Ending the ramp at 33 BB
+ * left 15-25 BB all-ins almost ungated: calling raises up to 10 BB with any five cards, then shoving two pair or
+ * better after the draw with 30 BB, won +54 +- 22 BB/100 vs MANIAC x4 [6 seeds] (live 0dc1b96 -227); ending it at
+ * 20 BB, -24 [4 seeds], while the same line shoving any five cards in a 0.5-1.25 pot window stays at -185 [2 seeds].
  */
-export const FIVE_DRAW_POST_SHALLOW_RAMP_BB: readonly [number, number] = [12, 33];
+export const FIVE_DRAW_POST_SHALLOW_RAMP_BB: readonly [number, number] = [12, 20];
 
 /**
  * Re-review fix-ups (STUDDRAW-RR1-MEASUREMENT-2 / R4R-EXPLOIT-1) — the made hand the gate asks phases in with the share
@@ -2605,7 +2608,7 @@ function postFlopStrategyCore(
   //    rank) through two pair (from 0.30 for a bet, 0.36 for an all-in) to aces up and trips on
   //    overbets (FIVE_DRAW_POST_CLASS_PO), never above the stack-off class; an overcall needs more
   //    (FIVE_DRAW_POST_OVERCALL); it phases in with the share of the depth the call puts in (from a
-  //    sixth to a third) and, against an all-in, with the depth (12-33 BB); FISH / CALLING_STATION
+  //    sixth to a third) and, against an all-in, with the depth (12-20 BB); FISH / CALLING_STATION
   //    read the price lower (FIVE_DRAW_POST_LOOSE_PO), and so does a MANIAC that checked, for a bet
   //    (FIVE_DRAW_POST_CHECKED_PO); an all-in over this seat's own bet asks two pair, no ramp.
   //  - Fixed limit, the rounds after the first: facing ONE bet, a pot share that clears the price
