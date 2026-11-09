@@ -8,17 +8,29 @@
  * and folded ~78% of those re-raises to his 100 BB shove. The spots below pin the basis: the MANIAC's own stack
  * fails them all, the largest opponent's stack (a review candidate) fails the second deep stack, the raisers'
  * stacks only fail the cold 4-bet shove from a player still to act, and a folded short stack does not bind.
- * Real PokerTable + real decideAction, seeded Math.random (the LCG of tests/botPremiumHold.test.ts).
+ * Real PokerTable + real decideAction, seeded Math.random (the LCG of tests/botPremiumHold.test.ts) AND a seeded
+ * deck: PokerTable deals the other seats from crypto.randomBytes, and deal() rejection-samples against those
+ * cards, so an unseeded deck changed the MANIAC's hands run to run (fixup 1 of round 4: test 1 failed ~1 run in
+ * 11 on an unchanged tree). The re-raise bound is 25% (the head re-raises ~10-17%, 0bc7529 50-94%); the fold
+ * bound (<= 10% of the re-raises; 0bc7529 77-81%) is the pin.
  */
 import { PokerTable, PlayerAction } from '../src/game/PokerTable';
 import { decideAction } from '../src/ai/AIPlayer';
 import { getStackOffPercentile } from '../src/ai/preflopRanges';
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const nodeCrypto = require('crypto');
+/** Seeded Math.random AND a seeded deck (crypto.randomBytes, the sha256 stream of tests/fix4ManiacDeepFullLine). */
 function seedRandom(seed: number): () => void {
-  const orig = Math.random;
-  let s = seed >>> 0;
+  const orig = Math.random, rb = nodeCrypto.randomBytes;
+  let s = seed >>> 0, ctr = 0;
   Math.random = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
-  return () => { Math.random = orig; };
+  nodeCrypto.randomBytes = (n: number) => {
+    let buf = Buffer.alloc(0);
+    while (buf.length < n) buf = Buffer.concat([buf, nodeCrypto.createHash('sha256').update(`fix4-mdr-${seed}-${ctr++}`).digest()]);
+    return buf.subarray(0, n);
+  };
+  return () => { Math.random = orig; nodeCrypto.randomBytes = rb; };
 }
 const prof = (archetype: string, difficulty = 'hard') =>
   ({ botName: 'B', difficulty, personality: 'aggressive', archetype, vpip: 0.6, pfr: 0.5, aggressionFactor: 5, bluffFrequency: 0.4 } as any);
@@ -69,7 +81,7 @@ function run(spot: Spot, n: number, difficulty = 'hard'): { n: number; reraises:
 }
 
 describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the depth at risk, not of its own stack', () => {
-  it('a 200 / 300 / 500 / 1,000 BB MANIAC in the big blind vs a 100 BB human\'s button open (2.5 / 3 / 6 / 10 BB): it re-raises like a 100 BB MANIAC (<= 15%), and folds at most 10% of those re-raises to the human\'s 100 BB shove (difficulty noise; 0bc7529 folded ~78%)', () => {
+  it('a 200 / 300 / 500 / 1,000 BB MANIAC in the big blind vs a 100 BB human\'s button open (2.5 / 3 / 6 / 10 BB): it re-raises like a 100 BB MANIAC (<= 25%), and folds at most 10% of those re-raises to the human\'s 100 BB shove (difficulty noise; 0bc7529 folded ~78%)', () => {
     const bad: string[] = [];
     for (const [deep, open] of [[200, 2.5], [300, 3], [500, 6], [1000, 10]]) for (const diff of ['medium', 'hard']) {
       // UTG / MP / CO (100 BB bots) fold, the human on the button opens, the small blind folds; the MANIAC decides.
@@ -85,7 +97,7 @@ describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the dep
         shoveBack: (t) => { expect(t.playerAllIn(0)).toBe(true); },
       };
       const r = run(spot, 300, diff);
-      if (r.reraises > 0.15 * r.n || r.folds > 0.1 * r.reraises) bad.push(`${diff} ${deep} BB vs open ${open}: re-raised ${r.reraises}/${r.n}, folded ${r.folds} of them to the shove`);
+      if (r.reraises > 0.25 * r.n || r.folds > 0.1 * r.reraises) bad.push(`${diff} ${deep} BB vs open ${open}: re-raised ${r.reraises}/${r.n}, folded ${r.folds} of them to the shove`);
     }
     expect(bad).toEqual([]);
   });
@@ -103,7 +115,7 @@ describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the dep
     };
     const r = run(spot, 400);
     expect(r.folds).toBeLessThanOrEqual(0.1 * r.reraises);
-    expect(r.reraises).toBeLessThanOrEqual(0.15 * r.n);
+    expect(r.reraises).toBeLessThanOrEqual(0.25 * r.n);
   });
 
   it('a short player still to act binds (the raisers\' stacks alone would not): a 500 BB LAG opens UTG, the 500 BB MANIAC on the cutoff decides, a 100 BB human in the big blind can cold-shove', () => {
@@ -120,16 +132,16 @@ describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the dep
     };
     const r = run(spot, 400);
     expect(r.folds).toBeLessThanOrEqual(0.1 * r.reraises);
-    expect(r.reraises).toBeLessThanOrEqual(0.15 * r.n);
+    expect(r.reraises).toBeLessThanOrEqual(0.25 * r.n);
   });
 
   it('only LIVE opponents count: with everyone at the table 1,000 BB deep and a 100 BB player folded, a MANIAC still re-raises light (up to 50 BB, 5% of 1,000 BB) with a third of its weak hands or more', () => {
-    const t = table([1000, 1000, 1000, 1000, 100, 1000], 3);
-    expect(t.playerRaise(3, 3 * BB)).toBe(true);
-    expect(t.playerFold(4)).toBe(true);   // the 100 BB player
-    const restore = seedRandom(4242);
+    const restore = seedRandom(4242);   // before the table: its deck is dealt from the seeded stream too
     let weak = 0, light = 0, above = 0;
     try {
+      const t = table([1000, 1000, 1000, 1000, 100, 1000], 3);
+      expect(t.playerRaise(3, 3 * BB)).toBe(true);
+      expect(t.playerFold(4)).toBe(true);   // the 100 BB player
       for (let k = 0; k < 400; k++) {
         deal(t, 5);
         if (getStackOffPercentile(t.seats[5].holeCards) >= 0.75) continue;

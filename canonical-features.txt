@@ -2118,7 +2118,7 @@ scratchCapColumns:
 # shove into the multiway stack-off line (All-In or Fold AKo folded 95-100% there).
 if (s.currentBet >= table.currentBetToMatch)
 # 2026-11-05 (bots review fix round 3, holdem lane, MANIAC-RTF) - preFlopStrategy (no-limit): facing a raise, a MANIAC hand
-# that fails the stack-off range re-raises only up to HOLDEM_LIGHT_RERAISE_FRACTION (5%) of the street stack, else calls
+# that fails the stack-off range re-raises only up to HOLDEM_LIGHT_RERAISE_FRACTION (5%) of the depth at risk (round 4; round 3: its own street stack), else calls
 # (top 70%) / folds; it re-raised 25-59 BB and folded ~89% of it to a shove (an any-two-cards +600..+1,900 BB/100 line).
 HOLDEM_LIGHT_RERAISE_FRACTION
 # 2026-11-08 (bots review fix round 3, holdem lane, MANIAC-RTF part 2) - preFlopStrategy (no-limit): a MANIAC that raised

@@ -159,5 +159,5 @@ describe('HOLDEM-R3-REG-1 + call-then-fold — any two cards does not profit fro
     const r = play(line, lineup, depths, hands, seed, heroBB);
     rows.push(`${line} vs ${_name}: ${r.bb100.toFixed(1)} (${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
     expect([line, r.hands, r.drift, r.bb100 < 0]).toEqual([line, hands, 0, true]);
-  }, 300_000);
+  }, 600_000);   // synchronous and slow under load (rsj took up to 332 s in review): a generous ceiling
 });
