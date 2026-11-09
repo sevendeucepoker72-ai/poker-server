@@ -161,19 +161,21 @@ describe('HOLDEM-R3-REG-1 + call-then-fold — any two cards does not profit fro
   const M5 = ['MANIAC', 'MANIAC', 'MANIAC', 'MANIAC', 'MANIAC'];
   // rsjm folds every hand but the big blind's: cheap, so more hands (the spot is ~1 hand in 6).
   const RSJM_N = Number(process.env.FIX4_MDF_RSJM_HANDS || 12 * N);
-  const CASES: Array<[string, string, string[], number[], number, number, number, string?]> = [
-    ['tg:4:3', 'a 1,000 BB MANIAC + 100 BB TAG/LAG/NIT/FISH', MPLUS, [1000, 100, 100, 100, 100], N, 41, 100],
-    ['osrr:3:3', 'a 1,000 BB MANIAC + 100 BB TAG/LAG/NIT/FISH', MPLUS, [1000, 100, 100, 100, 100], N, 42, 100],
-    ['os:2.5', 'five 200 BB MANIACs', M5, [200, 200, 200, 200, 200], N, 43, 100],
-    ['os:4', 'heads-up, a 300 BB MANIAC', ['MANIAC'], [300], 4 * N, 44, 100],
-    ['sq', 'five 40 BB MANIACs, the human 40 BB', M5, [40, 40, 40, 40, 40], 3 * N, 45, 40],
-    ['rsj', 'five 500 BB MANIACs, the human 40 BB', M5, [500, 500, 500, 500, 500], 3 * N, 46, 40],
+  // Every row names its difficulty: jest-each passes a `done` callback to a test function with more parameters than
+  // the row has (fix-up 1: rows without it timed out after 600 s with `done` read as the difficulty).
+  const CASES: Array<[string, string, string[], number[], number, number, number, string]> = [
+    ['tg:4:3', 'a 1,000 BB MANIAC + 100 BB TAG/LAG/NIT/FISH', MPLUS, [1000, 100, 100, 100, 100], N, 41, 100, DIFF],
+    ['osrr:3:3', 'a 1,000 BB MANIAC + 100 BB TAG/LAG/NIT/FISH', MPLUS, [1000, 100, 100, 100, 100], N, 42, 100, DIFF],
+    ['os:2.5', 'five 200 BB MANIACs', M5, [200, 200, 200, 200, 200], N, 43, 100, DIFF],
+    ['os:4', 'heads-up, a 300 BB MANIAC', ['MANIAC'], [300], 4 * N, 44, 100, DIFF],
+    ['sq', 'five 40 BB MANIACs, the human 40 BB', M5, [40, 40, 40, 40, 40], 3 * N, 45, 40, DIFF],
+    ['rsj', 'five 500 BB MANIACs, the human 40 BB', M5, [500, 500, 500, 500, 500], 3 * N, 46, 40, DIFF],
     ['rsjm', 'a 500 BB MANIAC + 100 BB TAG/LAG/NIT/FISH (hard), the human 100 BB', MPLUS, [500, 100, 100, 100, 100], RSJM_N, 47, 100, 'hard'],
     ['rsjm', 'MANIAC/TAG/LAG/NIT/FISH all 100 BB (hard), the human 100 BB', MPLUS, [100, 100, 100, 100, 100], RSJM_N, 48, 100, 'hard'],
   ];
   it.each(CASES)('%s loses against %s', (line, _name, lineup, depths, hands, seed, heroBB, diff) => {
     const t0 = process.hrtime.bigint();
-    const r = play(line, lineup, depths, hands, seed, heroBB, diff || DIFF);
+    const r = play(line, lineup, depths, hands, seed, heroBB, diff);
     rows.push(`${line} vs ${_name}: ${r.bb100.toFixed(1)} (${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
     expect([line, r.hands, r.drift, r.bb100 < 0]).toEqual([line, hands, 0, true]);
   }, 600_000);   // synchronous and slow under load (rsj took up to 332 s in review): a generous ceiling
