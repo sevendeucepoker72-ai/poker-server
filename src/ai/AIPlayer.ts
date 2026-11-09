@@ -1842,15 +1842,39 @@ function fullRaisesThisRound(table: PokerTable, variantFirstRound: 'stud' | 'dra
  * 40 BB human's 3 BB open to ~10 BB and folded ~90% of those to his 40 BB shove (call 30 to win 51), so
  * opening 3 BB with any five cards and shoving over every re-raise won +98 +- 22 BB/100 vs MANIAC x4
  * (live 0dc1b96 +4 +- 32; it came with fix round 2's stack-off gate: e92bc52 -21, 2b5ac52 +122).
+ * Fix round 4 review (REGRESSION-2): a raise is an action that RAISED the round's bet (betRaisingEntries). An
+ * all-in CALL for less ('went all-in for 30' under a 50 big blind) is not one: read as a raise, it turned the
+ * bot's plain open after it into a "re-raise", and a MANIAC / LAG / TAG / FISH open then called a 40 BB shove with
+ * any five cards (0 of 160 folds; cdb31dd 140-148).
  */
 function reRaisePricedIn(table: PokerTable, seat: Seat, shover: Seat | null): boolean {
   if (!shover || seat.currentBet <= FIVE_DRAW_LIGHT_RERAISE_FRACTION * Math.min(handStartStack(seat), handStartStack(shover))) return false;
   let raised = false;
-  for (const e of table.actionLog) {
-    if (e.street !== table.currentPhase) continue;
-    if (e.seatIndex !== seat.seatIndex) { if (OWN_RAISE_RE.test(e.action)) raised = true; } else if (raised && OWN_RAISE_RE.test(e.action)) return true;
+  for (const seatIndex of betRaisingEntries(table)) {
+    if (seatIndex !== seat.seatIndex) raised = true; else if (raised) return true;
   }
   return false;
+}
+
+/** 'raised to N' / 'bet N' / 'went all-in for N' (the amount the seat's bet now totals). */
+const BET_TOTAL_RE = /^(?:raised to |bet |went all-in for )(\d+)/;
+
+/**
+ * Fix round 4 review (REGRESSION-2) — this round's actions that RAISED the bet to match, in order (the seat of
+ * each): a raise, an opening bet, or an all-in above the running bet. The first round starts from the big blind
+ * (the blinds' log lines carry no street); an all-in for no more than the running bet is a call.
+ */
+function betRaisingEntries(table: PokerTable): number[] {
+  let level = table.currentPhase === GamePhase.PreFlop ? Number(table.config.bigBlind) || 0 : 0;
+  const out: number[] = [];
+  for (const e of table.actionLog) {
+    if (e.street !== table.currentPhase) continue;
+    const m = BET_TOTAL_RE.exec(e.action);
+    if (!m) continue;
+    const total = Number(m[1]);
+    if (total > level) { out.push(e.seatIndex); level = total; }
+  }
+  return out;
 }
 
 function studDrawFirstRound(

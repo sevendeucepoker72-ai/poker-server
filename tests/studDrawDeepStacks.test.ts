@@ -141,4 +141,36 @@ describe('fix round 4 (unequal stacks): a bot\'s re-raise is priced in against a
       expect(folds / n).toBeGreaterThan(0.6);
     } finally { restore(); }
   }, 120_000);
+
+  // Fix round 4 review (REGRESSION-2): an all-in CALL for less than the big blind made before the bot's open is
+  // not a raise, so the open is still not a re-raise (c2b81d4 read 'went all-in for 30' as one: 0 of 160 folds
+  // for MANIAC / LAG / TAG / FISH; cdb31dd 140-148).
+  it('CONTROL: an all-in CALL for less than the big blind before the bot\'s 5 BB open does not make the open a re-raise (folds most, every loose archetype)', () => {
+    const restore = detEnv(4315);
+    try {
+      const out: string[] = [];
+      for (const arch of ['MANIAC', 'LAG', 'TAG', 'FISH']) {
+        let folds = 0, n = 0;
+        for (const diff of DIFFS) for (let k = 0; k < 12; k++) {
+          const t = new FiveCardDrawTable({ tableId: 'micro', tableName: 'micro', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 5000 }, false);
+          for (let i = 0; i < 6; i++) t.sitDown(i, 'P' + i, 5000, (i === 3 || i === 5 ? 'human-micro-' : 'ai-micro-') + i, !(i === 3 || i === 5));
+          t.seats[3].chipCount = 30;          // UTG: less than the big blind
+          t.seats[5].chipCount = 40 * 50;     // the shover: 40 BB
+          t.startNewHand();
+          expect(t.activeSeatIndex).toBe(3);
+          expect(t.playerAllIn(3)).toBe(true);           // 'went all-in for 30': a call for less
+          expect(t.playerRaise(4, 250)).toBe(true);      // the bot opens to 5 BB
+          expect(t.playerAllIn(5)).toBe(true);           // the 40 BB human shoves
+          let g = 0; while (g++ < 10 && t.activeSeatIndex >= 0 && t.activeSeatIndex !== 4) t.playerFold(t.activeSeatIndex);
+          expect(t.activeSeatIndex).toBe(4);
+          n++;
+          if (AI.decideAction(t, 4, { ...AI.generateRandomProfile(diff), archetype: arch, difficulty: diff }).action === PlayerAction.Fold) folds++;
+        }
+        out.push(`${arch} ${folds}/${n}`);
+        expect(n).toBe(48);
+        expect(folds / n).toBeGreaterThan(0.6);
+      }
+      process.stdout.write(`micro all-in call, then the bot's open, then a 40 BB shove: folds ${out.join(', ')}\n`);
+    } finally { restore(); }
+  }, 120_000);
 });

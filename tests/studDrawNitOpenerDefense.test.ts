@@ -86,6 +86,45 @@ describe('fix round 3: a NIT that opened does not fold most of its range to ONE 
     } finally { restore(); }
   }, 240_000);
 
+  // Fix round 4 review (regression lens, non-blocking): the opener's ONE re-raise is counted in FULL raises (REG-1,
+  // fullRaisesThisRound). A short all-in for less than a full raise between the open and the re-raise is not one:
+  // read on the raw raisesThisStreet (3) the NIT folded its opening range again.
+  it('Badugi (fixed limit): a short all-in raise for less than a full bet between the open and the re-raise does not make it two re-raises (<= 10% folds)', () => {
+    const restore = detEnv(3308);
+    try {
+      const t = make.badugi(); const profs: any[] = [];   // profs[i] for seat i (seats 0 and 5 are humans)
+      for (let i = 0; i < 6; i++) { t.sitDown(i, 'P' + i, 5000, (i === 0 || i === 5 ? 'human-nd-' : 'ai-nd-') + i, !(i === 0 || i === 5)); profs.push(i >= 1 && i <= 4 ? nit() : null); }
+      let folds = 0, n = 0;
+      for (let h = 0; n < 60 && h < 60 * 60; h++) {
+        for (const x of t.seats) if (x.state === 'occupied') { x.chipCount = x.seatIndex === 5 ? 120 : 5000; x.eliminated = false; x.sittingOut = false; }
+        if (!t.startNewHand()) break;
+        let opener = -1, g = 0, shortOut = false;
+        while (g++ < 12 && t.activeSeatIndex > 0 && opener < 0) {
+          const s = t.activeSeatIndex;
+          if (s === 5) { t.playerFold(5); shortOut = true; continue; }
+          const d = AI.decideAction(t, s, profs[s]);
+          exec(t, s, d);
+          if (d.action === PlayerAction.Raise || d.action === PlayerAction.AllIn) opener = s;
+        }
+        if (shortOut || opener < 0 || t.activeSeatIndex < 0 || (Number(t.raisesThisStreet) || 0) !== 1 || t.seats[opener].allIn) continue;
+        // the short human (120 chips in all: a raise of 20 over the 100 open, under a full 50 bet) moves in, then the deep human re-raises
+        g = 0; let shortIn = false;
+        while (g++ < 12 && t.activeSeatIndex > 0 && t.activeSeatIndex !== opener) {
+          if (t.activeSeatIndex === 5) { if (!t.playerAllIn(5)) break; shortIn = true; } else t.playerFold(t.activeSeatIndex);
+        }
+        if (!shortIn || t.activeSeatIndex !== 0 || (Number(t.raisesThisStreet) || 0) !== 2) continue;
+        if (!t.playerRaise(0, t.getMinRaise())) continue;
+        g = 0; while (g++ < 12 && t.activeSeatIndex >= 0 && t.activeSeatIndex !== opener) t.playerFold(t.activeSeatIndex);
+        if (t.activeSeatIndex !== opener || (Number(t.raisesThisStreet) || 0) !== 3) continue;
+        n++;
+        if (AI.decideAction(t, opener, profs[opener]).action === PlayerAction.Fold) folds++;
+      }
+      process.stdout.write(`NIT opener vs a short all-in raise for less, then one re-raise, badugi: folds ${folds}/${n}\n`);
+      expect(n).toBe(60);
+      expect(folds / n).toBeLessThanOrEqual(0.10);
+    } finally { restore(); }
+  }, 240_000);
+
   it('Five Card Draw (no-limit): vs a 3-bet to 3x the open it keeps its value set and a share by the price (<= 60% folds; 2b5ac52: 82%)', () => {
     const restore = detEnv(3302);
     try {
