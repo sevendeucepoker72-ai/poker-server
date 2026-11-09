@@ -1004,6 +1004,25 @@ fiveDrawPostOvercall
 # risk is the SHORTEST live opponent with chips behind (fiveDrawPostBetDepth), not the deepest: in multiway pots a
 # LAG / MANIAC bet a short human's whole stack with one pair / two pair and was then pot-committed to his shove.
 fiveDrawPostBetDepth
+# 2026-11-09 (bots review fix round 4, re-review fix-ups) - postFlopStrategy, Five Card Draw after the draw: every LEAD is
+# capped at FIVE_DRAW_POST_LEAD_CAP of the depth at risk (one size for every hand: a big lead was aces up or better 473
+# times in 476); fiveDrawPostBetDepth skips opponents under FIVE_DRAW_POST_SHALLOW_BB behind (a 1 BB-behind seat silenced
+# the bets, R4F-REGRESSION-1); a MANIAC leads polarized (FIVE_DRAW_POST_MANIAC_LEAD) and its checked range reads a bet's
+# price lower (FIVE_DRAW_POST_CHECKED_PO).
+FIVE_DRAW_POST_LEAD_CAP
+FIVE_DRAW_POST_MANIAC_LEAD
+FIVE_DRAW_POST_CHECKED_PO
+# 2026-11-09 (bots review fix round 4, re-review fix-ups) - fiveDrawPostFolds: no step at a third of the depth
+# (FIVE_DRAW_POST_COMMIT_RAMP) nor at 15 BB of depth (FIVE_DRAW_POST_SHALLOW_RAMP_BB); an all-in asks one pair by rank
+# up to two pair (every archetype folded A-A to a 20 BB all-in into 30 BB, RR1-MEASUREMENT-1), unless it raises this
+# seat's own bet; FISH / CALLING_STATION read the price lower (FIVE_DRAW_POST_LOOSE_PO).
+FIVE_DRAW_POST_COMMIT_RAMP
+FIVE_DRAW_POST_SHALLOW_RAMP_BB
+FIVE_DRAW_POST_LOOSE_PO
+(shoveLike && raised)
+# 2026-11-09 (bots review fix round 4, re-review fix-ups) - betRaisingEntries: a UTG straddle is the first round's posted
+# blind, not a raise (R4F-REGRESSION-2: an all-in call for less than the straddle made the bot's open a re-raise).
+firstRound && e.action === 'straddle'
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

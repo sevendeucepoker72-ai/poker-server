@@ -173,4 +173,39 @@ describe('fix round 4 (unequal stacks): a bot\'s re-raise is priced in against a
       process.stdout.write(`micro all-in call, then the bot's open, then a 40 BB shove: folds ${out.join(', ')}\n`);
     } finally { restore(); }
   }, 120_000);
+
+  // Re-review fix-ups (STUDDRAW-R4F-REGRESSION-2): a UTG straddle is the round's posted blind. An all-in CALL for
+  // less than the straddle (80 under a 100 straddle) is a call, not a raise, so the bot's open after it is still
+  // not a re-raise (cdfc8a1 counted the level from the 50 big blind: 0 of 160 folds for MANIAC / LAG / TAG / FISH;
+  // the straddled pot without the short call 132-144).
+  it('CONTROL: in a STRADDLED pot an all-in call for less than the straddle before the bot\'s 5 BB open does not make the open a re-raise (folds most, every loose archetype)', () => {
+    const restore = detEnv(4316);
+    try {
+      const out: string[] = [];
+      for (const arch of ['MANIAC', 'LAG', 'TAG', 'FISH']) {
+        let folds = 0, n = 0;
+        for (const diff of DIFFS) for (let k = 0; k < 12; k++) {
+          const t = new FiveCardDrawTable({ tableId: 'mstr', tableName: 'mstr', smallBlind: 25, bigBlind: 50, ante: 0, minBuyIn: 5000 }, false);
+          const human = (i: number) => i === 0 || i === 3 || i === 4;
+          for (let i = 0; i < 6; i++) t.sitDown(i, 'P' + i, 5000, (human(i) ? 'human-mstr-' : 'ai-mstr-') + i, !human(i));
+          t.seats[0].chipCount = 40 * 50;     // the shover: 40 BB
+          t.seats[4].chipCount = 80;          // more than the big blind, less than the straddle
+          t.startNewHand();
+          expect(t.activeSeatIndex).toBe(3);
+          expect(t.straddle(3)).toBe(true);              // UTG straddles to 100
+          expect(t.playerAllIn(4)).toBe(true);           // 'went all-in for 80': a call for less
+          expect(t.playerRaise(5, 250)).toBe(true);      // the bot opens to 5 BB
+          expect(t.playerAllIn(0)).toBe(true);           // the 40 BB human shoves
+          let g = 0; while (g++ < 12 && t.activeSeatIndex >= 0 && t.activeSeatIndex !== 5) t.playerFold(t.activeSeatIndex);
+          expect(t.activeSeatIndex).toBe(5);
+          n++;
+          if (AI.decideAction(t, 5, { ...AI.generateRandomProfile(diff), archetype: arch, difficulty: diff }).action === PlayerAction.Fold) folds++;
+        }
+        out.push(`${arch} ${folds}/${n}`);
+        expect(n).toBe(48);
+        expect(folds / n).toBeGreaterThan(0.6);
+      }
+      process.stdout.write(`straddle, an all-in call for less than it, the bot's open, then a 40 BB shove: folds ${out.join(', ')}\n`);
+    } finally { restore(); }
+  }, 120_000);
 });

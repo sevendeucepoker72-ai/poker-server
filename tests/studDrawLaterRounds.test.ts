@@ -8,6 +8,11 @@
  *     better after the draw, won +180 BB/100 vs NIT x4 and MANIAC x4 (live -121 / -97) over whole hands.
  *     Review fix-ups: the hand needed rises smoothly with the price (fiveDrawPostFolds), eases against a SHORT stack,
  *     and an OVERCALL needs more than a lone call (FIVE_DRAW_POST_OVERCALL).
+ *     Re-review fix-ups: no step at a third of the depth (FIVE_DRAW_POST_COMMIT_RAMP) nor at 15 BB of depth
+ *     (FIVE_DRAW_POST_SHALLOW_RAMP_BB); an all-in asks one pair by rank up to two pair unless it raises this seat's
+ *     own bet; FISH / CALLING_STATION and a MANIAC that checked read the price lower; every LEAD is capped at
+ *     FIVE_DRAW_POST_LEAD_CAP of the depth (one size for every hand), the depth skips opponents under 15 BB behind,
+ *     and a MANIAC leads polarized (FIVE_DRAW_POST_MANIAC_LEAD).
  *  2. Fixed limit: facing ONE bet, a NIT / ROCK / MANIAC whose pot share clears the price calls
  *     (STUD_DRAW_FL_CALL_MARGIN). The NIT folded everything under 0.55 to one bet: calling the first round with any
  *     hand, betting when checked to and folding to any bet won +83 BB/100 vs NIT x4 in Badugi (live -49).
@@ -231,30 +236,50 @@ function postDrawShortShove(cards: any[], heroBB: number): { t: any; me: number 
   return { t, me };
 }
 
-describe('fix round 4 (unequal stacks): Five Card Draw after the draw, a smaller all-in that commits the depth at risk needs two pair', () => {
-  it('one pair (A-A, K-K, Q-Q) never calls a 40 BB human\'s 30 BB all-in into a 50 BB pot (price ~0.27), every archetype and difficulty (05248ab / cdb31dd / 2b5ac52 called it)', () => {
+// Re-review fix-ups (STUDDRAW-RR1-MEASUREMENT-1 / R4R-EXPLOIT-2): fix round 4 asked two pair of every such all-in
+// from 0.25, so every archetype folded A-A to it and shoving ANY five cards into a checked pot after the draw with
+// 25-30 BB won +97 to +100 BB/100 vs MANIAC x4 (live -224 to -236). It now asks one pair by rank (the all-in ramp).
+describe('fix round 4 (unequal stacks) / re-review fix-ups: Five Card Draw after the draw, a smaller all-in that commits the depth at risk asks one pair by rank', () => {
+  it('a 40 BB human\'s 30 BB all-in into a 50 BB pot (price ~0.27): the class gate never folds A-A / K-K / Q-Q (every archetype; cdfc8a1 folded every one pair) and still folds deuces for TAG / LAG / NIT / ROCK / MANIAC', () => {
     const restore = detEnv(4111);
     try {
-      const calls: string[] = []; let n = 0;
-      for (const h of ['Ah Ad Kc Qs 9h', 'Kh Kd Ac Js 8h', 'Qh Qd Ac Ks 7h']) for (const a of ARCH) for (const diff of DIFFS) {
-        for (let k = 0, got = 0; got < 2 && k < 30; k++) {
-          const r = postDrawShortShove(C(h), 40); if (!r) continue; got++; n++;
-          const ca = r.t.getCallAmount(r.t.seats[r.me]), pot = r.t.getTotalPot();
-          expect(ca).toBe(1500);
-          expect(ca / (pot + ca)).toBeGreaterThanOrEqual(0.25);
-          expect(ca / (pot + ca)).toBeLessThan(1 / 3);
-          const d = AI.decideAction(r.t, r.me, prof(a, diff));
-          if (d.action !== PlayerAction.Fold) calls.push(`${h} ${a}/${diff} ${d.action}`);
-        }
+      let n = 0;
+      for (let k = 0; k < 30 && n < 1; k++) {
+        const r = postDrawShortShove(C('Ah Ad Kc Qs 9h'), 40); if (!r) continue; n++;
+        const ca = r.t.getCallAmount(r.t.seats[r.me]), pot = r.t.getTotalPot();
+        expect(ca).toBe(1500);
+        const po = ca / (pot + ca);
+        expect(po).toBeGreaterThanOrEqual(0.25);
+        expect(po).toBeLessThan(1 / 3);
+        for (const a of ARCH) for (const h of ['Ah Ad Kc Qs 9h', 'Kh Kd Ac Js 8h', 'Qh Qd Ac Ks 7h']) expect([a, h, AI.fiveDrawPostFolds(C(h), po, a, true, 30)]).toEqual([a, h, false]);
+        for (const a of ['TAG', 'LAG', 'NIT', 'ROCK', 'MANIAC']) for (const h of ['2h 2d Ac Ks 7h']) expect([a, h, AI.fiveDrawPostFolds(C(h), po, a, true, 30)]).toEqual([a, h, true]);
       }
-      expect(n).toBe(3 * 7 * 4 * 2);
-      expect(calls).toEqual([]);
+      expect(n).toBe(1);
     } finally { restore(); }
   }, 300_000);
 
-  it('the small all-in rule: from a third of the pot (price 0.25), two pair (pinned)', () => {
-    expect([AI.FIVE_DRAW_POST_ALLIN_MIN_PO, AI.FIVE_DRAW_POST_ALLIN_CLASS]).toEqual([0.25, 2]);
+  it('the all-in ramp: every pair from a third of the pot (price 0.25), two pair at FIVE_DRAW_POST_CLASS_PO[0] (pinned)', () => {
+    expect([AI.FIVE_DRAW_POST_ALLIN_MIN_PO, AI.FIVE_DRAW_POST_ALLIN_CLASS, AI.FIVE_DRAW_POST_CLASS_PO[0]]).toEqual([0.25, 2, 0.36]);
   });
+
+  it('heads-up after the draw, a 20 / 30 BB all-in into a 30 BB pot: a FISH / CALLING_STATION / MANIAC with A-A or Q-Q one pair does not fold every time (cdfc8a1: every archetype folded both every time)', () => {
+    const restore = detEnv(4112);
+    try {
+      const out: string[] = []; let tot = 0, cont = 0;
+      for (const heroBB of [35, 45]) for (const a of ['FISH', 'CALLING_STATION', 'MANIAC']) for (const h of ['Ah Ad Kc 9s 4h', 'Qh Qd Ac 9s 4h']) {
+        let c = 0, m = 0;
+        for (const diff of DIFFS) for (let k = 0, got = 0; got < 2 && k < 30; k++) {
+          const r = headsUpPostDraw(C(h), 'shove', 1, 30, heroBB); if (!r) continue; got++; m++;
+          if (AI.decideAction(r.t, r.me, prof(a, diff)).action !== PlayerAction.Fold) c++;
+        }
+        out.push(`${heroBB - 15} BB ${a} ${h.slice(0, 5)} ${c}/${m}`); tot += m; cont += c;
+        expect([heroBB, a, h, m]).toEqual([heroBB, a, h, 8]);
+        expect([heroBB, a, h, c > 0]).toEqual([heroBB, a, h, true]);
+      }
+      process.stdout.write(`HU all-in into 30 BB after the draw, continues: ${out.join(', ')}\n`);
+      expect(cont / tot).toBeGreaterThanOrEqual(0.5);
+    } finally { restore(); }
+  }, 300_000);
 });
 
 /**
@@ -312,11 +337,17 @@ describe('fix round 4 review (MEASUREMENT-1 / EXPLOIT-1): Five Card Draw after t
     } finally { restore(); }
   }, 300_000);
 
-  it('a bet just under the pot and one just over it get the same answer from the class gate (0.95 / 1.0 / 1.05 pot), one pair and two pair, every archetype', () => {
-    for (const a of ARCH) for (const h of ['Ah Ad Kc Qs 9h', 'Qh Qd 9c 5s 2h', 'Kh Kd Qc Qs 3h', '9h 9d 5c 5s Kh', 'Ah Ad Kc Ks 3h']) {
-      const at = (po: number) => AI.fiveDrawPostFolds(C(h), po, a, false, 80);
-      const p95 = 0.95 / 2.9, p100 = 1 / 3, p105 = 1.05 / 3.1;
-      expect([a, h, at(p95), at(p100)]).toEqual([a, h, at(p105), at(p105)]);
+  // Re-review fix-ups: with FISH / CALLING_STATION reading the price lower (FIVE_DRAW_POST_LOOSE_PO) their pair ramp
+  // crosses the pot size, so one hand may flip there; what must not come back is a step (c2b81d4 folded every hand
+  // under aces up at the pot and none at 0.95).
+  it('a bet just under the pot and one just over it get nearly the same answer from the class gate (0.95 / 1.0 / 1.05 pot): over every one pair and two pair, at most two hands differ, every archetype', () => {
+    const hands: string[] = [];
+    for (const r of ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']) hands.push(`${r}h ${r}d ${r === 'A' ? 'K' : 'A'}c ${r === '9' ? '8' : '9'}s ${r === '4' ? '3' : '4'}h`);
+    for (const t of ['3', '5', '7', '9', 'J', 'K']) hands.push(`${t}h ${t}d 2c 2s ${t === 'K' ? 'Q' : 'K'}h`);
+    for (const a of ARCH) {
+      const folded = (po: number) => hands.filter((h) => AI.fiveDrawPostFolds(C(h), po, a, false, 80));
+      const f95 = folded(0.95 / 2.9), f100 = folded(1 / 3), f105 = folded(1.05 / 3.1);
+      expect([a, f105.length - f95.length <= 2, f100.length - f95.length <= 2, f105.length >= f95.length]).toEqual([a, true, true, true]);
     }
   });
 
@@ -347,11 +378,17 @@ describe('fix round 4 review (MEASUREMENT-1 / EXPLOIT-1): Five Card Draw after t
     expect(P('3h 3d 2c 2s 9h', 0.48, 'CALLING_STATION')).toBe(false);   // CALLING_STATION: two pair at any price
     // an all-in (or a call that puts the bot all-in)
     expect(P('Kh Kd Qc Qs 3h', 1 / 3, 'TAG', true)).toBe(false);   // a pot-size all-in: two pair (c2b81d4: aces up)
-    expect(P('Ah Ad 9c 7s 3h', 0.30, 'TAG', true)).toBe(true);     // a smaller one: one pair folds from 0.25
+    expect(P('Ah Ad 9c 7s 3h', 0.30, 'TAG', true)).toBe(false);    // a smaller one: the all-in ramp, eights or better at 0.30 (re-review fix-ups; cdfc8a1: two pair)
+    expect(P('5h 5d 9c 7s 3h', 0.30, 'TAG', true)).toBe(true);     // ... fives fold (need 1.45)
     expect(P('Ah Ad 9c 7s 3h', 0.24, 'TAG', true)).toBe(false);    // under a third of the pot: the strategy decides
     expect(P('4h 4d 3c 3s 9h', 0.39, 'TAG', true)).toBe(true);     // vs ~2x the pot the same ramp as any bet
     expect(P('9h 9d 5c 5s Kh', 0.39, 'TAG', true)).toBe(false);
-    expect(P('Ah Ad 9c 7s 3h', 0.31, 'TAG', true, 10)).toBe(false); // under FIVE_DRAW_POST_SHALLOW_BB: no gate
+    expect(P('Ah Ad 9c 7s 3h', 0.31, 'TAG', true, 10)).toBe(false); // under FIVE_DRAW_POST_SHALLOW_RAMP_BB[0]: no gate
+    // the all-in gate phases in with the depth (no step at 15 BB: cdfc8a1 folded A-A there and nothing at 14)
+    for (const d of [13, 14, 15, 16]) expect([d, P('Th Td 9c 7s 3h', 1 / 3, 'TAG', true, d)]).toEqual([d, false]);
+    expect(P('2h 2d 9c 7s 3h', 1 / 3, 'TAG', true, 29)).toBe(true);
+    // FISH / CALLING_STATION read the price lower (FIVE_DRAW_POST_LOOSE_PO): vs 0.75 pot sevens fold for a FISH, eights continue, any pair for a CALLING_STATION; TAG two pair
+    expect([P('7h 7d 9c 5s 3h', 0.30, 'FISH'), P('8h 8d 9c 5s 3h', 0.30, 'FISH'), P('2h 2d 9c 5s 3h', 0.30, 'CALLING_STATION'), P('Ah Ad 9c 5s 3h', 0.30, 'TAG')]).toEqual([true, false, false, true]);
     expect(P('Ah Ad Kc Ks 3h', 0.44, 'NIT', true, 19)).toBe(false); // under FIVE_DRAW_ALLIN_COMMIT_BB: aces up is enough
     expect(P('Ah Ad Kc Ks 3h', 0.44, 'NIT', true, 80)).toBe(true);
     // a 100 BB shove into a limped pot (price ~0.48): the stack-off class, as fix round 4 made it (MEAS-1)
@@ -363,6 +400,9 @@ describe('fix round 4 review (MEASUREMENT-1 / EXPLOIT-1): Five Card Draw after t
     expect([...AI.FIVE_DRAW_POST_CLASS_PO]).toEqual([0.36, 0.42, 0.46]);
     expect([...AI.FIVE_DRAW_POST_PAIR_PO]).toEqual([0.20, 0.30]);
     expect(AI.FIVE_DRAW_POST_SHALLOW_BB).toBe(15);
+    expect([...AI.FIVE_DRAW_POST_SHALLOW_RAMP_BB]).toEqual([12, 33]);
+    expect([...AI.FIVE_DRAW_POST_COMMIT_RAMP]).toEqual([1 / 6, 1 / 3]);
+    expect(AI.FIVE_DRAW_POST_LOOSE_PO).toEqual({ NIT: 0, ROCK: 0, TAG: 0, LAG: 0, MANIAC: 0, FISH: 0.06, CALLING_STATION: 0.10 });
   });
 
   it('heads-up, a 60 BB human\'s pot-size ALL-IN after the draw (40 BB into a 40 BB pot): two pair continues for TAG / LAG / FISH / MANIAC (c2b81d4 and 977fd0e asked aces up: betting 1.5x the pot with any hand won +210 to +500 BB/100 vs MANIAC x4)', () => {
@@ -570,7 +610,9 @@ function postDrawMultiLead(cards: any[], heroBB = 40, openBB = 5): { t: any; me:
 }
 
 describe('fix round 4 review fix-ups (MEASUREMENT-2): Five Card Draw after the draw, the bet gate measures the depth on the SHORTEST live opponent', () => {
-  it('a 5-way pot with a 40 BB human (35 BB behind) and 100 BB bots: a LAG / MANIAC first to act never bets a third of the human\'s depth with Q-Q, 9-9-5-5 or K-K-Q-Q (b8cca39: LAG 9-11 of 12, MANIAC 2-6 of 12); aces up and trips still bet', () => {
+  // Re-review fix-ups: every lead is capped at FIVE_DRAW_POST_LEAD_CAP of the depth, aces up and trips included (they
+  // bet a third of it on cdfc8a1, so a big lead told the class); they still bet.
+  it('a 5-way pot with a 40 BB human (35 BB behind) and 100 BB bots: a LAG / MANIAC first to act never bets a third of the human\'s depth with Q-Q, 9-9-5-5 or K-K-Q-Q (b8cca39: LAG 9-11 of 12, MANIAC 2-6 of 12); aces up and trips still bet, under a third too', () => {
     const restore = detEnv(4161);
     try {
       const big: string[] = []; let n = 0, strong = 0, sN = 0;
@@ -582,15 +624,192 @@ describe('fix round 4 review fix-ups (MEASUREMENT-2): Five Card Draw after the d
             const depth = Math.min(me.chipCount + me.currentBet, hero.chipCount + hero.currentBet);
             const d = AI.decideAction(r.t, r.me, prof(a, diff));
             const put = d.action === PlayerAction.AllIn ? me.chipCount : d.action === PlayerAction.Raise ? d.raiseAmount - me.currentBet : 0;
-            if (h.startsWith('A') || h.startsWith('2')) { sN++; if (put >= depth / 3) strong++; continue; }
-            n++;
             if (put >= depth / 3) big.push(`${h} ${a}/${diff} ${d.action} ${put}`);
+            if (h.startsWith('A') || h.startsWith('2')) { sN++; if (put > 0) strong++; continue; }
+            n++;
           }
         }
       }
       expect([n, sN]).toEqual([2 * 4 * 3 * 3, 2 * 4 * 2 * 3]);
       expect(big).toEqual([]);
       expect(strong / sN).toBeGreaterThanOrEqual(0.7);
+    } finally { restore(); }
+  }, 300_000);
+});
+
+/**
+ * Re-review fix-ups (STUDDRAW-R4F-REGRESSION-1): Five Card Draw, 5 seats at 25/50. Seat 0 (a human) opens to 3 BB.
+ * 'hu': seat 0 holds `behindBB` BB behind after the open, the first bot to act calls and the rest fold (heads-up).
+ * 'third': seat 0 holds 100 BB, every seat calls, and seat 3 is a short human left with `behindBB` BB behind.
+ * All stand pat; after the draw the humans check and the first bot to act (nothing to call) holds `cards`.
+ * null when the deal does not take that shape.
+ */
+function postDrawShortLead(cards: any[], shape: 'hu' | 'third', behindBB: number): { t: any; me: number } | null {
+  const t = make['five-card-draw']();
+  const human = (i: number) => i === 0 || (shape === 'third' && i === 3);
+  for (let i = 0; i < 5; i++) t.sitDown(i, 'P' + i, 5000, (human(i) ? 'human-later-' : 'ai-later-') + i, !human(i));
+  if (shape === 'hu') t.seats[0].chipCount = 150 + behindBB * 50; else t.seats[3].chipCount = 150 + behindBB * 50;
+  if (!t.startNewHand()) return null;
+  let g = 0, opened = false;
+  while (t.currentPhase === GamePhase.PreFlop && g++ < 30) {
+    const a = t.activeSeatIndex; if (a < 0) return null;
+    if (a === 0 && !opened) { if (!t.playerRaise(0, 150)) return null; opened = true; continue; }
+    if (shape === 'hu' && a !== 0 && t.seats.some((x: any) => x.seatIndex !== 0 && !x.folded && x.currentBet >= 150)) { t.playerFold(a); continue; }
+    if (!t.playerCall(a)) t.playerCheck(a);
+  }
+  if (!opened || t.seats[shape === 'hu' ? 0 : 3].chipCount !== behindBB * 50) return null;
+  g = 0;
+  while (DRAW.includes(t.currentPhase) && g++ < 10) for (const x of t.seats) if (x.state === 'occupied' && !x.folded && x.holeCards.length && !t.drawsCompleted.has(x.seatIndex)) { t.playerDraw(x.seatIndex, []); if (!DRAW.includes(t.currentPhase)) break; }
+  g = 0; while (t.currentPhase === GamePhase.Bet2 && human(t.activeSeatIndex) && g++ < 10) t.playerCheck(t.activeSeatIndex);
+  if (t.currentPhase !== GamePhase.Bet2) return null;
+  const me = t.activeSeatIndex; if (me < 0 || human(me) || t.getCallAmount(t.seats[me]) !== 0) return null;
+  const spare = t.seats[me].holeCards.filter((c: any) => !cards.some((y: any) => same(y, c)));
+  for (const x of t.seats) if (x.seatIndex !== me) x.holeCards = x.holeCards.map((c: any) => (cards.some((y: any) => same(y, c)) ? spare.pop() : c));
+  t.seats[me].holeCards = cards.map((c) => ({ ...c }));
+  return { t, me };
+}
+
+function leadShare(seed: number, spot: (c: any[]) => { t: any; me: number } | null, hands: string[], per: number): { bets: number; n: number; out: string[] } {
+  const restore = detEnv(seed);
+  try {
+    const out: string[] = []; let bets = 0, n = 0;
+    for (const h of hands) for (const a of ['MANIAC', 'LAG']) {
+      let b = 0, m = 0;
+      for (const diff of DIFFS) for (let k = 0, got = 0; got < per && k < per * 15; k++) {
+        const r = spot(C(h)); if (!r) continue; got++; m++;
+        const d = AI.decideAction(r.t, r.me, prof(a, diff));
+        if (d.action === PlayerAction.Raise || d.action === PlayerAction.AllIn) b++;
+      }
+      out.push(`${h} ${a} ${b}/${m}`); bets += b; n += m;
+    }
+    return { bets, n, out };
+  } finally { restore(); }
+}
+
+describe('re-review fix-ups (STUDDRAW-R4F-REGRESSION-1 / R4R-EXPLOIT-1 / RR1-MEASUREMENT-2): Five Card Draw after the draw, one lead size for every hand, and short stacks are bet into', () => {
+  it('heads-up vs a human with 10 / 25 BB behind, checked to: a MANIAC / LAG still leads K-K-Q-Q, 9-9-5-5 and a pair of aces (cdfc8a1: 0 of 15 at 10 BB and for MANIAC at 25 BB; live 15 of 15)', () => {
+    const hands = ['Kh Kd Qc Qs 3h', '9h 9d 5c 5s Kh', 'Ah Ad Kc Qs 9h'];
+    const r10 = leadShare(4171, (c) => postDrawShortLead(c, 'hu', 10), hands, 3);
+    const r25 = leadShare(4172, (c) => postDrawShortLead(c, 'hu', 25), hands, 3);
+    process.stdout.write(`HU short human, leads: 10 BB ${r10.out.join(', ')} | 25 BB ${r25.out.join(', ')}\n`);
+    expect([r10.n, r25.n]).toEqual([3 * 2 * 4 * 3, 3 * 2 * 4 * 3]);
+    expect(r10.bets / r10.n).toBeGreaterThanOrEqual(0.9);
+    expect(r25.bets / r25.n).toBeGreaterThanOrEqual(0.9);
+  }, 300_000);
+
+  it('a 5-way pot with a 100 BB human and a THIRD seat left with 1 / 3 / 10 BB behind: a MANIAC / LAG still leads K-K-Q-Q (cdfc8a1: 0 of 90; c2b81d4 and live 28 of 90, MANIAC / LAG 13-15 of 15)', () => {
+    let bets = 0, n = 0; const out: string[] = [];
+    for (const [seed, bb] of [[4173, 1], [4174, 3], [4175, 10]]) {
+      const r = leadShare(seed, (c) => postDrawShortLead(c, 'third', bb), ['Kh Kd Qc Qs 3h'], 3);
+      bets += r.bets; n += r.n; out.push(`${bb} BB: ${r.out.join(', ')}`);
+    }
+    process.stdout.write(`third seat short, K-K-Q-Q leads: ${out.join(' | ')}\n`);
+    expect(n).toBe(3 * 2 * 4 * 3);
+    expect(bets / n).toBeGreaterThanOrEqual(0.9);
+  }, 300_000);
+
+  it('a 5-way pot with a 40 BB human: one capped lead size for every hand; a LAG leads one pair and no pair too, a MANIAC leads a pair of kings or better and about half its no-pair hands, and checks the lower pairs (cdfc8a1: a big lead was aces up or better 473 times in 476; one pair never led, no pair never led)', () => {
+    const restore = detEnv(4176);
+    try {
+      const groups: Record<string, string[]> = { low: ['Qh Qd 9c 5s 2h', '7h 7d Ac 9s 4h'], air: ['Ah Kd 9c 7s 3h', 'Kh Qd 9c 6s 2h'], value: ['Kh Kd Ac 9s 4h', 'Ah Ad Kc Ks 3h', '2h 2d 2c 7s 3h'] };
+      const st: Record<string, { bets: number; n: number; size: number }> = {};
+      let over = 0;
+      for (const a of ['MANIAC', 'LAG']) for (const g of Object.keys(groups)) for (const diff of DIFFS) for (const h of groups[g]) {
+        const key = `${a} ${g}`; st[key] = st[key] || { bets: 0, n: 0, size: 0 };
+        for (let k = 0, got = 0; got < 3 && k < 30; k++) {
+          const r = postDrawMultiLead(C(h)); if (!r) continue; got++;
+          const me = r.t.seats[r.me], hero = r.t.seats[0];
+          const depth = Math.min(me.chipCount + me.currentBet, hero.chipCount + hero.currentBet);
+          const d = AI.decideAction(r.t, r.me, prof(a, diff));
+          const put = d.action === PlayerAction.AllIn ? me.chipCount : d.action === PlayerAction.Raise ? d.raiseAmount - me.currentBet : 0;
+          st[key].n++;
+          if (put > 0) { st[key].bets++; st[key].size += put / depth; }
+          if (put > AI.FIVE_DRAW_POST_LEAD_CAP * depth) over++;
+        }
+      }
+      const share = (k: string) => st[k].bets / st[k].n, mean = (k: string) => st[k].size / Math.max(1, st[k].bets);
+      process.stdout.write(`40 BB human, leads: ${Object.keys(st).map((k) => `${k} ${st[k].bets}/${st[k].n} (${mean(k).toFixed(3)})`).join(', ')}\n`);
+      expect(over).toBe(0);
+      expect([share('LAG low') >= 0.6, share('LAG air') >= 0.3, share('LAG value') >= 0.75]).toEqual([true, true, true]);
+      expect([share('MANIAC low'), share('MANIAC value')]).toEqual([0, 1]);
+      expect(share('MANIAC air')).toBeGreaterThanOrEqual(0.25);
+      expect(share('MANIAC air')).toBeLessThanOrEqual(0.75);
+      // every lead the same size: value and bluffs alike
+      for (const k of ['LAG low', 'LAG air', 'MANIAC air']) expect([k, Math.abs(mean(k) - mean(k.split(' ')[0] + ' value')) <= 0.03]).toEqual([k, true]);
+    } finally { restore(); }
+  }, 300_000);
+
+  it('the MANIAC lead rule and the checked-range price are pinned', () => {
+    expect([...AI.FIVE_DRAW_POST_MANIAC_LEAD]).toEqual([1 + 11 / 13, 0.5]);
+    expect(AI.FIVE_DRAW_POST_CHECKED_PO).toEqual({ NIT: 0, ROCK: 0, TAG: 0, LAG: 0, MANIAC: 0.08, FISH: 0, CALLING_STATION: 0 });
+  });
+
+  it('fiveDrawPostFolds (pure): a MANIAC that checked reads the price of a bet lower (its checked range holds its middle pairs), never of an all-in nor of an overcall; an all-in over this seat\'s own bet asks two pair, no ramp', () => {
+    const P = (h: string, po: number, a: string, shove: boolean, over: boolean, checked: boolean, raised: boolean) => AI.fiveDrawPostFolds(C(h), po, a, shove, 80, over, 1, checked, raised);
+    expect(P('9h 9d Kc 7s 3h', 0.30, 'MANIAC', false, false, false, false)).toBe(true);    // two pair asked ...
+    expect(P('9h 9d Kc 7s 3h', 0.30, 'MANIAC', false, false, true, false)).toBe(false);    // ... after its check the price reads 0.22
+    expect(P('9h 9d Kc 7s 3h', 0.30, 'TAG', false, false, true, false)).toBe(true);        // MANIAC only
+    expect(P('9h 9d Kc 7s 3h', 0.33, 'MANIAC', true, false, true, false)).toBe(true);      // not an all-in (the ramp: 1.75)
+    expect(P('Ah Ad Kc 7s 3h', 0.25, 'MANIAC', false, true, true, false)).toBe(true);      // an overcall: no shift
+    expect(P('Ah Ad Kc 7s 3h', 0.30, 'TAG', true, false, false, false)).toBe(false);       // the all-in ramp ...
+    expect(P('Ah Ad Kc 7s 3h', 0.30, 'TAG', true, false, false, true)).toBe(true);         // ... not over its own bet: two pair
+    expect(P('Kh Kd Qc Qs 3h', 0.30, 'TAG', true, false, false, true)).toBe(false);
+  });
+
+  it('the lead cap is pinned', () => {
+    expect(AI.FIVE_DRAW_POST_LEAD_CAP).toBe(0.3);
+  });
+});
+
+describe('re-review fix-ups (STUDDRAW-RR1-MEASUREMENT-2 / R4R-EXPLOIT-1): Five Card Draw after the draw, the gate phases in with the share of the depth a call puts in', () => {
+  it('fiveDrawPostFolds (pure): `commit` scales the hand needed (0 = no gate, 1 = all of it), so the answer moves with the size of the call, not at one edge', () => {
+    const P = (h: string, po: number, a: string, commit: number) => AI.fiveDrawPostFolds(C(h), po, a, false, 80, false, commit);
+    expect(P('Ah Kd 9c 7s 3h', 0.30, 'TAG', 0)).toBe(false);       // nothing brought in: the strategy decides
+    expect(P('Ah Kd 9c 7s 3h', 0.30, 'TAG', 0.3)).toBe(true);      // no pair folds as soon as any of it is
+    expect(P('2h 2d Kc 7s 3h', 0.30, 'TAG', 0.5)).toBe(false);     // half of two pair: every pair continues
+    expect(P('8h 8d Kc 7s 3h', 0.30, 'TAG', 0.75)).toBe(true);     // three quarters: 1.5, eights fold ...
+    expect(P('9h 9d Kc 7s 3h', 0.30, 'TAG', 0.75)).toBe(false);    // ... nines continue
+    expect(P('Ah Ad Kc 7s 3h', 0.30, 'TAG', 1)).toBe(true);        // all of it: two pair
+  });
+
+  // (A FISH's own call rule folds its weakest hands to a bet over 0.4 of the pot, as on live 0dc1b96: that step is the
+  // strategy's, not the gate's, so the FISH is checked on the gate alone in the pure test above and with Q-Q below.)
+  it('heads-up, 40 BB pot, 80 BB behind: facing a bet just under a third of the depth (0.65 pot) and one just over it (0.70 pot), a CALLING_STATION / MANIAC / TAG / LAG folds at most two more pair ranks to the bigger one (cdfc8a1: none folded to the gate at 0.65, every pair below aces at 0.70)', () => {
+    const restore = detEnv(4181);
+    try {
+      const out: string[] = [];
+      const ranks = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A'];
+      for (const a of ['CALLING_STATION', 'MANIAC', 'TAG', 'LAG']) {
+        const folds: Record<string, number> = { '0.65': 0, '0.7': 0 }; let n = 0;
+        for (const frac of [0.65, 0.7]) for (const r of ranks) for (const diff of ['hard', 'expert']) {
+          for (let k = 0, got = 0; got < 1 && k < 30; k++) {
+            const h = `${r}h ${r}d ${r === 'K' ? 'Q' : 'K'}c ${r === '9' ? '8' : '9'}s ${r === '4' ? '3' : '4'}h`;
+            const res = headsUpPostDraw(C(h), 'face', frac, 40); if (!res) continue; got++; n++;
+            if (AI.decideAction(res.t, res.me, prof(a, diff)).action === PlayerAction.Fold) folds[String(frac)]++;
+          }
+        }
+        out.push(`${a} ${folds['0.65']}/26 -> ${folds['0.7']}/26`);
+        expect([a, n]).toEqual([a, 52]);
+        expect([a, folds['0.7'] - folds['0.65'] <= 2 * 2 + 1]).toEqual([a, true]);
+      }
+      process.stdout.write(`HU 0.65 / 0.70 pot, pair folds: ${out.join(', ')}\n`);
+    } finally { restore(); }
+  }, 300_000);
+
+  it('the same two bets: a pair of queens gets the same answer from a FISH and a CALLING_STATION (it calls both; cdfc8a1 folded it to the bigger one every time)', () => {
+    const restore = detEnv(4182);
+    try {
+      const out: string[] = [];
+      for (const a of ['FISH', 'CALLING_STATION']) for (const frac of [0.65, 0.7]) {
+        let c = 0, n = 0;
+        for (const diff of DIFFS) for (let k = 0, got = 0; got < 2 && k < 30; k++) {
+          const res = headsUpPostDraw(C('Qh Qd Kc 9s 4h'), 'face', frac, 40); if (!res) continue; got++; n++;
+          if (AI.decideAction(res.t, res.me, prof(a, diff)).action !== PlayerAction.Fold) c++;
+        }
+        out.push(`${a} ${frac}: ${c}/${n}`);
+        expect([a, frac, n, c]).toEqual([a, frac, 8, 8]);
+      }
+      process.stdout.write(`HU Q-Q vs 0.65 / 0.70 pot, continues: ${out.join(', ')}\n`);
     } finally { restore(); }
   }, 300_000);
 });
