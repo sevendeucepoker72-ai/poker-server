@@ -2173,4 +2173,5 @@ effBB >= 2 * behindBB
 # of its 3-bets to a 100 BB shove and opening 6-10 BB with any two then shoving over them broke even (live -139..-273).
 FISH_RAISE_PCTILE
 DIFFICULTY_NOISE
-FISH_RAISE_PCTILE - (DIFFICULTY_NOISE[
+# SUPERSEDED 2026-11-09 by the next line (tsc emits exports.DIFFICULTY_NOISE inside the module, so this never matched): FISH_RAISE_PCTILE - (DIFFICULTY_NOISE[
+DIFFICULTY_NOISE[profile.difficulty] ?? 0) / 2
