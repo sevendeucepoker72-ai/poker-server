@@ -2205,3 +2205,7 @@ MICRO_CALL_NEED / Math.max(1, numOpponents)
 # price, and flatting a MANIAC raise with any two then moving in on the flop with a pair or a draw won +41 BB/100 (live -3).
 MANIAC_ALLIN_VALUE_STRENGTH
 MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds
+# 2026-11-09 (fix-up 3, sweep) - nearAllInRaiser: committed also with a stack-to-pot ratio <= NEAR_ALLIN_SPR (1): a raise to 40-45%
+# of a 40 BB stack over a MANIAC open was flat-called under the light re-raise cap and his flop all-in won +22 / +25 BB/100 (live -7 / -2).
+NEAR_ALLIN_SPR
+NEAR_ALLIN_SPR * (table.getTotalPot() + table.getCallAmount(seat))

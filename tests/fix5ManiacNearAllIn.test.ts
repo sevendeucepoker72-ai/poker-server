@@ -1,7 +1,7 @@
 /**
  * tests/fix5ManiacNearAllIn.test.ts (2026-11-09, bots review fix round 4, fix-up 3: HOLDEM-RR2-EXPLOIT-1 / -2), node level.
- * No-limit Hold'em. A raise that leaves the raiser half of his hand-start stack or less is the all-in it effectively is:
- * he calls any re-raise. 7740996 keyed every all-in rule on a real all-in only. A human who re-raised a MANIAC's raise to
+ * No-limit Hold'em. A raise that leaves the raiser half of his hand-start stack or less, or no more than the pot a call
+ * would make (stack-to-pot ratio <= 1), is the all-in it effectively is: he calls any re-raise. 7740996 keyed every all-in rule on a real all-in only. A human who re-raised a MANIAC's raise to
  * 50-95% of his stack, NOT all-in, then met either
  *  (a) the commit gate at the depth of the LARGEST live opponent: a 100 BB MANIAC continued 16% against a 40 BB human's
  *      raise to 38 BB (69% against his all-in, 91% on live 0dc1b96), and 16% against a 75 BB human's raise to 45; or
@@ -144,15 +144,16 @@ describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all
   const log: string[] = [];
   afterAll(() => process.stdout.write(`fix5 MANIAC near all-in: ${log.join('; ')}\n`));
 
-  it('the constant is half the hand-start stack', () => {
+  it('the constants: half the hand-start stack, or a stack-to-pot ratio of 1', () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    expect(require('../src/ai/AIPlayer').NEAR_ALLIN_LEFT_FRACTION).toBe(0.5);
+    const AI = require('../src/ai/AIPlayer');
+    expect([AI.NEAR_ALLIN_LEFT_FRACTION, AI.NEAR_ALLIN_SPR]).toEqual([0.5, 1]);
   });
 
-  it('the opener answers a 40-75 BB human\'s raise to 50-95% of his stack as it answers his all-in: it continues >= 58%, within 10 points of that, and never by a flat call (7740996, hard: 41% against 95% of 40 BB, 23% against 60% of 75 BB; a 500 BB MANIAC flat-called 58-63%)', () => {
+  it('the opener answers a 40-75 BB human\'s raise to 35-95% of his stack (half of it, or a stack-to-pot ratio <= 1, left) as it answers his all-in: it continues >= 58%, within 10 points of that, and never by a flat call (7740996, hard: 41% against 95% of 40 BB, 23% against 60% of 75 BB; a 500 BB MANIAC flat-called 58-63%; c0dac55 flat-called a raise to 35-40%)', () => {
     const bad: string[] = [];
     for (const diff of ['hard', 'medium']) {
-      for (const [m, h, f] of [[100, 40, 0.95], [100, 75, 0.6], [100, 75, 0.5], [500, 60, 0.95], [500, 75, 0.6]]) {
+      for (const [m, h, f] of [[100, 40, 0.95], [100, 75, 0.6], [100, 75, 0.5], [500, 60, 0.95], [500, 75, 0.6], [100, 40, 0.4], [500, 40, 0.35]]) {
         const near = opener(m, h, f, diff), all = opener(m, h, 1, diff);
         log.push(`${diff} ${m}/${h} raise ${f}: ${pct(near)} vs all-in ${pct(all)}`);
         if (near.spots < 200 || near.cont < 0.58 * near.spots || Math.abs(near.cont / near.spots - all.cont / all.spots) > 0.10 || near.flats > 0) {

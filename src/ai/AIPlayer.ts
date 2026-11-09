@@ -1327,6 +1327,14 @@ export const MANIAC_SHORT_SHOVE_MAX_BB = 75;
  */
 export const NEAR_ALLIN_LEFT_FRACTION = 0.5;
 /**
+ * Fix-up 3, sweep — he is committed too when his chips behind are no more than this many times the pot this seat's call
+ * would make (stack-to-pot ratio <= 1: his last bet can be no bigger than that pot, so it is priced in). A raise that kept
+ * more than half the stack (40-45% of 40 BB over a MANIAC open) was flat-called under the light re-raise cap, and the price
+ * on his flop all-in let a MANIAC fold: re-raise to 40 / 45% of the stack and move in on the flop won +22 (9) / +25 (10)
+ * BB/100 with one 100 BB MANIAC and a 40 BB stack (live 0dc1b96 -7 / -2); with this ratio -1 / -1, and 0.3 / 0.35 +1 / -6.
+ */
+export const NEAR_ALLIN_SPR = 1;
+/**
  * Fix round 4, fix-up 3 — Hold'em family, after the flop: a MANIAC facing an all-in (or a bet that left its maker
  * NEAR_ALLIN_LEFT_FRACTION of his stack or less) continues only with a strength above this (its raise-or-fold value line,
  * postFlopStrategy) or above the price it is laid (pot odds); a micro price is always called (the price floor). Its
@@ -1387,14 +1395,15 @@ export function shoverFaced(table: PokerTable, seat: Seat): Seat | null {
 
 /**
  * Fix-up 3 (NEAR_ALLIN_LEFT_FRACTION) — the live opponent whose raise or bet set the bet this seat faces (the street's last
- * aggressor) and kept NEAR_ALLIN_LEFT_FRACTION of his hand-start stack or less, with chips behind (null: none; an all-in is
- * shoverFaced's).
+ * aggressor) and is committed, with chips behind: he kept NEAR_ALLIN_LEFT_FRACTION of his hand-start stack or less, or no
+ * more than NEAR_ALLIN_SPR x the pot this seat's call would make (null: none; an all-in is shoverFaced's).
  */
 export function nearAllInRaiser(table: PokerTable, seat: Seat): Seat | null {
   const s = table.lastAggressorSeat >= 0 ? table.seats[table.lastAggressorSeat] : undefined;
   if (!s || s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) return null;
   if (s.currentBet !== table.currentBetToMatch) return null;
-  return s.chipCount <= NEAR_ALLIN_LEFT_FRACTION * handStartStack(s) ? s : null;
+  return s.chipCount <= NEAR_ALLIN_LEFT_FRACTION * handStartStack(s)
+    || s.chipCount <= NEAR_ALLIN_SPR * (table.getTotalPot() + table.getCallAmount(seat)) ? s : null;
 }
 
 /**
