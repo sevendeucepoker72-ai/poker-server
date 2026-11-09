@@ -967,7 +967,21 @@ return reRaisePricedIn(table, seat, shover) ? (callAmount < seat.chipCount ? CAL
 # two pair or better, never one pair (a 40 BB human's value shove after the draw was paid by Q-Q+ one pair).
 FIVE_DRAW_POST_ALLIN_MIN_PO
 FIVE_DRAW_POST_ALLIN_CLASS
-(potOdds >= 1 / 3 || (potOdds >= exports.FIVE_DRAW_POST_ALLIN_MIN_PO && !!shoverFaced(table, seat)))
+# SUPERSEDED 2026-11-09 by the fix round 4 review lines below (never shipped; the gate is now fiveDrawPostFolds,
+# which prices an all-in and any other bet apart - the pot-size step folded two pair to a pot bet):
+# (potOdds >= 1 / 3 || (potOdds >= exports.FIVE_DRAW_POST_ALLIN_MIN_PO && !!shoverFaced(table, seat)))
+# 2026-11-09 (bots review fix round 4, review fix-ups) - postFlopStrategyCore, Five Card Draw after the draw: the
+# made-hand gate (fiveDrawPostFolds) prices an all-in (or a bet that leaves nearly nothing behind) apart from any
+# other bet: a bet that is not an all-in meets the stack-off class only from an overbet (~2.6x the pot); below it
+# two pair continues and one pair by its rank and the price, smoothly (no step at a pot-size bet: MEASUREMENT-1 /
+# EXPLOIT-1); against a SHORT stack the gate eases (no gate under 15 BB at risk, aces up / two pair under 33 BB:
+# REGRESSION-1).
+fiveDrawPostFolds
+fiveDrawPostShoveLike
+FIVE_DRAW_POST_OVERBET_PO
+FIVE_DRAW_POST_PAIR_PO
+FIVE_DRAW_POST_SHALLOW_BB
+const overbet = potOdds >= exports.FIVE_DRAW_POST_OVERBET_PO || (potOdds >= 1 / 3 && depthBB >= exports.FIVE_DRAW_ALLIN_COMMIT_BB);
 # 2026-11-09 (bots review fix round 4, review fix-ups) - studDrawFirstRound: reRaisePricedIn counts as a raise only
 # an action that RAISED the running bet (betRaisingEntries); an all-in CALL for less is not one (REGRESSION-2).
 betRaisingEntries

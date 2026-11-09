@@ -1732,18 +1732,18 @@ export function fiveDrawStackOffPremium(cards: Card[]): boolean {
 }
 
 /**
- * Fix round 4 (MEAS-1 / EXPLOIT-1) — Five Card Draw AFTER the draw: a call of at least the pot
- * (potOdds >= 1/3) that commits a third of the depth at risk against the bet (the smaller of this
- * seat's stack and the bet's this round: fiveDrawPostCommits) continues only with this made-hand
- * class or better (fiveDrawMadeClass), by archetype: NIT / ROCK trips, TAG / LAG / MANIAC / FISH
- * aces up, CALLING_STATION two pair. The later-round strength is the pot share vs each bettor's
- * STARTING range (studDrawRangeFloor: 0.62 / 0.80 whatever the bet), so a 100 BB shove after the
- * draw was priced like a small bet and a NIT called it with one pair (32 of 103 callers; live
- * 0dc1b96, whose made-hand heuristic it replaced, 0 of 14): limping any five cards and shoving two
- * pair or better after the draw won +180 BB/100 vs NIT x4 and MANIAC x4 (live -121 / -97). At two
- * pair a MANIAC still lost +166 BB/100 to calling its raises up to 10 BB with any five cards and
- * shoving two pair or better after the draw (live -220; aces up: -103), and a FISH +257 to opening
- * the top 25% and shoving two pair or better after the draw (live +113; aces up: -45).
+ * Fix round 4 (MEAS-1 / EXPLOIT-1) — Five Card Draw AFTER the draw: a call that commits a third of the depth
+ * at risk against the bet (the smaller of this seat's stack and the bet's this round: fiveDrawPostCommits)
+ * of an ALL-IN priced at least the pot (potOdds >= 1/3), or of any bet priced FIVE_DRAW_POST_OVERBET_PO or
+ * more (fiveDrawPostFolds), continues only with this made-hand class or better (fiveDrawMadeClass), by
+ * archetype: NIT / ROCK trips, TAG / LAG / MANIAC / FISH aces up, CALLING_STATION two pair. The later-round
+ * strength is the pot share vs each bettor's STARTING range (studDrawRangeFloor: 0.62 / 0.80 whatever the
+ * bet), so a 100 BB shove after the draw was priced like a small bet and a NIT called it with one pair (32 of
+ * 103 callers; live 0dc1b96, whose made-hand heuristic it replaced, 0 of 14): limping any five cards and
+ * shoving two pair or better after the draw won +180 BB/100 vs NIT x4 and MANIAC x4 (live -121 / -97). At two
+ * pair a MANIAC still lost +166 BB/100 to calling its raises up to 10 BB with any five cards and shoving two
+ * pair or better after the draw (live -220; aces up: -103), and a FISH +257 to opening the top 25% and shoving
+ * two pair or better after the draw (live +113; aces up: -45).
  */
 export const FIVE_DRAW_POST_STACKOFF_CLASS: Record<Archetype, number> = {
   NIT: 4, ROCK: 4, TAG: 3, LAG: 3, MANIAC: 3, FISH: 3, CALLING_STATION: 2,
@@ -1763,17 +1763,104 @@ export const FIVE_DRAW_POST_ALLIN_MIN_PO = 0.25;
 export const FIVE_DRAW_POST_ALLIN_CLASS = 2;
 
 /**
- * Fix round 4 — after the draw: does calling `callAmount` commit a third of the depth at risk against the
- * bet (this seat's stack this round, or the smallest stack among the seats that have put the whole bet in,
- * an all-in shover's included, if smaller)?
+ * Fix round 4 review (MEASUREMENT-1 / EXPLOIT-1) — Five Card Draw after the draw, a bet that is NOT an all-in
+ * (fiveDrawPostShoveLike): the stack-off class above prices it only from this price on (an overbet: ~2.6x the pot
+ * or more). Below it two pair or better continues, and one pair by its rank and the price
+ * (FIVE_DRAW_POST_PAIR_PO). The class gate used to start at a pot-size bet (potOdds 1/3) for every bet: TAG / LAG
+ * / FISH / MANIAC folded every hand under aces up to a bet of exactly the pot but called a 0.95-pot bet with one
+ * pair. Calling raises up to 10 BB with any five cards, then betting at least the pot with ANY hand when checked
+ * to after the draw, won +382 BB/100 vs MANIAC x4 (live 0dc1b96 -228); re-raising any open, then betting the pot
+ * with any hand heads-up, +90 vs LAG x4 and +41 / +55 vs NIT / TAG x4 with a 40 BB stack (live about 0); opening
+ * any five cards, then betting the pot, +46 vs FISH x4 with 20-25 BB (live -108).
  */
-function fiveDrawPostCommits(table: PokerTable, seat: Seat, callAmount: number): boolean {
+export const FIVE_DRAW_POST_OVERBET_PO = 0.42;
+
+/**
+ * Fix round 4 review — one pair facing a bet that is not an all-in after the draw continues when its pair rank is
+ * at least 2 + 13 x (potOdds - lo) / (hi - lo): every pair against a third of the pot or less (potOdds 0.20),
+ * none from three quarters of the pot (0.30), aces from ~0.29. A smooth threshold, not a step, so a value bet just
+ * under a size and a bluff just over it are priced alike.
+ */
+export const FIVE_DRAW_POST_PAIR_PO: readonly [number, number] = [0.20, 0.30];
+
+/**
+ * Fix round 4 review (REGRESSION-1) — the class gate is for stacks that can be lost: against an all-in with a
+ * depth at risk under this many big blinds it does not apply (the strategy prices the call); under
+ * FIVE_DRAW_ALLIN_COMMIT_BB the stack-off class is at most aces up, and an all-in under an overbet needs two pair.
+ * On the shorter stack alone a 5 BB human's 4 BB all-in into 5 BB was folded with a pair of aces by every archetype
+ * (live 0dc1b96: 96 of 126 called), a NIT / ROCK folded aces up to a 20 BB human's all-in (live ROCK 18 of 18
+ * called), and opening any five cards, then betting the pot after the draw (his whole stack), won +46 BB/100 vs
+ * FISH x4 with 25 BB and +63 with 20 BB (live -108 / -96; cdb31dd -152).
+ */
+export const FIVE_DRAW_POST_SHALLOW_BB = 15;
+
+/** Fix round 4 review — the depth at risk against the bet this seat faces after the draw (chips): this seat's stack this round, or the smallest stack among the seats that have put the whole bet in, if smaller. */
+function fiveDrawPostDepth(table: PokerTable, seat: Seat): number {
   let bet = 0;
   for (const s of table.seats) {
     if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
     if (s.currentBet >= table.currentBetToMatch) bet = bet === 0 ? s.chipCount + s.currentBet : Math.min(bet, s.chipCount + s.currentBet);
   }
-  return bet > 0 && callAmount >= STACKOFF_COMMIT_FRACTION * Math.min(seat.chipCount + seat.currentBet, bet);
+  return bet > 0 ? Math.min(seat.chipCount + seat.currentBet, bet) : 0;
+}
+
+/**
+ * Fix round 4 — after the draw: does calling `callAmount` commit a third of the depth at risk against the
+ * bet (fiveDrawPostDepth)?
+ */
+function fiveDrawPostCommits(table: PokerTable, seat: Seat, callAmount: number): boolean {
+  const depth = fiveDrawPostDepth(table, seat);
+  return depth > 0 && callAmount >= STACKOFF_COMMIT_FRACTION * depth;
+}
+
+/**
+ * Fix round 4 review — is the bet this seat faces an all-in for the class gate: an all-in, a call that puts this
+ * seat all-in, or a bet that leaves its maker at most 2 BB or a tenth of the bet behind (a value bet of "all but a
+ * chip" is priced as the shove it is)?
+ */
+function fiveDrawPostShoveLike(table: PokerTable, seat: Seat, callAmount: number, bigBlind: number): boolean {
+  if (shoverFaced(table, seat) || callAmount >= seat.chipCount) return true;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
+    if (s.currentBet > 0 && s.currentBet >= table.currentBetToMatch && s.chipCount <= Math.max(2 * bigBlind, 0.1 * s.currentBet)) return true;
+  }
+  return false;
+}
+
+/** The rank of the pair in a one-pair Five Card Draw hand (0 for any other hand). */
+function fiveDrawPairRank(cards: Card[]): number {
+  if (fiveDrawMadeClass(cards) !== 1) return 0;
+  const cnt = new Map<number, number>();
+  for (const c of cards) cnt.set(c.rank, (cnt.get(c.rank) || 0) + 1);
+  for (const [r, k] of cnt) if (k === 2) return r;
+  return 0;
+}
+
+/**
+ * Fix round 4 review — Five Card Draw after the draw, a call that commits the depth at risk (fiveDrawPostCommits):
+ * does the made-hand gate fold `cards` (pure)? `shoveLike`: fiveDrawPostShoveLike; `depthBB`: fiveDrawPostDepth in
+ * big blinds.
+ *  - An all-in: the stack-off class (FIVE_DRAW_POST_STACKOFF_CLASS) from a pot-size price (1/3) - with less than
+ *    FIVE_DRAW_ALLIN_COMMIT_BB at risk only from an overbet (FIVE_DRAW_POST_OVERBET_PO) -, else two pair
+ *    (FIVE_DRAW_POST_ALLIN_CLASS) from FIVE_DRAW_POST_ALLIN_MIN_PO; nothing under FIVE_DRAW_POST_SHALLOW_BB.
+ *  - Any other bet: the stack-off class from FIVE_DRAW_POST_OVERBET_PO; below it two pair or better continues, one
+ *    pair by its rank and the price (FIVE_DRAW_POST_PAIR_PO), no pair folds.
+ *  - Under FIVE_DRAW_ALLIN_COMMIT_BB of depth the stack-off class is at most aces up.
+ */
+export function fiveDrawPostFolds(cards: Card[], potOdds: number, archetype: Archetype, shoveLike: boolean, depthBB: number): boolean {
+  const cls = fiveDrawMadeClass(cards);
+  let stackOff = FIVE_DRAW_POST_STACKOFF_CLASS[archetype] ?? 3;
+  if (depthBB < FIVE_DRAW_ALLIN_COMMIT_BB) stackOff = Math.min(stackOff, 3);
+  if (shoveLike) {
+    if (depthBB < FIVE_DRAW_POST_SHALLOW_BB || potOdds < FIVE_DRAW_POST_ALLIN_MIN_PO) return false;
+    const overbet = potOdds >= FIVE_DRAW_POST_OVERBET_PO || (potOdds >= 1 / 3 && depthBB >= FIVE_DRAW_ALLIN_COMMIT_BB);
+    return cls < (overbet ? stackOff : FIVE_DRAW_POST_ALLIN_CLASS);
+  }
+  if (potOdds >= FIVE_DRAW_POST_OVERBET_PO) return cls < stackOff;
+  if (cls !== 1) return cls < 1;
+  const [lo, hi] = FIVE_DRAW_POST_PAIR_PO;
+  const minRank = potOdds <= lo ? 2 : potOdds >= hi ? 15 : 2 + (13 * (potOdds - lo)) / (hi - lo);
+  return fiveDrawPairRank(cards) < minRank;
 }
 
 /**
@@ -2340,18 +2427,20 @@ function postFlopStrategyCore(
 
   // Fix round 4 (bots review, studdraw MEAS-1 / MEAS-2, EXPLOIT-1 / EXPLOIT-2) — Stud / Draw ONLY:
   // sdKind is null on Hold'em, Omaha, Short Deck and Pineapple, whose decisions do not change.
-  //  - Five Card Draw after the draw: a call of the pot or more that commits a third of the depth
-  //    at risk needs a stack-off hand by made-hand class (FIVE_DRAW_POST_STACKOFF_CLASS); a smaller
-  //    ALL-IN that commits it (a third of the pot or more) needs two pair (FIVE_DRAW_POST_ALLIN_CLASS).
+  //  - Five Card Draw after the draw: a call that commits a third of the depth at risk folds the
+  //    hands fiveDrawPostFolds names: against an all-in of the pot or more, under the stack-off class
+  //    (FIVE_DRAW_POST_STACKOFF_CLASS), against a smaller one (a third of the pot or more) under two
+  //    pair; against any other bet, under the stack-off class from an overbet on
+  //    (FIVE_DRAW_POST_OVERBET_PO), else no pair, and one pair by its rank and the price.
   //  - Fixed limit, the rounds after the first: facing ONE bet, a pot share that clears the price
   //    (STUD_DRAW_FL_CALL_MARGIN) calls in the NIT / ROCK / MANIAC branches, which folded under a
   //    flat 0.55 / 0.30 / 0.25 whatever the pot laid.
   const sdKind = studDrawKindOfTable(table);
   if (sdKind === 'draw-hi' && table.bettingStructure === 'no-limit' && callAmount > 0
     && drawsLeftAt(sdKind, table.currentPhase) === 0
-    && (potOdds >= 1 / 3 || (potOdds >= FIVE_DRAW_POST_ALLIN_MIN_PO && !!shoverFaced(table, seat)))
     && fiveDrawPostCommits(table, seat, callAmount)
-    && fiveDrawMadeClass(seat.holeCards) < (potOdds >= 1 / 3 ? (FIVE_DRAW_POST_STACKOFF_CLASS[profile.archetype] ?? 3) : FIVE_DRAW_POST_ALLIN_CLASS)) {
+    && fiveDrawPostFolds(seat.holeCards, potOdds, profile.archetype, fiveDrawPostShoveLike(table, seat, callAmount, bigBlind),
+      fiveDrawPostDepth(table, seat) / Math.max(1, bigBlind))) {
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
   const flPotOddsCall = sdKind !== null && table.bettingStructure === 'fixed-limit' && callAmount > 0
