@@ -259,11 +259,13 @@ describe('fix round 4 (unequal stacks): Five Card Draw after the draw, a smaller
  * Fix round 4 review: Five Card Draw heads-up after the draw. Seat 0 (a human) raises to `potBB / 2` BB before the
  * draw and the bot (seat 1) calls, so the pot is `potBB` BB with `100 - potBB / 2` BB behind each; both stand pat.
  * 'face': the bot checks and the human bets `betFrac` of the pot (not an all-in); 'lead': the bot acts first (the
- * human checks if he is first). The bot holds `cards`. null when the deal does not take that shape.
+ * human checks if he is first); 'shove': the bot checks and the human (`heroBB`) moves all-in. The bot holds `cards`.
+ * null when the deal does not take that shape.
  */
-function headsUpPostDraw(cards: any[], spot: 'face' | 'lead', betFrac = 1, potBB = 40): { t: any; me: number } | null {
+function headsUpPostDraw(cards: any[], spot: 'face' | 'lead' | 'shove', betFrac = 1, potBB = 40, heroBB = 100): { t: any; me: number } | null {
   const t = make['five-card-draw']();
   t.sitDown(0, 'Hero', 5000, 'human-later-hu', false); t.sitDown(1, 'Bot', 5000, 'ai-later-hu', true);
+  t.seats[0].chipCount = heroBB * 50;
   if (!t.startNewHand()) return null;
   let g = 0, raised = false;
   while (t.currentPhase === GamePhase.PreFlop && g++ < 10) {
@@ -280,7 +282,8 @@ function headsUpPostDraw(cards: any[], spot: 'face' | 'lead', betFrac = 1, potBB
     if (t.activeSeatIndex === 0 && !t.playerCheck(0)) return null;
   } else {
     if (t.activeSeatIndex === 1 && !t.playerCheck(1)) return null;
-    if (t.activeSeatIndex !== 0 || !t.playerRaise(0, Math.floor(potBB * 50 * betFrac))) return null;
+    if (t.activeSeatIndex !== 0) return null;
+    if (spot === 'shove' ? !t.playerAllIn(0) : !t.playerRaise(0, Math.floor(potBB * 50 * betFrac))) return null;
   }
   if (t.activeSeatIndex !== 1) return null;
   const spare = t.seats[1].holeCards.filter((c: any) => !cards.some((y: any) => same(y, c)));
@@ -315,37 +318,68 @@ describe('fix round 4 review (MEASUREMENT-1 / EXPLOIT-1): Five Card Draw after t
     }
   });
 
-  it('fiveDrawPostFolds (pure): against a bet that is not an all-in, the stack-off class only from an overbet; two pair always continues below it; one pair by rank and price; no pair folds', () => {
+  it('fiveDrawGateScore (pure): one pair by rank, two pair by its top pair, then aces up / trips / straights', () => {
+    const cases: [string, number][] = [
+      ['Ah Kd 9c 7s 3h', 0], ['2h 2d 9c 7s 3h', 1], ['Ah Ad 9c 7s 3h', 1 + 12 / 13], ['3h 3d 2c 2s 9h', 2],
+      ['Kh Kd Qc Qs 3h', 2 + 10 / 11], ['Ah Ad 2c 2s 3h', 3], ['2h 2d 2c 7s 3h', 4], ['9h Td Jc Qs Kh', 5],
+    ];
+    for (const [h, v] of cases) expect([h, AI.fiveDrawGateScore(C(h))]).toEqual([h, v]);
+  });
+
+  it('fiveDrawPostFolds (pure): the hand needed rises smoothly with the price, an all-in and any other bet alike from a 1.3x-pot bet on, never above the stack-off class', () => {
     const P = (h: string, po: number, a = 'TAG', shove = false, depth = 80) => AI.fiveDrawPostFolds(C(h), po, a, shove, depth);
-    // not an all-in
-    expect(P('9h 9d 5c 5s Kh', 0.40)).toBe(false);            // low two pair vs a 2x-pot bet: continues
-    expect(P('9h 9d 5c 5s Kh', 0.42)).toBe(true);             // vs an overbet: TAG needs aces up
-    expect(P('Ah Ad Kc Ks 3h', 0.42, 'NIT')).toBe(true);      // NIT needs trips vs an overbet
-    expect(P('Ah Ad Kc Ks 3h', 0.40, 'NIT')).toBe(false);
+    // a bet that is not an all-in
     expect(P('2h 2d 9c 7s 3h', 0.20)).toBe(false);            // every pair vs a third of the pot
     expect(P('2h 2d 9c 7s 3h', 0.25)).toBe(true);             // deuces fold half-pot ...
     expect(P('Th Td 9c 7s 3h', 0.25)).toBe(false);            // ... tens continue (rank 10 >= 8.5)
     expect(P('Ah Ad 9c 7s 3h', 0.29)).toBe(false);
     expect(P('Ah Ad 9c 7s 3h', 0.30)).toBe(true);             // no pair continues from three quarters of the pot
     expect(P('Ah Kd 9c 7s 3h', 0.15)).toBe(true);             // no pair always folds a committing bet
+    expect(P('3h 3d 2c 2s 9h', 0.35)).toBe(false);            // any two pair up to ~1.3x the pot
+    expect(P('9h 9d 5c 5s Kh', 0.40)).toBe(true);             // vs 2x the pot: two pair needs nines-up+ ... (need 2.67)
+    expect(P('Kh Kd Qc Qs 3h', 0.40)).toBe(false);            // ... kings up continue
+    expect(P('Kh Kd Qc Qs 3h', 0.42)).toBe(true);             // from ~2.6x the pot: aces up (TAG's stack-off class)
+    expect(P('Ah Ad Kc Ks 3h', 0.42)).toBe(false);
+    expect(P('Ah Ad Kc Ks 3h', 0.44, 'NIT')).toBe(true);      // NIT: rising to trips (need 3.5)
+    expect(P('Ah Ad Kc Ks 3h', 0.40, 'NIT')).toBe(false);
+    expect(P('3h 3d 2c 2s 9h', 0.48, 'CALLING_STATION')).toBe(false);   // CALLING_STATION: two pair at any price
     // an all-in (or a call that puts the bot all-in)
-    expect(P('Kh Kd Qc Qs 3h', 1 / 3, 'TAG', true)).toBe(true);    // pot-size all-in: TAG needs aces up
-    expect(P('Kh Kd Qc Qs 3h', 0.30, 'TAG', true)).toBe(false);    // a smaller one: two pair
-    expect(P('Ah Ad 9c 7s 3h', 0.30, 'TAG', true)).toBe(true);     // ... one pair folds
+    expect(P('Kh Kd Qc Qs 3h', 1 / 3, 'TAG', true)).toBe(false);   // a pot-size all-in: two pair (c2b81d4: aces up)
+    expect(P('Ah Ad 9c 7s 3h', 0.30, 'TAG', true)).toBe(true);     // a smaller one: one pair folds from 0.25
     expect(P('Ah Ad 9c 7s 3h', 0.24, 'TAG', true)).toBe(false);    // under a third of the pot: the strategy decides
+    expect(P('4h 4d 3c 3s 9h', 0.39, 'TAG', true)).toBe(true);     // vs ~2x the pot the same ramp as any bet
+    expect(P('9h 9d 5c 5s Kh', 0.39, 'TAG', true)).toBe(false);
     expect(P('Ah Ad 9c 7s 3h', 0.31, 'TAG', true, 10)).toBe(false); // under FIVE_DRAW_POST_SHALLOW_BB: no gate
     expect(P('Ah Ad Kc Ks 3h', 0.44, 'NIT', true, 19)).toBe(false); // under FIVE_DRAW_ALLIN_COMMIT_BB: aces up is enough
     expect(P('Ah Ad Kc Ks 3h', 0.44, 'NIT', true, 80)).toBe(true);
-    expect(P('Kh Kd Qc Qs 3h', 0.36, 'TAG', true, 25)).toBe(false); // under FIVE_DRAW_ALLIN_COMMIT_BB, a pot-size all-in: two pair
-    expect(P('Ah Ad 9c 7s 3h', 0.36, 'TAG', true, 25)).toBe(true);
-    expect(P('Kh Kd Qc Qs 3h', 0.36, 'TAG', true, 40)).toBe(true);  // with more at risk: the stack-off class
+    // a 100 BB shove into a limped pot (price ~0.48): the stack-off class, as fix round 4 made it (MEAS-1)
+    for (const a of ['TAG', 'LAG', 'FISH', 'MANIAC']) expect([a, P('Kh Kd Qc Qs 3h', 0.48, a, true)]).toEqual([a, true]);
+    for (const a of ['NIT', 'ROCK']) expect([a, P('Ah Ad Kc Ks 3h', 0.48, a, true), P('2h 2d 2c 7s 3h', 0.48, a, true)]).toEqual([a, true, false]);
   });
 
-  it('the overbet price, the one-pair price band and the shallow depth are pinned', () => {
-    expect(AI.FIVE_DRAW_POST_OVERBET_PO).toBe(0.42);
+  it('the price bands and the shallow depth are pinned', () => {
+    expect([...AI.FIVE_DRAW_POST_CLASS_PO]).toEqual([0.36, 0.42, 0.46]);
     expect([...AI.FIVE_DRAW_POST_PAIR_PO]).toEqual([0.20, 0.30]);
     expect(AI.FIVE_DRAW_POST_SHALLOW_BB).toBe(15);
   });
+
+  it('heads-up, a 60 BB human\'s pot-size ALL-IN after the draw (40 BB into a 40 BB pot): two pair continues for TAG / LAG / FISH / MANIAC (c2b81d4 and 977fd0e asked aces up: betting 1.5x the pot with any hand won +210 to +500 BB/100 vs MANIAC x4)', () => {
+    const restore = detEnv(4122);
+    try {
+      const folds: string[] = []; let n = 0;
+      for (const a of ['TAG', 'LAG', 'FISH', 'MANIAC']) for (const diff of DIFFS) {
+        for (let k = 0, got = 0; got < 3 && k < 30; k++) {
+          const r = headsUpPostDraw(C('Kh Kd Qc Qs 3h'), 'shove', 1, 40, 60); if (!r) continue; got++; n++;
+          const ca = r.t.getCallAmount(r.t.seats[r.me]);
+          expect(ca).toBe(2000);
+          expect(ca / (r.t.getTotalPot() + ca)).toBeCloseTo(1 / 3, 3);
+          if (AI.decideAction(r.t, r.me, prof(a, diff)).action === PlayerAction.Fold) folds.push(`${a}/${diff}`);
+        }
+      }
+      expect(n).toBe(4 * 4 * 3);
+      expect(folds).toEqual([]);
+    } finally { restore(); }
+  }, 300_000);
 });
 
 /**
