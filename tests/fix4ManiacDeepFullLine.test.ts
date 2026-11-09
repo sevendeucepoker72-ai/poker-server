@@ -20,6 +20,11 @@
  *              +30 BB/100 at a 500 BB MANIAC, +30 at equal 100 BB stacks; live 0dc1b96 -36 / -30). A 40 BB human's
  *              squeeze is pinned at node level (tests/fix4ManiacOpenerFlatters.test.ts): on the whole line it sits
  *              near 0 (dead money of the flatter; live is -13), too close to 0 for a seeded sign test.
+ *   rsjma      as rsjm, over the one raise of ANY MANIAC (fix-up 2, HOLDEM-RR1-EXPLOIT-1: two 100 BB MANIACs, a 40 BB
+ *              human: they no longer re-raise each other, so a lone MANIAC raise reaches him ~2x as often; the opener
+ *              then folded 65% of its raises to his all-in (the stack-off range for 40 BB) or isolated over flatters:
+ *              +24 (5) BB/100 on 09fe8d2, hard, exploit review harness; live 0dc1b96 -28. With
+ *              MANIAC_SHORT_SHOVE_MAX_BB it keeps its MANIAC branch: ~0 there, and this harness's row below).
  * On 0bc7529 the light re-raise cap was 5% of the MANIAC's OWN stack, so a deep MANIAC re-raised ~93% of hands
  * again and folded ~78% of them to the 100 BB shove (hard, BB/100): tg:4:3 +445, osrr:3:3 +172 vs a 1,000 BB
  * MANIAC + 100 BB TAG/LAG/NIT/FISH; os:2.5 +182 vs five 200 BB MANIACs; heads-up os:4 +66 vs a 300 BB MANIAC
@@ -79,10 +84,11 @@ function play(line: string, lineup: string[], depths: number[], hands: number, s
         if (kind === 'tg' && !deepRaiser()) { fold(); return; }
         t.playerAllIn(0); return;
       }
-      if (kind === 'rsjm') {
+      if (kind === 'rsjm' || kind === 'rsjma') {
         let last = -1;
         for (const e of t.actionLog) if (e.street === t.currentPhase && e.seatIndex !== 0 && /^(raised to|bet |went all-in)/.test(String(e.action))) last = e.seatIndex;
-        if (raises === 1 && !facingAllIn && last === 1) { raised = true; t.playerAllIn(0); return; }
+        const maniacRaise = kind === 'rsjm' ? last === 1 : last > 0 && (profs[last] as any).archetype === 'MANIAC';
+        if (raises === 1 && !facingAllIn && maniacRaise) { raised = true; t.playerAllIn(0); return; }
         if (facingAllIn && premium(s0.holeCards)) { t.playerCall(0) || t.playerAllIn(0); return; }
         fold(); return;
       }
@@ -161,6 +167,8 @@ describe('HOLDEM-R3-REG-1 + call-then-fold — any two cards does not profit fro
   const M5 = ['MANIAC', 'MANIAC', 'MANIAC', 'MANIAC', 'MANIAC'];
   // rsjm folds every hand but the big blind's: cheap, so more hands (the spot is ~1 hand in 6).
   const RSJM_N = Number(process.env.FIX4_MDF_RSJM_HANDS || 12 * N);
+  // rsjma at 40 BB sits within ~10 BB/100 of 0 on 6,000 hands either way: 30 x N (12,000) hands.
+  const RSJMA_N = Number(process.env.FIX4_MDF_RSJMA_HANDS || 30 * N);
   // Every row names its difficulty: jest-each passes a `done` callback to a test function with more parameters than
   // the row has (fix-up 1: rows without it timed out after 600 s with `done` read as the difficulty).
   const CASES: Array<[string, string, string[], number[], number, number, number, string]> = [
@@ -172,11 +180,12 @@ describe('HOLDEM-R3-REG-1 + call-then-fold — any two cards does not profit fro
     ['rsj', 'five 500 BB MANIACs, the human 40 BB', M5, [500, 500, 500, 500, 500], 3 * N, 46, 40, DIFF],
     ['rsjm', 'a 500 BB MANIAC + 100 BB TAG/LAG/NIT/FISH (hard), the human 100 BB', MPLUS, [500, 100, 100, 100, 100], RSJM_N, 47, 100, 'hard'],
     ['rsjm', 'MANIAC/TAG/LAG/NIT/FISH all 100 BB (hard), the human 100 BB', MPLUS, [100, 100, 100, 100, 100], RSJM_N, 48, 100, 'hard'],
+    ['rsjma', 'two MANIACs + TAG/FISH/LAG all 100 BB (hard), the human 40 BB', ['MANIAC', 'MANIAC', 'TAG', 'FISH', 'LAG'], [100, 100, 100, 100, 100], RSJMA_N, 51, 40, 'hard'],
   ];
   it.each(CASES)('%s loses against %s', (line, _name, lineup, depths, hands, seed, heroBB, diff) => {
     const t0 = process.hrtime.bigint();
     const r = play(line, lineup, depths, hands, seed, heroBB, diff);
     rows.push(`${line} vs ${_name}: ${r.bb100.toFixed(1)} (${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
     expect([line, r.hands, r.drift, r.bb100 < 0]).toEqual([line, hands, 0, true]);
-  }, 600_000);   // synchronous and slow under load (rsj took up to 332 s in review): a generous ceiling
+  }, 1_200_000);   // synchronous and slow under load (rsj took up to 332 s in review, rsjma 423 s): a generous ceiling
 });

@@ -13,6 +13,11 @@
  * squeeze profitable whatever the opener did (+14..+39 BB/100 for a 40 BB human, live -20): with
  * MANIAC_SQUEEZE_BEHIND_MAX_BB a MANIAC flats only what continues against the squeeze when a 26-50 BB player is still
  * to act (the last test).
+ * Fix-up 2 (HOLDEM-RR1-EXPLOIT-1 / -2, MANIAC_SHORT_SHOVE_MAX_BB): against an all-in of 26-75 BB at risk the opener keeps
+ * its MANIAC branch (~68-74% continue, by CALLING, so the flatters keep their overcall: isolating made their chips dead
+ * money, and a 40 BB squeeze over a MANIAC open still won +24 BB/100 with two 100 BB MANIACs). The opener rule this file
+ * pinned binds against deeper all-ins (the 100 BB rows); the 40 BB rows now pin the fix-up 2 behaviour
+ * (tests/fix4ManiacShortShove.test.ts has the rest).
  * Real PokerTable + real decideAction; seeded Math.random and a seeded deck (crypto.randomBytes).
  * 6 seats at 50/100, button 4: small blind 5, big blind 0 (the human), UTG 1 (the MANIAC), MP 2, CO 3.
  */
@@ -72,23 +77,23 @@ function respond(maniacBB: number, humanBB: number, flats: number, difficulty = 
 }
 
 describe('fix-up 1 (HOLDEM-R4-EXPLOIT-1 / -2) — a MANIAC opener squeezed with flatters behind treats them as dead money', () => {
-  it('one flatter: a 500 BB MANIAC continues >= 60% vs a 40 BB squeeze and >= 35% vs a 100 BB one, a 100 BB MANIAC >= 60% vs 40 BB (b4d567f: 23 / 14 / 14%), and never by a flat call', () => {
+  it('one flatter: a 500 BB MANIAC continues >= 35% vs a 100 BB squeeze, never by a flat call; >= 60% vs a 40 BB one, a 100 / 200 BB MANIAC too (b4d567f: 14 / 23 / 14%; the 40 BB rows by calling since fix-up 2)', () => {
     const bad: string[] = [];
     for (const diff of ['hard', 'medium']) {
       for (const [mbb, hbb, min] of [[500, 40, 0.6], [500, 100, 0.35], [100, 40, 0.6], [200, 40, 0.6]]) {
         const r = respond(mbb, hbb, 1, diff);
         if (r.spots < 300) bad.push(`${diff} ${mbb}/${hbb}: only ${r.spots} spots`);
-        if (r.cont < min * r.spots || r.calls > 0) bad.push(`${diff} MANIAC ${mbb} BB vs ${hbb} BB squeeze: continued ${r.cont}/${r.spots}, flat-called ${r.calls}`);
+        if (r.cont < min * r.spots || (hbb > 75 && r.calls > 0)) bad.push(`${diff} MANIAC ${mbb} BB vs ${hbb} BB squeeze: continued ${r.cont}/${r.spots}, flat-called ${r.calls}`);
       }
     }
     expect(bad).toEqual([]);
   });
 
-  it('two flatters: wider still (>= 85% vs a 40 BB squeeze, >= 50% vs 100 BB; b4d567f 17 / 10%)', () => {
+  it('two flatters: wider still vs a 100 BB squeeze (>= 50%, never a flat call; b4d567f 10%); vs a 40 BB one >= 60% (b4d567f 17%; by calling since fix-up 2)', () => {
     const bad: string[] = [];
-    for (const [mbb, hbb, min] of [[500, 40, 0.85], [500, 100, 0.5]]) {
+    for (const [mbb, hbb, min] of [[500, 40, 0.6], [500, 100, 0.5]]) {
       const r = respond(mbb, hbb, 2);
-      if (r.cont < min * r.spots || r.calls > 0) bad.push(`MANIAC ${mbb} BB vs ${hbb} BB squeeze, 2 flatters: continued ${r.cont}/${r.spots}, flat-called ${r.calls}`);
+      if (r.cont < min * r.spots || (hbb > 75 && r.calls > 0)) bad.push(`MANIAC ${mbb} BB vs ${hbb} BB squeeze, 2 flatters: continued ${r.cont}/${r.spots}, flat-called ${r.calls}`);
     }
     expect(bad).toEqual([]);
   });
@@ -118,10 +123,9 @@ describe('fix-up 1 (HOLDEM-R4-EXPLOIT-1 / -2) — a MANIAC opener squeezed with 
     expect([short <= 0.3, deep >= 0.5, similar >= 0.5]).toEqual([true, true, true]);
   });
 
-  it('no flatter (its call closes the action): unchanged, the raised stack-off width (heads-up ~37% vs 40 BB, ~21% vs 100 BB)', () => {
+  it('no flatter (its call closes the action): untouched by the opener rule; vs 100 BB the raised stack-off width (~21%), vs 40 BB the MANIAC branch since fix-up 2 (>= 60%; the stack-off width gave ~37%)', () => {
     const r40 = respond(500, 40, 0), r100 = respond(500, 100, 0);
-    expect(r40.cont / r40.spots).toBeGreaterThan(0.25);
-    expect(r40.cont / r40.spots).toBeLessThan(0.5);
+    expect(r40.cont / r40.spots).toBeGreaterThan(0.6);
     expect(r100.cont / r100.spots).toBeGreaterThan(0.12);
     expect(r100.cont / r100.spots).toBeLessThan(0.3);
   });

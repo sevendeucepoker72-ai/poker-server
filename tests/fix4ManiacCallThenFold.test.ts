@@ -15,6 +15,10 @@
  * the shover's depth counting the flatter (it folded 77-86% of its opens, and a big-blind squeeze of any two won
  * +30..+55 BB/100): the flatter is dead money (MANIAC_FLATTER_WIDEN), and it continues by an isolation re-raise,
  * never a flat call, so the call-then-fold this file pins stays gone (tests/fix4ManiacOpenerFlatters.test.ts).
+ * Fix-up 2 (HOLDEM-RR1-EXPLOIT-1 / -2, MANIAC_SHORT_SHOVE_MAX_BB): against a 26-75 BB all-in the opener keeps its
+ * MANIAC branch (~70%, by calling: isolating made the flatters' chips dead money for the shover), and a flatter reads
+ * the stack-off range for the shover's depth counting him alone (the players behind narrowed it to ~23%; now ~36%,
+ * still far from the ~70% this file pins against). Test 2's opener row and flatter bound follow.
  * Real PokerTable + real decideAction, seeded Math.random (the LCG of tests/botPremiumHold.test.ts) and a seeded
  * deck (crypto.randomBytes: an unseeded deck changed the hands deal() draws run to run). 6 seats at
  * 50/100: btn 0 (the human), sb 1, bb 2, utg 3, mp 4, co 5. The bounds below fail on 0bc7529 and on the
@@ -91,25 +95,25 @@ describe('MANIAC call-then-fold (fix round 4) — a MANIAC that flat-called does
     expect(bad).toEqual([]);
   });
 
-  it('a deep (500 BB) MANIAC facing a 40 BB all-in with players still to act no longer calls ~70%: the unraised big blind <= 15%, a flatter <= 35%; the opener (a flatter behind it: fix-up 1) continues >= 50% but only by an isolation re-raise, never a flat call', () => {
+  it('a deep (500 BB) MANIAC facing a 40 BB all-in with players still to act no longer calls ~70%: the unraised big blind <= 15%, a flatter <= 45% (fix-up 2: the shover alone counted, ~36%); the opener (a flatter behind it) continues >= 50% (fix-up 2: by calling, the MANIAC branch)', () => {
     const bad: string[] = [];
     const deep = [40, 500, 500, 500, 500, 500];
     const spots: Array<[string, () => PokerTable, number, number]> = [
       // the big blind (posted, no voluntary chips) with the opener and a flatter behind
       ['big blind', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerFold(5); t.playerAllIn(0); t.playerFold(1); return t; }, 2, 0.15],
       // a flatter with a second flatter behind
-      ['flatter', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerCall(5); t.playerAllIn(0); for (const s of [1, 2, 3]) t.playerFold(s); return t; }, 4, 0.35],
+      ['flatter', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerCall(5); t.playerAllIn(0); for (const s of [1, 2, 3]) t.playerFold(s); return t; }, 4, 0.45],
     ];
     for (const diff of ['hard', 'medium']) for (const [name, build, me, max] of spots) {
       const r = contRate(build, me, diff);
       if (r > max) bad.push(`${diff} ${name}: continued ${(100 * r).toFixed(1)}% > ${100 * max}%`);
     }
-    // the opener with a flatter behind (fix-up 1: the flatter is dead money; it isolates, it does not flat)
+    // the opener with a flatter behind (fix-up 1 isolated; fix-up 2: a 40 BB all-in keeps the MANIAC branch, which calls)
     const opener = () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerFold(5); t.playerAllIn(0); t.playerFold(1); t.playerFold(2); return t; };
     for (const diff of ['hard', 'medium']) {
       const o = { calls: 0 };
       const r = contRate(opener, 3, diff, 400, o);
-      if (r < 0.5 || o.calls > 0) bad.push(`${diff} opener: continued ${(100 * r).toFixed(1)}%, flat-called ${(100 * o.calls).toFixed(1)}%`);
+      if (r < 0.5 || o.calls < 0.4) bad.push(`${diff} opener: continued ${(100 * r).toFixed(1)}%, flat-called ${(100 * o.calls).toFixed(1)}%`);
     }
     expect(bad).toEqual([]);
   });

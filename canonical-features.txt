@@ -2175,3 +2175,13 @@ FISH_RAISE_PCTILE
 DIFFICULTY_NOISE
 # SUPERSEDED 2026-11-09 by the next line (tsc emits exports.DIFFICULTY_NOISE inside the module, so this never matched): FISH_RAISE_PCTILE - (DIFFICULTY_NOISE[
 DIFFICULTY_NOISE[profile.difficulty] ?? 0) / 2
+# 2026-11-09 (bots review fix round 4 fix-up 2, holdem lane, HOLDEM-RR1-EXPLOIT-1/-2) - preFlopStrategy (no-limit): a MANIAC that
+# raised this street, facing an all-in of 26 to MANIAC_SHORT_SHOVE_MAX_BB (75) BB at risk, keeps its MANIAC branch (0dc1b96: ~68%
+# continue, by calling); one that only called plays the stack-off range for the shover's depth counting him alone (2x). The
+# stack-off range continued 35-51% and the opener isolated over flatters: a 26-60 BB human shoving any two over a MANIAC raise won
+# +8..+24 BB/100 (live -18..-28). The flat rule skips a 25 BB or shorter player still to act (a 15 BB bot switched it off).
+MANIAC_SHORT_SHOVE_MAX_BB
+const keepManiacBranch = shortShove &&
+&& !keepManiacBranch
+MANIAC_RAISED_STACKOFF_WIDEN, 1)
+d = Math.min(d, bb)
