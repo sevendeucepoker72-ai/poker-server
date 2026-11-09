@@ -25,6 +25,13 @@
  *              then folded 65% of its raises to his all-in (the stack-off range for 40 BB) or isolated over flatters:
  *              +24 (5) BB/100 on 09fe8d2, hard, exploit review harness; live 0dc1b96 -28. With
  *              MANIAC_SHORT_SHOVE_MAX_BB it keeps its MANIAC branch: ~0 there, and this harness's row below).
+ *   nsm:F      over the one raise of ANY MANIAC, re-raise to F x his stack, NOT all-in; call any re-raise; move all-in on the
+ *              flop (fix-up 3, HOLDEM-RR2-EXPLOIT-1 / -2: every all-in rule keyed on a real all-in, so at F = 0.95 a 100 BB
+ *              MANIAC met the commit gate at the largest opponent's depth and continued 16% against a 40 BB human; a 300 BB
+ *              one flat-called under the light re-raise cap and folded air to his last 5 BB on the flop: +82 (5) and
+ *              +1,285 (104) BB/100 on 7740996, hard, exploit review harness; live 0dc1b96 -28 / -131. With
+ *              NEAR_ALLIN_LEFT_FRACTION the raise is his all-in, and the post-flop price floor calls the micro all-in).
+ *              His all-in is scored on its main pot from the board at which he went all-in.
  * On 0bc7529 the light re-raise cap was 5% of the MANIAC's OWN stack, so a deep MANIAC re-raised ~93% of hands
  * again and folded ~78% of them to the 100 BB shove (hard, BB/100): tg:4:3 +445, osrr:3:3 +172 vs a 1,000 BB
  * MANIAC + 100 BB TAG/LAG/NIT/FISH; os:2.5 +182 vs five 200 BB MANIACs; heads-up os:4 +66 vs a 300 BB MANIAC
@@ -76,13 +83,37 @@ function play(line: string, lineup: string[], depths: number[], hands: number, s
     const hero = (): void => {
       const s0 = t.seats[0], ca = t.getCallAmount(s0);
       const fold = () => (ca > 0 ? t.playerFold(0) : (t.playerCheck(0) || t.playerFold(0)));
-      if (t.currentPhase !== GamePhase.PreFlop) { fold(); return; }
+      if (t.currentPhase !== GamePhase.PreFlop) {
+        if (kind === 'nsm' && raised && s0.chipCount > 0 && t.currentPhase === GamePhase.Flop) {
+          // scored from this board: when his all-in closes the action the hand ends inside the call
+          if (!(t as any).__allInPre) { (t as any).__allInPre = true; evBoard = t.communityCards.length; }
+          t.playerAllIn(0) || fold(); return;
+        }
+        fold(); return;
+      }
       const facingAllIn = t.seats.some((x: any) => x.seatIndex !== 0 && x.state === 'occupied' && !x.folded && x.allIn && x.currentBet > s0.currentBet);
       const raises = Number(t.raisesThisStreet) || 0;
+      if (raised && ca > 0 && kind === 'nsm') {
+        if (ca >= s0.chipCount && !(t as any).__allInPre) { (t as any).__allInPre = true; evBoard = t.communityCards.length; }
+        t.playerCall(0) || t.playerAllIn(0) || fold(); return;
+      }
       if (raised && ca > 0) {
         if (facingAllIn) { if (premium(s0.holeCards)) t.playerCall(0) || t.playerAllIn(0); else t.playerFold(0); return; }
         if (kind === 'tg' && !deepRaiser()) { fold(); return; }
         t.playerAllIn(0); return;
+      }
+      if (kind === 'nsm') {
+        let last = -1;
+        for (const e of t.actionLog) if (e.street === t.currentPhase && e.seatIndex !== 0 && /^(raised to|bet |went all-in)/.test(String(e.action))) last = e.seatIndex;
+        if (raises === 1 && !facingAllIn && last > 0 && (profs[last] as any).archetype === 'MANIAC') {
+          const to = Math.floor(Number(b) * (s0.chipCount + s0.currentBet) / 50) * 50;
+          raised = true;
+          if (to >= s0.chipCount + s0.currentBet) { t.playerAllIn(0); return; }
+          if (!t.playerRaise(0, Math.max(to, t.getMinRaise()))) { raised = false; fold(); }
+          return;
+        }
+        if (facingAllIn && premium(s0.holeCards)) { t.playerCall(0) || t.playerAllIn(0); return; }
+        fold(); return;
       }
       if (kind === 'rsjm' || kind === 'rsjma') {
         let last = -1;
@@ -139,7 +170,12 @@ function play(line: string, lineup: string[], depths: number[], hands: number, s
       let g = 0;
       while (t.isHandInProgress() && g++ < 300) {
         const a = t.activeSeatIndex; if (a < 0) break;
-        if (a === 0) { hero(); if (t.seats[0].allIn && t.currentPhase === GamePhase.PreFlop) (t as any).__allInPre = true; continue; }
+        if (a === 0) {
+          const board = t.communityCards.length;
+          hero();
+          if (t.seats[0].allIn && !(t as any).__allInPre && (t.currentPhase === GamePhase.PreFlop || kind === 'nsm')) { (t as any).__allInPre = true; evBoard = board; }
+          continue;
+        }
         if (t.seats[0].folded) { if (!t.playerFold(a)) t.playerCheck(a); continue; }   // the human's result is final
         const wasIn = !t.seats[a].folded;
         const d = AI.decideAction(t, a, profs[a]);
@@ -169,6 +205,9 @@ describe('HOLDEM-R3-REG-1 + call-then-fold — any two cards does not profit fro
   const RSJM_N = Number(process.env.FIX4_MDF_RSJM_HANDS || 12 * N);
   // rsjma at 40 BB sits within ~10 BB/100 of 0 on 6,000 hands either way: 30 x N (12,000) hands.
   const RSJMA_N = Number(process.env.FIX4_MDF_RSJMA_HANDS || 30 * N);
+  // nsm (fix-up 3): 6,000 hands at 40 BB (seed 54: 7740996 +79.2, head -21.0; seed 52: +70.9 / -8.2); 600 against the five
+  // 300 BB MANIACs (seed 53: 7740996 +1,106.9, head -587.7).
+  const NSM_N = Number(process.env.FIX4_MDF_NSM_HANDS || 15 * N);
   // Every row names its difficulty: jest-each passes a `done` callback to a test function with more parameters than
   // the row has (fix-up 1: rows without it timed out after 600 s with `done` read as the difficulty).
   const CASES: Array<[string, string, string[], number[], number, number, number, string]> = [
@@ -181,6 +220,8 @@ describe('HOLDEM-R3-REG-1 + call-then-fold — any two cards does not profit fro
     ['rsjm', 'a 500 BB MANIAC + 100 BB TAG/LAG/NIT/FISH (hard), the human 100 BB', MPLUS, [500, 100, 100, 100, 100], RSJM_N, 47, 100, 'hard'],
     ['rsjm', 'MANIAC/TAG/LAG/NIT/FISH all 100 BB (hard), the human 100 BB', MPLUS, [100, 100, 100, 100, 100], RSJM_N, 48, 100, 'hard'],
     ['rsjma', 'two MANIACs + TAG/FISH/LAG all 100 BB (hard), the human 40 BB', ['MANIAC', 'MANIAC', 'TAG', 'FISH', 'LAG'], [100, 100, 100, 100, 100], RSJMA_N, 51, 40, 'hard'],
+    ['nsm:0.95', 'two MANIACs + TAG/FISH/LAG all 100 BB (hard), the human 40 BB', ['MANIAC', 'MANIAC', 'TAG', 'FISH', 'LAG'], [100, 100, 100, 100, 100], NSM_N, 54, 40, 'hard'],
+    ['nsm:0.95', 'five 300 BB MANIACs (hard), the human 100 BB', M5, [300, 300, 300, 300, 300], Math.round(NSM_N / 10), 53, 100, 'hard'],
   ];
   it.each(CASES)('%s loses against %s', (line, _name, lineup, depths, hands, seed, heroBB, diff) => {
     const t0 = process.hrtime.bigint();
