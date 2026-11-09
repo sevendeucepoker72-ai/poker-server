@@ -1143,6 +1143,16 @@ function decideActionForSeat(
     seat, table, profile, storyBoard, opponents, outs, bigBlind, numOpponents, oppCategory,
     holdemEquivalentStreet(table.currentPhase, sdKind)
   );
+  // Fix-up 3 (HOLDEM-RR2-EXPLOIT-2) — the Hold'em family only (never Stud / draw): against an all-in, or a bet that left its
+  // maker NEAR_ALLIN_LEFT_FRACTION of his stack or less, the decision is priced.
+  //  - The pre-flop price floor on the later streets: at most MICRO_CALL_NEED of equity per opponent needed, a FOLD is a call.
+  //    The MANIAC "raise or fold" (and NIT / ROCK below a fixed strength) folded air to a human's last 2-5 BB in an 80-400 BB
+  //    pot after flat-calling his near-all-in raise.
+  const allInBettor = !sdKind && table.bettingStructure !== 'fixed-limit' && callAmount > 0
+    ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
+  if (allInBettor && potOdds <= MICRO_CALL_NEED / Math.max(1, numOpponents)) {
+    if (post.action === PlayerAction.Fold) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
+  }
   return limitBotRaiseWar(table, seat, post, false, effectiveStrength);
 }
 
@@ -1295,6 +1305,23 @@ export const MANIAC_SQUEEZE_BEHIND_MAX_BB = 50;
  */
 export const MANIAC_SHORT_SHOVE_MAX_BB = 75;
 /**
+ * Fix round 4, fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — no-limit Hold'em family: a raise (or a post-flop bet) that leaves the
+ * player who made it this share of his hand-start stack or less is the all-in it effectively is: he calls any re-raise.
+ * Pre-flop, deeper than the push/fold zone (depth at risk > 25 BB), every all-in rule of preFlopStrategy reads it as the
+ * all-in (nearAllInRaiser: the price floor, the commit gate, the MANIAC short-shove band, the opener / FISH / deep-MANIAC
+ * all-in rules, the flat rule), and a bot that continues re-raises to cover him (a flat left him chips to move in after the
+ * flop). Post-flop the price floor (decideAction) treats his bet as an all-in. They keyed on a real all-in only, so a human
+ * who re-raised a MANIAC's raise to 50-95% of his stack met the commit gate at the LARGEST opponent's depth (a 100 BB MANIAC
+ * continued 16% against a 40 BB human's raise to 38 BB, 69% against his all-in) or the light re-raise cap (a 300 BB MANIAC
+ * flat-called ~70%, then folded air to his last 2-5 BB on the flop). Re-raise to F of the stack, call any re-raise, move
+ * in on the flop (hard, whole line, BB/100, 7740996 / live 0dc1b96): a 40 BB human vs two 100 BB MANIACs +17 / +44 / +69 /
+ * +92 at F = 0.5 / 0.6 / 0.75 / 0.95 (live +1 / 0 / -12 / -18); a 75 BB human +81 at every F (live -5 to -23); a 100 BB
+ * human vs five 300 BB MANIACs +51 / +406 / +795 / +1,581 (live -228 / -245 / -116 / -88). A 10% share (the review
+ * candidate) left F <= 0.75 open (+81 at 75 BB, +279 / +487 vs the 300 BB MANIACs); the commit gate at the raiser's depth
+ * alone left +75.
+ */
+export const NEAR_ALLIN_LEFT_FRACTION = 0.5;
+/**
  * Fix round 4, fix-up 1 (HOLDEM-R4-MEASUREMENT-1) — no-limit: the FISH "weird raise" (B5, rounds 1-2) is a 3x raise with
  * its top 10% by strength against a random hand (pctile >= this), where 0dc1b96 moved all-in with them. Facing an
  * all-in deeper than the push/fold zone after it raised this street, it continues with every hand it raises for: it
@@ -1341,6 +1368,18 @@ export function shoverFaced(table: PokerTable, seat: Seat): Seat | null {
     if (s.allIn && s.currentBet === table.currentBetToMatch) return s;
   }
   return null;
+}
+
+/**
+ * Fix-up 3 (NEAR_ALLIN_LEFT_FRACTION) — the live opponent whose raise or bet set the bet this seat faces (the street's last
+ * aggressor) and kept NEAR_ALLIN_LEFT_FRACTION of his hand-start stack or less, with chips behind (null: none; an all-in is
+ * shoverFaced's).
+ */
+export function nearAllInRaiser(table: PokerTable, seat: Seat): Seat | null {
+  const s = table.lastAggressorSeat >= 0 ? table.seats[table.lastAggressorSeat] : undefined;
+  if (!s || s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) return null;
+  if (s.currentBet !== table.currentBetToMatch) return null;
+  return s.chipCount <= NEAR_ALLIN_LEFT_FRACTION * handStartStack(s) ? s : null;
 }
 
 /**
@@ -1525,8 +1564,19 @@ function preFlopStrategy(
   const headPyta = Math.min(3, Math.max(1, totalActive - 1));
   // NEW-1 — the all-in that SET the bet this seat faces, and the depth at risk
   // against it (min of the two hand-start stacks), never the shover's 0 left.
-  const shover = callAmount > 0 ? shoverFaced(table, seat) : null;
+  // Fix-up 3 (NEAR_ALLIN_LEFT_FRACTION): no-limit, deeper than the push/fold zone, a raise that left its maker half his
+  // stack or less is that all-in for every rule below.
+  let shover = callAmount > 0 ? shoverFaced(table, seat) : null;
+  const nearRaiser = !shover && callAmount > 0 && noLimit && !allInOrFold ? nearAllInRaiser(table, seat) : null;
+  if (nearRaiser && Math.round(Math.min(handStartStack(seat), handStartStack(nearRaiser)) / bigBlind) > PUSH_FOLD_MAX_BB) shover = nearRaiser;
   const shoveBB = shover ? Math.max(1, Math.round(Math.min(handStartStack(seat), handStartStack(shover)) / bigBlind)) : 0;
+  // Fix-up 3 — continuing against the all-in: a call; against a near-all-in raise, a re-raise to cover him (a flat call
+  // left him his last chips to move in after the flop, and folding air to them was the leak).
+  let CONT = CALL;
+  if (shover && !shover.allIn) {
+    const to = Math.max(minRaise, shover.currentBet + shover.chipCount);
+    CONT = to >= seat.chipCount + seat.currentBet ? ALLIN : { action: PlayerAction.Raise, raiseAmount: to };
+  }
   // Review fix — price a spot as "calling the shove" ONLY when nobody else can
   // still act: pureCall = a call closes the action; pureAllInCall = no other live
   // opponent has chips (it is this seat against the all-in player(s) alone).
@@ -1562,7 +1612,7 @@ function preFlopStrategy(
   const held = valueHand && callAmount > 0 && ((rawValue as number) >= PREMIUM_STACKOFF_THRESHOLD || inForBet <= 1);
   const FOLD: AIDecision = !held ? { action: PlayerAction.Fold, raiseAmount: 0 }
     : allInOrFold || callAmount >= seat.chipCount ? ALLIN
-    : pureCall ? CALL
+    : pureCall ? CONT
     : noLimit && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION ? ALLIN
     : CALL;
 
@@ -1574,7 +1624,7 @@ function preFlopStrategy(
   const floorNeed = noLimit || allInOrFold ? MICRO_CALL_NEED / pyta : PLO_LONE_ALLIN_CALL_NEED / pyta;
   if (shover && table.bettingStructure !== 'fixed-limit' && (allInOrFold ? pureAllInCall : pureCall)
       && callAmount / (totalPot + callAmount) <= floorNeed) {
-    return allInOrFold || callAmount >= seat.chipCount ? ALLIN : CALL;
+    return allInOrFold || callAmount >= seat.chipCount ? ALLIN : CONT;
   }
 
   // ── Short-stack push/fold (and every All-In or Fold decision): the baked Nash lookup. ──
@@ -1652,18 +1702,18 @@ function preFlopStrategy(
   if (!allInOrFold && noLimit && shover && profile.archetype === 'FISH' && effBB > PUSH_FOLD_MAX_BB && shoveBB > PUSH_FOLD_MAX_BB
     && ownRaisesThisStreet(table, seat) > 0
     && (ctx.rawPctile ?? pctile) >= FISH_RAISE_PCTILE - (DIFFICULTY_NOISE[profile.difficulty] ?? 0) / 2) {
-    return callAmount < seat.chipCount ? CALL : ALLIN;
+    return callAmount < seat.chipCount ? CONT : ALLIN;
   }
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
   // (and, fix round 3, its 0dc1b96 chips-left depth: chipsLeftEffectiveStackBB).
   if (shortShove && !keepManiacBranch && ownCallsThisStreet(table, seat) > 0) {
     if (!stackOffOK(shoveBB, MANIAC_RAISED_STACKOFF_WIDEN, 1)) return FOLD;
-    return callAmount < seat.chipCount ? CALL : ALLIN;
+    return callAmount < seat.chipCount ? CONT : ALLIN;
   }
   if (!allInOrFold && noLimit && (pureCall || committing) && !keepManiacBranch) {
     const soDepth = pureCall ? shoveBB : effBB;
     if (!stackOffOK(soDepth, maniacWiden(soDepth))) return FOLD;
-    return pureCall && callAmount < seat.chipCount ? CALL : ALLIN;
+    return pureCall && callAmount < seat.chipCount ? CONT : ALLIN;
   }
   // Fix round 4 — a MANIAC deeper than the push/fold zone facing an all-in it does not close (players
   // still to act) for less than a third of ITS stack skipped the gate above, and the MANIAC branch below
@@ -1674,7 +1724,7 @@ function preFlopStrategy(
   if (!allInOrFold && noLimit && shover && profile.archetype === 'MANIAC' && effBB > PUSH_FOLD_MAX_BB && shoveBB > PUSH_FOLD_MAX_BB
     && !keepManiacBranch) {
     if (!stackOffOK(shoveBB, maniacWiden(shoveBB))) return FOLD;
-    return callAmount < seat.chipCount ? CALL : ALLIN;
+    return callAmount < seat.chipCount ? CONT : ALLIN;
   }
   /** A re-raise; when it would be a jam it must pass the stack-off range too (null = not this hand: fall through). */
   const raiseOrJam = (amount: number): AIDecision | null => {
@@ -1722,7 +1772,7 @@ function preFlopStrategy(
         return stackOffOK(behindBB, MANIAC_RAISED_STACKOFF_WIDEN) ? CALL : FOLD;
       }
     }
-    return pctile >= 0.30 ? CALL : FOLD;
+    return pctile >= 0.30 ? CONT : FOLD;
   }
 
   // ── FISH: loose-passive; LIMPS its playables (openLimpFreq), calls too wide. ──

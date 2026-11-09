@@ -2185,3 +2185,18 @@ const keepManiacBranch = shortShove &&
 && !keepManiacBranch
 MANIAC_RAISED_STACKOFF_WIDEN, 1)
 d = Math.min(d, bb)
+# 2026-11-09 (bots review fix round 4 fix-up 3, holdem lane, HOLDEM-RR2-EXPLOIT-1/-2) - preFlopStrategy (no-limit): a raise that
+# leaves its maker NEAR_ALLIN_LEFT_FRACTION (half) of his hand-start stack or less is the all-in for every all-in rule (depth at
+# risk > 25 BB), and a bot that continues re-raises to cover him (CONT): re-raising a MANIAC's raise to 50-95% of the stack, NOT
+# all-in, calling any re-raise and moving in on the flop won +17..+92 BB/100 (40 BB human, two 100 BB MANIACs), +81 at 75 BB and
+# +51..+1,581 against five 300 BB MANIACs (live -18..-245). decideAction (Hold'em family, never Stud / draw): an all-in, or a bet
+# that left its maker half his stack or less, needing <= MICRO_CALL_NEED of equity per opponent is never folded after the flop
+# (MANIAC / NIT / ROCK folded air to the last 2-5 BB in an 80-400 BB pot).
+NEAR_ALLIN_LEFT_FRACTION
+function nearAllInRaiser(
+let CONT = CALL;
+shover.currentBet + shover.chipCount
+pctile >= 0.30 ? CONT : FOLD
+pureCall && callAmount < seat.chipCount ? CONT : ALLIN
+shoverFaced(table, seat) ?? nearAllInRaiser(table, seat)
+MICRO_CALL_NEED / Math.max(1, numOpponents)
