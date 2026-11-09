@@ -1275,6 +1275,8 @@ export const MANIAC_FLATTER_WIDEN = 1;
  * with two 500 BB MANIACs (open, flat) a 40 BB human squeezing any two from the big blind won +20 BB/100 after the
  * opener fix (live 0dc1b96 -18: the second MANIAC 3-bet instead), whatever the opener did (call / isolate / jam:
  * +14..+39). With this rule +5 (n.s.). Measured squeeze value of the dead money: 40 BB +20, 60 BB ~0, 100 BB < 0.
+ * Only for a MANIAC at least twice as deep (effective) as that player: with similar stacks (a tournament; five
+ * 40 BB MANIACs and a 40 BB human) the squeeze measured no leak (+6 (18), live +31) and the flats stay.
  */
 export const MANIAC_SQUEEZE_BEHIND_MAX_BB = 50;
 
@@ -1657,10 +1659,12 @@ function preFlopStrategy(
     }
     if (callAmount === 0) return CHECK;
     // Fix-up 1 (MANIAC_SQUEEZE_BEHIND_MAX_BB): a flat call in front of a 26-50 BB player still to act is dead money
-    // for his squeeze; flat only what continues against it. Plain raises only (a short all-in keeps the branch).
+    // for his squeeze; flat only what continues against it, when this MANIAC is at least twice as deep as him (a deep
+    // ring-game MANIAC; similar stacks, as in a tournament, keep the branch: five 40 BB MANIACs measured no leak).
+    // Plain raises only (a short all-in keeps the branch).
     if (noLimit && facingRaise && !facingThreeBet && !shover && effBB > PUSH_FOLD_MAX_BB) {
       const behindBB = Math.round(shortestToActBB(table, seat, bigBlind));
-      if (behindBB > PUSH_FOLD_MAX_BB && behindBB <= MANIAC_SQUEEZE_BEHIND_MAX_BB) {
+      if (behindBB > PUSH_FOLD_MAX_BB && behindBB <= MANIAC_SQUEEZE_BEHIND_MAX_BB && effBB >= 2 * behindBB) {
         return stackOffOK(behindBB, MANIAC_RAISED_STACKOFF_WIDEN) ? CALL : FOLD;
       }
     }
