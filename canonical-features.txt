@@ -995,6 +995,11 @@ FIVE_DRAW_POST_CLASS_PO
 # 2026-11-09 (bots review fix round 4, review fix-ups) - studDrawFirstRound: reRaisePricedIn counts as a raise only
 # an action that RAISED the running bet (betRaisingEntries); an all-in CALL for less is not one (REGRESSION-2).
 betRaisingEntries
+# 2026-11-09 (bots review fix round 4, review fix-ups) - fiveDrawPostFolds: an OVERCALL after the draw (a seat other
+# than the bet's maker already called it) needs one class more than a lone call, and at least two pair
+# (FIVE_DRAW_POST_OVERCALL; MEASUREMENT-2: value bets into MANIAC-built multiway pots were paid by every caller).
+FIVE_DRAW_POST_OVERCALL
+fiveDrawPostOvercall
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

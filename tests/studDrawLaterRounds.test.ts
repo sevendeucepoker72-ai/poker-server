@@ -6,6 +6,8 @@
  *     vs the bettor's STARTING range, so a 100 BB shove after the draw was priced like a small bet: NITs called it
  *     with one pair (32 of 103 callers; live 0dc1b96 0 of 14) and limping any five cards, then shoving two pair or
  *     better after the draw, won +180 BB/100 vs NIT x4 and MANIAC x4 (live -121 / -97) over whole hands.
+ *     Review fix-ups: the hand needed rises smoothly with the price (fiveDrawPostFolds), eases against a SHORT stack,
+ *     and an OVERCALL needs more than a lone call (FIVE_DRAW_POST_OVERCALL).
  *  2. Fixed limit: facing ONE bet, a NIT / ROCK / MANIAC whose pot share clears the price calls
  *     (STUD_DRAW_FL_CALL_MARGIN). The NIT folded everything under 0.55 to one bet: calling the first round with any
  *     hand, betting when checked to and folding to any bet won +83 BB/100 vs NIT x4 in Badugi (live -49).
@@ -385,9 +387,10 @@ describe('fix round 4 review (MEASUREMENT-1 / EXPLOIT-1): Five Card Draw after t
 /**
  * Fix round 4 review (REGRESSION-1): a SHORT human after the draw. postDrawShove with `heroBB` (everyone limps, the
  * human moves all-in into the ~5 BB pot); postDrawPotBet: the human (heroBB) opens to 3 BB, every bot calls, all
- * stand pat, the bots before him check and he bets exactly the pot (not an all-in); the next bot holds `cards`.
+ * stand pat, the bots before him check and he bets exactly the pot (not an all-in); the next bot holds `cards` (with
+ * `overcall`, the next bot calls first and the one after it holds `cards`).
  */
-function postDrawPotBet(cards: any[], heroBB: number): { t: any; me: number } | null {
+function postDrawPotBet(cards: any[], heroBB: number, overcall = false): { t: any; me: number } | null {
   const t = make['five-card-draw']();
   for (let i = 0; i < 5; i++) t.sitDown(i, 'P' + i, 5000, (i === 0 ? 'human-later-' : 'ai-later-') + i, i !== 0);
   t.seats[0].chipCount = heroBB * 50;
@@ -404,6 +407,7 @@ function postDrawPotBet(cards: any[], heroBB: number): { t: any; me: number } | 
   g = 0; while (t.currentPhase === GamePhase.Bet2 && t.activeSeatIndex > 0 && g++ < 10) t.playerCheck(t.activeSeatIndex);
   if (t.currentPhase !== GamePhase.Bet2 || t.activeSeatIndex !== 0) return null;
   if (!t.playerRaise(0, t.getTotalPot())) return null;
+  if (overcall) { const c = t.activeSeatIndex; if (c <= 0 || !t.playerCall(c)) return null; }   // the next bot calls first
   const me = t.activeSeatIndex; if (me <= 0) return null;
   const spare = t.seats[me].holeCards.filter((c: any) => !cards.some((y: any) => same(y, c)));
   for (const x of t.seats) if (x.seatIndex !== me) x.holeCards = x.holeCards.map((c: any) => (cards.some((y: any) => same(y, c)) ? spare.pop() : c));
@@ -485,6 +489,56 @@ describe('fix round 4 review (REGRESSION-3): Five Card Draw after the draw, the 
       expect(big).toEqual([]);
       expect(aN).toBe(2 * 4 * 3);
       expect(aBets / aN).toBeGreaterThanOrEqual(0.9);
+    } finally { restore(); }
+  }, 300_000);
+});
+
+describe('fix round 4 review fix-ups (MEASUREMENT-2): Five Card Draw after the draw, an OVERCALL needs more than a lone call', () => {
+  it('fiveDrawPostFolds (pure): an overcall needs FIVE_DRAW_POST_OVERCALL[0] more and at least [1] (two pair), never above the stack-off class; a lone call is unchanged', () => {
+    const P = (h: string, po: number, a = 'TAG', shove = false, depth = 37, over = false) => AI.fiveDrawPostFolds(C(h), po, a, shove, depth, over);
+    expect([...AI.FIVE_DRAW_POST_OVERCALL]).toEqual([1, 2]);
+    // a bet of the pot already called once: the overcall is priced 0.25
+    expect([P('Qh Qd 9c 5s 2h', 0.25), P('Qh Qd 9c 5s 2h', 0.25, 'TAG', false, 37, true)]).toEqual([false, true]);
+    expect([P('Ah Ad 9c 5s 2h', 0.25), P('Ah Ad 9c 5s 2h', 0.25, 'FISH', false, 37, true)]).toEqual([false, true]);
+    expect([P('4h 4d 3c 3s 9h', 0.25), P('4h 4d 3c 3s 9h', 0.25, 'MANIAC', false, 37, true)]).toEqual([false, true]);
+    expect(P('9h 9d 5c 5s Kh', 0.25, 'TAG', false, 37, true)).toBe(false);          // nines up: 2.55 >= 2.5
+    // vs a pot-size bet (0.33) two pair below aces up overcalls only up to the stack-off class
+    expect([P('Kh Kd Qc Qs 3h', 1 / 3), P('Kh Kd Qc Qs 3h', 1 / 3, 'TAG', false, 37, true)]).toEqual([false, true]);
+    expect(P('Ah Ad Kc Ks 3h', 1 / 3, 'TAG', false, 37, true)).toBe(false);
+    expect(P('Kh Kd Qc Qs 3h', 1 / 3, 'CALLING_STATION', false, 37, true)).toBe(false);   // its class is two pair
+    expect(P('Ah Ad 9c 5s 2h', 0.25, 'CALLING_STATION', false, 37, true)).toBe(true);
+    // a small all-in (under FIVE_DRAW_POST_ALLIN_MIN_PO): no gate for a lone call, two pair for an overcall
+    expect([P('Ah Ad 9c 5s 2h', 0.2, 'TAG', true), P('Ah Ad 9c 5s 2h', 0.2, 'TAG', true, 37, true), P('3h 3d 2c 2s 9h', 0.2, 'TAG', true, 37, true)]).toEqual([false, true, false]);
+    expect(P('Ah Ad 9c 5s 2h', 0.2, 'TAG', true, 10, true)).toBe(false);            // under FIVE_DRAW_POST_SHALLOW_BB: no gate
+  });
+
+  it('a 40 BB human\'s pot-size bet after the draw, already called by one bot: the next bot never overcalls with a pair of aces (every archetype) or with 4-4-3-3 / 7-7-5-5 (every archetype but the CALLING_STATION, whose class is two pair); ca66fff: FISH / CALLING_STATION overcalled every time', () => {
+    const restore = detEnv(4151);
+    try {
+      const over: string[] = []; let n = 0;
+      for (const h of ['Ah Ad Kc Qs 9h', '4h 4d 3c 3s 9h', '7h 7d 5c 5s Kh']) for (const a of ARCH) {
+        if (a === 'CALLING_STATION' && h !== 'Ah Ad Kc Qs 9h') continue;
+        for (const diff of DIFFS) for (let k = 0, got = 0; got < 3 && k < 30; k++) {
+          const r = postDrawPotBet(C(h), 40, true); if (!r) continue; got++; n++;
+          const ca = r.t.getCallAmount(r.t.seats[r.me]);
+          expect(ca / (r.t.getTotalPot() + ca)).toBeCloseTo(0.25, 3);
+          if (AI.decideAction(r.t, r.me, prof(a, diff)).action !== PlayerAction.Fold) over.push(`${h} ${a}/${diff}`);
+        }
+      }
+      expect(n).toBe((7 + 6 + 6) * 4 * 3);
+      expect(over).toEqual([]);
+    } finally { restore(); }
+  }, 300_000);
+
+  it('CONTROL: K-K-Q-Q still overcalls it (TAG / LAG / FISH / MANIAC / CALLING_STATION), and the FIRST caller (no caller ahead) with 7-7-5-5 still calls (FISH / CALLING_STATION)', () => {
+    const restore = detEnv(4152);
+    try {
+      const a1 = shortHuman((c) => postDrawPotBet(c, 40, true), 'Kh Kd Qc Qs 3h', ['TAG', 'LAG', 'FISH', 'MANIAC', 'CALLING_STATION'], 3);
+      const a2 = shortHuman((c) => postDrawPotBet(c, 40), '7h 7d 5c 5s Kh', ['FISH', 'CALLING_STATION'], 3);
+      process.stdout.write(`overcall K-K-Q-Q: ${a1.out.join(', ')} | first call 7-7-5-5: ${a2.out.join(', ')}\n`);
+      expect([a1.n, a2.n]).toEqual([5 * 4 * 3, 2 * 4 * 3]);
+      expect(a1.cont / a1.n).toBeGreaterThanOrEqual(0.9);
+      expect(a2.cont / a2.n).toBeGreaterThanOrEqual(0.85);
     } finally { restore(); }
   }, 300_000);
 });

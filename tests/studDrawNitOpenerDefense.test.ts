@@ -176,5 +176,5 @@ describe('fix round 3: a NIT that opened does not fold most of its range to ONE 
     process.stdout.write(`Badugi raise-war any hand vs NIT x4, pooled: ${bb100.toFixed(1)} BB/100 over ${hands} hands\n`);
     expect(hands).toBe(1500);
     expect(bb100).toBeLessThan(30);
-  }, 1_200_000);
+  }, 2_400_000);   // 1,500 Badugi hands: ~600-900 s on a loaded machine (fix round 4 review note)
 });
