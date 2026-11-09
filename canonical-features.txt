@@ -962,6 +962,12 @@ FIVE_DRAW_ALLIN_COMMIT_BB && streetRaises <= 1);
 # MANIAC folded ~90% of its light re-raises to a 40 BB human's shove and opening any five cards won +98 BB/100.
 reRaisePricedIn
 return reRaisePricedIn(table, seat, shover) ? (callAmount < seat.chipCount ? CALL : ALLIN) : FOLD;
+# 2026-11-08 (bots review fix round 4, unequal stacks) - postFlopStrategyCore, Five Card Draw after the draw: an
+# all-in smaller than the pot-size gate (a third of the pot or more) that commits the depth at risk is called with
+# two pair or better, never one pair (a 40 BB human's value shove after the draw was paid by Q-Q+ one pair).
+FIVE_DRAW_POST_ALLIN_MIN_PO
+FIVE_DRAW_POST_ALLIN_CLASS
+(potOdds >= 1 / 3 || (potOdds >= exports.FIVE_DRAW_POST_ALLIN_MIN_PO && !!shoverFaced(table, seat)))
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

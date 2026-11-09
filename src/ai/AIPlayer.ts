@@ -1750,6 +1750,19 @@ export const FIVE_DRAW_POST_STACKOFF_CLASS: Record<Archetype, number> = {
 };
 
 /**
+ * Fix round 4 (unequal stacks) — Five Card Draw after the draw: an ALL-IN smaller than the pot-size gate (a price
+ * from FIVE_DRAW_POST_ALLIN_MIN_PO up to 1/3: at least a third of the pot) that still commits a third of the depth
+ * at risk is called with FIVE_DRAW_POST_ALLIN_CLASS (two pair) or better; one pair folds. A 40 BB human's all-in
+ * after the draw is that small whenever the pot was built before it: MANIACs called his ~30 BB shove into ~45 BB
+ * with a pair of queens or better, and calling every raise up to 10 BB with any five cards, then shoving two pair
+ * or better, won +147 +- 46 BB/100 vs MANIAC x4 [3k/2] (live 0dc1b96 -218; 2b5ac52 / cdb31dd +312); with this,
+ * +15 +- 40 (the same line shoving ANY five cards: -409, live -244). Folding two pair as well (the pot-size class)
+ * turned that bluff line to +247.
+ */
+export const FIVE_DRAW_POST_ALLIN_MIN_PO = 0.25;
+export const FIVE_DRAW_POST_ALLIN_CLASS = 2;
+
+/**
  * Fix round 4 — after the draw: does calling `callAmount` commit a third of the depth at risk against the
  * bet (this seat's stack this round, or the smallest stack among the seats that have put the whole bet in,
  * an all-in shover's included, if smaller)?
@@ -2304,15 +2317,17 @@ function postFlopStrategyCore(
   // Fix round 4 (bots review, studdraw MEAS-1 / MEAS-2, EXPLOIT-1 / EXPLOIT-2) — Stud / Draw ONLY:
   // sdKind is null on Hold'em, Omaha, Short Deck and Pineapple, whose decisions do not change.
   //  - Five Card Draw after the draw: a call of the pot or more that commits a third of the depth
-  //    at risk needs a stack-off hand by made-hand class (FIVE_DRAW_POST_STACKOFF_CLASS).
+  //    at risk needs a stack-off hand by made-hand class (FIVE_DRAW_POST_STACKOFF_CLASS); a smaller
+  //    ALL-IN that commits it (a third of the pot or more) needs two pair (FIVE_DRAW_POST_ALLIN_CLASS).
   //  - Fixed limit, the rounds after the first: facing ONE bet, a pot share that clears the price
   //    (STUD_DRAW_FL_CALL_MARGIN) calls in the NIT / ROCK / MANIAC branches, which folded under a
   //    flat 0.55 / 0.30 / 0.25 whatever the pot laid.
   const sdKind = studDrawKindOfTable(table);
   if (sdKind === 'draw-hi' && table.bettingStructure === 'no-limit' && callAmount > 0
-    && drawsLeftAt(sdKind, table.currentPhase) === 0 && potOdds >= 1 / 3
+    && drawsLeftAt(sdKind, table.currentPhase) === 0
+    && (potOdds >= 1 / 3 || (potOdds >= FIVE_DRAW_POST_ALLIN_MIN_PO && !!shoverFaced(table, seat)))
     && fiveDrawPostCommits(table, seat, callAmount)
-    && fiveDrawMadeClass(seat.holeCards) < (FIVE_DRAW_POST_STACKOFF_CLASS[profile.archetype] ?? 3)) {
+    && fiveDrawMadeClass(seat.holeCards) < (potOdds >= 1 / 3 ? (FIVE_DRAW_POST_STACKOFF_CLASS[profile.archetype] ?? 3) : FIVE_DRAW_POST_ALLIN_CLASS)) {
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
   const flPotOddsCall = sdKind !== null && table.bettingStructure === 'fixed-limit' && callAmount > 0

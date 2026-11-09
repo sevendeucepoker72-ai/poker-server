@@ -198,3 +198,58 @@ describe('fix round 4 (MEAS-2 / EXPLOIT-2): fixed limit, the rounds after the fi
     expect(AI.STUD_DRAW_FL_CALL_MARGIN).toBe(0.05);
   });
 });
+
+/**
+ * Fix round 4 (unequal stacks): Five Card Draw, 5 seats at 25/50, seat 0 a human with `heroBB`, the bots 100 BB. The
+ * first actor raises to 10 BB and everyone calls (a 50 BB pot), all stand pat, the seats before the human check after
+ * the draw and the human moves all-in for his last `heroBB - 10` BB; the bot to act next holds `cards` (planted as
+ * postDrawShove does). null when the deal does not take that shape.
+ */
+function postDrawShortShove(cards: any[], heroBB: number): { t: any; me: number } | null {
+  const t = make['five-card-draw']();
+  for (let i = 0; i < 5; i++) t.sitDown(i, 'P' + i, 5000, (i === 0 ? 'human-later-' : 'ai-later-') + i, i !== 0);
+  t.seats[0].chipCount = heroBB * 50;
+  if (!t.startNewHand()) return null;
+  let g = 0, raised = false;
+  while (t.currentPhase === GamePhase.PreFlop && g++ < 20) {
+    const a = t.activeSeatIndex; if (a < 0) return null;
+    if (!raised) { if (!t.playerRaise(a, 500)) return null; raised = true; continue; }
+    if (!t.playerCall(a)) t.playerCheck(a);
+  }
+  checkThrough(t, GamePhase.Bet2);
+  g = 0;
+  while (t.currentPhase === GamePhase.Bet2 && t.activeSeatIndex > 0 && g++ < 10) t.playerCheck(t.activeSeatIndex);
+  if (t.currentPhase !== GamePhase.Bet2 || t.activeSeatIndex !== 0 || t.seats.some((x: any) => x.folded)) return null;
+  expect(t.playerAllIn(0)).toBe(true);
+  const me = t.activeSeatIndex; if (me <= 0) return null;
+  const spare = t.seats[me].holeCards.filter((c: any) => !cards.some((y: any) => same(y, c)));
+  for (const x of t.seats) if (x.seatIndex !== me) x.holeCards = x.holeCards.map((c: any) => (cards.some((y: any) => same(y, c)) ? spare.pop() : c));
+  t.seats[me].holeCards = cards.map((c) => ({ ...c }));
+  return { t, me };
+}
+
+describe('fix round 4 (unequal stacks): Five Card Draw after the draw, a smaller all-in that commits the depth at risk needs two pair', () => {
+  it('one pair (A-A, K-K, Q-Q) never calls a 40 BB human\'s 30 BB all-in into a 50 BB pot (price ~0.27), every archetype and difficulty (05248ab / cdb31dd / 2b5ac52 called it)', () => {
+    const restore = detEnv(4111);
+    try {
+      const calls: string[] = []; let n = 0;
+      for (const h of ['Ah Ad Kc Qs 9h', 'Kh Kd Ac Js 8h', 'Qh Qd Ac Ks 7h']) for (const a of ARCH) for (const diff of DIFFS) {
+        for (let k = 0, got = 0; got < 2 && k < 30; k++) {
+          const r = postDrawShortShove(C(h), 40); if (!r) continue; got++; n++;
+          const ca = r.t.getCallAmount(r.t.seats[r.me]), pot = r.t.getTotalPot();
+          expect(ca).toBe(1500);
+          expect(ca / (pot + ca)).toBeGreaterThanOrEqual(0.25);
+          expect(ca / (pot + ca)).toBeLessThan(1 / 3);
+          const d = AI.decideAction(r.t, r.me, prof(a, diff));
+          if (d.action !== PlayerAction.Fold) calls.push(`${h} ${a}/${diff} ${d.action}`);
+        }
+      }
+      expect(n).toBe(3 * 7 * 4 * 2);
+      expect(calls).toEqual([]);
+    } finally { restore(); }
+  }, 300_000);
+
+  it('the small all-in rule: from a third of the pot (price 0.25), two pair (pinned)', () => {
+    expect([AI.FIVE_DRAW_POST_ALLIN_MIN_PO, AI.FIVE_DRAW_POST_ALLIN_CLASS]).toEqual([0.25, 2]);
+  });
+});
