@@ -4,7 +4,9 @@
  *  1. a MANIAC's check is not a capped range: with seats behind it, it traps a share of its kings or better and leads
  *     a share of its lower pairs (FIVE_DRAW_POST_MANIAC_MIX); checked to by every seat it bets every hand
  *     (STUDDRAW-RR2-EXPLOIT-1 / R4RR-REGRESSION-1);
- *  2. a short bot whose capped lead is under the minimum bet leads its whole stack (STUDDRAW-R4RR-REGRESSION-2).
+ *  2. the call-site wiring of fiveDrawPostFolds' `checked` and `raised` arguments (STUDDRAW-R4RR-REGRESSION-3), and
+ *     fiveDrawPostShoveLike (a bet that leaves its maker all but a chip);
+ *  3. a short bot whose capped lead is under the minimum bet leads its whole stack (STUDDRAW-R4RR-REGRESSION-2).
  * Real tables, deterministic (seeded Math.random, frozen Date.now, seeded deck).
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
@@ -71,6 +73,33 @@ function shortBotLead(cards: any[], botBehindBB: number): { t: any; me: number }
   if (me <= 0 || t.getCallAmount(t.seats[me]) !== 0 || t.seats[me].chipCount !== botBehindBB * 50) return null;
   plant(t, me, cards);
   return { t, me };
+}
+
+/**
+ * Heads-up Five Card Draw at 25/50: a human with `heroBB` BB and a bot with 100 BB, the bot in seat 1 or seat 0 (whichever
+ * makes the bot first to act after the draw when `botFirst`, the human otherwise). The first round is raised to
+ * `potBB` / 2 BB and called, both stand pat; null unless the pot is `potBB` BB after the draw. The bot then holds `cards`.
+ */
+function huAfterDraw(cards: any[], heroBB: number, botFirst: boolean, potBB = 40): { t: any; bot: number; hero: number } | null {
+  for (const bot of [1, 0]) {
+    const hero = 1 - bot;
+    const t = new FiveCardDrawTable(cfg(), false);
+    t.sitDown(bot, 'Bot', 5000, 'ai-postdraw-hu', true); t.sitDown(hero, 'Hero', 5000, 'human-postdraw-hu', false);
+    t.seats[hero].chipCount = heroBB * 50;
+    if (!t.startNewHand()) return null;
+    let g = 0, raised = false;
+    while (t.currentPhase === GamePhase.PreFlop && g++ < 10) {
+      const a = t.activeSeatIndex; if (a < 0) return null;
+      if (!raised) { if (!t.playerRaise(a, (potBB / 2) * 50)) return null; raised = true; continue; }
+      if (!t.playerCall(a)) t.playerCheck(a);
+    }
+    standPat(t);
+    if (t.currentPhase !== GamePhase.Bet2 || t.getTotalPot() !== potBB * 50) return null;
+    if (t.activeSeatIndex !== (botFirst ? bot : hero)) continue;
+    plant(t, bot, cards);
+    return { t, bot, hero };
+  }
+  return null;
 }
 
 /**
@@ -149,6 +178,73 @@ describe('fix-up 3 (STUDDRAW-RR2-EXPLOIT-1 / R4RR-REGRESSION-1): Five Card Draw 
   it('the MANIAC lead mix is pinned', () => {
     expect([...AI.FIVE_DRAW_POST_MANIAC_MIX]).toEqual([0.5, 0.3]);
   });
+});
+
+describe('fix-up 3 (STUDDRAW-R4RR-REGRESSION-3): the call site passes fiveDrawPostFolds whether the bot checked and whether it has chips in', () => {
+  it('heads-up after the draw, 40 BB pot, 80 BB behind, the human bets 0.75 pot: a MANIAC that CHECKED continues with T-T (its checked range reads the price FIVE_DRAW_POST_CHECKED_PO lower), one that has not acted folds it to the gate', () => {
+    const restore = detEnv(5311);
+    try {
+      const res: Record<string, { cont: number; n: number }> = { checked: { cont: 0, n: 0 }, first: { cont: 0, n: 0 } };
+      for (const spot of ['checked', 'first']) for (const diff of DIFFS) for (let k = 0, got = 0; got < 3 && k < 60; k++) {
+        const r = huAfterDraw(C('Th Td Kc 8s 4h'), 100, spot === 'checked'); if (!r) continue;
+        const { t, bot, hero } = r;
+        if (spot === 'checked' && !t.playerCheck(bot)) continue;
+        if (!t.playerRaise(hero, 1500) || t.activeSeatIndex !== bot) continue;
+        got++; res[spot].n++;
+        if (AI.decideAction(t, bot, prof('MANIAC', diff)).action !== PlayerAction.Fold) res[spot].cont++;
+      }
+      process.stdout.write(`MANIAC T-T vs a 0.75-pot bet: checked ${res.checked.cont}/${res.checked.n}, not acted ${res.first.cont}/${res.first.n}\n`);
+      expect([res.checked.n, res.first.n]).toEqual([12, 12]);
+      expect(res.checked.cont).toBeGreaterThanOrEqual(10);   // the strategy itself may still fold it
+      expect(res.first.cont).toBe(0);
+    } finally { restore(); }
+  }, 300_000);
+
+  it('heads-up after the draw, 40 BB pot: a bot\'s capped lead (0.3 of 80 BB) shoved over at a price of 0.28 folds A-A / K-K one pair (the all-in raises chips it already put in), while a 25.5 BB shove at about the same price after its check keeps the all-in ramp and is called (MANIAC / LAG)', () => {
+    const restore = detEnv(5312);
+    try {
+      const res: Record<string, { cont: number; n: number; po: number }> = { lead: { cont: 0, n: 0, po: 0 }, check: { cont: 0, n: 0, po: 0 } };
+      for (const spot of ['lead', 'check']) for (const a of ['MANIAC', 'LAG']) for (const h of ['Ah Ad Kc 8s 4h', 'Kh Kd Qc 8s 4h']) {
+        for (const diff of DIFFS) for (let k = 0, got = 0; got < 2 && k < 60; k++) {
+          const r = huAfterDraw(C(h), spot === 'lead' ? 100 : 45.5, true); if (!r) continue;
+          const { t, bot, hero } = r;
+          if (spot === 'lead' ? !t.playerRaise(bot, 1200) : !t.playerCheck(bot)) continue;
+          if (!t.playerAllIn(hero) || t.activeSeatIndex !== bot) continue;
+          got++; res[spot].n++;
+          const call = t.getCallAmount(t.seats[bot]); res[spot].po = Math.max(res[spot].po, call / (t.getTotalPot() + call));
+          if (AI.decideAction(t, bot, prof(a, diff)).action !== PlayerAction.Fold) res[spot].cont++;
+        }
+      }
+      process.stdout.write(`A-A / K-K vs a shove: over its own lead ${res.lead.cont}/${res.lead.n} (po ${res.lead.po.toFixed(3)}), after its check ${res.check.cont}/${res.check.n} (po ${res.check.po.toFixed(3)})\n`);
+      expect([res.lead.n, res.check.n]).toEqual([32, 32]);
+      expect([res.lead.po > 0.25 && res.lead.po < 0.36, res.check.po > 0.25 && res.check.po < 0.36]).toEqual([true, true]);
+      expect(res.lead.cont).toBe(0);
+      expect(res.check.cont).toBeGreaterThanOrEqual(24);
+    } finally { restore(); }
+  }, 300_000);
+});
+
+describe('fix-up 3 (re-review note): a bet that leaves its maker all but a chip is priced as the all-in it is (fiveDrawPostShoveLike)', () => {
+  it('heads-up after the draw, 40 BB pot, the human bets 30 BB first: with 1 BB left behind a TAG / LAG calls A-A / J-J on the all-in ramp; with 10 BB left behind (a bet) it folds them to the gate (two pair from a price of 0.30)', () => {
+    const restore = detEnv(5321);
+    try {
+      const res: Record<string, { cont: number; n: number }> = { allButAChip: { cont: 0, n: 0 }, bet: { cont: 0, n: 0 } };
+      for (const spot of ['allButAChip', 'bet']) for (const a of ['TAG', 'LAG']) for (const h of ['Ah Ad Kc 8s 4h', 'Jh Jd Kc 8s 4h']) {
+        for (const diff of DIFFS) for (let k = 0, got = 0; got < 2 && k < 60; k++) {
+          const r = huAfterDraw(C(h), spot === 'allButAChip' ? 51 : 60, false); if (!r) continue;
+          const { t, bot, hero } = r;
+          if (!t.playerRaise(hero, 1500) || t.activeSeatIndex !== bot) continue;
+          expect(t.seats[hero].chipCount).toBe(spot === 'allButAChip' ? 50 : 500);
+          got++; res[spot].n++;
+          if (AI.decideAction(t, bot, prof(a, diff)).action !== PlayerAction.Fold) res[spot].cont++;
+        }
+      }
+      process.stdout.write(`A-A / J-J vs a 30 BB bet into 40 BB: maker 1 BB behind ${res.allButAChip.cont}/${res.allButAChip.n}, 10 BB behind ${res.bet.cont}/${res.bet.n}\n`);
+      expect([res.allButAChip.n, res.bet.n]).toEqual([32, 32]);
+      expect(res.allButAChip.cont).toBeGreaterThanOrEqual(28);
+      expect(res.bet.cont).toBe(0);
+    } finally { restore(); }
+  }, 300_000);
 });
 
 describe('fix-up 3 (STUDDRAW-R4RR-REGRESSION-2): Five Card Draw after the draw, a short bot still leads', () => {
