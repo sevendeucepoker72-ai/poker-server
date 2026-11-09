@@ -2151,3 +2151,11 @@ Math.min(1, nitSlack * sizeFactor)
 # 2026-11-08 (bots review fix round 4, holdem lane) - the deep-MANIAC all-in gate above applies only to an all-in deeper than the
 # push/fold zone (shoveBB > PUSH_FOLD_MAX_BB): a short all-in keeps the MANIAC branch (it isolates a 1.5 BB shove ~52%).
 && shoveBB >
+# 2026-11-08 (bots review fix round 4 fix-up 1, holdem lane, HOLDEM-R4-EXPLOIT-1/-2) - preFlopStrategy (no-limit): a MANIAC that
+# raised this street, facing an all-in deeper than 25 BB that it does not close with flatters still to act, treats them as dead
+# money: the stack-off range for the shover's depth counting only the other players, at MANIAC_RAISED_STACKOFF_WIDEN x (1 +
+# MANIAC_FLATTER_WIDEN per flatter) the width, continued by an isolation re-raise (it folded 77-86% of its opens to a big-blind
+# squeeze: any two +30..+55 BB/100, live -7..-36).
+MANIAC_FLATTER_WIDEN
+function flattersToAct(
+MANIAC_FLATTER_WIDEN * flatters

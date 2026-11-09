@@ -11,18 +11,30 @@
  *     only with the stack-off range for the depth at risk (the shover's stack), by calling: a 40 BB re-shove with
  *     any two over five 500 BB MANIACs won +250 BB/100 (live -138). A short all-in (within the push/fold zone,
  *     25 BB) keeps the MANIAC branch, so it still isolates a micro shove.
- * Real PokerTable + real decideAction, seeded Math.random (the LCG of tests/botPremiumHold.test.ts). 6 seats at
+ * Fix-up 1 (HOLDEM-R4-EXPLOIT-1): the OPENER with a flatter behind is no longer held to the stack-off width for
+ * the shover's depth counting the flatter (it folded 77-86% of its opens, and a big-blind squeeze of any two won
+ * +30..+55 BB/100): the flatter is dead money (MANIAC_FLATTER_WIDEN), and it continues by an isolation re-raise,
+ * never a flat call, so the call-then-fold this file pins stays gone (tests/fix4ManiacOpenerFlatters.test.ts).
+ * Real PokerTable + real decideAction, seeded Math.random (the LCG of tests/botPremiumHold.test.ts) and a seeded
+ * deck (crypto.randomBytes: an unseeded deck changed the hands deal() draws run to run). 6 seats at
  * 50/100: btn 0 (the human), sb 1, bb 2, utg 3, mp 4, co 5. The bounds below fail on 0bc7529 and on the
  * HOLDEM-R3-REG-1 commit alone (equal 40 / 60 / 100 BB: 19 / 13 / 10% continued; deep: 63-72%).
  */
 import { PokerTable, PlayerAction } from '../src/game/PokerTable';
 import { decideAction } from '../src/ai/AIPlayer';
 
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const nodeCrypto = require('crypto');
 function seedRandom(seed: number): () => void {
-  const orig = Math.random;
-  let s = seed >>> 0;
+  const orig = Math.random, rb = nodeCrypto.randomBytes;
+  let s = seed >>> 0, ctr = 0;
   Math.random = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
-  return () => { Math.random = orig; };
+  nodeCrypto.randomBytes = (n: number) => {
+    let buf = Buffer.alloc(0);
+    while (buf.length < n) buf = Buffer.concat([buf, nodeCrypto.createHash('sha256').update(`fix4-mctf-${seed}-${ctr++}`).digest()]);
+    return buf.subarray(0, n);
+  };
+  return () => { Math.random = orig; nodeCrypto.randomBytes = rb; };
 }
 const prof = (archetype: string, difficulty = 'hard') =>
   ({ botName: 'B', difficulty, personality: 'maniac', archetype, vpip: 0.6, pfr: 0.5, aggressionFactor: 4, bluffFrequency: 0.3 } as any);
@@ -43,18 +55,21 @@ function deal(t: PokerTable, me: number): void {
   while (a === b || used.has((2 + (a % 13)) * 4 + Math.floor(a / 13)) || used.has((2 + (b % 13)) * 4 + Math.floor(b / 13)));
   t.seats[me].holeCards = [{ rank: 2 + (a % 13), suit: Math.floor(a / 13) }, { rank: 2 + (b % 13), suit: Math.floor(b / 13) }] as any;
 }
-/** Share of n random hands for which the MANIAC at `me` continues (does not fold). */
-function contRate(build: () => PokerTable, me: number, difficulty: string, n = 400): number {
-  let k = 0;
+/** Share of n random hands for which the MANIAC at `me` continues (does not fold); `calls`: the share it flat-calls. */
+function contRate(build: () => PokerTable, me: number, difficulty: string, n = 400, out?: { calls: number }): number {
+  let k = 0, c = 0;
   const restore = seedRandom(4242);
   try {
     for (let i = 0; i < n; i++) {
       const t = build();
       deal(t, me);
       expect(t.activeSeatIndex).toBe(me);
-      if (decideAction(t, me, prof('MANIAC', difficulty)).action !== PlayerAction.Fold) k++;
+      const d = decideAction(t, me, prof('MANIAC', difficulty));
+      if (d.action !== PlayerAction.Fold) k++;
+      if (d.action === PlayerAction.Call) c++;
     }
   } finally { restore(); }
+  if (out) out.calls = c / n;
   return k / n;
 }
 
@@ -76,20 +91,25 @@ describe('MANIAC call-then-fold (fix round 4) — a MANIAC that flat-called does
     expect(bad).toEqual([]);
   });
 
-  it('a deep (500 BB) MANIAC facing a 40 BB all-in with players still to act no longer calls ~70%: the unraised big blind <= 15%, the opener and a flatter <= 35%', () => {
+  it('a deep (500 BB) MANIAC facing a 40 BB all-in with players still to act no longer calls ~70%: the unraised big blind <= 15%, a flatter <= 35%; the opener (a flatter behind it: fix-up 1) continues >= 50% but only by an isolation re-raise, never a flat call', () => {
     const bad: string[] = [];
     const deep = [40, 500, 500, 500, 500, 500];
     const spots: Array<[string, () => PokerTable, number, number]> = [
       // the big blind (posted, no voluntary chips) with the opener and a flatter behind
       ['big blind', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerFold(5); t.playerAllIn(0); t.playerFold(1); return t; }, 2, 0.15],
-      // the opener with a flatter behind
-      ['opener', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerFold(5); t.playerAllIn(0); t.playerFold(1); t.playerFold(2); return t; }, 3, 0.35],
       // a flatter with a second flatter behind
       ['flatter', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerCall(5); t.playerAllIn(0); for (const s of [1, 2, 3]) t.playerFold(s); return t; }, 4, 0.35],
     ];
     for (const diff of ['hard', 'medium']) for (const [name, build, me, max] of spots) {
       const r = contRate(build, me, diff);
       if (r > max) bad.push(`${diff} ${name}: continued ${(100 * r).toFixed(1)}% > ${100 * max}%`);
+    }
+    // the opener with a flatter behind (fix-up 1: the flatter is dead money; it isolates, it does not flat)
+    const opener = () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerFold(5); t.playerAllIn(0); t.playerFold(1); t.playerFold(2); return t; };
+    for (const diff of ['hard', 'medium']) {
+      const o = { calls: 0 };
+      const r = contRate(opener, 3, diff, 400, o);
+      if (r < 0.5 || o.calls > 0) bad.push(`${diff} opener: continued ${(100 * r).toFixed(1)}%, flat-called ${(100 * o.calls).toFixed(1)}%`);
     }
     expect(bad).toEqual([]);
   });

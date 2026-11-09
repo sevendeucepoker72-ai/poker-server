@@ -1253,6 +1253,19 @@ export const HOLDEM_LIGHT_RERAISE_FRACTION = 0.05;
  * only calls wider still. A MANIAC that has not raised keeps the stack-off width (lone 100 BB shove ~9%).
  */
 export const MANIAC_RAISED_STACKOFF_WIDEN = 2;
+/**
+ * Fix round 4, fix-up 1 (HOLDEM-R4-EXPLOIT-1 / -2) — no-limit: a MANIAC that raised this street and then faces an
+ * all-in deeper than the push/fold zone that it does not close, with FLATTERS still to act (players who only called
+ * this street): they are dead money, not players at risk. It reads the stack-off range for the shover's depth
+ * counting only the other live players, at MANIAC_RAISED_STACKOFF_WIDEN x (1 + this per flatter) the width, and
+ * continues as the MANIAC branch and 0dc1b96 do, by an isolation re-raise (the flatters then face a stack-off).
+ * Round 4 counted each flatter as a player at risk (the width / 1.5 each) and continued by calling: the opener
+ * folded 77-86% of its any-two opens, and from the big blind a squeeze all-in with any two over a MANIAC open and
+ * a flat won +30 to +55 BB/100 (hard, whole line; live 0dc1b96 -7 to -36). Each fold paid the human the dead money
+ * (+5.6 / +8.9 BB per spot with one / two flatters); when the MANIAC isolates he wins ~0. At 1 per flatter (one:
+ * 4x, two: 6x the width) the opener continues ~71% / ~100% against a 40 BB squeeze, ~46% / ~65% against 100 BB.
+ */
+export const MANIAC_FLATTER_WIDEN = 1;
 
 export interface PreflopCtx {
   /** Live (not folded) opponents in the hand: the players who can still call a shove or are in it (B16). */
@@ -1320,6 +1333,17 @@ function ownCallsThisStreet(table: PokerTable, seat: Seat): number {
   let n = 0;
   for (const e of table.actionLog) {
     if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && /^called /.test(e.action)) n++;
+  }
+  return n;
+}
+
+/** Fix-up 1 — live opponents with chips still to act on this bet who have only CALLED this street (flat callers). */
+function flattersToAct(table: PokerTable, seat: Seat): number {
+  let n = 0;
+  for (const s of table.seats) {
+    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
+    if (s.currentBet >= table.currentBetToMatch) continue;
+    if (ownCallsThisStreet(table, s) > 0 && ownRaisesThisStreet(table, s) === 0) n++;
   }
   return n;
 }
@@ -1530,11 +1554,12 @@ function preFlopStrategy(
   const committing = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
   // HAI-1 — up to 25 BB the Nash call is never narrower than the deep width at the 25 BB anchor
   // (with 3 players in, 0.93 vs 0.915: 23-25 BB continued less than 26 BB).
-  // `widen` (MANIAC-RTF part 2) multiplies the continuing width; 1 = the range as it was.
-  const stackOffOK = (depthBB: number, widen = 1): boolean => {
+  // `widen` (MANIAC-RTF part 2) multiplies the continuing width; 1 = the range as it was. `players`: the
+  // players counted against it (fix-up 1: a MANIAC opener does not count the flatters behind it).
+  const stackOffOK = (depthBB: number, widen = 1, players = callPyta): boolean => {
     const th = depthBB <= PUSH_FOLD_MAX_BB
-      ? adjustThreshold(Math.min(nashCallPctile(depthBB, callPyta), 1 - stackOffCallWidth(depthBB, callPyta)), factor)
-      : adjustThreshold(1 - stackOffCallWidth(depthBB, callPyta), factor);
+      ? adjustThreshold(Math.min(nashCallPctile(depthBB, players), 1 - stackOffCallWidth(depthBB, players)), factor)
+      : adjustThreshold(1 - stackOffCallWidth(depthBB, players), factor);
     return (depthBB <= PUSH_FOLD_MAX_BB ? pctile : so) >= (widen === 1 ? th : 1 - (1 - th) * widen);
   };
   // MANIAC-RTF part 2 (fix round 3): a MANIAC that raised this street (its any-two open, isolation
@@ -1545,6 +1570,17 @@ function preFlopStrategy(
   // won +144 BB/100 (live +30), a re-shove +44 (live -2); 25 BB and shallower are unchanged.
   const maniacWiden = (depthBB: number): number => profile.archetype === 'MANIAC' && (ownRaisesThisStreet(table, seat) > 0
     || (depthBB > PUSH_FOLD_MAX_BB && ownCallsThisStreet(table, seat) > 0)) ? MANIAC_RAISED_STACKOFF_WIDEN : 1;
+  // Fix round 4, fix-up 1 (MANIAC_FLATTER_WIDEN): a MANIAC that raised this street, facing an all-in deeper than
+  // 25 BB that it does not close with flatters still to act, does not count them against its range (they are dead
+  // money): the stack-off range for the shover's depth at (1 + 1 per flatter) x its raised width, and it continues
+  // by an isolation re-raise, as the MANIAC branch does. Before the commit gate: at equal stacks the call commits.
+  const flatters = !allInOrFold && noLimit && !!shover && !pureCall && profile.archetype === 'MANIAC'
+    && shoveBB > PUSH_FOLD_MAX_BB && ownRaisesThisStreet(table, seat) > 0 ? flattersToAct(table, seat) : 0;
+  if (flatters > 0) {
+    const others = Math.min(CALL_WIDTH_MAX_PLAYERS, Math.max(1, pyta - flatters));
+    if (!stackOffOK(shoveBB, MANIAC_RAISED_STACKOFF_WIDEN * (1 + MANIAC_FLATTER_WIDEN * flatters), others)) return FOLD;
+    return raiseOrAllIn(Math.round(betToMatch * (2.5 + Math.random() * 1.5)));
+  }
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
   // (and, fix round 3, its 0dc1b96 chips-left depth: chipsLeftEffectiveStackBB).
   if (!allInOrFold && noLimit && (pureCall || committing)) {
