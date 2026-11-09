@@ -1266,11 +1266,13 @@ function withoutLeftoverBusts(helpers: string): string {
 }
 // F50 (2026-10-21): a hand END deals through autoStartNextHand at EVERY table now (not only
 // inside the tournament branch) — the pre-S1 control takes that route out as well.
-const HAND_END_ROUTE = '    if (table.currentPhase === GamePhase.HandComplete) {\n      autoStartNextHand(session.tableId);';
+// (fix round 3: that deal is `try { autoStartNextHand(…) } catch (err) { … settleDealThrow … }`.)
+const HAND_END_COND = '    if (table.currentPhase === GamePhase.HandComplete) {\n      // Fix round 3 (2026-11-05) — its deal settles a deal-time payout fault';
+const HAND_END_ROUTE = `${HAND_END_COND} like the timers' (others rethrown).\n      try { autoStartNextHand(session.tableId); }`;
 function withoutStartHandRoute(startHand: string): string {
   expect(startHand).toContain(START_ROUTE);
   expect(startHand).toContain(HAND_END_ROUTE);
-  return startHand.replace(START_ROUTE, '    if (false) {').replace(HAND_END_ROUTE, '    if (false) {\n      autoStartNextHand(session.tableId);');
+  return startHand.replace(START_ROUTE, '    if (false) {').replace(HAND_END_COND, '    if (false) {\n      // Fix round 3 (2026-11-05) — its deal settles a deal-time payout fault');
 }
 /** All three S1 locks out: the pre-S1 code. */
 const PRE_S1 = { autoStart: withoutDealGuard(P.autoStart), helpers: withoutLeftoverBusts(P.helpers), startHand: withoutStartHandRoute(P.startHand) };
@@ -1532,7 +1534,8 @@ describe('S1 — a tournament table never deals before its bust check has run', 
     expect(SRC).toContain("runPendingTournamentBustChecks(tableId, 'hand_complete_threw');");
     expect(P.autoStart.indexOf(DEAL_GUARD)).toBeLessThan(P.autoStart.indexOf('const started = table.startNewHand();'));
     expect(P.autoStart.indexOf(DEAL_GUARD)).toBeLessThan(P.autoStart.indexOf('if (tournamentBreaksAwaitingHandEnd.get(tableId) === tId) {'));
-    expect(P.startHand.indexOf(START_ROUTE)).toBeLessThan(P.startHand.indexOf('const started = table.startNewHand();'));
+    // fix round 3: the deal is `try { started = table.startNewHand(); } catch (err) { … settleDealThrow … }`
+    expect(P.startHand.indexOf(START_ROUTE)).toBeLessThan(P.startHand.indexOf('started = table.startNewHand();'));
     expect(P.startHand).toContain('autoStartNextHand(session.tableId);');
   });
 });

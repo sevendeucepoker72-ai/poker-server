@@ -81,9 +81,11 @@ describe('F45 — a LIVE extra-table seat is never checked / folded 500ms into i
       armTurnTimer() {}, ensureTurnTimerWired() {}, ensureInsuranceHoldWired() {}, scheduleAIAction() {},
       absentTournamentSeatMayLimp: () => false, tournamentHandStartSafety: { allAbsentAutoCalls: 0 }, console: quiet,
     };
-    const code = bc + fnSrc('function seatHasLiveSession(') + fnSrc('function seatHasAnySession(') + fnSrc('function autoActForSeat(');
+    // Fix round 4 (SERVER-R3-REG-3) — the auto-act's one-pending check (skipAbsentActArm) is REAL too.
+    const AUTO_ACT_ONCE = slice('const TURN_ACT_RETRIES = 3;', 'absentActPending.add(key);\n  return false;\n}\n');
+    const code = bc + fnSrc('function seatHasLiveSession(') + fnSrc('function seatHasAnySession(') + fnSrc('function autoActForSeat(') + AUTO_ACT_ONCE;
     const { exports: m, stubbed } = load(code, scope, '{ broadcastGameState }');
-    expect([...stubbed].filter((n) => /seatHas|autoAct|Sessions/.test(n))).toEqual([]);
+    expect([...stubbed].filter((n) => /seatHas|autoAct|Sessions|absentAct|AbsentAct/i.test(n))).toEqual([]);
     return { table, seat, m };
   }
   beforeEach(() => { jest.useFakeTimers({ doNotFake: ['setImmediate', 'nextTick', 'queueMicrotask'] }); });

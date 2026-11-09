@@ -431,6 +431,41 @@ export class PokerTable extends EventEmitter {
   /** Starting chip counts at beginning of hand (for hand history) */
   public startChips: Map<number, number> = new Map();
 
+  /**
+   * Bots review fix round 3 (2026-11-05, SR2-2) — the table as this hand's PAYOUT began:
+   * per seat chipCount + totalInvestedThisHand (-1 = not occupied) and its playerId, taken
+   * ONCE per hand on the first entry into determineWinners (the base or a hi-lo override),
+   * before any chip moves. Until then bets, refunds and dead money only move chips between
+   * those two fields of the same seat, so after a payout fault it says exactly what was
+   * paid, whatever path ran the payout (a timer, a socket action, a fold for a leaver, a
+   * deal). index.ts settles a hand found resting in Showdown from it and never runs a
+   * payout again blind. null until this hand's payout starts; cleared at every deal.
+   * `payable` (fix round 3 review, SERVER-R3-FAULT-1): the seats this payout can credit at
+   * all — chips in the pot (a folded seat's uncalled excess comes back to it) or still
+   * contesting it. A seat with neither (a joiner sat out of the hand, a fold with nothing in)
+   * is paid nothing, so its leaving or being taken afterwards never makes the result unreadable.
+   * Fix round 4 (SERVER-R3-REG-PAYABLE-1) — exactly determineWinners' own exclusions: an
+   * ELIMINATED seat (a busted 0-chip seat, dealt nothing) is never in its seat list, and a seat
+   * holding no cards counts as folded; such a seat was marked payable and its leave HELD the hand.
+   * `left` (fix round 4): what a seat of the mark held (chipCount + totalInvestedThisHand) when
+   * it was stood up while this payout rested in Showdown (a faulted payout, before its settle) —
+   * whatever path stood it up — so the settle still reads what the payout credited it.
+   */
+  public payoutStartMark: { hand: number; stakes: number[]; ids: string[]; payable: boolean[]; left: Array<{ holding: number; invested: number } | null> } | null = null;
+
+  /** SR2-2 — take this hand's payoutStartMark (first call per hand only). */
+  protected markPayoutStart(): void {
+    if (this.payoutStartMark && this.payoutStartMark.hand === this.handNumber) return;
+    this.payoutStartMark = {
+      hand: this.handNumber,
+      stakes: this.seats.map((s) => (s.state === 'occupied' ? s.chipCount + (s.totalInvestedThisHand || 0) : -1)),
+      ids: this.seats.map((s) => s.playerId),
+      payable: this.seats.map((s) => s.state === 'occupied' && !s.eliminated
+        && ((s.totalInvestedThisHand || 0) > 0 || (!s.folded && s.holeCards.length > 0))),
+      left: this.seats.map(() => null),
+    };
+  }
+
   /** TDA Rule 16: Track last aggressor seat for showdown order */
   public lastAggressorSeat: number = -1;
 
@@ -574,6 +609,14 @@ export class PokerTable extends EventEmitter {
     if (this.seats[seatIndex].state === 'empty') return false;
 
     const playerName = this.seats[seatIndex].playerName;
+    // Fix round 4 (SERVER-R3-REG-PAYABLE-1) — a seat of this hand's payout mark leaving while the
+    // payout rests in Showdown (a faulted payout, before its settle): what it held goes on the mark.
+    const mark = this.payoutStartMark;
+    const leaving = this.seats[seatIndex];
+    if (mark && mark.hand === this.handNumber && this.currentPhase === GamePhase.Showdown
+        && Array.isArray(mark.left) && !mark.left[seatIndex] && mark.ids[seatIndex] === leaving.playerId) {
+      mark.left[seatIndex] = { holding: leaving.chipCount + (leaving.totalInvestedThisHand || 0), invested: leaving.totalInvestedThisHand || 0 };
+    }
     this.seats[seatIndex] = createEmptySeat(seatIndex);
     // Defensively drop from the sitting-out set so a new occupant of
     // this index inherits a clean slate — belt-and-suspenders on top
@@ -748,7 +791,10 @@ export class PokerTable extends EventEmitter {
     // chips deducted here would leave the stack and enter no pot — destroyed.
     // Leave the debt intact (don't clearDeadBlind); it's collected
     // automatically when the next hand deals. 2026-07-01 audit #8.
-    if (!this.isHandInProgress()) return { ok: false, reason: 'not_in_hand' };
+    // Fix round 3 review (SERVER-R3-FAULT-1) — nor in Showdown: the payout has begun (a hand
+    // only RESTS there after a payout fault, settled from payoutStartMark), so the chips would
+    // join a pot that is already being paid.
+    if (!this.isHandInProgress() || this.currentPhase === GamePhase.Showdown) return { ok: false, reason: 'not_in_hand' };
     // 2026-10-21 (gameplay F4) — never from a seat DEALT INTO this hand: a live
     // player could pick the hand (after seeing his cards) to add dead money,
     // and a stack equal to the debt went "all-in" on the clock without
@@ -949,6 +995,8 @@ export class PokerTable extends EventEmitter {
     this.clearBetIncreases();             // F22 fix-up — a new betting round
     this.wentToShowdown = false; // set true only on a contested showdown (>= 2 tabled)
     this._runoutHeld = false;    // R1 insurance window — never carried into a new hand
+
+    this.payoutStartMark = null;  // SR2-2 (fix round 3) — taken again by this hand's payout
 
     // Capture starting chip counts for hand history
     this.startChips = new Map();
@@ -1801,8 +1849,16 @@ export class PokerTable extends EventEmitter {
    * If it IS their turn, callers use playerFold() instead so the turn
    * advances normally. No-ops on an empty/already-folded seat.
    */
-  forceFoldSeat(seatIndex: number): boolean {
+  forceFoldSeat(seatIndex: number, opts: { deadHand?: boolean } = {}): boolean {
     if (seatIndex < 0 || seatIndex >= MAX_SEATS) return false;
+    // Fix round 4 (server review, faults lens) — never in Showdown: the betting is over and the
+    // payout has begun (a hand only RESTS there after a payout fault, settled from
+    // payoutStartMark); a leaver folded there lost his share of a pot the settle's retry then paid.
+    // Fix round 4 fix-up (SERVER-R4-REGRESSION-2) — except a DEAD hand (opts.deadHand: a seat torn
+    // down at a tournament / fixed-roster table is out of the game, its hand dead even all-in): it is
+    // folded there as before, so the settle's retry never pays it a pot that would leave play with
+    // the seat. A fold moves no chip, and the mark fixed the payable seats and stakes first.
+    if (this.currentPhase === GamePhase.Showdown && !opts.deadHand) return false;
     const seat = this.seats[seatIndex];
     if (seat.state !== 'occupied' || seat.folded) return false;
     seat.folded = true;
@@ -2939,6 +2995,7 @@ export class PokerTable extends EventEmitter {
 
   protected determineWinners(): void {
     this.currentPhase = GamePhase.Showdown;
+    this.markPayoutStart();   // SR2-2 (fix round 3) — before any chip moves
 
     // Refund any uncalled top-stack excess BEFORE calculating pots.
     this.refundUncalledBets();

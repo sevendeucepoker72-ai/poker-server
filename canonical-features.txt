@@ -2113,3 +2113,76 @@ drawClockThrows
 [health-section-error]
 healthSectionErrors
 scratchCapColumns:
+# 2026-11-05 (bots review fix round 3, server lane) - crash guard round 3: the engine records each hand's payout-start
+# stakes (PokerTable.payoutStartMark, also in the Stud 8 hi-lo award, now paid IN Showdown); a hand resting in
+# Showdown that no timer's mark covers - a human path's payout fault (socket action / draw, a sit-out / AFK / leave /
+# departure fold) or the wedge watchdog's find - is settled from it, never run again (SR2-2); the turn clock returns
+# in Showdown and a recovery never settles from a mark taken there or a held hand (SR2-1) and applies the timeout's
+# consequences; every other engine timer is guarded (500 ms auto-act, absent stand-pat, runout-hold releases, Spin &
+# Go deal, reservation expiry, rebalance cascade / sweep); a draw round a recovery left open is stood pat again; every
+# deal settles a deal-time payout fault (settleDealThrow).
+payoutStartMark
+markPayoutStart()
+settleFromPayoutMark(
+settleRestingShowdown(
+settleHumanPathThrow(
+settleDealThrow(
+settleShowdownAfterTimerThrow(
+recoverAbsentActThrow(
+recoverAbsentStandPatThrow(
+recoverHoldReleaseThrow(
+recoverTimerThrow(
+standPatDrawRoundAfterFault(
+wedge_watchdog_showdown
+humanPathShowdowns
+watchdogShowdowns
+dealPayoutFaults
+drawRoundRetries
+'human_action'
+'reservation_expiry'
+# 2026-11-08 (bots review fix round 3 review fix-up, server lane) - the payout-start mark records which seats the
+# payout can credit (a mid-hand joiner / a fold with nothing in is skipped by the settle, never makes it HELD); the
+# wedge watchdog settles a resting Showdown at its FIRST tick and a payout its own forced action ran in that tick;
+# the Crazy Pineapple discard pick and the insurance accept / decline settle their runout's payout fault at once;
+# no dead blind is posted in Showdown; the 500 ms auto-act returns in Showdown; the absent-drawer stand-pat re-arm is
+# bounded per hand and draw round; the Spin & Go first deal is retried once.
+mark.payable
+'watchdog_forced'
+'pineapple_discard'
+'insurance_decision'
+ABSENT_STAND_PAT_REARMS
+absentStandPatGiveUps
+spinGoFirstDeal
+spinGoDealRetries
+payable: this.seats.map(
+# 2026-11-08 (bots review fix round 4, server lane) - a busted seat is not payable (the mark mirrors determineWinners);
+# a seat of the mark stood up while its payout rests in Showdown is recorded on the mark (left) and read by the settle;
+# a hand still unreadable is HELD, listed in health crashSafety.heldShowdowns and ended by an admin
+# ('adminResolveHeldHand'); the shutdown flush / forced close / quick cleanup cash a resting Showdown out from its
+# payout mark (never a paid pot again); the engine never folds a leaver in Showdown; the 500 ms auto-act is one
+# pending per seat and neither it nor a bot is re-armed for a turn that threw 3 times; a bomb pot's runout is inside
+# the guarded deal at dealAfterJoin / 'startHand' / the club challenge sweep.
+left: this.seats.map(() => null)
+payoutSinceMark(
+restingShowdownHoldings(
+crashSafety.heldShowdowns
+adminResolveHeldHand
+adminResolveHeldHandResult
+ADMIN_RESOLVE_HELD_HAND
+heldResolvedByAdmin
+'unreadable_stakes'
+'departed_gain'
+TURN_ACT_RETRIES
+# SUPERSEDED 2026-11-08 by skipAbsentActArm( (same check, inverted: a harness that stubs it keeps the old 500 ms act) - armAbsentActOnce(
+skipAbsentActArm(
+absentActGiveUps
+botActionGiveUps
+# 2026-11-08 (fix round 4 review fix-up, server lane) - a seat torn down at a tournament / fixed-roster table while
+# the hand rests in Showdown is folded (dead hand), never paid by the settle's retry; an admin's resolve that a
+# 'handResult' listener threw out of after the hand ended answers resolved; the failed attempt is durably audited;
+# the shutdown flush's resting-Showdown read never aborts the claim.
+!opts.deadHand
+forceFoldSeat(seatIndex, { deadHand: true })
+if (!before || t.handNumber !== hand
+'ADMIN_RESOLVE_HELD_HAND', 'ADMIN_RESOLVE_HELD_HAND_FAILED'
+resting-Showdown pre-read failed
