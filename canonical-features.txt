@@ -916,6 +916,130 @@ FOLD_VS_RAISE
 fiveDrawAcesOrBetter
 FIVE_DRAW_LIGHT_RERAISE_FRACTION
 n >= exports.STUD_DRAW_MIN_SIMS
+# 2026-11-05 (bots review fix round 3, SD2-1 / SD2-2) - studDrawFirstRound: the value set's "one raise" is the
+# table's own count (raisesThisStreet), so a short stack's all-in call or a lone short all-in is not a 3-bet; a
+# value-set hand closing the action on one all-in that does not commit it calls too (the gate prices the rest).
+# SUPERSEDED 2026-11-08 by the review REG-1 line below (same feature, counted on FULL raises; never shipped):
+# const facingOneRaise = facingRaise && streetRaises <= 1;
+!committing && facingOneRaise && inValueSet
+# 2026-11-05 (bots review fix round 3, full-line sweep) - studDrawFirstRound: a NIT that opened keeps a share of
+# its opening range facing ONE re-raise (fixed limit all of it, no-limit by the price, the value set always); it
+# folded every open under the 4-bet threshold, so 3-betting any two cards beat NIT tables.
+if (Math.max(pctile, raw) >= keepTh || inValueSet)
+# 2026-11-08 (bots review fix round 3, review fix-ups) - studDrawFirstRound: "one raise" counts FULL raises (an
+# all-in for less than a full raise is none: REG-1); against an all-in a call that commits a third of a 100 BB
+# stack on the depth at risk is a stack-off however deep the bot (REG-2); Five Card Draw stack-off premiums by
+# made-hand class (MEAS-3); a fixed-limit ROCK big blind defends its pot-odds range vs one raise (EXPLOIT-3).
+const facingOneRaise = facingRaise && fullRaises <= 1;
+fullRaisesThisRound
+FIVE_DRAW_ALLIN_COMMIT_BB
+return (pureCall || !ownCommit) && callAmount < seat.chipCount ? CALL : ALLIN;
+fiveDrawStackOffPremium
+STUD_DRAW_FL_ROCK_BB_DEFEND
+# 2026-11-08 (bots review fix round 4, Stud / Draw rounds after the first; postFlopStrategy behind a Stud / Draw
+# check, Hold'em / Omaha / Short Deck / Pineapple unchanged) - Five Card Draw after the draw: a call of the pot or
+# more, or a bet / raise, that commits a third of the depth at risk needs a stack-off hand by made-hand class
+# (MEAS-1 / EXPLOIT-1); fixed limit: a NIT / ROCK / MANIAC facing ONE bet calls when its pot share clears the
+# price (MEAS-2 / EXPLOIT-2).
+fiveDrawMadeClass
+FIVE_DRAW_POST_STACKOFF_CLASS
+fiveDrawPostCommits
+postFlopStrategyCore
+studDrawKindOfTable
+STUD_DRAW_FL_CALL_MARGIN
+flPotOddsCall
+# 2026-11-08 (bots review fix round 4, unequal stacks) - studDrawFirstRound: a Five Card Draw light re-raise is
+# sized against the shortest live stack whose shove commits the bot (lightRaiseDepth), not its own deep stack.
+# SUPERSEDED 2026-11-08 by the own-raise line below (never shipped; lightRaiseDepth made MANIACs call a short
+# human's open instead of re-raising and the cheap post-draw spots it gave back profited +227 to +461 BB/100):
+# lightRaiseDepth
+# 2026-11-08 (bots review fix round 4, unequal stacks) - studDrawFirstRound: the REG-2 depth rule (a 100 BB shove
+# commits a deep bot) is for a LONE shove (the round's one raise); in a raise war a seat prices a shove on its own
+# stack, as cdb31dd did.
+# SUPERSEDED 2026-11-09 by the full-raise line below (never shipped; a short all-in for less before the shove
+# switched the lone-shove rule off):
+# FIVE_DRAW_ALLIN_COMMIT_BB && streetRaises <= 1);
+FIVE_DRAW_ALLIN_COMMIT_BB && fullRaises <= 1);
+# 2026-11-08 (bots review fix round 4, unequal stacks) - studDrawFirstRound: a seat that RE-raised and put in more
+# than the light share (FIVE_DRAW_LIGHT_RERAISE_FRACTION) of the depth at risk against a SHORTER all-in calls it; a
+# MANIAC folded ~90% of its light re-raises to a 40 BB human's shove and opening any five cards won +98 BB/100.
+reRaisePricedIn
+return reRaisePricedIn(table, seat, shover) ? (callAmount < seat.chipCount ? CALL : ALLIN) : FOLD;
+# 2026-11-08 (bots review fix round 4, unequal stacks) - postFlopStrategyCore, Five Card Draw after the draw: an
+# all-in smaller than the pot-size gate (a third of the pot or more) that commits the depth at risk is called with
+# two pair or better, never one pair (a 40 BB human's value shove after the draw was paid by Q-Q+ one pair).
+FIVE_DRAW_POST_ALLIN_MIN_PO
+FIVE_DRAW_POST_ALLIN_CLASS
+# SUPERSEDED 2026-11-09 by the fix round 4 review lines below (never shipped; the gate is now fiveDrawPostFolds,
+# which prices an all-in and any other bet apart - the pot-size step folded two pair to a pot bet):
+# (potOdds >= 1 / 3 || (potOdds >= exports.FIVE_DRAW_POST_ALLIN_MIN_PO && !!shoverFaced(table, seat)))
+# 2026-11-09 (bots review fix round 4, review fix-ups) - postFlopStrategyCore, Five Card Draw after the draw: the
+# made-hand gate (fiveDrawPostFolds) prices an all-in (or a bet that leaves nearly nothing behind) apart from any
+# other bet: a bet that is not an all-in meets the stack-off class only from an overbet (~2.6x the pot); below it
+# two pair continues and one pair by its rank and the price, smoothly (no step at a pot-size bet: MEASUREMENT-1 /
+# EXPLOIT-1); against a SHORT stack the gate eases (no gate under 15 BB at risk, aces up / two pair under 33 BB:
+# REGRESSION-1).
+fiveDrawPostFolds
+fiveDrawPostShoveLike
+FIVE_DRAW_POST_PAIR_PO
+FIVE_DRAW_POST_SHALLOW_BB
+# SUPERSEDED 2026-11-09 by the smooth price ramp below (never shipped; an all-in of ~1.1x the pot still met the
+# stack-off class at 1/3 with 33 BB+ at risk, and betting 1.5x the pot with any hand beat MANIAC x4 at 60 BB):
+# FIVE_DRAW_POST_OVERBET_PO
+# const overbet = potOdds >= exports.FIVE_DRAW_POST_OVERBET_PO || (potOdds >= 1 / 3 && depthBB >= exports.FIVE_DRAW_ALLIN_COMMIT_BB);
+# 2026-11-09 (bots review fix round 4, review fix-ups) - fiveDrawPostFolds: the made hand a committing post-draw
+# call needs (fiveDrawGateScore) rises smoothly with the price, an all-in and any other bet alike from ~1.3x the
+# pot: two pair, to aces up at ~2.6x, to trips by ~6x (FIVE_DRAW_POST_CLASS_PO), never above the stack-off class.
+fiveDrawGateScore
+FIVE_DRAW_POST_CLASS_PO
+# 2026-11-09 (bots review fix round 4, review fix-ups) - studDrawFirstRound: reRaisePricedIn counts as a raise only
+# an action that RAISED the running bet (betRaisingEntries); an all-in CALL for less is not one (REGRESSION-2).
+betRaisingEntries
+# 2026-11-09 (bots review fix round 4, review fix-ups) - fiveDrawPostFolds: an OVERCALL after the draw (a seat other
+# than the bet's maker already called it) needs one class more than a lone call, and at least two pair
+# (FIVE_DRAW_POST_OVERCALL; MEASUREMENT-2: value bets into MANIAC-built multiway pots were paid by every caller).
+FIVE_DRAW_POST_OVERCALL
+fiveDrawPostOvercall
+# 2026-11-09 (bots review fix round 4, review fix-ups) - postFlopStrategy, the 5CD post-draw bet gate: the depth at
+# risk is the SHORTEST live opponent with chips behind (fiveDrawPostBetDepth), not the deepest: in multiway pots a
+# LAG / MANIAC bet a short human's whole stack with one pair / two pair and was then pot-committed to his shove.
+fiveDrawPostBetDepth
+# 2026-11-09 (bots review fix round 4, re-review fix-ups) - postFlopStrategy, Five Card Draw after the draw: every LEAD is
+# capped at FIVE_DRAW_POST_LEAD_CAP of the depth at risk (one size for every hand: a big lead was aces up or better 473
+# times in 476); fiveDrawPostBetDepth skips opponents under FIVE_DRAW_POST_SHALLOW_BB behind (a 1 BB-behind seat silenced
+# the bets, R4F-REGRESSION-1); a MANIAC leads polarized (FIVE_DRAW_POST_MANIAC_LEAD) and its checked range reads a bet's
+# price lower (FIVE_DRAW_POST_CHECKED_PO).
+FIVE_DRAW_POST_LEAD_CAP
+FIVE_DRAW_POST_MANIAC_LEAD
+FIVE_DRAW_POST_CHECKED_PO
+# 2026-11-09 (bots review fix round 4, re-review fix-ups) - fiveDrawPostFolds: no step at a third of the depth
+# (FIVE_DRAW_POST_COMMIT_RAMP) nor at 15 BB of depth (FIVE_DRAW_POST_SHALLOW_RAMP_BB); an all-in asks one pair by rank
+# up to two pair (every archetype folded A-A to a 20 BB all-in into 30 BB, RR1-MEASUREMENT-1), unless it raises this
+# seat's own bet; FISH / CALLING_STATION read the price lower (FIVE_DRAW_POST_LOOSE_PO).
+FIVE_DRAW_POST_COMMIT_RAMP
+FIVE_DRAW_POST_SHALLOW_RAMP_BB
+FIVE_DRAW_POST_LOOSE_PO
+(shoveLike && raised)
+# 2026-11-09 (bots review fix round 4, re-review fix-ups) - betRaisingEntries: a UTG straddle is the first round's posted
+# blind, not a raise (R4F-REGRESSION-2: an all-in call for less than the straddle made the bot's open a re-raise).
+firstRound && e.action === 'straddle'
+# 2026-11-09 (bots review fix round 4, fix-up 3) - postFlopStrategy, Five Card Draw after the draw: a MANIAC with seats
+# still to act behind it also leads a share of its lower pairs and checks (traps) a share of its kings or better
+# (FIVE_DRAW_POST_MANIAC_MIX), so its check is no longer a capped range (RR2-EXPLOIT-1: shoving any hand on the button
+# once every MANIAC had checked won +66 BB/100); checked to by every seat (fiveDrawPostCheckedToLast) it bets as the core
+# MANIAC does (R4RR-REGRESSION-1: a short stack's checked hands reached showdown free); a capped lead under the minimum
+# bet is the bot's whole stack, not a check (R4RR-REGRESSION-2).
+FIVE_DRAW_POST_MANIAC_MIX
+fiveDrawPostCheckedToLast
+to < table.getMinRaise()
+# 2026-11-09 (bots review fix round 4, fix-up 4) - postFlopStrategy, Five Card Draw after the draw: a MANIAC never
+# bets a lower pair (FIVE_DRAW_POST_MANIAC_MIX[0] is now 0), and checked to by every seat (fiveDrawPostCheckedToLast) it
+# bets every K-K or better and half its no-pair hands (FIVE_DRAW_POST_MANIAC_LAST), so an all-in over its bet no longer
+# finds a range that folds three bets in four (F3-MEASUREMENT-1 / F3-EXPLOIT-1 / F3-REGRESSION-1: any hand shoved over
+# it won +188 to +249 BB/100). SUPERSEDED 2026-11-09 by this entry: the fix-up 3 description above ("also leads a share
+# of its lower pairs", "checked to by every seat ... it bets as the core MANIAC does"); its token lines stay, the code
+# they pin is still there.
+FIVE_DRAW_POST_MANIAC_LAST
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

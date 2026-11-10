@@ -8,7 +8,9 @@
  *    folded them 10-43% to any 3-bet at medium on both (its 4-bet line read the noisy percentile).
  *  - R2: a MANIAC re-raised 91% of hands to 33-59% of its stack and folded 89% of them to a shove (98e2568):
  *    opening 15 BB with any two and shoving over any re-raise won +333..+955 BB/100. On d1ec56a it moved
- *    junk all-in instead (93% over a 30 BB open).
+ *    junk all-in instead (93% over a 30 BB open). Fix round 3 (TI-R2-1): the 4 BB open is where
+ *    FIVE_DRAW_LIGHT_RERAISE_FRACTION binds (a MANIAC re-raise to 10-16 BB): at 0.125 / 0.15 instead of 0.10 a
+ *    MANIAC re-raised and folded 51 / 84 of 120 deals there (0.10: 1), and every other size stayed green.
  *  - NEW-1 in the push/fold zone: a short all-in the bot faces alone was re-shoved on the PUSH range.
  * Planted hands skip any card-clash check where only the bot's own five cards matter.
  */
@@ -87,11 +89,11 @@ describe('R1: a premium never folds to a 3-bet or a short all-in that does not c
 });
 
 describe('R2: no raise war the bot cannot finish (no-limit)', () => {
-  it('facing a 6 / 10 / 15 BB open, a MANIAC (also FISH / LAG / TAG) re-raises and then folds to a 100 BB shove in <= 10% of deals, never makes a non-all-in raise of a third of its stack, and never moves a hand under the 80th percentile all-in', () => {
+  it('facing a 4 / 6 / 10 / 15 BB open, a MANIAC (also FISH / LAG / TAG) re-raises and then folds to a 100 BB shove in <= 10% of deals, never makes a non-all-in raise of a third of its stack, and never moves a hand under the 80th percentile all-in', () => {
     const restore = detEnv(53);
     try {
       const rows: string[] = [];
-      for (const a of ['MANIAC', 'FISH', 'LAG', 'TAG']) for (const X of [6, 10, 15]) {
+      for (const a of ['MANIAC', 'FISH', 'LAG', 'TAG']) for (const X of [4, 6, 10, 15]) {
         const p = prof(a); const t = table(5, 0);
         let deals = 0, rrFold = 0, jamJunk = 0, bigRaise = 0;
         for (let k = 0; deals < 120 && k < 1200; k++) {
