@@ -1150,12 +1150,12 @@ function decideActionForSeat(
   //    pot after flat-calling his near-all-in raise.
   //  - A MANIAC continues only with its value hands (MANIAC_ALLIN_VALUE_STRENGTH) or above the price, read against its range
   //    read and against any two cards: its "raise" there is a call, and it called 45% of its air at any price
-  //    (MANIAC_ALLIN_VALUE_STRENGTH doc).
+  //    (MANIAC_ALLIN_VALUE_STRENGTH doc). Not pot-limit Omaha (the floor only): see the same doc.
   const allInBettor = !sdKind && table.bettingStructure !== 'fixed-limit' && callAmount > 0
     ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
   if (allInBettor && potOdds <= MICRO_CALL_NEED / Math.max(1, numOpponents)) {
     if (post.action === PlayerAction.Fold) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
-  } else if (allInBettor && profile.archetype === 'MANIAC' && post.action !== PlayerAction.Fold
+  } else if (allInBettor && !isOmahaFamily && profile.archetype === 'MANIAC' && post.action !== PlayerAction.Fold
       && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds
       && getPostFlopStrength(isOmahaFamily ? seat.holeCards : holdemHoleCards(seat.holeCards, table.communityCards),
         table.communityCards, numOpponents, profile.difficulty, isOmahaFamily, 0, isShortDeck, isHiLoSplit) <= potOdds) {
@@ -1348,6 +1348,10 @@ export const NEAR_ALLIN_SPR = 1;
  * The price is read against ANY two cards too (equity with no range narrowing): read only against the range a raise
  * implies, it folded air that a short human's any-two all-in does not beat (five 100 BB MANIACs, a 12 BB human flat-calling
  * and moving in on any flop: +84 (16) BB/100, 7740996 -9, live -62; against any two +20 (15)).
+ * Not pot-limit Omaha: its pre-flop is 0dc1b96's (no light re-raise cap, so no extra cheap flops), and its equities run
+ * close, so the read (a share against every live opponent) folded what the call needed against a short human's all-in:
+ * a 12 BB human flat-calling five 100 BB MANIACs and moving in on any flop won +104 (9) BB/100 (7740996 +70 (8), live
+ * +59 (7)); without the rule +63 (4).
  */
 export const MANIAC_ALLIN_VALUE_STRENGTH = 0.55;
 /**

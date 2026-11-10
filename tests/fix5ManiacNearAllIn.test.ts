@@ -14,11 +14,12 @@
  * leaves the bettor half his stack or less: a FOLD at no more than MICRO_CALL_NEED of equity per opponent becomes a call, and
  * a MANIAC continues only with MANIAC_ALLIN_VALUE_STRENGTH or above the price (its "raise or fold" called 45% of its air
  * there at any price: flat a MANIAC raise with any two, move in on the flop with a pair or a draw, won +41 (9) BB/100 with
- * two 100 BB MANIACs and a 40 BB stack, live -3 (10)).
+ * two 100 BB MANIACs and a 40 BB stack, live -3 (10)); not in pot-limit Omaha (the floor only there).
  * Real PokerTable + real decideAction; seeded Math.random, a seeded deck (crypto.randomBytes) and a frozen clock.
  * 6 seats at 50/100, button 4: small blind 5, big blind 0 (the human), UTG 1, MP 2, CO 3.
  */
 import { PokerTable, PlayerAction, GamePhase } from '../src/game/PokerTable';
+import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { decideAction } from '../src/ai/AIPlayer';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -140,6 +141,39 @@ function flopShoveVsManiac(difficulty: string, n: number, seed: number, humanBB 
   return { air, airCont, strong, strongCont };
 }
 
+/**
+ * Pot-limit Omaha: UTG (seat 1) opens to 3 BB (forced), MP and CO call, the button and small blind fold, the human (big
+ * blind, humanBB) calls; on the flop he bets his last chips first (a pot-sized bet: all-in for humanBB - 3 BB into 12.5 BB).
+ * Each MANIAC's answer (all three are MANIACs).
+ */
+function ploFlopShove(humanBB: number, n: number, seed: number): { spots: number; cont: number } {
+  let spots = 0, cont = 0;
+  const restore = seedAll(seed);
+  try {
+    for (let k = 0; k < n; k++) {
+      const t: any = new OmahaTable({ tableId: 'p', tableName: 'p', smallBlind: 50, bigBlind: BB, ante: 0, minBuyIn: BB } as any, false, 4);
+      const id = tableNo++;
+      for (let i = 0; i < 6; i++) expect(t.sitDown(i, 'P' + i, (i === 0 ? humanBB : 100) * BB, (i === 0 ? 'player-mna-' : 'ai-mna-') + id + '-' + i, i !== 0)).toBe(true);
+      t.presetFirstButton(4);
+      expect(t.startNewHand()).toBe(true);
+      expect(t.playerRaise(1, 3 * BB)).toBe(true);
+      for (const s of [2, 3]) expect(t.playerCall(s)).toBe(true);
+      for (const s of [4, 5]) expect(t.playerFold(s)).toBe(true);
+      expect(t.playerCall(0)).toBe(true);
+      expect(t.currentPhase).toBe(GamePhase.Flop);
+      expect(t.playerAllIn(0)).toBe(true);
+      for (let g = 0; g < 3 && t.activeSeatIndex > 0 && t.currentPhase === GamePhase.Flop; g++) {
+        const a = t.activeSeatIndex;
+        spots++;
+        const d = decideAction(t, a, prof('MANIAC'));
+        if (d.action !== PlayerAction.Fold) { cont++; expect(t.playerCall(a) || t.playerAllIn(a)).toBe(true); }
+        else expect(t.playerFold(a)).toBe(true);
+      }
+    }
+  } finally { restore(); }
+  return { spots, cont };
+}
+
 describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all-in; a micro all-in is called on every street', () => {
   const log: string[] = [];
   afterAll(() => process.stdout.write(`fix5 MANIAC near all-in: ${log.join('; ')}\n`));
@@ -216,5 +250,15 @@ describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all
     const r = flopShoveVsManiac('hard', 300, 8900, 12);
     log.push(`MANIAC hard vs a 9 BB flop all-in: air ${r.airCont}/${r.air} continue`);
     expect(r.air >= 60 && r.airCont >= 0.25 * r.air).toBe(true);
+  });
+
+  it('pot-limit Omaha keeps the 7740996 MANIAC against a short flop all-in (no price rule there): three MANIACs facing a 12 / 20 BB human\'s last 9 / 17 BB continue >= 70% (7740996 76% / 77%; 96a901f, priced on its share against every live opponent: 58% / 56%)', () => {
+    const bad: string[] = [];
+    for (const h of [12, 20]) {
+      const r = ploFlopShove(h, 150, 9100 + h);
+      log.push(`PLO MANIAC 3-way vs a ${h} BB human's flop all-in: ${r.cont}/${r.spots} continue`);
+      if (r.spots < 400 || r.cont < 0.70 * r.spots) bad.push(`${h} BB: ${r.cont}/${r.spots}`);
+    }
+    expect(bad).toEqual([]);
   });
 });
