@@ -1143,8 +1143,8 @@ function decideActionForSeat(
     seat, table, profile, storyBoard, opponents, outs, bigBlind, numOpponents, oppCategory,
     holdemEquivalentStreet(table.currentPhase, sdKind)
   );
-  // Fix-up 3 (HOLDEM-RR2-EXPLOIT-2) — the Hold'em family only (never Stud / draw): against an all-in, or a bet that left its
-  // maker NEAR_ALLIN_LEFT_FRACTION of his stack or less, the decision is priced.
+  // Fix-up 3 (HOLDEM-RR2-EXPLOIT-2) — the Hold'em family only (never Stud / draw): against an all-in, or a bet from a committed
+  // player (nearAllInRaiser: no more than the pot behind), the decision is priced.
   //  - The price floor after the flop: at most POSTFLOP_MICRO_CALL_NEED of equity per opponent needed (fix-up 4; fix-up 3
   //    used the pre-flop MICRO_CALL_NEED), a FOLD is a call. The MANIAC "raise or fold" (and NIT / ROCK below a fixed
   //    strength) folded air to a human's last 2-5 BB in an 80-400 BB pot after flat-calling his near-all-in raise.
@@ -1327,33 +1327,31 @@ export const MANIAC_SQUEEZE_BEHIND_MAX_BB = 50;
  */
 export const MANIAC_SHORT_SHOVE_MAX_BB = 75;
 /**
- * Fix round 4, fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — no-limit Hold'em family: a raise (or a post-flop bet) that leaves the
- * player who made it this share of his hand-start stack or less is the all-in it effectively is: he calls any re-raise.
- * Pre-flop, deeper than the push/fold zone (depth at risk > 25 BB), every all-in rule of preFlopStrategy reads it as the
- * all-in (nearAllInRaiser: the price floor, the commit gate, the MANIAC short-shove band, the opener / FISH / deep-MANIAC
- * all-in rules, the flat rule), and a bot that continues re-raises to cover him (a flat left him chips to move in after the
- * flop). Post-flop the price floor (decideAction) treats his bet as an all-in. They keyed on a real all-in only, so a human
- * who re-raised a MANIAC's raise to 50-95% of his stack met the commit gate at the LARGEST opponent's depth (a 100 BB MANIAC
- * continued 16% against a 40 BB human's raise to 38 BB, 69% against his all-in) or the light re-raise cap (a 300 BB MANIAC
- * flat-called ~70%, then folded air to his last 2-5 BB on the flop). Re-raise to F of the stack, call any re-raise, move
- * in on the flop (hard, whole line, BB/100, 7740996 / live 0dc1b96): a 40 BB human vs two 100 BB MANIACs +17 / +44 / +69 /
- * +92 at F = 0.5 / 0.6 / 0.75 / 0.95 (live +1 / 0 / -12 / -18); a 75 BB human +81 at every F (live -5 to -23); a 100 BB
- * human vs five 300 BB MANIACs +51 / +406 / +795 / +1,581 (live -228 / -245 / -116 / -88). A 10% share (the review
- * candidate) left F <= 0.75 open (+81 at 75 BB, +279 / +487 vs the 300 BB MANIACs); the commit gate at the raiser's depth
- * alone left +75.
- */
-export const NEAR_ALLIN_LEFT_FRACTION = 0.5;
-/**
- * Fix-up 3, sweep — he is committed too when his chips behind are no more than this many times the pot this seat's call
- * would make (stack-to-pot ratio <= 1: his last bet can be no bigger than that pot, so it is priced in). A raise that kept
- * more than half the stack (40-45% of 40 BB over a MANIAC open) was flat-called under the light re-raise cap, and the price
- * on his flop all-in let a MANIAC fold: re-raise to 40 / 45% of the stack and move in on the flop won +22 (9) / +25 (10)
- * BB/100 with one 100 BB MANIAC and a 40 BB stack (live 0dc1b96 -7 / -2); with this ratio -1 / -1, and 0.3 / 0.35 +1 / -6.
+ * Fix round 4, fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — no-limit Hold'em family: a raise (or a post-flop bet) whose maker has no
+ * more chips behind than this many times the pot this seat's call would make (a stack-to-pot ratio <= 1: his last bet can be
+ * no bigger than that pot, so it is priced in) is the all-in it effectively is: he calls any re-raise. Pre-flop, deeper than
+ * the push/fold zone (depth at risk > 25 BB), every all-in rule of preFlopStrategy reads it as the all-in (nearAllInRaiser: the
+ * price floor, the commit gate, the MANIAC short-shove band, the opener / FISH / deep-MANIAC all-in rules, the flat rule), and
+ * a bot that continues re-raises to cover him (a flat left him chips to move in after the flop). Post-flop the price floor and
+ * the MANIAC price rule (decideAction) treat his bet as an all-in. They keyed on a real all-in only, so a human who re-raised
+ * a MANIAC's raise to 50-95% of his stack met the commit gate at the LARGEST opponent's depth (a 100 BB MANIAC continued 16%
+ * against a 40 BB human's raise to 38 BB, 69% against his all-in) or the light re-raise cap (a 300 BB MANIAC flat-called
+ * ~70%, then folded air to his last 2-5 BB on the flop). Re-raise to F of the stack, call any re-raise, move in on the flop
+ * (hard, whole line, BB/100, 7740996 / live 0dc1b96): a 40 BB human vs two 100 BB MANIACs +17 / +44 / +69 / +92 at F = 0.5 /
+ * 0.6 / 0.75 / 0.95 (live +1 / 0 / -12 / -18); a 75 BB human +81 at every F (live -5 to -23); a 100 BB human vs five 300 BB
+ * MANIACs +51 / +406 / +795 / +1,581 (live -228 / -245 / -116 / -88). A 10% share of the stack left (the review candidate)
+ * left F <= 0.75 open (+81 at 75 BB, +279 / +487 vs the 300 BB MANIACs); the commit gate at the raiser's depth alone left +75.
+ * Fix-up 3 first counted a raise that left half the hand-start stack or less (NEAR_ALLIN_LEFT_FRACTION, 0.5), then added this
+ * ratio: a raise that kept more than half the stack (40-45% of 40 BB over a MANIAC open) was flat-called under the light
+ * re-raise cap, and the price on his flop all-in let a MANIAC fold: re-raise to 40 / 45% of the stack and move in on the
+ * flop won +22 (9) / +25 (10) BB/100 with one 100 BB MANIAC and a 40 BB stack (live 0dc1b96 -7 / -2); with this ratio
+ * -1 / -1, and 0.3 / 0.35 +1 / -6. Fix-up 4 removed the half-stack clause: it never fired alone (chips behind no more than
+ * what he has put in are no more than the pot).
  */
 export const NEAR_ALLIN_SPR = 1;
 /**
- * Fix round 4, fix-up 3 — Hold'em family, after the flop: a MANIAC facing an all-in (or a bet that left its maker
- * NEAR_ALLIN_LEFT_FRACTION of his stack or less) continues only with a strength above this (its raise-or-fold value line,
+ * Fix round 4, fix-up 3 — Hold'em family, after the flop: a MANIAC facing an all-in (or a bet from a committed player,
+ * NEAR_ALLIN_SPR) continues only with a strength above this (its raise-or-fold value line,
  * postFlopStrategy) or above the price it is laid (pot odds); a micro price is always called (the price floor). Its
  * "raise or fold" raised 45% of its air there at any price, and the raise is a call: a human who flat-called a MANIAC's
  * raise with any two and moved in on the flop only with a pair or a draw won +41 (9) BB/100 against two 100 BB MANIACs and
@@ -1424,16 +1422,15 @@ export function shoverFaced(table: PokerTable, seat: Seat): Seat | null {
 }
 
 /**
- * Fix-up 3 (NEAR_ALLIN_LEFT_FRACTION) — the live opponent whose raise or bet set the bet this seat faces (the street's last
- * aggressor) and is committed, with chips behind: he kept NEAR_ALLIN_LEFT_FRACTION of his hand-start stack or less, or no
- * more than NEAR_ALLIN_SPR x the pot this seat's call would make (null: none; an all-in is shoverFaced's).
+ * Fix-up 3 (NEAR_ALLIN_SPR) — the live opponent whose raise or bet set the bet this seat faces (the street's last aggressor)
+ * and is committed, with chips behind: no more than NEAR_ALLIN_SPR x the pot this seat's call would make (null: none; an
+ * all-in is shoverFaced's).
  */
 export function nearAllInRaiser(table: PokerTable, seat: Seat): Seat | null {
   const s = table.lastAggressorSeat >= 0 ? table.seats[table.lastAggressorSeat] : undefined;
   if (!s || s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) return null;
   if (s.currentBet !== table.currentBetToMatch) return null;
-  return s.chipCount <= NEAR_ALLIN_LEFT_FRACTION * handStartStack(s)
-    || s.chipCount <= NEAR_ALLIN_SPR * (table.getTotalPot() + table.getCallAmount(seat)) ? s : null;
+  return s.chipCount <= NEAR_ALLIN_SPR * (table.getTotalPot() + table.getCallAmount(seat)) ? s : null;
 }
 
 /**
@@ -1618,8 +1615,8 @@ function preFlopStrategy(
   const headPyta = Math.min(3, Math.max(1, totalActive - 1));
   // NEW-1 — the all-in that SET the bet this seat faces, and the depth at risk
   // against it (min of the two hand-start stacks), never the shover's 0 left.
-  // Fix-up 3 (NEAR_ALLIN_LEFT_FRACTION): no-limit, deeper than the push/fold zone, a raise that left its maker half his
-  // stack or less is that all-in for every rule below.
+  // Fix-up 3 (NEAR_ALLIN_SPR): no-limit, deeper than the push/fold zone, a raise from a committed player (no more than the
+  // pot behind) is that all-in for every rule below.
   let shover = callAmount > 0 ? shoverFaced(table, seat) : null;
   const nearRaiser = !shover && callAmount > 0 && noLimit && !allInOrFold ? nearAllInRaiser(table, seat) : null;
   if (nearRaiser && Math.round(Math.min(handStartStack(seat), handStartStack(nearRaiser)) / bigBlind) > PUSH_FOLD_MAX_BB) shover = nearRaiser;

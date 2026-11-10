@@ -30,7 +30,7 @@
  *              MANIAC met the commit gate at the largest opponent's depth and continued 16% against a 40 BB human; a 300 BB
  *              one flat-called under the light re-raise cap and folded air to his last 5 BB on the flop: +82 (5) and
  *              +1,285 (104) BB/100 on 7740996, hard, exploit review harness; live 0dc1b96 -28 / -131. With
- *              NEAR_ALLIN_LEFT_FRACTION the raise is his all-in, and the post-flop price floor calls the micro all-in).
+ *              NEAR_ALLIN_SPR the raise is his all-in, and the post-flop price floor calls the micro all-in).
  *              His all-in is scored on its main pot from the board at which he went all-in.
  * On 0bc7529 the light re-raise cap was 5% of the MANIAC's OWN stack, so a deep MANIAC re-raised ~93% of hands
  * again and folded ~78% of them to the 100 BB shove (hard, BB/100): tg:4:3 +445, osrr:3:3 +172 vs a 1,000 BB

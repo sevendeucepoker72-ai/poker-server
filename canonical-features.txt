@@ -2192,7 +2192,7 @@ d = Math.min(d, bb)
 # +51..+1,581 against five 300 BB MANIACs (live -18..-245). decideAction (Hold'em family, never Stud / draw): an all-in, or a bet
 # that left its maker half his stack or less, needing <= MICRO_CALL_NEED of equity per opponent is never folded after the flop
 # (MANIAC / NIT / ROCK folded air to the last 2-5 BB in an 80-400 BB pot).
-NEAR_ALLIN_LEFT_FRACTION
+# SUPERSEDED 2026-11-10 by NEAR_ALLIN_SPR (fix-up 4, review P3: the half-stack clause never fired alone - chips behind <= what he put in <= the pot - and the constant is gone): NEAR_ALLIN_LEFT_FRACTION
 function nearAllInRaiser(
 let CONT = CALL;
 shover.currentBet + shover.chipCount

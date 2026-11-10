@@ -9,9 +9,9 @@
  *      (postFlopStrategy's MANIAC "raise or fold" has no price; NIT and ROCK fold below a fixed strength too).
  * Re-raise to 95% of the stack, call any re-raise, shove any flop (hard, whole line, BB/100): +82 (5) for a 40 BB human
  * against two 100 BB MANIACs, +1,285 (104) for a 100 BB human against five 300 BB MANIACs (live 0dc1b96 -28 / -131).
- * With NEAR_ALLIN_LEFT_FRACTION every pre-flop all-in rule reads such a raise as the all-in (deeper than the push/fold zone;
- * a bot that continues re-raises to cover him), and after the flop, in the Hold'em family, against an all-in or a bet that
- * leaves the bettor half his stack or less: a FOLD at no more than MICRO_CALL_NEED of equity per opponent becomes a call, and
+ * With NEAR_ALLIN_SPR every pre-flop all-in rule reads such a raise as the all-in (deeper than the push/fold zone; a bot
+ * that continues re-raises to cover him), and after the flop, in the Hold'em family, against an all-in or a bet from a
+ * committed player: a FOLD at no more than a micro price per opponent (POSTFLOP_MICRO_CALL_NEED, fix-up 4) becomes a call, and
  * a MANIAC continues only with MANIAC_ALLIN_VALUE_STRENGTH or above the price (its "raise or fold" called 45% of its air
  * there at any price: flat a MANIAC raise with any two, move in on the flop with a pair or a draw, won +41 (9) BB/100 with
  * two 100 BB MANIACs and a 40 BB stack, live -3 (10)); not in pot-limit Omaha (the floor only there).
@@ -178,13 +178,13 @@ describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all
   const log: string[] = [];
   afterAll(() => process.stdout.write(`fix5 MANIAC near all-in: ${log.join('; ')}\n`));
 
-  it('the constants: half the hand-start stack, or a stack-to-pot ratio of 1', () => {
+  it('the constant: a stack-to-pot ratio of 1 (fix-up 4: the half-stack clause, NEAR_ALLIN_LEFT_FRACTION, never fired alone and is gone)', () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const AI = require('../src/ai/AIPlayer');
-    expect([AI.NEAR_ALLIN_LEFT_FRACTION, AI.NEAR_ALLIN_SPR]).toEqual([0.5, 1]);
+    expect([AI.NEAR_ALLIN_SPR, AI.NEAR_ALLIN_LEFT_FRACTION]).toEqual([1, undefined]);
   });
 
-  it('the opener answers a 40-75 BB human\'s raise to 35-95% of his stack (half of it, or a stack-to-pot ratio <= 1, left) as it answers his all-in: it continues >= 58%, within 10 points of that, and never by a flat call (7740996, hard: 41% against 95% of 40 BB, 23% against 60% of 75 BB; a 500 BB MANIAC flat-called 58-63%; c0dac55 flat-called a raise to 35-40%)', () => {
+  it('the opener answers a 40-75 BB human\'s raise to 35-95% of his stack (a stack-to-pot ratio <= 1 left) as it answers his all-in: it continues >= 58%, within 10 points of that, and never by a flat call (7740996, hard: 41% against 95% of 40 BB, 23% against 60% of 75 BB; a 500 BB MANIAC flat-called 58-63%; c0dac55 flat-called a raise to 35-40%)', () => {
     const bad: string[] = [];
     for (const diff of ['hard', 'medium']) {
       for (const [m, h, f] of [[100, 40, 0.95], [100, 75, 0.6], [100, 75, 0.5], [500, 60, 0.95], [500, 75, 0.6], [100, 40, 0.4], [500, 40, 0.35]]) {
@@ -208,7 +208,7 @@ describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all
     expect(bad).toEqual([]);
   });
 
-  it('a raise that leaves the raiser more than half his stack is not an all-in: the 300 BB MANIAC still flat-calls a 100 BB human\'s 3-bet to 12 BB (as 7740996)', () => {
+  it('a raise that leaves the raiser more than the pot behind is not an all-in: the 300 BB MANIAC still flat-calls a 100 BB human\'s 3-bet to 12 BB (as 7740996)', () => {
     const r = opener(300, 100, 0.12);
     log.push(`300/100 3-bet to 12 BB: ${pct(r)}`);
     expect(r.flats > 0.4 * r.spots).toBe(true);
