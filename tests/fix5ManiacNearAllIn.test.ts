@@ -111,14 +111,14 @@ function flopSpot(arch: string, difficulty: string, botBB: number, humanBB: numb
  * he moves all-in (37 BB into 6.5 BB: 46% needed). The MANIAC's answers, by its hand on the flop: air (no pair with a hole
  * card, no four-flush, no four to a straight) and strong (three of a kind or better with a hole card).
  */
-function flopShoveVsManiac(difficulty: string, n: number, seed: number): { air: number; airCont: number; strong: number; strongCont: number } {
+function flopShoveVsManiac(difficulty: string, n: number, seed: number, humanBB = 40): { air: number; airCont: number; strong: number; strongCont: number } {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const HE = require('../src/game/HandEvaluator');
   let air = 0, airCont = 0, strong = 0, strongCont = 0;
   const restore = seedAll(seed);
   try {
     for (let k = 0; k < n; k++) {
-      const t = table([40, 100, 100, 100, 100, 100]);
+      const t = table([humanBB, 100, 100, 100, 100, 100]);
       expect(t.playerRaise(1, 3 * BB)).toBe(true);
       for (const s of [2, 3, 4, 5]) expect(t.playerFold(s)).toBe(true);
       expect(t.playerCall(0)).toBe(true);
@@ -201,14 +201,20 @@ describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all
     expect(r.folds > 0.3 * r.spots).toBe(true);
   });
 
-  it('a MANIAC prices a flop all-in: against 37 BB into 6.5 BB it folds its air (>= 90%; 7740996 continued 61% / 72% of it, hard / medium: its "raise" there is a call) and keeps three of a kind or better (>= 90%, hard)', () => {
+  it('a MANIAC prices a flop all-in: against 37 BB into 6.5 BB it folds its air (>= 80%; 7740996 continued 61% / 72% of it, hard / medium: its "raise" there is a call) and keeps three of a kind or better (>= 90%, hard)', () => {
     const bad: string[] = [];
     for (const [diff, n] of [['hard', 400], ['medium', 300]] as Array<[string, number]>) {
       const r = flopShoveVsManiac(diff, n, 8800);
       log.push(`MANIAC ${diff} vs a 37 BB flop all-in: air ${r.airCont}/${r.air} continue, trips+ ${r.strongCont}/${r.strong}`);
-      if (r.air < 0.3 * n || r.airCont > 0.1 * r.air) bad.push(`${diff} air ${r.airCont}/${r.air}`);
+      if (r.air < 0.3 * n || r.airCont > 0.2 * r.air) bad.push(`${diff} air ${r.airCont}/${r.air}`);
       if (diff === 'hard' && (r.strong < 5 || r.strongCont < 0.9 * r.strong)) bad.push(`${diff} trips+ ${r.strongCont}/${r.strong}`);
     }
     expect(bad).toEqual([]);
+  });
+
+  it('it prices the all-in against any two cards too: against a 12 BB human\'s last 9 BB into 6.5 BB (37% needed) it still continues with >= 25% of its air (81eeba3, read only against the range a raise implies: 11%)', () => {
+    const r = flopShoveVsManiac('hard', 300, 8900, 12);
+    log.push(`MANIAC hard vs a 9 BB flop all-in: air ${r.airCont}/${r.air} continue`);
+    expect(r.air >= 60 && r.airCont >= 0.25 * r.air).toBe(true);
   });
 });

@@ -1148,14 +1148,17 @@ function decideActionForSeat(
   //  - The pre-flop price floor on the later streets: at most MICRO_CALL_NEED of equity per opponent needed, a FOLD is a call.
   //    The MANIAC "raise or fold" (and NIT / ROCK below a fixed strength) folded air to a human's last 2-5 BB in an 80-400 BB
   //    pot after flat-calling his near-all-in raise.
-  //  - A MANIAC continues only with its value hands (MANIAC_ALLIN_VALUE_STRENGTH) or above the price: its "raise" there is a
-  //    call, and it called 45% of its air at any price (MANIAC_ALLIN_VALUE_STRENGTH doc).
+  //  - A MANIAC continues only with its value hands (MANIAC_ALLIN_VALUE_STRENGTH) or above the price, read against its range
+  //    read and against any two cards: its "raise" there is a call, and it called 45% of its air at any price
+  //    (MANIAC_ALLIN_VALUE_STRENGTH doc).
   const allInBettor = !sdKind && table.bettingStructure !== 'fixed-limit' && callAmount > 0
     ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
   if (allInBettor && potOdds <= MICRO_CALL_NEED / Math.max(1, numOpponents)) {
     if (post.action === PlayerAction.Fold) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
   } else if (allInBettor && profile.archetype === 'MANIAC' && post.action !== PlayerAction.Fold
-      && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds) {
+      && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds
+      && getPostFlopStrength(isOmahaFamily ? seat.holeCards : holdemHoleCards(seat.holeCards, table.communityCards),
+        table.communityCards, numOpponents, profile.difficulty, isOmahaFamily, 0, isShortDeck, isHiLoSplit) <= potOdds) {
     return { action: PlayerAction.Fold, raiseAmount: 0 };
   }
   return limitBotRaiseWar(table, seat, post, false, effectiveStrength);
@@ -1342,6 +1345,9 @@ export const NEAR_ALLIN_SPR = 1;
  * raise with any two and moved in on the flop only with a pair or a draw won +41 (9) BB/100 against two 100 BB MANIACs and
  * a 40 BB stack (hard, whole line; live 0dc1b96 -3 (10): its MANIACs re-raise the flat, round 3's MANIAC-RTF cap stops
  * that at a 100 BB table, so the flop came twice as often). Priced, -15 (11); moving in on every flop stays -127.
+ * The price is read against ANY two cards too (equity with no range narrowing): read only against the range a raise
+ * implies, it folded air that a short human's any-two all-in does not beat (five 100 BB MANIACs, a 12 BB human flat-calling
+ * and moving in on any flop: +84 (16) BB/100, 7740996 -9, live -62; against any two +20 (15)).
  */
 export const MANIAC_ALLIN_VALUE_STRENGTH = 0.55;
 /**
