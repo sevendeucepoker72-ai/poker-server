@@ -1032,6 +1032,14 @@ firstRound && e.action === 'straddle'
 FIVE_DRAW_POST_MANIAC_MIX
 fiveDrawPostCheckedToLast
 to < table.getMinRaise()
+# 2026-11-09 (bots review fix round 4, fix-up 4) - postFlopStrategy, Five Card Draw after the draw: a MANIAC never
+# bets a lower pair (FIVE_DRAW_POST_MANIAC_MIX[0] is now 0), and checked to by every seat (fiveDrawPostCheckedToLast) it
+# bets every K-K or better and half its no-pair hands (FIVE_DRAW_POST_MANIAC_LAST), so an all-in over its bet no longer
+# finds a range that folds three bets in four (F3-MEASUREMENT-1 / F3-EXPLOIT-1 / F3-REGRESSION-1: any hand shoved over
+# it won +188 to +249 BB/100). SUPERSEDED 2026-11-09 by this entry: the fix-up 3 description above ("also leads a share
+# of its lower pairs", "checked to by every seat ... it bets as the core MANIAC does"); its token lines stay, the code
+# they pin is still there.
+FIVE_DRAW_POST_MANIAC_LAST
 
 # 2026-11 bots review: Hold'em pre-flop (holdem-preflop C1, B10 / NEW-2) - the
 # percentile table is generated offline (gen-preflop-table.ts) and committed as

@@ -1,12 +1,14 @@
 /**
- * tests/studDrawFiveCardDrawPostDraw.test.ts (2026-11 bots review, fix round 4, studdraw fix-up 3).
+ * tests/studDrawFiveCardDrawPostDraw.test.ts (2026-11 bots review, fix round 4, studdraw fix-ups 3 and 4).
  * Five Card Draw no-limit AFTER the draw (postFlopStrategy behind studDrawKindOfTable), through the real decideAction:
- *  1. a MANIAC's check is not a capped range: with seats behind it, it traps a share of its kings or better and leads
- *     a share of its lower pairs (FIVE_DRAW_POST_MANIAC_MIX); checked to by every seat it bets every hand
- *     (STUDDRAW-RR2-EXPLOIT-1 / R4RR-REGRESSION-1);
- *  2. the call-site wiring of fiveDrawPostFolds' `checked` and `raised` arguments (STUDDRAW-R4RR-REGRESSION-3), and
+ *  1. a MANIAC's check is not a capped range: with seats behind it, it traps a share of its kings or better
+ *     (FIVE_DRAW_POST_MANIAC_MIX; STUDDRAW-RR2-EXPLOIT-1);
+ *  2. a MANIAC's bet is not a range that folds most of itself to an all-in over it: it never bets a lower pair, and
+ *     checked to by every seat it bets every king or better and half its no-pair hands (FIVE_DRAW_POST_MANIAC_LAST;
+ *     fix-up 4, STUDDRAW-F3-MEASUREMENT-1 / F3-EXPLOIT-1 / F3-REGRESSION-1);
+ *  3. the call-site wiring of fiveDrawPostFolds' `checked` and `raised` arguments (STUDDRAW-R4RR-REGRESSION-3), and
  *     fiveDrawPostShoveLike (a bet that leaves its maker all but a chip);
- *  3. a short bot whose capped lead is under the minimum bet leads its whole stack (STUDDRAW-R4RR-REGRESSION-2).
+ *  4. a short bot whose capped lead is under the minimum bet leads its whole stack (STUDDRAW-R4RR-REGRESSION-2).
  * Real tables, deterministic (seeded Math.random, frozen Date.now, seeded deck).
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
@@ -154,30 +156,95 @@ function maniacLeads(seed: number, spot: 'first' | 'last', per: number): Record<
 }
 const fmt = (st: Record<string, { bets: number; n: number }>) => Object.keys(st).map((k) => `${k} ${st[k].bets}/${st[k].n}`).join(', ');
 
+/** How often each class comes after the draw (the bots' own discard rule on random deals; scratch cls3 Monte Carlo): two pair or better, K-K / A-A, a lower pair, no pair. */
+const CLASS_W: Record<string, number> = { twoPairUp: 0.24, kings: 0.11, low: 0.39, air: 0.26 };
+
+/**
+ * Heads-up after the draw (40 BB pot, 80 BB behind each): the MANIAC acts first (`botFirst`) or the human checks to it.
+ * Per class (MANIAC_GROUPS): how often it bets, at what sizes, and, when it bets, whether it continues against the
+ * human's all-in over the bet; `cont` = the share of its bets that continue, weighted by CLASS_W.
+ */
+function huBetThenShove(seed: number, botFirst: boolean, per: number): { st: Record<string, { bets: number; n: number; faced: number; cont: number }>; sizes: Set<number>; cont: number } {
+  const restore = detEnv(seed);
+  try {
+    const st: Record<string, { bets: number; n: number; faced: number; cont: number }> = {};
+    const sizes = new Set<number>();
+    for (const g of Object.keys(MANIAC_GROUPS)) for (const h of MANIAC_GROUPS[g]) for (const diff of DIFFS) {
+      st[g] = st[g] || { bets: 0, n: 0, faced: 0, cont: 0 };
+      for (let k = 0, got = 0; got < per && k < per * 40; k++) {
+        const r = huAfterDraw(C(h), 100, botFirst); if (!r) continue;
+        const { t, bot, hero } = r;
+        if (!botFirst && (!t.playerCheck(hero) || t.activeSeatIndex !== bot)) continue;
+        got++; st[g].n++;
+        const p = prof('MANIAC', diff);
+        const d = AI.decideAction(t, bot, p);
+        if (!bets(d)) continue;
+        st[g].bets++;
+        if (!(d.action === PlayerAction.AllIn ? t.playerAllIn(bot) : t.playerRaise(bot, d.raiseAmount))) continue;
+        sizes.add(t.seats[bot].currentBet);
+        if (t.seats[bot].allIn || !t.playerAllIn(hero) || t.activeSeatIndex !== bot) continue;
+        st[g].faced++;
+        if (AI.decideAction(t, bot, p).action !== PlayerAction.Fold) st[g].cont++;
+      }
+    }
+    let num = 0, den = 0;
+    for (const g of Object.keys(st)) { const b = CLASS_W[g] * st[g].bets / st[g].n; den += b; num += b * (st[g].faced ? st[g].cont / st[g].faced : 0); }
+    return { st, sizes, cont: den > 0 ? num / den : 0 };
+  } finally { restore(); }
+}
+const fmt2 = (st: Record<string, { bets: number; n: number; faced: number; cont: number }>) => Object.keys(st).map((k) => `${k} ${st[k].bets}/${st[k].n} (vs all-in ${st[k].cont}/${st[k].faced})`).join(', ');
+
 describe('fix-up 3 (STUDDRAW-RR2-EXPLOIT-1 / R4RR-REGRESSION-1): Five Card Draw after the draw, a MANIAC\'s check is not a capped range', () => {
-  it('a 5-way pot, the MANIAC first to act (four seats behind it): it checks some of its two pair or better and some of its kings or aces, and leads some of its lower pairs (280dc09: every K-K or better led, every pair under K-K checked, so a check never held two pair or K-K)', () => {
+  it('a 5-way pot, the MANIAC first to act (four seats behind it): it checks some of its two pair or better and some of its kings or aces, and leads no lower pair (280dc09: every K-K or better led, so a check never held two pair or K-K; fix-up 4: fix-up 3 led half the lower pairs, a bet that folds to an all-in over it)', () => {
     const st = maniacLeads(5331, 'first', 3);
     process.stdout.write(`MANIAC first to act, leads: ${fmt(st)}\n`);
     expect([st.low.n, st.air.n, st.kings.n, st.twoPairUp.n]).toEqual([24, 24, 24, 48]);
     expect(st.twoPairUp.n - st.twoPairUp.bets).toBeGreaterThanOrEqual(5);   // checks with two pair or better
     expect(st.kings.n - st.kings.bets).toBeGreaterThanOrEqual(2);           // checks with K-K / A-A
     expect(st.twoPairUp.bets / st.twoPairUp.n).toBeGreaterThanOrEqual(0.5); // still leads most of them
-    expect(st.low.bets).toBeGreaterThanOrEqual(5);                          // leads some lower pairs
-    expect(st.low.bets / st.low.n).toBeLessThanOrEqual(0.75);
-    expect(st.air.bets / st.air.n).toBeGreaterThanOrEqual(0.25);
-    expect(st.air.bets / st.air.n).toBeLessThanOrEqual(0.75);
+    expect(st.low.bets).toBe(0);
+    expect(st.air.bets / st.air.n).toBeGreaterThanOrEqual(0.1);
+    expect(st.air.bets / st.air.n).toBeLessThanOrEqual(0.65);
   }, 300_000);
 
-  it('the same pot with every other seat checked to the MANIAC (it acts last): it bets every class, as the core MANIAC does (280dc09 checked every pair under K-K and half its no-pair hands there too, so a short stack\'s checked hands reached showdown free)', () => {
+  it('the same pot with every other seat checked to the MANIAC (it acts last): it bets every K-K or better and two pair or better (nobody is left to act: no traps), about half its no-pair hands and no lower pair (fix-up 4; 89ee502 bet every hand there, and every one pair folded to an all-in over the bet)', () => {
     const st = maniacLeads(5332, 'last', 2);
     process.stdout.write(`MANIAC checked to by every seat, leads: ${fmt(st)}\n`);
     expect([st.low.n, st.air.n, st.kings.n, st.twoPairUp.n]).toEqual([16, 16, 16, 32]);
-    for (const g of Object.keys(st)) expect([g, st[g].bets / st[g].n >= 0.9]).toEqual([g, true]);
+    expect([st.kings.bets / st.kings.n >= 0.9, st.twoPairUp.bets / st.twoPairUp.n >= 0.9]).toEqual([true, true]);
+    expect(st.low.bets).toBe(0);
+    expect(st.air.bets / st.air.n).toBeGreaterThanOrEqual(0.2);
+    expect(st.air.bets / st.air.n).toBeLessThanOrEqual(0.8);
   }, 300_000);
 
-  it('the MANIAC lead mix is pinned', () => {
-    expect([...AI.FIVE_DRAW_POST_MANIAC_MIX]).toEqual([0.5, 0.3]);
+  it('the MANIAC lead mix and its checked-to-last bet are pinned', () => {
+    expect([...AI.FIVE_DRAW_POST_MANIAC_MIX]).toEqual([0, 0.3]);
+    expect([...AI.FIVE_DRAW_POST_MANIAC_LAST]).toEqual([0, 0.5]);
   });
+});
+
+describe('fix-up 4 (STUDDRAW-F3-MEASUREMENT-1 / F3-EXPLOIT-1 / F3-REGRESSION-1): Five Card Draw after the draw, a MANIAC\'s bet is not a range that folds most of itself to an all-in over it', () => {
+  it('heads-up, 40 BB pot, 80 BB behind, the human checks to the MANIAC: it bets every K-K or better at one size but only a share of the rest, so at least 40% of its bets (weighted by how often each class comes) continue against an all-in over them (89ee502 bet every hand and folded all but two pair or better: 24%; checking every hand and shoving any hand over that bet won +249 BB/100 vs MANIAC x4, 280dc09 -102, live 0dc1b96 -388)', () => {
+    const r = huBetThenShove(5401, false, 3);
+    process.stdout.write(`HU MANIAC checked to: ${fmt2(r.st)}; weighted continue ${r.cont.toFixed(3)}; sizes ${[...r.sizes].join(' ')}\n`);
+    expect([r.st.low.n, r.st.air.n, r.st.kings.n, r.st.twoPairUp.n]).toEqual([24, 24, 24, 48]);
+    expect([r.st.kings.bets / r.st.kings.n >= 0.9, r.st.twoPairUp.bets / r.st.twoPairUp.n >= 0.9]).toEqual([true, true]);   // nobody is left to act: no traps
+    expect(r.st.twoPairUp.cont).toBe(r.st.twoPairUp.faced);
+    expect(r.sizes.size).toBe(1);   // one size for every hand
+    expect(r.cont).toBeGreaterThanOrEqual(0.4);
+  }, 300_000);
+
+  it('heads-up, the MANIAC first to act (the human behind it): it leads no pair under K-K, traps a share of its K-K or better, and at least 40% of its leads (weighted) continue against an all-in over them (89ee502 led half its lower pairs too: about 32%)', () => {
+    const r = huBetThenShove(5402, true, 3);
+    process.stdout.write(`HU MANIAC first to act: ${fmt2(r.st)}; weighted continue ${r.cont.toFixed(3)}; sizes ${[...r.sizes].join(' ')}\n`);
+    expect([r.st.low.n, r.st.air.n, r.st.kings.n, r.st.twoPairUp.n]).toEqual([24, 24, 24, 48]);
+    expect(r.st.low.bets).toBe(0);
+    expect(r.st.twoPairUp.n - r.st.twoPairUp.bets).toBeGreaterThanOrEqual(5);   // traps
+    expect(r.st.kings.n - r.st.kings.bets).toBeGreaterThanOrEqual(2);
+    expect(r.st.twoPairUp.cont).toBe(r.st.twoPairUp.faced);
+    expect(r.sizes.size).toBe(1);
+    expect(r.cont).toBeGreaterThanOrEqual(0.4);
+  }, 300_000);
 });
 
 describe('fix-up 3 (STUDDRAW-R4RR-REGRESSION-3): the call site passes fiveDrawPostFolds whether the bot checked and whether it has chips in', () => {

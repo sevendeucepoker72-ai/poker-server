@@ -12,7 +12,7 @@
  *     (FIVE_DRAW_POST_SHALLOW_RAMP_BB); an all-in asks one pair by rank up to two pair unless it raises this seat's
  *     own bet; FISH / CALLING_STATION and a MANIAC that checked read the price lower; every LEAD is capped at
  *     FIVE_DRAW_POST_LEAD_CAP of the depth (one size for every hand), the depth skips opponents under 15 BB behind,
- *     and a MANIAC leads polarized (FIVE_DRAW_POST_MANIAC_LEAD).
+ *     and a MANIAC leads polarized (FIVE_DRAW_POST_MANIAC_LEAD), never a lower pair (fix-up 4).
  *  2. Fixed limit: facing ONE bet, a NIT / ROCK / MANIAC whose pot share clears the price calls
  *     (STUD_DRAW_FL_CALL_MARGIN). The NIT folded everything under 0.55 to one bet: calling the first round with any
  *     hand, betting when checked to and folding to any bet won +83 BB/100 vs NIT x4 in Badugi (live -49).
@@ -715,7 +715,7 @@ describe('re-review fix-ups (STUDDRAW-R4F-REGRESSION-1 / R4R-EXPLOIT-1 / RR1-MEA
     expect([by.LAG.bets / by.LAG.n >= 0.75, by.MANIAC.bets / by.MANIAC.n >= 0.5]).toEqual([true, true]);
   }, 300_000);
 
-  it('a 5-way pot with a 40 BB human: one capped lead size for every hand; a LAG leads one pair and no pair too, a MANIAC (seats behind it) leads most of its kings or better, about half its lower pairs and a third of its no-pair hands (cdfc8a1: a big lead was aces up or better 473 times in 476; one pair never led, no pair never led; fix-up 3: 280dc09 checked every lower pair and led every K-K or better)', () => {
+  it('a 5-way pot with a 40 BB human: one capped lead size for every hand; a LAG leads one pair and no pair too, a MANIAC (seats behind it) leads most of its kings or better, no lower pair and a third of its no-pair hands (cdfc8a1: a big lead was aces up or better 473 times in 476; one pair never led, no pair never led; fix-up 3 led half the lower pairs, fix-up 4 none: a lower pair led folds to an all-in over the lead)', () => {
     const restore = detEnv(4176);
     try {
       const groups: Record<string, string[]> = { low: ['Qh Qd 9c 5s 2h', '7h 7d Ac 9s 4h'], air: ['Ah Kd 9c 7s 3h', 'Kh Qd 9c 6s 2h'], value: ['Kh Kd Ac 9s 4h', 'Ah Ad Kc Ks 3h', '2h 2d 2c 7s 3h'] };
@@ -738,11 +738,11 @@ describe('re-review fix-ups (STUDDRAW-R4F-REGRESSION-1 / R4R-EXPLOIT-1 / RR1-MEA
       process.stdout.write(`40 BB human, leads: ${Object.keys(st).map((k) => `${k} ${st[k].bets}/${st[k].n} (${mean(k).toFixed(3)})`).join(', ')}\n`);
       expect(over).toBe(0);
       expect([share('LAG low') >= 0.6, share('LAG air') >= 0.3, share('LAG value') >= 0.75]).toEqual([true, true, true]);
-      expect([share('MANIAC low') >= 0.2, share('MANIAC low') <= 0.8, share('MANIAC value') >= 0.5, share('MANIAC value') <= 0.95]).toEqual([true, true, true, true]);
+      expect([share('MANIAC low') === 0, share('MANIAC value') >= 0.5, share('MANIAC value') <= 0.95]).toEqual([true, true, true]);
       expect(share('MANIAC air')).toBeGreaterThanOrEqual(0.1);
       expect(share('MANIAC air')).toBeLessThanOrEqual(0.6);
       // every lead the same size: value and bluffs alike
-      for (const k of ['LAG low', 'LAG air', 'MANIAC low', 'MANIAC air']) expect([k, Math.abs(mean(k) - mean(k.split(' ')[0] + ' value')) <= 0.03]).toEqual([k, true]);
+      for (const k of ['LAG low', 'LAG air', 'MANIAC air']) expect([k, Math.abs(mean(k) - mean(k.split(' ')[0] + ' value')) <= 0.03]).toEqual([k, true]);
     } finally { restore(); }
   }, 300_000);
 

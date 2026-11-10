@@ -2443,10 +2443,11 @@ function studDrawFirstRound(
  *    (re-review fix-ups); a capped lead under the minimum bet (the bot's own stack is under ~3.3 BB) is its
  *    whole stack, one size for every hand (fix-up 3, STUDDRAW-R4RR-REGRESSION-2: it was a check, so a bot with
  *    2 BB behind never bet a full house, 0 of 54; live 0dc1b96 16 of 54);
- *  - a MANIAC with seats still to act behind it leads polarized (FIVE_DRAW_POST_MANIAC_LEAD): a pair of kings
- *    or better and a share of its no-pair hands (re-review fix-ups), plus a share of its lower pairs, and it
- *    checks a share of the kings or better (FIVE_DRAW_POST_MANIAC_MIX, fix-up 3), so neither its lead nor its
- *    check is a capped range; checked to by every seat, it bets as the core does;
+ *  - a MANIAC bets polarized (FIVE_DRAW_POST_MANIAC_LEAD): a pair of kings or better and a share of its
+ *    no-pair hands, never a lower pair (re-review fix-ups; fix-up 4). With seats still to act behind it, it
+ *    checks (traps) a share of its kings or better (FIVE_DRAW_POST_MANIAC_MIX, fix-up 3), so its check is not a
+ *    capped range; checked to by every other seat, it bets every king or better and half its no-pair hands
+ *    (FIVE_DRAW_POST_MANIAC_LAST, fix-up 4), so half of what it bets continues against an all-in over it;
  *  - a RAISE that puts a third of the depth in needs the stack-off class (FIVE_DRAW_POST_STACKOFF_CLASS),
  *    else it calls.
  * Fix round 4 made every big bet of a weaker hand a check: in pots built big before the draw a MANIAC bet
@@ -2481,10 +2482,12 @@ function postFlopStrategy(
     board, opponents, outs, bigBlind, numOpponents, oppCategory, street);
   if ((d.action !== PlayerAction.Raise && d.action !== PlayerAction.AllIn) || callAmount >= seat.chipCount) return d;
   if (studDrawKindOfTable(table) !== 'draw-hi' || table.bettingStructure !== 'no-limit' || drawsLeftAt('draw-hi', table.currentPhase) !== 0) return d;
-  if (callAmount === 0 && profile.archetype === 'MANIAC' && !fiveDrawPostCheckedToLast(table, seat)) {
+  if (callAmount === 0 && profile.archetype === 'MANIAC') {
+    const last = fiveDrawPostCheckedToLast(table, seat);
     const score = fiveDrawGateScore(seat.holeCards);
-    const [leadFrom, airShare] = FIVE_DRAW_POST_MANIAC_LEAD;
-    const [pairShare, trapShare] = FIVE_DRAW_POST_MANIAC_MIX;
+    const leadFrom = FIVE_DRAW_POST_MANIAC_LEAD[0];
+    const [pairShare, airShare] = last ? FIVE_DRAW_POST_MANIAC_LAST : [FIVE_DRAW_POST_MANIAC_MIX[0], FIVE_DRAW_POST_MANIAC_LEAD[1]];
+    const trapShare = last ? 0 : FIVE_DRAW_POST_MANIAC_MIX[1];
     const u = Math.random();
     if (score < 1 ? u >= airShare : score < leadFrom ? u >= pairShare : u < trapShare) return { action: PlayerAction.Check, raiseAmount: 0 };
   }
@@ -2528,22 +2531,41 @@ export const FIVE_DRAW_POST_LEAD_CAP = 0.3;
  * [3 seeds] and -223 +- 76 [2 seeds]. Its checked range then holds the middle pairs, which call more
  * (FIVE_DRAW_POST_CHECKED_PO). Fix-up 3: with seats still to act behind it (FIVE_DRAW_POST_MANIAC_MIX), and the
  * no-pair share is 0.35 (was 0.5): it now traps a share of its kings or better, and the lower air share keeps its
- * leads about as strong as before.
+ * leads about as strong as before. Checked to by every other seat it bets FIVE_DRAW_POST_MANIAC_LAST (fix-up 4).
  */
 export const FIVE_DRAW_POST_MANIAC_LEAD: readonly [number, number] = [1 + 11 / 13, 0.35];
 
 /**
  * Fix-up 3 (STUDDRAW-RR2-EXPLOIT-1 / R4RR-REGRESSION-1) — Five Card Draw after the draw, a MANIAC with players still to
- * act behind it: it also leads the share [0] of the pairs under FIVE_DRAW_POST_MANIAC_LEAD[0] and checks (traps) the
- * share [1] of the hands from it, so its check is not a capped range. When every other live seat has checked to it
- * (fiveDrawPostCheckedToLast) it bets as the core MANIAC does, every hand at the capped size. With every pair under
- * K-K checked and every K-K or better led, its check never held two pair or K-K, and the gate folds such a range to an
- * overbet shove: calling up to 10 BB before the draw with any five cards on the button only, then shoving two pair or
- * better, or any hand once every seat had checked, won +66 +- 19 BB/100 vs MANIAC x4 [8 seeds] (live 0dc1b96 -88);
- * a short stack's checked hands got to showdown free (calling up to 10 BB, then shoving two pair or better with
- * 20-30 BB: about +110 BB/100 over the same line without the polarized lead, to break-even; live -230).
+ * act behind it: it leads the share [0] of the pairs under FIVE_DRAW_POST_MANIAC_LEAD[0] and checks (traps) the share
+ * [1] of the hands from it, so its check is not a capped range. With every pair under K-K checked and every K-K or
+ * better led, its check never held two pair or K-K, and the gate folds such a range to an overbet shove: calling up to
+ * 10 BB before the draw with any five cards on the button only, then shoving two pair or better, or any hand once every
+ * seat had checked, won +66 +- 19 BB/100 vs MANIAC x4 [8 seeds] (live 0dc1b96 -88); with the traps, +40 +- 28 [4].
+ * Fix-up 4 (STUDDRAW-F3-MEASUREMENT-1 / F3-EXPLOIT-1 / F3-REGRESSION-1): [0] is 0 (fix-up 3 led half of them). An
+ * all-in over this seat's own bet asks two pair (fiveDrawPostFolds `raised`), so a lower pair it bets is a bet it
+ * folds to a shove: with half of them led, and every hand bet when checked to last, about three bets in four folded to
+ * an all-in, and calling up to 10 BB before the draw with any five cards, checking every hand after it and shoving any
+ * hand over a bet heads-up won +249 +- 47 BB/100 vs MANIAC x4 [8 seeds] (280dc09 -102, live 0dc1b96 -388); over the
+ * stab of a seat checked to last, +188 +- 47 (280dc09 +37, live -241). With no lower pair bet: -40 +- 64 and
+ * -35 +- 59 [4 seeds]. Defending more against such an all-in instead (no `raised` rule, or a J-J / K-K floor) left
+ * the any-hand line at +183 to +236 and paid two pair or better shoved over the bet more (+75 to +208, 2 seeds);
+ * leading the lower pairs in multiway pots only reopened it (+239: a multiway lead is heads-up once the others fold).
  */
-export const FIVE_DRAW_POST_MANIAC_MIX: readonly [number, number] = [0.5, 0.3];
+export const FIVE_DRAW_POST_MANIAC_MIX: readonly [number, number] = [0, 0.3];
+
+/**
+ * Fix-up 4 (STUDDRAW-F3-MEASUREMENT-1 / F3-EXPLOIT-1 / F3-REGRESSION-1) — Five Card Draw after the draw, a MANIAC that
+ * every other live seat has checked to (fiveDrawPostCheckedToLast): it bets the share [0] of its pairs under
+ * FIVE_DRAW_POST_MANIAC_LEAD[0], the share [1] of its no-pair hands, and every hand from it (nobody is left to act: no
+ * traps), so half of what it bets continues against an all-in over it. Fix-up 3 bet every hand there (a short stack's
+ * checked hands got to showdown free), but an all-in over the bet asks two pair, so three bets in four folded to one:
+ * checking every hand after the draw and shoving any hand over that bet won +231 +- 46 BB/100 heads-up vs MANIAC x4
+ * [8 seeds] (280dc09 -11, live 0dc1b96 -231); with this, -57 +- 60 [4]. The short stack's checked hands reach
+ * showdown again, as on 280dc09: calling up to 10 BB, then shoving two pair or better with 15 / 20 / 30 BB,
+ * -44 / -11 / -26 BB/100 [4 seeds] (280dc09 -66 / +7 / -24, fix-up 3 -150 / -90 / -118, live about -230).
+ */
+export const FIVE_DRAW_POST_MANIAC_LAST: readonly [number, number] = [0, 0.5];
 
 /** Fix-up 3 — after the draw, has every other live seat with chips behind already checked this round (this seat acts last)? */
 function fiveDrawPostCheckedToLast(table: PokerTable, seat: Seat): boolean {
