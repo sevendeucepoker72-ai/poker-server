@@ -1150,16 +1150,20 @@ function decideActionForSeat(
   //    strength) folded air to a human's last 2-5 BB in an 80-400 BB pot after flat-calling his near-all-in raise.
   //  - A MANIAC continues only with its value hands (MANIAC_ALLIN_VALUE_STRENGTH) or above the price, read against its range
   //    read and against any two cards: its "raise" there is a call, and it called 45% of its air at any price
-  //    (MANIAC_ALLIN_VALUE_STRENGTH doc). Not pot-limit Omaha (the floor only): see the same doc.
+  //    (MANIAC_ALLIN_VALUE_STRENGTH doc). Not pot-limit Omaha (the floor only): see the same doc. Fix-up 4: both reads are
+  //    Monte Carlo equity at every difficulty (below hard getPostFlopStrength is a static ladder: see the same doc).
   const allInBettor = !sdKind && table.bettingStructure !== 'fixed-limit' && callAmount > 0
     ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
   if (allInBettor && potOdds <= POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents)) {
     if (post.action === PlayerAction.Fold) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
   } else if (allInBettor && !isOmahaFamily && profile.archetype === 'MANIAC' && post.action !== PlayerAction.Fold
-      && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds
-      && getPostFlopStrength(isOmahaFamily ? seat.holeCards : holdemHoleCards(seat.holeCards, table.communityCards),
-        table.communityCards, numOpponents, profile.difficulty, isOmahaFamily, 0, isShortDeck, isHiLoSplit) <= potOdds) {
-    return { action: PlayerAction.Fold, raiseAmount: 0 };
+      && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH) {
+    const hole = holdemHoleCards(seat.holeCards, table.communityCards);
+    const equity = (oppMin: number): number =>
+      getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, oppMin, isShortDeck, false);
+    if ((mcTier ? effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds) {
+      return { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
   }
   return limitBotRaiseWar(table, seat, post, false, effectiveStrength);
 }
@@ -1362,6 +1366,12 @@ export const NEAR_ALLIN_SPR = 1;
  * close, so the read (a share against every live opponent) folded what the call needed against a short human's all-in:
  * a 12 BB human flat-calling five 100 BB MANIACs and moving in on any flop won +104 (9) BB/100 (7740996 +70 (8), live
  * +59 (7)); without the rule +63 (4).
+ * Fix-up 4 (HOLDEM-F3-MEASUREMENT-2 / EXPLOIT-3): both reads are Monte Carlo equity (calculateEquity) at every difficulty
+ * (hard / expert unchanged). Below hard getPostFlopStrength is a static ladder (one pair 0.22-0.34, two pair 0.42-0.50) and
+ * both reads were that ladder, so a medium / easy MANIAC folded one pair 162 / 171 and two pair 14 / 40 to a heads-up
+ * any-two overbet all-in (live 0dc1b96 35 / 0): calling any small raise and moving in on any flop won +28 (9) BB/100 heads-up
+ * at 20 BB against a medium MANIAC (live -60) and +52 (8) at a medium 3-max 25 BB table (Spin & Go shape; live -24); with
+ * Monte Carlo -98 (12) / -72 (14) (one pair kept 80%, two pair 100%, as on live).
  */
 export const MANIAC_ALLIN_VALUE_STRENGTH = 0.55;
 /**

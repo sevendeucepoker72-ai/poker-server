@@ -4,6 +4,9 @@
  *     Fix-up 3 used the pre-flop MICRO_CALL_NEED (0.25: heads-up a half-pot bet), and the committed-bettor test
  *     (nearAllInRaiser: no more than the pot behind) reaches ordinary river bets: every archetype called a 0.33 / 0.45-pot
  *     river bet with air (folded 0%; live 0dc1b96 86-100%).
+ *  2. HOLDEM-F3-MEASUREMENT-2 / EXPLOIT-3 — the MANIAC price rule reads Monte Carlo equity at every difficulty. Below hard
+ *     getPostFlopStrength is a static ladder, so a medium / easy MANIAC folded one pair 162 / 171 and two pair 14 / 40 to a
+ *     heads-up any-two overbet all-in (live 35 / 0).
  * Real PokerTable + real decideAction; seeded Math.random, a seeded deck (crypto.randomBytes) and a frozen clock.
  */
 import { PokerTable, PlayerAction, GamePhase } from '../src/game/PokerTable';
@@ -76,7 +79,42 @@ function riverBet(arch: string, difficulty: string, rivF: number, n: number, see
   return { spots, near, air, airFold };
 }
 
-describe('fix-up 4 — a micro floor after the flop', () => {
+/**
+ * Heads-up, 100 BB each: the human raises to 3 BB, the bot calls (forced); on the flop the bot checks (forced) and the human
+ * moves all-in (97 BB into 6 BB: 48% needed). The bot's answer by its hand: one pair with a hole card, two pair or better.
+ */
+function overbetShove(arch: string, difficulty: string, n: number, seed: number): { pair: number; pairCont: number; two: number; twoCont: number } {
+  let pair = 0, pairCont = 0, two = 0, twoCont = 0;
+  const restore = seedAll(seed);
+  try {
+    for (let k = 0; k < n; k++) {
+      const t = new PokerTable({ tableId: 'o', tableName: 'o', smallBlind: 50, bigBlind: BB, ante: 0, minBuyIn: BB } as any);
+      sit(t, [100, 100]);
+      expect(t.startNewHand()).toBe(true);
+      let g = 0;
+      while (t.currentPhase === GamePhase.PreFlop && t.isHandInProgress() && g++ < 6) {
+        const a = t.activeSeatIndex;
+        if (a === 0 && t.seats[0].currentBet < 3 * BB) expect(t.playerRaise(0, 3 * BB)).toBe(true);
+        else if (t.getCallAmount(t.seats[a]) > 0) expect(t.playerCall(a)).toBe(true);
+        else expect(t.playerCheck(a)).toBe(true);
+      }
+      expect(t.currentPhase).toBe(GamePhase.Flop);
+      if (t.activeSeatIndex === 1) expect(t.playerCheck(1)).toBe(true);
+      expect(t.activeSeatIndex).toBe(0);
+      expect(t.playerAllIn(0)).toBe(true);
+      expect(t.activeSeatIndex).toBe(1);
+      const hole = t.seats[1].holeCards, board = t.communityCards;
+      const r = evaluateHand([...hole, ...board]).handRank;
+      const holePair = hole[0].rank === hole[1].rank || hole.some((c) => board.some((b) => b.rank === c.rank));
+      const cont = decideAction(t, 1, prof(arch, difficulty)).action !== PlayerAction.Fold;
+      if (r >= HandRank.TwoPair && holePair) { two++; if (cont) twoCont++; }
+      else if (r === HandRank.OnePair && holePair) { pair++; if (cont) pairCont++; }
+    }
+  } finally { restore(); }
+  return { pair, pairCont, two, twoCont };
+}
+
+describe('fix-up 4 — a micro floor after the flop; the MANIAC price on real equity', () => {
   const log: string[] = [];
   afterAll(() => process.stdout.write(`fix6 holdem fix-up 4: ${log.join('; ')}\n`));
 
@@ -94,6 +132,16 @@ describe('fix-up 4 — a micro floor after the flop', () => {
         log.push(`${arch} river ${f} pot: air ${r.airFold}/${r.air} fold (near ${r.near}/${r.spots})`);
         if (r.spots < 100 || r.near < r.spots || r.air < 30 || r.airFold < 0.75 * r.air) bad.push(`${arch} ${f}: ${r.airFold}/${r.air} air folds, near ${r.near}/${r.spots}`);
       }
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('a medium / easy MANIAC keeps one pair (>= 70%) and two pair or better (>= 90%) against a heads-up any-two overbet all-in on the flop (9cfda99: 2% / 67%; live 0dc1b96 80% / 100%)', () => {
+    const bad: string[] = [];
+    for (const diff of ['medium', 'easy']) {
+      const r = overbetShove('MANIAC', diff, 200, 6700);
+      log.push(`MANIAC ${diff} vs a 97 BB flop all-in into 6 BB: one pair ${r.pairCont}/${r.pair}, two pair+ ${r.twoCont}/${r.two} continue`);
+      if (r.pair < 40 || r.pairCont < 0.70 * r.pair || r.two < 10 || r.twoCont < 0.90 * r.two) bad.push(`${diff}: one pair ${r.pairCont}/${r.pair}, two pair+ ${r.twoCont}/${r.two}`);
     }
     expect(bad).toEqual([]);
   });

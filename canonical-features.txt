@@ -2204,14 +2204,14 @@ shoverFaced(table, seat) ?? nearAllInRaiser(table, seat)
 # flop continues only above MANIAC_ALLIN_VALUE_STRENGTH or above the price: its "raise or fold" called 45% of its air at any
 # price, and flatting a MANIAC raise with any two then moving in on the flop with a pair or a draw won +41 BB/100 (live -3).
 MANIAC_ALLIN_VALUE_STRENGTH
-MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds
+# SUPERSEDED 2026-11-10 by effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds (fix-up 4, HOLDEM-F3-MEASUREMENT-2: the MANIAC price rule reads Monte Carlo equity at every difficulty): MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds
 # 2026-11-09 (fix-up 3, sweep) - nearAllInRaiser: committed also with a stack-to-pot ratio <= NEAR_ALLIN_SPR (1): a raise to 40-45%
 # of a 40 BB stack over a MANIAC open was flat-called under the light re-raise cap and his flop all-in won +22 / +25 BB/100 (live -7 / -2).
 NEAR_ALLIN_SPR
 NEAR_ALLIN_SPR * (table.getTotalPot() + table.getCallAmount(seat))
 # 2026-11-09 (fix-up 3, sweep) - the MANIAC price rule reads its equity against ANY two cards too (no range narrowing): read only
 # against a raiser's range it folded air that a 12 BB human's any-two flop all-in does not beat (+84 BB/100 vs five 100 BB MANIACs).
-table.communityCards, numOpponents, profile.difficulty, isOmahaFamily, 0, isShortDeck, isHiLoSplit) <= potOdds
+# SUPERSEDED 2026-11-10 by getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, oppMin, isShortDeck, false) (fix-up 4, HOLDEM-F3-MEASUREMENT-2: the any-two read is Monte Carlo at every difficulty): table.communityCards, numOpponents, profile.difficulty, isOmahaFamily, 0, isShortDeck, isHiLoSplit) <= potOdds
 # 2026-11-09 (fix-up 3, PLO sweep) - the MANIAC price rule is not for pot-limit Omaha (the floor only there): PLO keeps 0dc1b96's
 # pre-flop (no extra cheap flops) and its multiway share read folded what the call needed (12 BB any-four flop all-in vs five
 # 100 BB MANIACs +104 BB/100, 7740996 +70, live +59; without it +63).
@@ -2221,3 +2221,8 @@ allInBettor && !isOmahaFamily && profile.archetype
 # test (no more than the pot behind) every archetype called a 0.33-0.45-pot river bet with air (0% folds; live 0dc1b96 86-100%).
 POSTFLOP_MICRO_CALL_NEED
 POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents)
+# 2026-11-10 (fix-up 4, HOLDEM-F3-MEASUREMENT-2 / EXPLOIT-3) - decideAction (Hold'em family, not Omaha): the MANIAC price rule reads
+# Monte Carlo equity at every difficulty: below hard both reads were the static ladder (one pair 0.22-0.34), so a medium / easy MANIAC
+# folded one pair 95% to an any-two overbet all-in (heads-up / Spin & Go medium: call small raises, move in on any flop +28 / +52 BB/100).
+effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds
+getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, oppMin, isShortDeck, false)
