@@ -8,7 +8,8 @@
  *     fix-up 4, STUDDRAW-F3-MEASUREMENT-1 / F3-EXPLOIT-1 / F3-REGRESSION-1);
  *  3. the call-site wiring of fiveDrawPostFolds' `checked` and `raised` arguments (STUDDRAW-R4RR-REGRESSION-3), and
  *     fiveDrawPostShoveLike (a bet that leaves its maker all but a chip);
- *  4. a short bot whose capped lead is under the minimum bet leads its whole stack (STUDDRAW-R4RR-REGRESSION-2).
+ *  4. a short bot whose capped lead is under the minimum bet leads its whole stack (STUDDRAW-R4RR-REGRESSION-2);
+ *  5. fiveDrawPostCheckedToLast counts only this round's checks and skips all-in seats (fix-up 4, re-review note).
  * Real tables, deterministic (seeded Math.random, frozen Date.now, seeded deck).
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
@@ -334,5 +335,70 @@ describe('fix-up 3 (STUDDRAW-R4RR-REGRESSION-2): Five Card Draw after the draw, 
       expect(by.MANIAC).toBeGreaterThanOrEqual(10);   // of 24: with seats behind it a MANIAC traps a share (FIVE_DRAW_POST_MANIAC_MIX)
       expect(allIn).toBe(b);   // one size: the whole short stack
     } finally { restore(); }
+  }, 300_000);
+});
+
+/**
+ * Five Card Draw, 3 seats at 25/50 (one bot, two humans), all stand pat; after the draw the bot (nothing to call) holds
+ * `cards`. 'street': the button folds, the small blind (the bot) completes, the big blind (a human) checks his option;
+ * after the draw the bot acts FIRST (the big blind behind it has checked, but only before the draw). 'allin': the button
+ * (a human cut to 3 BB) goes all in, the small blind (a human) and the big blind (the bot) call; after the draw the small
+ * blind checks, so the bot acts LAST (the all-in seat cannot act). null when the deal does not take that shape.
+ */
+function threeHanded(cards: any[], shape: 'street' | 'allin'): { t: any; me: number } | null {
+  for (const b of [0, 1, 2]) {
+    const t = new FiveCardDrawTable(cfg(), false);
+    for (let i = 0; i < 3; i++) t.sitDown(i, 'P' + i, 5000, (i === b ? 'ai-three-' : 'human-three-') + i, i === b);
+    if (!t.startNewHand()) return null;
+    const order: number[] = [];
+    let g = 0, ok = true;
+    while (t.currentPhase === GamePhase.PreFlop && g++ < 10 && ok) {
+      const a = t.activeSeatIndex; if (a < 0) { ok = false; break; }
+      order.push(a);
+      const k = order.length;
+      if (shape === 'street') ok = k === 1 ? t.playerFold(a) : k === 2 ? t.playerCall(a) : t.playerCheck(a);
+      else if (k === 1) { t.seats[a].chipCount = 150; ok = t.playerAllIn(a); }
+      else ok = t.playerCall(a) || t.playerCheck(a);
+    }
+    if (!ok || order.length !== 3 || order[shape === 'street' ? 1 : 2] !== b) continue;
+    standPat(t);
+    if (t.currentPhase !== GamePhase.Bet2) continue;
+    if (shape === 'allin') { if (t.activeSeatIndex !== order[1] || !t.playerCheck(order[1])) continue; }
+    if (t.activeSeatIndex !== b || t.getCallAmount(t.seats[b]) !== 0) continue;
+    const checkedBefore = t.actionLog.some((e: any) => e.street === GamePhase.PreFlop && e.seatIndex === order[2] && e.action === 'checked');
+    if (shape === 'street' && !checkedBefore) continue;
+    if (shape === 'allin' && !t.seats[order[0]].allIn) continue;
+    plant(t, b, cards);
+    return { t, me: b };
+  }
+  return null;
+}
+
+describe('fix-up 4 (re-review note): fiveDrawPostCheckedToLast counts only this round\'s checks, and skips all-in seats', () => {
+  const kings = ['Kh Kd Ac 9s 4h', 'Ah Ad Kc Ks 3h'];
+  function kingsBets(seed: number, shape: 'street' | 'allin'): { bets: number; n: number } {
+    const restore = detEnv(seed);
+    try {
+      let bets = 0, n = 0;
+      for (const h of kings) for (const diff of DIFFS) for (let k = 0, got = 0; got < 3 && k < 120; k++) {
+        const r = threeHanded(C(h), shape); if (!r) continue; got++; n++;
+        if (AI.decideAction(r.t, r.me, prof('MANIAC', diff)).action !== PlayerAction.Check) bets++;
+      }
+      return { bets, n };
+    } finally { restore(); }
+  }
+  it('3-handed, the big blind checked his option before the draw: after it the MANIAC acts first with the big blind behind it, so it still traps a share of its K-K or better (a check from the first round does not make it last)', () => {
+    const r = kingsBets(5411, 'street');
+    process.stdout.write(`MANIAC first after the draw, BB checked before it: K-K+ bets ${r.bets}/${r.n}\n`);
+    expect(r.n).toBe(2 * 4 * 3);
+    expect(r.bets).toBeLessThanOrEqual(r.n - 3);   // traps (FIVE_DRAW_POST_MANIAC_MIX[1])
+    expect(r.bets).toBeGreaterThanOrEqual(r.n / 2);
+  }, 300_000);
+
+  it('3-handed with one seat all in: when the other live seat has checked after the draw, the MANIAC acts last and bets every K-K or better (nobody can act behind it: no traps)', () => {
+    const r = kingsBets(5412, 'allin');
+    process.stdout.write(`MANIAC last after the draw, one seat all in: K-K+ bets ${r.bets}/${r.n}\n`);
+    expect(r.n).toBe(2 * 4 * 3);
+    expect(r.bets).toBeGreaterThanOrEqual(r.n - 1);
   }, 300_000);
 });
