@@ -1126,7 +1126,7 @@ function decideActionForSeat(
     // 2026-11 — Stud (Third Street) and draw first rounds have their own routing
     // (studDrawFirstRound: no blinds in Stud, a completion is a raise, fixed-limit
     // has no push/fold); Hold'em / Omaha / Short Deck / Pineapple use preFlopStrategy.
-    const pre = sdKind
+    let pre = sdKind
       ? studDrawFirstRound(
         handStrength, callAmount, totalPot, seat, table, profile,
         myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true, isStudKind(sdKind) ? 'stud' : 'draw',
@@ -1135,6 +1135,10 @@ function decideActionForSeat(
         handStrength, callAmount, totalPot, seat, table, profile,
         myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true,
         { liveOpponents: numOpponents, stackOff, rawPctile: rawStrength, rawStackOff, maniacPctile });
+    // Fix-up 5 (HOLDEM-F4-EXPLOIT-2): a NIT does not flat-call a short (<= 25 BB at risk) raiser heads-up; it covers him.
+    if (!sdKind && profile.archetype === 'NIT' && pre.action === PlayerAction.Call && opts.allInOrFold !== true) {
+      pre = nitShortRaiserCover(table, seat) ?? pre;
+    }
     return limitBotRaiseWar(table, seat, pre, true, handStrength);
   }
 
@@ -1400,6 +1404,26 @@ export function sidePotAgainstShortStack(table: PokerTable, seat: Seat): boolean
   const live = table.seats.filter((s) => s.seatIndex !== seat.seatIndex && s.state === 'occupied' && !s.folded && !s.eliminated);
   return live.some((x) => (x.allIn || x.chipCount <= POSTFLOP_MICRO_CALL_NEED * pot)
     && live.some((o) => o !== x && !o.allIn && o.chipCount > 0));
+}
+
+/**
+ * Fix-up 5 (HOLDEM-F4-EXPLOIT-2) — no-limit, not All-In or Fold: a NIT that would flat-call a single raise from a player
+ * with 25 BB or less at risk (the smaller hand-start stack), with nobody else in for the bet, moves in over it instead (the
+ * cover: raise to his whole stack). Its flat range is its 3-bet range (TT+ / AQ+ class), which is a stack-off at that
+ * depth; the flat left him a cheap flop all-in that the NIT then folded unless it hit. B5 (fix round 2: a NIT opens its
+ * premiums rather than limping them) took away live 0dc1b96's limp-traps, so against five 100 BB NITs a 20-25 BB human who
+ * opened any two to 25-35% of his stack, folded to a re-raise and moved in on any flop won +28 to +43 BB/100 (hard; live
+ * -1 to -25; fix-up 5's heads-up cover closed only the committed 35% opens). With this rule -21 to -67. Null: not this spot.
+ */
+export function nitShortRaiserCover(table: PokerTable, seat: Seat): AIDecision | null {
+  if (table.bettingStructure !== 'no-limit' || (Number((table as any).raisesThisStreet) || 0) !== 1 || shoverFaced(table, seat)) return null;
+  const r = table.lastAggressorSeat >= 0 ? table.seats[table.lastAggressorSeat] : undefined;
+  if (!r || r.seatIndex === seat.seatIndex || r.allIn || r.chipCount <= 0 || r.currentBet !== table.currentBetToMatch) return null;
+  if (Math.min(handStartStack(r), handStartStack(seat)) > PUSH_FOLD_MAX_BB * table.config.bigBlind) return null;
+  if (table.seats.some((o) => o.seatIndex !== seat.seatIndex && o !== r && o.state === 'occupied' && !o.folded && !o.eliminated
+    && !o.allIn && o.chipCount > 0 && o.currentBet >= table.currentBetToMatch)) return null;
+  const to = Math.max(table.getMinRaise(), r.currentBet + r.chipCount);
+  return to >= seat.chipCount + seat.currentBet ? { action: PlayerAction.AllIn, raiseAmount: 0 } : { action: PlayerAction.Raise, raiseAmount: to };
 }
 
 /** B8 — raises this seat has made on the current street (its own open / 3-bet), from the table's action log. */

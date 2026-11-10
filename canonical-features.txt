@@ -2249,3 +2249,8 @@ othersWithChips === 1))
 function maniacFacingRaise0dc1b96(
 maniacFacingRaise0dc1b96(ctx.maniacPctile ?? pctile
 getPreFlopHandRank(holdemHoleCards(seat.holeCards)) + noise
+# 2026-11-10 (fix-up 5, HOLDEM-F4-EXPLOIT-2) - decideAction pre-flop: a NIT that would flat-call a single raise from a player with 25 BB or
+# less at risk, nobody else in for the bet, moves in over it (nitShortRaiserCover): B5's NITs open instead of limp-trapping, and an any-two
+# open to 25-30% of a 20-25 BB stack, fold to a re-raise, any flop all-in won +28..+33 BB/100 against five NITs (live -1..-25).
+function nitShortRaiserCover(
+nitShortRaiserCover(table, seat) ?? pre

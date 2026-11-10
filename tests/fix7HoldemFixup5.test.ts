@@ -13,6 +13,9 @@
  *    (maniacFacingRaise0dc1b96): the opener isolates a short all-in with a flatter behind (f605403 flat-called it ~70%:
  *    the flatter's chips were dead money), and limping any two then moving in on the flop with a pair or a draw loses
  *    again at the MANIAC tables (f605403 +215..+307 BB/100 at the default tables; live -85 / -13).
+ * 4. HOLDEM-F4-EXPLOIT-2, the uncommitted open: a NIT that would flat-call a single raise from a player with 25 BB or less at
+ *    risk, nobody else in, moves in over it (nitShortRaiserCover; f605403 flat-called its 3-bet range and folded the flop:
+ *    an any-two open to 25-30% of a 20-25 BB stack won +28 to +33 BB/100 against five NITs, live -1 to -25).
  *
  * Whole lines are played on a real PokerTable through AI.decideAction, applied as index.ts executeAIAction applies
  * them. An all-in of the human that is called is scored at its equity from the board of his all-in, on the pot he can
@@ -230,6 +233,7 @@ describe('HOLDEM-F4-REGRESSION-1 / MEASUREMENT-1 / EXPLOIT-2 — committed-raise
     ['osn:0.4:a', 'heads-up, a 20 BB NIT (Heads-Up Snap)', ['NIT'], 20, 1500, 82, 20],
     ['opn:0.35:p', 'heads-up, a 20 BB TAG (Heads-Up Snap)', ['TAG'], 20, 3000, 83, 20],
     ['osn:0.35:a', 'five 100 BB NITs, the human 15 BB', NITS, 100, 3000, 84, 15],
+    ['osn:0.25:a', 'five 100 BB NITs, the human 25 BB (an open that leaves more than the pot behind)', NITS, 100, 3000, 85, 25],
   ];
   it.each(CASES)('%s loses against %s', (line, name, lineup, botBB, hands, seed, heroBB) => {
     const t0 = process.hrtime.bigint();
@@ -270,6 +274,23 @@ describe('HOLDEM-F4-EXPLOIT-1 / -2 — a short player\'s raise is isolated, not 
       // UTG (seat 1, the MANIAC) opens to 3 BB, MP (seat 2) flat-calls, CO / button / small blind fold, the human (big blind) shoves.
       const r = decisions(() => { const t = six([hbb, 100, 100, 100, 100, 100], 'iso' + hbb + flatter); t.playerRaise(1, 3 * BB); t.playerCall(2); for (const s of [3, 4, 5]) t.playerFold(s); t.playerAllIn(0); return t; }, 1, 'MANIAC', 300, 7100 + hbb);
       if (r.call > 0 || r.raise + r.allin < 0.85 * 300) bad.push(`${hbb} BB vs ${flatter} flatter: ${JSON.stringify(r)}`);
+    }
+    expect(bad).toEqual([]);
+  });
+  it('a 100 BB NIT facing a 20 / 25 BB human\'s open to 25-30% of his stack, nobody else in, never flat-calls it: it moves in or folds (f605403 flat-called its 3-bet range and folded the flop)', () => {
+    const bad: string[] = [];
+    for (const [hbb, f] of [[20, 0.3], [20, 0.25], [25, 0.25], [15, 0.25]]) {
+      // the human UTG... here the human is the big blind's left: seat 1 (UTG) is the human; seats 2-5 and 0 are NITs.
+      const r = decisions(() => {
+        const t = new PokerTable({ tableId: 'nit' + hbb, tableName: 'nit', smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
+        for (let i = 0; i < 6; i++) expect(t.sitDown(i, 'P' + i, (i === 1 ? hbb : 100) * BB, (i === 1 ? 'player-nit-' : 'ai-nit-') + i, i !== 1)).toBe(true);
+        t.presetFirstButton(4);
+        expect(t.startNewHand()).toBe(true);   // button 4, small blind 5, big blind 0, UTG 1 (the human)
+        expect(t.playerRaise(1, Math.round(f * hbb) * BB)).toBe(true);
+        for (const s of [2, 3, 4, 5]) expect(t.playerFold(s)).toBe(true);
+        return t;
+      }, 0, 'NIT', 400, 7200 + hbb);
+      if (r.call > 0 || r.raise + r.allin === 0) bad.push(`${hbb} BB open to ${f}: ${JSON.stringify(r)}`);
     }
     expect(bad).toEqual([]);
   });
