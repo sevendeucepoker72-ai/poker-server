@@ -9,16 +9,22 @@
  *    only other player with chips the bot now covers him (the jam) at every depth; multiway it still calls.
  * 2. HOLDEM-F4-EXPLOIT-2: the same cover at a NIT table (a 15 BB human opening any two to 35% of his stack, folding to a
  *    re-raise and moving in on any flop: +23 BB/100 on f605403, live -136).
+ * 3. HOLDEM-F4-EXPLOIT-1 / THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC
+ *    (maniacFacingRaise0dc1b96): the opener isolates a short all-in with a flatter behind (f605403 flat-called it ~70%:
+ *    the flatter's chips were dead money), and limping any two then moving in on the flop with a pair or a draw loses
+ *    again at the MANIAC tables (f605403 +215..+307 BB/100 at the default tables; live -85 / -13).
  *
  * Whole lines are played on a real PokerTable through AI.decideAction, applied as index.ts executeAIAction applies
- * them. An all-in of the human that is called is scored at its equity, from the board at which the betting closed,
- * on the pot he can win (sum of min(invested, his investment)). Deterministic: seeded Math.random, seeded deck
- * (crypto.randomBytes), frozen Date.now.
+ * them. An all-in of the human that is called is scored at its equity from the board of his all-in, on the pot he can
+ * win (sum of min(invested, his investment)), when nobody acts after that street; when the deeper stacks play a side
+ * pot after it, the hand is scored by its chips (the equity at the board of a later fold is not an unbiased score: the
+ * fold depends on the cards that come). Deterministic: seeded Math.random, seeded deck (crypto.randomBytes), frozen Date.now.
  *   osn:F:R    first in, raise to F x the stack with any two; re-raised: continue with the top 6% (stack-off
  *              percentile >= 0.94), else fold; after the flop R = a: move in at the first action, R = p: only with a
  *              pair (a hole card used), a flush draw or an open-ended straight draw, else check / fold.
  *   opn:F:R    raise to F x the stack with any two when first in or over ONE (not all-in) raise; call any re-raise;
  *              after the flop as osn.
+ *   lg:C:R     limp any two first in (check the option), call ONE raise of at most C BB, fold to more; after the flop as osn.
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
 const { PokerTable, PlayerAction, GamePhase } = require('../src/game/PokerTable');
@@ -81,7 +87,7 @@ function play(line: string, lineup: string[], botBB: number, hands: number, seed
     const t = new PokerTable({ tableId: 'fx7', tableName: 'fx7', smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
     for (let i = 0; i < ns; i++) expect(t.sitDown(i, i ? 'B' + i : 'Hero', start[i], (i ? 'ai-fx7-' : 'player-fx7-') + i, i !== 0)).toBe(true);
     const profs = [null, ...lineup.map((a, i) => prof(a, i + 1, diff))];
-    let raised = false, evBoard = -1, ev: number | null = null;
+    let raised = false, limped = false, called = false, sidePlay = false, evBoard = -1, ev: number | null = null;
     const hero = (): void => {
       const s0 = t.seats[0], ca = t.getCallAmount(s0);
       const fold = () => (ca > 0 ? t.playerFold(0) : (t.playerCheck(0) || t.playerFold(0)));
@@ -93,6 +99,12 @@ function play(line: string, lineup: string[], botBB: number, hands: number, seed
       const raises = Number(t.raisesThisStreet) || 0;
       const facingAllIn = t.seats.some((x: any) => x.seatIndex !== 0 && x.state === 'occupied' && !x.folded && x.allIn && x.currentBet > s0.currentBet);
       const to = Math.floor(F * (s0.chipCount + s0.currentBet) / 50) * 50;
+      if (kind === 'lg') {
+        if (raises === 0 && !limped) { limped = true; if (ca > 0) { t.playerCall(0) || fold(); } else { t.playerCheck(0) || fold(); } return; }
+        if (raises === 0) { if (ca > 0) { t.playerCall(0) || fold(); } else { t.playerCheck(0) || fold(); } return; }
+        if (raises === 1 && !called && ca > 0 && ca <= F * BB && !facingAllIn) { called = true; t.playerCall(0) || fold(); return; }
+        fold(); return;
+      }
       if (raised && ca > 0) {
         if (kind === 'opn' || PR.getStackOffPercentile(s0.holeCards) >= 0.94) { t.playerCall(0) || t.playerAllIn(0) || fold(); return; }
         fold(); return;
@@ -108,7 +120,7 @@ function play(line: string, lineup: string[], botBB: number, hands: number, seed
     const dw = t.determineWinners.bind(t);
     t.determineWinners = (...args: any[]) => {
       const h0 = t.seats[0];
-      if (h0.allIn && !h0.folded && t.communityCards.length === 5 && ev === null && evBoard >= 0) {
+      if (h0.allIn && !h0.folded && t.communityCards.length === 5 && ev === null && evBoard >= 0 && !sidePlay) {
         const live = t.seats.filter((x: any) => x.state === 'occupied' && !x.folded && x.holeCards.length === 2);
         const used = new Set<number>(); for (const x of live) for (const c of x.holeCards) used.add(c.rank * 4 + c.suit);
         for (const c of t.communityCards.slice(0, evBoard)) used.add(c.rank * 4 + c.suit);
@@ -131,7 +143,7 @@ function play(line: string, lineup: string[], botBB: number, hands: number, seed
     let total = 0, drift = 0, n = 0;
     for (let h = 0; h < hands; h++) {
       for (let i = 0; i < ns; i++) { const x = t.seats[i]; x.chipCount = start[i]; x.eliminated = false; x.sittingOut = false; }
-      raised = false; ev = null; evBoard = -1;
+      raised = false; limped = false; called = false; sidePlay = false; ev = null; evBoard = -1;
       expect(t.startNewHand()).toBe(true);
       let g = 0;
       while (t.isHandInProgress() && g++ < 300) {
@@ -139,9 +151,8 @@ function play(line: string, lineup: string[], botBB: number, hands: number, seed
         const board = t.communityCards.length;
         if (a === 0) { hero(); if (t.seats[0].allIn && evBoard < 0) evBoard = board; continue; }
         if (t.seats[0].folded) { if (!t.playerFold(a)) t.playerCheck(a); continue; }   // the human's result is final
-        const wasIn = !t.seats[a].folded;
+        if (evBoard >= 0 && board > evBoard) sidePlay = true;   // a decision after his all-in street: scored by chips
         apply(t, a, AI.decideAction(t, a, profs[a]));
-        if (evBoard >= 0 && wasIn && t.seats[a].folded) evBoard = t.communityCards.length;   // a player of his pot folded
         if (t.seats[0].allIn && evBoard < 0) evBoard = board;
       }
       expect(t.isHandInProgress()).toBe(false);
@@ -223,6 +234,58 @@ describe('HOLDEM-F4-REGRESSION-1 / MEASUREMENT-1 / EXPLOIT-2 — committed-raise
   it.each(CASES)('%s loses against %s', (line, name, lineup, botBB, hands, seed, heroBB) => {
     const t0 = process.hrtime.bigint();
     const r = play(line, lineup, botBB, hands, seed, heroBB);
+    rows.push(`${line} vs ${name}: ${r.bb100.toFixed(1)} (${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
+    expect([line, r.hands, r.drift, r.bb100 < 0]).toEqual([line, hands, 0, true]);
+  }, 1_200_000);
+});
+
+/** A 6-max table at 50/100 (button 4: small blind 5, big blind 0), stacks in BB by seat, every seat but 0 a bot. */
+function six(stacks: number[], tag: string): any {
+  const t = new PokerTable({ tableId: tag, tableName: tag, smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
+  for (let i = 0; i < 6; i++) expect(t.sitDown(i, 'P' + i, stacks[i] * BB, (i === 0 ? 'player-' : 'ai-') + tag + '-' + i, i !== 0)).toBe(true);
+  t.presetFirstButton(4);
+  expect(t.startNewHand()).toBe(true);
+  return t;
+}
+/** Decisions of `arch` at seat `me` over `n` deals of `build` (the table is rebuilt each deal: fresh cards). */
+function decisions(build: () => any, me: number, arch: string, n: number, seed: number): Record<string, number> {
+  const restore = detEnv(seed);
+  const out: Record<string, number> = { fold: 0, check: 0, call: 0, raise: 0, allin: 0 };
+  try {
+    for (let k = 0; k < n; k++) {
+      const t = build();
+      expect(t.activeSeatIndex).toBe(me);
+      const d = AI.decideAction(t, me, prof(arch, me));
+      out[d.action === PlayerAction.Fold ? 'fold' : d.action === PlayerAction.Check ? 'check' : d.action === PlayerAction.Call ? 'call'
+        : d.action === PlayerAction.Raise ? 'raise' : 'allin']++;
+    }
+  } finally { restore(); }
+  return out;
+}
+
+describe('HOLDEM-F4-EXPLOIT-1 / -2 — a short player\'s raise is isolated, not flat-called (node level)', () => {
+  it('a 100 BB MANIAC that opened, facing a 20 / 25 BB human\'s all-in with a flatter still to act, isolates it (>= 85% re-raise / all-in) and never flat-calls (f605403 flat-called ~70%: the flatter\'s chips were dead money for the human)', () => {
+    const bad: string[] = [];
+    for (const hbb of [20, 25]) for (const flatter of ['TAG', 'FISH']) {
+      // UTG (seat 1, the MANIAC) opens to 3 BB, MP (seat 2) flat-calls, CO / button / small blind fold, the human (big blind) shoves.
+      const r = decisions(() => { const t = six([hbb, 100, 100, 100, 100, 100], 'iso' + hbb + flatter); t.playerRaise(1, 3 * BB); t.playerCall(2); for (const s of [3, 4, 5]) t.playerFold(s); t.playerAllIn(0); return t; }, 1, 'MANIAC', 300, 7100 + hbb);
+      if (r.call > 0 || r.raise + r.allin < 0.85 * 300) bad.push(`${hbb} BB vs ${flatter} flatter: ${JSON.stringify(r)}`);
+    }
+    expect(bad).toEqual([]);
+  });
+});
+
+describe('THE MANIAC CLASS (HOLDEM-F3-REGRESSION-2 = MEASUREMENT-1 = EXPLOIT-2) — limp any two, move in on the flop with a pair or a draw: loses (whole line)', () => {
+  const rows: string[] = [];
+  afterAll(() => process.stdout.write(`fix7 MANIAC class lines (BB/100): ${rows.join('; ')}\n`));
+  const M5 = ['MANIAC', 'MANIAC', 'MANIAC', 'MANIAC', 'MANIAC'];
+  const CASES: Array<[string, string, string[], number, number, number, number, string]> = [
+    ['lg:5:p', 'five 100 BB MANIACs, the human 100 BB (the default table, hard)', M5, 100, 1500, 91, 100, 'hard'],
+    ['lg:5:p', 'two 100 BB MANIACs + TAG / FISH / LAG, the human 100 BB (medium)', ['MANIAC', 'MANIAC', 'TAG', 'FISH', 'LAG'], 100, 1500, 92, 100, 'medium'],
+  ];
+  it.each(CASES)('%s loses against %s', (line, name, lineup, botBB, hands, seed, heroBB, diff) => {
+    const t0 = process.hrtime.bigint();
+    const r = play(line, lineup, botBB, hands, seed, heroBB, diff);
     rows.push(`${line} vs ${name}: ${r.bb100.toFixed(1)} (${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
     expect([line, r.hands, r.drift, r.bb100 < 0]).toEqual([line, hands, 0, true]);
   }, 1_200_000);

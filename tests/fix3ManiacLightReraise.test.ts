@@ -1,10 +1,13 @@
 /**
  * tests/fix3ManiacLightReraise.test.ts (2026-11-05, bots review fix round 3: MANIAC-RTF, node level).
- * No-limit Hold'em: a MANIAC re-raise by a hand that fails the stack-off range is made only up to
- * HOLDEM_LIGHT_RERAISE_FRACTION (5%) of the street stack; larger, it calls (top 70%) or folds. On 2b5ac52 it
- * re-raised ~93% of hands to 2.5-4x the bet (25-59 BB over a 10 BB open) and then folded ~89% of them to a
- * shove (the round-1 stack-off gate). Real PokerTable + real decideAction, seeded Math.random (the LCG of
- * tests/botPremiumHold.test.ts). The bounds below are literal chip counts, so raising the constant fails them.
+ * Round 3 capped a MANIAC light re-raise at HOLDEM_LIGHT_RERAISE_FRACTION (5%) of the street stack (round 4: of the depth
+ * at risk) and this file pinned that cap. Fix-up 5 (2026-11-10, THE MANIAC CLASS) removed it, so this file now pins what
+ * replaced it: facing a raise, a MANIAC plays 0dc1b96's MANIAC (maniacFacingRaise0dc1b96). It re-raises ~93% of hands to
+ * 2.5-4x the bet (all-in from 70% of its stack) and folds the rest; it never flat-calls a raise. With the cap the MANIACs
+ * flat-called each other and the human, and limping or flat-calling any two then moving in on the flop with a pair or a
+ * draw won +215 to +379 BB/100 (live 0dc1b96 -83 to -100). The raise-then-fold the cap was for (2b5ac52: ~89% of the
+ * re-raises folded to a shove) does not come back: after its own raise it continues as 0dc1b96 does
+ * (tests/fix3ManiacRaisedStackoff.test.ts). Real PokerTable + real decideAction, seeded Math.random.
  */
 import { PokerTable, PlayerAction } from '../src/game/PokerTable';
 import { decideAction } from '../src/ai/AIPlayer';
@@ -44,51 +47,53 @@ function* hands(t: PokerTable, me: number, n: number): Generator<number> {
   }
 }
 
-describe('MANIAC-RTF — a MANIAC light re-raise stays within 5% of the stack (no-limit Hold\'em)', () => {
-  it('the constant is 5% of the street stack', () => {
-    expect(AI.HOLDEM_LIGHT_RERAISE_FRACTION).toBe(0.05);
+describe('fix-up 5 — a MANIAC facing a raise re-raises light again, as 0dc1b96 (no-limit Hold\'em)', () => {
+  it('the light re-raise cap is gone (HOLDEM_LIGHT_RERAISE_FRACTION removed with the rule)', () => {
+    expect((AI as any).HOLDEM_LIGHT_RERAISE_FRACTION).toBeUndefined();
   });
 
-  it('100 BB, facing a 2 / 2.5 / 3 / 4 / 6 / 10 / 15 / 20 / 30 BB open: a hand under the stack-off range (raw stack-off pct < 0.75) never re-raises to more than 5 BB without moving in, at every difficulty', () => {
+  it('100 BB, facing a 2 / 2.5 / 3 / 4 / 6 / 10 / 15 / 20 / 30 BB open: it re-raises 85-100% of hands (to 2.5-4x the open, all-in from 70% of its stack), never flat-calls, at every difficulty', () => {
     const bad: string[] = [];
     for (const diff of ['easy', 'medium', 'hard', 'expert']) for (const open of [2, 2.5, 3, 4, 6, 10, 15, 20, 30]) {
       const { t, me } = bbFacingOpen(open);
       const restore = seedRandom(4242);
-      let weak = 0, big = 0, calls = 0;
+      let n = 0, raises = 0, calls = 0, offSize = 0;
       try {
-        for (const so of hands(t, me, 300)) {
-          if (so >= 0.75) continue;
-          weak++;
+        for (const _ of hands(t, me, 300)) {
+          n++;
           const d = decideAction(t, me, prof('MANIAC', diff));
-          if (d.action === PlayerAction.Raise && d.raiseAmount > 500) big++;
           if (d.action === PlayerAction.Call) calls++;
+          if (d.action === PlayerAction.AllIn) raises++;
+          if (d.action === PlayerAction.Raise) {
+            raises++;
+            const to = d.raiseAmount;
+            if (to < Math.max(t.getMinRaise(), 2.5 * open * 100 - 1) || to > 4 * open * 100 + 1 || to >= 0.7 * t.seats[me].chipCount) offSize++;
+          }
         }
       } finally { restore(); }
-      if (big > 0) bad.push(`${diff} open ${open} BB: ${big}/${weak} weak hands re-raised above 5 BB`);
-      // ... and it still plays: the weak hands it does not re-raise are called (top 70%), not folded wholesale.
-      if (calls === 0) bad.push(`${diff} open ${open} BB: no calls`);
+      if (raises / n < 0.85) bad.push(`${diff} open ${open} BB: re-raised ${raises}/${n}`);
+      if (calls > 0) bad.push(`${diff} open ${open} BB: ${calls} flat calls`);
+      if (offSize > 0) bad.push(`${diff} open ${open} BB: ${offSize} re-raises off 2.5-4x`);
     }
     expect(bad).toEqual([]);
   });
 
-  it('200 BB deep, facing a 3 BB open: it still re-raises light (2.5-4x the open, kept when at most 10 BB, 5% of 200 BB) with a third of hands or more', () => {
+  it('200 BB deep, facing a 3 BB open: it re-raises >= 85% of hands to 7.5-12 BB', () => {
     const { t, me } = bbFacingOpen(3, 200);
     const restore = seedRandom(4242);
-    let weak = 0, light = 0, above = 0;
+    let n = 0, light = 0;
     try {
-      for (const so of hands(t, me, 400)) {
-        if (so >= 0.75) continue;
-        weak++;
+      for (const _ of hands(t, me, 400)) {
+        n++;
         const d = decideAction(t, me, prof('MANIAC', 'hard'));
-        if (d.action === PlayerAction.Raise) { light++; if (d.raiseAmount > 1000) above++; }
+        if (d.action === PlayerAction.Raise && d.raiseAmount >= 750 && d.raiseAmount <= 1200) light++;
       }
     } finally { restore(); }
-    expect(above).toBe(0);
-    expect(light / weak).toBeGreaterThan(0.3);
+    expect(light / n).toBeGreaterThanOrEqual(0.85);
   });
 
-  it('it stays a maniac where the rule does not bind: first in at 100 BB it opens >= 85% of hands, and it still re-raises its stack-off hands', () => {
-    // CO first in (UTG / MP fold): every MANIAC open is 2.5-4 BB, within any cap.
+  it('first in at 100 BB it opens >= 85% of hands, and AA facing a 10 BB open re-raises or moves in (never calls or folds)', () => {
+    // CO first in (UTG / MP fold): every MANIAC open is 2.5-5 BB.
     const t = new PokerTable({ tableId: 't', tableName: 't', smallBlind: 50, bigBlind: 100, ante: 0, minBuyIn: 100 } as any);
     for (let i = 0; i < 6; i++) expect(t.sitDown(i, 'P' + i, 10000, 'ai-mlr-open-' + i, true)).toBe(true);
     expect(t.startNewHand()).toBe(true);
@@ -99,7 +104,6 @@ describe('MANIAC-RTF — a MANIAC light re-raise stays within 5% of the stack (n
       for (const _ of hands(t, 5, 400)) { n++; if (decideAction(t, 5, prof('MANIAC')).action === PlayerAction.Raise) opens++; }
     } finally { restore(); }
     expect(opens / n).toBeGreaterThanOrEqual(0.85);
-    // AA facing a 10 BB open: a re-raise (or a jam), never a call / fold.
     const { t: t2, me } = bbFacingOpen(10);
     t2.seats[me].holeCards = [{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }] as any;
     const r2 = seedRandom(4242);

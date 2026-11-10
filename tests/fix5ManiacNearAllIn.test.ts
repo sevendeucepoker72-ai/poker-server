@@ -1,5 +1,9 @@
 /**
  * tests/fix5ManiacNearAllIn.test.ts (2026-11-09, bots review fix round 4, fix-up 3: HOLDEM-RR2-EXPLOIT-1 / -2), node level.
+ * Fix-up 5 (2026-11-10, THE MANIAC CLASS): a MANIAC facing a raise or an all-in now plays 0dc1b96's MANIAC
+ * (maniacFacingRaise0dc1b96): against a committed raise it re-raises / moves in ~95% (never a flat call), against the all-in
+ * ~70% (0dc1b96's push/fold on the chips-left depth), so tests 2-4 pin that instead of the stack-off range (no flat call
+ * is the part of fix-up 3 that stays). The post-flop rows (5-9) are unchanged.
  * No-limit Hold'em. A raise that leaves the raiser half of his hand-start stack or less, or no more than the pot a call
  * would make (stack-to-pot ratio <= 1), is the all-in it effectively is: he calls any re-raise. 7740996 keyed every all-in rule on a real all-in only. A human who re-raised a MANIAC's raise to
  * 50-95% of his stack, NOT all-in, then met either
@@ -184,13 +188,13 @@ describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all
     expect([AI.NEAR_ALLIN_SPR, AI.NEAR_ALLIN_LEFT_FRACTION]).toEqual([1, undefined]);
   });
 
-  it('the opener answers a 40-75 BB human\'s raise to 35-95% of his stack (a stack-to-pot ratio <= 1 left) as it answers his all-in: it continues >= 58%, within 10 points of that, and never by a flat call (7740996, hard: 41% against 95% of 40 BB, 23% against 60% of 75 BB; a 500 BB MANIAC flat-called 58-63%; c0dac55 flat-called a raise to 35-40%)', () => {
+  it('the opener answers a 40-75 BB human\'s raise to 35-95% of his stack (a stack-to-pot ratio <= 1 left) at least as often as his all-in less 10 points, >= 58%, and never by a flat call (7740996, hard: 41% against 95% of 40 BB, 23% against 60% of 75 BB; a 500 BB MANIAC flat-called 58-63%; fix-up 5: 0dc1b96, ~95% / ~70%)', () => {
     const bad: string[] = [];
     for (const diff of ['hard', 'medium']) {
       for (const [m, h, f] of [[100, 40, 0.95], [100, 75, 0.6], [100, 75, 0.5], [500, 60, 0.95], [500, 75, 0.6], [100, 40, 0.4], [500, 40, 0.35]]) {
         const near = opener(m, h, f, diff), all = opener(m, h, 1, diff);
         log.push(`${diff} ${m}/${h} raise ${f}: ${pct(near)} vs all-in ${pct(all)}`);
-        if (near.spots < 200 || near.cont < 0.58 * near.spots || Math.abs(near.cont / near.spots - all.cont / all.spots) > 0.10 || near.flats > 0) {
+        if (near.spots < 200 || near.cont < 0.58 * near.spots || near.cont / near.spots < all.cont / all.spots - 0.10 || near.flats > 0) {
           bad.push(`${diff} MANIAC ${m} BB vs a ${h} BB human's raise to ${f}: ${pct(near)}, all-in ${pct(all)}`);
         }
       }
@@ -198,20 +202,20 @@ describe('fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — a near-all-in raise is an all
     expect(bad).toEqual([]);
   });
 
-  it('a 300 BB MANIAC answers a 100 BB human\'s raise to 60-95% of his stack with the stack-off range for 100 BB, as his all-in (<= 32%), and never flat-calls it (7740996: continued 73%, 64% by a flat call)', () => {
+  it('a 300 BB MANIAC answers a 100 BB human\'s raise to 60-95% of his stack as 0dc1b96 (>= 58%) and never flat-calls it (7740996: continued 73%, 64% by a flat call; f605403: the stack-off range for 100 BB, <= 32%)', () => {
     const bad: string[] = [];
     for (const f of [0.95, 0.75, 0.6]) {
       const near = opener(300, 100, f);
       log.push(`300/100 raise ${f}: ${pct(near)}`);
-      if (near.spots < 200 || near.cont > 0.32 * near.spots || near.flats > 0) bad.push(`raise to ${f}: ${pct(near)}`);
+      if (near.spots < 200 || near.cont < 0.58 * near.spots || near.flats > 0) bad.push(`raise to ${f}: ${pct(near)}`);
     }
     expect(bad).toEqual([]);
   });
 
-  it('a raise that leaves the raiser more than the pot behind is not an all-in: the 300 BB MANIAC still flat-calls a 100 BB human\'s 3-bet to 12 BB (as 7740996)', () => {
+  it('a 3-bet that leaves the raiser more than the pot behind (a 100 BB human\'s 3-bet to 12 BB): the 300 BB MANIAC re-raises it as 0dc1b96 (>= 85%), not a flat call (7740996 and f605403 flat-called it)', () => {
     const r = opener(300, 100, 0.12);
     log.push(`300/100 3-bet to 12 BB: ${pct(r)}`);
-    expect(r.flats > 0.4 * r.spots).toBe(true);
+    expect([r.cont >= 0.85 * r.spots, r.flats]).toEqual([true, 0]);
   });
 
   it('flop: facing the human\'s last 2-5 BB all-in (or a bet that leaves him less) in an 80-400 BB pot, no archetype folds (7740996: MANIAC, NIT and ROCK fold air)', () => {

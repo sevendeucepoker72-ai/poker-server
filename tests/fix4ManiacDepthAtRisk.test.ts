@@ -13,6 +13,11 @@
  * cards, so an unseeded deck changed the MANIAC's hands run to run (fixup 1 of round 4: test 1 failed ~1 run in
  * 11 on an unchanged tree). The re-raise bound of test 1 is 25% (the head re-raises ~10-17%, 0bc7529 50-94%), of
  * tests 2 and 3 15% (~7%); the fold bound (<= 10% of the re-raises; 0bc7529 77-81%) is the pin.
+ * Fix-up 5 (2026-11-10, THE MANIAC CLASS): the cap is gone; a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC
+ * (maniacFacingRaise0dc1b96). The same spots now pin 0dc1b96's answers: the deep MANIAC re-raises ~93% (to 2.5-4x the open)
+ * and answers the human's 100 BB shove with 0dc1b96's push/fold on the chips-left depth (it folds ~30% of its re-raises, not
+ * 0bc7529's ~78%). The whole lines against deep MANIACs measure at or below 0dc1b96 (any two opened 2.5-4 BB and shoved over
+ * the re-raise: five 200 / 300 / 1,000 BB MANIACs -208 / -336 / -222 BB/100, live -167 / -240 / +398; hard, 1,500 hands).
  */
 import { PokerTable, PlayerAction } from '../src/game/PokerTable';
 import { decideAction } from '../src/ai/AIPlayer';
@@ -80,8 +85,10 @@ function run(spot: Spot, n: number, difficulty = 'hard'): { n: number; reraises:
   return { n, reraises, folds };
 }
 
-describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the depth at risk, not of its own stack', () => {
-  it('a 200 / 300 / 500 / 1,000 BB MANIAC in the big blind vs a 100 BB human\'s button open (2.5 / 3 / 6 / 10 BB): it re-raises like a 100 BB MANIAC (<= 25%), and folds at most 10% of those re-raises to the human\'s 100 BB shove (difficulty noise; 0bc7529 folded ~78%)', () => {
+describe('HOLDEM-R3-REG-1 (fix-up 5: as 0dc1b96) — a deep MANIAC re-raises light and does not raise-then-fold as 0bc7529 did', () => {
+  const log: string[] = [];
+  afterAll(() => process.stdout.write(`fix4 MANIAC depth at risk: ${log.join('; ')}\n`));
+  it('a 200 / 300 / 500 / 1,000 BB MANIAC in the big blind vs a 100 BB human\'s button open (2.5 / 3 / 6 / 10 BB): it re-raises >= 85% (0dc1b96), and folds at most 45% of those re-raises to the human\'s 100 BB shove (0bc7529 ~78%)', () => {
     const bad: string[] = [];
     for (const [deep, open] of [[200, 2.5], [300, 3], [500, 6], [1000, 10]]) for (const diff of ['medium', 'hard']) {
       // UTG / MP / CO (100 BB bots) fold, the human on the button opens, the small blind folds; the MANIAC decides.
@@ -97,12 +104,13 @@ describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the dep
         shoveBack: (t) => { expect(t.playerAllIn(0)).toBe(true); },
       };
       const r = run(spot, 300, diff);
-      if (r.reraises > 0.25 * r.n || r.folds > 0.1 * r.reraises) bad.push(`${diff} ${deep} BB vs open ${open}: re-raised ${r.reraises}/${r.n}, folded ${r.folds} of them to the shove`);
+      log.push(`${diff} ${deep}/${open}: ${r.reraises}/${r.n} re-raised, ${r.folds} folded`);
+      if (r.reraises < 0.85 * r.n || r.folds > 0.45 * r.reraises) bad.push(`${diff} ${deep} BB vs open ${open}: re-raised ${r.reraises}/${r.n}, folded ${r.folds} of them to the shove`);
     }
     expect(bad).toEqual([]);
   });
 
-  it('a second deep stack still to act does not lift the cap (the largest opponent\'s stack would): a 500 BB MANIAC on the cutoff vs a 100 BB human\'s UTG open, the blinds and the button at 500 BB', () => {
+  it('a second deep stack still to act: a 500 BB MANIAC on the cutoff vs a 100 BB human\'s UTG open (the blinds and the button at 500 BB) re-raises >= 85% and folds <= 45% of them to his shove', () => {
     const spot: Spot = {
       build: () => {
         const t = table([500, 500, 500, 100, 100, 500], 3);
@@ -114,11 +122,12 @@ describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the dep
       shoveBack: (t) => { for (const s of [0, 1, 2]) expect(t.playerFold(s)).toBe(true); expect(t.playerAllIn(3)).toBe(true); },
     };
     const r = run(spot, 400);
-    expect(r.folds).toBeLessThanOrEqual(0.1 * r.reraises);
-    expect(r.reraises).toBeLessThanOrEqual(0.15 * r.n);   // ~7% (28 of 400); the 25% loosening was for test 1 only
+    log.push(`${r.reraises}/${r.n} re-raised, ${r.folds} folded`);
+    expect(r.folds).toBeLessThanOrEqual(0.45 * r.reraises);
+    expect(r.reraises).toBeGreaterThanOrEqual(0.85 * r.n);
   });
 
-  it('a short player still to act binds (the raisers\' stacks alone would not): a 500 BB LAG opens UTG, the 500 BB MANIAC on the cutoff decides, a 100 BB human in the big blind can cold-shove', () => {
+  it('a short player still to act: a 500 BB LAG opens UTG, the 500 BB MANIAC on the cutoff re-raises >= 85%, and folds <= 45% of them to the 100 BB human\'s cold shove from the big blind', () => {
     const spot: Spot = {
       build: () => {
         const t = table([500, 500, 100, 500, 100, 500], 2);
@@ -131,11 +140,12 @@ describe('HOLDEM-R3-REG-1 — a MANIAC light re-raise is capped at 5% of the dep
       shoveBack: (t) => { for (const s of [0, 1]) expect(t.playerFold(s)).toBe(true); expect(t.playerAllIn(2)).toBe(true); expect(t.playerFold(3)).toBe(true); },
     };
     const r = run(spot, 400);
-    expect(r.folds).toBeLessThanOrEqual(0.1 * r.reraises);
-    expect(r.reraises).toBeLessThanOrEqual(0.15 * r.n);   // ~7% (28 of 400); the 25% loosening was for test 1 only
+    log.push(`${r.reraises}/${r.n} re-raised, ${r.folds} folded`);
+    expect(r.folds).toBeLessThanOrEqual(0.45 * r.reraises);
+    expect(r.reraises).toBeGreaterThanOrEqual(0.85 * r.n);
   });
 
-  it('only LIVE opponents count: with everyone at the table 1,000 BB deep and a 100 BB player folded, a MANIAC still re-raises light (up to 50 BB, 5% of 1,000 BB) with a third of its weak hands or more', () => {
+  it('1,000 BB deep with a 100 BB player folded: a MANIAC re-raises its weak hands light (2.5-4x, at most 50 BB) a third of the time or more', () => {
     const restore = seedRandom(4242);   // before the table: its deck is dealt from the seeded stream too
     let weak = 0, light = 0, above = 0;
     try {

@@ -9,6 +9,12 @@
  * (live 0dc1b96: -75 / -97). Real PokerTable / ShortDeckTable + real decideAction, seeded Math.random (the LCG
  * of tests/botPremiumHold.test.ts) and seeded crypto; the full-line block plays every street. The node bounds
  * bind: each one fails with the constant lowered 25% (1.5x), and on 2b5ac52.
+ * Fix-up 5 (2026-11-10, THE MANIAC CLASS): a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC
+ * (maniacFacingRaise0dc1b96), so MANIAC_RAISED_STACKOFF_WIDEN is gone and the node block pins 0dc1b96's continue instead:
+ * after its own raise it does not raise-then-fold (0dc1b96's push/fold on the chips-left depth calls a lone shove with
+ * ~65% of hands, its branch re-raises / calls ~93% when others still have chips). The control row is 0dc1b96's too: a
+ * MANIAC that did not raise faces a lone 100 BB shove the same way (NEW-5 / NEW-1 returned to live for the MANIAC only;
+ * every other archetype keeps the stack-off ranges, tests/botPreflopFixes.test.ts). The two full-line rows are unchanged.
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
 const { PokerTable, PlayerAction, GamePhase } = require('../src/game/PokerTable');
@@ -56,12 +62,12 @@ function six(stbb: number, Table: any = PokerTable): any {
   return t;
 }
 
-describe('MANIAC-RTF part 2 — a MANIAC that raised this street does not fold its raise to a shove at the stack-off width', () => {
-  it('the constant is 2', () => {
-    expect(AI.MANIAC_RAISED_STACKOFF_WIDEN).toBe(2);
+describe('MANIAC-RTF part 2 (fix-up 5: as 0dc1b96) — a MANIAC that raised this street does not fold its raise to a shove', () => {
+  it('the widening constant is gone (MANIAC_RAISED_STACKOFF_WIDEN removed with the rule)', () => {
+    expect(AI.MANIAC_RAISED_STACKOFF_WIDEN).toBeUndefined();
   });
 
-  it('100 BB: the MANIAC opened the CO, the button (a human) shoves, the blinds fold: it continues 21-30% (24%; 2b5ac52 12%, 1.5x 18%; live 0dc1b96 called ~91%, NEW-5)', () => {
+  it('100 BB: the MANIAC opened the CO, the button (a human) shoves, the blinds fold: it continues 55-80% as 0dc1b96 (66.5%; f605403 24%, 2b5ac52 12%)', () => {
     const restore = detEnv(4242);
     try {
       const t = six(100);
@@ -71,12 +77,12 @@ describe('MANIAC-RTF part 2 — a MANIAC that raised this street does not fold i
       for (const s of [1, 2]) expect(t.playerFold(s)).toBe(true);
       expect(t.activeSeatIndex).toBe(5);
       const r = contRate(t, 5, 600);
-      expect(r).toBeGreaterThanOrEqual(0.21);
-      expect(r).toBeLessThanOrEqual(0.30);
+      expect(r).toBeGreaterThanOrEqual(0.55);
+      expect(r).toBeLessThanOrEqual(0.80);
     } finally { restore(); }
   });
 
-  it('control: a MANIAC that did not raise (the big blind facing a lone 100 BB shove) keeps the stack-off width (<= 13%; 8.5% on every tree)', () => {
+  it('control: a MANIAC that did not raise (the big blind facing a lone 100 BB shove) answers it as 0dc1b96 too: 55-80% (65%; f605403 8.5%)', () => {
     const restore = detEnv(4243);
     try {
       const t = six(100);
@@ -84,7 +90,9 @@ describe('MANIAC-RTF part 2 — a MANIAC that raised this street does not fold i
       expect(t.playerAllIn(0)).toBe(true);
       expect(t.playerFold(1)).toBe(true);
       expect(t.activeSeatIndex).toBe(2);
-      expect(contRate(t, 2, 600)).toBeLessThanOrEqual(0.13);
+      const r = contRate(t, 2, 600);
+      expect(r).toBeGreaterThanOrEqual(0.55);
+      expect(r).toBeLessThanOrEqual(0.80);
     } finally { restore(); }
   });
 

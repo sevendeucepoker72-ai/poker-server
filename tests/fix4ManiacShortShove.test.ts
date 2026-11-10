@@ -10,6 +10,10 @@
  * all-in (it continues ~68%, by calling), and one that only flat-called plays the stack-off range for the shover's depth
  * counting him alone. A deeper all-in (100 BB) keeps the round-3 / round-4 stack-off rules. The MANIAC flat rule
  * (MANIAC_SQUEEZE_BEHIND_MAX_BB) no longer lets a 25 BB or shorter player still to act hide a 26-50 BB one.
+ * Fix-up 5 (2026-11-10, THE MANIAC CLASS): a MANIAC facing a raise or an all-in now plays 0dc1b96's MANIAC
+ * (maniacFacingRaise0dc1b96), so MANIAC_SHORT_SHOVE_MAX_BB and the flatter / deeper-all-in rules are gone. The rows that
+ * pinned them now pin 0dc1b96's answers: against a 26-100 BB all-in it closes the opener continues 64-80% (0dc1b96's push/fold
+ * on the chips-left depth), with flatters still to act it re-raises / moves in ~93% and never flat-calls (0dc1b96's branch).
  * Real PokerTable + real decideAction; seeded Math.random and a seeded deck (crypto.randomBytes).
  * 6 seats at 50/100, button 4: small blind 5, big blind 0 (the human), UTG 1, MP 2, CO 3.
  */
@@ -106,13 +110,13 @@ function flatsBehind(coBB: number, n = 400): number {
   return calls / n;
 }
 
-describe('fix-up 2 (HOLDEM-RR1-EXPLOIT-1 / -2) — a MANIAC that raised keeps its MANIAC branch against a 26-75 BB all-in', () => {
+describe('fix-up 2 (HOLDEM-RR1-EXPLOIT-1 / -2; fix-up 5: as 0dc1b96) — a MANIAC that raised does not fold its raise to a 26-100 BB all-in', () => {
   const log: string[] = [];
   afterAll(() => process.stdout.write(`fix4 MANIAC short shove: ${log.join('; ')}\n`));
 
-  it('the constant is 75 BB', () => {
+  it('the band constant is gone (MANIAC_SHORT_SHOVE_MAX_BB removed with the rule)', () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    expect(require('../src/ai/AIPlayer').MANIAC_SHORT_SHOVE_MAX_BB).toBe(75);
+    expect(require('../src/ai/AIPlayer').MANIAC_SHORT_SHOVE_MAX_BB).toBeUndefined();
   });
 
   it('no flatter (its call closes the action): the opener continues >= 58% against a 30 / 40 / 60 / 75 BB all-in (09fe8d2: 48 / 34 / 30 / 24%)', () => {
@@ -127,25 +131,25 @@ describe('fix-up 2 (HOLDEM-RR1-EXPLOIT-1 / -2) — a MANIAC that raised keeps it
     expect(bad).toEqual([]);
   });
 
-  it('one / two flatters: the opener continues >= 58% against a 40 / 60 BB squeeze, mostly by CALLING (>= 45% of spots: the flatters keep their overcall; 09fe8d2 isolated, 0 calls)', () => {
+  it('one / two flatters: the opener continues >= 85% against a 40 / 60 BB squeeze, as 0dc1b96 by a re-raise or a jam, never a flat call (f605403 >= 58%, >= 45% by calling)', () => {
     const bad: string[] = [];
     for (const diff of ['hard', 'medium']) {
       for (const [m, h, f] of [[100, 40, 1], [500, 40, 1], [500, 60, 1], [500, 40, 2]]) {
         const r = opener(m, h, f, diff);
         log.push(`${diff} ${m}/${h} fl${f} ${pct(r)}`);
-        if (r.spots < 300 || r.cont < 0.58 * r.spots || r.calls < 0.45 * r.spots) bad.push(`${diff} MANIAC ${m} BB vs ${h} BB, ${f} flatter(s): ${pct(r)}`);
+        if (r.spots < 300 || r.cont < 0.85 * r.spots || r.calls > 0) bad.push(`${diff} MANIAC ${m} BB vs ${h} BB, ${f} flatter(s): ${pct(r)}`);
       }
     }
     expect(bad).toEqual([]);
   });
 
-  it('a deeper all-in keeps the round-3 / round-4 rules: against an 80 / 100 BB all-in the opener continues <= 32% (the raised stack-off width), and with a flatter behind it isolates a 100 BB squeeze, never a flat call', () => {
+  it('a deeper all-in too (no raise-then-fold, as 0dc1b96): against an 80 / 100 BB all-in the opener continues >= 58% (f605403 <= 32%), and with a flatter behind >= 85%, never a flat call', () => {
     const r80 = opener(500, 80, 0), r100 = opener(500, 100, 0), f100 = opener(500, 100, 1);
     log.push(`80 ${pct(r80)}; 100 ${pct(r100)}; 100 fl1 ${pct(f100)}`);
-    expect([r80.cont <= 0.32 * r80.spots, r100.cont <= 0.32 * r100.spots, f100.calls]).toEqual([true, true, 0]);
+    expect([r80.cont >= 0.58 * r80.spots, r100.cont >= 0.58 * r100.spots, f100.cont >= 0.85 * f100.spots, f100.calls]).toEqual([true, true, true, 0]);
   });
 
-  it('a MANIAC that flat-called continues against a 30 / 40 BB squeeze with the stack-off range for the shover alone (>= 42 / 28%; 09fe8d2 counted the players behind: 33 / 23%, 12% for a 100 BB MANIAC)', () => {
+  it('a MANIAC that flat-called continues against a 30 / 40 BB squeeze (>= 42 / 28%; 09fe8d2 counted the players behind: 33 / 23%, 12% for a 100 BB MANIAC; fix-up 5: 0dc1b96, ~90%)', () => {
     const bad: string[] = [];
     for (const diff of ['hard', 'medium']) {
       for (const [m, h, min] of [[500, 30, 0.42], [500, 40, 0.28], [100, 40, 0.28]]) {
@@ -157,7 +161,7 @@ describe('fix-up 2 (HOLDEM-RR1-EXPLOIT-1 / -2) — a MANIAC that raised keeps it
     expect(bad).toEqual([]);
   });
 
-  it('the MANIAC flat rule: a 15 BB player still to act does not hide the 40 BB one (flat-calls <= 30%; 09fe8d2 ~69%), as with a 100 BB one', () => {
+  it('a deep MANIAC facing an open with a 40 BB player still to act does not flat-call (<= 30%; 09fe8d2 ~69%), whether a 15 or a 100 BB player sits between (fix-up 5: 0dc1b96 re-raises, 0 flats)', () => {
     const micro = flatsBehind(15), deep = flatsBehind(100);
     log.push(`flat with a 15 BB CO ${(100 * micro).toFixed(1)}%, a 100 BB CO ${(100 * deep).toFixed(1)}%`);
     expect([micro <= 0.3, deep <= 0.3]).toEqual([true, true]);

@@ -19,6 +19,11 @@
  * MANIAC branch (~70%, by calling: isolating made the flatters' chips dead money for the shover), and a flatter reads
  * the stack-off range for the shover's depth counting him alone (the players behind narrowed it to ~23%; now ~36%,
  * still far from the ~70% this file pins against). Test 2's opener row and flatter bound follow.
+ * Fix-up 5 (2026-11-10, THE MANIAC CLASS): a MANIAC facing a raise or an all-in now plays 0dc1b96's MANIAC
+ * (maniacFacingRaise0dc1b96). It no longer flat-calls opens (it re-raises ~93%), so the flat this file starts from comes
+ * only from a forced call (test 1, still >= 27 / 20 / 15%); facing a deep player's 40 BB all-in it isolates (re-raises)
+ * ~93% again, as 0dc1b96, and never flat-calls: the any-two re-shove over five 500 BB MANIACs measures -185 BB/100 there
+ * (live 0dc1b96 -149; the +250 this file pinned against was the capped MANIAC calling with ~70%). Tests 2 and 4 pin that.
  * Real PokerTable + real decideAction, seeded Math.random (the LCG of tests/botPremiumHold.test.ts) and a seeded
  * deck (crypto.randomBytes: an unseeded deck changed the hands deal() draws run to run). 6 seats at
  * 50/100: btn 0 (the human), sb 1, bb 2, utg 3, mp 4, co 5. The bounds below fail on 0bc7529 and on the
@@ -95,25 +100,26 @@ describe('MANIAC call-then-fold (fix round 4) — a MANIAC that flat-called does
     expect(bad).toEqual([]);
   });
 
-  it('a deep (500 BB) MANIAC facing a 40 BB all-in with players still to act no longer calls ~70%: the unraised big blind <= 15%, a flatter <= 45% (fix-up 2: the shover alone counted, ~36%); the opener (a flatter behind it) continues >= 50% (fix-up 2: by calling, the MANIAC branch)', () => {
+  it('a deep (500 BB) MANIAC facing a 40 BB all-in with players still to act answers it as 0dc1b96: the big blind, a flatter and the opener re-raise (isolate) >= 85%, and never flat-call it (fix round 4: called ~70%; fix-up 2: <= 15% / <= 45% / >= 50% by calling)', () => {
     const bad: string[] = [];
     const deep = [40, 500, 500, 500, 500, 500];
     const spots: Array<[string, () => PokerTable, number, number]> = [
       // the big blind (posted, no voluntary chips) with the opener and a flatter behind
-      ['big blind', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerFold(5); t.playerAllIn(0); t.playerFold(1); return t; }, 2, 0.15],
+      ['big blind', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerFold(5); t.playerAllIn(0); t.playerFold(1); return t; }, 2, 0.85],
       // a flatter with a second flatter behind
-      ['flatter', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerCall(5); t.playerAllIn(0); for (const s of [1, 2, 3]) t.playerFold(s); return t; }, 4, 0.45],
+      ['flatter', () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerCall(5); t.playerAllIn(0); for (const s of [1, 2, 3]) t.playerFold(s); return t; }, 4, 0.85],
     ];
-    for (const diff of ['hard', 'medium']) for (const [name, build, me, max] of spots) {
-      const r = contRate(build, me, diff);
-      if (r > max) bad.push(`${diff} ${name}: continued ${(100 * r).toFixed(1)}% > ${100 * max}%`);
+    for (const diff of ['hard', 'medium']) for (const [name, build, me, min] of spots) {
+      const o = { calls: 0 };
+      const r = contRate(build, me, diff, 400, o);
+      if (r < min || o.calls > 0) bad.push(`${diff} ${name}: continued ${(100 * r).toFixed(1)}%, flat-called ${(100 * o.calls).toFixed(1)}%`);
     }
     // the opener with a flatter behind (fix-up 1 isolated; fix-up 2: a 40 BB all-in keeps the MANIAC branch, which calls)
     const opener = () => { const t = table(deep); t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerFold(5); t.playerAllIn(0); t.playerFold(1); t.playerFold(2); return t; };
     for (const diff of ['hard', 'medium']) {
       const o = { calls: 0 };
       const r = contRate(opener, 3, diff, 400, o);
-      if (r < 0.5 || o.calls < 0.4) bad.push(`${diff} opener: continued ${(100 * r).toFixed(1)}%, flat-called ${(100 * o.calls).toFixed(1)}%`);
+      if (r < 0.85 || o.calls > 0) bad.push(`${diff} opener: continued ${(100 * r).toFixed(1)}%, flat-called ${(100 * o.calls).toFixed(1)}%`);
     }
     expect(bad).toEqual([]);
   });
@@ -136,18 +142,23 @@ describe('MANIAC call-then-fold (fix round 4) — a MANIAC that flat-called does
     }
   });
 
-  it('it still plays: AA in the deep big-blind spot always continues, and 72o folds', () => {
+  it('it still plays: AA in the deep big-blind spot always continues, and 72o only on its random raise (0dc1b96: 55% of its bottom hands, never a flat call)', () => {
     const restore = seedRandom(4242);
     try {
+      let weak = 0;
       for (const [cards, want] of [[[{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }], true], [[{ rank: 7, suit: 0 }, { rank: 2, suit: 1 }], false]] as Array<[any[], boolean]>) {
         for (let k = 0; k < 40; k++) {
           const t = table([40, 500, 500, 500, 500, 500]);
           t.playerRaise(3, 3 * BB); t.playerCall(4); t.playerFold(5); t.playerAllIn(0); t.playerFold(1);
           for (const s of t.seats) if (s.seatIndex !== 2) s.holeCards = s.holeCards.filter((c: any) => !cards.some((w) => w.rank === c.rank && w.suit === c.suit));
           t.seats[2].holeCards = cards.slice() as any;
-          expect(decideAction(t, 2, prof('MANIAC')).action !== PlayerAction.Fold).toBe(want);
+          const d = decideAction(t, 2, prof('MANIAC'));
+          if (want) expect(d.action !== PlayerAction.Fold).toBe(true);
+          else { expect(d.action).not.toBe(PlayerAction.Call); if (d.action !== PlayerAction.Fold) weak++; }
         }
       }
+      expect(weak).toBeGreaterThanOrEqual(10);
+      expect(weak).toBeLessThanOrEqual(32);
     } finally { restore(); }
   });
 });

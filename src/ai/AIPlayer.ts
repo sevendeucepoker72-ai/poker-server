@@ -1052,6 +1052,9 @@ function decideActionForSeat(
   const rawNoise = (Math.random() - 0.5) * noiseMap[profile.difficulty];
   const noise = isFinite(rawNoise) ? rawNoise : 0;
   handStrength = Math.min(1.0, Math.max(0.0, handStrength + noise));
+  // Fix-up 5: the strength 0dc1b96 read pre-flop in Short Deck (the Hold'em percentile of the two cards), same noise draw:
+  // a MANIAC facing a raise plays 0dc1b96's MANIAC on it (maniacFacingRaise0dc1b96).
+  const maniacPctile = isPreFlop && isShortDeck ? Math.min(1.0, Math.max(0.0, getPreFlopHandRank(holdemHoleCards(seat.holeCards)) + noise)) : undefined;
   if (stackOff !== null) stackOff = Math.min(1.0, Math.max(0.0, stackOff + noise));   // same noise draw
 
   // Outs and implied odds for draw decisions. 2026-11: Stud / Draw equity already
@@ -1131,7 +1134,7 @@ function decideActionForSeat(
       : preFlopStrategy(
         handStrength, callAmount, totalPot, seat, table, profile,
         myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true,
-        { liveOpponents: numOpponents, stackOff, rawPctile: rawStrength, rawStackOff });
+        { liveOpponents: numOpponents, stackOff, rawPctile: rawStrength, rawStackOff, maniacPctile });
     return limitBotRaiseWar(table, seat, pre, true, handStrength);
   }
 
@@ -1269,82 +1272,12 @@ export const AOF_ARCHETYPE_DAMP = 0.5;
  */
 export const AOF_NOISE_KEEP = 0.5;
 /**
- * MANIAC-RTF (fix round 3) — no-limit (Hold'em, Short Deck, Pineapple): a MANIAC re-raise by a hand
- * that fails the stack-off range is made only when it is at most this share of the depth at risk
- * (lightReraiseDepth: the smallest street stack that can shove over it, fix round 4; round 3 used the
- * MANIAC's own); larger, the hand calls (top 70%) or folds instead. It re-raised ~93% of hands to 2.5-4x the bet (25-59
- * BB over a 10 BB open) and the stack-off gate then folded ~89% of them to a shove: opening 10 BB with any
- * two and shoving over every re-raise won ~+1,500 BB/100 at a one-MANIAC table, +1,900 with 3-bets too
- * (live 0dc1b96: -266 / -329). Measured on the whole line (real engine, 100 BB, hard, vs five MANIACs,
- * 1,500 hands): re-raising TO the cap left a 2.5 / 3 BB open at +66 / +67 BB/100 with 0.06; refusing a
- * larger one (this rule) put a 2 BB open at -192 / -28 / +32 / +82 with 0.05 / 0.06 / 0.07 / 0.08 and a
- * 2.5 BB open at -196 / -196 / -44 / +85. At 100 BB no light re-raise is left (a min-raise's 2.5x is 5 BB);
- * with every live stack 200 BB deep it still re-raises light up to 10 BB, but not against a 100 BB player.
- */
-export const HOLDEM_LIGHT_RERAISE_FRACTION = 0.05;
-/**
- * MANIAC-RTF part 2 (fix round 3) — no-limit: a MANIAC that has raised this street (an any-two open, an
- * isolation raise over limpers, a light 3-bet) and then faces a stack-off continues with this multiple of the
- * stack-off width. It raises ~93% of hands and folded ~80-90% of those raises to a shove. With part 1
- * (HOLDEM_LIGHT_RERAISE_FRACTION) a MANIAC flat-calls the opens it used to re-raise light, and two any-two
- * lines paid on the whole hand (real engine, hard, 5,000 hands): 3-handed at 25 BB (the Spin & Go start) a
- * squeeze all-in over a MANIAC open and a MANIAC flat +32 BB/100, and in Short Deck limp, then shove over its
- * isolation raise +32 (live 0dc1b96: -75 / -97). At 2x they are -25 / -57; every other line measured stays
- * as negative or more. Continuing after its own raise, heads-up: a 100 BB shove 12% -> 24% of hands (live
- * called ~91%, NEW-5), the 25 BB squeeze 17% -> 31%, the Short Deck re-shove 10% -> 21%. 3x (-52 / -132)
- * only calls wider still. A MANIAC that has not raised keeps the stack-off width (lone 100 BB shove ~9%).
- */
-export const MANIAC_RAISED_STACKOFF_WIDEN = 2;
-/**
- * Fix round 4, fix-up 1 (HOLDEM-R4-EXPLOIT-1 / -2) — no-limit: a MANIAC that raised this street and then faces an
- * all-in deeper than the push/fold zone that it does not close, with FLATTERS still to act (players who only called
- * this street): they are dead money, not players at risk. It reads the stack-off range for the shover's depth
- * counting only the other live players, at MANIAC_RAISED_STACKOFF_WIDEN x (1 + this per flatter) the width, and
- * continues as the MANIAC branch and 0dc1b96 do, by an isolation re-raise (the flatters then face a stack-off).
- * Round 4 counted each flatter as a player at risk (the width / 1.5 each) and continued by calling: the opener
- * folded 77-86% of its any-two opens, and from the big blind a squeeze all-in with any two over a MANIAC open and
- * a flat won +30 to +55 BB/100 (hard, whole line; live 0dc1b96 -7 to -36). Each fold paid the human the dead money
- * (+5.6 / +8.9 BB per spot with one / two flatters); when the MANIAC isolates he wins ~0. At 1 per flatter (one:
- * 4x, two: 6x the width) the opener continues ~71% / ~100% against a 40 BB squeeze, ~46% / ~65% against 100 BB.
- * Fix-up 2: only against an all-in deeper than MANIAC_SHORT_SHOVE_MAX_BB (~46% / ~65% against 100 BB); a shorter one
- * keeps the MANIAC branch, which calls (an isolation raise also folded the flatters out of their overcalls).
- */
-export const MANIAC_FLATTER_WIDEN = 1;
-/**
- * Fix round 4, fix-up 1 (HOLDEM-R4-EXPLOIT-1, two deep MANIACs) — no-limit: a MANIAC deeper than the push/fold zone
- * that faces a single raise and does not re-raise it flat-calls only with the stack-off range (2x, as a flatter) for
- * the depth of the shortest player still to act behind it, when that player has more than 25 and at most this many
- * BB: his squeeze all-in over the raise and the flat leaves the flat as dead money. The light re-raise cap
- * (lightReraiseDepth) turned a deep MANIAC's 93% light 3-bets into ~70% flats whenever a <= 100 BB player sat behind;
- * with two 500 BB MANIACs (open, flat) a 40 BB human squeezing any two from the big blind won +20 BB/100 after the
- * opener fix (live 0dc1b96 -18: the second MANIAC 3-bet instead), whatever the opener did (call / isolate / jam:
- * +14..+39). With this rule +5 (n.s.). Measured squeeze value of the dead money: 40 BB +20, 60 BB ~0, 100 BB < 0.
- * Only for a MANIAC at least twice as deep (effective) as that player: with similar stacks (a tournament; five
- * 40 BB MANIACs and a 40 BB human) the squeeze measured no leak (+6 (18), live +31) and the flats stay. Effective
- * depth: at a 100 BB table any MANIAC of 52 BB or more qualifies, not only a deep one (it then folds ~83% of the
- * opens it flat-called; steals against it measured below 0 and below live). A 25 BB or shorter player still to act
- * is skipped (fix-up 2: he does not hide a 26-50 BB one).
- */
-export const MANIAC_SQUEEZE_BEHIND_MAX_BB = 50;
-/**
- * Fix round 4, fix-up 2 (HOLDEM-RR1-EXPLOIT-1 / -2) — no-limit: a MANIAC that raised this street (any two) and then faces an
- * all-in whose depth at risk (shoveBB) is more than 25 and at most this many BB keeps its MANIAC branch, as 0dc1b96 does: it
- * continues with ~68% of hands, by calling (it re-raises only with its stack-off hands). Against a shove of any two the call
- * needs ~42% equity, which ~70% of hands have. The stack-off range for that depth (x MANIAC_RAISED_STACKOFF_WIDEN) continued
- * 51 / 35 / 26% at 30 / 40 / 60 BB (live 0dc1b96 69%), and with flatters behind it isolated, so their chips were dead money for
- * the shover: shoving any two over a MANIAC's raise won (hard, whole line, BB/100) +8 (2) for a 30 BB human with every bot at
- * 100 BB, +24 (5) for a 40 BB human with two 100 BB MANIACs, ~+18 at 50-60 BB (live -20 / -28 / -18). A MANIAC that only called
- * this street continues against such an all-in with the stack-off range for the shover's depth counting him alone, at
- * MANIAC_RAISED_STACKOFF_WIDEN x the width. A deeper all-in (a 100 BB shove) keeps the stack-off rules (MANIAC-RTF, REG-1).
- */
-export const MANIAC_SHORT_SHOVE_MAX_BB = 75;
-/**
  * Fix round 4, fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — no-limit Hold'em family: a raise (or a post-flop bet) whose maker has no
  * more chips behind than this many times the pot this seat's call would make (a stack-to-pot ratio <= 1: his last bet can be
  * no bigger than that pot, so it is priced in) is the all-in it effectively is: he calls any re-raise. Pre-flop (fix-up 3:
  * deeper than the push/fold zone, depth at risk > 25 BB; fix-up 4: every depth), every all-in rule of preFlopStrategy reads
- * it as the all-in (nearAllInRaiser: the price floor, the commit gate, the MANIAC short-shove band, the opener / FISH /
- * deep-MANIAC all-in rules, the flat rule), and a bot that continues re-raises to cover him (a flat left him chips to move in
+ * it as the all-in (nearAllInRaiser: the price floor, the commit gate, the FISH rule; fix-up 5: a MANIAC facing it plays
+ * maniacFacingRaise0dc1b96), and a bot that continues re-raises to cover him (a flat left him chips to move in
  * after the flop; fix-up 4: deeper than the push/fold zone only). Post-flop the price floor and
  * the MANIAC price rule (decideAction) treat his bet as an all-in. They keyed on a real all-in only, so a human who re-raised
  * a MANIAC's raise to 50-95% of his stack met the commit gate at the LARGEST opponent's depth (a 100 BB MANIAC continued 16%
@@ -1363,6 +1296,7 @@ export const MANIAC_SHORT_SHOVE_MAX_BB = 75;
  * Fix-up 4 (HOLDEM-F3-EXPLOIT-1): at every depth outside All-In or Fold (fix-up 3: depth at risk > 25 BB). With 25 BB or
  * less at risk a bot that continues calls him, as against his all-in (the cover re-raise started side-pot wars), and a dry
  * side pot against him is checked down (sidePotAgainstShortStack).
+ * Fix-up 5 (HOLDEM-F4-REGRESSION-1): heads-up against him (the only other player with chips) the cover again, at every depth.
  */
 export const NEAR_ALLIN_SPR = 1;
 /**
@@ -1412,6 +1346,8 @@ export interface PreflopCtx {
   rawPctile?: number;
   /** The stack-off percentile before the difficulty noise (undefined = the noisy one). */
   rawStackOff?: number | null;
+  /** Fix-up 5 — Short Deck: 0dc1b96's pre-flop strength (the Hold'em percentile) for maniacFacingRaise0dc1b96 (undefined = pctile). */
+  maniacPctile?: number;
 }
 
 /** Stud / draw first-round context: who is live, and the strength before the difficulty noise. */
@@ -1452,7 +1388,7 @@ export function nearAllInRaiser(table: PokerTable, seat: Seat): Seat | null {
 /**
  * Fix-up 4 (HOLDEM-F3-EXPLOIT-1) — a side pot is being played against a short player: a live opponent is all-in or has no
  * more than POSTFLOP_MICRO_CALL_NEED of the pot behind, and another live opponent still has chips. Under the light re-raise
- * cap deep MANIACs flat-call a short player's all-in (or his raise to 75-95% of 12-25 BB) three or four handed; after the
+ * cap (rounds 3-4; fix-up 5 removed it: maniacFacingRaise0dc1b96) deep MANIACs flat-call a short player's all-in (or his raise to 75-95% of 12-25 BB) three or four handed; after the
  * flop one of them bet the side pot (a MANIAC bets every flop, and raises a micro all-in) and the others folded, so their
  * calls were dead money in his main pot: an all-in for 12 BB over a MANIAC open won +204 (21) BB/100 against five 100 BB
  * MANIACs (hard; live 0dc1b96 -63 (8), where they isolate it), a raise to 95% of 12 / 15 / 20 / 25 BB +234 / +288 / +304 /
@@ -1466,65 +1402,11 @@ export function sidePotAgainstShortStack(table: PokerTable, seat: Seat): boolean
     && live.some((o) => o !== x && !o.allIn && o.chipCount > 0));
 }
 
-/**
- * MANIAC-RTF, fix round 4 (HOLDEM-R3-REG-1) — the depth a light re-raise is measured against: the smallest
- * street stack (chips + this street's bet) that can still shove over it. That is this seat's own and every live
- * opponent's with chips behind: the raiser, the callers (they act again) and the players still to act. Round 3
- * measured it against the MANIAC's own stack. Bots have no stack cap and only grow, while a human buys in for
- * at most 100 BB, so a 200-1,000 BB MANIAC re-raised a 100 BB opener light again (93% of hands, to 8-33 BB) and
- * folded ~78% of them to his 100 BB shove: any two won +55 to +445 BB/100 where live 0dc1b96 loses. The
- * largest opponent's stack (a review candidate) still let a second deep stack at the table re-open it.
- */
-function lightReraiseDepth(table: PokerTable, seat: Seat): number {
-  let depth = seat.chipCount + seat.currentBet;
-  for (const s of table.seats) {
-    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
-    depth = Math.min(depth, s.chipCount + s.currentBet);
-  }
-  return depth;
-}
-
 /** B8 — raises this seat has made on the current street (its own open / 3-bet), from the table's action log. */
 function ownRaisesThisStreet(table: PokerTable, seat: Seat): number {
   let n = 0;
   for (const e of table.actionLog) {
     if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && OWN_RAISE_RE.test(e.action)) n++;
-  }
-  return n;
-}
-
-/** Fix round 4 — calls this seat has made on the current street (a posted blind is not one), from the action log. */
-function ownCallsThisStreet(table: PokerTable, seat: Seat): number {
-  let n = 0;
-  for (const e of table.actionLog) {
-    if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && /^called /.test(e.action)) n++;
-  }
-  return n;
-}
-
-/**
- * Fix-up 1 — the shortest street stack (BB) deeper than the push/fold zone among live opponents with chips still to act on
- * this bet (Infinity: none). Fix-up 2: a 25 BB or shorter player is skipped (he shoves or folds; he does not squeeze a
- * 26-50 BB one out of the count): a 15 BB bot to act turned the MANIAC flat rule off (flat-calls 12% -> 69%).
- */
-function shortestToActBB(table: PokerTable, seat: Seat, bigBlind: number): number {
-  let d = Infinity;
-  for (const s of table.seats) {
-    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
-    if (s.currentBet >= table.currentBetToMatch) continue;
-    const bb = (s.chipCount + s.currentBet) / bigBlind;
-    if (bb > PUSH_FOLD_MAX_BB) d = Math.min(d, bb);
-  }
-  return d;
-}
-
-/** Fix-up 1 — live opponents with chips still to act on this bet who have only CALLED this street (flat callers). */
-function flattersToAct(table: PokerTable, seat: Seat): number {
-  let n = 0;
-  for (const s of table.seats) {
-    if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
-    if (s.currentBet >= table.currentBetToMatch) continue;
-    if (ownCallsThisStreet(table, s) > 0 && ownRaisesThisStreet(table, s) === 0) n++;
   }
   return n;
 }
@@ -1545,6 +1427,45 @@ function aofShoverWidth(table: PokerTable, shover: Seat | null, effBB: number): 
   const prior = 1 - (aofPushPctile(effBB, Math.max(1, sp.total - 1 - sp.preflop)) ?? 1 - huW);
   const obs = getOpponentProfile(opponentModelKey(shover));
   return obs && obs.handsSeen > 0 ? (obs.vpipHands + AOF_OBS_PRIOR_HANDS * prior) / (obs.handsSeen + AOF_OBS_PRIOR_HANDS) : prior;
+}
+
+/**
+ * Fix-up 5 (THE MANIAC CLASS: HOLDEM-F3-REGRESSION-2 = MEASUREMENT-1 = EXPLOIT-2) — no-limit (Hold'em, Short Deck,
+ * Pineapple), not All-In or Fold: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, line for line: 0dc1b96's
+ * push/fold zone on its own depth (chipsLeftEffectiveStackBB: mine vs the largest opponent's chips LEFT, at most 3 players),
+ * else it re-raises ~93% of hands to 2.5-4x the bet (all-in at 70% of its stack), calls the top 70% of the rest, or folds.
+ * Rounds 3-4 capped its light re-raises (HOLDEM_LIGHT_RERAISE_FRACTION, 5% of the depth at risk) and priced its continues
+ * (stack-off ranges, MANIAC-RTF / REG-1 / NEW-5 and fix-ups 1-4). With the cap MANIACs flat-called each other and the
+ * human: a limp or a flat with any two saw a cheap multiway flop in ~80% of hands (live ~0%), and moving in there with a
+ * pair or a draw won at the DEFAULT table (five 100 BB MANIACs, hard, lg:5:p +291 BB/100, sgg +220; live -85 / -72), +379 /
+ * +290 against 300 / 500 BB MANIACs, +307 at two-MANIAC tables on medium (live -92 / -96 / -13); every new rule keyed on
+ * one shape opened a neighbouring one. Live's MANIAC is not exploitable by those lines: it re-raises the flats (they never
+ * see the flop) and calls the shoves over its re-raises. Measured on both families with this rule (hard / medium / easy,
+ * equal and unequal stacks, real engine, whole lines): the cheap-flop lines at live (-55 to -147); the light-3-bet-then-
+ * shove lines at live too (live has its own leak at 1,000 BB MANIACs: os:2.5 +398, osrr +939, unchanged here). Restoring
+ * only the light re-raise and the continue after it (and keeping the stack-off read for a MANIAC that faces a shove
+ * without having raised) failed: those MANIACs then folded where live's jam, and their raises were dead money (five
+ * 200-300 BB MANIACs, open 2.5-4 BB and move in over a re-raise: +387 to +933, live -167 to -501).
+ */
+function maniacFacingRaise0dc1b96(
+  pctile: number, callAmount: number, seat: Seat, table: PokerTable, factor: number, totalActive: number,
+  betToMatch: number, minRaise: number, FOLD: AIDecision,
+): AIDecision {
+  const ALLIN: AIDecision = { action: PlayerAction.AllIn, raiseAmount: 0 };
+  const effBB = chipsLeftEffectiveStackBB(table, seat.seatIndex);
+  const playersYetToAct = Math.min(3, Math.max(1, totalActive - 1));
+  if (inPushFoldZone(effBB, playersYetToAct)) {
+    const nashPush = nashPushPctile(effBB, playersYetToAct);
+    if (nashPush !== null) {
+      if (callAmount >= seat.chipCount) return pctile >= adjustThreshold(nashCallPctile(effBB, playersYetToAct), factor) ? ALLIN : FOLD;
+      return pctile >= adjustThreshold(nashPush, factor) ? ALLIN : FOLD;
+    }
+  }
+  if (pctile >= 0.15 || Math.random() < 0.55) {
+    const to = Math.max(minRaise, Math.round(betToMatch * (2.5 + Math.random() * 1.5)));
+    return to >= seat.chipCount * 0.7 ? ALLIN : { action: PlayerAction.Raise, raiseAmount: to };
+  }
+  return pctile >= 0.30 ? { action: PlayerAction.Call, raiseAmount: 0 } : FOLD;
 }
 
 function preFlopStrategy(
@@ -1716,6 +1637,13 @@ function preFlopStrategy(
     return allInOrFold || callAmount >= seat.chipCount ? ALLIN : CONT;
   }
 
+  // Fix-up 5 — no-limit, not All-In or Fold: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC exactly
+  // (maniacFacingRaise0dc1b96). After the price floor (a micro all-in the call closes is still called with any hand), before
+  // the push/fold zone: 0dc1b96 reads that its own way here.
+  if (profile.archetype === 'MANIAC' && noLimit && !allInOrFold && facingRaise) {
+    return maniacFacingRaise0dc1b96(ctx.maniacPctile ?? pctile, callAmount, seat, table, factor, totalActive, betToMatch, minRaise, FOLD);
+  }
+
   // ── Short-stack push/fold (and every All-In or Fold decision): the baked Nash lookup. ──
   const pfBB = allInOrFold ? Math.min(pureAllInCall ? shoveBB : effBB, PUSH_FOLD_MAX_BB) : effBB;
   if (allInOrFold || (inPushFoldZone(effBB, zonePlayers) && profile.archetype !== 'CALLING_STATION')) {
@@ -1751,40 +1679,14 @@ function preFlopStrategy(
   const committing = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
   // HAI-1 — up to 25 BB the Nash call is never narrower than the deep width at the 25 BB anchor
   // (with 3 players in, 0.93 vs 0.915: 23-25 BB continued less than 26 BB).
-  // `widen` (MANIAC-RTF part 2) multiplies the continuing width; 1 = the range as it was. `players`: the
-  // players counted against it (fix-up 1: a MANIAC opener does not count the flatters behind it).
-  const stackOffOK = (depthBB: number, widen = 1, players = callPyta): boolean => {
+  // Fix-up 5: a MANIAC facing a raise or an all-in no longer reaches this section (maniacFacingRaise0dc1b96), so the
+  // MANIAC widenings and gates of rounds 3-4 and fix-ups 1-2 are gone from it.
+  const stackOffOK = (depthBB: number): boolean => {
     const th = depthBB <= PUSH_FOLD_MAX_BB
-      ? adjustThreshold(Math.min(nashCallPctile(depthBB, players), 1 - stackOffCallWidth(depthBB, players)), factor)
-      : adjustThreshold(1 - stackOffCallWidth(depthBB, players), factor);
-    return (depthBB <= PUSH_FOLD_MAX_BB ? pctile : so) >= (widen === 1 ? th : 1 - (1 - th) * widen);
+      ? adjustThreshold(Math.min(nashCallPctile(depthBB, callPyta), 1 - stackOffCallWidth(depthBB, callPyta)), factor)
+      : adjustThreshold(1 - stackOffCallWidth(depthBB, callPyta), factor);
+    return (depthBB <= PUSH_FOLD_MAX_BB ? pctile : so) >= th;
   };
-  // MANIAC-RTF part 2 (fix round 3): a MANIAC that raised this street (its any-two open, isolation
-  // or light 3-bet) continues with MANIAC_RAISED_STACKOFF_WIDEN x the width; it folded ~80-90% of them.
-  // Fix round 4: so does one that flat-called this street, deeper than the push/fold zone (it flats
-  // ~70% of opens). At the plain width it folded 72-90% of its flats to a squeeze or re-shove (live
-  // 0dc1b96 ~30-38%): with five 40 BB MANIACs, a squeeze all-in over an open and a flat with any two
-  // won +144 BB/100 (live +30), a re-shove +44 (live -2); 25 BB and shallower are unchanged.
-  const maniacWiden = (depthBB: number): number => profile.archetype === 'MANIAC' && (ownRaisesThisStreet(table, seat) > 0
-    || (depthBB > PUSH_FOLD_MAX_BB && ownCallsThisStreet(table, seat) > 0)) ? MANIAC_RAISED_STACKOFF_WIDEN : 1;
-  // Fix-up 2 (MANIAC_SHORT_SHOVE_MAX_BB): facing an all-in of 26 BB to MANIAC_SHORT_SHOVE_MAX_BB at risk, a MANIAC that
-  // raised this street keeps the MANIAC branch below (it continues ~68%, by calling); one that only called plays the
-  // stack-off range for the shover's depth counting him alone (below, before the commit gate). The opener rule, the
-  // commit gate and the deep-MANIAC all-in gate apply to deeper all-ins.
-  // Fix round 4, fix-up 1 (MANIAC_FLATTER_WIDEN): a MANIAC that raised this street, facing a deeper all-in that it
-  // does not close with flatters still to act, does not count them against its range (they are dead money): the
-  // stack-off range for the shover's depth at (1 + 1 per flatter) x its raised width, and it continues by an
-  // isolation re-raise, as the MANIAC branch does. Before the commit gate: at equal stacks the call commits.
-  const shortShove = !allInOrFold && noLimit && !!shover && profile.archetype === 'MANIAC'
-    && shoveBB > PUSH_FOLD_MAX_BB && shoveBB <= MANIAC_SHORT_SHOVE_MAX_BB;
-  const keepManiacBranch = shortShove && ownRaisesThisStreet(table, seat) > 0;
-  const flatters = !keepManiacBranch && !allInOrFold && noLimit && !!shover && !pureCall && profile.archetype === 'MANIAC'
-    && shoveBB > PUSH_FOLD_MAX_BB && ownRaisesThisStreet(table, seat) > 0 ? flattersToAct(table, seat) : 0;
-  if (flatters > 0) {
-    const others = Math.min(CALL_WIDTH_MAX_PLAYERS, Math.max(1, pyta - flatters));
-    if (!stackOffOK(shoveBB, MANIAC_RAISED_STACKOFF_WIDEN * (1 + MANIAC_FLATTER_WIDEN * flatters), others)) return FOLD;
-    return raiseOrAllIn(Math.round(betToMatch * (2.5 + Math.random() * 1.5)));
-  }
   // Fix-up 1 (FISH_RAISE_PCTILE): a FISH that raised this street does not raise-then-fold an all-in deeper than the
   // push/fold zone: every hand it raises for continues (before the commit gate, which read it as a stack-off). Read on the
   // strength before this decision's noise, less half the noise width: the raise drew its own noise.
@@ -1795,25 +1697,9 @@ function preFlopStrategy(
   }
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
   // (and, fix round 3, its 0dc1b96 chips-left depth: chipsLeftEffectiveStackBB).
-  if (shortShove && !keepManiacBranch && ownCallsThisStreet(table, seat) > 0) {
-    if (!stackOffOK(shoveBB, MANIAC_RAISED_STACKOFF_WIDEN, 1)) return FOLD;
-    return callAmount < seat.chipCount ? CONT : ALLIN;
-  }
-  if (!allInOrFold && noLimit && (pureCall || committing) && !keepManiacBranch) {
-    const soDepth = pureCall ? shoveBB : effBB;
-    if (!stackOffOK(soDepth, maniacWiden(soDepth))) return FOLD;
+  if (!allInOrFold && noLimit && (pureCall || committing)) {
+    if (!stackOffOK(pureCall ? shoveBB : effBB)) return FOLD;
     return pureCall && callAmount < seat.chipCount ? CONT : ALLIN;
-  }
-  // Fix round 4 — a MANIAC deeper than the push/fold zone facing an all-in it does not close (players
-  // still to act) for less than a third of ITS stack skipped the gate above, and the MANIAC branch below
-  // called it with ~70% of hands (63-72% vs a 40 BB shove at 500 BB). Against the shover the call is a
-  // stack-off for the depth at risk (his stack): the stack-off range for shoveBB, by calling. A 40 BB
-  // re-shove with any two over five 500 BB MANIACs won +250 BB/100 (live 0dc1b96 -138). A short all-in
-  // (shoveBB within the push/fold zone) keeps the MANIAC branch: it still isolates it.
-  if (!allInOrFold && noLimit && shover && profile.archetype === 'MANIAC' && effBB > PUSH_FOLD_MAX_BB && shoveBB > PUSH_FOLD_MAX_BB
-    && !keepManiacBranch) {
-    if (!stackOffOK(shoveBB, maniacWiden(shoveBB))) return FOLD;
-    return callAmount < seat.chipCount ? CONT : ALLIN;
   }
   /** A re-raise; when it would be a jam it must pass the stack-off range too (null = not this hand: fall through). */
   const raiseOrJam = (amount: number): AIDecision | null => {
@@ -1829,10 +1715,8 @@ function preFlopStrategy(
     return callsSized(Math.max(0.30, 1 - CS_CALL_WIDTH * sizeFactor), 1 - CS_CALL_WIDTH) ? CALL : FOLD;
   }
 
-  // ── MANIAC: raises/3-bets almost anything — but a raise that would be a jam is a
-  //    stack-off (NEW-5: it called 100 BB off with 91% of hands), and facing a raise, a hand
-  //    that fails the stack-off range re-raises only up to HOLDEM_LIGHT_RERAISE_FRACTION of
-  //    the depth at risk, lightReraiseDepth (MANIAC-RTF: a bigger one was folded to the shove it invited). ──
+  // ── MANIAC (unopened, or limpers only: facing a raise it plays maniacFacingRaise0dc1b96): raises almost
+  //    anything — but a raise that would be a jam is a stack-off (NEW-5). ──
   if (profile.archetype === 'MANIAC') {
     const wantRaise = pctile >= 0.15 || Math.random() < 0.55;
     if (wantRaise) {
@@ -1843,24 +1727,10 @@ function preFlopStrategy(
         if (Math.max(minRaise, target) >= seat.chipCount * 0.7) return ALLIN;
         return raiseOrAllIn(target);
       }
-      const tooBigLight = facingRaise && !stackOffOK(effBB)
-        && Math.max(minRaise, target) > lightReraiseDepth(table, seat) * HOLDEM_LIGHT_RERAISE_FRACTION;
-      if (!tooBigLight) {
-        const r = raiseOrJam(target);
-        if (r) return r;
-      }
+      const r = raiseOrJam(target);
+      if (r) return r;
     }
     if (callAmount === 0) return CHECK;
-    // Fix-up 1 (MANIAC_SQUEEZE_BEHIND_MAX_BB): a flat call in front of a 26-50 BB player still to act is dead money
-    // for his squeeze; flat only what continues against it, when this MANIAC is at least twice as deep (effective) as
-    // him (similar stacks, as in a tournament, keep the branch: five 40 BB MANIACs measured no leak).
-    // Plain raises only (a short all-in keeps the branch).
-    if (noLimit && facingRaise && !facingThreeBet && !shover && effBB > PUSH_FOLD_MAX_BB) {
-      const behindBB = Math.round(shortestToActBB(table, seat, bigBlind));
-      if (behindBB > PUSH_FOLD_MAX_BB && behindBB <= MANIAC_SQUEEZE_BEHIND_MAX_BB && effBB >= 2 * behindBB) {
-        return stackOffOK(behindBB, MANIAC_RAISED_STACKOFF_WIDEN) ? CALL : FOLD;
-      }
-    }
     return pctile >= 0.30 ? CONT : FOLD;
   }
 

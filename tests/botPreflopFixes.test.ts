@@ -53,10 +53,18 @@ describe('NEW-1 — a lone all-in is priced at the real depth, not at the shover
     const { t, me } = utgShovesFoldsToBB();
     expect(getEffectiveStackBB(t, me)).toBe(100);
   });
-  it.each(ARCHS)('%s in the BB calls a lone 100 BB shove with 3-12%% of hands (was 53-66%%)', (a) => {
+  // Fix-up 5 (2026-11-10, THE MANIAC CLASS): a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC again
+  // (maniacFacingRaise0dc1b96): it answers the lone shove with 0dc1b96's push/fold on the chips-left depth (the next row);
+  // every other archetype keeps NEW-1.
+  it.each(ARCHS.filter((a) => a !== 'MANIAC'))('%s in the BB calls a lone 100 BB shove with 3-12%% of hands (was 53-66%%)', (a) => {
     const r = rate(utgShovesFoldsToBB, prof(a), cont);
     expect(r).toBeGreaterThanOrEqual(0.03);
     expect(r).toBeLessThanOrEqual(0.12);
+  });
+  it('fix-up 5: the MANIAC in the BB answers it as 0dc1b96 does (50-80% of hands; 0dc1b96 ~65%, f605403 ~8%)', () => {
+    const r = rate(utgShovesFoldsToBB, prof('MANIAC'), cont);
+    expect(r).toBeGreaterThanOrEqual(0.5);
+    expect(r).toBeLessThanOrEqual(0.8);
   });
   it('AA always calls it, 72o never', () => {
     expect(rate(utgShovesFoldsToBB, prof('NIT'), cont, 100, 'AA')).toBe(1);
@@ -72,9 +80,12 @@ describe('NEW-1 — a lone all-in is priced at the real depth, not at the shover
     expect(r10).toBeGreaterThan(0.28); expect(r10).toBeLessThan(0.45);
     expect(r20).toBeGreaterThan(0.14); expect(r20).toBeLessThan(0.28);
   });
-  it('NEW-5 — a MANIAC with three players behind no longer calls off 100 BB with ~91% of hands', () => {
+  // Fix-up 5 (2026-11-10, THE MANIAC CLASS) returned this spot to 0dc1b96 for the MANIAC: with the stack-off ranges (NEW-5)
+  // and the light re-raise cap, MANIACs that had not raised folded where 0dc1b96's call, and the raises of the others were
+  // dead money for a human's shove (five 200 BB MANIACs, open any two, shove over the re-raise: +218 BB/100, live -85).
+  it('NEW-5 (fix-up 5: as 0dc1b96) — a MANIAC with three players behind answers a 100 BB shove as 0dc1b96 again: >= 85% (f605403 <= 10%)', () => {
     const b = () => { const t = mk(6); t.playerAllIn(3); t.playerFold(4); return { t, me: 5 }; };
-    expect(rate(b, prof('MANIAC'), cont)).toBeLessThanOrEqual(0.10);
+    expect(rate(b, prof('MANIAC'), cont)).toBeGreaterThanOrEqual(0.85);
   });
   it('All-In or Fold: the big blind calls a lone 50 BB shove with the 25 BB Nash range (was ~65-70%)', () => {
     const b = () => { const t = mk(6, 50); t.playerAllIn(3); for (const s of [4, 5, 0, 1]) t.playerFold(s); return { t, me: 2 }; };
