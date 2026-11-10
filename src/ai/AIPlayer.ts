@@ -1145,15 +1145,15 @@ function decideActionForSeat(
   );
   // Fix-up 3 (HOLDEM-RR2-EXPLOIT-2) — the Hold'em family only (never Stud / draw): against an all-in, or a bet that left its
   // maker NEAR_ALLIN_LEFT_FRACTION of his stack or less, the decision is priced.
-  //  - The pre-flop price floor on the later streets: at most MICRO_CALL_NEED of equity per opponent needed, a FOLD is a call.
-  //    The MANIAC "raise or fold" (and NIT / ROCK below a fixed strength) folded air to a human's last 2-5 BB in an 80-400 BB
-  //    pot after flat-calling his near-all-in raise.
+  //  - The price floor after the flop: at most POSTFLOP_MICRO_CALL_NEED of equity per opponent needed (fix-up 4; fix-up 3
+  //    used the pre-flop MICRO_CALL_NEED), a FOLD is a call. The MANIAC "raise or fold" (and NIT / ROCK below a fixed
+  //    strength) folded air to a human's last 2-5 BB in an 80-400 BB pot after flat-calling his near-all-in raise.
   //  - A MANIAC continues only with its value hands (MANIAC_ALLIN_VALUE_STRENGTH) or above the price, read against its range
   //    read and against any two cards: its "raise" there is a call, and it called 45% of its air at any price
   //    (MANIAC_ALLIN_VALUE_STRENGTH doc). Not pot-limit Omaha (the floor only): see the same doc.
   const allInBettor = !sdKind && table.bettingStructure !== 'fixed-limit' && callAmount > 0
     ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
-  if (allInBettor && potOdds <= MICRO_CALL_NEED / Math.max(1, numOpponents)) {
+  if (allInBettor && potOdds <= POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents)) {
     if (post.action === PlayerAction.Fold) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
   } else if (allInBettor && !isOmahaFamily && profile.archetype === 'MANIAC' && post.action !== PlayerAction.Fold
       && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds
@@ -1215,6 +1215,16 @@ export const CS_CALL_WIDTH = 0.60;
  * HAI-3 (fix round 2): per opponent in the pot — the cutoff is MICRO_CALL_NEED / the live opponents.
  */
 export const MICRO_CALL_NEED = 0.25;
+/**
+ * Fix round 4, fix-up 4 (HOLDEM-F3-REGRESSION-1) — after the flop, Hold'em family: a call against an all-in or a committed
+ * bettor (nearAllInRaiser) at this needed equity or less per live opponent is always made. Fix-up 3 used the pre-flop
+ * MICRO_CALL_NEED (0.25): heads-up that prices in a half-pot bet, and the committed-bettor test (no more than the pot behind)
+ * reaches ordinary turn and river bets, so every archetype called a 0.33-0.45-pot river bet with air (a 40 BB human vs a
+ * 100 BB bot: TAG / LAG / NIT / ROCK / MANIAC folded 0% of it; live 0dc1b96 86-100%). At 0.10 the floor still calls what it
+ * is for, a human's last 2-5 BB into an 80-400 BB pot (<= 6% needed heads-up, <= 2% three-way), and the bot prices a
+ * third-pot bet (20% needed) as before.
+ */
+export const POSTFLOP_MICRO_CALL_NEED = 0.10;
 /**
  * Fix round 3 (PLO NEW-1 check) — pot-limit Omaha: a lone all-in the call closes is called with any hand at this
  * needed equity or less per opponent. Four-card hands run close (a random hand has 34% against AAxx on average,

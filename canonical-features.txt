@@ -2199,7 +2199,7 @@ shover.currentBet + shover.chipCount
 pctile >= 0.30 ? CONT : FOLD
 pureCall && callAmount < seat.chipCount ? CONT : ALLIN
 shoverFaced(table, seat) ?? nearAllInRaiser(table, seat)
-MICRO_CALL_NEED / Math.max(1, numOpponents)
+# SUPERSEDED 2026-11-10 by POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents) (fix-up 4, HOLDEM-F3-REGRESSION-1: the post-flop floor has its own micro constant): MICRO_CALL_NEED / Math.max(1, numOpponents)
 # 2026-11-09 (fix-up 3, sweep finding) - decideAction (Hold'em family): a MANIAC facing an all-in (or a near-all-in bet) after the
 # flop continues only above MANIAC_ALLIN_VALUE_STRENGTH or above the price: its "raise or fold" called 45% of its air at any
 # price, and flatting a MANIAC raise with any two then moving in on the flop with a pair or a draw won +41 BB/100 (live -3).
@@ -2216,3 +2216,8 @@ table.communityCards, numOpponents, profile.difficulty, isOmahaFamily, 0, isShor
 # pre-flop (no extra cheap flops) and its multiway share read folded what the call needed (12 BB any-four flop all-in vs five
 # 100 BB MANIACs +104 BB/100, 7740996 +70, live +59; without it +63).
 allInBettor && !isOmahaFamily && profile.archetype
+# 2026-11-10 (bots review fix round 4 fix-up 4, holdem lane, HOLDEM-F3-REGRESSION-1) - decideAction (Hold'em family): the price floor
+# after the flop is POSTFLOP_MICRO_CALL_NEED (0.10) per opponent, not the pre-flop MICRO_CALL_NEED (0.25): with the committed-bettor
+# test (no more than the pot behind) every archetype called a 0.33-0.45-pot river bet with air (0% folds; live 0dc1b96 86-100%).
+POSTFLOP_MICRO_CALL_NEED
+POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents)
