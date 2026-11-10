@@ -311,3 +311,52 @@ describe('THE MANIAC CLASS (HOLDEM-F3-REGRESSION-2 = MEASUREMENT-1 = EXPLOIT-2) 
     expect([line, r.hands, r.drift, r.bb100 < 0]).toEqual([line, hands, 0, true]);
   }, 1_200_000);
 });
+
+const card = (r: number, s: number) => ({ rank: r, suit: s });
+/** 4 players at 50/100 (button 3: small blind 0 = the human, big blind 1, UTG 2, button 3); everyone puts in 15 BB pre-flop; the human starts with humanBB. Flop K-Q-3 rainbow; the bots hold air. */
+function flopSpot(humanBB: number, tag: string): any {
+  const t = new PokerTable({ tableId: tag, tableName: tag, smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
+  for (let i = 0; i < 4; i++) expect(t.sitDown(i, 'P' + i, (i === 0 ? humanBB : 100) * BB, (i === 0 ? 'player-' : 'ai-') + tag + i, i !== 0)).toBe(true);
+  t.presetFirstButton(3);
+  expect(t.startNewHand()).toBe(true);
+  // pre-flop order: UTG 2, button 3, small blind 0, big blind 1
+  expect(t.playerRaise(2, 15 * BB)).toBe(true); expect(t.playerCall(3)).toBe(true); expect(t.playerCall(0)).toBe(true); expect(t.playerCall(1)).toBe(true);
+  expect(t.currentPhase).toBe(GamePhase.Flop);
+  t.communityCards = [card(13, 0), card(12, 1), card(3, 2)];
+  const air = [[card(7, 3), card(2, 0)], [card(9, 3), card(4, 0)], [card(8, 2), card(5, 3)]];
+  for (let i = 1; i <= 3; i++) t.seats[i].holeCards = air[i - 1];
+  t.seats[0].holeCards = [card(14, 3), card(14, 2)];
+  return t;
+}
+describe('re-review 4 P3 — the two fix-up 4 sub-rules no node test caught (each test fails only with its own rule reverted)', () => {
+  it('the post-flop price floor is flat: three MANIACs with air facing a short human\'s last 5 BB flop all-in into 60 BB (7.7% needed) never fold (per opponent, 3.3%, they did)', () => {
+    let folds = 0, n = 0;
+    const restore = detEnv(901);
+    try {
+      for (let k = 0; k < 60; k++) {
+        const t = flopSpot(20, 'fl' + k);
+        expect(t.activeSeatIndex).toBe(0);
+        expect(t.playerAllIn(0)).toBe(true);
+        const a = t.activeSeatIndex; expect(a).toBe(1);
+        n++; if (AI.decideAction(t, a, prof('MANIAC', a)).action === PlayerAction.Fold) folds++;
+      }
+    } finally { restore(); }
+    expect([n, folds]).toEqual([60, 0]);
+  });
+  it('a dry side pot against a short human who is not all-in (no more than 10% of the pot behind) is checked down: MANIAC air never bets it', () => {
+    let bets = 0, n = 0;
+    const restore = detEnv(902);
+    try {
+      for (let k = 0; k < 60; k++) {
+        const t = flopSpot(15.5, 'mc' + k);   // the human keeps 0.5 BB behind a 60 BB pot
+        expect(t.seats[0].allIn).toBe(false);
+        expect(t.activeSeatIndex).toBe(0);
+        expect(t.playerCheck(0)).toBe(true);
+        const a = t.activeSeatIndex; expect(a).toBe(1);
+        n++; const d = AI.decideAction(t, a, prof('MANIAC', a));
+        if (d.action === PlayerAction.Raise || d.action === PlayerAction.AllIn) bets++;
+      }
+    } finally { restore(); }
+    expect([n, bets]).toEqual([60, 0]);
+  });
+});

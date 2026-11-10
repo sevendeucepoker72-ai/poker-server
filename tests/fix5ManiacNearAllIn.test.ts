@@ -13,9 +13,9 @@
  *      (postFlopStrategy's MANIAC "raise or fold" has no price; NIT and ROCK fold below a fixed strength too).
  * Re-raise to 95% of the stack, call any re-raise, shove any flop (hard, whole line, BB/100): +82 (5) for a 40 BB human
  * against two 100 BB MANIACs, +1,285 (104) for a 100 BB human against five 300 BB MANIACs (live 0dc1b96 -28 / -131).
- * With NEAR_ALLIN_SPR every pre-flop all-in rule reads such a raise as the all-in (deeper than the push/fold zone; a bot
- * that continues re-raises to cover him), and after the flop, in the Hold'em family, against an all-in or a bet from a
- * committed player: a FOLD at no more than a micro price per opponent (POSTFLOP_MICRO_CALL_NEED, fix-up 4) becomes a call, and
+ * With NEAR_ALLIN_SPR every pre-flop all-in rule reads such a raise as the all-in (at every depth since fix-up 4; a bot
+ * that continues re-raises to cover him deeper than 25 BB and heads-up, else calls), and after the flop, in the Hold'em family, against an all-in or a bet from a
+ * committed player: a FOLD at no more than a micro price (POSTFLOP_MICRO_CALL_NEED, flat, fix-up 4) becomes a call, and
  * a MANIAC continues only with MANIAC_ALLIN_VALUE_STRENGTH or above the price (its "raise or fold" called 45% of its air
  * there at any price: flat a MANIAC raise with any two, move in on the flop with a pair or a draw, won +41 (9) BB/100 with
  * two 100 BB MANIACs and a 40 BB stack, live -3 (10)); not in pot-limit Omaha (the floor only there).

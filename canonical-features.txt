@@ -2217,7 +2217,7 @@ NEAR_ALLIN_SPR * (table.getTotalPot() + table.getCallAmount(seat))
 # 100 BB MANIACs +104 BB/100, 7740996 +70, live +59; without it +63).
 allInBettor && !isOmahaFamily && profile.archetype
 # 2026-11-10 (bots review fix round 4 fix-up 4, holdem lane, HOLDEM-F3-REGRESSION-1) - decideAction (Hold'em family): the price floor
-# after the flop is POSTFLOP_MICRO_CALL_NEED (0.10) per opponent, not the pre-flop MICRO_CALL_NEED (0.25): with the committed-bettor
+# after the flop is POSTFLOP_MICRO_CALL_NEED (0.10, flat since f605403: not per opponent), not the pre-flop MICRO_CALL_NEED (0.25): with the committed-bettor
 # test (no more than the pot behind) every archetype called a 0.33-0.45-pot river bet with air (0% folds; live 0dc1b96 86-100%).
 POSTFLOP_MICRO_CALL_NEED
 # SUPERSEDED 2026-11-10 by POSTFLOP_MICRO_CALL_NEED) { (fix-up 4, HOLDEM-F3-EXPLOIT-1: the post-flop floor is flat, not per opponent): POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents)
