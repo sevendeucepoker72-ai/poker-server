@@ -2234,5 +2234,10 @@ getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, opp
 function sidePotAgainstShortStack(
 sidePotAgainstShortStack(table, seat)
 shover = nearAllInRaiser(table, seat);
-shover && !shover.allIn && shoveBB >
+# SUPERSEDED 2026-11-10 by shover && !shover.allIn && (shoveBB > (fix-up 5, HOLDEM-F4-REGRESSION-1: heads-up the committed raiser is covered at every depth): shover && !shover.allIn && shoveBB >
 POSTFLOP_MICRO_CALL_NEED) {
+# 2026-11-10 (fix-up 5, HOLDEM-F4-REGRESSION-1 / MEASUREMENT-1 / EXPLOIT-2) - preFlopStrategy: against a committed raiser who is the only
+# other player with chips, a bot that continues covers him (the jam) at every depth; fix-up 4 called at 25 BB or less and the
+# bot then folded his flop all-in (Heads-Up Snap 20 BB any two opened to 40-50% +68..+139 BB/100 vs NIT / ROCK, live -152..-338).
+shover && !shover.allIn && (shoveBB >
+othersWithChips === 1))

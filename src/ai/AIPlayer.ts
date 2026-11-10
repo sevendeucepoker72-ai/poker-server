@@ -1653,15 +1653,6 @@ function preFlopStrategy(
   let shover = callAmount > 0 ? shoverFaced(table, seat) : null;
   if (!shover && callAmount > 0 && noLimit && !allInOrFold) shover = nearAllInRaiser(table, seat);
   const shoveBB = shover ? Math.max(1, Math.round(Math.min(handStartStack(seat), handStartStack(shover)) / bigBlind)) : 0;
-  // Fix-up 3 — continuing against the all-in: a call; against a near-all-in raise, a re-raise to cover him (a flat call
-  // left him his last chips to move in after the flop, and folding air to them was the leak). Fix-up 4: with 25 BB or less
-  // at risk, a call, as against his all-in: the cover is a full min-raise (twice his raise) and started side-pot wars that
-  // folded the other callers (a raise to 30% of 25 BB, then any flop all-in: +253 BB/100 with five 100 BB MANIACs, live +13).
-  let CONT = CALL;
-  if (shover && !shover.allIn && shoveBB > PUSH_FOLD_MAX_BB) {
-    const to = Math.max(minRaise, shover.currentBet + shover.chipCount);
-    CONT = to >= seat.chipCount + seat.currentBet ? ALLIN : { action: PlayerAction.Raise, raiseAmount: to };
-  }
   // Review fix — price a spot as "calling the shove" ONLY when nobody else can
   // still act: pureCall = a call closes the action; pureAllInCall = no other live
   // opponent has chips (it is this seat against the all-in player(s) alone).
@@ -1671,6 +1662,19 @@ function preFlopStrategy(
     if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
     othersWithChips++;
     if (s.currentBet < table.currentBetToMatch) othersToAct++;
+  }
+  // Fix-up 3 — continuing against the all-in: a call; against a near-all-in raise, a re-raise to cover him (a flat call
+  // left him his last chips to move in after the flop, and folding air to them was the leak). Fix-up 4: with 25 BB or less
+  // at risk, a call, as against his all-in: the cover is a full min-raise (twice his raise) and started side-pot wars that
+  // folded the other callers (a raise to 30% of 25 BB, then any flop all-in: +253 BB/100 with five 100 BB MANIACs, live +13).
+  // Fix-up 5 (HOLDEM-F4-REGRESSION-1 / MEASUREMENT-1): the cover at every depth when he is the only other player with chips
+  // (no side pot can be played): heads-up the call left him the flop all-in, which the bot then folded (Heads-Up Snap,
+  // 20 BB, any two opened to 40-50% of the stack and moved in on any flop: +68 to +139 BB/100 against NIT / ROCK, live
+  // -152 to -338; opened to 35%, a pair or draw moved in: +23 to +80 against every archetype, live -58 to -117).
+  let CONT = CALL;
+  if (shover && !shover.allIn && (shoveBB > PUSH_FOLD_MAX_BB || othersWithChips === 1)) {
+    const to = Math.max(minRaise, shover.currentBet + shover.chipCount);
+    CONT = to >= seat.chipCount + seat.currentBet ? ALLIN : { action: PlayerAction.Raise, raiseAmount: to };
   }
   const pureCall = !!shover && othersToAct === 0;
   const pureAllInCall = !!shover && othersWithChips === 0;
