@@ -1145,8 +1145,8 @@ function decideActionForSeat(
   );
   // Fix-up 3 (HOLDEM-RR2-EXPLOIT-2) — the Hold'em family only (never Stud / draw): against an all-in, or a bet from a committed
   // player (nearAllInRaiser: no more than the pot behind), the decision is priced.
-  //  - The price floor after the flop: at most POSTFLOP_MICRO_CALL_NEED of equity per opponent needed (fix-up 4; fix-up 3
-  //    used the pre-flop MICRO_CALL_NEED), a FOLD is a call. The MANIAC "raise or fold" (and NIT / ROCK below a fixed
+  //  - The price floor after the flop: at most POSTFLOP_MICRO_CALL_NEED of equity needed (fix-up 4: flat; fix-up 3 used the
+  //    pre-flop MICRO_CALL_NEED per opponent), a FOLD is a call. The MANIAC "raise or fold" (and NIT / ROCK below a fixed
   //    strength) folded air to a human's last 2-5 BB in an 80-400 BB pot after flat-calling his near-all-in raise.
   //  - A MANIAC continues only with its value hands (MANIAC_ALLIN_VALUE_STRENGTH) or above the price, read against its range
   //    read and against any two cards: its "raise" there is a call, and it called 45% of its air at any price
@@ -1154,7 +1154,7 @@ function decideActionForSeat(
   //    Monte Carlo equity at every difficulty (below hard getPostFlopStrength is a static ladder: see the same doc).
   const allInBettor = !sdKind && table.bettingStructure !== 'fixed-limit' && callAmount > 0
     ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
-  if (allInBettor && potOdds <= POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents)) {
+  if (allInBettor && potOdds <= POSTFLOP_MICRO_CALL_NEED) {
     if (post.action === PlayerAction.Fold) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
   } else if (allInBettor && !isOmahaFamily && profile.archetype === 'MANIAC' && post.action !== PlayerAction.Fold
       && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH) {
@@ -1164,6 +1164,15 @@ function decideActionForSeat(
     if ((mcTier ? effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds) {
       return { action: PlayerAction.Fold, raiseAmount: 0 };
     }
+  }
+  // Fix-up 4 (HOLDEM-F3-EXPLOIT-1) — the Hold'em family, not Omaha: a dry side pot is checked down. With a short player in the
+  // hand (all-in, or no more than POSTFLOP_MICRO_CALL_NEED of the pot behind) and another live opponent with chips, a hand
+  // below MANIAC_ALLIN_VALUE_STRENGTH does not bet the side pot (the bet is a check) or raise his all-in (the raise is a
+  // call): the other main-pot callers folded to it and their chips were dead money in his pot (sidePotAgainstShortStack).
+  if (!sdKind && !isOmahaFamily && table.bettingStructure !== 'fixed-limit' && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH
+      && (post.action === PlayerAction.Raise || post.action === PlayerAction.AllIn) && sidePotAgainstShortStack(table, seat)) {
+    if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
+    if (shoverFaced(table, seat)) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
   }
   return limitBotRaiseWar(table, seat, post, false, effectiveStrength);
 }
@@ -1221,12 +1230,15 @@ export const CS_CALL_WIDTH = 0.60;
 export const MICRO_CALL_NEED = 0.25;
 /**
  * Fix round 4, fix-up 4 (HOLDEM-F3-REGRESSION-1) — after the flop, Hold'em family: a call against an all-in or a committed
- * bettor (nearAllInRaiser) at this needed equity or less per live opponent is always made. Fix-up 3 used the pre-flop
+ * bettor (nearAllInRaiser) at this needed equity or less is always made. Fix-up 3 used the pre-flop
  * MICRO_CALL_NEED (0.25): heads-up that prices in a half-pot bet, and the committed-bettor test (no more than the pot behind)
  * reaches ordinary turn and river bets, so every archetype called a 0.33-0.45-pot river bet with air (a 40 BB human vs a
  * 100 BB bot: TAG / LAG / NIT / ROCK / MANIAC folded 0% of it; live 0dc1b96 86-100%). At 0.10 the floor still calls what it
- * is for, a human's last 2-5 BB into an 80-400 BB pot (<= 6% needed heads-up, <= 2% three-way), and the bot prices a
- * third-pot bet (20% needed) as before.
+ * is for, a human's last 2-5 BB into an 80-400 BB pot (<= 6% needed), and the bot prices a third-pot bet (20% needed) as
+ * before. Flat, not per opponent (HOLDEM-F3-EXPLOIT-1): divided by three live opponents (3.3%), a short human's last 5 BB
+ * into a 60 BB multiway pot (7% needed) was folded by MANIAC air, and those callers' chips were dead money in his main pot
+ * (a raise to 75% of 20 BB over a MANIAC open, then the flop all-in: +134 (48) BB/100 against five 100 BB MANIACs, live -83).
+ * It is also the short stack of a dry side pot (sidePotAgainstShortStack).
  */
 export const POSTFLOP_MICRO_CALL_NEED = 0.10;
 /**
@@ -1329,10 +1341,11 @@ export const MANIAC_SHORT_SHOVE_MAX_BB = 75;
 /**
  * Fix round 4, fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — no-limit Hold'em family: a raise (or a post-flop bet) whose maker has no
  * more chips behind than this many times the pot this seat's call would make (a stack-to-pot ratio <= 1: his last bet can be
- * no bigger than that pot, so it is priced in) is the all-in it effectively is: he calls any re-raise. Pre-flop, deeper than
- * the push/fold zone (depth at risk > 25 BB), every all-in rule of preFlopStrategy reads it as the all-in (nearAllInRaiser: the
- * price floor, the commit gate, the MANIAC short-shove band, the opener / FISH / deep-MANIAC all-in rules, the flat rule), and
- * a bot that continues re-raises to cover him (a flat left him chips to move in after the flop). Post-flop the price floor and
+ * no bigger than that pot, so it is priced in) is the all-in it effectively is: he calls any re-raise. Pre-flop (fix-up 3:
+ * deeper than the push/fold zone, depth at risk > 25 BB; fix-up 4: every depth), every all-in rule of preFlopStrategy reads
+ * it as the all-in (nearAllInRaiser: the price floor, the commit gate, the MANIAC short-shove band, the opener / FISH /
+ * deep-MANIAC all-in rules, the flat rule), and a bot that continues re-raises to cover him (a flat left him chips to move in
+ * after the flop; fix-up 4: deeper than the push/fold zone only). Post-flop the price floor and
  * the MANIAC price rule (decideAction) treat his bet as an all-in. They keyed on a real all-in only, so a human who re-raised
  * a MANIAC's raise to 50-95% of his stack met the commit gate at the LARGEST opponent's depth (a 100 BB MANIAC continued 16%
  * against a 40 BB human's raise to 38 BB, 69% against his all-in) or the light re-raise cap (a 300 BB MANIAC flat-called
@@ -1347,6 +1360,9 @@ export const MANIAC_SHORT_SHOVE_MAX_BB = 75;
  * flop won +22 (9) / +25 (10) BB/100 with one 100 BB MANIAC and a 40 BB stack (live 0dc1b96 -7 / -2); with this ratio
  * -1 / -1, and 0.3 / 0.35 +1 / -6. Fix-up 4 removed the half-stack clause: it never fired alone (chips behind no more than
  * what he has put in are no more than the pot).
+ * Fix-up 4 (HOLDEM-F3-EXPLOIT-1): at every depth outside All-In or Fold (fix-up 3: depth at risk > 25 BB). With 25 BB or
+ * less at risk a bot that continues calls him, as against his all-in (the cover re-raise started side-pot wars), and a dry
+ * side pot against him is checked down (sidePotAgainstShortStack).
  */
 export const NEAR_ALLIN_SPR = 1;
 /**
@@ -1431,6 +1447,23 @@ export function nearAllInRaiser(table: PokerTable, seat: Seat): Seat | null {
   if (!s || s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) return null;
   if (s.currentBet !== table.currentBetToMatch) return null;
   return s.chipCount <= NEAR_ALLIN_SPR * (table.getTotalPot() + table.getCallAmount(seat)) ? s : null;
+}
+
+/**
+ * Fix-up 4 (HOLDEM-F3-EXPLOIT-1) — a side pot is being played against a short player: a live opponent is all-in or has no
+ * more than POSTFLOP_MICRO_CALL_NEED of the pot behind, and another live opponent still has chips. Under the light re-raise
+ * cap deep MANIACs flat-call a short player's all-in (or his raise to 75-95% of 12-25 BB) three or four handed; after the
+ * flop one of them bet the side pot (a MANIAC bets every flop, and raises a micro all-in) and the others folded, so their
+ * calls were dead money in his main pot: an all-in for 12 BB over a MANIAC open won +204 (21) BB/100 against five 100 BB
+ * MANIACs (hard; live 0dc1b96 -63 (8), where they isolate it), a raise to 95% of 12 / 15 / 20 / 25 BB +234 / +288 / +304 /
+ * +328 (live -52 / -63 / -76 / -56). A bet or raise there with less than MANIAC_ALLIN_VALUE_STRENGTH is checked or called
+ * (decideAction): with it, -68 / -90 / -90 / -113 / -197 (seed 1, 1,500 hands each).
+ */
+export function sidePotAgainstShortStack(table: PokerTable, seat: Seat): boolean {
+  const pot = table.getTotalPot();
+  const live = table.seats.filter((s) => s.seatIndex !== seat.seatIndex && s.state === 'occupied' && !s.folded && !s.eliminated);
+  return live.some((x) => (x.allIn || x.chipCount <= POSTFLOP_MICRO_CALL_NEED * pot)
+    && live.some((o) => o !== x && !o.allIn && o.chipCount > 0));
 }
 
 /**
@@ -1615,16 +1648,17 @@ function preFlopStrategy(
   const headPyta = Math.min(3, Math.max(1, totalActive - 1));
   // NEW-1 — the all-in that SET the bet this seat faces, and the depth at risk
   // against it (min of the two hand-start stacks), never the shover's 0 left.
-  // Fix-up 3 (NEAR_ALLIN_SPR): no-limit, deeper than the push/fold zone, a raise from a committed player (no more than the
-  // pot behind) is that all-in for every rule below.
+  // Fix-up 3 (NEAR_ALLIN_SPR): no-limit, a raise from a committed player (no more than the pot behind) is that all-in for
+  // every rule below; fix-up 4 (HOLDEM-F3-EXPLOIT-1): at every depth (fix-up 3: deeper than the push/fold zone only).
   let shover = callAmount > 0 ? shoverFaced(table, seat) : null;
-  const nearRaiser = !shover && callAmount > 0 && noLimit && !allInOrFold ? nearAllInRaiser(table, seat) : null;
-  if (nearRaiser && Math.round(Math.min(handStartStack(seat), handStartStack(nearRaiser)) / bigBlind) > PUSH_FOLD_MAX_BB) shover = nearRaiser;
+  if (!shover && callAmount > 0 && noLimit && !allInOrFold) shover = nearAllInRaiser(table, seat);
   const shoveBB = shover ? Math.max(1, Math.round(Math.min(handStartStack(seat), handStartStack(shover)) / bigBlind)) : 0;
   // Fix-up 3 — continuing against the all-in: a call; against a near-all-in raise, a re-raise to cover him (a flat call
-  // left him his last chips to move in after the flop, and folding air to them was the leak).
+  // left him his last chips to move in after the flop, and folding air to them was the leak). Fix-up 4: with 25 BB or less
+  // at risk, a call, as against his all-in: the cover is a full min-raise (twice his raise) and started side-pot wars that
+  // folded the other callers (a raise to 30% of 25 BB, then any flop all-in: +253 BB/100 with five 100 BB MANIACs, live +13).
   let CONT = CALL;
-  if (shover && !shover.allIn) {
+  if (shover && !shover.allIn && shoveBB > PUSH_FOLD_MAX_BB) {
     const to = Math.max(minRaise, shover.currentBet + shover.chipCount);
     CONT = to >= seat.chipCount + seat.currentBet ? ALLIN : { action: PlayerAction.Raise, raiseAmount: to };
   }

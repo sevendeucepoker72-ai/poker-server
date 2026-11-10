@@ -31,7 +31,12 @@
  *              one flat-called under the light re-raise cap and folded air to his last 5 BB on the flop: +82 (5) and
  *              +1,285 (104) BB/100 on 7740996, hard, exploit review harness; live 0dc1b96 -28 / -131. With
  *              NEAR_ALLIN_SPR the raise is his all-in, and the post-flop price floor calls the micro all-in).
- *              His all-in is scored on its main pot from the board at which he went all-in.
+ *              His all-in is scored on its main pot from the board at which he went all-in. nsm:1 is the all-in itself.
+ *              Fix-up 4 (HOLDEM-F3-EXPLOIT-1): a 12-25 BB human (raise to 95%, or all-in) against five 100 BB MANIACs: they
+ *              flat-call him three or four handed under the light re-raise cap, one bet the side pot after the flop and the
+ *              others folded (dead money in his main pot): +304 / +204 BB/100 at 20 BB 95% / 12 BB all-in on 9cfda99
+ *              (exploit review harness; live 0dc1b96 -76 / -63). With the dry side pot checked down (sidePotAgainstShortStack)
+ *              and the committed raise read as his all-in at every depth, the rows below.
  * On 0bc7529 the light re-raise cap was 5% of the MANIAC's OWN stack, so a deep MANIAC re-raised ~93% of hands
  * again and folded ~78% of them to the 100 BB shove (hard, BB/100): tg:4:3 +445, osrr:3:3 +172 vs a 1,000 BB
  * MANIAC + 100 BB TAG/LAG/NIT/FISH; os:2.5 +182 vs five 200 BB MANIACs; heads-up os:4 +66 vs a 300 BB MANIAC
@@ -206,8 +211,10 @@ describe('HOLDEM-R3-REG-1 + call-then-fold — any two cards does not profit fro
   // rsjma at 40 BB sits within ~10 BB/100 of 0 on 6,000 hands either way: 30 x N (12,000) hands.
   const RSJMA_N = Number(process.env.FIX4_MDF_RSJMA_HANDS || 30 * N);
   // nsm (fix-up 3): 6,000 hands at 40 BB (seed 54: 7740996 +79.2, head -21.0; seed 52: +70.9 / -8.2); 600 against the five
-  // 300 BB MANIACs (seed 53: 7740996 +1,106.9, head -587.7).
+  // 300 BB MANIACs (seed 53: 7740996 +1,106.9, 9cfda99 -600.0).
   const NSM_N = Number(process.env.FIX4_MDF_NSM_HANDS || 15 * N);
+  // Fix-up 4: the 12-20 BB rows (hard, five 100 BB MANIACs), 1,000 hands: 9cfda99 +224.8 (20 BB, 95%) / +202.8 (12 BB, all-in).
+  const SHORT_N = Number(process.env.FIX4_MDF_SHORT_HANDS || Math.round(2.5 * N));
   // Every row names its difficulty: jest-each passes a `done` callback to a test function with more parameters than
   // the row has (fix-up 1: rows without it timed out after 600 s with `done` read as the difficulty).
   const CASES: Array<[string, string, string[], number[], number, number, number, string]> = [
@@ -222,6 +229,8 @@ describe('HOLDEM-R3-REG-1 + call-then-fold — any two cards does not profit fro
     ['rsjma', 'two MANIACs + TAG/FISH/LAG all 100 BB (hard), the human 40 BB', ['MANIAC', 'MANIAC', 'TAG', 'FISH', 'LAG'], [100, 100, 100, 100, 100], RSJMA_N, 51, 40, 'hard'],
     ['nsm:0.95', 'two MANIACs + TAG/FISH/LAG all 100 BB (hard), the human 40 BB', ['MANIAC', 'MANIAC', 'TAG', 'FISH', 'LAG'], [100, 100, 100, 100, 100], NSM_N, 54, 40, 'hard'],
     ['nsm:0.95', 'five 300 BB MANIACs (hard), the human 100 BB', M5, [300, 300, 300, 300, 300], Math.round(NSM_N / 10), 53, 100, 'hard'],
+    ['nsm:0.95', 'five 100 BB MANIACs (hard), the human 20 BB', M5, [100, 100, 100, 100, 100], SHORT_N, 55, 20, 'hard'],
+    ['nsm:1', 'five 100 BB MANIACs (hard), the human 12 BB', M5, [100, 100, 100, 100, 100], SHORT_N, 56, 12, 'hard'],
   ];
   it.each(CASES)('%s loses against %s', (line, _name, lineup, depths, hands, seed, heroBB, diff) => {
     const t0 = process.hrtime.bigint();

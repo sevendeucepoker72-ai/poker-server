@@ -1,12 +1,17 @@
 /**
  * tests/fix6HoldemFixup4.test.ts (2026-11-10, bots review fix round 4, fix-up 4), node level. No-limit Hold'em.
- *  1. HOLDEM-F3-REGRESSION-1 — the price floor after the flop is a MICRO floor (POSTFLOP_MICRO_CALL_NEED, 0.10 per opponent).
+ *  1. HOLDEM-F3-REGRESSION-1 — the price floor after the flop is a MICRO floor (POSTFLOP_MICRO_CALL_NEED, 0.10).
  *     Fix-up 3 used the pre-flop MICRO_CALL_NEED (0.25: heads-up a half-pot bet), and the committed-bettor test
  *     (nearAllInRaiser: no more than the pot behind) reaches ordinary river bets: every archetype called a 0.33 / 0.45-pot
  *     river bet with air (folded 0%; live 0dc1b96 86-100%).
  *  2. HOLDEM-F3-MEASUREMENT-2 / EXPLOIT-3 — the MANIAC price rule reads Monte Carlo equity at every difficulty. Below hard
  *     getPostFlopStrength is a static ladder, so a medium / easy MANIAC folded one pair 162 / 171 and two pair 14 / 40 to a
  *     heads-up any-two overbet all-in (live 35 / 0).
+ *  3. HOLDEM-F3-EXPLOIT-1 — a dry side pot is checked down (sidePotAgainstShortStack). Deep MANIACs flat-call a short
+ *     player's all-in (or his raise to 75-95% of 12-25 BB) three or four handed under the light re-raise cap; after the flop
+ *     one of them bet the side pot (or raised his last chips) with air and the others folded: their calls were dead money in
+ *     his main pot (+204 to +328 BB/100 against five 100 BB MANIACs, live -52 to -76). Now a bet or raise there below
+ *     MANIAC_ALLIN_VALUE_STRENGTH is a check or a call.
  * Real PokerTable + real decideAction; seeded Math.random, a seeded deck (crypto.randomBytes) and a frozen clock.
  */
 import { PokerTable, PlayerAction, GamePhase } from '../src/game/PokerTable';
@@ -114,11 +119,58 @@ function overbetShove(arch: string, difficulty: string, n: number, seed: number)
   return { pair, pairCont, two, twoCont };
 }
 
-describe('fix-up 4 — a micro floor after the flop; the MANIAC price on real equity', () => {
+/**
+ * Six-handed: the human (big blind, humanBB) faces UTG's 3 BB open (seat 1); MP and CO call (forced), the button and the small
+ * blind fold; the human moves all-in (frac 1) or raises to `frac` of his stack; the three bots call (forced). On the flop each
+ * bot that acts before the human (no bet to call) decides, then the human moves in his last chips (if any) and each bot faces
+ * that micro all-in. A side-pot bet / raise with air (no pair with a hole card, no four-flush, no four to a straight) or with
+ * trips or better (with a hole card) is counted. Every bot is a hard MANIAC with botBB.
+ */
+function sidePot(humanBB: number, frac: number, botBB: number, n: number, seed: number): { airSpots: number; airAgg: number; valSpots: number; valAgg: number } {
+  let airSpots = 0, airAgg = 0, valSpots = 0, valAgg = 0;
+  const restore = seedAll(seed);
+  try {
+    for (let k = 0; k < n; k++) {
+      const t = new PokerTable({ tableId: 's', tableName: 's', smallBlind: 50, bigBlind: BB, ante: 0, minBuyIn: BB } as any);
+      sit(t, [humanBB, botBB, botBB, botBB, botBB, botBB]);
+      (t as any).presetFirstButton(4);
+      expect(t.startNewHand()).toBe(true);
+      expect(t.playerRaise(1, 3 * BB)).toBe(true);
+      for (const x of [2, 3]) expect(t.playerCall(x)).toBe(true);
+      for (const x of [4, 5]) expect(t.playerFold(x)).toBe(true);
+      expect(frac >= 1 ? t.playerAllIn(0) : t.playerRaise(0, Math.round(frac * humanBB * 2) * BB / 2)).toBe(true);
+      for (const x of [1, 2, 3]) expect(t.playerCall(x)).toBe(true);
+      expect(t.currentPhase).toBe(GamePhase.Flop);
+      let g = 0;
+      while (t.currentPhase === GamePhase.Flop && t.isHandInProgress() && g++ < 8) {
+        const a = t.activeSeatIndex;
+        if (a < 0) break;
+        if (a === 0) { expect(t.playerAllIn(0)).toBe(true); continue; }
+        const hole = t.seats[a].holeCards, board = t.communityCards, all = [...hole, ...board];
+        const pairWithHole = hole[0].rank === hole[1].rank || hole.some((c) => board.some((b) => b.rank === c.rank));
+        const fourFlush = [0, 1, 2, 3].some((su) => all.filter((c) => c.suit === su).length >= 4);
+        const ranks = new Set<number>(all.map((c) => c.rank as number)); if (ranks.has(14)) ranks.add(1);
+        let fourStraight = false; for (let lo = 1; lo <= 11; lo++) { let m = 0; for (let r = lo; r < lo + 5; r++) if (ranks.has(r)) m++; if (m >= 4) fourStraight = true; }
+        const air = !pairWithHole && !fourFlush && !fourStraight;
+        const value = pairWithHole && evaluateHand(all).handRank >= HandRank.ThreeOfAKind;
+        const d = decideAction(t, a, prof('MANIAC'));
+        const agg = d.action === PlayerAction.Raise || d.action === PlayerAction.AllIn;
+        if (air) { airSpots++; if (agg) airAgg++; }
+        if (value) { valSpots++; if (agg) valAgg++; }
+        // continue the street passively: the human's main pot is what is scored here
+        const ok = t.getCallAmount(t.seats[a]) > 0 ? (t.playerCall(a) || t.playerAllIn(a)) : t.playerCheck(a);
+        if (!ok) t.playerFold(a);
+      }
+    }
+  } finally { restore(); }
+  return { airSpots, airAgg, valSpots, valAgg };
+}
+
+describe('fix-up 4 — a micro floor after the flop; the MANIAC price on real equity; a dry side pot is checked down', () => {
   const log: string[] = [];
   afterAll(() => process.stdout.write(`fix6 holdem fix-up 4: ${log.join('; ')}\n`));
 
-  it('the post-flop floor is micro: POSTFLOP_MICRO_CALL_NEED is 0.10 per opponent, the pre-flop MICRO_CALL_NEED stays 0.25', () => {
+  it('the post-flop floor is micro: POSTFLOP_MICRO_CALL_NEED is 0.10, the pre-flop MICRO_CALL_NEED stays 0.25', () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const AI = require('../src/ai/AIPlayer');
     expect([AI.POSTFLOP_MICRO_CALL_NEED, AI.MICRO_CALL_NEED]).toEqual([0.10, 0.25]);
@@ -142,6 +194,16 @@ describe('fix-up 4 — a micro floor after the flop; the MANIAC price on real eq
       const r = overbetShove('MANIAC', diff, 200, 6700);
       log.push(`MANIAC ${diff} vs a 97 BB flop all-in into 6 BB: one pair ${r.pairCont}/${r.pair}, two pair+ ${r.twoCont}/${r.two} continue`);
       if (r.pair < 40 || r.pairCont < 0.70 * r.pair || r.two < 10 || r.twoCont < 0.90 * r.two) bad.push(`${diff}: one pair ${r.pairCont}/${r.pair}, two pair+ ${r.twoCont}/${r.two}`);
+    }
+    expect(bad).toEqual([]);
+  });
+
+  it('a dry side pot is checked down: with a 12 BB human all-in (or a 20 BB human with 1 BB left) and three 100 BB MANIACs in, MANIAC air never bets or raises the side pot after the flop (9cfda99: it bets / raises most of it), trips or better still do (>= 60%)', () => {
+    const bad: string[] = [];
+    for (const [h, f] of [[12, 1], [20, 0.95]]) {
+      const r = sidePot(h, f, 100, 160, 6900 + h);
+      log.push(`side pot vs a ${h} BB human (${f < 1 ? 'raise to ' + f : 'all-in'}): air bets / raises ${r.airAgg}/${r.airSpots}, trips+ ${r.valAgg}/${r.valSpots}`);
+      if (r.airSpots < 60 || r.airAgg > 0 || r.valSpots < 5 || r.valAgg < 0.6 * r.valSpots) bad.push(`${h} BB: air ${r.airAgg}/${r.airSpots}, trips+ ${r.valAgg}/${r.valSpots}`);
     }
     expect(bad).toEqual([]);
   });

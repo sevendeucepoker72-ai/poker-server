@@ -2220,9 +2220,19 @@ allInBettor && !isOmahaFamily && profile.archetype
 # after the flop is POSTFLOP_MICRO_CALL_NEED (0.10) per opponent, not the pre-flop MICRO_CALL_NEED (0.25): with the committed-bettor
 # test (no more than the pot behind) every archetype called a 0.33-0.45-pot river bet with air (0% folds; live 0dc1b96 86-100%).
 POSTFLOP_MICRO_CALL_NEED
-POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents)
+# SUPERSEDED 2026-11-10 by POSTFLOP_MICRO_CALL_NEED) { (fix-up 4, HOLDEM-F3-EXPLOIT-1: the post-flop floor is flat, not per opponent): POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents)
 # 2026-11-10 (fix-up 4, HOLDEM-F3-MEASUREMENT-2 / EXPLOIT-3) - decideAction (Hold'em family, not Omaha): the MANIAC price rule reads
 # Monte Carlo equity at every difficulty: below hard both reads were the static ladder (one pair 0.22-0.34), so a medium / easy MANIAC
 # folded one pair 95% to an any-two overbet all-in (heads-up / Spin & Go medium: call small raises, move in on any flop +28 / +52 BB/100).
 effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds
 getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, oppMin, isShortDeck, false)
+# 2026-11-10 (fix-up 4, HOLDEM-F3-EXPLOIT-1) - a committed raise (NEAR_ALLIN_SPR) is the all-in at every depth outside All-In or Fold
+# (continued by a call at 25 BB or less), the post-flop floor is flat, and a dry side pot is checked down (decideAction, Hold'em family,
+# not Omaha: with a short player all-in or with <= POSTFLOP_MICRO_CALL_NEED of the pot behind and another live opponent with chips, a
+# bet / raise below MANIAC_ALLIN_VALUE_STRENGTH is a check / call): flat-called short all-ins / 95% raises over a MANIAC open won
+# +204..+328 BB/100 against five 100 BB MANIACs (live -52..-76) from the side-pot folds of the other callers.
+function sidePotAgainstShortStack(
+sidePotAgainstShortStack(table, seat)
+shover = nearAllInRaiser(table, seat);
+shover && !shover.allIn && shoveBB >
+POSTFLOP_MICRO_CALL_NEED) {
