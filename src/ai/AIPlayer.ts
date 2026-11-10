@@ -1435,6 +1435,58 @@ function ownRaisesThisStreet(table: PokerTable, seat: Seat): number {
   return n;
 }
 
+/** Fix-up 5 sweep — calls this seat has made on the current street (a posted blind is not one), from the action log. */
+function ownCallsThisStreet(table: PokerTable, seat: Seat): number {
+  let n = 0;
+  for (const e of table.actionLog) {
+    if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && /^called /.test(e.action)) n++;
+  }
+  return n;
+}
+
+/**
+ * Fix-up 5 sweep (the flat-then-fold dead money) — no-limit (Hold'em, Short Deck, Pineapple), not All-In or Fold: a
+ * non-MANIAC that flat-called a raise this street (more than the big blind in), facing an all-in or a committed raise
+ * that its call closes, with more than 25 BB at risk, makes 0dc1b96's continue decision for its archetype (0dc1b96's
+ * thresholds, on 0dc1b96's chips-left depth), not the stack-off range. With the stack-off range (NEW-1: 3-way at 100 BB
+ * about the top 3%) a FISH that flat-called a MANIAC re-raise folded 96% of them to the human's all-in (0dc1b96: 35%), so
+ * its flat was dead money (17.2 BB per all-in spot, 0dc1b96 8.4): two 300 BB MANIACs + TAG / FISH / LAG, a 100 BB human
+ * opening 2.5 / 3 BB with any two and moving in over the re-raise won +161 / +406 BB/100 (0dc1b96 -44 / +101; EV v3);
+ * one MANIAC + TAG / LAG / NIT / FISH at 100 BB, open 10 BB and move in, +103 / +84 (0dc1b96 -330 / -299). A seat that has
+ * not called this street (a lone all-in, the blinds) keeps the stack-off range: non-MANIAC archetypes still continue
+ * 5-10% against a lone 100 BB all-in. A MANIAC never gets here (maniacFacingRaise0dc1b96). FOLD keeps the value hold.
+ */
+function flatterContinue0dc1b96(
+  table: PokerTable, seat: Seat, profile: AIPlayerProfile, pctile: number, callAmount: number, bucket: PosBucket,
+  factor: number, huFactor: number, threeBetTh: number, facingThreeBet: boolean, CONT: AIDecision, FOLD: AIDecision,
+): AIDecision {
+  const ALLIN: AIDecision = { action: PlayerAction.AllIn, raiseAmount: 0 };
+  const GO = callAmount < seat.chipCount ? CONT : ALLIN;
+  const callTh = adjustThreshold(adjustThreshold(adjustThreshold(CALL_VS_RAISE_THRESHOLD[bucket], factor),
+    getStackDepthMultiplier(chipsLeftEffectiveStackBB(table, seat.seatIndex))), huFactor);
+  switch (profile.archetype) {
+    case 'CALLING_STATION':
+      if (callAmount > seat.chipCount * 0.30 && pctile < 0.35) return FOLD;
+      if (callAmount >= seat.chipCount) return pctile >= 0.40 ? ALLIN : FOLD;
+      return GO;
+    case 'FISH':
+      if (pctile >= 0.90) return ALLIN;
+      if (pctile >= adjustThreshold(0.55, factor) && callAmount <= seat.chipCount * 0.12) return GO;
+      return pctile >= callTh ? GO : FOLD;
+    case 'ROCK':
+      return pctile >= callTh ? GO : FOLD;
+    case 'NIT':
+      if (pctile >= FOURBET_THRESHOLD) return ALLIN;
+      if (facingThreeBet) return FOLD;
+      return pctile >= threeBetTh ? GO : FOLD;
+    default:   // TAG / LAG: a 4-bet (here, the all-in) with premiums, else the 3-bet range continues
+      if (pctile >= FOURBET_THRESHOLD) return ALLIN;
+      if (facingThreeBet) return pctile >= threeBetTh ? GO : FOLD;
+      if (pctile >= threeBetTh) return ALLIN;
+      return pctile >= callTh ? GO : FOLD;
+  }
+}
+
 /**
  * 2026-11 (bots review, economy E3, All-In or Fold): the width the all-in player
  * is read to shove. It is the AoF push width for the seat he shoved from (the
@@ -1718,6 +1770,12 @@ function preFlopStrategy(
     && ownRaisesThisStreet(table, seat) > 0
     && (ctx.rawPctile ?? pctile) >= FISH_RAISE_PCTILE - (DIFFICULTY_NOISE[profile.difficulty] ?? 0) / 2) {
     return callAmount < seat.chipCount ? CONT : ALLIN;
+  }
+  // Fix-up 5 sweep (flatterContinue0dc1b96): a non-MANIAC that flat-called a raise this street, facing an all-in (or a
+  // committed raise) its call closes with more than 25 BB at risk, makes 0dc1b96's continue decision, not the stack-off.
+  if (!allInOrFold && noLimit && shover && pureCall && shoveBB > PUSH_FOLD_MAX_BB && profile.archetype !== 'MANIAC'
+    && seat.currentBet > bigBlind && ownCallsThisStreet(table, seat) > 0) {
+    return flatterContinue0dc1b96(table, seat, profile, pctile, callAmount, bucket, factor, huFactor, threeBetTh, facingThreeBet, CONT, FOLD);
   }
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
   // (and, fix round 3, its 0dc1b96 chips-left depth: chipsLeftEffectiveStackBB).

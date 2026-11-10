@@ -2254,3 +2254,11 @@ getPreFlopHandRank(holdemHoleCards(seat.holeCards)) + noise
 # open to 25-30% of a 20-25 BB stack, fold to a re-raise, any flop all-in won +28..+33 BB/100 against five NITs (live -1..-25).
 function nitShortRaiserCover(
 nitShortRaiserCover(table, seat) ?? pre
+# 2026-11-10 (fix-up 5 sweep, the flat-then-fold dead money) - preFlopStrategy: a non-MANIAC that flat-called a raise this street (more than
+# the big blind in), facing an all-in or committed raise its call closes with more than 25 BB at risk (no-limit, not All-In or Fold), makes
+# 0dc1b96's continue decision (flatterContinue0dc1b96), not the stack-off range: a FISH folded 96% of its flats of a MANIAC re-raise to the
+# human's all-in (live 35%), and two 300 BB MANIACs + TAG / FISH / LAG, open any two and move in over the re-raise, won +161 / +406 BB/100
+# (EV v3; live -44 / +101). A seat with only the big blind in (a lone all-in) keeps the stack-off range.
+function flatterContinue0dc1b96(
+flatterContinue0dc1b96(table, seat, profile, pctile, callAmount
+function ownCallsThisStreet(

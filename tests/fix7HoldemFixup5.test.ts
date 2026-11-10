@@ -16,6 +16,10 @@
  * 4. HOLDEM-F4-EXPLOIT-2, the uncommitted open: a NIT that would flat-call a single raise from a player with 25 BB or less at
  *    risk, nobody else in, moves in over it (nitShortRaiserCover; f605403 flat-called its 3-bet range and folded the flop:
  *    an any-two open to 25-30% of a 20-25 BB stack won +28 to +33 BB/100 against five NITs, live -1 to -25).
+ * 5. The sweep's flat-then-fold dead money: a non-MANIAC that flat-called a raise this street, facing an all-in its call
+ *    closes with more than 25 BB at risk, makes 0dc1b96's continue decision (flatterContinue0dc1b96). On the stack-off range a
+ *    FISH folded 96% of its flats of a MANIAC re-raise (live 35%): two 300 BB MANIACs + TAG / FISH / LAG, any two opened and
+ *    moved in over the re-raise won +161 / +406 BB/100 (EV v3; live -44 / +101). Node level: the continue rates are 0dc1b96's.
  *
  * Whole lines are played on a real PokerTable through AI.decideAction, applied as index.ts executeAIAction applies
  * them. An all-in of the human that is called is scored at its equity from the board of his all-in, on the pot he can
@@ -358,5 +362,40 @@ describe('re-review 4 P3 — the two fix-up 4 sub-rules no node test caught (eac
       }
     } finally { restore(); }
     expect([n, bets]).toEqual([60, 0]);
+  });
+});
+
+/**
+ * 6-max at 50/100, button 4 (small blind 5, big blind 0 = the human, UTG 1): seat 1 (a 300 BB MANIAC) opens to 3 BB, seat 2
+ * (a 300 BB MANIAC) re-raises to 9 BB, seat 3 (the bot under test, 300 BB) flat-calls, seats 4 / 5 fold, the 100 BB human
+ * moves in, both MANIACs call: seat 3 closes the action against the all-in. `limp`: instead seats 1 / 2 fold, seat 3 limps,
+ * seats 4 / 5 fold and the human moves in over the limp (seat 3 then faces a lone all-in with only the big blind in).
+ */
+function flatThenShove(limp: boolean, tag: string): any {
+  const t = six([100, 300, 300, 300, 300, 300], tag);
+  if (limp) { t.playerFold(1); t.playerFold(2); t.playerCall(3); }
+  else { expect(t.playerRaise(1, 3 * BB)).toBe(true); expect(t.playerRaise(2, 9 * BB)).toBe(true); expect(t.playerCall(3)).toBe(true); }
+  expect(t.playerFold(4)).toBe(true); expect(t.playerFold(5)).toBe(true);
+  expect(t.playerAllIn(0)).toBe(true);
+  if (!limp) { expect(t.playerCall(1)).toBe(true); expect(t.playerCall(2)).toBe(true); }
+  return t;
+}
+describe('fix-up 5 sweep — a flat-call is not dead money: a non-MANIAC that flat-called a raise continues against the all-in on 0dc1b96\'s ranges (flatterContinue0dc1b96)', () => {
+  const rows: string[] = [];
+  afterAll(() => process.stdout.write(`fix7 flatter continues (of 300 deals): ${rows.join('; ')}\n`));
+  // f884467 (the stack-off range, 3-way at 100 BB): FISH 3%, TAG / LAG / ROCK / CS 1-5% -> 96% of a FISH's flats of a MANIAC
+  // re-raise were folded to the human's all-in (0dc1b96 35%): two 300 BB MANIACs + TAG / FISH / LAG, any two opened 2.5 / 3 BB
+  // and moved in over the re-raise won +161 / +406 BB/100 (EV v3; 0dc1b96 -44 / +101).
+  const CASES: Array<[string, number, number]> = [['FISH', 0.15, 0.6], ['TAG', 0.06, 0.4], ['LAG', 0.06, 0.5], ['ROCK', 0.06, 0.5], ['CALLING_STATION', 0.5, 1]];
+  it.each(CASES)('a 300 BB %s that flat-called a MANIAC re-raise, facing a 100 BB all-in it closes, continues on 0dc1b96\'s range', (arch, lo, hi) => {
+    const r = decisions(() => flatThenShove(false, 'ft' + arch), 3, arch, 300, 7300);
+    const cont = (r.call + r.allin) / 300;
+    rows.push(`${arch} ${(100 * cont).toFixed(1)}%`);
+    expect([arch, r.raise, cont >= lo && cont <= hi]).toEqual([arch, 0, true]);
+  });
+  it('a FISH with only the big blind in (it limped) facing a lone 100 BB all-in keeps the stack-off range (continues at most 12%)', () => {
+    const r = decisions(() => flatThenShove(true, 'lp'), 3, 'FISH', 300, 7310);
+    rows.push(`FISH limper ${(100 * (r.call + r.allin) / 300).toFixed(1)}%`);
+    expect((r.call + r.allin) / 300).toBeLessThanOrEqual(0.12);
   });
 });
