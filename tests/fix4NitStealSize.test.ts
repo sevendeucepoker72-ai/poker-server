@@ -8,7 +8,7 @@
  * open (6 BB) and reaches the SIZE_NARROW_MAX_TH floor by ~10 BB as before, so B4's 15 / 60 BB rows are unchanged.
  * Every one of the 1,326 starting hands is decided once per size, with the same seeded noise stream per size
  * (the LCG of tests/botPremiumHold.test.ts), on a real PokerTable through the real decideAction.
- * 25 BB and shallower (the push/fold zone's depth) are unchanged.
+ * 25 BB and shallower (the push/fold zone's depth): fix-up 6 removed B4's narrowing there for every archetype (last test).
  * 6 seats at 50/100, 100 BB unless stated: btn 0, sb 1, bb 2, utg 3, mp 4, co 5. The human opens.
  */
 import { PokerTable, PlayerAction } from '../src/game/PokerTable';
@@ -78,7 +78,11 @@ describe('NIT steal size (fix round 4) — a NIT does not over-fold to a 4-6 BB 
     }
   });
 
-  it('25 BB and shallower are unchanged: at 20 BB the big blind still narrows against a 5 BB open', () => {
-    for (const diff of ['hard', 'medium']) expect(contPct('bb', 5, diff, 20)).toBeLessThan(contPct('bb', 3, diff, 20));
+  // Fix-up 6 (2026-11-10, sweep: short-stack steals): at 25 BB and shallower B4 narrows nothing any more, for every archetype
+  // (0dc1b96's unsized ranges; the big blind still widens against a small raise). Narrowed, the big blind folded a third more
+  // to a 4-6 BB open, and an any-two 4-6 BB steal won +19 to +42 BB/100 at Spin & Go 25 BB and 20 BB six-max NIT / ROCK
+  // tables (live -40 to +15). This row pinned the old narrowing at 20 BB ("unchanged" by fix round 4); it now pins its removal.
+  it('fix-up 6: 25 BB and shallower narrow nothing: at 20 BB the big blind continues as often against a 4 / 5 / 6 BB open as against 3 BB', () => {
+    for (const diff of ['hard', 'medium']) for (const x of [4, 5, 6]) expect(contPct('bb', x, diff, 20)).toBe(contPct('bb', 3, diff, 20));
   });
 });

@@ -1608,9 +1608,14 @@ function preFlopStrategy(
   // small raise (NEW-4); every seat narrows vs a big one (noLimit: above).
   // A UTG straddle is this hand's effective big blind (PokerTable.straddle): the reference open is 3 straddles.
   const refBB = table.actionLog.some(e => e.street === table.currentPhase && e.action === 'straddle') ? 2 * bigBlind : bigBlind;
-  const sizeFactor = facingRaise && noLimit
+  const sizeRaw = facingRaise && noLimit
     ? Math.min(bucket === 'BB' ? SIZE_WIDEN_MAX : 1, (OPEN_REFERENCE_BB * refBB) / Math.max(betToMatch, refBB))
     : 1;
+  // Fix-up 6 (sweep: short-stack steals) — at the push/fold depths (hand-start effective stack <= PUSH_FOLD_MAX_BB) a bigger
+  // raise narrows nothing, as 0dc1b96 (the big blind still widens against a small one). Narrowed, a 25 BB big blind continued
+  // against a 4-6 BB open only 49-78% as often as against 3 BB, and an any-two 4-6 BB steal (fold to a re-raise) won +8 to
+  // +42 BB/100 in Spin & Go 25 BB against NIT / ROCK lineups (live -40 to +15; now -40 to +10). B4's deep rows are unchanged.
+  const sizeFactor = noLimit && effBB <= PUSH_FOLD_MAX_BB ? Math.max(1, sizeRaw) : sizeRaw;
   const sized = (th: number, f: number): number => (f === 1 ? th : Math.min(0.99, Math.max(0.30, 1 - (1 - th) * f)));
   const callVsRaiseThS = sized(callVsRaiseTh, sizeFactor);
   const threeBetThS = sized(threeBetTh, Math.min(1, sizeFactor));

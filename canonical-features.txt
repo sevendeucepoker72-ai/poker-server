@@ -2273,3 +2273,8 @@ inPushFoldZone)(zoneBB, zonePlayers)
 # beat live by +16..+39 BB/100 in Heads-Up Snap / Spin & Go); six-max keeps B5's raise.
 ROCK_LIMP_TRAP_MAX_PLAYERS = 3
 callAmount === 0 || totalActive >
+# 2026-11-10 (fix-up 6 sweep, short-stack steals) - preFlopStrategy: at a hand-start effective stack of 25 BB or less (PUSH_FOLD_MAX_BB) a bigger
+# raise narrows no call / 3-bet range (B4), as 0dc1b96; the big blind still widens against a small one. Narrowed, a 25 BB big blind continued
+# against a 4-6 BB open only 49-78% as often as against 3 BB, and an any-two 4-6 BB steal won +8..+42 BB/100 in Spin & Go 25 BB against
+# NIT / ROCK lineups (live -40..+15).
+Math.max(1, sizeRaw) : sizeRaw

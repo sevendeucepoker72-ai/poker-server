@@ -10,6 +10,10 @@
  * 2. HOLDEM-F5-REGRESSION-1: short-handed (three dealt or fewer) a first-in ROCK limps its premiums, as 0dc1b96 did
  *    (ROCK_LIMP_TRAP_MAX_PLAYERS). B5's raise left its limp range capped: an iso-raise over the limp, then any flop all-in,
  *    beat live by +16 to +39 BB/100 (Heads-Up Snap, Spin & Go). Six-max keeps B5 (botPreflopFixes: the ROCK raises AA).
+ * 3. The fix-up 6 sweep (short-stack steals): at a hand-start effective stack of 25 BB or less a bigger open narrows no call /
+ *    3-bet range (B4), as 0dc1b96 (the big blind still widens against a small one). Narrowed, a 25 BB big blind continued
+ *    against a 4-6 BB open only 49-78% as often as against 3 BB, and an any-two 4-6 BB steal won +8 to +42 BB/100 in Spin & Go
+ *    against NIT / ROCK lineups (live -40 to +15).
  *
  * Whole lines are played on a real PokerTable through AI.decideAction, applied as index.ts executeAIAction applies them,
  * scored as fix7HoldemFixup5.test.ts scores them (the human's all-in at its equity from the board of his all-in when nobody
@@ -225,6 +229,41 @@ describe('HOLDEM-F5-MEASUREMENT-1 = EXPLOIT-1 / EXPLOIT-2 — facing an uncommit
   });
 });
 
+/** Share (%) of the 1,326 starting hands with which the big blind (`arch`) does not fold to the human's `openBB` button open. */
+function bbContPct(arch: string, ns: number, depthBB: number, openBB: number, diff = 'hard'): number {
+  const t = new PokerTable({ tableId: 'sz', tableName: 'sz', smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
+  for (let i = 0; i < ns; i++) expect(t.sitDown(i, 'P' + i, depthBB * BB, (i === 0 ? 'player-sz-' : 'ai-sz-') + i, i !== 0)).toBe(true);
+  t.presetFirstButton(0);
+  expect(t.startNewHand()).toBe(true);   // button 0 (the human), small blind 1, big blind 2 (6-max: UTG 3 .. CO 5 fold first)
+  for (let s = 3; s < ns; s++) expect(t.playerFold(s)).toBe(true);
+  expect(t.playerRaise(0, openBB * BB)).toBe(true);
+  expect(t.playerFold(1)).toBe(true);
+  expect(t.activeSeatIndex).toBe(2);
+  let n = 0, c = 0;
+  const restore = detEnv(8300);
+  try {
+    for (let a = 0; a < 52; a++) for (let b = a + 1; b < 52; b++) {
+      t.seats[2].holeCards = [{ rank: 2 + (a % 13), suit: Math.floor(a / 13) }, { rank: 2 + (b % 13), suit: Math.floor(b / 13) }];
+      n++;
+      if (AI.decideAction(t, 2, prof(arch, 2, diff)).action !== PlayerAction.Fold) c++;
+    }
+  } finally { restore(); }
+  return (100 * c) / n;
+}
+describe('fix-up 6 sweep (Spin & Go steals) — at 25 BB and shallower a bigger open narrows nothing (node level)', () => {
+  it.each(['ROCK', 'NIT', 'TAG', 'LAG'])('Spin & Go 25 BB, a %s in the big blind continues against a 4 / 5 / 6 BB open at least 90%% as often as against 3 BB (94108d5: 49-78%%)', (arch) => {
+    const bad: string[] = [];
+    for (const diff of ['hard', 'medium']) {
+      const ref = bbContPct(arch, 3, 25, 3, diff);
+      for (const o of [4, 5, 6]) { const v = bbContPct(arch, 3, 25, o, diff); if (v < 0.9 * ref) bad.push(`${diff} ${o} BB: ${v.toFixed(1)}% vs ${ref.toFixed(1)}% at 3 BB`); }
+    }
+    expect(bad).toEqual([]);
+  });
+  it('B4 is unchanged deeper: at 100 BB a TAG in the big blind still narrows against a 6 BB open (< 75% of its 3 BB rate)', () => {
+    expect(bbContPct('TAG', 6, 100, 6)).toBeLessThan(0.75 * bbContPct('TAG', 6, 100, 3));
+  });
+});
+
 describe('HOLDEM-F5-REGRESSION-1 — short-handed, a first-in ROCK limps its premiums (ROCK_LIMP_TRAP_MAX_PLAYERS)', () => {
   it('heads-up (20 and 100 BB) and 3-handed, a ROCK first in limps AA / KK (94108d5 raised them: its limp range was capped)', () => {
     const bad: string[] = [];
@@ -274,6 +313,8 @@ describe('HOLDEM-F5 whole lines — uncommitted opens and steals against short-h
     ['opn:0.25:p', 'heads-up, a 20 BB NIT (hard)', ['NIT'], 20, 1500, 83, 20, 'hard'],
     ['osn:0.25:x', 'heads-up, a 20 BB NIT (hard): a 5 BB steal, fold to a re-raise, check / fold after the flop', ['NIT'], 20, 1500, 84, 20, 'hard'],
     ['osn:0.17:x', 'five 100 BB NITs, the human 12 BB: a 2 BB steal, check / fold after the flop', NITS, 100, 1500, 85, 12, 'hard'],
+    ['osn:0.2:x', 'Spin & Go 25 BB, a NIT and a FISH (hard): a 5 BB steal, check / fold after the flop', ['NIT', 'FISH'], 25, 1500, 86, 25, 'hard'],
+    ['osn:0.2:x', 'Spin & Go 25 BB, two ROCKs (hard): a 5 BB steal, check / fold after the flop', ['ROCK', 'ROCK'], 25, 1500, 87, 25, 'hard'],
   ];
   it.each(CASES)('%s loses against %s', (line, name, lineup, botBB, hands, seed, heroBB, diff) => {
     const t0 = process.hrtime.bigint();
