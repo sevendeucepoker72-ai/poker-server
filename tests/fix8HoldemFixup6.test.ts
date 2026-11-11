@@ -1,0 +1,240 @@
+/**
+ * tests/fix8HoldemFixup6.test.ts (2026-11-10, bots review fix round 4, fix-up 6: the Hold'em lane).
+ *
+ * 1. HOLDEM-F5-MEASUREMENT-1 = HOLDEM-F5-EXPLOIT-1 / HOLDEM-F5-EXPLOIT-2: facing a raise from a player who is neither all-in
+ *    nor committed, the push/fold zone is read on 0dc1b96's chips-left depth again (preFlopStrategy zoneBB). Heads-up 20 BB, a
+ *    4-6 BB open leaves 14-16 BB: 0dc1b96 jammed or folded there; 94108d5 read the hand-start 20 BB, flat-called (ROCK / TAG /
+ *    LAG / FISH) or folded (NIT, ~92%) and then folded the flop. Opening any two to 20-30% of the stack won +98 to +151 BB/100
+ *    against a ROCK (live -78 to -161), +33 to +41 against a NIT. At five 100 BB NITs a 12 BB human's 2 BB steal won +21 to
+ *    +39 (live -41 to +1): the big blind is 10 BB deep on the chips left, inside the 3-player zone.
+ *
+ * Whole lines are played on a real PokerTable through AI.decideAction, applied as index.ts executeAIAction applies them,
+ * scored as fix7HoldemFixup5.test.ts scores them (the human's all-in at its equity from the board of his all-in when nobody
+ * acts after that street, else by chips). Deterministic: seeded Math.random, seeded deck, frozen Date.now.
+ *   osn:F:R    first in (or over limpers), raise to F x the stack with any two; re-raised: continue with the top 6% (stack-off
+ *              percentile >= 0.94), else fold; after the flop R = a: move in at the first action; R = p: only with a pair (a
+ *              hole card used), a flush draw or an open-ended straight draw; R = x: never (check / fold).
+ *   opn:F:R    raise to F x the stack with any two when first in or over ONE (not all-in) raise; call any re-raise; after the
+ *              flop as osn.
+ */
+/* eslint-disable @typescript-eslint/no-var-requires */
+const { PokerTable, PlayerAction, GamePhase } = require('../src/game/PokerTable');
+const AI = require('../src/ai/AIPlayer');
+const HE = require('../src/game/HandEvaluator');
+const PR = require('../src/ai/preflopRanges');
+const nodeCrypto = require('crypto');
+export {};   // a module: its top-level names stay file-scoped
+
+function detEnv(seed: number): () => void {
+  const rb = nodeCrypto.randomBytes, r = Math.random, now = Date.now;
+  let ctr = 0;
+  nodeCrypto.randomBytes = (n: number) => { const h = nodeCrypto.createHash('sha256').update(`fix8-${seed}-${ctr++}`).digest(); return Buffer.concat([h, h, h]).subarray(0, n); };
+  let s = seed >>> 0; Math.random = () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
+  Date.now = () => 1_700_000_000_000;
+  return () => { nodeCrypto.randomBytes = rb; Math.random = r; Date.now = now; };
+}
+const BB = 100;
+const prof = (a: string, i: number, diff = 'hard') => ({ botName: 'B' + i, difficulty: diff, personality: 'x', archetype: a, vpip: 0.5, pfr: 0.3, aggressionFactor: 2, bluffFrequency: 0.2 });
+const kindOf = (d: any): string => (d.action === PlayerAction.Fold ? 'fold' : d.action === PlayerAction.Check ? 'check'
+  : d.action === PlayerAction.Call ? 'call' : d.action === PlayerAction.Raise ? 'raise' : 'allin');
+
+/** Apply a bot decision as index.ts executeAIAction does. */
+function apply(t: any, a: number, d: any): void {
+  const ok = d.action === PlayerAction.Fold ? t.playerFold(a)
+    : d.action === PlayerAction.Check ? (t.playerCheck(a) || t.playerFold(a))
+      : d.action === PlayerAction.Call ? (t.playerCall(a) || t.playerCheck(a) || t.playerFold(a))
+        : d.action === PlayerAction.Raise ? (t.playerRaise(a, d.raiseAmount) || t.playerCall(a) || t.playerCheck(a) || t.playerFold(a))
+          : (t.playerAllIn(a) || t.playerFold(a));
+  if (!ok) t.playerFold(a);
+}
+
+/** A pair with a hole card, a flush draw or made flush, an open-ended straight draw or a made straight. */
+function pairOrDraw(h: any[], b: any[]): boolean {
+  if (h[0].rank === h[1].rank) return true;
+  for (const x of h) for (const c of b) if (x.rank === c.rank) return true;
+  for (let su = 0; su < 4; su++) if ([...h, ...b].filter((c: any) => c.suit === su).length >= 4 && h.some((c: any) => c.suit === su)) return true;
+  const all = new Set<number>([...h, ...b].map((c: any) => c.rank)); if (all.has(14)) all.add(1);
+  const hr = new Set<number>(h.map((c: any) => c.rank)); if (hr.has(14)) hr.add(1);
+  for (let lo = 1; lo <= 10; lo++) {
+    let k = 0, useH = false; for (let r = lo; r <= lo + 4; r++) { if (all.has(r)) k++; if (hr.has(r)) useH = true; }
+    if (k === 5 && useH) return true;
+  }
+  for (let lo = 2; lo <= 10; lo++) {
+    let k = 0, useH = false; for (let r = lo; r <= lo + 3; r++) { if (all.has(r)) k++; if (hr.has(r)) useH = true; }
+    if (k === 4 && useH && lo - 1 >= 2 && lo + 4 <= 14) return true;
+  }
+  return false;
+}
+
+/** BB/100 of the human (seat 0, heroBB) over `hands` hands of `line` against `lineup` (bots at `botBB`). */
+function play(line: string, lineup: string[], botBB: number, hands: number, seed: number, heroBB: number, diff = 'hard'): { bb100: number; drift: number; hands: number } {
+  const restore = detEnv(seed);
+  let ms = (seed * 7919 + 17) >>> 0;
+  const mrnd = () => ((ms = (Math.imul(ms, 1103515245) + 12345) >>> 0) / 4294967296);
+  try {
+    const [kind, f, rule] = line.split(':');
+    const F = Number(f);
+    const ns = lineup.length + 1;
+    const start = [heroBB * BB, ...lineup.map(() => botBB * BB)];
+    const TOTAL = start.reduce((a, x) => a + x, 0);
+    const t = new PokerTable({ tableId: 'fx8', tableName: 'fx8', smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
+    for (let i = 0; i < ns; i++) expect(t.sitDown(i, i ? 'B' + i : 'Hero', start[i], (i ? 'ai-fx8-' : 'player-fx8-') + i, i !== 0)).toBe(true);
+    const profs = [null, ...lineup.map((a, i) => prof(a, i + 1, diff))];
+    let raised = false, sidePlay = false, evBoard = -1, ev: number | null = null;
+    const hero = (): void => {
+      const s0 = t.seats[0], ca = t.getCallAmount(s0);
+      const fold = () => (ca > 0 ? t.playerFold(0) : (t.playerCheck(0) || t.playerFold(0)));
+      const shove = () => (t.playerAllIn(0) || t.playerCall(0) || fold());
+      if (t.currentPhase !== GamePhase.PreFlop) {
+        if (s0.chipCount > 0 && (rule === 'a' || (rule === 'p' && pairOrDraw(s0.holeCards, t.communityCards)))) { shove(); return; }
+        fold(); return;
+      }
+      const raises = Number(t.raisesThisStreet) || 0;
+      const facingAllIn = t.seats.some((x: any) => x.seatIndex !== 0 && x.state === 'occupied' && !x.folded && x.allIn && x.currentBet > s0.currentBet);
+      const to = Math.floor(F * (s0.chipCount + s0.currentBet) / 50) * 50;
+      if (raised && ca > 0) {
+        if (kind === 'opn' || PR.getStackOffPercentile(s0.holeCards) >= 0.94) { t.playerCall(0) || t.playerAllIn(0) || fold(); return; }
+        fold(); return;
+      }
+      if (raises === 0 || (kind === 'opn' && raises === 1 && !facingAllIn)) {
+        raised = true;
+        if (to >= s0.chipCount + s0.currentBet) { t.playerAllIn(0); return; }
+        if (!t.playerRaise(0, Math.max(to, t.getMinRaise()))) { raised = false; fold(); }
+        return;
+      }
+      fold();
+    };
+    const dw = t.determineWinners.bind(t);
+    t.determineWinners = (...args: any[]) => {
+      const h0 = t.seats[0];
+      if (h0.allIn && !h0.folded && t.communityCards.length === 5 && ev === null && evBoard >= 0 && !sidePlay) {
+        const live = t.seats.filter((x: any) => x.state === 'occupied' && !x.folded && x.holeCards.length === 2);
+        const used = new Set<number>(); for (const x of live) for (const c of x.holeCards) used.add(c.rank * 4 + c.suit);
+        for (const c of t.communityCards.slice(0, evBoard)) used.add(c.rank * 4 + c.suit);
+        const deck: any[] = []; for (let su = 0; su < 4; su++) for (let r = 2; r <= 14; r++) if (!used.has(r * 4 + su)) deck.push({ rank: r, suit: su });
+        let share = 0; const SIMS = 300;
+        for (let i = 0; i < SIMS; i++) {
+          for (let j = 0; j < 5 - evBoard; j++) { const k = j + Math.floor(mrnd() * (deck.length - j)); const z = deck[j]; deck[j] = deck[k]; deck[k] = z; }
+          const board = [...t.communityCards.slice(0, evBoard), ...deck.slice(0, 5 - evBoard)];
+          const e2 = live.map((x: any) => HE.evaluateHand([...x.holeCards, ...board]));
+          let best = [0];
+          for (let k = 1; k < e2.length; k++) { const c = HE.compareTo(e2[k], e2[best[0]]); if (c > 0) best = [k]; else if (c === 0) best.push(k); }
+          if (best.includes(live.findIndex((x: any) => x.seatIndex === 0))) share += 1 / best.length;
+        }
+        const inv = h0.totalInvestedThisHand;
+        const pot = t.seats.reduce((q: number, x: any) => q + Math.min(x.totalInvestedThisHand || 0, inv), 0);
+        ev = (share / SIMS) * pot - inv;
+      }
+      return dw(...args);
+    };
+    let total = 0, drift = 0, n = 0;
+    for (let h = 0; h < hands; h++) {
+      for (let i = 0; i < ns; i++) { const x = t.seats[i]; x.chipCount = start[i]; x.eliminated = false; x.sittingOut = false; }
+      raised = false; sidePlay = false; ev = null; evBoard = -1;
+      expect(t.startNewHand()).toBe(true);
+      let g = 0;
+      while (t.isHandInProgress() && g++ < 300) {
+        const a = t.activeSeatIndex; if (a < 0) break;
+        const board = t.communityCards.length;
+        if (a === 0) { hero(); if (t.seats[0].allIn && evBoard < 0) evBoard = board; continue; }
+        if (t.seats[0].folded) { if (!t.playerFold(a)) t.playerCheck(a); continue; }   // the human's result is final
+        if (evBoard >= 0 && board > evBoard) sidePlay = true;   // a decision after his all-in street: scored by chips
+        apply(t, a, AI.decideAction(t, a, profs[a]));
+        if (t.seats[0].allIn && evBoard < 0) evBoard = board;
+      }
+      expect(t.isHandInProgress()).toBe(false);
+      if (t.seats.reduce((q: number, x: any) => q + (x.state === 'occupied' ? x.chipCount : 0), 0) !== TOTAL) drift++;
+      total += (ev ?? (t.seats[0].chipCount - start[0])) / BB; n++;
+    }
+    return { bb100: (100 * total) / n, drift, hands: n };
+  } finally { restore(); }
+}
+
+/** Decisions of the bot at seat `me` over `n` deals of `build` (the table is rebuilt each deal: fresh cards). */
+function decisions(build: () => any, me: number, arch: string, n: number, seed: number, diff = 'hard'): Record<string, number> {
+  const restore = detEnv(seed);
+  const out: Record<string, number> = { fold: 0, check: 0, call: 0, raise: 0, allin: 0 };
+  try {
+    for (let k = 0; k < n; k++) {
+      const t = build();
+      expect(t.activeSeatIndex).toBe(me);
+      out[kindOf(AI.decideAction(t, me, prof(arch, me, diff)))]++;
+    }
+  } finally { restore(); }
+  return out;
+}
+/** Heads-up at 50/100, `bb` BB each: seat 0 the human, seat 1 the bot; `btn` the button (= the small blind, first to act). */
+function hu(bb: number, btn: number, tag: string): any {
+  const t = new PokerTable({ tableId: tag, tableName: tag, smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
+  expect(t.sitDown(0, 'Hero', bb * BB, 'player-' + tag, false)).toBe(true);
+  expect(t.sitDown(1, 'B1', bb * BB, 'ai-' + tag, true)).toBe(true);
+  t.presetFirstButton(btn);
+  expect(t.startNewHand()).toBe(true);
+  return t;
+}
+
+describe('HOLDEM-F5-MEASUREMENT-1 = EXPLOIT-1 / EXPLOIT-2 — facing an uncommitted raise, the push/fold zone is on the chips-left depth (node level)', () => {
+  it.each(['ROCK', 'NIT', 'TAG', 'LAG', 'FISH'])('heads-up 20 BB, a %s in the big blind facing a 4 / 5 / 6 BB open (14-16 BB left) never flat-calls it: it moves in (>= 30%%) or folds (94108d5: ROCK / TAG / LAG / FISH flat-called it, a NIT folded ~92%%)', (arch) => {
+    const tot: Record<string, number> = { fold: 0, check: 0, call: 0, raise: 0, allin: 0 };
+    for (const open of [4, 5, 6]) {
+      const r = decisions(() => {
+        const t = hu(20, 0, 'z' + arch + open);
+        expect(t.activeSeatIndex).toBe(0);
+        expect(t.playerRaise(0, open * BB)).toBe(true);
+        expect(AI.nearAllInRaiser(t, t.seats[1])).toBeNull();   // not committed: more than the pot behind
+        return t;
+      }, 1, arch, 150, 8100 + open);
+      for (const k of Object.keys(tot)) tot[k] += r[k];
+    }
+    expect([arch, tot.call, tot.raise, tot.check]).toEqual([arch, 0, 0, 0]);
+    expect(tot.allin / 450).toBeGreaterThanOrEqual(0.3);
+  });
+  it('heads-up 20 BB, a 3 BB open (17 BB left: outside the zone) is still played on the normal ranges: a ROCK / TAG flat-calls some of it', () => {
+    for (const arch of ['ROCK', 'TAG']) {
+      const r = decisions(() => { const t = hu(20, 0, 'y' + arch); expect(t.playerRaise(0, 3 * BB)).toBe(true); return t; }, 1, arch, 200, 8110);
+      expect([arch, r.call > 0]).toEqual([arch, true]);
+    }
+  });
+  it('five 100 BB NITs, a 12 BB human\'s 2 BB open from UTG folded round to the big blind (10 BB left, three-player zone): the NIT moves in >= 15% and never flat-calls (94108d5 ~8%)', () => {
+    const r = decisions(() => {
+      const t = new PokerTable({ tableId: 'n12', tableName: 'n12', smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
+      for (let i = 0; i < 6; i++) expect(t.sitDown(i, 'P' + i, (i === 1 ? 12 : 100) * BB, (i === 1 ? 'player-n12-' : 'ai-n12-') + i, i !== 1)).toBe(true);
+      t.presetFirstButton(4);
+      expect(t.startNewHand()).toBe(true);   // button 4, small blind 5, big blind 0, UTG 1 (the human)
+      expect(t.playerRaise(1, 2 * BB)).toBe(true);
+      for (const s of [2, 3, 4, 5]) expect(t.playerFold(s)).toBe(true);
+      return t;
+    }, 0, 'NIT', 400, 8120);
+    expect([r.call, r.raise]).toEqual([0, 0]);
+    expect(r.allin / 400).toBeGreaterThanOrEqual(0.15);
+  });
+  it('an all-in or a committed raise keeps the hand-start depth (NEW-1): heads-up 20 BB, a TAG facing a 50% open continues on the 20 BB stack-off range (<= 35%), not the 10 BB push range', () => {
+    const r = decisions(() => {
+      const t = hu(20, 0, 'c50');
+      expect(t.playerRaise(0, 10 * BB)).toBe(true);
+      expect(AI.nearAllInRaiser(t, t.seats[1])?.seatIndex).toBe(0);
+      return t;
+    }, 1, 'TAG', 300, 8130);
+    expect(r.call).toBe(0);
+    expect((r.allin + r.raise) / 300).toBeLessThanOrEqual(0.35);
+  });
+});
+
+describe('HOLDEM-F5 whole lines — uncommitted opens and steals against short-handed ROCK / NIT bots lose (real engine)', () => {
+  const rows: string[] = [];
+  afterAll(() => process.stdout.write(`fix8 whole lines (BB/100): ${rows.join('; ')}\n`));
+  const NITS = ['NIT', 'NIT', 'NIT', 'NIT', 'NIT'];
+  const CASES: Array<[string, string, string[], number, number, number, number, string]> = [
+    ['osn:0.3:a', 'heads-up, a 20 BB ROCK (hard)', ['ROCK'], 20, 1500, 81, 20, 'hard'],
+    ['opn:0.25:p', 'heads-up, a 20 BB ROCK (medium)', ['ROCK'], 20, 1500, 82, 20, 'medium'],
+    ['opn:0.25:p', 'heads-up, a 20 BB NIT (hard)', ['NIT'], 20, 1500, 83, 20, 'hard'],
+    ['osn:0.25:x', 'heads-up, a 20 BB NIT (hard): a 5 BB steal, fold to a re-raise, check / fold after the flop', ['NIT'], 20, 1500, 84, 20, 'hard'],
+    ['osn:0.17:x', 'five 100 BB NITs, the human 12 BB: a 2 BB steal, check / fold after the flop', NITS, 100, 1500, 85, 12, 'hard'],
+  ];
+  it.each(CASES)('%s loses against %s', (line, name, lineup, botBB, hands, seed, heroBB, diff) => {
+    const t0 = process.hrtime.bigint();
+    const r = play(line, lineup, botBB, hands, seed, heroBB, diff);
+    rows.push(`${line} vs ${name}: ${r.bb100.toFixed(1)} (${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
+    expect([line, r.hands, r.drift, r.bb100 < 0]).toEqual([line, hands, 0, true]);
+  }, 1_200_000);
+});

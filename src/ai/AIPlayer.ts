@@ -1721,8 +1721,17 @@ function preFlopStrategy(
   }
 
   // ── Short-stack push/fold (and every All-In or Fold decision): the baked Nash lookup. ──
-  const pfBB = allInOrFold ? Math.min(pureAllInCall ? shoveBB : effBB, PUSH_FOLD_MAX_BB) : effBB;
-  if (allInOrFold || (inPushFoldZone(effBB, zonePlayers) && profile.archetype !== 'CALLING_STATION')) {
+  // Fix-up 6 (HOLDEM-F5-MEASUREMENT-1 = EXPLOIT-1, EXPLOIT-2) — no-limit, not All-In or Fold: facing a raise from a player who
+  // is neither all-in nor committed (shover: shoverFaced / nearAllInRaiser), zone membership and the Nash lookup read
+  // 0dc1b96's chips-left depth (chipsLeftEffectiveStackBB), as 0dc1b96 did. Heads-up 20 BB, a 5 BB open leaves 15 BB: in the
+  // zone, the bot jams or folds. On the hand-start depth (NEW-1) it read 20 BB, outside the zone, and flat-called or folded
+  // its normal ranges, then folded the flop: opening any two to 20-30% of a 20 BB stack, moving in on any flop, won +98 to
+  // +151 BB/100 against a ROCK (live -78 to -161), a 2 BB steal by a 12 BB stack +21 to +39 at five 100 BB NITs (live -41 to
+  // +1). An all-in or a committed raise keeps NEW-1's hand-start depth: its chips left read a lone shove (or a 90 BB open
+  // that leaves 10 BB) as a 1-10 BB stack, and the push / fold call floor continued 44-68% of hands.
+  const zoneBB = noLimit && !allInOrFold && facingRaise && !shover ? chipsLeftEffectiveStackBB(table, seat.seatIndex) : effBB;
+  const pfBB = allInOrFold ? Math.min(pureAllInCall ? shoveBB : effBB, PUSH_FOLD_MAX_BB) : zoneBB;
+  if (allInOrFold || (inPushFoldZone(zoneBB, zonePlayers) && profile.archetype !== 'CALLING_STATION')) {
     const nashPush = nashPushPctile(pfBB, zonePlayers);
     const pfFactor = allInOrFold ? Math.pow(factor, AOF_ARCHETYPE_DAMP) : factor;
     // All-In or Fold: the strength with AOF_NOISE_KEEP of the difficulty noise (the value set never below its raw strength).
@@ -2864,7 +2873,8 @@ export function getEffectiveStackBB(table: PokerTable, mySeat: number): number {
  * the push/fold zone again, as live. The hand-start depth (NEW-1, a Hold'em fix) sent those spots into the deep
  * Omaha ranges, which fold far too much for four-card equities: against five TAGs a 20 BB human who limps then
  * pots / jams any four won +172 BB/100, and pot-3-bets any four over an open +91 (live 0dc1b96: +21 / -7; with
- * this depth +34 / -4, whole line, real engine, 1,200 hands). Hold'em, Short Deck and Pineapple keep NEW-1.
+ * this depth +34 / -4, whole line, real engine, 1,200 hands). Hold'em, Short Deck and Pineapple keep NEW-1, except for the
+ * push/fold zone facing a raise from a player who is neither all-in nor committed (fix-up 6: preFlopStrategy's zoneBB).
  */
 function chipsLeftEffectiveStackBB(table: PokerTable, mySeat: number): number {
   const seat = table.seats[mySeat];

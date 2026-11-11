@@ -2262,3 +2262,9 @@ nitShortRaiserCover(table, seat) ?? pre
 function flatterContinue0dc1b96(
 flatterContinue0dc1b96(table, seat, profile, pctile, callAmount
 function ownCallsThisStreet(
+# 2026-11-10 (fix-up 6, HOLDEM-F5-MEASUREMENT-1 = EXPLOIT-1 / EXPLOIT-2) - preFlopStrategy: facing a raise from a player who is neither all-in
+# nor committed (no-limit, not All-In or Fold), the push/fold zone and the Nash lookup read 0dc1b96's chips-left depth (zoneBB): on the
+# hand-start depth a 20 BB bot facing a 4-6 BB open played its normal ranges and folded the flop (Heads-Up Snap: any two opened to 20-30%,
+# any flop all-in +98..+151 BB/100 vs ROCK, live -78..-161); a 12 BB human's 2 BB steal won +21..+39 at five NITs (live -41..+1).
+? chipsLeftEffectiveStackBB(table, seat.seatIndex) : effBB
+inPushFoldZone)(zoneBB, zonePlayers)
