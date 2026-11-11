@@ -1459,7 +1459,7 @@ function ownCallsThisStreet(table: PokerTable, seat: Seat): number {
  * thresholds, on 0dc1b96's chips-left depth), not the stack-off range. With the stack-off range (NEW-1: 3-way at 100 BB
  * about the top 3%) a FISH that flat-called a MANIAC re-raise folded 96% of them to the human's all-in (0dc1b96: 35%), so
  * its flat was dead money (17.2 BB per all-in spot, 0dc1b96 8.4): two 300 BB MANIACs + TAG / FISH / LAG, a 100 BB human
- * opening 2.5 / 3 BB with any two and moving in over the re-raise won +161 / +406 BB/100 (0dc1b96 -44 / +101; EV v3);
+ * opening 2.5 / 3 BB with any two and moving in over the re-raise won +122 / +350 BB/100 (0dc1b96 -18 / -20; EV v3, 15k hands);
  * one MANIAC + TAG / LAG / NIT / FISH at 100 BB, open 10 BB and move in, +103 / +84 (0dc1b96 -330 / -299). A seat that has
  * not called this street (a lone all-in, the blinds) keeps the stack-off range: non-MANIAC archetypes still continue
  * 5-10% against a lone 100 BB all-in. A MANIAC never gets here (maniacFacingRaise0dc1b96). FOLD keeps the value hold.
@@ -1526,10 +1526,10 @@ function aofShoverWidth(table: PokerTable, shover: Seat | null, effBB: number): 
  * one shape opened a neighbouring one. Live's MANIAC is not exploitable by those lines: it re-raises the flats (they never
  * see the flop) and calls the shoves over its re-raises. Measured on both families with this rule (hard / medium / easy,
  * equal and unequal stacks, real engine, whole lines): the cheap-flop lines at live (-55 to -147); the light-3-bet-then-
- * shove lines at live too (live has its own leak at 1,000 BB MANIACs: os:2.5 +398, osrr +939, unchanged here). Restoring
+ * shove lines at or below live (live has its own leak at 1,000 BB MANIACs: os:2.5 / osrr +211 / +731, here -180 / -73). Restoring
  * only the light re-raise and the continue after it (and keeping the stack-off read for a MANIAC that faces a shove
  * without having raised) failed: those MANIACs then folded where live's jam, and their raises were dead money (five
- * 200-300 BB MANIACs, open 2.5-4 BB and move in over a re-raise: +387 to +933, live -167 to -501).
+ * 200-300 BB MANIACs, open 2.5-4 BB and move in over a re-raise: +218 to +675, live -28 to -85; all EV v3).
  */
 function maniacFacingRaise0dc1b96(
   pctile: number, callAmount: number, seat: Seat, table: PokerTable, factor: number, totalActive: number,

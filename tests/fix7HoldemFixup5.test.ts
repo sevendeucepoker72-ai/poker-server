@@ -19,7 +19,7 @@
  * 5. The sweep's flat-then-fold dead money: a non-MANIAC that flat-called a raise this street, facing an all-in its call
  *    closes with more than 25 BB at risk, makes 0dc1b96's continue decision (flatterContinue0dc1b96). On the stack-off range a
  *    FISH folded 96% of its flats of a MANIAC re-raise (live 35%): two 300 BB MANIACs + TAG / FISH / LAG, any two opened and
- *    moved in over the re-raise won +161 / +406 BB/100 (EV v3; live -44 / +101). Node level: the continue rates are 0dc1b96's.
+ *    moved in over the re-raise won +122 / +350 BB/100 (EV v3, 15k hands; live -18 / -20). Node level: the continue rates are 0dc1b96's.
  *
  * Whole lines are played on a real PokerTable through AI.decideAction, applied as index.ts executeAIAction applies
  * them. An all-in of the human that is called is scored at its equity from the board of his all-in, on the pot he can
@@ -385,7 +385,7 @@ describe('fix-up 5 sweep — a flat-call is not dead money: a non-MANIAC that fl
   afterAll(() => process.stdout.write(`fix7 flatter continues (of 300 deals): ${rows.join('; ')}\n`));
   // f884467 (the stack-off range, 3-way at 100 BB): FISH 3%, TAG / LAG / ROCK / CS 1-5% -> 96% of a FISH's flats of a MANIAC
   // re-raise were folded to the human's all-in (0dc1b96 35%): two 300 BB MANIACs + TAG / FISH / LAG, any two opened 2.5 / 3 BB
-  // and moved in over the re-raise won +161 / +406 BB/100 (EV v3; 0dc1b96 -44 / +101).
+  // and moved in over the re-raise won +122 / +350 BB/100 (EV v3, 15k hands; 0dc1b96 -18 / -20).
   const CASES: Array<[string, number, number]> = [['FISH', 0.15, 0.6], ['TAG', 0.06, 0.4], ['LAG', 0.06, 0.5], ['ROCK', 0.06, 0.5], ['CALLING_STATION', 0.5, 1]];
   it.each(CASES)('a 300 BB %s that flat-called a MANIAC re-raise, facing a 100 BB all-in it closes, continues on 0dc1b96\'s range', (arch, lo, hi) => {
     const r = decisions(() => flatThenShove(false, 'ft' + arch), 3, arch, 300, 7300);
