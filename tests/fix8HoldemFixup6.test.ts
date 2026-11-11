@@ -340,3 +340,28 @@ describe('HOLDEM-F5-REGRESSION-1 whole lines — iso-raise the ROCK\'s limp, fol
     expect([line, r.hands, r.drift, r.bb100 <= bound]).toEqual([line, hands, 0, true]);
   }, 1_200_000);
 });
+
+describe('re-review 5 P3 — the Short Deck MANIAC reads 0dc1b96\'s Hold\'em percentile (ctx.maniacPctile) facing a raise or an all-in', () => {
+  it('Short Deck 100 BB: a MANIAC that isolated a limper continues >= 85% against his shove (96.0%; on the Short Deck percentile 65.5%; 0dc1b96 92.8%)', () => {
+    const { ShortDeckTable } = require('../src/game/variants/ShortDeckTable');
+    let n = 0, k = 0;
+    const restore = detEnv(8400);
+    try {
+      for (let d = 0; d < 400; d++) {
+        const t = new ShortDeckTable({ tableId: 'sdm' + d, tableName: 'sdm', smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
+        for (let i = 0; i < 6; i++) expect(t.sitDown(i, 'P' + i, 100 * BB, (i === 0 ? 'player-sdm-' : 'ai-sdm-') + i, i !== 0)).toBe(true);
+        t.presetFirstButton(0);
+        expect(t.startNewHand()).toBe(true);   // button 0 (the human), small blind 1, big blind 2, UTG 3
+        for (const s of [3, 4, 5]) expect(t.playerFold(s)).toBe(true);
+        expect(t.playerCall(0)).toBe(true);   // the human limps
+        expect(t.playerRaise(1, 4 * BB)).toBe(true);   // the small-blind MANIAC isolates
+        expect(t.playerFold(2)).toBe(true);
+        expect(t.playerAllIn(0)).toBe(true);
+        expect(t.activeSeatIndex).toBe(1);
+        n++; if (AI.decideAction(t, 1, prof('MANIAC', 1)).action !== PlayerAction.Fold) k++;
+      }
+    } finally { restore(); }
+    process.stdout.write(`fix8 Short Deck MANIAC continue: ${(100 * k / n).toFixed(1)}%\n`);
+    expect(k / n).toBeGreaterThanOrEqual(0.85);
+  });
+});
