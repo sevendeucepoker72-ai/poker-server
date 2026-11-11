@@ -1213,6 +1213,14 @@ export const SIZE_NARROW_MAX_TH = 0.946;
  */
 export const NIT_SIZE_NARROW_SLACK = 2;
 /**
+ * Fix-up 6 (HOLDEM-F5-REGRESSION-1) — no more dealt players than this (Heads-Up Snap, Spin & Go 3-max): a ROCK first in
+ * (not the big blind's option) LIMPS its premiums, as 0dc1b96 did; a bigger table keeps B5's raise. B5's raise left the
+ * short-handed limp range capped: an iso-raise over the limp to 2-3 BB, then any flop all-in, beat live by +16 to +39
+ * BB/100 (Heads-Up 20 BB +45 / +84 vs live +29 / +67; Spin 25 BB ROCK, ROCK +15 / +56 vs -23 / +21). With the limp: +30 /
+ * +69 and -18 / +23 (the human's whole line, real engine, 3,000 hands).
+ */
+export const ROCK_LIMP_TRAP_MAX_PLAYERS = 3;
+/**
  * Fix round 3 (review of HAI-2) — from a call of this share of the commit line
  * (STACKOFF_COMMIT_FRACTION: 1/2 x 1/3 = a sixth of the stack) the size floor slides linearly
  * to the stack-off width at the depth, which is what the call faces at the commit line. A
@@ -1847,8 +1855,11 @@ function preFlopStrategy(
   // ── ROCK: tight-passive; limps its playables, RAISES only premiums. ──
   if (profile.archetype === 'ROCK') {
     if (unopened) {
-      // B5 — premiums raise from ANY seat (AA used to be limped everywhere but the big blind).
-      if (pctile >= adjustThreshold(0.94, huFactor)) return raiseOrAllIn(Math.round(bigBlind * 2.5));
+      // B5 — premiums raise from ANY seat (AA used to be limped everywhere but the big blind). Fix-up 6: short-handed
+      // (ROCK_LIMP_TRAP_MAX_PLAYERS dealt or fewer) a first-in ROCK limps them, as 0dc1b96 did.
+      if (pctile >= adjustThreshold(0.94, huFactor) && (callAmount === 0 || totalActive > ROCK_LIMP_TRAP_MAX_PLAYERS)) {
+        return raiseOrAllIn(Math.round(bigBlind * 2.5));
+      }
       if (callAmount === 0) return CHECK;
       return pctile >= callVsRaiseTh ? CALL : FOLD;                  // limp (unchanged range)
     }

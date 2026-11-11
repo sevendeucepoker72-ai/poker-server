@@ -2268,3 +2268,8 @@ function ownCallsThisStreet(
 # any flop all-in +98..+151 BB/100 vs ROCK, live -78..-161); a 12 BB human's 2 BB steal won +21..+39 at five NITs (live -41..+1).
 ? chipsLeftEffectiveStackBB(table, seat.seatIndex) : effBB
 inPushFoldZone)(zoneBB, zonePlayers)
+# 2026-11-10 (fix-up 6, HOLDEM-F5-REGRESSION-1) - preFlopStrategy: with ROCK_LIMP_TRAP_MAX_PLAYERS (3) dealt or fewer, a first-in ROCK limps its
+# premiums as 0dc1b96 did (B5's raise capped its short-handed limp range: an iso-raise over the limp, fold to a re-raise, any flop all-in
+# beat live by +16..+39 BB/100 in Heads-Up Snap / Spin & Go); six-max keeps B5's raise.
+ROCK_LIMP_TRAP_MAX_PLAYERS = 3
+callAmount === 0 || totalActive >

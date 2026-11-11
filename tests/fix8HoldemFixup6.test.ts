@@ -7,6 +7,9 @@
  *    LAG / FISH) or folded (NIT, ~92%) and then folded the flop. Opening any two to 20-30% of the stack won +98 to +151 BB/100
  *    against a ROCK (live -78 to -161), +33 to +41 against a NIT. At five 100 BB NITs a 12 BB human's 2 BB steal won +21 to
  *    +39 (live -41 to +1): the big blind is 10 BB deep on the chips left, inside the 3-player zone.
+ * 2. HOLDEM-F5-REGRESSION-1: short-handed (three dealt or fewer) a first-in ROCK limps its premiums, as 0dc1b96 did
+ *    (ROCK_LIMP_TRAP_MAX_PLAYERS). B5's raise left its limp range capped: an iso-raise over the limp, then any flop all-in,
+ *    beat live by +16 to +39 BB/100 (Heads-Up Snap, Spin & Go). Six-max keeps B5 (botPreflopFixes: the ROCK raises AA).
  *
  * Whole lines are played on a real PokerTable through AI.decideAction, applied as index.ts executeAIAction applies them,
  * scored as fix7HoldemFixup5.test.ts scores them (the human's all-in at its equity from the board of his all-in when nobody
@@ -16,6 +19,7 @@
  *              hole card used), a flush draw or an open-ended straight draw; R = x: never (check / fold).
  *   opn:F:R    raise to F x the stack with any two when first in or over ONE (not all-in) raise; call any re-raise; after the
  *              flop as osn.
+ *   pf:F:R     as osn, but fold to any re-raise.
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
 const { PokerTable, PlayerAction, GamePhase } = require('../src/game/PokerTable');
@@ -93,6 +97,7 @@ function play(line: string, lineup: string[], botBB: number, hands: number, seed
       const facingAllIn = t.seats.some((x: any) => x.seatIndex !== 0 && x.state === 'occupied' && !x.folded && x.allIn && x.currentBet > s0.currentBet);
       const to = Math.floor(F * (s0.chipCount + s0.currentBet) / 50) * 50;
       if (raised && ca > 0) {
+        if (kind === 'pf') { fold(); return; }
         if (kind === 'opn' || PR.getStackOffPercentile(s0.holeCards) >= 0.94) { t.playerCall(0) || t.playerAllIn(0) || fold(); return; }
         fold(); return;
       }
@@ -220,6 +225,45 @@ describe('HOLDEM-F5-MEASUREMENT-1 = EXPLOIT-1 / EXPLOIT-2 — facing an uncommit
   });
 });
 
+describe('HOLDEM-F5-REGRESSION-1 — short-handed, a first-in ROCK limps its premiums (ROCK_LIMP_TRAP_MAX_PLAYERS)', () => {
+  it('heads-up (20 and 100 BB) and 3-handed, a ROCK first in limps AA / KK (94108d5 raised them: its limp range was capped)', () => {
+    const bad: string[] = [];
+    for (const code of ['AA', 'KK']) for (const bb of [20, 100]) {
+      const restore = detEnv(8200 + bb);
+      try {
+        const t = hu(bb, 1, 'r' + code + bb);   // the bot is the button / small blind: first in
+        expect(t.activeSeatIndex).toBe(1);
+        t.seats[1].holeCards = code === 'AA' ? [{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }] : [{ rank: 13, suit: 0 }, { rank: 13, suit: 1 }];
+        const d = AI.decideAction(t, 1, prof('ROCK', 1));
+        if (d.action !== PlayerAction.Call) bad.push(`HU ${bb} BB ${code}: ${d.action}`);
+      } finally { restore(); }
+    }
+    const restore = detEnv(8210);
+    try {
+      const t = new PokerTable({ tableId: 'r3', tableName: 'r3', smallBlind: BB / 2, bigBlind: BB, ante: 0, minBuyIn: BB });
+      for (let i = 0; i < 3; i++) expect(t.sitDown(i, 'P' + i, 25 * BB, (i === 0 ? 'player-r3-' : 'ai-r3-') + i, i !== 0)).toBe(true);
+      t.presetFirstButton(1);
+      expect(t.startNewHand()).toBe(true);   // 3-handed: the button (seat 1) acts first pre-flop
+      expect(t.activeSeatIndex).toBe(1);
+      t.seats[1].holeCards = [{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }];
+      const d = AI.decideAction(t, 1, prof('ROCK', 1));
+      if (d.action !== PlayerAction.Call) bad.push(`3-handed 25 BB AA: ${d.action}`);
+    } finally { restore(); }
+    expect(bad).toEqual([]);
+  });
+  it('heads-up, a ROCK with AA limps, then continues against an iso-raise (the value its capped limp range was missing)', () => {
+    const restore = detEnv(8220);
+    try {
+      const t = hu(20, 1, 'rl');
+      t.seats[1].holeCards = [{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }];
+      apply(t, 1, AI.decideAction(t, 1, prof('ROCK', 1)));
+      expect(t.seats[1].currentBet).toBe(BB);   // limped
+      expect(t.playerRaise(0, 3 * BB)).toBe(true);
+      expect(kindOf(AI.decideAction(t, 1, prof('ROCK', 1)))).not.toBe('fold');
+    } finally { restore(); }
+  });
+});
+
 describe('HOLDEM-F5 whole lines — uncommitted opens and steals against short-handed ROCK / NIT bots lose (real engine)', () => {
   const rows: string[] = [];
   afterAll(() => process.stdout.write(`fix8 whole lines (BB/100): ${rows.join('; ')}\n`));
@@ -236,5 +280,22 @@ describe('HOLDEM-F5 whole lines — uncommitted opens and steals against short-h
     const r = play(line, lineup, botBB, hands, seed, heroBB, diff);
     rows.push(`${line} vs ${name}: ${r.bb100.toFixed(1)} (${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
     expect([line, r.hands, r.drift, r.bb100 < 0]).toEqual([line, hands, 0, true]);
+  }, 1_200_000);
+});
+
+describe('HOLDEM-F5-REGRESSION-1 whole lines — iso-raise the ROCK\'s limp, fold to a re-raise, any flop all-in: no better than live (real engine)', () => {
+  // These 3 BB any-two raises are profitable on live 0dc1b96 too (its own leak): the bound is live's level on the same seeds
+  // (heads-up seed 89: live +51.6, 94108d5 +64.5; Spin & Go seed 87: live +20.0, 94108d5 +37.4; 3,000 hands each).
+  const rows: string[] = [];
+  afterAll(() => process.stdout.write(`fix8 ROCK limp-trap lines (BB/100): ${rows.join('; ')}\n`));
+  const CASES: Array<[string, string, string[], number, number, number, number, number]> = [
+    ['pf:0.15:a', 'heads-up, a 20 BB ROCK (hard)', ['ROCK'], 20, 3000, 89, 20, 56],
+    ['pf:0.12:a', 'Spin & Go 25 BB, two ROCKs (hard)', ['ROCK', 'ROCK'], 25, 3000, 87, 25, 25],
+  ];
+  it.each(CASES)('%s against %s', (line, name, lineup, botBB, hands, seed, heroBB, bound) => {
+    const t0 = process.hrtime.bigint();
+    const r = play(line, lineup, botBB, hands, seed, heroBB);
+    rows.push(`${line} vs ${name}: ${r.bb100.toFixed(1)} (bound ${bound}; ${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
+    expect([line, r.hands, r.drift, r.bb100 <= bound]).toEqual([line, hands, 0, true]);
   }, 1_200_000);
 });
