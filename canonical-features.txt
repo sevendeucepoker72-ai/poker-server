@@ -2310,3 +2310,211 @@ forceFoldSeat(seatIndex, { deadHand: true })
 if (!before || t.handNumber !== hand
 'ADMIN_RESOLVE_HELD_HAND', 'ADMIN_RESOLVE_HELD_HAND_FAILED'
 resting-Showdown pre-read failed
+# 2026-11-05 (bots review fix round 3, holdem lane, HR2-1) - preFlopStrategy: an opponent is "in for the bet" only when he
+# MATCHES it; an all-in for less (a blind posted all-in short, a small shove under a bigger one) no longer turns a single
+# shove into the multiway stack-off line (All-In or Fold AKo folded 95-100% there).
+if (s.currentBet >= table.currentBetToMatch)
+# 2026-11-05 (bots review fix round 3, holdem lane, MANIAC-RTF) - preFlopStrategy (no-limit): facing a raise, a MANIAC hand
+# that fails the stack-off range re-raises only up to HOLDEM_LIGHT_RERAISE_FRACTION (5%) of the depth at risk (round 4; round 3: its own street stack), else calls
+# (top 70%) / folds; it re-raised 25-59 BB and folded ~89% of it to a shove (an any-two-cards +600..+1,900 BB/100 line).
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): HOLDEM_LIGHT_RERAISE_FRACTION
+# 2026-11-08 (bots review fix round 3, holdem lane, MANIAC-RTF part 2) - preFlopStrategy (no-limit): a MANIAC that raised
+# this street continues a stack-off with MANIAC_RAISED_STACKOFF_WIDEN (2) x the width; it folded ~80-90% of its any-two
+# raises to a shove (3-handed 25 BB squeeze over its open +32 BB/100, Short Deck limp-shove +32; live -75 / -97).
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): MANIAC_RAISED_STACKOFF_WIDEN
+# 2026-11-08 (bots review fix round 3, holdem lane, PLO NEW-1 check) - preFlopStrategy (pot-limit Omaha): the 0dc1b96
+# chips-left depth (chipsLeftEffectiveStackBB; round 1's hand-start depth folded 96% to a 20 BB pot 3-bet and 97% to the
+# last all-in of a pot war), and a lone all-in the call closes is called with any hand at <= PLO_LONE_ALLIN_CALL_NEED (30%).
+PLO_LONE_ALLIN_CALL_NEED
+function chipsLeftEffectiveStackBB(
+# 2026-11-08 (bots review fix round 4, holdem lane, HOLDEM-R3-REG-1) - preFlopStrategy (no-limit): the MANIAC light re-raise
+# cap is HOLDEM_LIGHT_RERAISE_FRACTION (5%) of the DEPTH AT RISK, lightReraiseDepth (the smallest street stack that can still
+# shove over it: its own and every live opponent's with chips), not of its own stack. Bots have no stack cap; a 200-1,000 BB
+# MANIAC re-raised a 100 BB opener light again and folded ~78% to his shove (any two +55..+445 BB/100, live negative).
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): function lightReraiseDepth(
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): > lightReraiseDepth(table, seat) *
+# 2026-11-08 (bots review fix round 4, holdem lane, MANIAC call-then-fold) - preFlopStrategy (no-limit): a MANIAC that flat-called
+# this street, deeper than the push/fold zone, continues a stack-off at MANIAC_RAISED_STACKOFF_WIDEN x the width (as one that raised:
+# at the plain width it folded 72-90% of its flats to a squeeze / re-shove); a deep MANIAC facing an all-in it does not close plays
+# the stack-off range for the shover's depth (it called ~70% of them).
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): function ownCallsThisStreet(
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): maniacWiden(soDepth)
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): !stackOffOK(shoveBB, maniacWiden(shoveBB))
+# 2026-11-08 (bots review fix round 4, holdem lane, NIT steal size) - preFlopStrategy (no-limit, deeper than 25 BB): a NIT's flat range
+# narrows by the B4 open-size factor only past NIT_SIZE_NARROW_SLACK (2) x the 3 BB reference open (it continued 5.6% vs a 4-6 BB
+# open, live 6.2-9.0%; a 5 BB any-two steal vs five NITs won +28 to +30 BB/100, live +6 to +19).
+NIT_SIZE_NARROW_SLACK
+Math.min(1, nitSlack * sizeFactor)
+# 2026-11-08 (bots review fix round 4, holdem lane) - the deep-MANIAC all-in gate above applies only to an all-in deeper than the
+# push/fold zone (shoveBB > PUSH_FOLD_MAX_BB): a short all-in keeps the MANIAC branch (it isolates a 1.5 BB shove ~52%).
+&& shoveBB >
+# 2026-11-08 (bots review fix round 4 fix-up 1, holdem lane, HOLDEM-R4-EXPLOIT-1/-2) - preFlopStrategy (no-limit): a MANIAC that
+# raised this street, facing an all-in deeper than 25 BB that it does not close with flatters still to act, treats them as dead
+# money: the stack-off range for the shover's depth counting only the other players, at MANIAC_RAISED_STACKOFF_WIDEN x (1 +
+# MANIAC_FLATTER_WIDEN per flatter) the width, continued by an isolation re-raise (it folded 77-86% of its opens to a big-blind
+# squeeze: any two +30..+55 BB/100, live -7..-36).
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): MANIAC_FLATTER_WIDEN
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): function flattersToAct(
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): MANIAC_FLATTER_WIDEN * flatters
+# 2026-11-08 (fix-up 1, two deep MANIACs) - a deep MANIAC facing a single raise flats only what continues against the squeeze of
+# a 26-50 BB player still to act (MANIAC_SQUEEZE_BEHIND_MAX_BB): open + flat by two 500 BB MANIACs let a 40 BB human squeeze any
+# two for +20 BB/100 whatever the opener did (live -19).
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): MANIAC_SQUEEZE_BEHIND_MAX_BB
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): function shortestToActBB(
+# 2026-11-09 (fix-up 1) - the MANIAC flat rule above applies only to a MANIAC at least twice as deep (effective) as that 26-50 BB
+# player: with similar stacks (a tournament; five 40 BB MANIACs and a 40 BB human) the squeeze measured no leak and the flats stay.
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): effBB >= 2 * behindBB
+# 2026-11-09 (bots review fix round 4 fix-up 1, holdem lane, HOLDEM-R4-MEASUREMENT-1) - preFlopStrategy (no-limit): a FISH that
+# raised this street (B5: a 3x raise with its top 10%, FISH_RAISE_PCTILE) continues against an all-in deeper than 25 BB with every
+# hand it raises for, read on the pre-noise strength less half the difficulty's noise width (DIFFICULTY_NOISE): it folded 17-52%
+# of its 3-bets to a 100 BB shove and opening 6-10 BB with any two then shoving over them broke even (live -139..-273).
+FISH_RAISE_PCTILE
+DIFFICULTY_NOISE
+# SUPERSEDED 2026-11-09 by the next line (tsc emits exports.DIFFICULTY_NOISE inside the module, so this never matched): FISH_RAISE_PCTILE - (DIFFICULTY_NOISE[
+DIFFICULTY_NOISE[profile.difficulty] ?? 0) / 2
+# 2026-11-09 (bots review fix round 4 fix-up 2, holdem lane, HOLDEM-RR1-EXPLOIT-1/-2) - preFlopStrategy (no-limit): a MANIAC that
+# raised this street, facing an all-in of 26 to MANIAC_SHORT_SHOVE_MAX_BB (75) BB at risk, keeps its MANIAC branch (0dc1b96: ~68%
+# continue, by calling); one that only called plays the stack-off range for the shover's depth counting him alone (2x). The
+# stack-off range continued 35-51% and the opener isolated over flatters: a 26-60 BB human shoving any two over a MANIAC raise won
+# +8..+24 BB/100 (live -18..-28). The flat rule skips a 25 BB or shorter player still to act (a 15 BB bot switched it off).
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): MANIAC_SHORT_SHOVE_MAX_BB
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): const keepManiacBranch = shortShove &&
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): && !keepManiacBranch
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): MANIAC_RAISED_STACKOFF_WIDEN, 1)
+# SUPERSEDED 2026-11-10 by function maniacFacingRaise0dc1b96( (fix-up 5, THE MANIAC CLASS: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, maniacFacingRaise0dc1b96; this round 3-4 / fix-up 1-2 MANIAC rule is gone): d = Math.min(d, bb)
+# 2026-11-09 (bots review fix round 4 fix-up 3, holdem lane, HOLDEM-RR2-EXPLOIT-1/-2) - preFlopStrategy (no-limit): a raise that
+# leaves its maker NEAR_ALLIN_LEFT_FRACTION (half) of his hand-start stack or less is the all-in for every all-in rule (depth at
+# risk > 25 BB), and a bot that continues re-raises to cover him (CONT): re-raising a MANIAC's raise to 50-95% of the stack, NOT
+# all-in, calling any re-raise and moving in on the flop won +17..+92 BB/100 (40 BB human, two 100 BB MANIACs), +81 at 75 BB and
+# +51..+1,581 against five 300 BB MANIACs (live -18..-245). decideAction (Hold'em family, never Stud / draw): an all-in, or a bet
+# that left its maker half his stack or less, needing <= MICRO_CALL_NEED of equity per opponent is never folded after the flop
+# (MANIAC / NIT / ROCK folded air to the last 2-5 BB in an 80-400 BB pot).
+# SUPERSEDED 2026-11-10 by NEAR_ALLIN_SPR (fix-up 4, review P3: the half-stack clause never fired alone - chips behind <= what he put in <= the pot - and the constant is gone): NEAR_ALLIN_LEFT_FRACTION
+function nearAllInRaiser(
+let CONT = CALL;
+shover.currentBet + shover.chipCount
+pctile >= 0.30 ? CONT : FOLD
+pureCall && callAmount < seat.chipCount ? CONT : ALLIN
+shoverFaced(table, seat) ?? nearAllInRaiser(table, seat)
+# SUPERSEDED 2026-11-10 by POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents) (fix-up 4, HOLDEM-F3-REGRESSION-1: the post-flop floor has its own micro constant): MICRO_CALL_NEED / Math.max(1, numOpponents)
+# 2026-11-09 (fix-up 3, sweep finding) - decideAction (Hold'em family): a MANIAC facing an all-in (or a near-all-in bet) after the
+# flop continues only above MANIAC_ALLIN_VALUE_STRENGTH or above the price: its "raise or fold" called 45% of its air at any
+# price, and flatting a MANIAC raise with any two then moving in on the flop with a pair or a draw won +41 BB/100 (live -3).
+MANIAC_ALLIN_VALUE_STRENGTH
+# SUPERSEDED 2026-11-10 by effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds (fix-up 4, HOLDEM-F3-MEASUREMENT-2: the MANIAC price rule reads Monte Carlo equity at every difficulty): MANIAC_ALLIN_VALUE_STRENGTH && effectiveStrength <= potOdds
+# 2026-11-09 (fix-up 3, sweep) - nearAllInRaiser: committed also with a stack-to-pot ratio <= NEAR_ALLIN_SPR (1): a raise to 40-45%
+# of a 40 BB stack over a MANIAC open was flat-called under the light re-raise cap and his flop all-in won +22 / +25 BB/100 (live -7 / -2).
+NEAR_ALLIN_SPR
+NEAR_ALLIN_SPR * (table.getTotalPot() + table.getCallAmount(seat))
+# 2026-11-09 (fix-up 3, sweep) - the MANIAC price rule reads its equity against ANY two cards too (no range narrowing): read only
+# against a raiser's range it folded air that a 12 BB human's any-two flop all-in does not beat (+84 BB/100 vs five 100 BB MANIACs).
+# SUPERSEDED 2026-11-10 by getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, oppMin, isShortDeck, false) (fix-up 4, HOLDEM-F3-MEASUREMENT-2: the any-two read is Monte Carlo at every difficulty): table.communityCards, numOpponents, profile.difficulty, isOmahaFamily, 0, isShortDeck, isHiLoSplit) <= potOdds
+# 2026-11-09 (fix-up 3, PLO sweep) - the MANIAC price rule is not for pot-limit Omaha (the floor only there): PLO keeps 0dc1b96's
+# pre-flop (no extra cheap flops) and its multiway share read folded what the call needed (12 BB any-four flop all-in vs five
+# 100 BB MANIACs +104 BB/100, 7740996 +70, live +59; without it +63).
+allInBettor && !isOmahaFamily && profile.archetype
+# 2026-11-10 (bots review fix round 4 fix-up 4, holdem lane, HOLDEM-F3-REGRESSION-1) - decideAction (Hold'em family): the price floor
+# after the flop is POSTFLOP_MICRO_CALL_NEED (0.10, flat since f605403: not per opponent), not the pre-flop MICRO_CALL_NEED (0.25): with the committed-bettor
+# test (no more than the pot behind) every archetype called a 0.33-0.45-pot river bet with air (0% folds; live 0dc1b96 86-100%).
+POSTFLOP_MICRO_CALL_NEED
+# SUPERSEDED 2026-11-10 by POSTFLOP_MICRO_CALL_NEED) { (fix-up 4, HOLDEM-F3-EXPLOIT-1: the post-flop floor is flat, not per opponent): POSTFLOP_MICRO_CALL_NEED / Math.max(1, numOpponents)
+# 2026-11-10 (fix-up 4, HOLDEM-F3-MEASUREMENT-2 / EXPLOIT-3) - decideAction (Hold'em family, not Omaha): the MANIAC price rule reads
+# Monte Carlo equity at every difficulty: below hard both reads were the static ladder (one pair 0.22-0.34), so a medium / easy MANIAC
+# folded one pair 95% to an any-two overbet all-in (heads-up / Spin & Go medium: call small raises, move in on any flop +28 / +52 BB/100).
+# SUPERSEDED 2026-11-12 by effectiveStrength : equity(rangeFloor)) <= potOdds && equity(0) <= potOdds (fix-up 7, HOLDEM-F6-REGRESSION-1: the range read is rangeFloor, which in Short Deck is the floor at 0dc1b96's share of hands, shortDeckRangeFloor; Hold'em passes oppMinPctile unchanged): effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds
+effectiveStrength : equity(rangeFloor)) <= potOdds && equity(0) <= potOdds
+getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, oppMin, isShortDeck, false)
+# 2026-11-10 (fix-up 4, HOLDEM-F3-EXPLOIT-1) - a committed raise (NEAR_ALLIN_SPR) is the all-in at every depth outside All-In or Fold
+# (continued by a call at 25 BB or less), the post-flop floor is flat, and a dry side pot is checked down (decideAction, Hold'em family,
+# not Omaha: with a short player all-in or with <= POSTFLOP_MICRO_CALL_NEED of the pot behind and another live opponent with chips, a
+# bet / raise below MANIAC_ALLIN_VALUE_STRENGTH is a check / call): flat-called short all-ins / 95% raises over a MANIAC open won
+# +204..+328 BB/100 against five 100 BB MANIACs (live -52..-76) from the side-pot folds of the other callers.
+function sidePotAgainstShortStack(
+sidePotAgainstShortStack(table, seat)
+shover = nearAllInRaiser(table, seat);
+# SUPERSEDED 2026-11-10 by shover && !shover.allIn && (shoveBB > (fix-up 5, HOLDEM-F4-REGRESSION-1: heads-up the committed raiser is covered at every depth): shover && !shover.allIn && shoveBB >
+POSTFLOP_MICRO_CALL_NEED) {
+# 2026-11-10 (fix-up 5, HOLDEM-F4-REGRESSION-1 / MEASUREMENT-1 / EXPLOIT-2) - preFlopStrategy: against a committed raiser who is the only
+# other player with chips, a bot that continues covers him (the jam) at every depth; fix-up 4 called at 25 BB or less and the
+# bot then folded his flop all-in (Heads-Up Snap 20 BB any two opened to 40-50% +68..+139 BB/100 vs NIT / ROCK, live -152..-338).
+shover && !shover.allIn && (shoveBB >
+othersWithChips === 1))
+# 2026-11-10 (fix-up 5, THE MANIAC CLASS: HOLDEM-F3-REGRESSION-2 = MEASUREMENT-1 = EXPLOIT-2) - preFlopStrategy: a MANIAC facing a raise or an
+# all-in (no-limit, not All-In or Fold) plays 0dc1b96's MANIAC line for line (its push/fold on the chips-left depth, then the ~93% re-raise /
+# call / fold branch; Short Deck on 0dc1b96's Hold'em percentile): the light re-raise cap made MANIACs flat each other and the human, and
+# a limp / flat with any two then a pair-or-draw flop all-in won +215..+379 BB/100 (live -83..-100); a cap only in the light re-raise
+# spots left MANIACs folding where live's call (five 200-300 BB MANIACs, open and shove over the re-raise: +218..+675, live -28..-85).
+function maniacFacingRaise0dc1b96(
+maniacFacingRaise0dc1b96(ctx.maniacPctile ?? pctile
+getPreFlopHandRank(holdemHoleCards(seat.holeCards)) + noise
+# 2026-11-10 (fix-up 5, HOLDEM-F4-EXPLOIT-2) - decideAction pre-flop: a NIT that would flat-call a single raise from a player with 25 BB or
+# less at risk, nobody else in for the bet, moves in over it (nitShortRaiserCover): B5's NITs open instead of limp-trapping, and an any-two
+# open to 25-30% of a 20-25 BB stack, fold to a re-raise, any flop all-in won +28..+33 BB/100 against five NITs (live -1..-25).
+function nitShortRaiserCover(
+nitShortRaiserCover(table, seat) ?? pre
+# 2026-11-10 (fix-up 5 sweep, the flat-then-fold dead money) - preFlopStrategy: a non-MANIAC that flat-called a raise this street (more than
+# the big blind in), facing an all-in or committed raise its call closes with more than 25 BB at risk (no-limit, not All-In or Fold), makes
+# 0dc1b96's continue decision (flatterContinue0dc1b96), not the stack-off range: a FISH folded 96% of its flats of a MANIAC re-raise to the
+# human's all-in (live 35%), and two 300 BB MANIACs + TAG / FISH / LAG, open any two and move in over the re-raise, won +122 / +350 BB/100
+# (EV v3, 15k hands; live -18 / -20). A seat with only the big blind in (a lone all-in) keeps the stack-off range.
+function flatterContinue0dc1b96(
+# SUPERSEDED 2026-11-12 by flatterContinue0dc1b96(table, seat, profile, flatP, callAmount (fix-up 7, HOLDEM-F6-REGRESSION-1: in Short Deck the flat-caller reads 0dc1b96's strength, flatP; Hold'em passes the same pctile): flatterContinue0dc1b96(table, seat, profile, pctile, callAmount
+flatterContinue0dc1b96(table, seat, profile, flatP, callAmount
+function ownCallsThisStreet(
+# 2026-11-10 (fix-up 6, HOLDEM-F5-MEASUREMENT-1 = EXPLOIT-1 / EXPLOIT-2) - preFlopStrategy: facing a raise from a player who is neither all-in
+# nor committed (no-limit, not All-In or Fold), the push/fold zone and the Nash lookup read 0dc1b96's chips-left depth (zoneBB): on the
+# hand-start depth a 20 BB bot facing a 4-6 BB open played its normal ranges and folded the flop (Heads-Up Snap: any two opened to 20-30%,
+# any flop all-in +98..+151 BB/100 vs ROCK, live -78..-161); a 12 BB human's 2 BB steal won +21..+39 at five NITs (live -41..+1).
+? chipsLeftEffectiveStackBB(table, seat.seatIndex) : effBB
+inPushFoldZone)(zoneBB, zonePlayers)
+# 2026-11-10 (fix-up 6, HOLDEM-F5-REGRESSION-1) - preFlopStrategy: with ROCK_LIMP_TRAP_MAX_PLAYERS (3) dealt or fewer, a first-in ROCK limps its
+# premiums as 0dc1b96 did (B5's raise capped its short-handed limp range: an iso-raise over the limp, fold to a re-raise, any flop all-in
+# beat live by +16..+39 BB/100 in Heads-Up Snap / Spin & Go); six-max keeps B5's raise.
+ROCK_LIMP_TRAP_MAX_PLAYERS = 3
+callAmount === 0 || totalActive >
+# 2026-11-10 (fix-up 6 sweep, short-stack steals) - preFlopStrategy: at a hand-start effective stack of 25 BB or less (PUSH_FOLD_MAX_BB) a bigger
+# raise narrows no call / 3-bet range (B4), as 0dc1b96; the big blind still widens against a small one. Narrowed, a 25 BB big blind continued
+# against a 4-6 BB open only 49-78% as often as against 3 BB, and an any-two 4-6 BB steal won +8..+42 BB/100 in Spin & Go 25 BB against
+# NIT / ROCK lineups (live -40..+15).
+Math.max(1, sizeRaw) : sizeRaw
+# 2026-11-11 (fix-up 6 sweep, FISH re-raise) - preFlopStrategy: at a hand-start effective stack of 25 BB or less (no-limit, not All-In or
+# Fold) a FISH's raise over a single raise (top 10%, FISH_RAISE_PCTILE) is the jam, as 0dc1b96, not B5's 3x re-raise: heads-up 20 BB, a
+# min-raise of any two that calls any re-raise and moves in on the flop with a pair or a draw won +96 BB/100 (live +64; now +77 vs +78).
+FISH_RAISE_PCTILE && noLimit && !allInOrFold && effBB <=
+# 2026-11-12 (fix-up 7, HOLDEM-F6-REGRESSION-1 = HOLDEM-F6-EXPLOIT-1) - decideAction / preFlopStrategy: Short Deck, no-limit, not All-In or
+# Fold, a non-MANIAC facing a single raise from a player who is neither all-in nor committed, or first in with
+# SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS (3) dealt or fewer, reads 0dc1b96's strength (sdLivePctile: the Hold'em percentile with 0dc1b96's
+# noise and hard / expert adjustment) with no size term (sdLiveSpot); the stack-off ranges keep the Short Deck percentile (ownPctile).
+# On the Short Deck percentile a NIT defended 9.8% against a 2.5 BB button open (live 20.3%) and any-two 2-2.5 BB steals won +35..+53
+# BB/100 at Short Deck NIT tables (live +1..+24).
+SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS = 3
+let sdLivePctile = maniacPctile;
+sdLivePctile !== undefined && sdLivePctile < 0.65
+const strength = sdLiveSpot ? ctx.sdLivePctile : handStrength;
+# SUPERSEDED 2026-11-12 by const sizeFactor = sdLiveSpot ? (effBB > (fix-up 8, HOLDEM-F7-EXPLOIT-2: deeper than 25 BB a bigger open narrows the sdLiveSpot calls again, B4 without the widening; the line it pinned no longer exists): const sizeFactor = sdLiveSpot ? 1 : noLimit
+# 2026-11-12 (fix-up 7, HOLDEM-F6-REGRESSION-1, after the flop) - decideAction: Short Deck carries the opponents' range floor (oppMinPctile,
+# tuned on the Hold'em percentile) onto the Short Deck table at the share of the 630 combos 0dc1b96's sampler kept with it
+# (shortDeckRangeFloor): on the Short Deck table the same floor kept about half of 0dc1b96's range, a hard ROCK folded 17.5% of its flop
+# bets to an all-in (0dc1b96 3.8%), and opening 2 BB with any two then moving in on every flop won +45 BB/100 heads-up at 20 BB (0dc1b96 +24).
+function shortDeckRangeFloor(
+const rangeFloor = isShortDeck ? shortDeckRangeFloor(oppMinPctile) : oppMinPctile;
+# 2026-11-12 (fix-up 8, HOLDEM-F7-EXPLOIT-1 = MEASUREMENT-1 = REGRESSION-1, EXPLOIT-2) - preFlopStrategy sdLiveSpot: one scale per decision. Short
+# Deck first in, only a ROCK or a CALLING_STATION (a limp or a fold) reads 0dc1b96's strength; facing an all-in or a committed raise with
+# SHORT_DECK_LIVE_ALLIN_MAX_BB (40) or less at risk every non-MANIAC reads it; inside sdLiveSpot the stack-off reads (ownPctile, so) and the
+# unsized 3-bet range read it too, and deeper than 25 BB a bigger open narrows the calls (B4). Fix-up 7 opened at 0dc1b96's width and met the
+# re-raise / all-in on the Short Deck percentile: moving in over any open won +17..+49 BB/100 heads-up / 3-handed at 20-40 BB (live -46..-157),
+# a 25% open then any flop all-in +17..+236 at 30-100 BB (live -65..-159).
+const sdShover = ctx.sdLivePctile !== undefined
+SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS && (profile.archetype === 'ROCK' || profile.archetype === 'CALLING_STATION')
+SHORT_DECK_LIVE_ALLIN_MAX_BB = 40
+SHORT_DECK_LIVE_ALLIN_MAX_BB * bigBlind : sr === 1
+const ownPctile = sdLiveSpot ? pctile :
+const sizeFactor = sdLiveSpot ? (effBB >
+Math.min(1, sizeRaw) : 1)
+const threeBetThS = sdLiveSpot ? threeBetTh : sized(
+# 2026-11-12 (fix-up 8, HOLDEM-F7-REGRESSION-1, B5's class) - preFlopStrategy NIT: no-limit, NIT_LIMP_TRAP_MAX_PLAYERS (3) dealt or fewer, a NIT
+# in an unopened pot with a call to make plays 0dc1b96's NIT without its 100 BB jam: 4-bet value hands raise to 2.5 BB, the rest of its 3-bet
+# range limps and calls an iso-raise. B5's open folded all but the value hands to a 3-bet: open any two + 3-bet any open + c-bet (cb3) won
+# +62 / +77 BB/100 heads-up at 40 BB in Hold'em / Short Deck (live +54 / +48).
+NIT_LIMP_TRAP_MAX_PLAYERS = 3
+NIT_LIMP_TRAP_MAX_PLAYERS) {

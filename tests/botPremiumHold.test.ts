@@ -192,10 +192,20 @@ describe('HAI-3 — the micro-call floor is per opponent in the pot', () => {
       const t = aof(); t.playerAllIn(3); t.playerAllIn(4); t.playerAllIn(5); t.playerFold(0); t.playerFold(1); return { t, me: 2 };
     }, AOF],
   ];
+  // Fix-up 5 (2026-11-10, THE MANIAC CLASS): outside All-In or Fold a MANIAC facing all-ins plays 0dc1b96's MANIAC
+  // (maniacFacingRaise0dc1b96: 0dc1b96's push/fold on the chips-left depth, or its random raise of a bottom hand with callers
+  // still holding chips), not the stack-off range: it continues 50-97% of hands (~65% when every shover is all-in, ~93% when
+  // the callers have chips behind), 72o / 32o at most 60% (0dc1b96 ~45% with the callers' chips behind). Every other archetype, and the MANIAC in All-In or Fold, keep the 0 / <= 12% bounds.
   it.each(['easy', 'medium', 'hard'])('%s: 72o and 32o fold in the deep multiway all-ins (every archetype called 100%%)', (diff) => {
     for (const [label, build, opts] of closes) for (const a of ARCHS) {
-      for (const c of ['72o', '32o']) expect([label, a, c, rate(build, prof(a, diff), cont, 40, c, opts || {})]).toEqual([label, a, c, 0]);
-      expect(rate(build, prof(a, diff), cont, 600, undefined, opts || {})).toBeLessThanOrEqual(0.12);
+      for (const c of ['72o', '32o']) {
+        const w = rate(build, prof(a, diff), cont, 40, c, opts || {});
+        if (a === 'MANIAC' && !opts) expect([label, a, c, w <= 0.6]).toEqual([label, a, c, true]);
+        else expect([label, a, c, w]).toEqual([label, a, c, 0]);
+      }
+      const r = rate(build, prof(a, diff), cont, 600, undefined, opts || {});
+      if (a === 'MANIAC' && !opts) expect([label, r >= 0.5 && r <= 0.97]).toEqual([label, true]);
+      else expect(r).toBeLessThanOrEqual(0.12);
     }
   });
   it('...while every archetype still calls a genuinely small all-in that it closes with any two cards (C14)', () => {

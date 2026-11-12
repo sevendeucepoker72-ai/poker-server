@@ -6,7 +6,7 @@ import { calculateEquity, keptHoldemHoleCards } from '../training/TrainingEngine
 import {
   getPreflopPercentile, getStackOffPercentile, posBucket, PosBucket,
   OPEN_THRESHOLD, THREEBET_THRESHOLD, FOURBET_THRESHOLD, FOURBET_STACKOFF_THRESHOLD, CALL_VS_RAISE_THRESHOLD,
-  ARCHETYPE_RANGE_FACTOR, adjustThreshold, PREMIUM_STACKOFF_THRESHOLD,
+  ARCHETYPE_RANGE_FACTOR, adjustThreshold, PREMIUM_STACKOFF_THRESHOLD, percentileByRanks,
 } from './preflopRanges';
 import {
   inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB, stackOffCallWidth,
@@ -15,7 +15,7 @@ import {
 import {
   StudDrawKind, studDrawKindOf, isStudKind, studDrawEquity, firstRoundEquity, equityToPercentile, drawsLeftAt,
 } from './studDrawStrength';
-import { getShortDeckPreflopPercentile } from './shortDeckPreflop';
+import { getShortDeckPreflopPercentile, shortDeckPercentileByRanks } from './shortDeckPreflop';
 import { calibrateOmahaPreflop } from './omahaPreflopCalibration';
 import { countOmahaDrawOuts } from '../training/fastOmahaEval';
 
@@ -575,6 +575,38 @@ function shortDeckStaticStrength(allCards: Card[], communityCards: Card[]): numb
   return Math.min(1.0, Math.max(0.0, score));
 }
 
+/** The Hold'em and the Short Deck percentile of each of the 630 Short Deck combos, each sorted strongest first (lazy, fixed). */
+let shortDeckFloorTable: { holdem: number[]; shortDeck: number[] } | null = null;
+/**
+ * Fix-up 7 (HOLDEM-F6-REGRESSION-1, after the flop) — Short Deck: the opponents' range floor that decideAction derives from
+ * their action (oppMinPctile: 0.45 / 0.62 / 0.80 plus the read's nudges, tuned on the Hold'em percentile), carried onto the
+ * Short Deck table at the share of the 630 Short Deck combos that 0dc1b96 kept with it (its sampler ranked them on the
+ * Hold'em percentile; since 39f043a calculateEquity ranks them on the Short Deck table). On the Short Deck table the same
+ * floor kept about half of 0dc1b96's range (0.62: 38% of the combos, 0dc1b96 64%; 0.80: 21%, 0dc1b96 39%), so a hard bot
+ * read its equity against a bet or a raise low: a heads-up 20 BB ROCK folded 17.5% of its flop bets to an all-in (0dc1b96
+ * 3.8%), and opening 2 BB with any two then moving in on every flop won +45 BB/100 (0dc1b96 +24; 25 BB +20 vs -4). With the
+ * floor at 0dc1b96's share: +26 / -2 (bets kept 92%). 0 (no floor) stays 0, and so does a floor that kept every combo.
+ */
+export function shortDeckRangeFloor(holdemFloor: number): number {
+  if (!(holdemFloor > 0)) return holdemFloor;
+  if (!shortDeckFloorTable) {
+    const holdem: number[] = [], shortDeck: number[] = [];
+    for (let a = 0; a < 36; a++) for (let b = a + 1; b < 36; b++) {
+      const r1 = 6 + (a >> 2), r2 = 6 + (b >> 2), suited = (a & 3) === (b & 3);
+      holdem.push(percentileByRanks(r1, r2, suited));
+      shortDeck.push(shortDeckPercentileByRanks(r1, r2, suited));
+    }
+    holdem.sort((x, y) => y - x);
+    shortDeck.sort((x, y) => y - x);
+    shortDeckFloorTable = { holdem, shortDeck };
+  }
+  const { holdem, shortDeck } = shortDeckFloorTable;
+  let kept = 0;
+  while (kept < holdem.length && holdem[kept] >= holdemFloor) kept++;
+  if (kept >= shortDeck.length) return 0;
+  return shortDeck[Math.max(1, kept) - 1];
+}
+
 // ============================================================
 // Implied odds & stack-to-pot ratio considerations
 // ============================================================
@@ -1002,6 +1034,8 @@ function decideActionForSeat(
   // the id 'omaha-6', so its public variant.isHiLo is read too.
   const isShortDeck = !isOmahaFamily && /short|six.?plus|6.?plus/i.test(variantId);
   const isHiLoSplit = isOmahaFamily && ((table as any).variant?.isHiLo === true || /hi.?lo/i.test(variantId));
+  // Fix-up 7: Short Deck reads the range floor at the share of Short Deck hands 0dc1b96 kept with it (shortDeckRangeFloor).
+  const rangeFloor = isShortDeck ? shortDeckRangeFloor(oppMinPctile) : oppMinPctile;
   // 2026-11 — Hold'em pre-flop also reads the STACK-OFF percentile (4-bets, deep
   // all-ins). Never Omaha or Short Deck: null falls back to their own strength.
   let stackOff: number | null = null;
@@ -1028,7 +1062,7 @@ function decideActionForSeat(
     handStrength = getPostFlopStrength(
       isOmahaFamily ? seat.holeCards : holdemHoleCards(seat.holeCards, table.communityCards),
       table.communityCards, numOpponents, profile.difficulty,
-      isOmahaFamily, oppMinPctile, isShortDeck, isHiLoSplit
+      isOmahaFamily, rangeFloor, isShortDeck, isHiLoSplit
     );
   }
 
@@ -1048,12 +1082,18 @@ function decideActionForSeat(
   const rawStackOff = stackOff;
 
   // Difficulty-based noise (expert has almost none)
-  const noiseMap: Record<Difficulty, number> = {
-    easy: 0.25, medium: 0.12, hard: 0.05, expert: 0.02
-  };
+  const noiseMap = DIFFICULTY_NOISE;
   const rawNoise = (Math.random() - 0.5) * noiseMap[profile.difficulty];
   const noise = isFinite(rawNoise) ? rawNoise : 0;
   handStrength = Math.min(1.0, Math.max(0.0, handStrength + noise));
+  // Fix-up 5: the strength 0dc1b96 read pre-flop in Short Deck (the Hold'em percentile of the two cards), same noise draw:
+  // a MANIAC facing a raise plays 0dc1b96's MANIAC on it (maniacFacingRaise0dc1b96). Not adjusted below: at hard / expert
+  // 0dc1b96 also took 0.05 / 0.08 off a strength under 0.65 facing an aggressive opponent's bet of more than 4 BB, so in that
+  // spot the Short Deck MANIAC is slightly looser than 0dc1b96's (Hold'em passes the adjusted strength and is exact).
+  const maniacPctile = isPreFlop && isShortDeck ? Math.min(1.0, Math.max(0.0, getPreFlopHandRank(holdemHoleCards(seat.holeCards)) + noise)) : undefined;
+  // Fix-up 7 (HOLDEM-F6-REGRESSION-1 = EXPLOIT-1): the same 0dc1b96 strength, with 0dc1b96's hard / expert aggression
+  // adjustment below, for the Short Deck spots where every other archetype plays 0dc1b96's ranges (preFlopStrategy sdLiveSpot).
+  let sdLivePctile = maniacPctile;
   if (stackOff !== null) stackOff = Math.min(1.0, Math.max(0.0, stackOff + noise));   // same noise draw
 
   // Outs and implied odds for draw decisions. 2026-11: Stud / Draw equity already
@@ -1102,6 +1142,7 @@ function decideActionForSeat(
       if (handStrength < 0.65) {
         handStrength -= aggressionAdjust;
       }
+      if (sdLivePctile !== undefined && sdLivePctile < 0.65) sdLivePctile -= aggressionAdjust;   // fix-up 7: as 0dc1b96's strength
     }
 
     // Multi-way pot adjustment: hands play worse multi-way
@@ -1125,7 +1166,7 @@ function decideActionForSeat(
     // 2026-11 — Stud (Third Street) and draw first rounds have their own routing
     // (studDrawFirstRound: no blinds in Stud, a completion is a raise, fixed-limit
     // has no push/fold); Hold'em / Omaha / Short Deck / Pineapple use preFlopStrategy.
-    const pre = sdKind
+    let pre = sdKind
       ? studDrawFirstRound(
         handStrength, callAmount, totalPot, seat, table, profile,
         myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true, isStudKind(sdKind) ? 'stud' : 'draw',
@@ -1133,7 +1174,11 @@ function decideActionForSeat(
       : preFlopStrategy(
         handStrength, callAmount, totalPot, seat, table, profile,
         myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true,
-        { liveOpponents: numOpponents, stackOff, rawPctile: rawStrength, rawStackOff });
+        { liveOpponents: numOpponents, stackOff, rawPctile: rawStrength, rawStackOff, maniacPctile, sdLivePctile });
+    // Fix-up 5 (HOLDEM-F4-EXPLOIT-2): a NIT does not flat-call a short (<= 25 BB at risk) raiser heads-up; it covers him.
+    if (!sdKind && profile.archetype === 'NIT' && pre.action === PlayerAction.Call && opts.allInOrFold !== true) {
+      pre = nitShortRaiserCover(table, seat) ?? pre;
+    }
     return limitBotRaiseWar(table, seat, pre, true, handStrength);
   }
 
@@ -1145,6 +1190,37 @@ function decideActionForSeat(
     seat, table, profile, storyBoard, opponents, outs, bigBlind, numOpponents, oppCategory,
     holdemEquivalentStreet(table.currentPhase, sdKind)
   );
+  // Fix-up 3 (HOLDEM-RR2-EXPLOIT-2) — the Hold'em family only (never Stud / draw): against an all-in, or a bet from a committed
+  // player (nearAllInRaiser: no more than the pot behind), the decision is priced.
+  //  - The price floor after the flop: at most POSTFLOP_MICRO_CALL_NEED of equity needed (fix-up 4: flat; fix-up 3 used the
+  //    pre-flop MICRO_CALL_NEED per opponent), a FOLD is a call. The MANIAC "raise or fold" (and NIT / ROCK below a fixed
+  //    strength) folded air to a human's last 2-5 BB in an 80-400 BB pot after flat-calling his near-all-in raise.
+  //  - A MANIAC continues only with its value hands (MANIAC_ALLIN_VALUE_STRENGTH) or above the price, read against its range
+  //    read and against any two cards: its "raise" there is a call, and it called 45% of its air at any price
+  //    (MANIAC_ALLIN_VALUE_STRENGTH doc). Not pot-limit Omaha (the floor only): see the same doc. Fix-up 4: both reads are
+  //    Monte Carlo equity at every difficulty (below hard getPostFlopStrength is a static ladder: see the same doc).
+  const allInBettor = !sdKind && table.bettingStructure !== 'fixed-limit' && callAmount > 0
+    ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
+  if (allInBettor && potOdds <= POSTFLOP_MICRO_CALL_NEED) {
+    if (post.action === PlayerAction.Fold) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
+  } else if (allInBettor && !isOmahaFamily && profile.archetype === 'MANIAC' && post.action !== PlayerAction.Fold
+      && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH) {
+    const hole = holdemHoleCards(seat.holeCards, table.communityCards);
+    const equity = (oppMin: number): number =>
+      getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, oppMin, isShortDeck, false);
+    if ((mcTier ? effectiveStrength : equity(rangeFloor)) <= potOdds && equity(0) <= potOdds) {
+      return { action: PlayerAction.Fold, raiseAmount: 0 };
+    }
+  }
+  // Fix-up 4 (HOLDEM-F3-EXPLOIT-1) — the Hold'em family, not Omaha: a dry side pot is checked down. With a short player in the
+  // hand (all-in, or no more than POSTFLOP_MICRO_CALL_NEED of the pot behind) and another live opponent with chips, a hand
+  // below MANIAC_ALLIN_VALUE_STRENGTH does not bet the side pot (the bet is a check) or raise his all-in (the raise is a
+  // call): the other main-pot callers folded to it and their chips were dead money in his pot (sidePotAgainstShortStack).
+  if (!sdKind && !isOmahaFamily && table.bettingStructure !== 'fixed-limit' && effectiveStrength <= MANIAC_ALLIN_VALUE_STRENGTH
+      && (post.action === PlayerAction.Raise || post.action === PlayerAction.AllIn) && sidePotAgainstShortStack(table, seat)) {
+    if (callAmount === 0) return { action: PlayerAction.Check, raiseAmount: 0 };
+    if (shoverFaced(table, seat)) return { action: callAmount >= seat.chipCount ? PlayerAction.AllIn : PlayerAction.Call, raiseAmount: 0 };
+  }
   return limitBotRaiseWar(table, seat, post, false, effectiveStrength);
 }
 
@@ -1167,6 +1243,59 @@ export const SIZE_WIDEN_MAX = 1.3;
  * 3-bet line keeps narrowing; the value set is held whatever the size (preFlopStrategy).
  */
 export const SIZE_NARROW_MAX_TH = 0.946;
+/**
+ * Fix round 4 — no-limit, deeper than the push/fold zone: a NIT's flat range (its 3-bet range) facing a
+ * single raise narrows by the B4 size factor only past this multiple of the reference open (2 x 3 BB =
+ * 6 BB), then reaches the SIZE_NARROW_MAX_TH floor by ~10 BB as before (B4's 15 / 60 BB rows unchanged).
+ * Its range is only the top ~6-9%: narrowed in proportion it continued 5.6% against a 4-6 BB open (6.2-9.2%
+ * against 3 BB; live 0dc1b96 6.2-9.0% at every size), and opening 5 / 6 BB with any two and folding to a
+ * re-raise won +28 to +30 / +22 BB/100 against five NITs (live +6 to +19 / -10 to +6). Now +11 to +14 / 0.
+ */
+export const NIT_SIZE_NARROW_SLACK = 2;
+/**
+ * Fix-up 6 (HOLDEM-F5-REGRESSION-1) — no more dealt players than this (Heads-Up Snap, Spin & Go 3-max): a ROCK in an unopened
+ * pot with a call to make (first in, or behind limpers: "unopened" counts no raise, so a limper ahead does not open it; not
+ * the big blind's option) LIMPS its premiums, as 0dc1b96 did, in both cases; a bigger table keeps B5's raise. It has no
+ * variant guard: short-handed pot-limit Omaha limps them too, which is also 0dc1b96 (re-review 6 measured PLO 3-handed ROCK
+ * lines at live). B5's raise left the
+ * short-handed limp range capped: an iso-raise over the limp to 2-3 BB, then any flop all-in, beat live by +16 to +39
+ * BB/100 (Heads-Up 20 BB +45 / +84 vs live +29 / +67; Spin 25 BB ROCK, ROCK +15 / +56 vs -23 / +21). With the limp: +30 /
+ * +69 and -18 / +23 (the human's whole line, real engine, 3,000 hands).
+ */
+export const ROCK_LIMP_TRAP_MAX_PLAYERS = 3;
+/**
+ * Fix-up 8 (HOLDEM-F7-REGRESSION-1, B5's class) — no-limit, no more dealt players than this (Heads-Up, Spin & Go 3-max): a NIT
+ * in an unopened pot with a call to make (first in, or behind limpers) plays 0dc1b96's NIT without its 100 BB jam: its 4-bet
+ * value hands (fourBetValue) raise to 2.5 BB, the rest of its 3-bet range limps, and it calls an iso-raise with them as
+ * 0dc1b96 did; a bigger table keeps B5's open. B5's open (its 3-bet range, max(openTh, threeBetTh)) folded every hand but
+ * the 4-bet value ones to a 3-bet: heads-up at 40 BB, opening any two, 3-betting any open and c-betting (cb3) won +62 / +77
+ * BB/100 in Hold'em / Short Deck (live 0dc1b96 +54 / +48), a bare 3-bet of any open +15 in Short Deck (live -12). With the
+ * limp: +45 / +39 and -15; 3-handed at 40 BB +38 / +19 (live +65 / +50); the iso-raise over its limp loses as on live
+ * (isop:4 -33 / -35, live -33 / -58; whole lines, real engine, EV v3, 4,000-6,000 hands).
+ */
+export const NIT_LIMP_TRAP_MAX_PLAYERS = 3;
+/**
+ * Fix-up 7 (HOLDEM-F6-REGRESSION-1 = EXPLOIT-1), fix-up 8 (HOLDEM-F7-EXPLOIT-1 = MEASUREMENT-1) — Short Deck, no more dealt
+ * players than this: a ROCK or a CALLING_STATION first in (a call to make, no raise yet) plays its first-in decision on
+ * 0dc1b96's strength (ctx.sdLivePctile), as it does facing a single raise (preFlopStrategy sdLiveSpot). Fix-up 7 applied it to every
+ * non-MANIAC: a raiser then opened at 0dc1b96's width and met the re-raise or the all-in on the Short Deck percentile (a
+ * heads-up 20 / 30 BB TAG folded 73 / 84% of its opens to an all-in), and moving in with any two over its open won +17 to
+ * +49 BB/100 heads-up and 3-handed at 20-40 BB (live -46 to -157). A ROCK's or a CALLING_STATION's first-in decision is a
+ * limp or a fold, answered on the same scale (an iso-raise in sdLiveSpot, an all-in below SHORT_DECK_LIVE_ALLIN_MAX_BB);
+ * without the rule a heads-up 20 / 25 BB ROCK played 33% first in (0dc1b96 57%) and a 2 BB steal won +6 BB/100 (live -4).
+ */
+export const SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS = 3;
+/**
+ * Fix-up 8 (HOLDEM-F7-EXPLOIT-1 = MEASUREMENT-1) — Short Deck: facing an all-in (or a committed raise: nearAllInRaiser) with no
+ * more than this many big blinds at risk (the smaller hand-start stack), a non-MANIAC reads 0dc1b96's strength
+ * (preFlopStrategy sdLiveSpot) in every read, the stack-off ranges included.
+ * On the Short Deck percentile the Hold'em-tuned stack-off and Nash call ranges kept about half of 0dc1b96's continues: a
+ * heads-up 30 BB TAG big blind continued 14% against an all-in from the button (now 29%; 0dc1b96 91%), and moving in with
+ * any two on every hand won +8 to +27 BB/100 at 20-30 BB already on 5cf7147 (live -47 to -76; now -36 to -56). Deeper the
+ * Short Deck stack-off range stays (a lone 100 BB all-in: 5-10%, NEW-1); heads-up at 60 BB moving in over every open is
+ * +11 (9) BB/100, as on 5cf7147 (live -92).
+ */
+export const SHORT_DECK_LIVE_ALLIN_MAX_BB = 40;
 /**
  * Fix round 3 (review of HAI-2) — from a call of this share of the commit line
  * (STACKOFF_COMMIT_FRACTION: 1/2 x 1/3 = a sixth of the stack) the size floor slides linearly
@@ -1191,6 +1320,29 @@ export const CS_CALL_WIDTH = 0.60;
  */
 export const MICRO_CALL_NEED = 0.25;
 /**
+ * Fix round 4, fix-up 4 (HOLDEM-F3-REGRESSION-1) — after the flop, Hold'em family: a call against an all-in or a committed
+ * bettor (nearAllInRaiser) at this needed equity or less is always made. Fix-up 3 used the pre-flop
+ * MICRO_CALL_NEED (0.25): heads-up that prices in a half-pot bet, and the committed-bettor test (no more than the pot behind)
+ * reaches ordinary turn and river bets, so every archetype called a 0.33-0.45-pot river bet with air (a 40 BB human vs a
+ * 100 BB bot: TAG / LAG / NIT / ROCK / MANIAC folded 0% of it; live 0dc1b96 86-100%). At 0.10 the floor still calls what it
+ * is for, a human's last 2-5 BB into an 80-400 BB pot (<= 6% needed), and the bot prices a third-pot bet (20% needed) as
+ * before. Flat, not per opponent (HOLDEM-F3-EXPLOIT-1): divided by three live opponents (3.3%), a short human's last 5 BB
+ * into a 60 BB multiway pot (7% needed) was folded by MANIAC air, and those callers' chips were dead money in his main pot
+ * (a raise to 75% of 20 BB over a MANIAC open, then the flop all-in: +134 (48) BB/100 against five 100 BB MANIACs, live -83).
+ * It is also the short stack of a dry side pot (sidePotAgainstShortStack).
+ */
+export const POSTFLOP_MICRO_CALL_NEED = 0.10;
+/**
+ * Fix round 3 (PLO NEW-1 check) — pot-limit Omaha: a lone all-in the call closes is called with any hand at this
+ * needed equity or less per opponent. Four-card hands run close (a random hand has 34% against AAxx on average,
+ * p25 31%; 47% against the top 41%), and a pot-limit all-in never needs more than about a third. The round-1
+ * hand-start depth (NEW-1) sent short lone all-ins into the Hold'em Nash call on the Omaha scale: a TAG that
+ * pot-opened the button folded 43% of its opening range to an 8 BB shove needing 26.5% (live 0dc1b96: 0%).
+ * PLO now keeps the 0dc1b96 depth too (chipsLeftEffectiveStackBB); this floor also keeps the push/fold
+ * zone's bottom-of-range folds (NIT 0.7% there at 0dc1b96) out of such a spot.
+ */
+export const PLO_LONE_ALLIN_CALL_NEED = 0.30;
+/**
  * Fix round 3 (All-In or Fold economy) — in All-In or Fold every decision is a stack-off, so an
  * archetype's range factor applies as factor ^ AOF_ARCHETYPE_DAMP there (MANIAC 0.60 -> 0.77, FISH
  * 0.78 -> 0.88, NIT 1.10 -> 1.05): the personalities stay, at half the width spread. The full spread
@@ -1207,6 +1359,71 @@ export const AOF_ARCHETYPE_DAMP = 0.5;
  * games, 20/40, 1,000 chips, live mix), the fixed .85 / .88 one ~-0.5%, a hard bot ~+1.8%.
  */
 export const AOF_NOISE_KEEP = 0.5;
+/**
+ * Fix round 4, fix-up 3 (HOLDEM-RR2-EXPLOIT-1 / -2) — no-limit Hold'em family: a raise (or a post-flop bet) whose maker has no
+ * more chips behind than this many times the pot this seat's call would make (a stack-to-pot ratio <= 1: his last bet can be
+ * no bigger than that pot, so it is priced in) is the all-in it effectively is: he calls any re-raise. Pre-flop (fix-up 3:
+ * deeper than the push/fold zone, depth at risk > 25 BB; fix-up 4: every depth), every all-in rule of preFlopStrategy reads
+ * it as the all-in (nearAllInRaiser: the price floor, the commit gate, the FISH rule; fix-up 5: a MANIAC facing it plays
+ * maniacFacingRaise0dc1b96), and a bot that continues re-raises to cover him (a flat left him chips to move in
+ * after the flop; fix-up 4: deeper than the push/fold zone only). Post-flop the price floor and
+ * the MANIAC price rule (decideAction) treat his bet as an all-in. They keyed on a real all-in only, so a human who re-raised
+ * a MANIAC's raise to 50-95% of his stack met the commit gate at the LARGEST opponent's depth (a 100 BB MANIAC continued 16%
+ * against a 40 BB human's raise to 38 BB, 69% against his all-in) or the light re-raise cap (a 300 BB MANIAC flat-called
+ * ~70%, then folded air to his last 2-5 BB on the flop). Re-raise to F of the stack, call any re-raise, move in on the flop
+ * (hard, whole line, BB/100, 7740996 / live 0dc1b96): a 40 BB human vs two 100 BB MANIACs +17 / +44 / +69 / +92 at F = 0.5 /
+ * 0.6 / 0.75 / 0.95 (live +1 / 0 / -12 / -18); a 75 BB human +81 at every F (live -5 to -23); a 100 BB human vs five 300 BB
+ * MANIACs +51 / +406 / +795 / +1,581 (live -228 / -245 / -116 / -88). A 10% share of the stack left (the review candidate)
+ * left F <= 0.75 open (+81 at 75 BB, +279 / +487 vs the 300 BB MANIACs); the commit gate at the raiser's depth alone left +75.
+ * Fix-up 3 first counted a raise that left half the hand-start stack or less (NEAR_ALLIN_LEFT_FRACTION, 0.5), then added this
+ * ratio: a raise that kept more than half the stack (40-45% of 40 BB over a MANIAC open) was flat-called under the light
+ * re-raise cap, and the price on his flop all-in let a MANIAC fold: re-raise to 40 / 45% of the stack and move in on the
+ * flop won +22 (9) / +25 (10) BB/100 with one 100 BB MANIAC and a 40 BB stack (live 0dc1b96 -7 / -2); with this ratio
+ * -1 / -1, and 0.3 / 0.35 +1 / -6. Fix-up 4 removed the half-stack clause: it never fired alone (chips behind no more than
+ * what he has put in are no more than the pot).
+ * Fix-up 4 (HOLDEM-F3-EXPLOIT-1): at every depth outside All-In or Fold (fix-up 3: depth at risk > 25 BB). With 25 BB or
+ * less at risk a bot that continues calls him, as against his all-in (the cover re-raise started side-pot wars), and a dry
+ * side pot against him is checked down (sidePotAgainstShortStack).
+ * Fix-up 5 (HOLDEM-F4-REGRESSION-1): heads-up against him (the only other player with chips) the cover again, at every depth.
+ */
+export const NEAR_ALLIN_SPR = 1;
+/**
+ * Fix round 4, fix-up 3 — Hold'em family, after the flop: a MANIAC facing an all-in (or a bet from a committed player,
+ * NEAR_ALLIN_SPR) continues only with a strength above this (its raise-or-fold value line,
+ * postFlopStrategy) or above the price it is laid (pot odds); a micro price is always called (the price floor). Its
+ * "raise or fold" raised 45% of its air there at any price, and the raise is a call: a human who flat-called a MANIAC's
+ * raise with any two and moved in on the flop only with a pair or a draw won +41 (9) BB/100 against two 100 BB MANIACs and
+ * a 40 BB stack (hard, whole line; live 0dc1b96 -3 (10): its MANIACs re-raise the flat, round 3's MANIAC-RTF cap stops
+ * that at a 100 BB table, so the flop came twice as often). Priced, -15 (11); moving in on every flop stays -127.
+ * The price is read against ANY two cards too (equity with no range narrowing): read only against the range a raise
+ * implies, it folded air that a short human's any-two all-in does not beat (five 100 BB MANIACs, a 12 BB human flat-calling
+ * and moving in on any flop: +84 (16) BB/100, 7740996 -9, live -62; against any two +20 (15)).
+ * Not pot-limit Omaha: its pre-flop is 0dc1b96's (no light re-raise cap, so no extra cheap flops), and its equities run
+ * close, so the read (a share against every live opponent) folded what the call needed against a short human's all-in:
+ * a 12 BB human flat-calling five 100 BB MANIACs and moving in on any flop won +104 (9) BB/100 (7740996 +70 (8), live
+ * +59 (7)); without the rule +63 (4).
+ * Fix-up 4 (HOLDEM-F3-MEASUREMENT-2 / EXPLOIT-3): both reads are Monte Carlo equity (calculateEquity) at every difficulty
+ * (hard / expert unchanged). Below hard getPostFlopStrength is a static ladder (one pair 0.22-0.34, two pair 0.42-0.50) and
+ * both reads were that ladder, so a medium / easy MANIAC folded one pair 162 / 171 and two pair 14 / 40 to a heads-up
+ * any-two overbet all-in (live 0dc1b96 35 / 0): calling any small raise and moving in on any flop won +28 (9) BB/100 heads-up
+ * at 20 BB against a medium MANIAC (live -60) and +52 (8) at a medium 3-max 25 BB table (Spin & Go shape; live -24); with
+ * Monte Carlo -98 (12) / -72 (14) (one pair kept 80%, two pair 100%, as on live).
+ */
+export const MANIAC_ALLIN_VALUE_STRENGTH = 0.55;
+/**
+ * Fix round 4, fix-up 1 (HOLDEM-R4-MEASUREMENT-1) — no-limit: the FISH "weird raise" (B5, rounds 1-2) is a 3x raise with
+ * its top 10% by strength against a random hand (pctile >= this), where 0dc1b96 moved all-in with them. Facing an
+ * all-in deeper than the push/fold zone after it raised this street, it continues with every hand it raises for: it
+ * folded 17-52% of them to a 100 BB shove (the 0.12-of-its-own-stack call rule and the size-narrowed call range read
+ * the shove as a big bet, or the stack-off range when its call closed the action), so opening 6-10 BB with any two and
+ * shoving over its 3-bet broke even against five 200-500 BB FISH (hard, BB/100: os:10 at 500 BB +9 (30), os:8 -1 (49),
+ * os:6 at 200 BB +14 (52); live 0dc1b96 -273 / -179 / -139, where it moved in instead; with this rule -602 / -587 / -600).
+ */
+export const FISH_RAISE_PCTILE = 0.90;
+/** Width of the per-decision strength noise by difficulty (decideAction draws +-half of it). */
+export const DIFFICULTY_NOISE: Record<Difficulty, number> = {
+  easy: 0.25, medium: 0.12, hard: 0.05, expert: 0.02
+};
 
 export interface PreflopCtx {
   /** Live (not folded) opponents in the hand: the players who can still call a shove or are in it (B16). */
@@ -1217,6 +1434,13 @@ export interface PreflopCtx {
   rawPctile?: number;
   /** The stack-off percentile before the difficulty noise (undefined = the noisy one). */
   rawStackOff?: number | null;
+  /** Fix-up 5 — Short Deck: 0dc1b96's pre-flop strength (the Hold'em percentile) for maniacFacingRaise0dc1b96 (undefined = pctile). */
+  maniacPctile?: number;
+  /**
+   * Fix-up 7 — Short Deck: 0dc1b96's pre-flop strength (the Hold'em percentile, with 0dc1b96's hard / expert aggression
+   * adjustment) for a non-MANIAC in the spots where it plays 0dc1b96's ranges (preFlopStrategy sdLiveSpot; undefined = none).
+   */
+  sdLivePctile?: number;
 }
 
 /** Stud / draw first-round context: who is live, and the strength before the difficulty noise. */
@@ -1242,6 +1466,55 @@ export function shoverFaced(table: PokerTable, seat: Seat): Seat | null {
   return null;
 }
 
+/**
+ * Fix-up 3 (NEAR_ALLIN_SPR) — the live opponent whose raise or bet set the bet this seat faces (the street's last aggressor)
+ * and is committed, with chips behind: no more than NEAR_ALLIN_SPR x the pot this seat's call would make (null: none; an
+ * all-in is shoverFaced's).
+ */
+export function nearAllInRaiser(table: PokerTable, seat: Seat): Seat | null {
+  const s = table.lastAggressorSeat >= 0 ? table.seats[table.lastAggressorSeat] : undefined;
+  if (!s || s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) return null;
+  if (s.currentBet !== table.currentBetToMatch) return null;
+  return s.chipCount <= NEAR_ALLIN_SPR * (table.getTotalPot() + table.getCallAmount(seat)) ? s : null;
+}
+
+/**
+ * Fix-up 4 (HOLDEM-F3-EXPLOIT-1) — a side pot is being played against a short player: a live opponent is all-in or has no
+ * more than POSTFLOP_MICRO_CALL_NEED of the pot behind, and another live opponent still has chips. Under the light re-raise
+ * cap (rounds 3-4; fix-up 5 removed it: maniacFacingRaise0dc1b96) deep MANIACs flat-call a short player's all-in (or his raise to 75-95% of 12-25 BB) three or four handed; after the
+ * flop one of them bet the side pot (a MANIAC bets every flop, and raises a micro all-in) and the others folded, so their
+ * calls were dead money in his main pot: an all-in for 12 BB over a MANIAC open won +204 (21) BB/100 against five 100 BB
+ * MANIACs (hard; live 0dc1b96 -63 (8), where they isolate it), a raise to 95% of 12 / 15 / 20 / 25 BB +234 / +288 / +304 /
+ * +328 (live -52 / -63 / -76 / -56). A bet or raise there with less than MANIAC_ALLIN_VALUE_STRENGTH is checked or called
+ * (decideAction): with it, -68 / -90 / -90 / -113 / -197 (seed 1, 1,500 hands each).
+ */
+export function sidePotAgainstShortStack(table: PokerTable, seat: Seat): boolean {
+  const pot = table.getTotalPot();
+  const live = table.seats.filter((s) => s.seatIndex !== seat.seatIndex && s.state === 'occupied' && !s.folded && !s.eliminated);
+  return live.some((x) => (x.allIn || x.chipCount <= POSTFLOP_MICRO_CALL_NEED * pot)
+    && live.some((o) => o !== x && !o.allIn && o.chipCount > 0));
+}
+
+/**
+ * Fix-up 5 (HOLDEM-F4-EXPLOIT-2) — no-limit, not All-In or Fold: a NIT that would flat-call a single raise from a player
+ * with 25 BB or less at risk (the smaller hand-start stack), with nobody else in for the bet, moves in over it instead (the
+ * cover: raise to his whole stack). Its flat range is its 3-bet range (TT+ / AQ+ class), which is a stack-off at that
+ * depth; the flat left him a cheap flop all-in that the NIT then folded unless it hit. B5 (fix round 2: a NIT opens its
+ * premiums rather than limping them) took away live 0dc1b96's limp-traps, so against five 100 BB NITs a 20-25 BB human who
+ * opened any two to 25-35% of his stack, folded to a re-raise and moved in on any flop won +28 to +43 BB/100 (hard; live
+ * -1 to -25; fix-up 5's heads-up cover closed only the committed 35% opens). With this rule -21 to -67. Null: not this spot.
+ */
+export function nitShortRaiserCover(table: PokerTable, seat: Seat): AIDecision | null {
+  if (table.bettingStructure !== 'no-limit' || (Number((table as any).raisesThisStreet) || 0) !== 1 || shoverFaced(table, seat)) return null;
+  const r = table.lastAggressorSeat >= 0 ? table.seats[table.lastAggressorSeat] : undefined;
+  if (!r || r.seatIndex === seat.seatIndex || r.allIn || r.chipCount <= 0 || r.currentBet !== table.currentBetToMatch) return null;
+  if (Math.min(handStartStack(r), handStartStack(seat)) > PUSH_FOLD_MAX_BB * table.config.bigBlind) return null;
+  if (table.seats.some((o) => o.seatIndex !== seat.seatIndex && o !== r && o.state === 'occupied' && !o.folded && !o.eliminated
+    && !o.allIn && o.chipCount > 0 && o.currentBet >= table.currentBetToMatch)) return null;
+  const to = Math.max(table.getMinRaise(), r.currentBet + r.chipCount);
+  return to >= seat.chipCount + seat.currentBet ? { action: PlayerAction.AllIn, raiseAmount: 0 } : { action: PlayerAction.Raise, raiseAmount: to };
+}
+
 /** B8 — raises this seat has made on the current street (its own open / 3-bet), from the table's action log. */
 function ownRaisesThisStreet(table: PokerTable, seat: Seat): number {
   let n = 0;
@@ -1249,6 +1522,58 @@ function ownRaisesThisStreet(table: PokerTable, seat: Seat): number {
     if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && OWN_RAISE_RE.test(e.action)) n++;
   }
   return n;
+}
+
+/** Fix-up 5 sweep — calls this seat has made on the current street (a posted blind is not one), from the action log. */
+function ownCallsThisStreet(table: PokerTable, seat: Seat): number {
+  let n = 0;
+  for (const e of table.actionLog) {
+    if (e.street === table.currentPhase && e.seatIndex === seat.seatIndex && /^called /.test(e.action)) n++;
+  }
+  return n;
+}
+
+/**
+ * Fix-up 5 sweep (the flat-then-fold dead money) — no-limit (Hold'em, Short Deck, Pineapple), not All-In or Fold: a
+ * non-MANIAC that flat-called a raise this street (more than the big blind in), facing an all-in or a committed raise
+ * that its call closes, with more than 25 BB at risk, makes 0dc1b96's continue decision for its archetype (0dc1b96's
+ * thresholds, on 0dc1b96's chips-left depth), not the stack-off range. With the stack-off range (NEW-1: 3-way at 100 BB
+ * about the top 3%) a FISH that flat-called a MANIAC re-raise folded 96% of them to the human's all-in (0dc1b96: 35%), so
+ * its flat was dead money (17.2 BB per all-in spot, 0dc1b96 8.4): two 300 BB MANIACs + TAG / FISH / LAG, a 100 BB human
+ * opening 2.5 / 3 BB with any two and moving in over the re-raise won +122 / +350 BB/100 (0dc1b96 -18 / -20; EV v3, 15k hands);
+ * one MANIAC + TAG / LAG / NIT / FISH at 100 BB, open 10 BB and move in, +103 / +84 (0dc1b96 -330 / -299). A seat that has
+ * not called this street (a lone all-in, the blinds) keeps the stack-off range: non-MANIAC archetypes still continue
+ * 5-10% against a lone 100 BB all-in. A MANIAC never gets here (maniacFacingRaise0dc1b96). FOLD keeps the value hold.
+ */
+function flatterContinue0dc1b96(
+  table: PokerTable, seat: Seat, profile: AIPlayerProfile, pctile: number, callAmount: number, bucket: PosBucket,
+  factor: number, huFactor: number, threeBetTh: number, facingThreeBet: boolean, CONT: AIDecision, FOLD: AIDecision,
+): AIDecision {
+  const ALLIN: AIDecision = { action: PlayerAction.AllIn, raiseAmount: 0 };
+  const GO = callAmount < seat.chipCount ? CONT : ALLIN;
+  const callTh = adjustThreshold(adjustThreshold(adjustThreshold(CALL_VS_RAISE_THRESHOLD[bucket], factor),
+    getStackDepthMultiplier(chipsLeftEffectiveStackBB(table, seat.seatIndex))), huFactor);
+  switch (profile.archetype) {
+    case 'CALLING_STATION':
+      if (callAmount > seat.chipCount * 0.30 && pctile < 0.35) return FOLD;
+      if (callAmount >= seat.chipCount) return pctile >= 0.40 ? ALLIN : FOLD;
+      return GO;
+    case 'FISH':
+      if (pctile >= 0.90) return ALLIN;
+      if (pctile >= adjustThreshold(0.55, factor) && callAmount <= seat.chipCount * 0.12) return GO;
+      return pctile >= callTh ? GO : FOLD;
+    case 'ROCK':
+      return pctile >= callTh ? GO : FOLD;
+    case 'NIT':
+      if (pctile >= FOURBET_THRESHOLD) return ALLIN;
+      if (facingThreeBet) return FOLD;
+      return pctile >= threeBetTh ? GO : FOLD;
+    default:   // TAG / LAG: a 4-bet (here, the all-in) with premiums, else the 3-bet range continues
+      if (pctile >= FOURBET_THRESHOLD) return ALLIN;
+      if (facingThreeBet) return pctile >= threeBetTh ? GO : FOLD;
+      if (pctile >= threeBetTh) return ALLIN;
+      return pctile >= callTh ? GO : FOLD;
+  }
 }
 
 /**
@@ -1267,6 +1592,46 @@ function aofShoverWidth(table: PokerTable, shover: Seat | null, effBB: number): 
   const prior = 1 - (aofPushPctile(effBB, Math.max(1, sp.total - 1 - sp.preflop)) ?? 1 - huW);
   const obs = getOpponentProfile(opponentModelKey(shover));
   return obs && obs.handsSeen > 0 ? (obs.vpipHands + AOF_OBS_PRIOR_HANDS * prior) / (obs.handsSeen + AOF_OBS_PRIOR_HANDS) : prior;
+}
+
+/**
+ * Fix-up 5 (THE MANIAC CLASS: HOLDEM-F3-REGRESSION-2 = MEASUREMENT-1 = EXPLOIT-2) — no-limit (Hold'em, Short Deck,
+ * Pineapple), not All-In or Fold: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, line for line (Short Deck: on
+ * 0dc1b96's Hold'em percentile, without its hard / expert aggression adjustment; see ctx.maniacPctile): 0dc1b96's
+ * push/fold zone on its own depth (chipsLeftEffectiveStackBB: mine vs the largest opponent's chips LEFT, at most 3 players),
+ * else it re-raises ~93% of hands to 2.5-4x the bet (all-in at 70% of its stack), calls the top 70% of the rest, or folds.
+ * Rounds 3-4 capped its light re-raises (HOLDEM_LIGHT_RERAISE_FRACTION, 5% of the depth at risk) and priced its continues
+ * (stack-off ranges, MANIAC-RTF / REG-1 / NEW-5 and fix-ups 1-4). With the cap MANIACs flat-called each other and the
+ * human: a limp or a flat with any two saw a cheap multiway flop in ~80% of hands (live ~0%), and moving in there with a
+ * pair or a draw won at the DEFAULT table (five 100 BB MANIACs, hard, lg:5:p +291 BB/100, sgg +220; live -85 / -72), +379 /
+ * +290 against 300 / 500 BB MANIACs, +307 at two-MANIAC tables on medium (live -92 / -96 / -13); every new rule keyed on
+ * one shape opened a neighbouring one. Live's MANIAC is not exploitable by those lines: it re-raises the flats (they never
+ * see the flop) and calls the shoves over its re-raises. Measured on both families with this rule (hard / medium / easy,
+ * equal and unequal stacks, real engine, whole lines): the cheap-flop lines at live (-55 to -147); the light-3-bet-then-
+ * shove lines at or below live (live has its own leak at 1,000 BB MANIACs: os:2.5 / osrr +211 / +731, here -180 / -73). Restoring
+ * only the light re-raise and the continue after it (and keeping the stack-off read for a MANIAC that faces a shove
+ * without having raised) failed: those MANIACs then folded where live's jam, and their raises were dead money (five
+ * 200-300 BB MANIACs, open 2.5-4 BB and move in over a re-raise: +218 to +675, live -28 to -85; all EV v3).
+ */
+function maniacFacingRaise0dc1b96(
+  pctile: number, callAmount: number, seat: Seat, table: PokerTable, factor: number, totalActive: number,
+  betToMatch: number, minRaise: number, FOLD: AIDecision,
+): AIDecision {
+  const ALLIN: AIDecision = { action: PlayerAction.AllIn, raiseAmount: 0 };
+  const effBB = chipsLeftEffectiveStackBB(table, seat.seatIndex);
+  const playersYetToAct = Math.min(3, Math.max(1, totalActive - 1));
+  if (inPushFoldZone(effBB, playersYetToAct)) {
+    const nashPush = nashPushPctile(effBB, playersYetToAct);
+    if (nashPush !== null) {
+      if (callAmount >= seat.chipCount) return pctile >= adjustThreshold(nashCallPctile(effBB, playersYetToAct), factor) ? ALLIN : FOLD;
+      return pctile >= adjustThreshold(nashPush, factor) ? ALLIN : FOLD;
+    }
+  }
+  if (pctile >= 0.15 || Math.random() < 0.55) {
+    const to = Math.max(minRaise, Math.round(betToMatch * (2.5 + Math.random() * 1.5)));
+    return to >= seat.chipCount * 0.7 ? ALLIN : { action: PlayerAction.Raise, raiseAmount: to };
+  }
+  return pctile >= 0.30 ? { action: PlayerAction.Call, raiseAmount: 0 } : FOLD;
 }
 
 function preFlopStrategy(
@@ -1291,10 +1656,38 @@ function preFlopStrategy(
   // its own percentile (value AA-QQ, premium AA); pot-limit Omaha is not held.
   const rawValue = ctx.rawStackOff ?? (noLimit && ctx.stackOff === null ? ctx.rawPctile ?? null : null);
   const valueHand = rawValue !== null && rawValue >= FOURBET_STACKOFF_THRESHOLD;
-  const pctile = valueHand ? Math.max(handStrength, ctx.rawPctile ?? handStrength) : handStrength;
+  // Fix-up 7 (HOLDEM-F6-REGRESSION-1 = EXPLOIT-1) — Short Deck, no-limit, not All-In or Fold, not a MANIAC (facing a raise it
+  // plays maniacFacingRaise0dc1b96): facing a single raise from a player who is neither all-in nor committed, or first in with
+  // SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS dealt or fewer, every threshold below reads 0dc1b96's strength (ctx.sdLivePctile:
+  // the Hold'em percentile of the two cards), as 0dc1b96 did. On the Short Deck percentile (a32dcf2, rounds 1-2) these
+  // Hold'em-tuned thresholds kept about half of 0dc1b96's blind defence (a NIT 9.8% against a 2.5 BB button open, 0dc1b96
+  // 20.3%; a ROCK / TAG 50.3%, 68.6%), and an any-two 2-2.5 BB steal won +35 to +53 BB/100 at Short Deck NIT tables (0dc1b96
+  // +1 to +24). Now a NIT 19.5%, a ROCK / TAG 68.1%, and the steals at five NITs (a 15-100 BB human; osf 2-3 BB, c-bet,
+  // jam-over) -59 to +15 (0dc1b96 -17 to +35; whole lines, real engine, EV v3, 6,000 hands each). The value set and the
+  // premium holds keep the Short Deck percentile, and so do six-max first-in opens and 3-bet defence (C8).
+  // Fix-up 8 (HOLDEM-F7-EXPLOIT-1 = MEASUREMENT-1 = REGRESSION-1, EXPLOIT-2): one scale per decision, and per hand where the
+  // first decision is answered. Fix-up 7 read 0dc1b96's strength first in for every archetype and the Short Deck
+  // percentile for the answer to the re-raise or the all-in, and inside one sdLiveSpot decision the jam gate (stackOffOK,
+  // so) still read the Short Deck percentile. Now: first in only a ROCK or a CALLING_STATION (a limp or a fold, answered here)
+  // reads it (SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS); facing an all-in or a committed raise with no more than
+  // SHORT_DECK_LIVE_ALLIN_MAX_BB at risk every non-MANIAC reads it; and in sdLiveSpot the stack-off reads (ownPctile, so)
+  // read it too. A deeper all-in (a lone 100 BB shove: 5-10%) keeps the Short Deck stack-off range. Heads-up 20-40 BB
+  // against a TAG / LAG, moving in over every open: -31 to -50 BB/100 (fix-up 7 +17 to +40; live -47 to -81).
+  const sr = Number((table as any).raisesThisStreet) || 0;
+  const sdShover = ctx.sdLivePctile !== undefined && callAmount > 0 ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
+  const sdLiveSpot = ctx.sdLivePctile !== undefined && noLimit && !allInOrFold && profile.archetype !== 'MANIAC' && callAmount > 0
+    && (sr === 0
+      ? totalActive <= SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS && (profile.archetype === 'ROCK' || profile.archetype === 'CALLING_STATION')
+      : sdShover ? Math.min(handStartStack(seat), handStartStack(sdShover)) <= SHORT_DECK_LIVE_ALLIN_MAX_BB * bigBlind : sr === 1);
+  const strength = sdLiveSpot ? ctx.sdLivePctile as number : handStrength;
+  const pctile = valueHand ? Math.max(strength, ctx.rawPctile ?? strength) : strength;
+  /** The variant's own percentile (Short Deck: its table), for the stack-off reads; in sdLiveSpot the same 0dc1b96 strength. */
+  const ownPctile = sdLiveSpot ? pctile : valueHand ? Math.max(handStrength, ctx.rawPctile ?? handStrength) : handStrength;
   const bucket = posBucket(position, totalActive);
   const factor = ARCHETYPE_RANGE_FACTOR[profile.archetype] ?? 1.0;
-  const effBB = getEffectiveStackBB(table, seat.seatIndex);   // NEW-1: start-of-hand stacks
+  // NEW-1: start-of-hand stacks. Pot-limit Omaha keeps the 0dc1b96 chips-left depth (fix round 3).
+  const effBB = table.bettingStructure === 'pot-limit' && !allInOrFold
+    ? chipsLeftEffectiveStackBB(table, seat.seatIndex) : getEffectiveStackBB(table, seat.seatIndex);
   const stackMult = getStackDepthMultiplier(effBB);
   const huFactor = totalActive <= 2 ? 0.55 : 1.0;
   const streetRaises = Number((table as any).raisesThisStreet) || 0;
@@ -1308,7 +1701,7 @@ function preFlopStrategy(
   const minRaise = table.getMinRaise();
   // Hold'em: value 4-bets and deep stack-offs read the stack-off percentile (QQ+/AK on top);
   // Omaha keeps its own strength on the old vs-random threshold.
-  const so = valueHand ? Math.max(ctx.stackOff ?? pctile, rawValue as number) : ctx.stackOff ?? pctile;
+  const so = valueHand ? Math.max(ctx.stackOff ?? ownPctile, rawValue as number) : ctx.stackOff ?? ownPctile;
   const fourBetValue = ctx.stackOff !== null ? so >= FOURBET_STACKOFF_THRESHOLD : pctile >= FOURBET_THRESHOLD;
 
   // Model-derived, archetype/stack/heads-up-adjusted thresholds (percentile scale) — unchanged.
@@ -1323,12 +1716,26 @@ function preFlopStrategy(
   // small raise (NEW-4); every seat narrows vs a big one (noLimit: above).
   // A UTG straddle is this hand's effective big blind (PokerTable.straddle): the reference open is 3 straddles.
   const refBB = table.actionLog.some(e => e.street === table.currentPhase && e.action === 'straddle') ? 2 * bigBlind : bigBlind;
-  const sizeFactor = facingRaise && noLimit
+  const sizeRaw = facingRaise && noLimit
     ? Math.min(bucket === 'BB' ? SIZE_WIDEN_MAX : 1, (OPEN_REFERENCE_BB * refBB) / Math.max(betToMatch, refBB))
     : 1;
+  // Fix-up 6 (sweep: short-stack steals) — at the push/fold depths (hand-start effective stack <= PUSH_FOLD_MAX_BB) a bigger
+  // raise narrows nothing, as 0dc1b96 (the big blind still widens against a small one). Narrowed, a 25 BB big blind continued
+  // against a 4-6 BB open only 49-78% as often as against 3 BB, and an any-two 4-6 BB steal (fold to a re-raise) won +8 to
+  // +42 BB/100 in Spin & Go 25 BB against NIT / ROCK lineups (live -40 to +15; now -40 to +10). B4's deep rows are unchanged.
+  // Fix-up 7: in the Short Deck spots on 0dc1b96's strength (sdLiveSpot) there is no size term, as 0dc1b96. With NEW-4's
+  // widening on that scale a heads-up 20 BB ROCK big blind defended 96% against a min-raise (0dc1b96 85%; now 82%) and
+  // a six-max ROCK / TAG 78% against a 2.5 BB button open (0dc1b96 69%; now 68%).
+  // Fix-up 8 (HOLDEM-F7-EXPLOIT-2): deeper than the push/fold depths a bigger open narrows the calls there too (B4; still no
+  // widening), but not the re-raise: 0dc1b96 re-raised its whole 3-bet range at every size, and against a big open the re-raise
+  // is a jam that the stack-off range (on the same strength there) decides. Without both a heads-up 30-100 BB
+  // TAG flat-called a 25% open 83-88% and folded the flop all-in: open any two to 20-30% of the stack and move in on any flop
+  // won +17 to +236 BB/100 (live -65 to -159); now -50 to -148 (medium / easy at 30 BB -39 / -48, live -33 / -28).
+  const sizeFactor = sdLiveSpot ? (effBB > PUSH_FOLD_MAX_BB ? Math.min(1, sizeRaw) : 1)
+    : noLimit && effBB <= PUSH_FOLD_MAX_BB ? Math.max(1, sizeRaw) : sizeRaw;
   const sized = (th: number, f: number): number => (f === 1 ? th : Math.min(0.99, Math.max(0.30, 1 - (1 - th) * f)));
   const callVsRaiseThS = sized(callVsRaiseTh, sizeFactor);
-  const threeBetThS = sized(threeBetTh, Math.min(1, sizeFactor));
+  const threeBetThS = sdLiveSpot ? threeBetTh : sized(threeBetTh, Math.min(1, sizeFactor));
   // HAI-2 — a CALL line (th: sized; base: unscaled) is never narrowed past SIZE_NARROW_MAX_TH (it
   // was pushed to the 0.96-0.99 noise band of AA/KK), nor widened by it. Fix round 3: where the
   // stack-off line at this depth is narrower than that floor (deep stacks, ~36 BB+ multiway), from
@@ -1368,7 +1775,10 @@ function preFlopStrategy(
   const headPyta = Math.min(3, Math.max(1, totalActive - 1));
   // NEW-1 — the all-in that SET the bet this seat faces, and the depth at risk
   // against it (min of the two hand-start stacks), never the shover's 0 left.
-  const shover = callAmount > 0 ? shoverFaced(table, seat) : null;
+  // Fix-up 3 (NEAR_ALLIN_SPR): no-limit, a raise from a committed player (no more than the pot behind) is that all-in for
+  // every rule below; fix-up 4 (HOLDEM-F3-EXPLOIT-1): at every depth (fix-up 3: deeper than the push/fold zone only).
+  let shover = callAmount > 0 ? shoverFaced(table, seat) : null;
+  if (!shover && callAmount > 0 && noLimit && !allInOrFold) shover = nearAllInRaiser(table, seat);
   const shoveBB = shover ? Math.max(1, Math.round(Math.min(handStartStack(seat), handStartStack(shover)) / bigBlind)) : 0;
   // Review fix — price a spot as "calling the shove" ONLY when nobody else can
   // still act: pureCall = a call closes the action; pureAllInCall = no other live
@@ -1379,6 +1789,19 @@ function preFlopStrategy(
     if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated || s.allIn || s.chipCount <= 0) continue;
     othersWithChips++;
     if (s.currentBet < table.currentBetToMatch) othersToAct++;
+  }
+  // Fix-up 3 — continuing against the all-in: a call; against a near-all-in raise, a re-raise to cover him (a flat call
+  // left him his last chips to move in after the flop, and folding air to them was the leak). Fix-up 4: with 25 BB or less
+  // at risk, a call, as against his all-in: the cover is a full min-raise (twice his raise) and started side-pot wars that
+  // folded the other callers (a raise to 30% of 25 BB, then any flop all-in: +253 BB/100 with five 100 BB MANIACs, live +13).
+  // Fix-up 5 (HOLDEM-F4-REGRESSION-1 / MEASUREMENT-1): the cover at every depth when he is the only other player with chips
+  // (no side pot can be played): heads-up the call left him the flop all-in, which the bot then folded (Heads-Up Snap,
+  // 20 BB, any two opened to 40-50% of the stack and moved in on any flop: +68 to +139 BB/100 against NIT / ROCK, live
+  // -152 to -338; opened to 35%, a pair or draw moved in: +23 to +80 against every archetype, live -58 to -117).
+  let CONT = CALL;
+  if (shover && !shover.allIn && (shoveBB > PUSH_FOLD_MAX_BB || othersWithChips === 1)) {
+    const to = Math.max(minRaise, shover.currentBet + shover.chipCount);
+    CONT = to >= seat.chipCount + seat.currentBet ? ALLIN : { action: PlayerAction.Raise, raiseAmount: to };
   }
   const pureCall = !!shover && othersToAct === 0;
   const pureAllInCall = !!shover && othersWithChips === 0;
@@ -1392,31 +1815,53 @@ function preFlopStrategy(
   // single bet (one opponent in for it: an open of any size, a 3-bet, a 4-bet, a shove), and AA /
   // KK never fold at all; they continue instead (all-in when the call is a stack-off). With two or
   // more opponents already in for the bet, QQ / JJ / AK play the stack-off ranges like any hand
-  // (on their pre-noise strength).
+  // (on their pre-noise strength). HR2-1 (fix round 3): in for the bet = matching it. An all-in
+  // for less (a blind posted all-in short, a 2 BB shove under a 25 BB one) is not: counting it
+  // folded All-In-or-Fold AKo 95-100% to one real shove (live 0dc1b96: 0-27%). So two real shoves
+  // count as two only when the smaller matches the larger: QQ / JJ / AK hold against 25 + 24 BB
+  // all-ins and take the multiway line against 25 + 25 (disclosed in fix round 4).
   let inForBet = 0;
   for (const s of table.seats) {
     if (s.seatIndex === seat.seatIndex || s.state !== 'occupied' || s.folded || s.eliminated) continue;
-    if (s.allIn || s.currentBet >= table.currentBetToMatch) inForBet++;
+    if (s.currentBet >= table.currentBetToMatch) inForBet++;
   }
   const held = valueHand && callAmount > 0 && ((rawValue as number) >= PREMIUM_STACKOFF_THRESHOLD || inForBet <= 1);
   const FOLD: AIDecision = !held ? { action: PlayerAction.Fold, raiseAmount: 0 }
     : allInOrFold || callAmount >= seat.chipCount ? ALLIN
-    : pureCall ? CALL
+    : pureCall ? CONT
     : noLimit && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION ? ALLIN
     : CALL;
 
   // Price floor — a micro all-in that this call closes is called with any two cards: at most
   // MICRO_CALL_NEED of equity needed PER OPPONENT in the pot (the big blind vs a 1.5 BB shove
   // needs 14%). HAI-3: 0.25 flat let three 100 BB all-ins' dead money price in 72o (24.7%
-  // needed; 72o has 12-15% 4-way); at 0.25 / 3 = 8.3% it never fires there.
+  // needed; 72o has 12-15% 4-way); at 0.25 / 3 = 8.3% it never fires there. Pot-limit Omaha
+  // uses PLO_LONE_ALLIN_CALL_NEED (fix round 3).
+  const floorNeed = noLimit || allInOrFold ? MICRO_CALL_NEED / pyta : PLO_LONE_ALLIN_CALL_NEED / pyta;
   if (shover && table.bettingStructure !== 'fixed-limit' && (allInOrFold ? pureAllInCall : pureCall)
-      && callAmount / (totalPot + callAmount) <= MICRO_CALL_NEED / pyta) {
-    return allInOrFold || callAmount >= seat.chipCount ? ALLIN : CALL;
+      && callAmount / (totalPot + callAmount) <= floorNeed) {
+    return allInOrFold || callAmount >= seat.chipCount ? ALLIN : CONT;
+  }
+
+  // Fix-up 5 — no-limit, not All-In or Fold: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC exactly
+  // (maniacFacingRaise0dc1b96). After the price floor (a micro all-in the call closes is still called with any hand), before
+  // the push/fold zone: 0dc1b96 reads that its own way here.
+  if (profile.archetype === 'MANIAC' && noLimit && !allInOrFold && facingRaise) {
+    return maniacFacingRaise0dc1b96(ctx.maniacPctile ?? pctile, callAmount, seat, table, factor, totalActive, betToMatch, minRaise, FOLD);
   }
 
   // ── Short-stack push/fold (and every All-In or Fold decision): the baked Nash lookup. ──
-  const pfBB = allInOrFold ? Math.min(pureAllInCall ? shoveBB : effBB, PUSH_FOLD_MAX_BB) : effBB;
-  if (allInOrFold || (inPushFoldZone(effBB, zonePlayers) && profile.archetype !== 'CALLING_STATION')) {
+  // Fix-up 6 (HOLDEM-F5-MEASUREMENT-1 = EXPLOIT-1, EXPLOIT-2) — no-limit, not All-In or Fold: facing a raise from a player who
+  // is neither all-in nor committed (shover: shoverFaced / nearAllInRaiser), zone membership and the Nash lookup read
+  // 0dc1b96's chips-left depth (chipsLeftEffectiveStackBB), as 0dc1b96 did. Heads-up 20 BB, a 5 BB open leaves 15 BB: in the
+  // zone, the bot jams or folds. On the hand-start depth (NEW-1) it read 20 BB, outside the zone, and flat-called or folded
+  // its normal ranges, then folded the flop: opening any two to 20-30% of a 20 BB stack, moving in on any flop, won +98 to
+  // +151 BB/100 against a ROCK (live -78 to -161), a 2 BB steal by a 12 BB stack +21 to +39 at five 100 BB NITs (live -41 to
+  // +1). An all-in or a committed raise keeps NEW-1's hand-start depth: its chips left read a lone shove (or a 90 BB open
+  // that leaves 10 BB) as a 1-10 BB stack, and the push / fold call floor continued 44-68% of hands.
+  const zoneBB = noLimit && !allInOrFold && facingRaise && !shover ? chipsLeftEffectiveStackBB(table, seat.seatIndex) : effBB;
+  const pfBB = allInOrFold ? Math.min(pureAllInCall ? shoveBB : effBB, PUSH_FOLD_MAX_BB) : zoneBB;
+  if (allInOrFold || (inPushFoldZone(zoneBB, zonePlayers) && profile.archetype !== 'CALLING_STATION')) {
     const nashPush = nashPushPctile(pfBB, zonePlayers);
     const pfFactor = allInOrFold ? Math.pow(factor, AOF_ARCHETYPE_DAMP) : factor;
     // All-In or Fold: the strength with AOF_NOISE_KEEP of the difficulty noise (the value set never below its raw strength).
@@ -1449,14 +1894,36 @@ function preFlopStrategy(
   const committing = callAmount > 0 && callAmount >= seat.chipCount * STACKOFF_COMMIT_FRACTION;
   // HAI-1 — up to 25 BB the Nash call is never narrower than the deep width at the 25 BB anchor
   // (with 3 players in, 0.93 vs 0.915: 23-25 BB continued less than 26 BB).
-  const stackOffOK = (depthBB: number): boolean => depthBB <= PUSH_FOLD_MAX_BB
-    ? pctile >= adjustThreshold(Math.min(nashCallPctile(depthBB, callPyta), 1 - stackOffCallWidth(depthBB, callPyta)), factor)
-    : so >= adjustThreshold(1 - stackOffCallWidth(depthBB, callPyta), factor);
+  // Fix-up 5: a MANIAC facing a raise or an all-in no longer reaches this section (maniacFacingRaise0dc1b96), so the
+  // MANIAC widenings and gates of rounds 3-4 and fix-ups 1-2 are gone from it.
+  const stackOffOK = (depthBB: number): boolean => {
+    const th = depthBB <= PUSH_FOLD_MAX_BB
+      ? adjustThreshold(Math.min(nashCallPctile(depthBB, callPyta), 1 - stackOffCallWidth(depthBB, callPyta)), factor)
+      : adjustThreshold(1 - stackOffCallWidth(depthBB, callPyta), factor);
+    return (depthBB <= PUSH_FOLD_MAX_BB ? pctile : so) >= th;
+  };
+  // Fix-up 1 (FISH_RAISE_PCTILE): a FISH that raised this street does not raise-then-fold an all-in deeper than the
+  // push/fold zone: every hand it raises for continues (before the commit gate, which read it as a stack-off). Read on the
+  // strength before this decision's noise, less half the noise width: the raise drew its own noise.
+  if (!allInOrFold && noLimit && shover && profile.archetype === 'FISH' && effBB > PUSH_FOLD_MAX_BB && shoveBB > PUSH_FOLD_MAX_BB
+    && ownRaisesThisStreet(table, seat) > 0
+    && (ctx.rawPctile ?? pctile) >= FISH_RAISE_PCTILE - (DIFFICULTY_NOISE[profile.difficulty] ?? 0) / 2) {
+    return callAmount < seat.chipCount ? CONT : ALLIN;
+  }
+  // Fix-up 5 sweep (flatterContinue0dc1b96): a non-MANIAC that flat-called a raise this street, facing an all-in (or a
+  // committed raise) its call closes with more than 25 BB at risk, makes 0dc1b96's continue decision, not the stack-off.
+  if (!allInOrFold && noLimit && shover && pureCall && shoveBB > PUSH_FOLD_MAX_BB && profile.archetype !== 'MANIAC'
+    && seat.currentBet > bigBlind && ownCallsThisStreet(table, seat) > 0) {
+    // Fix-up 7: Short Deck reads 0dc1b96's strength here too (its flat was made on it: sdLiveSpot); a value hand never below
+    // its own pre-noise percentile.
+    const flatP = ctx.sdLivePctile !== undefined ? Math.max(ctx.sdLivePctile, valueHand ? ownPctile : 0) : pctile;
+    return flatterContinue0dc1b96(table, seat, profile, flatP, callAmount, bucket, factor, huFactor, threeBetTh, facingThreeBet, CONT, FOLD);
+  }
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
-  // (its NEW-1 case, the push/fold zone misfire, is fixed by the hand-start effective stack above).
+  // (and, fix round 3, its 0dc1b96 chips-left depth: chipsLeftEffectiveStackBB).
   if (!allInOrFold && noLimit && (pureCall || committing)) {
     if (!stackOffOK(pureCall ? shoveBB : effBB)) return FOLD;
-    return pureCall && callAmount < seat.chipCount ? CALL : ALLIN;
+    return pureCall && callAmount < seat.chipCount ? CONT : ALLIN;
   }
   /** A re-raise; when it would be a jam it must pass the stack-off range too (null = not this hand: fall through). */
   const raiseOrJam = (amount: number): AIDecision | null => {
@@ -1472,8 +1939,8 @@ function preFlopStrategy(
     return callsSized(Math.max(0.30, 1 - CS_CALL_WIDTH * sizeFactor), 1 - CS_CALL_WIDTH) ? CALL : FOLD;
   }
 
-  // ── MANIAC: raises/3-bets almost anything — but a raise that would be a jam is a
-  //    stack-off (NEW-5: it called 100 BB off with 91% of hands). ──
+  // ── MANIAC (unopened, or limpers only: facing a raise it plays maniacFacingRaise0dc1b96): raises almost
+  //    anything — but a raise that would be a jam is a stack-off (NEW-5). ──
   if (profile.archetype === 'MANIAC') {
     const wantRaise = pctile >= 0.15 || Math.random() < 0.55;
     if (wantRaise) {
@@ -1488,7 +1955,7 @@ function preFlopStrategy(
       if (r) return r;
     }
     if (callAmount === 0) return CHECK;
-    return pctile >= 0.30 ? CALL : FOLD;
+    return pctile >= 0.30 ? CONT : FOLD;
   }
 
   // ── FISH: loose-passive; LIMPS its playables (openLimpFreq), calls too wide. ──
@@ -1500,11 +1967,14 @@ function preFlopStrategy(
     if (unopened) {
       // B5 — the hands it used to SHOVE for 100 BB (top 10%) are now a 3 BB raise;
       // the rest of its range limps as before (same VPIP and PFR).
-      if (pctile >= 0.90) return raiseOrAllIn(Math.round(bigBlind * 3));
+      if (pctile >= FISH_RAISE_PCTILE) return raiseOrAllIn(Math.round(bigBlind * 3));
       return pctile >= adjustThreshold(0.55, factor) ? CALL : FOLD;   // limp
     }
-    // Its "weird raise": a 3-bet, not a 100 BB jam; never a 4-bet.
-    if (!facingThreeBet && pctile >= 0.90) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
+    // Its "weird raise": a 3-bet, not a 100 BB jam; never a 4-bet. Fix-up 6: at a hand-start effective stack of 25 BB or
+    // less it is the jam, as 0dc1b96: re-raised to 3x, a min-raise of any two that calls any re-raise then moves in on the
+    // flop with a pair or a draw won +96 BB/100 against a 20 BB FISH heads-up (live +64; with the jam +77 vs +78).
+    if (!facingThreeBet && pctile >= FISH_RAISE_PCTILE && noLimit && !allInOrFold && effBB <= PUSH_FOLD_MAX_BB) return ALLIN;
+    if (!facingThreeBet && pctile >= FISH_RAISE_PCTILE) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
     if (pctile >= adjustThreshold(0.55, factor) && callAmount <= seat.chipCount * 0.12) return CALL;
     if (callsSized(callVsRaiseThS, callVsRaiseTh)) return CALL;
     return FOLD;
@@ -1513,8 +1983,11 @@ function preFlopStrategy(
   // ── ROCK: tight-passive; limps its playables, RAISES only premiums. ──
   if (profile.archetype === 'ROCK') {
     if (unopened) {
-      // B5 — premiums raise from ANY seat (AA used to be limped everywhere but the big blind).
-      if (pctile >= adjustThreshold(0.94, huFactor)) return raiseOrAllIn(Math.round(bigBlind * 2.5));
+      // B5 — premiums raise from ANY seat (AA used to be limped everywhere but the big blind). Fix-up 6: short-handed
+      // (ROCK_LIMP_TRAP_MAX_PLAYERS dealt or fewer) a ROCK first in or behind limpers limps them, as 0dc1b96 did.
+      if (pctile >= adjustThreshold(0.94, huFactor) && (callAmount === 0 || totalActive > ROCK_LIMP_TRAP_MAX_PLAYERS)) {
+        return raiseOrAllIn(Math.round(bigBlind * 2.5));
+      }
       if (callAmount === 0) return CHECK;
       return pctile >= callVsRaiseTh ? CALL : FOLD;                  // limp (unchanged range)
     }
@@ -1528,12 +2001,21 @@ function preFlopStrategy(
       // Off the big blind it opens the range it already played there (its 3-bet
       // range: ~6% EP to ~11% BTN); the big blind keeps its old raise range.
       const nitOpenTh = callAmount === 0 ? openTh : Math.max(openTh, threeBetTh);
+      // Fix-up 8 (HOLDEM-F7-REGRESSION-1): short-handed (NIT_LIMP_TRAP_MAX_PLAYERS dealt or fewer), no-limit, a call to make:
+      // 0dc1b96's NIT, without its 100 BB jam: the 4-bet value hands raise, the rest of its 3-bet range limps (and calls).
+      if (noLimit && callAmount > 0 && totalActive <= NIT_LIMP_TRAP_MAX_PLAYERS) {
+        if (fourBetValue) return raiseOrAllIn(Math.round(bigBlind * 2.5));
+        return pctile >= threeBetTh ? CALL : FOLD;
+      }
       if (pctile >= nitOpenTh) return raiseOrAllIn(Math.round(bigBlind * 2.5));
       return callAmount === 0 ? CHECK : FOLD;
     }
     if (facingThreeBet) return fourBetValue ? ALLIN : FOLD;
     if (fourBetValue) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }   // 3-bet, not a jam
-    if (callsSized(threeBetThS, threeBetTh)) return CALL;   // NIT flats its 3-bet range
+    // NIT flats its 3-bet range; deeper than the push/fold zone it is narrowed by the open size only past
+    // NIT_SIZE_NARROW_SLACK x the reference (fix round 4; 25 BB and shallower are unchanged).
+    const nitSlack = effBB > PUSH_FOLD_MAX_BB ? NIT_SIZE_NARROW_SLACK : 1;
+    if (callsSized(sized(threeBetTh, Math.min(1, nitSlack * sizeFactor)), threeBetTh)) return CALL;
     return FOLD;
   }
 
@@ -3146,6 +3628,28 @@ export function getEffectiveStackBB(table: PokerTable, mySeat: number): number {
   }
   const effective = Math.min(handStartStack(seat), largestOpp);
   return Math.max(1, Math.round(effective / bb));
+}
+
+/**
+ * Fix round 3 (PLO NEW-1 check) — pot-limit Omaha's pre-flop depth: the 0dc1b96 effective stack, from the chips
+ * LEFT (mine vs the largest opponent's). A short all-in, or a pot raise that leaves the raiser little behind, is in
+ * the push/fold zone again, as live. The hand-start depth (NEW-1, a Hold'em fix) sent those spots into the deep
+ * Omaha ranges, which fold far too much for four-card equities: against five TAGs a 20 BB human who limps then
+ * pots / jams any four won +172 BB/100, and pot-3-bets any four over an open +91 (live 0dc1b96: +21 / -7; with
+ * this depth +34 / -4, whole line, real engine, 1,200 hands). Hold'em, Short Deck and Pineapple keep NEW-1, except for the
+ * push/fold zone facing a raise from a player who is neither all-in nor committed (fix-up 6: preFlopStrategy's zoneBB).
+ */
+function chipsLeftEffectiveStackBB(table: PokerTable, mySeat: number): number {
+  const seat = table.seats[mySeat];
+  if (!seat) return 100;
+  const bb = table.config.bigBlind || 50;
+  let largestOpp = 0;
+  for (const s of table.seats) {
+    if (s.seatIndex === mySeat) continue;
+    if (s.state !== 'occupied' || s.folded || s.eliminated) continue;
+    if (s.chipCount > largestOpp) largestOpp = s.chipCount;
+  }
+  return Math.max(1, Math.round(Math.min(seat.chipCount, largestOpp) / bb));
 }
 
 /** Enumerate the non-folded opponents' opponent-model keys on a table.
