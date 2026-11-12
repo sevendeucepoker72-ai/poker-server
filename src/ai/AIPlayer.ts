@@ -1253,8 +1253,11 @@ export const SIZE_NARROW_MAX_TH = 0.946;
  */
 export const NIT_SIZE_NARROW_SLACK = 2;
 /**
- * Fix-up 6 (HOLDEM-F5-REGRESSION-1) — no more dealt players than this (Heads-Up Snap, Spin & Go 3-max): a ROCK first in
- * (not the big blind's option) LIMPS its premiums, as 0dc1b96 did; a bigger table keeps B5's raise. B5's raise left the
+ * Fix-up 6 (HOLDEM-F5-REGRESSION-1) — no more dealt players than this (Heads-Up Snap, Spin & Go 3-max): a ROCK in an unopened
+ * pot with a call to make (first in, or behind limpers: "unopened" counts no raise, so a limper ahead does not open it; not
+ * the big blind's option) LIMPS its premiums, as 0dc1b96 did, in both cases; a bigger table keeps B5's raise. It has no
+ * variant guard: short-handed pot-limit Omaha limps them too, which is also 0dc1b96 (re-review 6 measured PLO 3-handed ROCK
+ * lines at live). B5's raise left the
  * short-handed limp range capped: an iso-raise over the limp to 2-3 BB, then any flop all-in, beat live by +16 to +39
  * BB/100 (Heads-Up 20 BB +45 / +84 vs live +29 / +67; Spin 25 BB ROCK, ROCK +15 / +56 vs -23 / +21). With the limp: +30 /
  * +69 and -18 / +23 (the human's whole line, real engine, 3,000 hands).
@@ -1941,7 +1944,7 @@ function preFlopStrategy(
   if (profile.archetype === 'ROCK') {
     if (unopened) {
       // B5 — premiums raise from ANY seat (AA used to be limped everywhere but the big blind). Fix-up 6: short-handed
-      // (ROCK_LIMP_TRAP_MAX_PLAYERS dealt or fewer) a first-in ROCK limps them, as 0dc1b96 did.
+      // (ROCK_LIMP_TRAP_MAX_PLAYERS dealt or fewer) a ROCK first in or behind limpers limps them, as 0dc1b96 did.
       if (pctile >= adjustThreshold(0.94, huFactor) && (callAmount === 0 || totalActive > ROCK_LIMP_TRAP_MAX_PLAYERS)) {
         return raiseOrAllIn(Math.round(bigBlind * 2.5));
       }
