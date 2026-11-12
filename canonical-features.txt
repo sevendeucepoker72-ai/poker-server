@@ -2224,7 +2224,8 @@ POSTFLOP_MICRO_CALL_NEED
 # 2026-11-10 (fix-up 4, HOLDEM-F3-MEASUREMENT-2 / EXPLOIT-3) - decideAction (Hold'em family, not Omaha): the MANIAC price rule reads
 # Monte Carlo equity at every difficulty: below hard both reads were the static ladder (one pair 0.22-0.34), so a medium / easy MANIAC
 # folded one pair 95% to an any-two overbet all-in (heads-up / Spin & Go medium: call small raises, move in on any flop +28 / +52 BB/100).
-effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds
+# SUPERSEDED 2026-11-12 by effectiveStrength : equity(rangeFloor)) <= potOdds && equity(0) <= potOdds (fix-up 7, HOLDEM-F6-REGRESSION-1: the range read is rangeFloor, which in Short Deck is the floor at 0dc1b96's share of hands, shortDeckRangeFloor; Hold'em passes oppMinPctile unchanged): effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds
+effectiveStrength : equity(rangeFloor)) <= potOdds && equity(0) <= potOdds
 getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, oppMin, isShortDeck, false)
 # 2026-11-10 (fix-up 4, HOLDEM-F3-EXPLOIT-1) - a committed raise (NEAR_ALLIN_SPR) is the all-in at every depth outside All-In or Fold
 # (continued by a call at 25 BB or less), the post-flop floor is flat, and a dry side pot is checked down (decideAction, Hold'em family,
@@ -2260,7 +2261,8 @@ nitShortRaiserCover(table, seat) ?? pre
 # human's all-in (live 35%), and two 300 BB MANIACs + TAG / FISH / LAG, open any two and move in over the re-raise, won +122 / +350 BB/100
 # (EV v3, 15k hands; live -18 / -20). A seat with only the big blind in (a lone all-in) keeps the stack-off range.
 function flatterContinue0dc1b96(
-flatterContinue0dc1b96(table, seat, profile, pctile, callAmount
+# SUPERSEDED 2026-11-12 by flatterContinue0dc1b96(table, seat, profile, flatP, callAmount (fix-up 7, HOLDEM-F6-REGRESSION-1: in Short Deck the flat-caller reads 0dc1b96's strength, flatP; Hold'em passes the same pctile): flatterContinue0dc1b96(table, seat, profile, pctile, callAmount
+flatterContinue0dc1b96(table, seat, profile, flatP, callAmount
 function ownCallsThisStreet(
 # 2026-11-10 (fix-up 6, HOLDEM-F5-MEASUREMENT-1 = EXPLOIT-1 / EXPLOIT-2) - preFlopStrategy: facing a raise from a player who is neither all-in
 # nor committed (no-limit, not All-In or Fold), the push/fold zone and the Nash lookup read 0dc1b96's chips-left depth (zoneBB): on the
@@ -2282,3 +2284,20 @@ Math.max(1, sizeRaw) : sizeRaw
 # Fold) a FISH's raise over a single raise (top 10%, FISH_RAISE_PCTILE) is the jam, as 0dc1b96, not B5's 3x re-raise: heads-up 20 BB, a
 # min-raise of any two that calls any re-raise and moves in on the flop with a pair or a draw won +96 BB/100 (live +64; now +77 vs +78).
 FISH_RAISE_PCTILE && noLimit && !allInOrFold && effBB <=
+# 2026-11-12 (fix-up 7, HOLDEM-F6-REGRESSION-1 = HOLDEM-F6-EXPLOIT-1) - decideAction / preFlopStrategy: Short Deck, no-limit, not All-In or
+# Fold, a non-MANIAC facing a single raise from a player who is neither all-in nor committed, or first in with
+# SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS (3) dealt or fewer, reads 0dc1b96's strength (sdLivePctile: the Hold'em percentile with 0dc1b96's
+# noise and hard / expert adjustment) with no size term (sdLiveSpot); the stack-off ranges keep the Short Deck percentile (ownPctile).
+# On the Short Deck percentile a NIT defended 9.8% against a 2.5 BB button open (live 20.3%) and any-two 2-2.5 BB steals won +35..+53
+# BB/100 at Short Deck NIT tables (live +1..+24).
+SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS = 3
+let sdLivePctile = maniacPctile;
+sdLivePctile !== undefined && sdLivePctile < 0.65
+const strength = sdLiveSpot ? ctx.sdLivePctile : handStrength;
+const sizeFactor = sdLiveSpot ? 1 : noLimit
+# 2026-11-12 (fix-up 7, HOLDEM-F6-REGRESSION-1, after the flop) - decideAction: Short Deck carries the opponents' range floor (oppMinPctile,
+# tuned on the Hold'em percentile) onto the Short Deck table at the share of the 630 combos 0dc1b96's sampler kept with it
+# (shortDeckRangeFloor): on the Short Deck table the same floor kept about half of 0dc1b96's range, a hard ROCK folded 17.5% of its flop
+# bets to an all-in (0dc1b96 3.8%), and opening 2 BB with any two then moving in on every flop won +45 BB/100 heads-up at 20 BB (0dc1b96 +24).
+function shortDeckRangeFloor(
+const rangeFloor = isShortDeck ? shortDeckRangeFloor(oppMinPctile) : oppMinPctile;

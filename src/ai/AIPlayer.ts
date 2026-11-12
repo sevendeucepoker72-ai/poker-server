@@ -6,7 +6,7 @@ import { calculateEquity, keptHoldemHoleCards } from '../training/TrainingEngine
 import {
   getPreflopPercentile, getStackOffPercentile, posBucket, PosBucket,
   OPEN_THRESHOLD, THREEBET_THRESHOLD, FOURBET_THRESHOLD, FOURBET_STACKOFF_THRESHOLD, CALL_VS_RAISE_THRESHOLD,
-  ARCHETYPE_RANGE_FACTOR, adjustThreshold, PREMIUM_STACKOFF_THRESHOLD,
+  ARCHETYPE_RANGE_FACTOR, adjustThreshold, PREMIUM_STACKOFF_THRESHOLD, percentileByRanks,
 } from './preflopRanges';
 import {
   inPushFoldZone, nashPushPctile, nashCallPctile, PUSH_FOLD_MAX_BB, stackOffCallWidth,
@@ -15,7 +15,7 @@ import {
 import {
   StudDrawKind, studDrawKindOf, isStudKind, studDrawEquity, firstRoundEquity, equityToPercentile, drawsLeftAt,
 } from './studDrawStrength';
-import { getShortDeckPreflopPercentile } from './shortDeckPreflop';
+import { getShortDeckPreflopPercentile, shortDeckPercentileByRanks } from './shortDeckPreflop';
 import { calibrateOmahaPreflop } from './omahaPreflopCalibration';
 import { countOmahaDrawOuts } from '../training/fastOmahaEval';
 
@@ -575,6 +575,38 @@ function shortDeckStaticStrength(allCards: Card[], communityCards: Card[]): numb
   return Math.min(1.0, Math.max(0.0, score));
 }
 
+/** The Hold'em and the Short Deck percentile of each of the 630 Short Deck combos, each sorted strongest first (lazy, fixed). */
+let shortDeckFloorTable: { holdem: number[]; shortDeck: number[] } | null = null;
+/**
+ * Fix-up 7 (HOLDEM-F6-REGRESSION-1, after the flop) — Short Deck: the opponents' range floor that decideAction derives from
+ * their action (oppMinPctile: 0.45 / 0.62 / 0.80 plus the read's nudges, tuned on the Hold'em percentile), carried onto the
+ * Short Deck table at the share of the 630 Short Deck combos that 0dc1b96 kept with it (its sampler ranked them on the
+ * Hold'em percentile; since 39f043a calculateEquity ranks them on the Short Deck table). On the Short Deck table the same
+ * floor kept about half of 0dc1b96's range (0.62: 38% of the combos, 0dc1b96 64%; 0.80: 21%, 0dc1b96 39%), so a hard bot
+ * read its equity against a bet or a raise low: a heads-up 20 BB ROCK folded 17.5% of its flop bets to an all-in (0dc1b96
+ * 3.8%), and opening 2 BB with any two then moving in on every flop won +45 BB/100 (0dc1b96 +24; 25 BB +20 vs -4). With the
+ * floor at 0dc1b96's share: +26 / -2 (bets kept 92%). 0 (no floor) stays 0, and so does a floor that kept every combo.
+ */
+export function shortDeckRangeFloor(holdemFloor: number): number {
+  if (!(holdemFloor > 0)) return holdemFloor;
+  if (!shortDeckFloorTable) {
+    const holdem: number[] = [], shortDeck: number[] = [];
+    for (let a = 0; a < 36; a++) for (let b = a + 1; b < 36; b++) {
+      const r1 = 6 + (a >> 2), r2 = 6 + (b >> 2), suited = (a & 3) === (b & 3);
+      holdem.push(percentileByRanks(r1, r2, suited));
+      shortDeck.push(shortDeckPercentileByRanks(r1, r2, suited));
+    }
+    holdem.sort((x, y) => y - x);
+    shortDeck.sort((x, y) => y - x);
+    shortDeckFloorTable = { holdem, shortDeck };
+  }
+  const { holdem, shortDeck } = shortDeckFloorTable;
+  let kept = 0;
+  while (kept < holdem.length && holdem[kept] >= holdemFloor) kept++;
+  if (kept >= shortDeck.length) return 0;
+  return shortDeck[Math.max(1, kept) - 1];
+}
+
 // ============================================================
 // Implied odds & stack-to-pot ratio considerations
 // ============================================================
@@ -1002,6 +1034,8 @@ function decideActionForSeat(
   // the id 'omaha-6', so its public variant.isHiLo is read too.
   const isShortDeck = !isOmahaFamily && /short|six.?plus|6.?plus/i.test(variantId);
   const isHiLoSplit = isOmahaFamily && ((table as any).variant?.isHiLo === true || /hi.?lo/i.test(variantId));
+  // Fix-up 7: Short Deck reads the range floor at the share of Short Deck hands 0dc1b96 kept with it (shortDeckRangeFloor).
+  const rangeFloor = isShortDeck ? shortDeckRangeFloor(oppMinPctile) : oppMinPctile;
   // 2026-11 — Hold'em pre-flop also reads the STACK-OFF percentile (4-bets, deep
   // all-ins). Never Omaha or Short Deck: null falls back to their own strength.
   let stackOff: number | null = null;
@@ -1028,7 +1062,7 @@ function decideActionForSeat(
     handStrength = getPostFlopStrength(
       isOmahaFamily ? seat.holeCards : holdemHoleCards(seat.holeCards, table.communityCards),
       table.communityCards, numOpponents, profile.difficulty,
-      isOmahaFamily, oppMinPctile, isShortDeck, isHiLoSplit
+      isOmahaFamily, rangeFloor, isShortDeck, isHiLoSplit
     );
   }
 
@@ -1057,6 +1091,9 @@ function decideActionForSeat(
   // 0dc1b96 also took 0.05 / 0.08 off a strength under 0.65 facing an aggressive opponent's bet of more than 4 BB, so in that
   // spot the Short Deck MANIAC is slightly looser than 0dc1b96's (Hold'em passes the adjusted strength and is exact).
   const maniacPctile = isPreFlop && isShortDeck ? Math.min(1.0, Math.max(0.0, getPreFlopHandRank(holdemHoleCards(seat.holeCards)) + noise)) : undefined;
+  // Fix-up 7 (HOLDEM-F6-REGRESSION-1 = EXPLOIT-1): the same 0dc1b96 strength, with 0dc1b96's hard / expert aggression
+  // adjustment below, for the Short Deck spots where every other archetype plays 0dc1b96's ranges (preFlopStrategy sdLiveSpot).
+  let sdLivePctile = maniacPctile;
   if (stackOff !== null) stackOff = Math.min(1.0, Math.max(0.0, stackOff + noise));   // same noise draw
 
   // Outs and implied odds for draw decisions. 2026-11: Stud / Draw equity already
@@ -1105,6 +1142,7 @@ function decideActionForSeat(
       if (handStrength < 0.65) {
         handStrength -= aggressionAdjust;
       }
+      if (sdLivePctile !== undefined && sdLivePctile < 0.65) sdLivePctile -= aggressionAdjust;   // fix-up 7: as 0dc1b96's strength
     }
 
     // Multi-way pot adjustment: hands play worse multi-way
@@ -1136,7 +1174,7 @@ function decideActionForSeat(
       : preFlopStrategy(
         handStrength, callAmount, totalPot, seat, table, profile,
         myPosition, totalActive, opponents, bigBlind, opts.allInOrFold === true,
-        { liveOpponents: numOpponents, stackOff, rawPctile: rawStrength, rawStackOff, maniacPctile });
+        { liveOpponents: numOpponents, stackOff, rawPctile: rawStrength, rawStackOff, maniacPctile, sdLivePctile });
     // Fix-up 5 (HOLDEM-F4-EXPLOIT-2): a NIT does not flat-call a short (<= 25 BB at risk) raiser heads-up; it covers him.
     if (!sdKind && profile.archetype === 'NIT' && pre.action === PlayerAction.Call && opts.allInOrFold !== true) {
       pre = nitShortRaiserCover(table, seat) ?? pre;
@@ -1170,7 +1208,7 @@ function decideActionForSeat(
     const hole = holdemHoleCards(seat.holeCards, table.communityCards);
     const equity = (oppMin: number): number =>
       getPostFlopStrength(hole, table.communityCards, numOpponents, 'hard', false, oppMin, isShortDeck, false);
-    if ((mcTier ? effectiveStrength : equity(oppMinPctile)) <= potOdds && equity(0) <= potOdds) {
+    if ((mcTier ? effectiveStrength : equity(rangeFloor)) <= potOdds && equity(0) <= potOdds) {
       return { action: PlayerAction.Fold, raiseAmount: 0 };
     }
   }
@@ -1222,6 +1260,15 @@ export const NIT_SIZE_NARROW_SLACK = 2;
  * +69 and -18 / +23 (the human's whole line, real engine, 3,000 hands).
  */
 export const ROCK_LIMP_TRAP_MAX_PLAYERS = 3;
+/**
+ * Fix-up 7 (HOLDEM-F6-REGRESSION-1 = EXPLOIT-1) — Short Deck, no more dealt players than this: a non-MANIAC first in (a call
+ * to make, no raise yet) plays its first-in decision on 0dc1b96's strength (ctx.sdLivePctile), as it does facing a single
+ * raise (preFlopStrategy sdLiveSpot). Six-max first-in opens keep the Short Deck percentile (C8: botsShortDeckBots).
+ * On the Short Deck percentile a heads-up 20 BB ROCK played 33.5% first in (0dc1b96 53.5%; now 57%), so the human's big blind
+ * was walked to far more often; with the rule (whole lines, real engine, BB/100): 3-handed 25 BB vs two NITs, a 2 BB steal
+ * +22 (+35 facing-only; 0dc1b96 +40; 5cf7147 +58); heads-up 15 BB vs a ROCK -64 (-50; 0dc1b96 -65).
+ */
+export const SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS = 3;
 /**
  * Fix round 3 (review of HAI-2) — from a call of this share of the commit line
  * (STACKOFF_COMMIT_FRACTION: 1/2 x 1/3 = a sixth of the stack) the size floor slides linearly
@@ -1362,6 +1409,11 @@ export interface PreflopCtx {
   rawStackOff?: number | null;
   /** Fix-up 5 — Short Deck: 0dc1b96's pre-flop strength (the Hold'em percentile) for maniacFacingRaise0dc1b96 (undefined = pctile). */
   maniacPctile?: number;
+  /**
+   * Fix-up 7 — Short Deck: 0dc1b96's pre-flop strength (the Hold'em percentile, with 0dc1b96's hard / expert aggression
+   * adjustment) for a non-MANIAC in the spots where it plays 0dc1b96's ranges (preFlopStrategy sdLiveSpot; undefined = none).
+   */
+  sdLivePctile?: number;
 }
 
 /** Stud / draw first-round context: who is live, and the strength before the difficulty noise. */
@@ -1577,7 +1629,23 @@ function preFlopStrategy(
   // its own percentile (value AA-QQ, premium AA); pot-limit Omaha is not held.
   const rawValue = ctx.rawStackOff ?? (noLimit && ctx.stackOff === null ? ctx.rawPctile ?? null : null);
   const valueHand = rawValue !== null && rawValue >= FOURBET_STACKOFF_THRESHOLD;
-  const pctile = valueHand ? Math.max(handStrength, ctx.rawPctile ?? handStrength) : handStrength;
+  // Fix-up 7 (HOLDEM-F6-REGRESSION-1 = EXPLOIT-1) — Short Deck, no-limit, not All-In or Fold, not a MANIAC (facing a raise it
+  // plays maniacFacingRaise0dc1b96): facing a single raise from a player who is neither all-in nor committed, or first in with
+  // SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS dealt or fewer, every threshold below reads 0dc1b96's strength (ctx.sdLivePctile:
+  // the Hold'em percentile of the two cards), as 0dc1b96 did. On the Short Deck percentile (a32dcf2, rounds 1-2) these
+  // Hold'em-tuned thresholds kept about half of 0dc1b96's blind defence (a NIT 9.8% against a 2.5 BB button open, 0dc1b96
+  // 20.3%; a ROCK / TAG 50.3%, 68.6%), and an any-two 2-2.5 BB steal won +35 to +53 BB/100 at Short Deck NIT tables (0dc1b96
+  // +1 to +24). Now a NIT 19.5%, a ROCK / TAG 68.1%, and the steals at five NITs (a 15-100 BB human; osf 2-3 BB, c-bet,
+  // jam-over) -59 to +15 (0dc1b96 -17 to +35; whole lines, real engine, EV v3, 6,000 hands each). The value set, the premium
+  // holds and the stack-off ranges (so: an all-in, a committed raise, a call that commits a third of the stack) keep the
+  // Short Deck percentile, and so do six-max first-in opens and 3-bet defence (C8).
+  const sr = Number((table as any).raisesThisStreet) || 0;
+  const sdLiveSpot = ctx.sdLivePctile !== undefined && noLimit && !allInOrFold && profile.archetype !== 'MANIAC' && callAmount > 0
+    && (sr === 1 ? !shoverFaced(table, seat) && !nearAllInRaiser(table, seat) : sr === 0 && totalActive <= SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS);
+  const strength = sdLiveSpot ? ctx.sdLivePctile as number : handStrength;
+  const pctile = valueHand ? Math.max(strength, ctx.rawPctile ?? strength) : strength;
+  /** The variant's own percentile (Short Deck: its table), for the stack-off reads. */
+  const ownPctile = valueHand ? Math.max(handStrength, ctx.rawPctile ?? handStrength) : handStrength;
   const bucket = posBucket(position, totalActive);
   const factor = ARCHETYPE_RANGE_FACTOR[profile.archetype] ?? 1.0;
   // NEW-1: start-of-hand stacks. Pot-limit Omaha keeps the 0dc1b96 chips-left depth (fix round 3).
@@ -1596,7 +1664,7 @@ function preFlopStrategy(
   const minRaise = table.getMinRaise();
   // Hold'em: value 4-bets and deep stack-offs read the stack-off percentile (QQ+/AK on top);
   // Omaha keeps its own strength on the old vs-random threshold.
-  const so = valueHand ? Math.max(ctx.stackOff ?? pctile, rawValue as number) : ctx.stackOff ?? pctile;
+  const so = valueHand ? Math.max(ctx.stackOff ?? ownPctile, rawValue as number) : ctx.stackOff ?? ownPctile;
   const fourBetValue = ctx.stackOff !== null ? so >= FOURBET_STACKOFF_THRESHOLD : pctile >= FOURBET_THRESHOLD;
 
   // Model-derived, archetype/stack/heads-up-adjusted thresholds (percentile scale) — unchanged.
@@ -1618,7 +1686,10 @@ function preFlopStrategy(
   // raise narrows nothing, as 0dc1b96 (the big blind still widens against a small one). Narrowed, a 25 BB big blind continued
   // against a 4-6 BB open only 49-78% as often as against 3 BB, and an any-two 4-6 BB steal (fold to a re-raise) won +8 to
   // +42 BB/100 in Spin & Go 25 BB against NIT / ROCK lineups (live -40 to +15; now -40 to +10). B4's deep rows are unchanged.
-  const sizeFactor = noLimit && effBB <= PUSH_FOLD_MAX_BB ? Math.max(1, sizeRaw) : sizeRaw;
+  // Fix-up 7: in the Short Deck spots on 0dc1b96's strength (sdLiveSpot) there is no size term, as 0dc1b96. With NEW-4's
+  // widening on that scale a heads-up 20 BB ROCK big blind defended 96% against a min-raise (0dc1b96 85%; now 82%) and
+  // a six-max ROCK / TAG 78% against a 2.5 BB button open (0dc1b96 69%; now 68%).
+  const sizeFactor = sdLiveSpot ? 1 : noLimit && effBB <= PUSH_FOLD_MAX_BB ? Math.max(1, sizeRaw) : sizeRaw;
   const sized = (th: number, f: number): number => (f === 1 ? th : Math.min(0.99, Math.max(0.30, 1 - (1 - th) * f)));
   const callVsRaiseThS = sized(callVsRaiseTh, sizeFactor);
   const threeBetThS = sized(threeBetTh, Math.min(1, sizeFactor));
@@ -1800,7 +1871,10 @@ function preFlopStrategy(
   // committed raise) its call closes with more than 25 BB at risk, makes 0dc1b96's continue decision, not the stack-off.
   if (!allInOrFold && noLimit && shover && pureCall && shoveBB > PUSH_FOLD_MAX_BB && profile.archetype !== 'MANIAC'
     && seat.currentBet > bigBlind && ownCallsThisStreet(table, seat) > 0) {
-    return flatterContinue0dc1b96(table, seat, profile, pctile, callAmount, bucket, factor, huFactor, threeBetTh, facingThreeBet, CONT, FOLD);
+    // Fix-up 7: Short Deck reads 0dc1b96's strength here too (its flat was made on it: sdLiveSpot); a value hand never below
+    // its own pre-noise percentile.
+    const flatP = ctx.sdLivePctile !== undefined ? Math.max(ctx.sdLivePctile, valueHand ? ownPctile : 0) : pctile;
+    return flatterContinue0dc1b96(table, seat, profile, flatP, callAmount, bucket, factor, huFactor, threeBetTh, facingThreeBet, CONT, FOLD);
   }
   // No-limit only (Hold'em, Short Deck, Pineapple): pot-limit Omaha keeps its 0dc1b96 commit ranges
   // (and, fix round 3, its 0dc1b96 chips-left depth: chipsLeftEffectiveStackBB).
