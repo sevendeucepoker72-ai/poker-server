@@ -2294,10 +2294,24 @@ SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS = 3
 let sdLivePctile = maniacPctile;
 sdLivePctile !== undefined && sdLivePctile < 0.65
 const strength = sdLiveSpot ? ctx.sdLivePctile : handStrength;
-const sizeFactor = sdLiveSpot ? 1 : noLimit
+# SUPERSEDED 2026-11-12 by const sizeFactor = sdLiveSpot ? (effBB > (fix-up 8, HOLDEM-F7-EXPLOIT-2: deeper than 25 BB a bigger open narrows the sdLiveSpot calls again, B4 without the widening; the line it pinned no longer exists): const sizeFactor = sdLiveSpot ? 1 : noLimit
 # 2026-11-12 (fix-up 7, HOLDEM-F6-REGRESSION-1, after the flop) - decideAction: Short Deck carries the opponents' range floor (oppMinPctile,
 # tuned on the Hold'em percentile) onto the Short Deck table at the share of the 630 combos 0dc1b96's sampler kept with it
 # (shortDeckRangeFloor): on the Short Deck table the same floor kept about half of 0dc1b96's range, a hard ROCK folded 17.5% of its flop
 # bets to an all-in (0dc1b96 3.8%), and opening 2 BB with any two then moving in on every flop won +45 BB/100 heads-up at 20 BB (0dc1b96 +24).
 function shortDeckRangeFloor(
 const rangeFloor = isShortDeck ? shortDeckRangeFloor(oppMinPctile) : oppMinPctile;
+# 2026-11-12 (fix-up 8, HOLDEM-F7-EXPLOIT-1 = MEASUREMENT-1 = REGRESSION-1, EXPLOIT-2) - preFlopStrategy sdLiveSpot: one scale per decision. Short
+# Deck first in, only a ROCK or a CALLING_STATION (a limp or a fold) reads 0dc1b96's strength; facing an all-in or a committed raise with
+# SHORT_DECK_LIVE_ALLIN_MAX_BB (40) or less at risk every non-MANIAC reads it; inside sdLiveSpot the stack-off reads (ownPctile, so) and the
+# unsized 3-bet range read it too, and deeper than 25 BB a bigger open narrows the calls (B4). Fix-up 7 opened at 0dc1b96's width and met the
+# re-raise / all-in on the Short Deck percentile: moving in over any open won +17..+49 BB/100 heads-up / 3-handed at 20-40 BB (live -46..-157),
+# a 25% open then any flop all-in +17..+236 at 30-100 BB (live -65..-159).
+const sdShover = ctx.sdLivePctile !== undefined
+SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS && (profile.archetype === 'ROCK' || profile.archetype === 'CALLING_STATION')
+SHORT_DECK_LIVE_ALLIN_MAX_BB = 40
+SHORT_DECK_LIVE_ALLIN_MAX_BB * bigBlind : sr === 1
+const ownPctile = sdLiveSpot ? pctile :
+const sizeFactor = sdLiveSpot ? (effBB >
+Math.min(1, sizeRaw) : 1)
+const threeBetThS = sdLiveSpot ? threeBetTh : sized(

@@ -1264,14 +1264,27 @@ export const NIT_SIZE_NARROW_SLACK = 2;
  */
 export const ROCK_LIMP_TRAP_MAX_PLAYERS = 3;
 /**
- * Fix-up 7 (HOLDEM-F6-REGRESSION-1 = EXPLOIT-1) — Short Deck, no more dealt players than this: a non-MANIAC first in (a call
- * to make, no raise yet) plays its first-in decision on 0dc1b96's strength (ctx.sdLivePctile), as it does facing a single
- * raise (preFlopStrategy sdLiveSpot). Six-max first-in opens keep the Short Deck percentile (C8: botsShortDeckBots).
- * On the Short Deck percentile a heads-up 20 BB ROCK played 33.5% first in (0dc1b96 53.5%; now 57%), so the human's big blind
- * was walked to far more often; with the rule (whole lines, real engine, BB/100): 3-handed 25 BB vs two NITs, a 2 BB steal
- * +22 (+35 facing-only; 0dc1b96 +40; 5cf7147 +58); heads-up 15 BB vs a ROCK -64 (-50; 0dc1b96 -65).
+ * Fix-up 7 (HOLDEM-F6-REGRESSION-1 = EXPLOIT-1), fix-up 8 (HOLDEM-F7-EXPLOIT-1 = MEASUREMENT-1) — Short Deck, no more dealt
+ * players than this: a ROCK or a CALLING_STATION first in (a call to make, no raise yet) plays its first-in decision on
+ * 0dc1b96's strength (ctx.sdLivePctile), as it does facing a single raise (preFlopStrategy sdLiveSpot). Fix-up 7 applied it to every
+ * non-MANIAC: a raiser then opened at 0dc1b96's width and met the re-raise or the all-in on the Short Deck percentile (a
+ * heads-up 20 / 30 BB TAG folded 73 / 84% of its opens to an all-in), and moving in with any two over its open won +17 to
+ * +49 BB/100 heads-up and 3-handed at 20-40 BB (live -46 to -157). A ROCK's or a CALLING_STATION's first-in decision is a
+ * limp or a fold, answered on the same scale (an iso-raise in sdLiveSpot, an all-in below SHORT_DECK_LIVE_ALLIN_MAX_BB);
+ * without the rule a heads-up 20 / 25 BB ROCK played 33% first in (0dc1b96 57%) and a 2 BB steal won +6 BB/100 (live -4).
  */
 export const SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS = 3;
+/**
+ * Fix-up 8 (HOLDEM-F7-EXPLOIT-1 = MEASUREMENT-1) — Short Deck: facing an all-in (or a committed raise: nearAllInRaiser) with no
+ * more than this many big blinds at risk (the smaller hand-start stack), a non-MANIAC reads 0dc1b96's strength
+ * (preFlopStrategy sdLiveSpot) in every read, the stack-off ranges included.
+ * On the Short Deck percentile the Hold'em-tuned stack-off and Nash call ranges kept about half of 0dc1b96's continues: a
+ * heads-up 30 BB TAG big blind continued 14% against an all-in from the button (now 29%; 0dc1b96 91%), and moving in with
+ * any two on every hand won +8 to +27 BB/100 at 20-30 BB already on 5cf7147 (live -47 to -76; now -36 to -56). Deeper the
+ * Short Deck stack-off range stays (a lone 100 BB all-in: 5-10%, NEW-1); heads-up at 60 BB moving in over every open is
+ * +11 (9) BB/100, as on 5cf7147 (live -92).
+ */
+export const SHORT_DECK_LIVE_ALLIN_MAX_BB = 40;
 /**
  * Fix round 3 (review of HAI-2) — from a call of this share of the commit line
  * (STACKOFF_COMMIT_FRACTION: 1/2 x 1/3 = a sixth of the stack) the size floor slides linearly
@@ -1639,16 +1652,26 @@ function preFlopStrategy(
   // Hold'em-tuned thresholds kept about half of 0dc1b96's blind defence (a NIT 9.8% against a 2.5 BB button open, 0dc1b96
   // 20.3%; a ROCK / TAG 50.3%, 68.6%), and an any-two 2-2.5 BB steal won +35 to +53 BB/100 at Short Deck NIT tables (0dc1b96
   // +1 to +24). Now a NIT 19.5%, a ROCK / TAG 68.1%, and the steals at five NITs (a 15-100 BB human; osf 2-3 BB, c-bet,
-  // jam-over) -59 to +15 (0dc1b96 -17 to +35; whole lines, real engine, EV v3, 6,000 hands each). The value set, the premium
-  // holds and the stack-off ranges (so: an all-in, a committed raise, a call that commits a third of the stack) keep the
-  // Short Deck percentile, and so do six-max first-in opens and 3-bet defence (C8).
+  // jam-over) -59 to +15 (0dc1b96 -17 to +35; whole lines, real engine, EV v3, 6,000 hands each). The value set and the
+  // premium holds keep the Short Deck percentile, and so do six-max first-in opens and 3-bet defence (C8).
+  // Fix-up 8 (HOLDEM-F7-EXPLOIT-1 = MEASUREMENT-1 = REGRESSION-1, EXPLOIT-2): one scale per decision, and per hand where the
+  // first decision is answered. Fix-up 7 read 0dc1b96's strength first in for every archetype and the Short Deck
+  // percentile for the answer to the re-raise or the all-in, and inside one sdLiveSpot decision the jam gate (stackOffOK,
+  // so) still read the Short Deck percentile. Now: first in only a ROCK or a CALLING_STATION (a limp or a fold, answered here)
+  // reads it (SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS); facing an all-in or a committed raise with no more than
+  // SHORT_DECK_LIVE_ALLIN_MAX_BB at risk every non-MANIAC reads it; and in sdLiveSpot the stack-off reads (ownPctile, so)
+  // read it too. A deeper all-in (a lone 100 BB shove: 5-10%) keeps the Short Deck stack-off range. Heads-up 20-40 BB
+  // against a TAG / LAG, moving in over every open: -31 to -50 BB/100 (fix-up 7 +17 to +40; live -47 to -81).
   const sr = Number((table as any).raisesThisStreet) || 0;
+  const sdShover = ctx.sdLivePctile !== undefined && callAmount > 0 ? shoverFaced(table, seat) ?? nearAllInRaiser(table, seat) : null;
   const sdLiveSpot = ctx.sdLivePctile !== undefined && noLimit && !allInOrFold && profile.archetype !== 'MANIAC' && callAmount > 0
-    && (sr === 1 ? !shoverFaced(table, seat) && !nearAllInRaiser(table, seat) : sr === 0 && totalActive <= SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS);
+    && (sr === 0
+      ? totalActive <= SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS && (profile.archetype === 'ROCK' || profile.archetype === 'CALLING_STATION')
+      : sdShover ? Math.min(handStartStack(seat), handStartStack(sdShover)) <= SHORT_DECK_LIVE_ALLIN_MAX_BB * bigBlind : sr === 1);
   const strength = sdLiveSpot ? ctx.sdLivePctile as number : handStrength;
   const pctile = valueHand ? Math.max(strength, ctx.rawPctile ?? strength) : strength;
-  /** The variant's own percentile (Short Deck: its table), for the stack-off reads. */
-  const ownPctile = valueHand ? Math.max(handStrength, ctx.rawPctile ?? handStrength) : handStrength;
+  /** The variant's own percentile (Short Deck: its table), for the stack-off reads; in sdLiveSpot the same 0dc1b96 strength. */
+  const ownPctile = sdLiveSpot ? pctile : valueHand ? Math.max(handStrength, ctx.rawPctile ?? handStrength) : handStrength;
   const bucket = posBucket(position, totalActive);
   const factor = ARCHETYPE_RANGE_FACTOR[profile.archetype] ?? 1.0;
   // NEW-1: start-of-hand stacks. Pot-limit Omaha keeps the 0dc1b96 chips-left depth (fix round 3).
@@ -1692,10 +1715,16 @@ function preFlopStrategy(
   // Fix-up 7: in the Short Deck spots on 0dc1b96's strength (sdLiveSpot) there is no size term, as 0dc1b96. With NEW-4's
   // widening on that scale a heads-up 20 BB ROCK big blind defended 96% against a min-raise (0dc1b96 85%; now 82%) and
   // a six-max ROCK / TAG 78% against a 2.5 BB button open (0dc1b96 69%; now 68%).
-  const sizeFactor = sdLiveSpot ? 1 : noLimit && effBB <= PUSH_FOLD_MAX_BB ? Math.max(1, sizeRaw) : sizeRaw;
+  // Fix-up 8 (HOLDEM-F7-EXPLOIT-2): deeper than the push/fold depths a bigger open narrows the calls there too (B4; still no
+  // widening), but not the re-raise: 0dc1b96 re-raised its whole 3-bet range at every size, and against a big open the re-raise
+  // is a jam that the stack-off range (on the same strength there) decides. Without both a heads-up 30-100 BB
+  // TAG flat-called a 25% open 83-88% and folded the flop all-in: open any two to 20-30% of the stack and move in on any flop
+  // won +17 to +236 BB/100 (live -65 to -159); now -50 to -148 (medium / easy at 30 BB -39 / -48, live -33 / -28).
+  const sizeFactor = sdLiveSpot ? (effBB > PUSH_FOLD_MAX_BB ? Math.min(1, sizeRaw) : 1)
+    : noLimit && effBB <= PUSH_FOLD_MAX_BB ? Math.max(1, sizeRaw) : sizeRaw;
   const sized = (th: number, f: number): number => (f === 1 ? th : Math.min(0.99, Math.max(0.30, 1 - (1 - th) * f)));
   const callVsRaiseThS = sized(callVsRaiseTh, sizeFactor);
-  const threeBetThS = sized(threeBetTh, Math.min(1, sizeFactor));
+  const threeBetThS = sdLiveSpot ? threeBetTh : sized(threeBetTh, Math.min(1, sizeFactor));
   // HAI-2 — a CALL line (th: sized; base: unscaled) is never narrowed past SIZE_NARROW_MAX_TH (it
   // was pushed to the 0.96-0.99 noise band of AA/KK), nor widened by it. Fix round 3: where the
   // stack-off line at this depth is narrower than that floor (deep stacks, ~36 BB+ multiway), from

@@ -15,6 +15,9 @@
  * 0dc1b96 kept with it (shortDeckRangeFloor): since 39f043a the Monte Carlo samples Short Deck ranges on the Short Deck table,
  * where the Hold'em-tuned floor kept about half of 0dc1b96's range, and a heads-up 20 BB ROCK folded its flop bets to an
  * all-in (open any two, move in on every flop: +45 BB/100, 0dc1b96 +24).
+ * Fix-up 8 (tests/fix10HoldemFixup8.test.ts): the first-in rule keeps only the ROCK and the CALLING_STATION (a raiser met the
+ * re-raise on the other scale), all-ins with no more than 40 BB at risk are read on 0dc1b96's strength, and inside sdLiveSpot
+ * the stack-off reads are too; every pin here still holds.
  *
  * Whole lines are played on a real ShortDeckTable through AI.decideAction, applied as index.ts executeAIAction applies them;
  * the human's all-in is scored at its Short Deck equity from the board of his all-in when nobody acts after that street, else
@@ -231,7 +234,9 @@ function playSD(line: string, lineup: string[], botBB: number, hands: number, se
 
 describe('HOLDEM-F6-REGRESSION-1 = EXPLOIT-1 whole lines — Short Deck steals: no better than live (real engine)', () => {
   // Bounds (BB/100, hard). osf:2 at five 100 BB NITs, a 40 BB human: 0dc1b96 +15 (6) over 6,000 hands of the review harness
-  // (xr14, EV v3), so the bound is +27 (live + 2 se); this seed: 5cf7147 +51.8, here +12.6. os:2 heads-up against a 20 BB ROCK
+  // (xr14, EV v3); fix-up 8 (re-review 7 P3, HOLDEM-F7-MEASUREMENT-2): with the three reviewers' live runs it pools to about
+  // +11 (3) over 17,000 hands, so the bound is +20 (live + 2 se; it was +27); this seed: 5cf7147 +51.8, here +12.6. os:2 heads-up
+  // against a 20 BB ROCK
   // (the ROCK never re-raises, so it is the steal itself): < 0 (5cf7147 +7.5 on this seed, +11 (2) over 9,000 hands; here -4.3,
   // -4 (2) over 9,000; 0dc1b96 -7 (2)). pf:2 (any flop all-in) against the same ROCK: 0dc1b96 +24 (5) over 9,000 hands, the bound
   // +40 (live + 2 se of 3,000 hands); this seed: 5cf7147 +48.3, here +23.5 (on the Short Deck table's range floor: +45 (5)).
@@ -239,7 +244,7 @@ describe('HOLDEM-F6-REGRESSION-1 = EXPLOIT-1 whole lines — Short Deck steals: 
   afterAll(() => process.stdout.write(`fix9 Short Deck whole lines (BB/100): ${rows.join('; ')}\n`));
   const NITS = ['NIT', 'NIT', 'NIT', 'NIT', 'NIT'];
   const CASES: Array<[string, string, string[], number, number, number, number, number]> = [
-    ['osf:2', 'five 100 BB NITs, the human 40 BB (hard)', NITS, 100, 2000, 93, 40, 27],
+    ['osf:2', 'five 100 BB NITs, the human 40 BB (hard)', NITS, 100, 2000, 93, 40, 20],
     ['os:2', 'heads-up, a 20 BB ROCK (hard)', ['ROCK'], 20, 3000, 96, 20, 0],
     ['pf:2', 'heads-up, a 20 BB ROCK (hard)', ['ROCK'], 20, 3000, 97, 20, 40],
   ];
@@ -248,7 +253,7 @@ describe('HOLDEM-F6-REGRESSION-1 = EXPLOIT-1 whole lines — Short Deck steals: 
     const r = playSD(line, lineup, botBB, hands, seed, heroBB);
     rows.push(`${line} vs ${name}: ${r.bb100.toFixed(1)} (bound ${bound}; ${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
     expect([line, r.hands, r.drift, r.bb100 < bound]).toEqual([line, hands, 0, true]);
-  }, 1_200_000);
+  }, 2_400_000);   // fix-up 8 (re-review 7 P3): the os:2 row took 1,189 s of its 1,200 s under load
 });
 
 describe('HOLDEM-F6-REGRESSION-1 after the flop — the Short Deck range floor keeps 0dc1b96\'s share of hands (shortDeckRangeFloor)', () => {
