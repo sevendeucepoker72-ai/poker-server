@@ -1850,7 +1850,10 @@ function preFlopStrategy(
       if (pctile >= FISH_RAISE_PCTILE) return raiseOrAllIn(Math.round(bigBlind * 3));
       return pctile >= adjustThreshold(0.55, factor) ? CALL : FOLD;   // limp
     }
-    // Its "weird raise": a 3-bet, not a 100 BB jam; never a 4-bet.
+    // Its "weird raise": a 3-bet, not a 100 BB jam; never a 4-bet. Fix-up 6: at a hand-start effective stack of 25 BB or
+    // less it is the jam, as 0dc1b96: re-raised to 3x, a min-raise of any two that calls any re-raise then moves in on the
+    // flop with a pair or a draw won +96 BB/100 against a 20 BB FISH heads-up (live +64; with the jam +77 vs +78).
+    if (!facingThreeBet && pctile >= FISH_RAISE_PCTILE && noLimit && !allInOrFold && effBB <= PUSH_FOLD_MAX_BB) return ALLIN;
     if (!facingThreeBet && pctile >= FISH_RAISE_PCTILE) { const r = raiseOrJam(roundToBB(Math.round(betToMatch * 3), bigBlind)); if (r) return r; }
     if (pctile >= adjustThreshold(0.55, factor) && callAmount <= seat.chipCount * 0.12) return CALL;
     if (callsSized(callVsRaiseThS, callVsRaiseTh)) return CALL;

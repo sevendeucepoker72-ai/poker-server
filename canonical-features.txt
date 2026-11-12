@@ -2278,3 +2278,7 @@ callAmount === 0 || totalActive >
 # against a 4-6 BB open only 49-78% as often as against 3 BB, and an any-two 4-6 BB steal won +8..+42 BB/100 in Spin & Go 25 BB against
 # NIT / ROCK lineups (live -40..+15).
 Math.max(1, sizeRaw) : sizeRaw
+# 2026-11-11 (fix-up 6 sweep, FISH re-raise) - preFlopStrategy: at a hand-start effective stack of 25 BB or less (no-limit, not All-In or
+# Fold) a FISH's raise over a single raise (top 10%, FISH_RAISE_PCTILE) is the jam, as 0dc1b96, not B5's 3x re-raise: heads-up 20 BB, a
+# min-raise of any two that calls any re-raise and moves in on the flop with a pair or a draw won +96 BB/100 (live +64; now +77 vs +78).
+FISH_RAISE_PCTILE && noLimit && !allInOrFold && effBB <=

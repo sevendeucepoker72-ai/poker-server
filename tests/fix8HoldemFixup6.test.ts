@@ -24,6 +24,7 @@
  *   opn:F:R    raise to F x the stack with any two when first in or over ONE (not all-in) raise; call any re-raise; after the
  *              flop as osn.
  *   pf:F:R     as osn, but fold to any re-raise.
+ *   mrn:0:R    first in (or over limpers), a minimum raise with any two; call any re-raise; after the flop as osn.
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
 const { PokerTable, PlayerAction, GamePhase } = require('../src/game/PokerTable');
@@ -99,10 +100,10 @@ function play(line: string, lineup: string[], botBB: number, hands: number, seed
       }
       const raises = Number(t.raisesThisStreet) || 0;
       const facingAllIn = t.seats.some((x: any) => x.seatIndex !== 0 && x.state === 'occupied' && !x.folded && x.allIn && x.currentBet > s0.currentBet);
-      const to = Math.floor(F * (s0.chipCount + s0.currentBet) / 50) * 50;
+      const to = kind === 'mrn' ? t.getMinRaise() : Math.floor(F * (s0.chipCount + s0.currentBet) / 50) * 50;
       if (raised && ca > 0) {
         if (kind === 'pf') { fold(); return; }
-        if (kind === 'opn' || PR.getStackOffPercentile(s0.holeCards) >= 0.94) { t.playerCall(0) || t.playerAllIn(0) || fold(); return; }
+        if (kind === 'opn' || kind === 'mrn' || PR.getStackOffPercentile(s0.holeCards) >= 0.94) { t.playerCall(0) || t.playerAllIn(0) || fold(); return; }
         fold(); return;
       }
       if (raises === 0 || (kind === 'opn' && raises === 1 && !facingAllIn)) {
@@ -364,4 +365,41 @@ describe('re-review 5 P3 — the Short Deck MANIAC reads 0dc1b96\'s Hold\'em per
     process.stdout.write(`fix8 Short Deck MANIAC continue: ${(100 * k / n).toFixed(1)}%\n`);
     expect(k / n).toBeGreaterThanOrEqual(0.85);
   });
+});
+
+describe('fix-up 6 sweep (FISH re-raise) — at 25 BB or less the FISH\'s raise over a raise is the jam, as 0dc1b96 (node level)', () => {
+  it('heads-up 20 BB, a FISH in the big blind facing a 2 / 3 BB open moves in with its top hands (94108d5: a 3x re-raise); at 100 BB it still re-raises 3x (B5)', () => {
+    const bad: string[] = [];
+    const H: Record<string, any[]> = {
+      AA: [{ rank: 14, suit: 0 }, { rank: 14, suit: 1 }], KK: [{ rank: 13, suit: 0 }, { rank: 13, suit: 1 }],
+      QQ: [{ rank: 12, suit: 0 }, { rank: 12, suit: 1 }], AKs: [{ rank: 14, suit: 2 }, { rank: 13, suit: 2 }],
+    };
+    for (const code of Object.keys(H)) for (const open of [2, 3]) for (const bb of [20, 100]) {
+      const restore = detEnv(8500 + open + bb);
+      try {
+        const t = hu(bb, 0, 'fj' + code + open + bb);
+        expect(t.playerRaise(0, open * BB)).toBe(true);
+        t.seats[1].holeCards = H[code];
+        const d = kindOf(AI.decideAction(t, 1, prof('FISH', 1)));
+        if (d !== (bb === 20 ? 'allin' : 'raise')) bad.push(`${bb} BB ${code} vs ${open} BB: ${d}`);
+      } finally { restore(); }
+    }
+    expect(bad).toEqual([]);
+  });
+});
+
+describe('fix-up 6 sweep (FISH re-raise) whole line — min-raise any two, call any re-raise, pair-or-draw flop all-in: no better than live (real engine)', () => {
+  // Profitable on live 0dc1b96 too (a FISH calls too wide): the bound is live's level on the same seed (seed 91, 3,000 hands:
+  // live +31.1, ec837a7 +61.1 (its 3x re-raise was called and the flop all-in folded to), with the jam +23.3).
+  const rows: string[] = [];
+  afterAll(() => process.stdout.write(`fix8 FISH re-raise line (BB/100): ${rows.join('; ')}\n`));
+  const CASES: Array<[string, string, string[], number, number, number, number, number]> = [
+    ['mrn:0:p', 'heads-up, a 20 BB FISH (hard)', ['FISH'], 20, 3000, 91, 20, 35],
+  ];
+  it.each(CASES)('%s against %s', (line, name, lineup, botBB, hands, seed, heroBB, bound) => {
+    const t0 = process.hrtime.bigint();
+    const r = play(line, lineup, botBB, hands, seed, heroBB);
+    rows.push(`${line} vs ${name}: ${r.bb100.toFixed(1)} (bound ${bound}; ${(Number(process.hrtime.bigint() - t0) / 1e9).toFixed(1)} s)`);
+    expect([line, r.hands, r.drift, r.bb100 <= bound]).toEqual([line, hands, 0, true]);
+  }, 1_200_000);
 });
