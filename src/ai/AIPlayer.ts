@@ -1264,6 +1264,17 @@ export const NIT_SIZE_NARROW_SLACK = 2;
  */
 export const ROCK_LIMP_TRAP_MAX_PLAYERS = 3;
 /**
+ * Fix-up 8 (HOLDEM-F7-REGRESSION-1, B5's class) — no-limit, no more dealt players than this (Heads-Up, Spin & Go 3-max): a NIT
+ * in an unopened pot with a call to make (first in, or behind limpers) plays 0dc1b96's NIT without its 100 BB jam: its 4-bet
+ * value hands (fourBetValue) raise to 2.5 BB, the rest of its 3-bet range limps, and it calls an iso-raise with them as
+ * 0dc1b96 did; a bigger table keeps B5's open. B5's open (its 3-bet range, max(openTh, threeBetTh)) folded every hand but
+ * the 4-bet value ones to a 3-bet: heads-up at 40 BB, opening any two, 3-betting any open and c-betting (cb3) won +62 / +77
+ * BB/100 in Hold'em / Short Deck (live 0dc1b96 +54 / +48), a bare 3-bet of any open +15 in Short Deck (live -12). With the
+ * limp: +45 / +39 and -15; 3-handed at 40 BB +38 / +19 (live +65 / +50); the iso-raise over its limp loses as on live
+ * (isop:4 -33 / -35, live -33 / -58; whole lines, real engine, EV v3, 4,000-6,000 hands).
+ */
+export const NIT_LIMP_TRAP_MAX_PLAYERS = 3;
+/**
  * Fix-up 7 (HOLDEM-F6-REGRESSION-1 = EXPLOIT-1), fix-up 8 (HOLDEM-F7-EXPLOIT-1 = MEASUREMENT-1) — Short Deck, no more dealt
  * players than this: a ROCK or a CALLING_STATION first in (a call to make, no raise yet) plays its first-in decision on
  * 0dc1b96's strength (ctx.sdLivePctile), as it does facing a single raise (preFlopStrategy sdLiveSpot). Fix-up 7 applied it to every
@@ -1990,6 +2001,12 @@ function preFlopStrategy(
       // Off the big blind it opens the range it already played there (its 3-bet
       // range: ~6% EP to ~11% BTN); the big blind keeps its old raise range.
       const nitOpenTh = callAmount === 0 ? openTh : Math.max(openTh, threeBetTh);
+      // Fix-up 8 (HOLDEM-F7-REGRESSION-1): short-handed (NIT_LIMP_TRAP_MAX_PLAYERS dealt or fewer), no-limit, a call to make:
+      // 0dc1b96's NIT, without its 100 BB jam: the 4-bet value hands raise, the rest of its 3-bet range limps (and calls).
+      if (noLimit && callAmount > 0 && totalActive <= NIT_LIMP_TRAP_MAX_PLAYERS) {
+        if (fourBetValue) return raiseOrAllIn(Math.round(bigBlind * 2.5));
+        return pctile >= threeBetTh ? CALL : FOLD;
+      }
       if (pctile >= nitOpenTh) return raiseOrAllIn(Math.round(bigBlind * 2.5));
       return callAmount === 0 ? CHECK : FOLD;
     }

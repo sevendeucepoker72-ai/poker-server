@@ -13,6 +13,9 @@
  *    all-in keeps the Short Deck stack-off range: fix9's GUARD).
  *  - HOLDEM-F7-EXPLOIT-2: in sdLiveSpot the stack-off reads (the re-raise's jam gate) read the same 0dc1b96 strength, and
  *    deeper than 25 BB a bigger open narrows the ranges (B4, no widening).
+ *  - HOLDEM-F7-REGRESSION-1 (NIT, B5's class, every no-limit variant): with NIT_LIMP_TRAP_MAX_PLAYERS (3) dealt or fewer a
+ *    NIT with a call to make in an unopened pot plays 0dc1b96's NIT without its 100 BB jam: its 4-bet value hands raise to
+ *    2.5 BB, the rest of its 3-bet range limps and calls an iso-raise. B5's open folded every hand but those to a 3-bet.
  *
  * Whole lines are played on a real PokerTable / ShortDeckTable through AI.decideAction, applied as index.ts executeAIAction
  * applies them; the human's all-in is scored at its equity from the board of his all-in when nobody acts after that street,
@@ -20,6 +23,8 @@
  *   rsj        never first in (fold the small blind, check the big blind's option); over a single raise move in with any two.
  *   osn:F      first in (or over limpers) raise to F x the stack with any two; re-raised: continue with QQ+ / AK only; move
  *              in at the first action after the flop.
+ *   cb3:B:F:M  first in (or over limpers) raise to B BB with any two, and over a single raise re-raise to M x it; re-raised
+ *              or all-in: continue with QQ+ / AK only; after the flop bet F x the pot once when checked to, else check / fold.
  */
 /* eslint-disable @typescript-eslint/no-var-requires */
 const { PokerTable, PlayerAction, GamePhase } = require('../src/game/PokerTable');
@@ -149,6 +154,30 @@ describe('HOLDEM-F7-EXPLOIT-2 — in Short Deck a bigger open narrows the defenc
   });
 });
 
+describe('HOLDEM-F7-REGRESSION-1 (B5\'s class) — short-handed, a NIT limps its 3-bet range and raises only its 4-bet value hands (NIT_LIMP_TRAP_MAX_PLAYERS)', () => {
+  it.each(['holdem', 'shortdeck'])('%s heads-up 40 BB, a NIT first in raises <= 6%% of combos, limps >= 8%%, and continues >= 85%% of its raises against a 3x 3-bet (the 4-bet value hands, on a fresh noise draw; 70ffc14: raised 14-31%%, folded 76-87%% of them)', (v) => {
+    const raise = pct(v as Variant, () => hu(v as Variant, 40, 1, 'nf'), 1, 'NIT', (d) => d.action === PlayerAction.Raise || d.action === PlayerAction.AllIn);
+    const limp = pct(v as Variant, () => hu(v as Variant, 40, 1, 'nl'), 1, 'NIT', (d) => d.action === PlayerAction.Call);
+    const r = openThenAnswer(v as Variant, 40, 'NIT', 3);
+    process.stdout.write(`fix10 ${v} HU 40 BB NIT first in: raises ${raise.toFixed(1)}%, limps ${limp.toFixed(1)}%, continues ${r.cont.toFixed(1)}% of its raises vs a 3-bet\n`);
+    expect([v, raise <= 6, limp >= 8, r.cont >= 85]).toEqual([v, true, true, true]);
+  });
+  it.each(['holdem', 'shortdeck'])('%s heads-up 40 BB, the NIT continues against a 4 BB iso-raise over its limp with >= 90%% of its limps (0dc1b96: every one)', (v) => {
+    const r = openThenAnswer(v as Variant, 40, 'NIT', 4, 'limp');
+    expect([v, r.open >= 8, r.cont >= 90]).toEqual([v, true, true]);
+  });
+  it('a six-max NIT keeps B5: first in under the gun it never limps', () => {
+    const v = pct('holdem', () => {
+      const t = mkTable('holdem', 'n6');
+      for (let i = 0; i < 6; i++) expect(t.sitDown(i, 'P' + i, 100 * BB, (i === 0 ? 'player-n6-' : 'ai-n6-') + i, i !== 0)).toBe(true);
+      t.presetFirstButton(0);
+      expect(t.startNewHand()).toBe(true);   // button 0, blinds 1 / 2, UTG 3
+      return t;
+    }, 3, 'NIT', (d) => d.action === PlayerAction.Call);
+    expect(v).toBe(0);
+  });
+});
+
 /** BB/100 of the human (seat 0, heroBB) over `hands` hands of `line` against `lineup` (bots at `botBB`). */
 function play(v: Variant, line: string, lineup: string[], botBB: number, hands: number, seed: number, heroBB: number, diff = 'hard'): { bb100: number; drift: number; hands: number } {
   const restore = detEnv(seed);
@@ -249,14 +278,17 @@ function play(v: Variant, line: string, lineup: string[], botBB: number, hands: 
 
 describe('HOLDEM-F7 whole lines — no better than live (real engine, hard)', () => {
   // Bounds (BB/100). rsj against a TAG: < 0 (review harness xr16, EV v3: live -59 / -81 at 20 / 30 BB, 70ffc14 +26 / +38,
-  // here -50 / -35 over 4,500-6,000 hands). osn:0.25 against a 40 BB TAG: < 0 (live -72, 70ffc14 +62, here -72).
-  // On these seeds 70ffc14: +15.8 / +32.1 / +67.8; here -52.4 / -34.0 / -87.7.
+  // here -50 / -35 over 4,500-6,000 hands). osn:0.25 against a 40 BB TAG: < 0 (live -72, 70ffc14 +62, here -72). cb3 against
+  // a 40 BB NIT: live's best line there + 2 se (Short Deck cb3 +48 (4) -> 56; Hold'em cb3 +54 (2) -> 58; 70ffc14 +77 / +62).
+  // On these seeds 70ffc14: +15.8 / +32.1 / +67.8 / +71.9 / +63.4; here -52.4 / -34.0 / -87.7 / +37.7 / +40.5.
   const rows: string[] = [];
   afterAll(() => process.stdout.write(`fix10 whole lines (BB/100): ${rows.join('; ')}\n`));
   const CASES: Array<[string, Variant, string, string[], number, number, number, number, number]> = [
     ['rsj', 'shortdeck', 'heads-up, a 20 BB TAG', ['TAG'], 20, 2000, 101, 20, 0],
     ['rsj', 'shortdeck', 'heads-up, a 30 BB TAG', ['TAG'], 30, 2000, 102, 30, 0],
     ['osn:0.25', 'shortdeck', 'heads-up, a 40 BB TAG', ['TAG'], 40, 2000, 103, 40, 0],
+    ['cb3:2.5:0.5:3', 'shortdeck', 'heads-up, a 40 BB NIT', ['NIT'], 40, 2000, 104, 40, 56],
+    ['cb3:2.5:0.5:3', 'holdem', 'heads-up, a 40 BB NIT', ['NIT'], 40, 2000, 105, 40, 58],
   ];
   it.each(CASES)('%s %s against %s', (line, v, name, lineup, botBB, hands, seed, heroBB, bound) => {
     const t0 = process.hrtime.bigint();

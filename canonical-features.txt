@@ -2315,3 +2315,9 @@ const ownPctile = sdLiveSpot ? pctile :
 const sizeFactor = sdLiveSpot ? (effBB >
 Math.min(1, sizeRaw) : 1)
 const threeBetThS = sdLiveSpot ? threeBetTh : sized(
+# 2026-11-12 (fix-up 8, HOLDEM-F7-REGRESSION-1, B5's class) - preFlopStrategy NIT: no-limit, NIT_LIMP_TRAP_MAX_PLAYERS (3) dealt or fewer, a NIT
+# in an unopened pot with a call to make plays 0dc1b96's NIT without its 100 BB jam: 4-bet value hands raise to 2.5 BB, the rest of its 3-bet
+# range limps and calls an iso-raise. B5's open folded all but the value hands to a 3-bet: open any two + 3-bet any open + c-bet (cb3) won
+# +62 / +77 BB/100 heads-up at 40 BB in Hold'em / Short Deck (live +54 / +48).
+NIT_LIMP_TRAP_MAX_PLAYERS = 3
+NIT_LIMP_TRAP_MAX_PLAYERS) {
