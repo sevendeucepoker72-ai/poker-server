@@ -1053,7 +1053,9 @@ function decideActionForSeat(
   const noise = isFinite(rawNoise) ? rawNoise : 0;
   handStrength = Math.min(1.0, Math.max(0.0, handStrength + noise));
   // Fix-up 5: the strength 0dc1b96 read pre-flop in Short Deck (the Hold'em percentile of the two cards), same noise draw:
-  // a MANIAC facing a raise plays 0dc1b96's MANIAC on it (maniacFacingRaise0dc1b96).
+  // a MANIAC facing a raise plays 0dc1b96's MANIAC on it (maniacFacingRaise0dc1b96). Not adjusted below: at hard / expert
+  // 0dc1b96 also took 0.05 / 0.08 off a strength under 0.65 facing an aggressive opponent's bet of more than 4 BB, so in that
+  // spot the Short Deck MANIAC is slightly looser than 0dc1b96's (Hold'em passes the adjusted strength and is exact).
   const maniacPctile = isPreFlop && isShortDeck ? Math.min(1.0, Math.max(0.0, getPreFlopHandRank(holdemHoleCards(seat.holeCards)) + noise)) : undefined;
   if (stackOff !== null) stackOff = Math.min(1.0, Math.max(0.0, stackOff + noise));   // same noise draw
 
@@ -1515,7 +1517,8 @@ function aofShoverWidth(table: PokerTable, shover: Seat | null, effBB: number): 
 
 /**
  * Fix-up 5 (THE MANIAC CLASS: HOLDEM-F3-REGRESSION-2 = MEASUREMENT-1 = EXPLOIT-2) — no-limit (Hold'em, Short Deck,
- * Pineapple), not All-In or Fold: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, line for line: 0dc1b96's
+ * Pineapple), not All-In or Fold: a MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, line for line (Short Deck: on
+ * 0dc1b96's Hold'em percentile, without its hard / expert aggression adjustment; see ctx.maniacPctile): 0dc1b96's
  * push/fold zone on its own depth (chipsLeftEffectiveStackBB: mine vs the largest opponent's chips LEFT, at most 3 players),
  * else it re-raises ~93% of hands to 2.5-4x the bet (all-in at 70% of its stack), calls the top 70% of the rest, or folds.
  * Rounds 3-4 capped its light re-raises (HOLDEM_LIGHT_RERAISE_FRACTION, 5% of the depth at risk) and priced its continues
