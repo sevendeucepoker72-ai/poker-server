@@ -2531,3 +2531,15 @@ OPPONENT_PROFILE_STORE = new Map()
 OPPONENT_PROFILES = opponentProfileStore_1.OPPONENT_PROFILE_STORE
 function evaluateMaybeShortDeck(
 require("./TrainingEngine")
+# 2026-11-12 (Short Deck reset fix-up ID1-B11-SHARED-STORE) - B11's Stud Third Street observations are recorded under their own kinds
+# ('vpip_3rd' ...) into their own fields (vpipHands3rd ...), never in the PreFlop counts that the frozen 0dc1b96 copy (Short Deck) reads
+# from the shared opponent store (live counted PreFlop only). The current bots add them back (firstRoundCounts), so every other variant
+# reads what a3ac266 read. tests/sdLiveOpponentStore.test.ts runs the real index.ts feed.
+thirdStreet ? 'vpip_3rd' : 'vpip'
+thirdStreet ? 'pfr_3rd' : 'pfr'
+thirdStreet ? 'face_3bet_3rd' : 'face_3bet'
+thirdStreet ? 'fold_to_3bet_3rd' : 'fold_to_3bet'
+function firstRoundCounts(
+vpip: p.vpipHands + (p.vpipHands3rd || 0)
+case 'fold_to_3bet_3rd':
+(firstRoundCounts(obs).vpip +

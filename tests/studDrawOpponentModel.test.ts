@@ -11,6 +11,10 @@
  * 'blindPosted' (never here); a completion is a Raise (VPIP + PFR). The
  * player's HUD 3-bet context (progressionManager.recordPreflopRaiseContext)
  * stays PreFlop only.
+ * 2026-11-12 (Short Deck reset, fix-up ID1-B11-SHARED-STORE): Third Street is
+ * recorded under its own kinds into vpipHands3rd / pfrHands3rd / ...; the
+ * PreFlop fields keep live 0dc1b96's counts (the frozen copy that plays Short
+ * Deck reads them). The current bots read the sum (firstRoundCounts).
  *
  * REAL src/index.ts text (ensureTableProgressListener, sliced + transpiled)
  * with the REAL recordOpponentObservation / opponentModelKey / categorizeOpponent
@@ -18,7 +22,8 @@
  */
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
-import { recordOpponentObservation, opponentModelKey, getOpponentProfile, categorizeOpponent } from '../src/ai/AIPlayer';
+import { recordOpponentObservation, opponentModelKey, getOpponentProfile, categorizeOpponent, firstRoundCounts } from '../src/ai/AIPlayer';
+import * as LIVE from '../src/ai/live0dc1b96/AIPlayer';
 import { fnSrc, load } from './helpers/indexSource';
 
 const LISTENER = fnSrc('function ensureTableProgressListener(');
@@ -73,14 +78,19 @@ describe('SD8 — Stud Third Street counts for the opponent model (VPIP / PFR)',
     return { table, w, key: `${label}-p1`, completed };
   }
 
-  it('a human who completes every Third Street for 16 hands: vpipHands === pfrHands === handsSeen, categorized "maniac" (0dc1b96: 0 / 0, "nit")', () => {
+  it('a human who completes every Third Street for 16 hands: first-round VPIP === PFR === handsSeen, categorized "maniac" (0dc1b96: 0 / 0, "nit")', () => {
     const r = studHands('stud16', 16);
     expect(r.completed).toBe(16);
     const p = getOpponentProfile(r.key)!;
     expect(p.handsSeen).toBe(16);
-    expect(p.vpipHands).toBe(16);
-    expect(p.pfrHands).toBe(16);
+    // B11's Third Street counts, in their own fields; the current bots read PreFlop + Third Street.
+    expect([p.vpipHands3rd, p.pfrHands3rd]).toEqual([16, 16]);
+    expect(firstRoundCounts(p)).toEqual({ vpip: 16, pfr: 16, threeBetsFaced: 0, threeBetFolds: 0 });
     expect(categorizeOpponent(r.key)).toBe('maniac');
+    // ID1-B11-SHARED-STORE: the PreFlop fields hold what 0dc1b96's feed wrote on Stud (nothing), so the frozen
+    // 0dc1b96 copy that plays Short Deck reads this player exactly as live did.
+    expect([p.vpipHands, p.pfrHands, p.threeBetsFaced, p.threeBetFolds]).toEqual([0, 0, 0, 0]);
+    expect(LIVE.categorizeOpponent(r.key)).toBe('nit');
     expect([...r.w.stubbed].filter((n) => /recordOpponentObservation|opponentModelKey|progressionManager|GamePhase/.test(n))).toEqual([]);
   });
 

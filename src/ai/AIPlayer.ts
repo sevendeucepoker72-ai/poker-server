@@ -930,6 +930,9 @@ export function generateRandomProfile(difficulty: Difficulty): AIPlayerProfile {
  * Differences from live 0dc1b96 that are kept, none a decision: the pre-flop percentile is the baked table
  * (preflopTable.ts, B10: live built it lazily with Math.random on the first bot decision of each boot, a 7-13 s
  * freeze); index.ts's crash guards around the bot timer. The fixes for every other variant are untouched.
+ * The opponent reads the copy sees are live's too: B11's Stud Third Street counts (a fix for the Stud bots) are
+ * stored in their own fields (vpipHands3rd ...), which the copy never reads, so a player who also plays Stud / Razz
+ * reads to a Short Deck bot exactly as live's feed recorded him (fix-up ID1-B11-SHARED-STORE).
  *
  * The Short Deck code of fix rounds 1-4 (B13's Short Deck equity / pre-flop table on the bots, the sdLiveSpot rules,
  * NEW-1 on Short Deck, B4/B5/B8/B9, the MANIAC rules, push/fold) is NOT deleted: it is dormant behind this switch,
@@ -1638,7 +1641,8 @@ function aofShoverWidth(table: PokerTable, shover: Seat | null, effBB: number): 
   const sp = seatPositions(table, shover.seatIndex);
   const prior = 1 - (aofPushPctile(effBB, Math.max(1, sp.total - 1 - sp.preflop)) ?? 1 - huW);
   const obs = getOpponentProfile(opponentModelKey(shover));
-  return obs && obs.handsSeen > 0 ? (obs.vpipHands + AOF_OBS_PRIOR_HANDS * prior) / (obs.handsSeen + AOF_OBS_PRIOR_HANDS) : prior;
+  // VPIP = PreFlop + Stud Third Street (B11), as a3ac266 read it (firstRoundCounts).
+  return obs && obs.handsSeen > 0 ? (firstRoundCounts(obs).vpip + AOF_OBS_PRIOR_HANDS * prior) / (obs.handsSeen + AOF_OBS_PRIOR_HANDS) : prior;
 }
 
 /**
@@ -3490,6 +3494,19 @@ export interface OpponentSessionProfile {
   showdownsReached: number;
   showdownsWonWithBluff: number;
   lastHandNumber: number;
+  /**
+   * 2026-11-12 (Short Deck reset, fix-up ID1-B11-SHARED-STORE) — B11's Stud counts: the first betting round of a
+   * Seven Card Stud / Stud Hi-Lo / Razz hand (Third Street), recorded by index.ts under the '*_3rd' kinds. They are
+   * kept OUT of vpipHands / pfrHands / threeBetsFaced / threeBetFolds, which hold the PreFlop counts only, exactly
+   * what live 0dc1b96's feed wrote there. The frozen 0dc1b96 copy that plays Short Deck reads only those four, from
+   * this same store, so its read of a player who also plays Stud is live's. The current bots add the two
+   * (firstRoundCounts), so every other variant reads what a3ac266 read. A profile created by the frozen copy's own
+   * (unused) writer has no such fields: read them through firstRoundCounts (missing = 0).
+   */
+  vpipHands3rd: number;
+  pfrHands3rd: number;
+  threeBetsFaced3rd: number;
+  threeBetFolds3rd: number;
 }
 
 /**
@@ -3522,6 +3539,7 @@ function getOrCreateOpponentProfile(opponentKey: string): OpponentSessionProfile
       cbetsFaced: 0, cbetFolds: 0,
       showdownsReached: 0, showdownsWonWithBluff: 0,
       lastHandNumber: -1,
+      vpipHands3rd: 0, pfrHands3rd: 0, threeBetsFaced3rd: 0, threeBetFolds3rd: 0,
     };
     while (OPPONENT_PROFILES.size >= OPPONENT_PROFILES_CAP) {
       const oldest = OPPONENT_PROFILES.keys().next().value;
@@ -3542,11 +3560,30 @@ export function opponentProfileCount(): number {
   return OPPONENT_PROFILES.size;
 }
 
+/**
+ * 2026-11-12 (fix-up ID1-B11-SHARED-STORE) — the first-betting-round counts the CURRENT bots read: PreFlop plus Stud's
+ * Third Street (B11), i.e. exactly what a3ac266 held in vpipHands / pfrHands / threeBetsFaced / threeBetFolds. Integer
+ * sums, so every ratio below is bit-for-bit a3ac266's. The frozen 0dc1b96 copy never calls this (PreFlop only, as live).
+ */
+export function firstRoundCounts(p: OpponentSessionProfile): { vpip: number; pfr: number; threeBetsFaced: number; threeBetFolds: number } {
+  return {
+    vpip: p.vpipHands + (p.vpipHands3rd || 0),
+    pfr: p.pfrHands + (p.pfrHands3rd || 0),
+    threeBetsFaced: p.threeBetsFaced + (p.threeBetsFaced3rd || 0),
+    threeBetFolds: p.threeBetFolds + (p.threeBetFolds3rd || 0),
+  };
+}
+
+/** The observation kinds index.ts records. '*_3rd' = the same event on Stud's Third Street (B11; see vpipHands3rd). */
+export type OpponentObservation =
+  'hand_start' | 'vpip' | 'pfr' | 'face_3bet' | 'fold_to_3bet' | 'face_cbet' | 'fold_to_cbet' | 'showdown'
+  | 'vpip_3rd' | 'pfr_3rd' | 'face_3bet_3rd' | 'fold_to_3bet_3rd';
+
 // External hook — index.ts calls it on the table's action events to build the
 // session view. R3 (GAME-P3-10): `opponentKey` = opponentModelKey(seat).
 export function recordOpponentObservation(
   opponentKey: string,
-  observation: 'hand_start' | 'vpip' | 'pfr' | 'face_3bet' | 'fold_to_3bet' | 'face_cbet' | 'fold_to_cbet' | 'showdown',
+  observation: OpponentObservation,
   extra?: { bluffed?: boolean; handNumber?: number }
 ): void {
   if (!opponentKey) return;
@@ -3568,6 +3605,11 @@ export function recordOpponentObservation(
       p.showdownsReached++;
       if (extra && extra.bluffed) p.showdownsWonWithBluff++;
       break;
+    // B11's Stud Third Street counts, apart from the PreFlop ones above (see vpipHands3rd).
+    case 'vpip_3rd':         p.vpipHands3rd = (p.vpipHands3rd || 0) + 1; break;
+    case 'pfr_3rd':          p.pfrHands3rd = (p.pfrHands3rd || 0) + 1; break;
+    case 'face_3bet_3rd':    p.threeBetsFaced3rd = (p.threeBetsFaced3rd || 0) + 1; break;
+    case 'fold_to_3bet_3rd': p.threeBetFolds3rd = (p.threeBetFolds3rd || 0) + 1; break;
   }
 }
 
@@ -3576,9 +3618,11 @@ export type OpponentCategory = 'unknown' | 'nit' | 'tag' | 'lag' | 'fish' | 'sta
 export function categorizeOpponent(opponentKey: string): OpponentCategory {
   const p = OPPONENT_PROFILES.get(opponentKey);
   if (!p || p.handsSeen < 10) return 'unknown';
-  const vpip = p.vpipHands / p.handsSeen;
-  const pfr = p.pfrHands / p.handsSeen;
-  const foldTo3bet = p.threeBetsFaced > 0 ? p.threeBetFolds / p.threeBetsFaced : 0.6;
+  // PreFlop + Stud Third Street (B11), as a3ac266 read them (firstRoundCounts).
+  const fr = firstRoundCounts(p);
+  const vpip = fr.vpip / p.handsSeen;
+  const pfr = fr.pfr / p.handsSeen;
+  const foldTo3bet = fr.threeBetsFaced > 0 ? fr.threeBetFolds / fr.threeBetsFaced : 0.6;
   if (vpip < 0.15 && pfr < 0.12) return 'nit';
   if (vpip > 0.45 && pfr < 0.10) return 'station';
   if (vpip > 0.50 && pfr > 0.35) return 'maniac';

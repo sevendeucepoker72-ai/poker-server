@@ -8597,18 +8597,24 @@ function ensureTableProgressListener(table: PokerTable, tableId: string): void {
     // voluntary too (the bring-in posts as 'blindPosted', not here). Every Stud
     // opponent used to read as a nit (vpip = pfr = 0). The HUD 3-bet context
     // below stays Hold'em / draw PreFlop only.
-    const firstBettingRound = table.currentPhase === GamePhase.PreFlop || table.currentPhase === GamePhase.ThirdStreet;
+    // 2026-11-12 (Short Deck reset, fix-up ID1-B11-SHARED-STORE) — Third Street is
+    // recorded under its OWN kinds ('vpip_3rd' ...), never in the PreFlop counts:
+    // the frozen 0dc1b96 copy that plays Short Deck reads those PreFlop counts from
+    // this same process-wide store, and live's feed counted PreFlop only. The
+    // current bots add the two (AIPlayer firstRoundCounts), so B11 is unchanged for them.
+    const thirdStreet = table.currentPhase === GamePhase.ThirdStreet;
+    const firstBettingRound = table.currentPhase === GamePhase.PreFlop || thirdStreet;
     if (firstBettingRound) {
       const voluntary = a === PlayerAction.Call || aggressive;
-      if (voluntary && !obsVpip.has(oppKey)) { obsVpip.add(oppKey); recordOpponentObservation(oppKey, 'vpip'); }
-      if (aggressive && !obsPfr.has(oppKey)) { obsPfr.add(oppKey); recordOpponentObservation(oppKey, 'pfr'); }
+      if (voluntary && !obsVpip.has(oppKey)) { obsVpip.add(oppKey); recordOpponentObservation(oppKey, thirdStreet ? 'vpip_3rd' : 'vpip'); }
+      if (aggressive && !obsPfr.has(oppKey)) { obsPfr.add(oppKey); recordOpponentObservation(oppKey, thirdStreet ? 'pfr_3rd' : 'pfr'); }
       // 2026-07-07: facing a 3-bet+ means ≥2 preflop raises are already in front
       // of this player (open + reraise). Record the spot and whether they fold —
       // this feeds categorizeOpponent's fold-to-3-bet read (was hardcoded 0.6).
       if (preflopRaiseCount >= 2 && !obs3bet.has(oppKey)) {
         obs3bet.add(oppKey);
-        recordOpponentObservation(oppKey, 'face_3bet');
-        if (a === PlayerAction.Fold) recordOpponentObservation(oppKey, 'fold_to_3bet');
+        recordOpponentObservation(oppKey, thirdStreet ? 'face_3bet_3rd' : 'face_3bet');
+        if (a === PlayerAction.Fold) recordOpponentObservation(oppKey, thirdStreet ? 'fold_to_3bet_3rd' : 'fold_to_3bet');
       }
       // 3-bet%: a prior preflop raise already in front = a 3-bet spot; raising
       // in that spot is a 3-bet+. preflopRaiseCount reflects raises BEFORE this
