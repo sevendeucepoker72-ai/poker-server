@@ -1876,6 +1876,85 @@ tournaments say "non-qualifier". Every frame / route change is additive.
 | C2 / C1 review fix-up: every hand record says its table kind and the hand's level | (1) `PokerTable.emitHandCompletion` stamps every variant's `handHistory` record with `smallBlind` / `bigBlind` / `ante` = the level the hand was played at (`handLevelOfRecord`: handSmallBlind / handBigBlind / handAnte, F18; the table level when none was captured). A mid-hand level-up does not change them. (2) index.ts handHistory listener: `handRecordKindOf(tableId)` adds `tableKind` (tableKindOf) and, at a tournament table, `tournamentId` to `serializedHistory` - so the emitted copy, the saved copy and every F11 copy carry them. poker-3d C2 classifies STORED records (after a reload / fresh sign-in, F11 copies of an absent player) as tournament hands from them; C1's header stakes come from the record instead of a log guess. Additive everywhere. | `PokerTable.emitHandCompletion / handLevelOfRecord`, `HandHistoryRecord`; `index.ts handRecordKindOf`, the handHistory listener | `tests/sngC2RecordKindAndStakes.test.ts` (5 of 5 fail on the F19 fix-up); r3EconomyFixes stubbed list + `handRecordKindOf` (intended) |
 | C2 review fix-up: durableState.tournamentResults | `tournamentResults.resultsFor(userId, limit)` (F14 store, same serialized chain): his FINISHED results (place set, not voided, not a qualifier, within 30 days), newest first -> `[{tournamentId, name, place, prize, entryFee (buy-in), finishedAt (ms), tableIds}]`; a failed read answers [] (counted). `getDurableState` adds `tournamentResults` through `durableTournamentResultsFor` (waits at most `DURABLE_TOURNAMENT_RESULTS_WAIT_MS` = 1.5 s; slow / failed / odd -> []; never rejects, so the rest of durableState is never held up or lost). poker-3d hydrates it (its results list lived in page memory only), so the bankroll plots prize - entry fee after a reload or a fresh sign-in. Spin & Go has no F14 row (its hands are still left out of wallet results by the record's tableKind). | `tournamentResults.ts resultsFor`, `index.ts durableTournamentResultsFor`, `getDurableState` | `tests/sngC2DurableTournamentResults.test.ts` (5 of 5 fail on the record-stamp commit); economyHandlers world gains the fake (intended) |
 
+## AI bots (2026-11 review fixes)
+
+The owner asked for a review of the .online bots on 2026-11-04 ("Fix everything except 6"). Live before this work was 0dc1b96. Fix rounds 1-4 and Hold'em fix-ups 1-8 followed (2026-11-05 to 11-12). This section says what the bots do now and how to change them safely.
+
+### Short Deck: bots play live 0dc1b96, behind one switch
+
+- `SHORT_DECK_BOTS_PLAY_LIVE = true` in `src/ai/AIPlayer.ts`. It is a code constant. No env var or config can change it.
+- `decideAction` checks it first. A Short Deck table (`isShortDeckBotTable`: variant id `short-deck` / six-plus, never Omaha) goes to `src/ai/live0dc1b96/AIPlayer.ts`.
+- That folder is a frozen copy of 0dc1b96's `src/ai/AIPlayer.ts` and `src/training/TrainingEngine.ts`. Only the import paths differ, plus one line: the opponent store.
+- Never edit the frozen copy. `tests/sdLiveGolden.test.ts` pins its fingerprint and replays 420 decisions recorded from a git archive of 0dc1b96 (action, raise size and Math.random draws).
+- The opponent model is one Map for the process (`src/ai/opponentProfileStore.ts`). index.ts writes it through `recordOpponentObservation`. Both bot modules read it, as live's one module did.
+- The frozen copy also does live's own post-processing (its `limitBotRaiseWar`). None of the new rules run for it, not even "never fold when checking is free".
+- Kept differences from live. None is a bot decision:
+  - the pre-flop percentile is the baked table (`preflopTable.ts`). Live built it with Math.random on the first bot decision of each boot: a 7-13 s freeze of the whole server (B10);
+  - the crash guards around the bot timer (row 35).
+- Why: eight review rounds each found a new way to beat the CHANGED Short Deck bots that did not work against live. Re-review 8 left five blockers, all Short Deck (opening 4-16 BB then moving in over the re-raise: up to +671 BB/100; live loses 170-751). The other blocker lines measured against live: a 25% open then any flop all-in, 3-max 25 BB ROCK,TAG, +6 (changed bots +37); any-two jams heads-up at 45 BB, -85 (+15); limp-and-bet against a heads-up 40 BB NIT, -15 (+14).
+- The lane's Short Deck code is NOT deleted. It sits dormant behind the switch: the Short Deck pre-flop table on the bots (`shortDeckPreflop.ts`), `sdLiveSpot` / `sdLivePctile`, `SHORT_DECK_LIVE_FIRST_IN_MAX_PLAYERS`, `SHORT_DECK_LIVE_ALLIN_MAX_BB`, `shortDeckRangeFloor`, the Short Deck MANIAC read.
+- Its tests still run it, through `setShortDeckLaneForTests(true)`. That hook throws outside Jest. Turn the switch off only after a fresh full review of the lane's Short Deck code.
+- Where Short Deck is played: the lobby table "Short Deck Showdown", club tables and home games. All-In or Fold, Spin & Go, Heads-Up Snap, career, tournaments and qualifiers are Hold'em only. Any future Short Deck table is routed by its variant id, so it plays live too.
+
+Short Deck residuals: live behaviour that stays unfixed on Short Deck (fixed on the other variants):
+- NEW-1: a lone all-in reads the shover's chips LEFT (0), so the bots call a lone deep shove with most hands (heads-up, a big blind calls a 40-100 BB jam about 91% of the time).
+- B13: Short Deck strength is the full-deck Hold'em percentile before the flop. After it, live's equity model ranks only the flush over the full house (a straight still beats trips) and samples ranges from the full-deck table.
+- B4 (raise size ignored pre-flop), B5 (NIT / FISH / ROCK unopened-pot branch: 100 BB premium shoves, a ROCK limps AA), B8 (folds about 70% to a min 3-bet), B9 (a big blind facing a min-raise plays it as a limp), B16 (push/fold ignores the seat).
+- The CALLING_STATION plays every hand. A bot can fold when checking is free (HAI-4).
+- Live's MANIAC, push/fold and raise-war limits. None of the post-flop all-in rules (near all-in, micro-call floor, dry side pot, MANIAC all-in price).
+- Measured live leaks on Short Deck: heads-up ROCK, open 25% of the stack: +297 to +664 BB/100; NIT steal / c-bet lines +34 to +53.
+
+### Hold'em family (Hold'em, Pineapple, Crazy Pineapple; Omaha where named)
+
+- No raise-then-fold. An all-in is an all-in whatever its size (`NEAR_ALLIN_SPR`, `nearAllInRaiser`).
+- After the flop, against an all-in or a committed bettor, a fold is a call when the price is under `POSTFLOP_MICRO_CALL_NEED` (0.10). A dry side pot is checked down (`sidePotAgainstShortStack`).
+- A MANIAC facing a raise or an all-in plays 0dc1b96's MANIAC, line for line (`maniacFacingRaise0dc1b96`). Not at All-In or Fold. Every rule keyed on one MANIAC shape opened a neighbouring one (fix-ups 1-4).
+- A non-MANIAC that flat-called a raise and then faces an all-in its call closes (more than 25 BB at risk) makes 0dc1b96's continue decision (`flatterContinue0dc1b96`).
+- Short stacks (fix-up 6): the push/fold zone facing an uncommitted raise is on 0dc1b96's chips-left depth (`chipsLeftEffectiveStackBB`). At 25 BB or less a bigger raise narrows no range. A short FISH's raise over a raise is the jam. B4's narrowing stays above 25 BB.
+- Short-handed (3 dealt or fewer): a ROCK limps its premiums (`ROCK_LIMP_TRAP_MAX_PLAYERS`). A NIT plays 0dc1b96's NIT without the 100 BB jam: 4-bet value hands raise to 2.5 BB, the rest of its 3-bet range limps and calls an iso-raise (`NIT_LIMP_TRAP_MAX_PLAYERS`).
+- NIT: `NIT_SIZE_NARROW_SLACK`; it covers a short raiser instead of flatting (`nitShortRaiserCover`). FISH: `FISH_RAISE_PCTILE`. AA / KK never fold pre-flop; JJ+ / AK never fold to a single bet.
+- Pot-limit Omaha keeps 0dc1b96's pre-flop depth (`PLO_LONE_ALLIN_CALL_NEED`).
+- Converged by returning to live: the MANIAC facing a raise, the flatter's continue, the short-stack zone, the short-handed ROCK and NIT limps, the short FISH jam. What live itself pays is live behaviour (NIT steals, ROCK big opens, FISH limp-and-go).
+- Known exception: against a NIT that covers a raiser of 25 BB or less, steal-then-any-flop-all-in pays as the plain steal (below live's best line).
+- Residuals: heads-up NIT big steals (open 10-12 BB at 40-100 BB) +25 to +31 BB/100 (live -6 to +3; live's best NIT line, +58, is above it). B4's size narrowing still starts with a step at 26 BB. A FISH above 25 BB still min-raises and calls any re-raise. The micro-call floor calls a river bet of 10% of the pot with air. `limitBotRaiseWar` can turn a continue into a call past the street cap.
+
+### Stud / Draw
+
+FIRST ROUND (`studDrawFirstRound`):
+- "One raise" means the table's count of FULL raises (`fullRaisesThisRound`).
+- A value-set hand (`STUD_DRAW_VALUE_PCTILE`; in 5CD also `fiveDrawAcesOrBetter`) never folds to one raise that does not commit a third of its stack.
+- 5CD premiums are judged by made-hand class (`fiveDrawStackOffPremium`). A LONE all-in with `FIVE_DRAW_ALLIN_COMMIT_BB` (33 BB) at risk is a stack-off.
+- `reRaisePricedIn`: a seat that re-raised more than 10% of the depth calls a SHORTER all-in. A raise is an entry that RAISED the running bet (`betRaisingEntries`). An all-in call for less is not one. A UTG straddle is the round's posted blind, not a raise.
+- Fixed-limit draw games: a ROCK big blind defends with `STUD_DRAW_FL_ROCK_BB_DEFEND`. A NIT opener keeps its range against one full re-raise.
+
+LATER ROUNDS (`postFlopStrategy` = `postFlopStrategyCore` + the 5CD post-draw rules):
+- All of it sits behind `studDrawKindOfTable`, so Hold'em, Omaha, Short Deck and Pineapple are untouched by it.
+- Depth at risk = min(own stack, the shortest live opponent with `FIVE_DRAW_POST_SHALLOW_BB` (15 BB) or more behind) (`fiveDrawPostBetDepth`).
+- Leads: every lead puts in at most `FIVE_DRAW_POST_LEAD_CAP` (0.3) of the depth, for every hand, so the size tells nothing. A capped lead under the minimum bet is the whole stack, never a check.
+- A MANIAC never bets a pair under K-K after the draw. With seats still to act it leads K-K or better except a 0.3 trap share, and 0.35 of its no-pair hands. Checked to by every other seat, it bets every K-K or better and half its no-pair hands.
+- Raises: a raise that commits a third of the depth needs the stack-off class; otherwise it calls. This is a known tell.
+- Calls (`fiveDrawPostFolds`, one made-hand score `fiveDrawGateScore`): the hand needed rises with the price, phased in by the share of the depth the call puts in (`FIVE_DRAW_POST_COMMIT_RAMP`) and, against an all-in, by the depth (`FIVE_DRAW_POST_SHALLOW_RAMP_BB`). A seat that already put chips in this round needs two pair against an all-in over them. FISH / CALLING_STATION read the price lower; an overcall needs one class more.
+- Fixed limit, after the first round: facing ONE bet, NIT / ROCK / MANIAC call by pot odds (`STUD_DRAW_FL_CALL_MARGIN`).
+- Rules: never a step at one size or one depth for a made hand; never a capped or nut-only bet, check or lead; never a bet range that mostly folds to an all-in over it. Each 5CD post-draw rule so far created a tell the neighbouring line exploited. Fix the class, then measure the neighbouring lines.
+- Residuals (owner call): MANIACs re-raise at most 10 BB before the draw and a FISH defends a 3 BB open (VPIP about 59%; live 8%), so a human sees cheap draws. Value lines against post-draw MANIACs: vf95 +142, pcv +115, xl0 +125 BB/100 at 100 BB (x4); vs FISH x4 vf95 +69. pcxv against MANIAC x4 at a 50 / 60 BB hero: +53 / +92 (live -81 / -32). Closing these needs a pre-draw MANIAC / FISH personality change.
+- Tests: studDrawLaterRounds, studDrawFiveCardDrawPostDraw, studDrawDeepStacks, studDrawValueSetAllIn, studDrawNitOpenerDefense, studDrawFiveCardDrawRaiseWars, studDrawRockBigBlindDefense.
+
+### The gate for any bot change
+
+- Measure WHOLE human lines on the real engine against live 0dc1b96: seeded, chip-drift checked, EV v3, each (cell, tree, seed) counted once.
+- Cover unequal stacks and the default equal 100 BB table; heads-up, 3-max and six-max; every archetype at hard / medium / easy; every variant the change reaches.
+- Lines: steals (os / osf / cb / pf), re-shoves (rsj / aj / bj), 3-bets (3bs / 3bf / cb3 / osf3), iso-raises (isop / ofo), big opens (osn / osq at 15-30% of the stack), value lines (vb / val), and opening 4-16 BB then moving in over the re-raise (os:B, ocj, osp). For Stud / Draw also the size-reading, check-around, check-raise and shove-over-lead lines.
+- No any-two line above 0 by more than 2 se unless live is as positive. Nothing newly profitable by more than +100 BB/100. Re-run a borderline cell on 6+ seeds.
+- A decision must read the same scale as the decision that answers it. Pin both: "opens X% and continues Y% of its opens against the all-in".
+- Prove that what should not change did not: an action-log identity run against the previous head (every action and amount, same deck, same Math.random stream).
+
+### Test, manifest and ops gotchas
+
+- With jest-each, give every row every argument. Whole-line rows get a 2,400 s ceiling.
+- Live 0dc1b96 builds its pre-flop table with Math.random at first use. To compare against live, give the live tree the baked `preflopRanges.ts` + `preflopTable.ts`.
+- Manifest tokens: tsc emits an exported constant as `exports.NAME` and an imported one as `module_1.NAME`. Start tokens at the constant, avoid trailing spaces, and check them against a scratch build.
+- An outside process deletes scratch copies of the live tree and worktree node_modules junctions. Re-create a junction with PowerShell New-Item -ItemType Junction. Never rm -rf a directory that holds one.
+
 ## Gotchas
 
 - **There is no SQLite (corrected 2026-10-11, CLUBS-P3-1).** Clubs (and
