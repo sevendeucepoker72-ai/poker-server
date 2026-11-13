@@ -12,7 +12,13 @@
 import { Card } from '../src/game/Card';
 import { PlayerAction } from '../src/game/PokerTable';
 import { ShortDeckTable } from '../src/game/variants/ShortDeckTable';
-import { decideAction, getPostFlopStrength } from '../src/ai/AIPlayer';
+import { decideAction, getPostFlopStrength, setShortDeckLaneForTests } from '../src/ai/AIPlayer';
+
+// 2026-11-12 (Short Deck reset): production Short Deck bots play live 0dc1b96 (SHORT_DECK_BOTS_PLAY_LIVE). #4 pins the
+// lane's Short Deck pre-flop table on the bots, now dormant behind the switch: it runs through the Jest-only hook
+// (tests/sdLiveGolden pins the shipped, live behaviour). #5 reads getPostFlopStrength directly (no routing).
+beforeAll(() => setShortDeckLaneForTests(true));
+afterAll(() => setShortDeckLaneForTests(false));
 
 const RK: Record<string, number> = { A: 14, K: 13, Q: 12, J: 11, T: 10 };
 const SU: Record<string, number> = { h: 0, d: 1, c: 2, s: 3 };

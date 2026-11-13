@@ -276,6 +276,10 @@ describe('B5 residual — NIT / ROCK / FISH never limp (or fold) a value hand un
 });
 
 describe('HAI-1 / HAI-2 on Short Deck (no-limit, its own pre-flop table)', () => {
+  // 2026-11-12 (Short Deck reset): the lane's Short Deck code is dormant behind SHORT_DECK_BOTS_PLAY_LIVE; this pin runs it
+  // through the Jest-only hook (tests/sdLiveGolden pins the shipped, live behaviour).
+  beforeAll(() => AI.setShortDeckLaneForTests(true));
+  afterAll(() => AI.setShortDeckLaneForTests(false));
   const sd = (): ShortDeckTable => {
     const t = new ShortDeckTable({ tableId: 's', tableName: 's', smallBlind: 50, bigBlind: BB, ante: 0, minBuyIn: 100 } as any);
     const id = tableNo++;

@@ -2518,3 +2518,16 @@ const threeBetThS = sdLiveSpot ? threeBetTh : sized(
 # +62 / +77 BB/100 heads-up at 40 BB in Hold'em / Short Deck (live +54 / +48).
 NIT_LIMP_TRAP_MAX_PLAYERS = 3
 NIT_LIMP_TRAP_MAX_PLAYERS) {
+# 2026-11-12 (Short Deck reset) - Short Deck bots play EXACTLY as live 0dc1b96: src/ai/AIPlayer.ts decideAction hands a Short Deck table
+# (isShortDeckBotTable) to the frozen 0dc1b96 copy in src/ai/live0dc1b96/ (AIPlayer.ts + the TrainingEngine.ts equity it read; only the
+# import paths differ, plus the shared opponent-store line). The switch SHORT_DECK_BOTS_PLAY_LIVE is a code constant, no env var. The
+# lane's Short Deck code (the sdLiveSpot tokens above) stays, dormant behind it. tests/sdLiveGolden.test.ts replays 420 recorded 0dc1b96
+# Short Deck decisions and pins the frozen copy's fingerprint. One opponent-model Map (src/ai/opponentProfileStore.ts) for both modules.
+SHORT_DECK_BOTS_PLAY_LIVE = true
+function shortDeckBotsPlayLive(
+return live0dc1b96.decideAction(table, seatIndex, profile, opts)
+require("./live0dc1b96/AIPlayer")
+OPPONENT_PROFILE_STORE = new Map()
+OPPONENT_PROFILES = opponentProfileStore_1.OPPONENT_PROFILE_STORE
+function evaluateMaybeShortDeck(
+require("./TrainingEngine")

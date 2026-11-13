@@ -113,6 +113,9 @@ describe('MANIAC-RTF part 2 (fix-up 5: as 0dc1b96) — a MANIAC that raised this
   });
 
   it('Short Deck 100 BB: the MANIAC isolated a limper (a human), who then shoves: it continues >= 17% (20.5%; 2b5ac52 9.5%, 1.5x 14%)', () => {
+    // 2026-11-12 (Short Deck reset): the lane's Short Deck code is dormant behind SHORT_DECK_BOTS_PLAY_LIVE; this pin runs it
+    // through the Jest-only hook (tests/sdLiveGolden pins the shipped, live behaviour).
+    AI.setShortDeckLaneForTests(true);
     const restore = detEnv(4245);
     try {
       const t = six(100, ShortDeckTable);
@@ -123,7 +126,7 @@ describe('MANIAC-RTF part 2 (fix-up 5: as 0dc1b96) — a MANIAC that raised this
       expect(t.playerAllIn(0)).toBe(true);
       expect(t.activeSeatIndex).toBe(1);
       expect(contRate(t, 1, 600, 'MANIAC', 'hard', 6)).toBeGreaterThanOrEqual(0.17);
-    } finally { restore(); }
+    } finally { restore(); AI.setShortDeckLaneForTests(false); }
   });
 });
 

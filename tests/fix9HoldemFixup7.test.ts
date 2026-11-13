@@ -36,6 +36,12 @@ const AI = require('../src/ai/AIPlayer');
 const nodeCrypto = require('crypto');
 export {};   // a module: its top-level names stay file-scoped
 
+// 2026-11-12 (Short Deck reset): production Short Deck bots play live 0dc1b96 (SHORT_DECK_BOTS_PLAY_LIVE). This file pins
+// the lane's Short Deck code, now dormant behind the switch: it runs it through the Jest-only hook (tests/sdLiveGolden
+// pins the shipped, live behaviour).
+beforeAll(() => AI.setShortDeckLaneForTests(true));
+afterAll(() => AI.setShortDeckLaneForTests(false));
+
 function detEnv(seed: number): () => void {
   const rb = nodeCrypto.randomBytes, r = Math.random, now = Date.now;
   let ctr = 0;

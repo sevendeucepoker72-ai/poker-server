@@ -18,6 +18,8 @@ import {
 import { getShortDeckPreflopPercentile, shortDeckPercentileByRanks } from './shortDeckPreflop';
 import { calibrateOmahaPreflop } from './omahaPreflopCalibration';
 import { countOmahaDrawOuts } from '../training/fastOmahaEval';
+import { OPPONENT_PROFILE_STORE } from './opponentProfileStore';
+import * as live0dc1b96 from './live0dc1b96/AIPlayer';
 
 export type Difficulty = 'easy' | 'medium' | 'hard' | 'expert';
 export type Personality =
@@ -915,12 +917,57 @@ export function generateRandomProfile(difficulty: Difficulty): AIPlayerProfile {
   return { botName, difficulty, personality, archetype, vpip, pfr, aggressionFactor, bluffFrequency };
 }
 
+/**
+ * 2026-11-12 (bots review, Short Deck reset) — THE switch: true = every Short Deck bot decision is live 0dc1b96's.
+ *
+ * Eight rounds of review kept finding a new way to beat the CHANGED Short Deck bots that does not work against the
+ * live ones (re-review 8: five open blockers, all Short Deck). So, by the integrator's decision, Short Deck bots play
+ * EXACTLY as live 0dc1b96 did: decideAction hands a Short Deck table (isShortDeckBotTable) to the frozen copy of
+ * 0dc1b96's decision code in src/ai/live0dc1b96/ (AIPlayer.ts + the TrainingEngine.ts equity it read; only import
+ * paths differ, plus the one shared opponent-store line). That copy also does 0dc1b96's own post-processing
+ * (its limitBotRaiseWar), and nothing below runs for it (not HAI-4's fold-to-check).
+ *
+ * Differences from live 0dc1b96 that are kept, none a decision: the pre-flop percentile is the baked table
+ * (preflopTable.ts, B10: live built it lazily with Math.random on the first bot decision of each boot, a 7-13 s
+ * freeze); index.ts's crash guards around the bot timer. The fixes for every other variant are untouched.
+ *
+ * The Short Deck code of fix rounds 1-4 (B13's Short Deck equity / pre-flop table on the bots, the sdLiveSpot rules,
+ * NEW-1 on Short Deck, B4/B5/B8/B9, the MANIAC rules, push/fold) is NOT deleted: it is dormant behind this switch,
+ * and the lane's tests still run it through setShortDeckLaneForTests. Turn it back on only after a fresh review.
+ * A code constant on purpose: no env var or config can change it (tests/sdLiveGolden.test.ts pins it).
+ */
+export const SHORT_DECK_BOTS_PLAY_LIVE: boolean = true;
+
+/** Short Deck by the table's variant id, as 0dc1b96 (and the lane's isShortDeck) read it: 'short-deck' (ShortDeckTable). */
+export function isShortDeckBotTable(table: PokerTable): boolean {
+  const variantId: string = (table as any).variantId || 'texas-holdem';
+  return !/omaha/i.test(variantId) && /short|six.?plus|6.?plus/i.test(variantId);
+}
+
+let shortDeckLaneForTests = false;
+/**
+ * TEST-ONLY hook (Jest): true runs the dormant Short Deck lane code (fix rounds 1-4) instead of live 0dc1b96, so its
+ * tests keep pinning it while it is switched off. Throws outside Jest (JEST_WORKER_ID unset): no production path can
+ * turn it on. Reset it to false after use.
+ */
+export function setShortDeckLaneForTests(on: boolean): void {
+  if (!process.env.JEST_WORKER_ID) throw new Error('setShortDeckLaneForTests is a Jest-only hook');
+  shortDeckLaneForTests = on;
+}
+
+/** True when this table's bots play live 0dc1b96 (SHORT_DECK_BOTS_PLAY_LIVE, a Short Deck table, the test hook off). */
+export function shortDeckBotsPlayLive(table: PokerTable): boolean {
+  return SHORT_DECK_BOTS_PLAY_LIVE && !shortDeckLaneForTests && isShortDeckBotTable(table);
+}
+
 export function decideAction(
   table: PokerTable,
   seatIndex: number,
   profile: AIPlayerProfile,
   opts: DecideOptions = {}
 ): AIDecision {
+  // Short Deck reset (SHORT_DECK_BOTS_PLAY_LIVE): live 0dc1b96's whole decision, its own post-processing included.
+  if (shortDeckBotsPlayLive(table)) return live0dc1b96.decideAction(table, seatIndex, profile, opts);
   const d = decideActionForSeat(table, seatIndex, profile, opts);
   // Bots review fix round 2 (HAI-4): a bot never folds when checking is free, on
   // every variant and street. A raised pot can owe nothing (the straddler's
@@ -3453,7 +3500,9 @@ export interface OpponentSessionProfile {
  * nit's tendencies against a maniac. Bounded (least-recently-observed out) —
  * bot ids are new per seating, so the map would otherwise only grow.
  */
-const OPPONENT_PROFILES: Map<string, OpponentSessionProfile> = new Map();
+// 2026-11-12 (Short Deck reset) — the process-wide store (opponentProfileStore.ts), shared with the frozen 0dc1b96
+// copy that plays Short Deck (SHORT_DECK_BOTS_PLAY_LIVE): one Map, as live 0dc1b96 had.
+const OPPONENT_PROFILES: Map<string, OpponentSessionProfile> = OPPONENT_PROFILE_STORE;
 export const OPPONENT_PROFILES_CAP = 5000;
 
 /** R3 (GAME-P3-10) — the opponent-model key of a seat: its playerId (the display name only for a seat without one). */

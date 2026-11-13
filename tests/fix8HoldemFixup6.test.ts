@@ -343,6 +343,10 @@ describe('HOLDEM-F5-REGRESSION-1 whole lines — iso-raise the ROCK\'s limp, fol
 });
 
 describe('re-review 5 P3 — the Short Deck MANIAC reads 0dc1b96\'s Hold\'em percentile (ctx.maniacPctile) facing a raise or an all-in', () => {
+  // 2026-11-12 (Short Deck reset): the lane's Short Deck code is dormant behind SHORT_DECK_BOTS_PLAY_LIVE; this pin runs it
+  // through the Jest-only hook (tests/sdLiveGolden pins the shipped, live behaviour).
+  beforeAll(() => AI.setShortDeckLaneForTests(true));
+  afterAll(() => AI.setShortDeckLaneForTests(false));
   it('Short Deck 100 BB: a MANIAC that isolated a limper continues >= 85% against his shove (96.0%; on the Short Deck percentile 65.5%; 0dc1b96 92.8%)', () => {
     const { ShortDeckTable } = require('../src/game/variants/ShortDeckTable');
     let n = 0, k = 0;

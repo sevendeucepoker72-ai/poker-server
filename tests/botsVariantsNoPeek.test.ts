@@ -10,6 +10,8 @@
  *     as r2AiBots.playBotHands does) with the real clock: 0 throws, 0 stuck hands.
  * GUARD suite: it passes on 0dc1b96 too (the bots never read hidden cards there either);
  * it pins that the new Omaha / Short Deck / Pineapple wiring keeps it that way.
+ * 2026-11-12 (Short Deck reset): 'short-deck' is the shipped path, live 0dc1b96 (SHORT_DECK_BOTS_PLAY_LIVE; its equity is
+ * the frozen copy's calculateEquity, spied too); 'short-deck-lane' runs the dormant lane code through the Jest-only hook.
  */
 import { Card } from '../src/game/Card';
 import { PokerTable, GamePhase, PlayerAction } from '../src/game/PokerTable';
@@ -17,7 +19,8 @@ import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { ShortDeckTable } from '../src/game/variants/ShortDeckTable';
 import { PineappleTable } from '../src/game/variants/PineappleTable';
 import * as TE from '../src/training/TrainingEngine';
-import { decideAction, generateRandomProfile } from '../src/ai/AIPlayer';
+import * as LIVE_TE from '../src/ai/live0dc1b96/TrainingEngine';
+import { decideAction, generateRandomProfile, setShortDeckLaneForTests } from '../src/ai/AIPlayer';
 import { fnSrc, load } from './helpers/indexSource';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const nodeCrypto = require('crypto');
@@ -30,6 +33,7 @@ const MK: Record<string, () => PokerTable> = {
   'omaha-hi-lo': () => new OmahaTable(cfg(), true, 4),
   'omaha-6-hilo': () => new OmahaTable(cfg(), true, 6),
   'short-deck': () => new ShortDeckTable(cfg()),
+  'short-deck-lane': () => new ShortDeckTable(cfg()),   // the dormant lane code (setShortDeckLaneForTests)
   pineapple: () => new PineappleTable(cfg(50), false),
   'crazy-pineapple': () => new PineappleTable(cfg(50), true),
 };
@@ -52,6 +56,12 @@ function steppedDecision<T>(seed: number, fn: () => T): T {
   let clock = 1_700_000_000_000; Date.now = () => (clock += 50);
   try { return fn(); } finally { Math.random = r; Date.now = now; }
 }
+/** Runs fn with the dormant Short Deck lane code on for the 'short-deck-lane' case. */
+function laneIf<T>(v: string, fn: () => T): T {
+  if (v !== 'short-deck-lane') return fn();
+  setShortDeckLaneForTests(true);
+  try { return fn(); } finally { setShortDeckLaneForTests(false); }
+}
 function lcg(seed: number): () => number {
   let s = seed >>> 0;
   return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
@@ -59,8 +69,13 @@ function lcg(seed: number): () => number {
 
 describe('(1) no peeking: opponents\' hidden cards never change a decision', () => {
   afterEach(() => jest.restoreAllMocks());
-  it.each(['omaha-5', 'omaha-6', 'omaha-hi-lo', 'short-deck', 'pineapple', 'crazy-pineapple'])('%s: 40 decision points (pre-flop, flop, turn)', (v) => {
-    const spy = jest.spyOn(TE, 'calculateEquity');
+  it.each(['omaha-5', 'omaha-6', 'omaha-hi-lo', 'short-deck', 'short-deck-lane', 'pineapple', 'crazy-pineapple'])('%s: 40 decision points (pre-flop, flop, turn)', (v) => laneIf(v, () => {
+    // Every calculateEquity call in call order, from either equity module (the shipped Short Deck path reads the frozen copy's).
+    const calls: any[][] = [];
+    const origNew = TE.calculateEquity, origLive = LIVE_TE.calculateEquity;
+    jest.spyOn(TE, 'calculateEquity').mockImplementation((...a: any[]) => { calls.push(['new', ...a]); return (origNew as any)(...a); });
+    jest.spyOn(LIVE_TE, 'calculateEquity').mockImplementation((...a: any[]) => { calls.push(['0dc1b96', ...a]); return (origLive as any)(...a); });
+    const spy = { mock: { calls } };
     let checks = 0;
     for (let k = 0; k < 40; k++) {
       const ready = seededDeal(300 + k, () => {
@@ -84,7 +99,7 @@ describe('(1) no peeking: opponents\' hidden cards never change a decision', () 
       const d0 = steppedDecision(77 + k, () => decideAction(t, me, p));
       const a0 = argsOf(mark);
       // Replace every opponent's hole cards with cards nobody holds and the board does not show.
-      const lo = v === 'short-deck' ? 6 : 2;
+      const lo = v.startsWith('short-deck') ? 6 : 2;
       const used = new Set<number>();
       for (const s of t.seats) for (const c of s.holeCards || []) used.add(c.suit * 16 + c.rank);
       for (const c of t.communityCards) used.add(c.suit * 16 + c.rank);
@@ -108,11 +123,13 @@ describe('(1) no peeking: opponents\' hidden cards never change a decision', () 
       checks++;
     }
     expect(checks).toBeGreaterThanOrEqual(30);
-  }, 120_000);
+    if (v === 'short-deck') expect(calls.some((c) => c[0] === '0dc1b96') && !calls.some((c) => c[0] === 'new')).toBe(true);
+    if (v === 'short-deck-lane') expect(calls.some((c) => c[0] === 'new') && !calls.some((c) => c[0] === '0dc1b96')).toBe(true);
+  }), 120_000);
 });
 
 describe('(2) fuzz: bot-only hands through the real executeAIAction', () => {
-  it.each(['omaha', 'omaha-5', 'omaha-6', 'omaha-hi-lo', 'omaha-6-hilo', 'short-deck', 'pineapple', 'crazy-pineapple'])('%s: 20 hands, 0 throws, 0 stuck', (v) => {
+  it.each(['omaha', 'omaha-5', 'omaha-6', 'omaha-hi-lo', 'omaha-6-hilo', 'short-deck', 'short-deck-lane', 'pineapple', 'crazy-pineapple'])('%s: 20 hands, 0 throws, 0 stuck', (v) => laneIf(v, () => {
     const t = MK[v]();
     const bots = v.startsWith('omaha-6') ? 6 : 5;
     let throws = 0;
@@ -150,5 +167,5 @@ describe('(2) fuzz: bot-only hands through the real executeAIAction', () => {
     expect(decisions).toBeGreaterThan(20);
     expect(throws).toBe(0);
     expect(stuck).toBe(0);
-  }, 120_000);
+  }), 120_000);
 });
