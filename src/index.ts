@@ -16,7 +16,7 @@ import {
   PokerTableSnapshot,
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
-import { parseMasterSchedule, MasterScheduleEntry, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT, QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText, QUALIFIER_HELP_TOOLS_OFF_TEXT } from './game/qualifierSchedule';
+import { parseMasterSchedule, MasterScheduleEntry, qualifierEventConfig, leagueFinishFrameFields, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT, QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText, QUALIFIER_HELP_TOOLS_OFF_TEXT, notQualifiedText, onlineLeagueGivesWeeklyCredits } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
@@ -3496,6 +3496,14 @@ app.get('/api/health', async (_req, res) => {
           // 2026-11-02 (broadcast P1-S6) — voice chat refused at qualifier tables /
           // sockets forced out of voice on landing at one (and the voice_ rooms left).
           voiceOff: { ...qualifierVoiceOff },
+          // 2026-11-21 (Online League, owner) — the free Mon-Sat 6:00 PM league night:
+          // nights opened by the sync, lobby lists that asked for league items, free
+          // entries / re-entries, second re-entries refused, nights cancelled / finished;
+          // listed = league nights in the registry now (not finished).
+          onlineLeague: healthSection('r2Play.qualifiers.onlineLeague', () => ({
+            ...onlineLeagueStats,
+            listed: [...qualifierTournaments.values()].filter((q) => q.kind === 'league' && q.status !== 'finished').length,
+          })),
         },
         quickGames: healthSection('r2Play.quickGames', () => ({ ...quickGameStats, live: quickGames.size })),
         privateTables: { ...privateTableStats },
@@ -3799,6 +3807,19 @@ interface QualifierTournamentReg {
    * before it was screened).
    */
   lastScreenAt?: number;
+  /**
+   * 2026-11-21 (Online League, owner) — 'league' on an Online League night (type
+   * 'online_league'; qualifierEventConfig): free entry (requiresQualifierCredit
+   * false), ONE re-entry (maxReEntries 1), 4:00 PM / 7:00 PM, 10-minute levels.
+   * Absent on every qualifier (its entry is built exactly as before). Its frames
+   * add kind:'league'.
+   */
+  kind?: 'league';
+  /** The master's Online League id / points / prize / min-field switches for this night (refreshed every sync, like seatPackage). League nights only. */
+  leagueId?: string | null;
+  leaguePoints?: boolean | null;
+  leaguePrize?: 'chair_month' | null;
+  leagueAwardsMinField?: number | null;
 }
 
 /** R2 (TOURNEY-3 / AUTH-9) — a registration is the MASTER account's (masterPlayerId), never a login handle / phone / name. */
@@ -3820,6 +3841,14 @@ interface QualifierRegistrant {
 }
 
 const qualifierTournaments = new Map<string, QualifierTournamentReg>();
+/**
+ * 2026-11-21 (Online League, owner) — health r2Play.qualifiers.onlineLeague:
+ * eventsOpened = league nights the schedule sync opened; listRequests = lobby
+ * lists that asked for league items ({kinds:['league']} / ?kinds=league);
+ * entries / reEntries = free entries and re-entries made; reEntryRefused = second
+ * re-entries refused (reentry_limit); cancelled / finished = nights ended.
+ */
+const onlineLeagueStats = { eventsOpened: 0, listRequests: 0, entries: 0, reEntries: 0, reEntryRefused: 0, cancelled: 0, finished: 0 };
 
 // ────────────────────────────────────────────────────────────────────────
 // Qualifier-credit consume/refund over HTTP to the master API.
@@ -3975,7 +4004,12 @@ async function syncQualifierSchedule(): Promise<void> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), QUALIFIER_SYNC_TIMEOUT_MS);
   try {
-    const resp = await fetch(`${base}/qualifiers/schedule`, {
+    // 2026-11-21 (Online League, owner) — `?kinds=league`: the master lists its
+    // 'online_league' nights ONLY to a caller that asks (and only while its
+    // ONLINE_LEAGUE_ENABLED is on). This is the ONLY league request in the fleet:
+    // never remove it (without it every listed league night is cancelled
+    // 'removed_from_schedule'). An older master ignores the parameter.
+    const resp = await fetch(`${base}/qualifiers/schedule?kinds=league`, {
       headers: { 'X-Internal-Token': tok },
       signal: ac.signal,
     });
@@ -3996,6 +4030,11 @@ function applyQualifierSchedule(list: MasterScheduleEntry[], now: number): void 
   for (const q of list) {
     if (q.status !== 'open') continue;
     listed.add(q.id);
+    // 2026-11-21 (Online League, owner) — the event's rules come from its TYPE
+    // (qualifierEventConfig): an 'online_league' night is free (no credit), ONE
+    // re-entry, sign-up 4:00 PM, late entry until 7:00 PM, 10-minute levels. Every
+    // other type: exactly the values (and the registry entry) of before.
+    const cfg = qualifierEventConfig(q.type);
     const existing = qualifierTournaments.get(q.id);
     if (existing) {
       existing.lastSeenInSchedule = now;
@@ -4004,13 +4043,30 @@ function applyQualifierSchedule(list: MasterScheduleEntry[], now: number): void 
       if (existing.status === 'registering' && !existing.tournamentId) {
         existing.scheduledAt = new Date(q.scheduledAt).toISOString();
         existing.qualifierName = q.name;
+        if (existing.qualifierType !== q.type) {
+          // 2026-11-21 — a type change (never expected: the master keeps one row per
+          // night / week) takes that type's entry rules with it, so a free league
+          // entry can never stay free as a qualifier (and the reverse).
+          existing.requiresQualifierCredit = cfg.requiresQualifierCredit;
+          existing.blindStructure = qualifierStructure(QUALIFIER_BASE_STACK, cfg.levelMinutes).levels;
+          if (cfg.maxReEntries != null) existing.maxReEntries = cfg.maxReEntries; else delete existing.maxReEntries;
+          if (cfg.kind === 'league') existing.kind = 'league'; else delete existing.kind;
+        }
         existing.qualifierType = q.type;
         existing.clientQualifierId = q.clientQualifierId;
       }
+      // 2026-11-21 — a league night's fields follow the master on every sync (like the seat package).
+      if (existing.kind === 'league') {
+        existing.leagueId = q.leagueId ?? null;
+        existing.leaguePoints = q.leaguePoints ?? null;
+        existing.leaguePrize = q.leaguePrize ?? null;
+        existing.leagueAwardsMinField = q.leagueAwardsMinField ?? null;
+      }
       continue;
     }
-    // A brand-new event whose late registration already ended is not opened.
-    if (now > qualifierWindows(q.scheduledAt).lateRegUntil) continue;
+    // A brand-new event whose late registration already ended is not opened
+    // (2026-11-21 — by its own window: a league night after 7:00 PM).
+    if (now > qualifierWindows(q.scheduledAt, q.type).lateRegUntil) continue;
     qualifierTournaments.set(q.id, {
       qualifierId: q.id,
       masterQualifierId: q.id,
@@ -4020,16 +4076,29 @@ function applyQualifierSchedule(list: MasterScheduleEntry[], now: number): void 
       scheduledAt: new Date(q.scheduledAt).toISOString(),
       startingStack: QUALIFIER_BASE_STACK,
       maxPlayers: 999,
-      requiresQualifierCredit: true,
+      requiresQualifierCredit: cfg.requiresQualifierCredit,
       players: [],
       status: 'registering',
       tournamentId: null,
-      blindStructure: qualifierStructure(QUALIFIER_BASE_STACK).levels,
+      blindStructure: qualifierStructure(QUALIFIER_BASE_STACK, cfg.levelMinutes).levels,
       lastSeenInSchedule: now,
       finishedAt: null,
       results: null,
       seatPackage: q.seatPackage,
+      // 2026-11-21 — a per-event re-entry cap only when the type sets one (the league: 1).
+      ...(cfg.maxReEntries != null ? { maxReEntries: cfg.maxReEntries } : {}),
+      ...(cfg.kind === 'league' ? {
+        kind: 'league' as const,
+        leagueId: q.leagueId ?? null,
+        leaguePoints: q.leaguePoints ?? null,
+        leaguePrize: q.leaguePrize ?? null,
+        leagueAwardsMinField: q.leagueAwardsMinField ?? null,
+      } : {}),
     });
+    if (cfg.kind === 'league') {
+      onlineLeagueStats.eventsOpened++;
+      console.log(`[QualifierSync] ${JSON.stringify({ event: 'online_league_night_listed', qualifierId: q.id, scheduledAt: new Date(q.scheduledAt).toISOString() })}`);
+    }
   }
   // Taken off the schedule before it started (the master closed / moved it):
   // cancelled — every consumed credit refunded, registrants told.
@@ -4068,9 +4137,14 @@ function qualifierEventFor(qualifierId: unknown): [string, QualifierTournamentRe
 /** R2 (C3) — one qualifier as the lobby shows it, for an asking master account (or none). */
 function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, viewerMasterId: string | null): Record<string, unknown> {
   const at = new Date(qt.scheduledAt).getTime();
-  const w = qualifierWindows(at);
+  // 2026-11-21 (Online League, owner) — the event's rules from its type
+  // (qualifierEventConfig): its windows (a league night: 4:00 PM / 7:00 PM), its
+  // structure (10-minute levels), its kind and whether an entry needs a credit.
+  const cfg = qualifierEventConfig(qt.qualifierType);
+  const isLeague = cfg.kind === 'league';
+  const w = qualifierWindows(at, qt.qualifierType);
   const phase = qt.status === 'finished' ? 'finished' : (qt.status === 'running' || qt.status === 'starting') ? 'running' : 'pending';
-  const status = qualifierStatusOf(phase, at, now);
+  const status = qualifierStatusOf(phase, at, now, qt.qualifierType);
   const mine = viewerMasterId ? qt.players.find((p) => p.masterPlayerId === viewerMasterId) : undefined;
   const myResult = viewerMasterId && qt.results ? qt.results.find((r) => r.masterUserId === viewerMasterId) : undefined;
   // 2026-10-21 — an event with a seat package: seats down to its last place.
@@ -4085,12 +4159,17 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
   // re-entries left (within a cap, if one is ever set). null = anonymous, or the
   // list was never read. The master's atomic consume stays the real gate: a
   // stale count only ever means a refusal, never a free entry.
-  const tierCredits = viewerMasterId ? qualifiedPlayers.get(qt.qualifierType) : undefined;
+  // 2026-11-21 repair round 1 — an event that needs NO credit (an Online
+  // League night) never reads the credit cache: a cached list for its type
+  // (anyone can fill one with GET /api/qualifiers/online_league, and no credit
+  // has that tier, so it is []) made creditsHeld 0 and hid the free re-entry
+  // (reEntriesLeft = min(cap, 0)). null = "not credit-bound": the cap alone.
+  const tierCredits = viewerMasterId && cfg.requiresQualifierCredit ? qualifiedPlayers.get(qt.qualifierType) : undefined;
   const creditsHeld = Array.isArray(tierCredits)
     ? Math.max(0, Math.floor(Number(tierCredits.find((p) => String(p.playerId) === viewerMasterId)?.creditCount) || 0))
     : null;
   const reEntryCap = qt.maxReEntries ?? QUALIFIER_MAX_REENTRIES;
-  const structure = qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK);
+  const structure = qualifierStructure(qt.startingStack || QUALIFIER_BASE_STACK, cfg.levelMinutes);
   // 2026-10-24 (owner 2026-10-23: "Fix both") — late entry + re-entry close at the SEAT
   // BUBBLE or at 2:00 PM, whichever comes first. Read from TournamentManager only (no
   // module helper: the lobby harnesses slice this function alone). lateRegOpen: while
@@ -4153,13 +4232,26 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     // closes late entry / re-entry at the seat bubble (poker-3d's rules page reads it);
     // lateRegOpen / lateRegClosedAt / lateRegClosedReason: the live state (the card stops
     // offering Late Register / Re-enter).
-    lateRegClosesAtBubble: true,
+    // 2026-11-21 — false on an Online League night (no seats: no bubble; 7:00 PM only).
+    lateRegClosesAtBubble: !isLeague,
     // 2026-10-24 (owner 2026-10-23: "Fix both") — additive capability flag: this server keeps a
     // running qualifier's fairness seeds private until it ends (poker-3d's rules page reads it).
     seedsHeldUntilEnd: true,
     lateRegOpen,
     lateRegClosedAt,
     lateRegClosedReason,
+    // 2026-11-21 (Online League, owner) — additive, on EVERY item: kind ('league' = the
+    // free Online League night, else 'qualifier'); requiresCredit (false = free entry: no
+    // credit is checked or consumed, so poker-3d never shows "not qualified" or credit
+    // copy); and the master's league fields for this night (null on a qualifier): its
+    // league id (the standings link), whether points / the winner's chair prize are on,
+    // and the minimum field for the awards (null = 1).
+    kind: cfg.kind,
+    requiresCredit: cfg.requiresQualifierCredit,
+    leagueId: isLeague ? (qt.leagueId ?? null) : null,
+    leaguePoints: isLeague ? (qt.leaguePoints ?? null) : null,
+    leaguePrize: isLeague ? (qt.leaguePrize ?? null) : null,
+    leagueAwardsMinField: isLeague ? (qt.leagueAwardsMinField ?? null) : null,
   };
 }
 
@@ -4170,14 +4262,19 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
  * dealsAt (ISO, the start second); absent otherwise (poker-3d reads absent as
  * false / null). The REST item (/api/qualifier-tournaments/:id) adds the same.
  */
-function qualifierList(viewerMasterId: string | null, now: number = Date.now()): Array<Record<string, unknown>> {
+function qualifierList(viewerMasterId: string | null, now: number = Date.now(), opts: { includeLeague?: boolean } = {}): Array<Record<string, unknown>> {
   return [...qualifierTournaments.entries()]
     .sort((a, b) => new Date(a[1].scheduledAt).getTime() - new Date(b[1].scheduledAt).getTime())
-    .map(([id, qt]) => ({
+    .map(([id, qt]): Record<string, unknown> => ({
       ...qualifierListItem(id, qt, now, viewerMasterId),
       // (Held = the 'prestart' pause, which only the early rooms set.)
       ...((!!qt.tournamentId && tournamentManager.getTournament(qt.tournamentId)?.pauseReason === 'prestart') ? qualifierTablesOpenFields(qt) : {}),
-    }));
+    }))
+    // 2026-11-21 (Online League, owner) — league items ONLY for a caller that asks
+    // (opts.includeLeague: socket {kinds:['league']} / REST ?kinds=league). An older
+    // cached .online lobby would show a FREE league night as a qualifier it is "not
+    // qualified" for, with credit copy.
+    .filter((item) => opts.includeLeague === true || item.kind !== 'league');
 }
 
 /**
@@ -4785,7 +4882,8 @@ app.post('/api/qualifiers/pause', (req, res) => {
 function nextQualifierTableNumber(tournamentId: string, tableIds: readonly string[]): number {
   let used = Math.max(qualifierOverflowTableNumbers.get(tournamentId) || 0, tableIds.length);
   for (const tid of tableIds) {
-    const m = /^Qualifier Table (\d+)$/.exec(tableManager.getTable(tid)?.config.tableName || '');
+    // 2026-11-21 — an Online League night's tables are 'Online League Table N'.
+    const m = /^(?:Qualifier|Online League) Table (\d+)$/.exec(tableManager.getTable(tid)?.config.tableName || '');
     if (m) used = Math.max(used, Number(m[1]));
   }
   qualifierOverflowTableNumbers.set(tournamentId, used + 1);
@@ -4824,8 +4922,9 @@ function openQualifierOverflowTable(qt: QualifierTournamentReg): string | null {
     const blinds = tournamentManager.getCurrentBlinds(tournamentId);
     if (!blinds) throw new Error('no current blind level');
     const number = nextQualifierTableNumber(tournamentId, tournament.tableIds);
+    // 2026-11-21 — named like the event's own tables ('Online League Table N' on a league night).
     tableId = tableManager.createQuickTable(
-      `Qualifier Table ${number}`, 9, blinds.sb, blinds.bb, qt.startingStack || QUALIFIER_BASE_STACK, undefined, blinds.ante,
+      `${qualifierEventConfig(qt.qualifierType).tableLabel} ${number}`, 9, blinds.sb, blinds.bb, qt.startingStack || QUALIFIER_BASE_STACK, undefined, blinds.ante,
     );
     const table = tableManager.getTable(tableId);
     if (!table) throw new Error('created table not found');
@@ -4949,11 +5048,13 @@ function cancelQualifierEvent(qualId: string, qt: QualifierTournamentReg, reason
   qt.cancelled = true;
   qt.finishedAt = Date.now();
   qualifierCancellations.cancelled++;
+  if (qt.kind === 'league') onlineLeagueStats.cancelled++;
   const players = qt.players.slice();
   const tasks = players.map((p) => {
     const hadCredit = !!p.consumedCreditId;
     if (hadCredit) qualifierCancellations.creditsRefunded++;
-    for (const s of socketsOfMaster(p.masterPlayerId)) s.emit('qualifierCancelled', { qualifierId: qualId, reason, creditRefunded: hadCredit });
+    // 2026-11-21 (Online League) — + kind:'league' on a league night (poker-3d: "Online League cancelled", no credit words).
+    for (const s of socketsOfMaster(p.masterPlayerId)) s.emit('qualifierCancelled', { qualifierId: qualId, reason, creditRefunded: hadCredit, ...(qt.kind === 'league' ? { kind: 'league' } : {}) });
     return releaseQualifierRegistration(qualId, qt, p, reason);
   });
   io.emit('qualifierTournamentUpdate', { qualifierId: qualId, status: 'finished', cancelled: true, registeredCount: 0, players: 0 });
@@ -4988,13 +5089,20 @@ function markQualifierFinished(tournamentId: string, data: { results?: Array<{ p
     qt.status = 'finished';
     qt.finishedAt = Date.now();
     qt.results = results;
+    if (qt.kind === 'league') onlineLeagueStats.finished++;
     const publicResults = results.map((r) => ({ place: r.place, playerName: r.playerName, wonSeat: r.wonSeat, seats: r.seats }));
+    // 2026-11-21 (Online League, owner) — a league night's frame adds kind:'league', the
+    // master's league fields (points / prize / min field: poker-3d promises a weekly credit
+    // or the chair prize only when they are on and the field is big enough) and `field`
+    // (the finishers). Absent on every qualifier (its frame is exactly as before).
+    const leagueFields = qt.kind === 'league' ? leagueFinishFrameFields(qt, results.length) : {};
     for (const p of qt.players) {
       const mine = results.find((r) => r.masterUserId && r.masterUserId === p.masterPlayerId);
       for (const s of socketsOfMaster(p.masterPlayerId)) {
         s.emit('qualifierResults', {
           qualifierId: qualId, myResult: mine ? { place: mine.place, wonSeat: mine.wonSeat, seats: mine.seats } : null,
           place: mine?.place ?? null, wonSeat: !!mine?.wonSeat, seatsForTop: seats, seatPackage: qt.seatPackage || null, results: publicResults,
+          ...leagueFields,
         });
       }
     }
@@ -5024,7 +5132,7 @@ function qualifierOfTournament(tournamentId: string): { qualId: string; qt: Qual
 function qualifierLateEntryBubbleOf(tournamentId: string): { closeAtAlive: number; openUntil: number } | null {
   const q = qualifierOfTournament(tournamentId);
   const seatsForTop = q ? seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage ?? null) : 0;
-  const openUntil = q ? qualifierWindows(new Date(q.qt.scheduledAt).getTime()).lateRegUntil : NaN;
+  const openUntil = q ? qualifierWindows(new Date(q.qt.scheduledAt).getTime(), q.qt.qualifierType).lateRegUntil : NaN;
   if (!q || !(Number.isInteger(seatsForTop) && seatsForTop >= 1) || !Number.isFinite(openUntil)) return null;
   return { closeAtAlive: seatsForTop + 1, openUntil };
 }
@@ -5056,7 +5164,7 @@ function noteQualifierLateRegClosedAtBubble(
     const seatsForTop = q ? seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage ?? null) : bubble - 1;
     const atMs = Number(data?.at);
     const closedAt = new Date(Number.isFinite(atMs) && atMs > 0 ? atMs : Date.now()).toISOString();
-    const lateRegUntilMs = q ? qualifierWindows(new Date(q.qt.scheduledAt).getTime()).lateRegUntil : NaN;
+    const lateRegUntilMs = q ? qualifierWindows(new Date(q.qt.scheduledAt).getTime(), q.qt.qualifierType).lateRegUntil : NaN;
     const record = {
       qualifierId: q ? q.qualId : null, tournamentId, alive, seatsForTop, bubble,
       lateRegUntil: Number.isFinite(lateRegUntilMs) ? new Date(lateRegUntilMs).toISOString() : null,
@@ -5333,8 +5441,12 @@ setInterval(() => sweepScheduledClubTables(), 60 * 1000);
 // R2 (C3) — ONLY the qualifiers the master schedule lists (the registry), in
 // the C3 shape; no player names or phones (the socket list adds the asking
 // account's own `registered`).
-app.get('/api/qualifier-tournaments', (_req, res) => {
-  res.json({ success: true, tournaments: qualifierList(null) });
+// 2026-11-21 (Online League, owner) — Online League items only with
+// ?kinds=league (a comma list), like the socket's {kinds:['league']}.
+app.get('/api/qualifier-tournaments', (req, res) => {
+  const includeLeague = String(req.query?.kinds ?? '').split(',').map((k) => k.trim().toLowerCase()).includes('league');
+  if (includeLeague) onlineLeagueStats.listRequests++;
+  res.json({ success: true, tournaments: qualifierList(null, Date.now(), { includeLeague }) });
 });
 
 // REST endpoint: get specific qualifier tournament (by master id or catalog key)
@@ -5363,7 +5475,7 @@ app.get('/api/qualifier-tournaments/:qualifierId', (req, res) => {
  */
 const qualifierNoShows = { released: 0, toldOnSignIn: 0 };
 const QUALIFIER_NO_SHOW_NOTICE_TTL_MS = 24 * 60 * 60 * 1000;
-const qualifierNoShowNotices = new Map<string, Array<{ qualifierId: string; qualifierName: string; lateRegUntil: number; creditRefunded: boolean; at: number }>>();
+const qualifierNoShowNotices = new Map<string, Array<{ qualifierId: string; qualifierName: string; lateRegUntil: number; creditRefunded: boolean; at: number; kind?: 'league' }>>();
 
 /** 2026-10-20 — is this registrant connected right now (the master account; else the registration socket)? */
 function qualifierRegistrantOnline(p: QualifierRegistrant): boolean {
@@ -5375,7 +5487,7 @@ function qualifierRegistrantOnline(p: QualifierRegistrant): boolean {
 function releaseQualifierNoShows(qualId: string, qt: QualifierTournamentReg, absent: QualifierRegistrant[], now: number): void {
   const gone = new Set(absent);
   qt.players = qt.players.filter((p) => !gone.has(p));
-  const lateRegUntil = qualifierWindows(new Date(qt.scheduledAt).getTime()).lateRegUntil;
+  const lateRegUntil = qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil;
   for (const p of absent) {
     qualifierNoShows.released++;
     const creditRefunded = !!p.consumedCreditId || (p.reentryCreditIds || []).length > 0;
@@ -5387,7 +5499,8 @@ function releaseQualifierNoShows(qualId: string, qt: QualifierTournamentReg, abs
     if (p.masterPlayerId) {
       const list = (qualifierNoShowNotices.get(p.masterPlayerId) || [])
         .filter((n) => now - n.at < QUALIFIER_NO_SHOW_NOTICE_TTL_MS && n.qualifierId !== qualId);
-      list.push({ qualifierId: qualId, qualifierName: qt.qualifierName, lateRegUntil, creditRefunded, at: now });
+      // 2026-11-21 — kind:'league' on a league night (its sign-in notice says so).
+      list.push({ qualifierId: qualId, qualifierName: qt.qualifierName, lateRegUntil, creditRefunded, at: now, ...(qt.kind === 'league' ? { kind: 'league' as const } : {}) });
       qualifierNoShowNotices.set(p.masterPlayerId, list);
     }
   }
@@ -5418,6 +5531,7 @@ function tellQualifierNoShowReleases(socket: Socket, auth: SocketAuthSession, vi
       socket.emit('qualifierCancelled', {
         qualifierId: n.qualifierId, reason: 'absent_at_start', qualifierName: n.qualifierName,
         lateRegUntil: new Date(n.lateRegUntil).toISOString(), lateRegOpen: now < n.lateRegUntil && !closedAtBubble, creditRefunded: n.creditRefunded,
+        ...(n.kind === 'league' ? { kind: 'league' } : {}),
       });
       told++;
     }
@@ -5495,7 +5609,8 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
     // registration ends — as with fewer than 2 registered.
     const { present, absent } = partitionByPresence(qt.players, now);
     if (present.length < 2) {
-      if (now > qualifierWindows(scheduledTime).lateRegUntil) void cancelQualifierEvent(qualId, qt, 'too_few_players');
+      // 2026-11-21 — at the event's own late close (a league night: 7:00 PM).
+      if (now > qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil) void cancelQualifierEvent(qualId, qt, 'too_few_players');
       continue;
     }
     if (absent.length > 0) releaseQualifierNoShows(qualId, qt, absent, now);
@@ -5516,7 +5631,8 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
 
     // Real players only — no AI fill
     const playerCount = qt.players.length;
-    const result = startQualifierTournament(humanPlayers, qt.startingStack || 50000, turbo);
+    // 2026-11-21 — the event's type names it and sets its level length (qualifierEventConfig).
+    const result = startQualifierTournament(humanPlayers, qt.startingStack || 50000, turbo, { eventType: qt.qualifierType });
 
     if (result) {
       qt.status = 'running';
@@ -5841,7 +5957,7 @@ function openQualifierTablesEarly(qualId: string, qt: QualifierTournamentReg, sc
     id: p.playerId, name: p.playerName, socketId: p.socketId, masterId: p.masterPlayerId || null,
   }));
   const tableCount = Math.max(1, Math.ceil(qt.players.length / 9));
-  const result = startQualifierTournament(humanPlayers, qt.startingStack || 50000, false, { tableCount, hold: true });
+  const result = startQualifierTournament(humanPlayers, qt.startingStack || 50000, false, { tableCount, hold: true, eventType: qt.qualifierType });
   if (!result) {
     qt.status = 'registering';   // the old path runs at the start second
     console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_tables_open_failed', qualifierId: qualId, online: online.length })}`);
@@ -6190,7 +6306,7 @@ function preStartDealMustWait(tournamentId: string, hold: QualifierPreStartHold,
   }
   if (present >= 2) return false;
   if (hold.timer) { clearTimeout(hold.timer); hold.timer = null; }
-  if (now > qualifierWindows(new Date(qt.scheduledAt).getTime()).lateRegUntil) {
+  if (now > qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil) {
     try {
       cancelHeldQualifierEvent(hold.qualId, qt, tournamentId, 'too_few_players');
     } catch (e: any) {
@@ -6243,7 +6359,7 @@ function seatPresentPendingAtDeal(qualId: string, qt: QualifierTournamentReg, re
   qualifierPreStart.seatFailures++;
   qt.players = qt.players.filter((p) => p !== reg);
   const creditRefunded = !!reg.consumedCreditId;
-  for (const s of qualifierRegistrantSockets(reg)) s.emit('qualifierCancelled', { qualifierId: qualId, reason: 'no_seat', creditRefunded });
+  for (const s of qualifierRegistrantSockets(reg)) s.emit('qualifierCancelled', { qualifierId: qualId, reason: 'no_seat', creditRefunded, ...(qt.kind === 'league' ? { kind: 'league' } : {}) });
   void releaseQualifierRegistration(qualId, qt, reg, 'no_seat');
   console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_no_seat_released', qualifierId: qualId, tournamentId })}`);
   return false;
@@ -14985,6 +15101,11 @@ io.on('connection', (socket: Socket) => {
       return;
     }
     const [qualId, qt] = found;
+    // 2026-11-21 (Online League, owner) — the event's rules from its type: an Online
+    // League night is FREE (qt.requiresQualifierCredit false: no qualification check,
+    // no credit consumed or refunded), ONE re-entry (qt.maxReEntries 1), sign-up 4:00
+    // PM, late entry + the re-entry until 7:00 PM; its refusals name it.
+    const qCfg = qualifierEventConfig(qt.qualifierType);
     const refuseQualifier = (code: string, error: string, extra: Record<string, unknown> = {}) =>
       socket.emit('qualifierRegistrationResult', { success: false, code, error, qualifierId: qualId, ...extra });
     // 2026-11-02 (broadcast P2-S4, owner rules text: "Streamers and commentators may not
@@ -15011,9 +15132,10 @@ io.on('connection', (socket: Socket) => {
     // (2026-10-22 owner: 3 hours, 11:00 AM start → 2:00 PM Denver; was 90 min).
     const scheduledTime = new Date(qt.scheduledAt).getTime();
     const now = Date.now();
-    const windows = qualifierWindows(scheduledTime);
+    // 2026-11-21 — the event's own windows (a league night: 4:00 PM / 7:00 PM).
+    const windows = qualifierWindows(scheduledTime, qt.qualifierType);
     if (qt.status === 'finished') {
-      refuseQualifier('registration_closed', qt.cancelled ? 'This qualifier was cancelled.' : 'This qualifier has finished.');
+      refuseQualifier('registration_closed', qt.cancelled ? `This ${qCfg.noun} was cancelled.` : `This ${qCfg.noun} has finished.`);
       return;
     }
     if (now < windows.signupOpensAt) {
@@ -15083,8 +15205,14 @@ io.on('connection', (socket: Socket) => {
     // Now require a credit of this tier (read-only check keyed on the master id).
     // Placed before BOTH the re-entry and first-entry branches so it covers all
     // entry paths.
-    if (!(await isPlayerQualified(masterId, qt.qualifierType))) {
-      refuseQualifier('not_qualified', `You need a ${qt.qualifierType} qualifier credit to enter. Earn one by finishing top-5 in a live game (weekly) or finishing top-20% of your league standings (monthly).`);
+    // 2026-11-21 (Online League, owner) — a FREE event (requiresQualifierCredit
+    // false: the Online League) has no credit gate. Every qualifier keeps it (an
+    // entry without the flag set is gated, as before).
+    if (qt.requiresQualifierCredit !== false && !(await isPlayerQualified(masterId, qt.qualifierType))) {
+      // 2026-11-21 repair round 2 — the text never names the hidden monthly any
+      // more, and the weekly's names the Online League's top-5 route while a
+      // league night that gives credits is listed (notQualifiedText).
+      refuseQualifier('not_qualified', notQualifiedText(qt.qualifierType, onlineLeagueGivesWeeklyCredits(qualifierTournaments.values())));
       return;
     }
 
@@ -15119,6 +15247,7 @@ io.on('connection', (socket: Socket) => {
         const maxReEntries = qt.maxReEntries ?? QUALIFIER_MAX_REENTRIES;
         const priorReEntries = (existingEntry as any).reEntries || 0;
         if (typeof maxReEntries === 'number' && priorReEntries >= maxReEntries) {
+          if (qt.kind === 'league') onlineLeagueStats.reEntryRefused++;   // 2026-11-21 — the Online League's ONE re-entry is used
           refuseQualifier('reentry_limit', `Re-entry limit reached (${maxReEntries})`);
           return;
         }
@@ -15315,6 +15444,7 @@ io.on('connection', (socket: Socket) => {
         // call's awaits; the check above (a) used the count from before them.
         if (typeof maxReEntries === 'number' && (existingEntry.reEntries || 0) >= maxReEntries) {
           await refundQualifierReentryCharges(auth.userId, auth.username, qualId, buyIn, consumedCreditId, 'reentry_limit');
+          if (qt.kind === 'league') onlineLeagueStats.reEntryRefused++;
           refuseQualifier('reentry_limit', `Re-entry limit reached (${maxReEntries})`);
           return;
         }
@@ -15419,7 +15549,14 @@ io.on('connection', (socket: Socket) => {
           }
           // 2026-10-20 — say the credit came back (it did, just above), and a
           // code the lobby can match, like a first entry's no_seat.
-          socket.emit('qualifierRegistrationResult', { success: false, code: 'no_seat', qualifierId: qualId, error: 'No seat is free for a re-entry right now — your qualifier credit was returned. Try again in a minute.' });
+          // 2026-11-21 (Online League) — a re-entry that consumed NO credit (the free
+          // league) says nothing about one.
+          socket.emit('qualifierRegistrationResult', {
+            success: false, code: 'no_seat', qualifierId: qualId,
+            error: consumedCreditId
+              ? 'No seat is free for a re-entry right now — your qualifier credit was returned. Try again in a minute.'
+              : 'No seat is free for a re-entry right now. Try again in a minute.',
+          });
           return;
         }
         // Bump in-memory re-entry counter — survives until the qt is
@@ -15428,6 +15565,7 @@ io.on('connection', (socket: Socket) => {
         // awaits counts too), not the value read before them.
         existingEntry.reEntries = (existingEntry.reEntries || 0) + 1;
         if (consumedCreditId) (existingEntry.reentryCreditIds ||= []).push(consumedCreditId);   // R2 — refundable by the shutdown flush
+        if (qt.kind === 'league') onlineLeagueStats.reEntries++;   // 2026-11-21 — the Online League's free re-entry
         // R2 — the table he now sits at (it used to broadcast the FIRST table, wherever he was seated).
         const reentryTableId = playerSessions.get(socket.id)?.tableId || tournament.tableIds[0];
         // 2026-10-22 — additive: overflowTable (+ waitingForPlayers while he sits there alone).
@@ -15578,13 +15716,17 @@ io.on('connection', (socket: Socket) => {
       if (!seat) seat = seatQualifierLateEntrantOnOverflowTable(socket, qt, registrant);
       if (!seat) {
         if (entryCreditId) await refundQualifierEntryCredit(auth.username, qualId, entryCreditId, 'no_seat');
-        refuseQualifier('no_seat', 'No seat is free in this qualifier right now — your qualifier credit was returned.');
+        // 2026-11-21 (Online League) — an entry that consumed NO credit (the free league) says nothing about one.
+        refuseQualifier('no_seat', entryCreditId
+          ? 'No seat is free in this qualifier right now — your qualifier credit was returned.'
+          : 'No seat is free right now. Try again in a minute.');
         return;
       }
       qt.players.push(registrant);
       persistQualifierRegistration(qt, masterId);
       progressionManager.getOrCreateProgress(registrant.playerId, registrant.playerName, auth.userId);
       qualifierLateEntries.seated++;
+      if (qt.kind === 'league') onlineLeagueStats.entries++;   // 2026-11-21 — a free Online League late entry
       // 2026-10-22 — additive: overflowTable (+ waitingForPlayers while he sits there alone).
       const lateSeatFlags = qualifierOverflowSeatFlags(seat.tableId);
       // 2026-10-23 (S4) — registered while the early rooms hold the first deal:
@@ -15613,6 +15755,7 @@ io.on('connection', (socket: Socket) => {
     }
 
     qt.players.push(registrant);
+    if (qt.kind === 'league') onlineLeagueStats.entries++;   // 2026-11-21 — a free Online League entry
     // Persist to master DB (the master's registration row for this event).
     persistQualifierRegistration(qt, masterId);
     // TOURNEY-10 — his progression entry exists before his first qualifier hand.
@@ -15678,10 +15821,19 @@ io.on('connection', (socket: Socket) => {
   // R2 (C3) — ONLY the events the master schedule lists, in the C3 shape, with
   // `registered` for the ASKING account (the lobby recognises its own
   // registration after a reload) — never other players' names.
-  socket.on('getQualifierTournaments', async () => {
+  // 2026-11-21 (Online League, owner) — Online League items only for a lobby that
+  // asks ({kinds:['league']}: poker-3d QUALIFIER_LIST_REQUEST). An older cached
+  // .online lobby (a bare emit) never gets one: it would show a FREE league night as
+  // a qualifier it is "not qualified" for. The DEFAULT parameter keeps the
+  // listener's length at 0, so socketGuard never payload-checks it (a bare emit
+  // still answers); a null / non-object payload simply asks for no league item.
+  socket.on('getQualifierTournaments', async (data: { kinds?: unknown } = {}) => {
     const auth = authSessions.get(socket.id);
     const viewerMasterId = auth ? (String(auth.masterUserId || auth.statsMasterUserId || '') || null) : null;
-    socket.emit('qualifierTournamentList', qualifierList(viewerMasterId));
+    const kinds = data?.kinds;
+    const includeLeague = Array.isArray(kinds) && kinds.includes('league');
+    if (includeLeague) onlineLeagueStats.listRequests++;
+    socket.emit('qualifierTournamentList', qualifierList(viewerMasterId, Date.now(), { includeLeague }));
   });
 
   // ========== Tournament Spectator Mode ==========
@@ -26388,6 +26540,10 @@ function emitTournamentFinishedToEntrants(tournamentId: string, roomTableIds: st
     }
   } else {
     const common = { isQualifier: true, qualifierId: q.qualId, seatsForTop: seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage), seatPackage: q.qt.seatPackage || null };
+    // 2026-11-21 (Online League) — + kind:'league', the league fields and `field` on a
+    // league night (markQualifierFinished ran first: qt.results = the finishers). A
+    // qualifier's frame is unchanged.
+    if (q.qt.kind === 'league') Object.assign(common, leagueFinishFrameFields(q.qt, q.qt.results?.length ?? 0));
     for (const [sid, sock] of io.sockets.sockets) {
       if (!sock || !rooms.some((r) => sock.rooms?.has(r))) continue;
       const mine = qualifierResultOf(q.qt, authSessions.get(sid));
@@ -27544,7 +27700,11 @@ function startQualifierTournament(
   // seated); `hold`: the tournament is held ('prestart' pause) right after its
   // start and NO table is dealt (runPreStartDeal deals at the start second).
   // Defaults: the start of before (ceil(n / 9) tables, dealt at once).
-  opts: { tableCount?: number; hold?: boolean } = {},
+  // 2026-11-21 (Online League, owner) — `eventType`: the event's qualifierType;
+  // qualifierEventConfig names the tournament and its tables and sets the level
+  // length ('online_league': 'Online League', 'Online League Table N', 10-minute
+  // levels). Absent / any qualifier type: exactly as before.
+  opts: { tableCount?: number; hold?: boolean; eventType?: string } = {},
 ): { tournamentId: string; tableIds: string[]; tableCount: number } | null {
   if (players.length < 2) return null;
   const seatsPerTable = 9;
@@ -27553,9 +27713,10 @@ function startQualifierTournament(
   // 2026-10-23 (qualifier lifecycle S3) — the RIG-ONLY time scale (always 1 on
   // Railway / NODE_ENV=production): divides the engine's level and break lengths.
   const timeScale = qualifierTestTimeScale(process.env);
+  const eventCfg = qualifierEventConfig(opts.eventType);
 
   const tournamentId = tournamentManager.createTournament({
-    name: 'Qualifier Tournament',
+    name: eventCfg.tournamentName,
     buyIn: 0,
     prizePool: 0,
     maxPlayers: players.length,
@@ -27563,7 +27724,7 @@ function startQualifierTournament(
     // R2 (TOURNEY-13 / C3) — the structure the lobby is shown (qualifierStructure):
     // the advertised 20-minute levels scaled to the real stack, continued until
     // it must end. It ran 10/20 blinds on a 50,000 stack — a qualifier that never ended.
-    blindLevels: qualifierBlindLevels(startingStack, timeScale),
+    blindLevels: qualifierBlindLevels(startingStack, timeScale, eventCfg.levelMinutes),
     startingChips: startingStack,
     // S3 (owner: "take breaks") — a 5-minute break after every 5th level
     // (qualifierBreakConfig; switch: tournamentManager.breaksEnabled).
@@ -27600,7 +27761,7 @@ function startQualifierTournament(
 
   for (let t = 0; t < tableCount; t++) {
     const tid = tableManager.createQuickTable(
-      `Qualifier Table ${t + 1}`,
+      `${eventCfg.tableLabel} ${t + 1}`,
       seatsPerTable,
       blinds.sb,
       blinds.bb,
@@ -30326,7 +30487,7 @@ function handForHandInputs(tournamentId: string): {
   return {
     qualifierId: q.qualId,
     now: Date.now(),
-    lateRegUntil: qualifierWindows(scheduledAt).lateRegUntil,
+    lateRegUntil: qualifierWindows(scheduledAt, q.qt.qualifierType).lateRegUntil,
     alive: tournamentManager.getAliveCount(tournamentId),
     seatsForTop: seatsForTopWith(q.qt.qualifierType, q.qt.seatPackage ?? null),
     tablesInPlay: handForHandTablesInPlay(tournamentId).length,
@@ -32033,7 +32194,8 @@ function claimQuickAndQualifierRefundsForShutdown(entryFees: LedgerCredit[]): Pr
       if (upcoming || heldPreStart || noEntrant) {
         const creditRefunded = !!p.consumedCreditId;
         try {
-          for (const s of socketsOfMaster(p.masterPlayerId)) s.emit('qualifierCancelled', { qualifierId: qualId, reason: 'server_restart', creditRefunded });
+          // 2026-11-21 — + kind:'league' on an Online League night (the next instance re-opens it EMPTY before 7:00 PM).
+          for (const s of socketsOfMaster(p.masterPlayerId)) s.emit('qualifierCancelled', { qualifierId: qualId, reason: 'server_restart', creditRefunded, ...(qt.kind === 'league' ? { kind: 'league' } : {}) });
           shutdownFlushStats.qualifierRegistrantsTold++;
         } catch { /* the sockets are going anyway */ }
       }

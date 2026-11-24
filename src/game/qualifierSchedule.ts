@@ -22,7 +22,131 @@ export interface MasterScheduleEntry {
   status: string;
   /** 2026-10-21 — the event's championship SEAT PACKAGE ({place: seats}); null = the standard award. */
   seatPackage: Record<number, number> | null;
+  /**
+   * 2026-11-21 (Online League, owner) — 'league' for an 'online_league' night, else
+   * 'qualifier'. From the TYPE only (never the item's own `kind`).
+   */
+  kind: 'qualifier' | 'league';
+  /** The Online League's id on the master (league nights only; null otherwise / unusable). */
+  leagueId: string | null;
+  /** The master's ONLINE_LEAGUE_POINTS switch for this night (league nights only; null = not said). */
+  leaguePoints: boolean | null;
+  /** 'chair_month' while the master's ONLINE_LEAGUE_PRIZES is on (league nights only); else null. */
+  leaguePrize: 'chair_month' | null;
+  /** The master's ONLINE_LEAGUE_MIN_FIELD (an integer >= 1; league nights only; null = not said = 1). */
+  leagueAwardsMinField: number | null;
 }
+
+/**
+ * 2026-11-21 (owner decisions, binding) — the ONLINE LEAGUE on .online: a FREE
+ * No-Limit Hold'em tournament every Monday to Saturday at 6:00 PM America/Denver
+ * (the master's online_qualifiers type 'online_league', one row per night). The
+ * master lists those rows ONLY to a caller that asks (GET
+ * /qualifiers/schedule?kinds=league, index.ts syncQualifierSchedule).
+ */
+export const ONLINE_LEAGUE_TYPE = 'online_league';
+
+/**
+ * 2026-11-21 — the rules an online event runs by, from its TYPE. The ONE place
+ * they live (qualifierEventConfig): every existing type keeps today's exact
+ * values; the Online League is free (no qualifier credit checked or consumed),
+ * ONE re-entry, sign-up from 4:00 PM, late entry and the re-entry until 7:00 PM,
+ * 10-minute levels.
+ */
+export interface QualifierEventConfig {
+  kind: 'qualifier' | 'league';
+  /** false = free entry: no qualifier-credit gate, nothing consumed / refunded. */
+  requiresQualifierCredit: boolean;
+  /** Re-entries per entrant (null = no cap: for a qualifier, his credits are the limit). */
+  maxReEntries: number | null;
+  /** Sign-up opens this long before the start. */
+  signupOpensBeforeMs: number;
+  /** Late entry AND re-entry close this long after the start (also the too-few-players cancel). */
+  lateRegMs: number;
+  /** Every blind level's length (minutes). */
+  levelMinutes: number;
+  /** The engine tournament's name (frames, the seat-kept notice). */
+  tournamentName: string;
+  /** Its tables are '<tableLabel> N' (overflow tables too). */
+  tableLabel: string;
+  /** What a refusal calls it ('This <noun> has finished.'). */
+  noun: string;
+}
+
+/** Online League sign-up: 2 hours before the 6:00 PM start = 4:00 PM MT (owner 2026-11-21). */
+export const ONLINE_LEAGUE_SIGNUP_OPENS_BEFORE_MS = 2 * 60 * 60 * 1000;
+/** Online League late entry + the re-entry: until 1 hour after the start = 7:00 PM MT (owner 2026-11-21). */
+export const ONLINE_LEAGUE_LATE_REG_MS = 60 * 60 * 1000;
+/** Online League levels: 10 minutes (owner 2026-11-21). Breaks are the weekly's: 5 minutes after every 5th level. */
+export const ONLINE_LEAGUE_LEVEL_MINUTES = 10;
+/** Online League: ONE re-entry per player (owner 2026-11-21). */
+export const ONLINE_LEAGUE_MAX_REENTRIES = 1;
+
+/**
+ * The rules of an online event of `type` (see QualifierEventConfig). Anything
+ * that is not exactly 'online_league' — weekly, monthly, console_*, toc, yearly,
+ * unknown, missing — answers today's qualifier values. Frozen objects.
+ */
+export function qualifierEventConfig(type: unknown): Readonly<QualifierEventConfig> {
+  // (The two frozen configs are declared below QUALIFIER_LEVEL_MINUTES: they read the constants above it.)
+  return type === ONLINE_LEAGUE_TYPE ? ONLINE_LEAGUE_EVENT_CONFIG : STANDARD_QUALIFIER_EVENT_CONFIG;
+}
+
+/** An online event's registry entry (or anything with its type) is an Online League night. */
+export function isLeagueEvent(qt: { qualifierType?: unknown } | null | undefined): boolean {
+  return qualifierEventConfig(qt?.qualifierType).kind === 'league';
+}
+
+/**
+ * 2026-11-21 repair round 2 — the not_qualified refusal a credit-gated event
+ * answers a player with no credit of its tier (poker-3d shows it as is).
+ * Monthly qualifiers are OFF and hidden (owner: never show a monthly), so it
+ * never names the monthly route any more ("... or finishing top-20% of your
+ * league standings (monthly)"); a monthly-tier event (never listed while
+ * hidden) gets a plain sentence. The WEEKLY also names the Online League route
+ * (owner: the top 5 each night earn a weekly credit) while a league night that
+ * gives credits is listed (`onlineLeagueCredits`: the master lists one only
+ * while ONLINE_LEAGUE_ENABLED is on, and the credits ride on its points).
+ */
+export function notQualifiedText(qualifierType: unknown, onlineLeagueCredits: boolean): string {
+  const t = String(qualifierType ?? '');
+  if (/monthly/i.test(t)) return 'You need a qualifier credit to enter this event.';
+  const league = onlineLeagueCredits && t === 'weekly' ? ' or in a nightly Online League game on americanpubpoker.online' : '';
+  return `You need a ${t} qualifier credit to enter. Earn one by finishing top-5 in a live game${league}.`;
+}
+
+/** Does the registry hold an Online League night that gives weekly credits (its points are on)? */
+export function onlineLeagueGivesWeeklyCredits(entries: Iterable<{ qualifierType?: unknown; leaguePoints?: boolean | null }>): boolean {
+  for (const x of entries) {
+    if (isLeagueEvent(x) && x.leaguePoints === true) return true;
+  }
+  return false;
+}
+
+/**
+ * 2026-11-21 — what a FINISH frame (qualifierResults, the per-socket
+ * tournamentFinished) adds on an Online League night: kind:'league', the master's
+ * league fields for the night and `field` (the finishers, disqualified left out),
+ * so poker-3d promises a weekly qualifier credit / the chair prize only when the
+ * master said they are on and the field is big enough. {} on any qualifier.
+ */
+export function leagueFinishFrameFields(
+  qt: { qualifierType?: unknown; leagueId?: string | null; leaguePoints?: boolean | null; leaguePrize?: string | null; leagueAwardsMinField?: number | null } | null | undefined,
+  field: number,
+): Record<string, unknown> {
+  if (!qt || !isLeagueEvent(qt)) return {};
+  return {
+    kind: 'league',
+    leagueId: qt.leagueId ?? null,
+    leaguePoints: qt.leaguePoints ?? null,
+    leaguePrize: qt.leaguePrize ?? null,
+    leagueAwardsMinField: qt.leagueAwardsMinField ?? null,
+    field: Number.isInteger(field) && field >= 0 ? field : 0,
+  };
+}
+
+/** The master's league id: 32-36 hex / hyphen characters (a hyphen-less id is accepted; the master canonicalises). */
+const LEAGUE_ID_RE = /^[0-9a-f-]{32,36}$/i;
 
 /**
  * 2026-10-21 (owner: "1st gets 3 seats, 2nd thru 4th get 2 seats and 5th
@@ -75,6 +199,10 @@ export function parseMasterSchedule(body: unknown): MasterScheduleEntry[] {
     const at = typeof r.scheduledAt === 'string' || typeof r.scheduledAt === 'number' ? new Date(r.scheduledAt as any).getTime() : NaN;
     if (!id || !Number.isFinite(at)) continue;
     const type = typeof r.type === 'string' && r.type ? r.type : 'weekly';
+    // 2026-11-21 (Online League) — additive. kind from the TYPE; the league fields only on
+    // a league night (a qualifier never carries them); unusable values → null.
+    const league = qualifierEventConfig(type).kind === 'league';
+    const minField = r.leagueAwardsMinField;
     out.push({
       id,
       name: typeof r.name === 'string' && r.name ? r.name.slice(0, 80) : 'Qualifier',
@@ -83,6 +211,11 @@ export function parseMasterSchedule(body: unknown): MasterScheduleEntry[] {
       scheduledAt: at,
       status: typeof r.status === 'string' ? r.status : 'open',
       seatPackage: parseSeatPackage(r.seatPackage),
+      kind: league ? 'league' : 'qualifier',
+      leagueId: league && typeof r.leagueId === 'string' && LEAGUE_ID_RE.test(r.leagueId) ? r.leagueId : null,
+      leaguePoints: league && typeof r.leaguePoints === 'boolean' ? r.leaguePoints : null,
+      leaguePrize: league && r.leaguePrize === 'chair_month' ? 'chair_month' : null,
+      leagueAwardsMinField: league && typeof minField === 'number' && Number.isInteger(minField) && minField >= 1 && minField <= 100_000 ? minField : null,
     });
   }
   return out;
@@ -97,6 +230,9 @@ export function parseMasterSchedule(body: unknown): MasterScheduleEntry[] {
  * constant: the register window, the late seat, the re-entry window, the
  * too-few-players cancel, the no-show notice and the lobby's lateRegUntil /
  * signupClosesAt all follow it. Owner-correctable here.
+ * 2026-11-21 — for every QUALIFIER type; the Online League has its own
+ * (ONLINE_LEAGUE_SIGNUP_OPENS_BEFORE_MS / ONLINE_LEAGUE_LATE_REG_MS, through
+ * qualifierEventConfig).
  */
 export const QUALIFIER_SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000;
 export const QUALIFIER_LATE_REG_MS = 180 * 60 * 1000;
@@ -227,22 +363,28 @@ export function qualifierReEntriesLeft(creditsHeld: number | null, cap: number |
   return capLeft === null ? held : Math.min(capLeft, held);
 }
 
-export function qualifierWindows(scheduledAt: number): { signupOpensAt: number; signupClosesAt: number; lateRegUntil: number } {
+/**
+ * 2026-11-21 (Online League) — `type` (the event's qualifierType): its own windows
+ * (qualifierEventConfig). No type / any qualifier type = today's 3 h / 3 h, byte for
+ * byte; 'online_league' = sign-up 2 h before (4:00 PM), closes 60 min after (7:00 PM).
+ */
+export function qualifierWindows(scheduledAt: number, type?: unknown): { signupOpensAt: number; signupClosesAt: number; lateRegUntil: number } {
+  const cfg = qualifierEventConfig(type);
   return {
-    signupOpensAt: scheduledAt - QUALIFIER_SIGNUP_OPENS_BEFORE_MS,
-    signupClosesAt: scheduledAt + QUALIFIER_LATE_REG_MS,
-    lateRegUntil: scheduledAt + QUALIFIER_LATE_REG_MS,
+    signupOpensAt: scheduledAt - cfg.signupOpensBeforeMs,
+    signupClosesAt: scheduledAt + cfg.lateRegMs,
+    lateRegUntil: scheduledAt + cfg.lateRegMs,
   };
 }
 
 export type QualifierPhase = 'pending' | 'running' | 'finished';
 export type QualifierStatus = 'scheduled' | 'registering' | 'running' | 'finished';
 
-/** C3 status: before signup opens 'scheduled'; then 'registering' until it starts; 'running'; 'finished' (incl. cancelled). */
-export function qualifierStatusOf(phase: QualifierPhase, scheduledAt: number, now: number): QualifierStatus {
+/** C3 status: before signup opens 'scheduled'; then 'registering' until it starts; 'running'; 'finished' (incl. cancelled). 2026-11-21 — `type`: its sign-up window. */
+export function qualifierStatusOf(phase: QualifierPhase, scheduledAt: number, now: number, type?: unknown): QualifierStatus {
   if (phase === 'finished') return 'finished';
   if (phase === 'running') return 'running';
-  return now < qualifierWindows(scheduledAt).signupOpensAt ? 'scheduled' : 'registering';
+  return now < qualifierWindows(scheduledAt, type).signupOpensAt ? 'scheduled' : 'registering';
 }
 
 /** Championship seats the master awards from a finish (its recordQualifierResults rules). */
@@ -286,7 +428,37 @@ export const QUALIFIER_LEVEL_MINUTES = 12;
 export const QUALIFIER_BREAK_EVERY_LEVELS = 5;
 export const QUALIFIER_BREAK_MINUTES = 5;
 
-export function qualifierStructure(startingStack: number = QUALIFIER_BASE_STACK): {
+/** 2026-11-21 — the two event configs (qualifierEventConfig): every qualifier type, and the Online League. */
+const STANDARD_QUALIFIER_EVENT_CONFIG: Readonly<QualifierEventConfig> = Object.freeze({
+  kind: 'qualifier',
+  requiresQualifierCredit: true,
+  maxReEntries: QUALIFIER_MAX_REENTRIES,
+  signupOpensBeforeMs: QUALIFIER_SIGNUP_OPENS_BEFORE_MS,
+  lateRegMs: QUALIFIER_LATE_REG_MS,
+  levelMinutes: QUALIFIER_LEVEL_MINUTES,
+  tournamentName: 'Qualifier Tournament',
+  tableLabel: 'Qualifier Table',
+  noun: 'qualifier',
+});
+const ONLINE_LEAGUE_EVENT_CONFIG: Readonly<QualifierEventConfig> = Object.freeze({
+  kind: 'league',
+  requiresQualifierCredit: false,
+  maxReEntries: ONLINE_LEAGUE_MAX_REENTRIES,
+  signupOpensBeforeMs: ONLINE_LEAGUE_SIGNUP_OPENS_BEFORE_MS,
+  lateRegMs: ONLINE_LEAGUE_LATE_REG_MS,
+  levelMinutes: ONLINE_LEAGUE_LEVEL_MINUTES,
+  tournamentName: 'Online League',
+  tableLabel: 'Online League Table',
+  noun: 'Online League game',
+});
+
+/** A level length as the structure uses it: a finite number > 0, else the qualifier's 12 minutes. */
+function levelMinutesOf(levelMinutes: unknown): number {
+  return typeof levelMinutes === 'number' && Number.isFinite(levelMinutes) && levelMinutes > 0 ? levelMinutes : QUALIFIER_LEVEL_MINUTES;
+}
+
+/** 2026-11-21 — `levelMinutes`: the event's level length (qualifierEventConfig; the Online League's 10). Default = today's 12. */
+export function qualifierStructure(startingStack: number = QUALIFIER_BASE_STACK, levelMinutes: number = QUALIFIER_LEVEL_MINUTES): {
   startingStack: number;
   levels: Array<{ sb: number; bb: number; ante: number; minutes: number }>;
   breaks: { everyLevels: number; minutes: number };
@@ -294,9 +466,10 @@ export function qualifierStructure(startingStack: number = QUALIFIER_BASE_STACK)
   const stack = Number.isFinite(startingStack) && startingStack > 0 ? Math.floor(startingStack) : QUALIFIER_BASE_STACK;
   const k = stack / QUALIFIER_BASE_STACK;
   const scale = (n: number) => (n <= 0 ? 0 : Math.max(1, Math.round(n * k)));
+  const minutes = levelMinutesOf(levelMinutes);
   const levels = [...ADVERTISED, ...CONTINUATION].map(([sb, bb, ante]) => {
     const s = scale(sb);
-    return { sb: s, bb: Math.max(s * 2, scale(bb)), ante: scale(ante), minutes: QUALIFIER_LEVEL_MINUTES };
+    return { sb: s, bb: Math.max(s * 2, scale(bb)), ante: scale(ante), minutes };
   });
   return { startingStack: stack, levels, breaks: { everyLevels: QUALIFIER_BREAK_EVERY_LEVELS, minutes: QUALIFIER_BREAK_MINUTES } };
 }
@@ -336,9 +509,10 @@ function engineTimeScale(timeScale: unknown): number {
  * S3 — `timeScale` (the rig knob, qualifierTestTimeScale; 1 = real time)
  * divides the duration (at least 1 s). Production always passes 1.
  */
-export function qualifierBlindLevels(startingStack: number = QUALIFIER_BASE_STACK, timeScale: number = 1): Array<{ sb: number; bb: number; ante: number; duration: number }> {
+export function qualifierBlindLevels(startingStack: number = QUALIFIER_BASE_STACK, timeScale: number = 1, levelMinutes: number = QUALIFIER_LEVEL_MINUTES): Array<{ sb: number; bb: number; ante: number; duration: number }> {
   const k = engineTimeScale(timeScale);
-  return qualifierStructure(startingStack).levels.map((l) => ({ sb: l.sb, bb: l.bb, ante: l.ante, duration: Math.max(1, Math.round((l.minutes * 60) / k)) }));
+  // 2026-11-21 — `levelMinutes`: the event's level length (the Online League's 10; default today's 12).
+  return qualifierStructure(startingStack, levelMinutes).levels.map((l) => ({ sb: l.sb, bb: l.bb, ante: l.ante, duration: Math.max(1, Math.round((l.minutes * 60) / k)) }));
 }
 
 /** S3 — the engine's break schedule (TournamentManager `config.breaks`): every 5th level, 5 minutes (divided by the rig's time scale, at least 1 s). */

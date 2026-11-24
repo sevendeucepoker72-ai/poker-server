@@ -27,6 +27,7 @@
  * Pure: reads the game server only through the EventWorld view. Never throws.
  */
 import type { Tournament, TournamentPlayer } from '../game/TournamentManager';
+import { isLeagueEvent } from '../game/qualifierSchedule';
 import type { ChannelId, EventKey } from './contract';
 
 /** The fields of a qualifierTournaments entry the broadcast reads (index.ts QualifierTournamentReg). */
@@ -114,6 +115,18 @@ export function qualifierKind(qt: Pick<QualifierRegView, 'qualifierType'>): 'wee
 }
 
 /**
+ * 2026-11-21 (Online League, owner) — an ONLINE LEAGUE night (qualifierType
+ * 'online_league', every Monday-Saturday) is NEVER broadcast: its players get no
+ * streaming notice or opt-out, and qualifierKind would read it as 'weekly', so it
+ * would take the weekly / main channels six nights a week. next: keys skip it
+ * (resolveNext); its q: / t: keys answer 'not_broadcastable'; GET
+ * /api/broadcast/events never lists it (wire.ts eventsList). Every qualifier: true.
+ */
+export function isBroadcastableQualifier(qt: Pick<QualifierRegView, 'qualifierType'> | null | undefined): boolean {
+  return !isLeagueEvent(qt);
+}
+
+/**
  * 2026-11-02 (broadcast fix round 2) — SIT & GO STREAMING IS OFF BY DEFAULT. Sit & Go
  * players get no streaming notice and no opt-out UI yet, so a template Sit & Go may be
  * broadcast only when env BROADCAST_SITGO is exactly '1' (surrounding spaces ignored;
@@ -163,6 +176,7 @@ export function resolveNext(world: EventWorld, kinds: ReadonlyArray<'weekly' | '
   let held: [string, QualifierRegView, number] | null = null;
   let soonest: [string, QualifierRegView, number] | null = null;
   for (const [qid, qt] of world.qualifiers()) {
+    if (!isBroadcastableQualifier(qt)) continue;   // 2026-11-21 — never an Online League night
     if (!kinds.includes(qualifierKind(qt))) continue;
     const at = Date.parse(qt.scheduledAt);
     if (!Number.isFinite(at)) continue;
@@ -196,11 +210,13 @@ export function resolveEventKey(world: EventWorld, key: EventKey | 'next:any'): 
     }
     if (p.kind === 'q') {
       const q = findQualifier(world, p.id);
+      if (q && !isBroadcastableQualifier(q[1])) return { ok: false, code: 'not_broadcastable' };   // 2026-11-21 — an Online League night
       return q ? { ok: true, ev: qualifierResolved(q[0], q[1]) } : { ok: false, code: 'event_not_found' };
     }
     // 't:' — a qualifier's tournament (shown as its qualifier) or a template Sit & Go
     // (only while Sit & Go streaming is on: env BROADCAST_SITGO=1).
     const q = qualifierOfTournament(world, p.id);
+    if (q && !isBroadcastableQualifier(q[1])) return { ok: false, code: 'not_broadcastable' };   // 2026-11-21 — an Online League night
     if (q) return { ok: true, ev: qualifierResolved(q[0], q[1]) };
     const t = world.tournament(p.id);
     if (!t) {

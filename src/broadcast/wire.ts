@@ -88,7 +88,7 @@ import {
   type BroadcastWorld, type ProgramBuild, type RankMemory,
 } from './broadcastSnapshot';
 import {
-  isBroadcastableSitGo, parseEventKey, qualifierKind, resolveEventKey, sitGoBroadcastOnOf, NEXT_HOLD_FINISHED_MS,
+  isBroadcastableSitGo, isBroadcastableQualifier, parseEventKey, qualifierKind, resolveEventKey, sitGoBroadcastOnOf, NEXT_HOLD_FINISHED_MS,
   type ArchivedTournament, type ResolvedEvent,
 } from './eventKey';
 import {
@@ -1722,6 +1722,7 @@ export function registerBroadcast(io: Server, deps: BroadcastDeps): BroadcastHan
     const out: EventSummary[] = [];
     const t0 = now();
     for (const [qid, qt] of world.qualifiers()) {
+      if (!isBroadcastableQualifier(qt)) continue;   // 2026-11-21 — an Online League night is never broadcast
       if (qt.status === 'finished' && !(Number(qt.finishedAt) > 0 && t0 - Number(qt.finishedAt) < NEXT_HOLD_FINISHED_MS)) continue;
       const ev: ResolvedEvent = { key: `q:${qid}`, kind: qualifierKind(qt), qualifierId: qid, tournamentId: qt.tournamentId || null, qt };
       const t = qt.tournamentId ? world.tournament(qt.tournamentId) : undefined;

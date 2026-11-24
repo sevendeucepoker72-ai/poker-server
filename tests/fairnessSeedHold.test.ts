@@ -26,6 +26,8 @@ import { TournamentManager } from '../src/game/TournamentManager';
 import {
   qualifierWindows, qualifierStatusOf, seatsForTopWith, qualifierStructure, QUALIFIER_BASE_STACK,
   QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft,
+  // 2026-11-21 (Online League) — qualifierListItem reads the event config.
+  qualifierEventConfig,
 } from '../src/game/qualifierSchedule';
 import { SRC, slice, fnSrc, load } from './helpers/indexSource';
 
@@ -233,7 +235,7 @@ describe('FS6 — the lobby item says so (seedsHeldUntilEnd: capability flag the
     };
     const { exports: m, stubbed } = load(fnSrc('function qualifierListItem('), {
       tournamentManager: tm, qualifierWindows, qualifierStatusOf, seatsForTopWith, qualifierStructure, QUALIFIER_BASE_STACK,
-      QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(),
+      QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(), qualifierEventConfig,
     }, '{ qualifierListItem }');
     expect(m.qualifierListItem('Q1', qt, Date.now(), null)).toMatchObject({ seedsHeldUntilEnd: true, lateRegClosesAtBubble: true });
     expect([...stubbed]).toEqual([]);

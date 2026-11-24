@@ -20,6 +20,8 @@ import { randomInt } from 'crypto';
 import { PokerTable } from '../src/game/PokerTable';
 import { TournamentManager } from '../src/game/TournamentManager';
 import { qualifierBlindLevels } from '../src/game/qualifierSchedule';
+// 2026-11-21 (Online League) — startQualifierTournament reads the event config (its name, tables, level length).
+import { qualifierEventConfig } from '../src/game/qualifierSchedule';
 import { SRC, slice, fnSrc, load, flush } from './helpers/indexSource';
 
 const quiet = { log() {}, warn() {}, error() {} };
@@ -35,7 +37,7 @@ describe('(a) startQualifierTournament seats the field by a random draw (crypto 
     const bootstraps: Array<{ tournamentId: string; tableIds: string[] }> = [];
     const randCalls: number[] = [];
     const { exports: m } = load(START_Q, {
-      tournamentManager: tm, tournamentTables: new Map(), fastModeTables: new Map(), qualifierBlindLevels,
+      tournamentManager: tm, tournamentTables: new Map(), fastModeTables: new Map(), qualifierBlindLevels, qualifierEventConfig,
       playerSessions: new Map(), io: { to: () => ({ emit() {} }), emit() {}, sockets: { sockets: new Map() } },
       tableManager: {
         createQuickTable: (name: string, seats: number, sb: number, bb: number, buyIn: number) => {
@@ -378,7 +380,7 @@ describe('(d) review fix-up — a throw with NO table dealt is re-thrown (the ol
       let created = 0;
       const { exports: m } = load(`${START_Q}\n${BOOT}`, {
         tournamentManager: Object.assign(tm, { onEvent: (id: string) => { onEvents.push(id); } }),
-        tournamentTables: new Map(), fastModeTables: new Map(), qualifierBlindLevels,
+        tournamentTables: new Map(), fastModeTables: new Map(), qualifierBlindLevels, qualifierEventConfig,
         playerSessions: new Map(), io: { to: () => ({ emit() {} }), emit() {}, sockets: { sockets: new Map() } },
         tableManager: {
           createQuickTable: (name: string, seats: number, sb: number, bb: number, buyIn: number) => {

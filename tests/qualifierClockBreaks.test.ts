@@ -24,6 +24,8 @@ import {
   qualifierBlindLevels, qualifierBreakConfig, qualifierStructure, qualifierTestTimeScale, seatsForTopWith,
   QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, QUALIFIER_BASE_STACK,
   qualifierWindows, qualifierStatusOf, qualifierReEntriesLeft, QUALIFIER_MAX_REENTRIES,
+  // 2026-11-21 (Online League) — startQualifierTournament / qualifierListItem read the event config.
+  qualifierEventConfig,
 } from '../src/game/qualifierSchedule';
 import { SRC, slice, fnSrc, handlerSrc, load } from './helpers/indexSource';
 
@@ -333,7 +335,7 @@ describe('qualifierSchedule: break constants, the additive structure, the rig-on
       const tables = new Map<string, PokerTable>();
       const { exports: m } = load(START_Q, {
         tournamentManager: tm, tournamentTables: new Map(), fastModeTables: new Map(),
-        qualifierBlindLevels, qualifierBreakConfig, qualifierTestTimeScale, process: { env },
+        qualifierBlindLevels, qualifierBreakConfig, qualifierTestTimeScale, qualifierEventConfig, process: { env },
         playerSessions: new Map(), io: { to: () => ({ emit() {} }), emit() {}, sockets: { sockets: new Map() } },
         tableManager: {
           createQuickTable: (name: string, seats: number, sb: number, bb: number, buyIn: number) => {
@@ -888,7 +890,7 @@ describe('review fix-up: the qualifier card follows the break switch (structure.
     };
     const { exports: m, stubbed } = load(fnSrc('function qualifierListItem('), {
       tournamentManager: tm, qualifierWindows, qualifierStatusOf, seatsForTopWith, qualifierStructure, QUALIFIER_BASE_STACK,
-      QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(),
+      QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(), qualifierEventConfig,
     }, '{ qualifierListItem }');
     return { tm, qt, item: () => m.qualifierListItem('Q1', qt, Date.now(), null), stubbed };
   }
@@ -910,7 +912,7 @@ describe('review fix-up: the qualifier card follows the break switch (structure.
     // One TournamentManager for both: the route's.
     const { exports: m } = load(fnSrc('function qualifierListItem('), {
       tournamentManager: r.tm, qualifierWindows, qualifierStatusOf, seatsForTopWith, qualifierStructure, QUALIFIER_BASE_STACK,
-      QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(),
+      QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(), qualifierEventConfig,
     }, '{ qualifierListItem }');
     const item = () => m.qualifierListItem('Q1', w.qt, Date.now(), null);
     expect(item().structure.breaks.on).toBe(true);

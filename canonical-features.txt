@@ -2543,3 +2543,16 @@ function firstRoundCounts(
 vpip: p.vpipHands + (p.vpipHands3rd || 0)
 case 'fold_to_3bet_3rd':
 (firstRoundCounts(obs).vpip +
+# 2026-11-21 (owner) - the ONLINE LEAGUE on .online: a FREE No-Limit Hold'em night Mon-Sat 6:00 PM MT (master type
+# 'online_league'). qualifierEventConfig (src/game/qualifierSchedule.ts) is the ONE config: no credit, ONE re-entry,
+# sign-up 4 PM, late entry until 7 PM, 10-minute levels; every other type keeps today's values. The schedule sync asks
+# the master for league rows with ?kinds=league (the ONLY league request in the fleet; never remove it). Lobby items
+# carry requiresCredit; a league night is never broadcast (isBroadcastableQualifier). tests/onlineLeague.test.ts.
+qualifierEventConfig
+online_league
+requiresCredit:
+isBroadcastableQualifier
+qualifiers/schedule?kinds=league
+# 2026-11-21 repair round 2 - the not_qualified refusal never names the hidden monthly route and
+# names the Online League's top-5 weekly-credit route while a league night gives it.
+notQualifiedText

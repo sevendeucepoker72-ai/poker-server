@@ -52,6 +52,10 @@ function health(opts: Opts = {}) {
     quickGameStats: { started: 2, ended: 1, byFormat: { headsUp: { started: 1, humanWins: 0 }, spinGo: { started: 1, humanWins: 1 } } },
     quickGames: new Map([['Q1', {}]]),
     clubTableRuntimeStats: { recreated: 0, refusedInvalid: 0, closedUnbound: 0, recreateSkippedNotMember: 0, idleDealsSkipped: 4 },
+    // 2026-11-21 (Online League) — r2Play.qualifiers.onlineLeague (a healthSection) reads the
+    // qualifier registry and its counters.
+    qualifierTournaments: new Map(),
+    onlineLeagueStats: { eventsOpened: 0, listRequests: 0, entries: 0, reEntries: 0, reEntryRefused: 0, cancelled: 0, finished: 0 },
     console: { log() {}, warn() {}, error: (m: unknown) => errors.push(String(m)) },
   };
   load(`${HELPER}\n${ROUTE}`, scope, '{}');

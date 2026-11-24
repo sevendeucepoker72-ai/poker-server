@@ -23,6 +23,8 @@
 import { PokerTable } from '../src/game/PokerTable';
 import { TournamentManager } from '../src/game/TournamentManager';
 import { qualifierBlindLevels } from '../src/game/qualifierSchedule';
+// 2026-11-21 (Online League) — startQualifierTournament reads the event config (its name, tables, level length).
+import { qualifierEventConfig } from '../src/game/qualifierSchedule';
 import { slice, fnSrc, load } from './helpers/indexSource';
 
 const quiet = { log() {}, warn() {}, error() {} };
@@ -36,7 +38,7 @@ function world(opts: { registryHasTournamentId?: boolean; sitAndGo?: boolean } =
   const acted: Array<[string, number]> = [];
   let created = 0;
   const scope: Record<string, unknown> = {
-    tournamentManager: tm, tournamentTables, qualifierTournaments, fastModeTables: new Map(), qualifierBlindLevels,
+    tournamentManager: tm, tournamentTables, qualifierTournaments, fastModeTables: new Map(), qualifierBlindLevels, qualifierEventConfig,
     playerSessions: new Map(), multiTableSessions: new Map(), reservedSeats: new Map(), SEAT_RESERVE_MS: 6 * 3600_000,
     io: { to: () => ({ emit() {} }), emit() {}, sockets: { sockets: new Map() } },
     tableManager: {

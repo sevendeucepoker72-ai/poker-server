@@ -57,6 +57,9 @@ describe('qualifierSchedule (pure)', () => {
     expect(list).toEqual([{
       id: WEEKLY, name: 'Weekly Qualifier — 2026-10-05', type: 'weekly', clientQualifierId: 'weekly-qualifier',
       scheduledAt: Date.parse('2026-10-11T12:00:00.000Z'), status: 'open', seatPackage: null,
+      // 2026-11-21 (Online League, owner) — additive fields: a qualifier is kind 'qualifier'
+      // with no league fields (tests/onlineLeague.test.ts covers the league item).
+      kind: 'qualifier', leagueId: null, leaguePoints: null, leaguePrize: null, leagueAwardsMinField: null,
     }]);
     expect(parseMasterSchedule({ schedule: MASTER_BODY.data.schedule })).toHaveLength(1);   // a bare {schedule} too
     expect(parseMasterSchedule(null)).toEqual([]);
@@ -235,6 +238,8 @@ function world(opts: {
     },
     qualifierSyncStats: { syncs: 0, failures: 0, lastSyncAt: null, listed: 0, cancelledOffSchedule: 0 },
     qualifierWindows, qualifierStatusOf, seatsForTopOf, seatsForTopWith, seatsWonAt, qualifierStructure, QUALIFIER_BASE_STACK,
+    // 2026-11-21 (Online League) — the event config + the finish frames' league fields (the REAL pure module).
+    qualifierEventConfig: QS.qualifierEventConfig, leagueFinishFrameFields: QS.leagueFinishFrameFields,
     QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers,
     samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS,
     assertPlayable: async () => null,
@@ -2324,6 +2329,8 @@ function earlyRoomsWorld(opts: { leadEnv?: string; overflowMax?: number; balance
     },
     qualifierSyncStats: { syncs: 0, failures: 0, lastSyncAt: null, listed: 0, cancelledOffSchedule: 0 },
     qualifierWindows, qualifierStatusOf, seatsForTopOf, seatsForTopWith, seatsWonAt, qualifierStructure, QUALIFIER_BASE_STACK,
+    // 2026-11-21 (Online League) — the event config + the finish frames' league fields (the REAL pure module).
+    qualifierEventConfig: QS.qualifierEventConfig, leagueFinishFrameFields: QS.leagueFinishFrameFields,
     QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(),
     samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS,
     qualifierBlindLevels, qualifierBreakConfig: s4BreakConfig, qualifierTestTimeScale: s4TimeScale,

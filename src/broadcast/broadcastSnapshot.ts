@@ -154,7 +154,7 @@ export function eventStatusOf(world: BroadcastWorld, ev: ResolvedEvent, t: Tourn
     if (qt.status === 'finished') return qt.cancelled ? 'cancelled' : 'finished';
     if (qt.status === 'running' || qt.status === 'starting') return !t || t.pauseReason === 'prestart' ? 'tables_open' : 'running';
     const at = Date.parse(qt.scheduledAt);
-    return Number.isFinite(at) && now < qualifierWindows(at).signupOpensAt ? 'scheduled' : 'registering';
+    return Number.isFinite(at) && now < qualifierWindows(at, qt.qualifierType).signupOpensAt ? 'scheduled' : 'registering';
   }
   if (!t) return archived ? 'finished' : 'cancelled';
   if (t.status === 'registering') return 'registering';
@@ -246,7 +246,7 @@ export function buildProgramData(input: {
 
   let lateReg: ProgramEvent['lateReg'] = { open: null, until: null, closedReason: null };
   if (qt && Number.isFinite(scheduledAtRaw)) {
-    const w = qualifierWindows(scheduledAtRaw);
+    const w = qualifierWindows(scheduledAtRaw, qt.qualifierType);
     let bubbleClose: { at: number } | null = null;
     if (t && tid) { try { bubbleClose = world.lateEntryClosedAtBubble(tid); } catch { bubbleClose = null; } }
     const playing = status === 'running' || status === 'tables_open';

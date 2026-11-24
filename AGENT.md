@@ -106,6 +106,7 @@ Railway (not in this repo).
 | 33 | **`broadcastGameState` arms the turn clock BEFORE it builds any frame (2026-10-26).** The `turnChanged` -> `armTurnTimer` listener is wired lazily by the first broadcast (`ensureTurnTimerWired`), and bootstrapTournamentTables / startTournamentGame / the quick games deal hand 1 BEFORE that broadcast: the first actor of a new table got `turnStartedAt: 0` in every frame of his turn (a frozen 30 on .online, no countdown, no warning; since rule 32 he is then sat out). The `armTurnTimer(tableId)` right after `ensureInsuranceHoldWired` is idempotent (seatChanged guard) and must stay above the frame loop; the tail call stays as the net. The stamped `turnTimeout` is `currentTurnTimeoutMs` (3 s for an away seat). Locked by tests/firstTurnClock.test.ts. | 2026-10-26 (rig) |
 | 34 | **A hole card never reaches a public path; the delayed feed is the only way out, and it ships OFF (owner 2026-11-02).** The public /broadcast builders never read a seat's hole cards (broadcastSnapshot.ts: no card at all; broadcastFrame.ts: only the engine's showdown record at a CONTESTED showdown). ONLY src/broadcast/holeCardDelay.ts reads them (captureHandStart, at the deal, for an ARMED event) into an in-process buffer that is never persisted (no Redis, no pg, no log line), purged past the longest delay + 5 min, wiped by the kill switch. A hand's cards are released ONLY when that hand has ENDED LIVE and at least the delay (5 min floor; env BROADCAST_HOLECARD_DELAY_MIN, producer setFeed upward) has passed since the frame shown (a long hand shows backs until it ends live); only on the featured table (or the producer's bc:producer:delayedPin); only to a session whose key holds the delayed scope, by DIRECT socket.emit, never a room (src/broadcast/delayedFeed.ts). Three gates, all needed: env BROADCAST_HOLECARD_POLICY (default off), the producer switch (bc:producer:holeCardsSwitch, starts OFF at every boot), an issuer in BROADCAST_HOLECARD_ISSUERS (empty = nobody). Locks: tests/broadcastPublicNoHoleCards.test.ts (50-hand deep scan), broadcastHoleCardDelay.test.ts, broadcastDelayedAccess.test.ts. A leak is a P0. | 2026-11-02 |
 | 35 | **Every timer that reaches a hand-progress engine call catches its throw (the qualifier start tick excepted, on purpose), and a hand found resting in Showdown after a fault is settled from a mark taken BEFORE its payout — never run again blind (bots review 2026-11-04, A-crash; fix rounds 2-4, 2026-11-05..08).** (a) **Guarded timers:** the bot action / draw timers; every timer that runs `autoStartNextHand` (scheduleAutoStart, executeAIAction's 1.5 s deal, the noteRefusedCashStart retry, the action handler's 3 s deal); the heartbeat (per table); the turn clock and the 30 s draw clock (round 2); and (round 3) the 500 ms sit-out / orphan auto-act (broadcastGameState), the absent-drawer stand-pat (armAbsentDrawerStandPat; a recovery that leaves its round open re-arms it at most 3 times per hand and draw round, then leaves the round to the 30 s draw clock: `absentStandPatGiveUps` — it used to re-arm every 500 ms without end on a sticky throw), the insurance and Crazy Pineapple runout-hold releases, the Spin & Go first deal (a throw BEFORE it dealt is retried once, 3 s later: `spinGoDealRetries`), a seat reservation's expiry, the tournament rebalance cascade (500 ms) and, per tournament, the 5 s rebalance sweep. `tests/fix3TimerInventory.test.ts` walks every setTimeout / setInterval / setImmediate callback in src/index.ts and fails when one that reaches a hand-progress engine call has no non-rethrowing catch on its path (28 such timers, 0 unguarded; 2b5ac52 had 8 of 26, 0dc1b96 17 of 26); it does not follow EventEmitter / TournamentManager.emitEvent listeners (their timer-reachable callers were checked by hand). Each catch writes a `[game-timer-error] {kind, tableId, seatIndex, error, where}` line (60/min, then counted), bumps health `crashSafety.gameTimers` (additive counters), and moves the table on: a seat that never acted is checked / folded for (stamped auto 'timeout' / 'away'), one that acted has its turn advanced, a draw that threw stands pat, a draw round a recovery left open is stood pat again 3 s later (up to 5 times; a round whose completion threw is completed), a pre-deal throw is retried ONCE 3 s later. A turn-clock recovery also applies the timeout's consequences (noteAbsentTimeout; at a tournament table the "1 timeout = sat out" rule, row 32). Round 4: the 500 ms auto-act is armed once per (table, seat) at a time (every broadcast used to add one more 2 Hz chain), the auto-act is never armed again for a turn (same hand, decision point and seat) on which it already threw 3 times (`absentActGiveUps`), and a bot's action recovery stops re-arming the bot after its 3rd throw on one turn (`botActionGiveUps`; another path's scheduleAIAction — the turn clock's recovery, a join — still arms it once each). A check / fold that throws every time used to loop at 2 Hz / at the bot's think delay without end. (b) **The Showdown settle:** Showdown is never a resting state (every assignment is followed synchronously by determineWinners, Stud 8's award included since round 3), so a hand found there is a faulted payout. `settleShowdownAfterFault` compares each seat's chipCount + totalInvestedThisHand with a mark taken before the payout (`payoutSinceMark`) — a timer's own stake mark (only one taken outside Showdown on an un-held hand: SR2-1), the deal's `table.startChips` (`settleDealtShowdownAfterFault`), or the engine's `PokerTable.payoutStartMark` (taken once per hand on the first entry into determineWinners, base or hi-lo override) for every other path — nothing paid → the engine's showdown ONCE (resolved); paid in full → `PokerTable.completeHandAfterFault()` (finished, never paid again); part-paid or the retry threw → `completeHandAfterFault(stakes)` VOIDS the hand (every stake back, a posted dead blind owed again — owner policy 2026-11-04, like a misdeal). The payout mark records which seats the payout can credit at all (`payoutStartMark.payable`: exactly determineWinners' own exclusions — chips in the pot, or still contesting it with cards; never an eliminated seat): one it cannot — a mid-hand joiner, a fold with nothing in, a busted 0-chip seat (round 4: it was marked payable, and its leave HELD the hand) — is skipped, and a void puts back only the payable stakes. A seat of the mark stood up while the payout rests (`PokerTable.standUp`, whatever path) is recorded on the mark (`payoutStartMark.left`: what it held) and read from it (round 4). HELD (never settled, never advanced) only when the mark cannot say what was paid: a payable seat changed hands without leaving or holds LESS than its stake (`unreadable_stakes`), a part-paid hand one of whose departed seats took more than its stake (`departed_gain`: a void cannot take it back), no payout mark for the hand (`no_payout_mark`, e.g. a restored table), no deal capture (`no_deal_capture`), or the settle itself threw before it ended the hand (`settle_threw`). No automatic choice is chip-safe there: a seat x below its stake reads the same whether nothing was paid and x left it, or the pot was paid to it and pot + x left it (the other seats do not move either way), and a void mints the pot in the second history where a finish destroys it in the first. So a held hand is listed in health `crashSafety.heldShowdowns` (`{tableId, handNumber, since, reason}`; counter `showdownHeld`) and an admin ends it with the socket event `adminResolveHeldHand {tableId, resolution: 'finish' or 'void'}` (isUserAdmin; 'finish' = the stacks stand, 'void' = every payable seat still the mark's back to its stake; durable audit `ADMIN_RESOLVE_HELD_HAND`, or `ADMIN_RESOLVE_HELD_HAND_FAILED` when the hand stays in Showdown; a throw after the hand has ended — a 'handResult' listener — still answers resolved, so the counter, the clients and the next deal follow; counter `heldResolvedByAdmin`). On a `departed_gain` hold 'finish' never mints (the unpaid rest of the pot is lost) and 'void' mints what the departed seat took beyond its stake. The paths that cash seats out WITHOUT running the hand — the shutdown flush (`claimSeatsForShutdown`, its unclaimed-seat sweep too), `adminForceCloseTable`, `cleanupQuickTable` — cash a hand resting in Showdown out from its payout mark (`restingShowdownHoldings`, read once before any seat moves; if the flush cannot list the tables, that read is skipped and the claim goes on with the live-hand rule): nothing paid → chipCount + totalInvestedThisHand; paid in full → chipCount (adding totalInvestedThisHand credited the paid pot a second time at every restart); part-paid → the payable stakes; unreadable → chipCount (never a pot it cannot show is unpaid). The settle reads a payout correctly only while nothing but the payout moves a seat's chips in Showdown: bets, dead blinds, rebuys and the leave fold are refused there, and no deal starts from it. (c) **Where it is settled:** a timer, in its own catch; every `startNewHand` outside autoStartNextHand / the heartbeat runs as `try { … } catch (err) { … settleDealThrow(…) }` (a deal-time payout fault settled like a scheduled deal's, then broadcast + the next deal — a sticky fault loops void → deal; any other throw is rethrown to the caller), and (round 4) the bomb pot's activation (`activateBombPotIfPending`, whose all-in runout pays) is inside that try at dealAfterJoin, 'startHand' and the club challenge sweep — its payout fault waited for the wedge watchdog, and a settled deal then dropped the pending bomb pot; autoStartNextHand / the heartbeat activate it inside their callers' guards; the HUMAN paths — socket 'action' / 'playerDraw', the sit-out / AFK folds, teardownSeat's folds (leave, reservation end), the departure folds and the runout released by the last Crazy Pineapple discard pick ('selectPineappleDiscard') or insurance accept / decline — settle at once (`settleHumanPathThrow`) and RETHROW, so socketGuard still logs and reports (SR2-2); any other un-held Showdown is the wedge watchdog's: it never folds / checks / advances a Showdown table — it settles it from the payout mark at the FIRST tick that sees it, within 15 s (`settleRestingShowdown`, counter `watchdogShowdowns`), and a payout its own forced fold / check / advance ran that throws is settled in that same tick. The turn clock and the 500 ms auto-act return in Showdown, as executeAIAction; a folded seat cannot rebuy into a payout resting unfinished, an owed dead blind is never posted into it (`postOwedBlindsNow` refuses in Showdown), and (round 4) `forceFoldSeat` refuses in Showdown (a leaver keeps his tabled hand: a settle's retry used to pay the pot without him) — except a DEAD hand: a seat torn down at a tournament / fixed-roster table (`leaverKeepsAllInHand` false) is folded there by teardownSeat (`forceFoldSeat(i, { deadHand: true })`), so the retry never pays it a pot that would leave play with it (round 4 had kept it: a disqualified seat was paid 13 and 22 of 40 such pots in two runs). Never call `advanceTurn` / `determineWinners` on a Showdown table to "unstick" it; `completeHandAfterFault` returns false outside Showdown and never pays. (d) **NOT covered:** the qualifier start tick (30 s interval, start-second timer) stays bare ON PURPOSE: a start that dealt no table rethrows so the crash flush releases and refunds the 'starting' event (qualifierLifecycleS1) — its deals' own throws are caught per table; the 5 s sweep guards each tournament's rebalance, but a throw in its other steps (pruning, overflow / early-room / hand-for-hand service) still reaches processGuards; a throw midway through handleTableRebalance's mover loop is caught now (it used to exit the process) but leaves the movers seated on both tables until a later sweep finishes the break (no test covers it); a HELD hand waits for an admin's `adminResolveHeldHand` or a restart (the flush then cashes it out as above: an unreadable hand at chipCount, so the unpaid part of its pot, if any, is lost rather than minted) — the admin event has no button in the apps yet; a seat whose check / fold throws on every try keeps its turn: after its 3 auto-act / bot retries only the turn clock (once; for a bot its recovery arms the bot once more) and the wedge watchdog (a forced check / fold every 15 s, logged, nothing paid) try again, and nothing voids a live hand; a draw seat whose stand-pat throws on every retry keeps its round waiting (the absent stand-pat gives up after 3 re-arms, the 30 s draw clock after 5 retries; nothing else stands it pat or voids the hand, and the wedge watchdog skips draw rounds); a Spin & Go first deal that throws twice waits for the player's Deal now; a 'handResult' listener that throws on every hand leaves a table in HandComplete after a human's action (the heartbeat restarts a cash table; a tournament table has no backstop); TournamentManager's own timers (blind level, break end, template re-create) are not wrapped — they reach no hand-progress call and their index.ts listeners wrap the broadcasts / deals / balancing, but a throw in the listener's room emit or config assignment would still exit; a socket handler's throw never exits (socketGuard) but anything it leaves other than a resting Showdown stays as it was (a teardown that settled and rethrew skips the rest of the teardown, as before); timers that reach no hand-progress call are outside this guard (their own try/catch, where they have one, is all they get): table lifecycle (a quick game's result and its cleanup, a finished or broken tournament table's removal), the Heads-Up / Spin & Go blind doublers, DB retries, the broadcast feed, auth. Tests: botsReviewCrashGuard, fix2ClockCrashGuard, fix2DealtShowdownSettle, fix3TurnClockShowdown, fix3HumanPathShowdown, fix3TimerGuards, fix3TimerInventory, fix3ReviewFixups, fix4ServerReview. | Bots review 2026-11-04 (A-crash; review fold_mint: the v1 recovery re-paid a pot); fix round 3 2026-11-05 (SR2-1 / SR2-2 / SR2-5: the round-2 wording overclaimed); fix round 3 review 2026-11-08 (SERVER-R3-FAULT-1 / REG-1 / REG-2 / MEAS-1); fix round 4 2026-11-08 (SERVER-R3-REG-PAYABLE-1 / REG-3 / FAULT-LENS-1); its review fix-up 2026-11-08 (SERVER-R4-REGRESSION-1 / -2) |
+| 36 | **No deploy or restart Mon-Sat 5:45-11:30 PM MT (owner 2026-11-21, Online League nights).** The Online League plays every Monday to Saturday at 6:00 PM MT (sign-up from 4:00 PM, late entry until 7:00 PM, the longest night ends about 10:45 PM). A restart releases every registrant of a night that has not started (`qualifierCancelled` `server_restart`) and voids a running one; the next instance re-opens the night EMPTY while it is before 7:00 PM, and the master keeps only the FIRST recorded result of a night (a second, different ladder is 409 `ladder_conflict`). That includes `railway up`, a Railway variable change (it restarts the service) and a rollback. Also avoid master API deploys in the window: results POSTs land then and the 7 retries cover only about 10 minutes. The Sunday weekly freeze (no Railway deploys Sun 8 AM until its results) is unchanged. Section "Online League (owner 2026-11-21)". | 2026-11-21 |
 
 ## Surface area
 
@@ -173,6 +174,10 @@ CI runs on every push/PR:
 3. `npm run build` — tsc compile
 
 If CI is red, do NOT `railway up`. Fix the typecheck/test failure first.
+
+Never deploy, restart or change a Railway variable Mon-Sat 5:45-11:30 PM MT
+(Online League nights, hard rule 36), nor Sunday from 8 AM until the weekly's
+results are in.
 
 ## Rollback
 
@@ -1834,6 +1839,142 @@ re-sends the POST (`tests/qualifierResultsDurable.test.ts`).
    - A row written during a SIGTERM / crash flush can be lost if the process
      exits before the insert lands. The `SHUTDOWN_FLUSH` row's
      `qualifierRegistrationsReleased` says how many refunds that flush started.
+
+### Online League (owner 2026-11-21)
+
+Owner decisions (2026-11-21, binding): a FREE No-Limit Hold'em tournament on
+.online every MONDAY to SATURDAY at 6:00 PM America/Denver, no skipped dates
+(holidays included), for anyone signed in with an American Pub Poker account,
+humans only. Points, the top-5 weekly qualifier credit and the winner's free
+chair month are ALL the master's (it records the night as a completed games row
+of the Online League; see the master `poker-api/AGENT.md` rules 15-20 and
+CONTRACTS.md "Online League"). This server only runs the night and posts its
+finish order, exactly as for a weekly.
+
+**What tells this server it is a league night:** the master's schedule item
+`type: 'online_league'` (one `online_qualifiers` row per Denver play date).
+Nothing here hard-codes the league id: it arrives as `leagueId` on the item.
+
+**The opt-in schedule fetch — NEVER remove it.** `syncQualifierSchedule`
+fetches `${MASTER_API_URL}/qualifiers/schedule?kinds=league`. It is the ONLY
+league request in the fleet: the master lists league rows only to a caller that
+sends `kinds=league` AND only while its `ONLINE_LEAGUE_ENABLED=1`. Without the
+parameter the master lists no league row, so every listed night is cancelled
+`removed_from_schedule` at the next 10-minute sync (a RUNNING night is never
+affected). An OLD poker-server (9c12781 or any rollback) never asks, so it can
+never open a league night as a credit-gated 12-minute qualifier, and the old
+broadcast `qualifierKind` (any non-monthly type = 'weekly') is never reached.
+Kill switch: master `ONLINE_LEAGUE_ENABLED` off → the rows disappear → a night
+that has not started is cancelled `removed_from_schedule` (nothing to refund).
+
+**The ONE config:** `qualifierEventConfig(type)` in
+`src/game/qualifierSchedule.ts`. Change a rule there, nowhere else. Every other
+type answers today's exact values (pinned in `tests/onlineLeague.test.ts`).
+
+| | weekly / monthly / console_* / toc / yearly / unknown | `online_league` |
+|---|---|---|
+| `kind` | `'qualifier'` | `'league'` |
+| `requiresQualifierCredit` | true | **false** (no `isPlayerQualified`, no consume, no refund) |
+| `maxReEntries` | `QUALIFIER_MAX_REENTRIES` (null = credits are the limit) | **1** (a 2nd re-entry: `reentry_limit` "Re-entry limit reached (1)") |
+| sign-up opens | 3 h before (8:00 AM) | **2 h before = 4:00 PM** |
+| late entry + re-entry close | 3 h after (2:00 PM) or the seat bubble | **60 min after = 7:00 PM** (no bubble) |
+| level length | 12 min | **10 min** |
+| tournament / table names | 'Qualifier Tournament' / 'Qualifier Table N' | 'Online League' / 'Online League Table N' (overflow tables too) |
+| refusal noun | 'qualifier' | 'Online League game' |
+
+- Everything else is the weekly's: the 50,000 stack, the same blind ladder, a
+  5-minute break after every 5th level (`QUALIFIER_BREAKS` / POST
+  /api/qualifiers/breaks apply), buy-in 0, overflow tables, table balancing,
+  early rooms (T-10), the no-show release at the start, help tools off, voice
+  off, fairness seeds held until it ends, one turn timeout sits a player out.
+  The longest possible night (26 levels x 10 min + 5 breaks x 5 min = 285 min)
+  ends about 10:45 PM MT.
+- **No championship seats:** `seatsForTopOf('online_league')` = 0, so no seat
+  bubble, no late close at the bubble (`qualifierLateEntryBubbleOf` null), no
+  hand-for-hand. Places are the engine's bust order (same-hand busts by
+  starting stack): distinct places, no chop.
+- Every `qualifierWindows(at, type)` / `qualifierStatusOf(..., type)` call passes
+  the event's type: the register window, the late seat, the re-entry window,
+  the too-few-players cancel (at **7:00 PM** for a league night), the no-show
+  notice, the new-event guard in `applyQualifierSchedule` (a NEW league night is
+  not opened after 7:00 PM) and the lobby's `lateRegUntil` / `signupClosesAt`.
+- Both starts pass `{ eventType: qt.qualifierType }` to
+  `startQualifierTournament` (the 6:00 PM start and the early rooms).
+- **Free-event copy has no credit words:** the no-seat refusals of an entry
+  that consumed no credit say "No seat is free right now. Try again in a
+  minute." / "No seat is free for a re-entry right now. Try again in a
+  minute."; the weekly's words are unchanged.
+- **The weekly's `not_qualified` refusal (repair round 2, 2026-11-21)** comes
+  from `qualifierSchedule.notQualifiedText(type, onlineLeagueGivesWeeklyCredits(registry))`:
+  it never names the hidden monthly route any more (owner: monthlies OFF and
+  hidden everywhere; it used to say "... or finishing top-20% of your league
+  standings (monthly)"), and the weekly's names the Online League's top-5 route
+  ("... top-5 in a live game or in a nightly Online League game on
+  americanpubpoker.online.") while the registry holds a league night whose
+  `leaguePoints` is true (owner: the top 5 each night earn the weekly credit).
+  poker-3d shows the text as is. Code `not_qualified` and the gate unchanged.
+- **The registry entry** gets `requiresQualifierCredit:false`, `maxReEntries:1`,
+  `kind:'league'` and the master's `leagueId` / `leaguePoints` / `leaguePrize` /
+  `leagueAwardsMinField` (refreshed on every sync, like `seatPackage`). A weekly
+  entry is built exactly as before (no `kind` key).
+- **Lobby list:** league items reach ONLY a caller that asks: socket
+  `getQualifierTournaments` with `{kinds:['league']}` (the listener is
+  `async (data = {}) =>`, length 0, so socketGuard never payload-checks it and an
+  old client's bare emit still works) or REST `GET /api/qualifier-tournaments?kinds=league`
+  (comma list). An old cached .online client never sees a league item (it would
+  call it "not qualified" and offer credit copy). Every item (weekly too) adds
+  `kind`, `requiresCredit`, `leagueId`, `leaguePoints`, `leaguePrize`,
+  `leagueAwardsMinField` (null / 'qualifier' / true for a qualifier); a league
+  item has `lateRegClosesAtBubble:false`, `seatsForTop:0`, `maxReEntries:1` and a
+  10-minute `structure`. `/api/qualifier-tournaments/:id` is unchanged.
+- **Frames:** `qualifierCancelled` (cancel, the no-show notice stored + sent at
+  sign-in, the deal's `no_seat` release, the shutdown flush) adds
+  `kind:'league'`; `qualifierResults` and the per-socket `tournamentFinished`
+  add `kind:'league'`, `leagueId`, `leaguePoints`, `leaguePrize`,
+  `leagueAwardsMinField` and `field` (finishers, disqualified left out). League
+  events only: a weekly's frames are byte-for-byte as before.
+  `qualifierTournamentUpdate` is unchanged.
+- **Not broadcastable** (no streaming notice / opt-out for it, and it must never
+  take the weekly / main channels six nights a week):
+  `isBroadcastableQualifier` (src/broadcast/eventKey.ts); `resolveNext` skips a
+  league night (next:weekly / next:monthly / next:any); `q:` / `t:` keys of one
+  answer `not_broadcastable`; `GET /api/broadcast/events` (eventsList) never
+  lists one.
+- **Results POST: unchanged** (`{results:[{playerId, finishPosition,
+  pointsAwarded:0}]}`, disqualified left out, durable audit rows, 7 retries).
+  The master keeps the FIRST recorded result of a night: an identical re-post is
+  a 200 no-op; a DIFFERENT ladder is 409 `ladder_conflict` → this server retries
+  7 times, then audits `QUALIFIER_RESULTS_POST_FAILED` with the `finishOrder`.
+  That is the right outcome after a restart (the first recorded night stands).
+  A night is corrected ONLY with the master's admin replace route (Admin > VIP
+  Program > Online League prizes > Replace night = POST
+  /admin/online-league/nights/:qualifierId/replace). Never hand SQL.
+- **Restart consequences:** a restart before 6:00 PM releases every registrant
+  (told `qualifierCancelled` `server_restart`, `kind:'league'`); a restart
+  during the night voids it (tournamentCancelled); the next instance re-opens
+  the night EMPTY while it is before 7:00 PM. Hence the hard rule: **no deploy
+  or restart Mon-Sat 5:45-11:30 PM MT** (hard rule 36).
+- Per-network limits: none (owner 2026-10-12 rule unchanged); the IP is still
+  recorded. One account per person is in the league's rules (owner-approved
+  text in poker-3d); an admin voids on the master.
+- **Health:** `/api/health` `r2Play.qualifiers.onlineLeague` = `eventsOpened`,
+  `listRequests` (league lists asked for), `entries`, `reEntries`,
+  `reEntryRefused`, `cancelled`, `finished`, `listed` (league nights in the
+  registry now, not finished).
+- **Re-entries left (repair round 1, 2026-11-21):** `qualifierListItem` never
+  reads the qualifier-credit cache for an event with
+  `requiresQualifierCredit: false` (`creditsHeld` null, `reEntriesLeft` = the
+  cap alone). Before, anyone could fill the cache for the type with the
+  unauthenticated `GET /api/qualifiers/online_league` (no credit has that tier:
+  `[]`), which made every registrant's free re-entry read 0 and hid "Re-enter"
+  in the lobby until a restart.
+- **Launch check (Wed 2026-11-25):** after the master's `ONLINE_LEAGUE_ENABLED=1`,
+  the next 10-minute sync must list the night (the master's `?kinds=league`
+  read creates it if missing and is never cached): `listed >= 1` here, or the
+  `online_league_night_listed` log line, BEFORE 4:00 PM MT.
+- **Tests:** `tests/onlineLeague.test.ts`. **Manifest:** `qualifierEventConfig`,
+  `online_league`, `requiresCredit:`, `isBroadcastableQualifier`,
+  `qualifiers/schedule?kinds=league`.
 
 ### Sit & Go fix-all (owner 2026-10-23: "Fix all", after the 9-player Sit & Go audit)
 

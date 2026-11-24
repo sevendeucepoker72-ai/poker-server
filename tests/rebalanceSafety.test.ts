@@ -45,6 +45,8 @@ import { PokerTable, GamePhase } from '../src/game/PokerTable';
 import { TournamentManager, DEFAULT_BLIND_LEVELS } from '../src/game/TournamentManager';
 // R2 (C3, 2026-10-11): startQualifierTournament runs the qualifier structure (qualifierBlindLevels).
 import { qualifierBlindLevels } from '../src/game/qualifierSchedule';
+// 2026-11-21 (Online League) — startQualifierTournament reads the event config (its name, tables, level length).
+import { qualifierEventConfig } from '../src/game/qualifierSchedule';
 import { planHandStartGate, masterIdFromStats, resolveSessionMasterId, HAND_GATE_MAX_STATUS_AGE_MS } from '../src/auth/playGate';
 import { OmahaTable } from '../src/game/variants/OmahaTable';
 import { SevenStudTable } from '../src/game/variants/SevenStudTable';
@@ -1163,7 +1165,7 @@ describe('minor (2026-10-10) — a tournament start binds a registrant\'s seat o
     };
     const { exports } = load(`${HELPERS}\n${start}`, {
       tournamentManager: tm, tournamentTables: new Map(), fastModeTables: new Map(), authSessions, playerSessions,
-      io: { to: () => { const op: any = { emit() {}, except: () => op }; return op; }, emit() {}, sockets: { sockets: live } }, DEFAULT_BLIND_LEVELS, qualifierBlindLevels,
+      io: { to: () => { const op: any = { emit() {}, except: () => op }; return op; }, emit() {}, sockets: { sockets: live } }, DEFAULT_BLIND_LEVELS, qualifierBlindLevels, qualifierEventConfig,
       tableManager: {
         createQuickTable: (name: string, _seats: number, sb: number, bb: number, buyIn: number) => {
           const id = `T${++n}`;

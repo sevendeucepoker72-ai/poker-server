@@ -22,6 +22,8 @@ import { accountDisplayName } from '../src/auth/displayName';
 import { sanitizeSeatAvatar } from '../src/seatProfile';
 // R2 (C3, 2026-10-11): qualifier windows / list item / structure (registerQualifierTournament reads the registry by master id).
 import { qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, QUALIFIER_BASE_STACK } from '../src/game/qualifierSchedule';
+// 2026-11-21 (Online League) — the event config the register handler / list item read (the REAL pure module).
+import { qualifierEventConfig } from '../src/game/qualifierSchedule';
 
 const ALICE = 101;
 const BOB = 102;
@@ -194,7 +196,7 @@ function world(opts: { handlers?: Partial<typeof H>; tournament?: 'buyin' | 'qua
     refundQualifierCreditOnMaster: async (id: string) => { creditRefunds.push(id); return true; },
     PLAYER_SUSPENDED_MESSAGE: 'SUSPENDED',
     accountDisplayName, sanitizeSeatAvatar,
-    qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, QUALIFIER_BASE_STACK,
+    qualifierWindows, qualifierStatusOf, seatsForTopOf, qualifierStructure, QUALIFIER_BASE_STACK, qualifierEventConfig,
     // R2 (C1 / C12): Quick Play reads the wallet first (affordable tables only); an invite code opens a PRIVATE table.
     getUserChips: async (uid: number) => { if (gates.balance) await gates.balance; return wallet.get(uid) ?? 0; },
     UNLIMITED_CHIPS_TESTING: false,
