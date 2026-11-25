@@ -325,7 +325,10 @@ describe('broadcastPid — opaque, stable within a process, per event', () => {
     expect(broadcastPid('T1', 'user-42')).toBe(a);
     expect(broadcastPid('T2', 'user-42')).not.toBe(a);
     expect(broadcastPid('T1', 'user-43')).not.toBe(a);
-    expect(a).not.toContain('42');
+    // 2026-11-25 — was not.toContain('42'): the pid is 16 hex of a per-process
+    // random salt's hash, so "42" appears by chance in ~6% of runs (failed
+    // locally as "b-46e6f2420a1cfa6f"). The player id itself is what must never show.
+    expect(a).not.toContain('user-42');
     expect(a).not.toContain('user');
   });
 });
