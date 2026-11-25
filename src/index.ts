@@ -3810,7 +3810,7 @@ interface QualifierTournamentReg {
   /**
    * 2026-11-21 (Online League, owner) — 'league' on an Online League night (type
    * 'online_league'; qualifierEventConfig): free entry (requiresQualifierCredit
-   * false), ONE re-entry (maxReEntries 1), 4:00 PM / 7:00 PM, 10-minute levels.
+   * false), ONE re-entry (maxReEntries 1), 3:00 PM / 7:00 PM, 10-minute levels.
    * Absent on every qualifier (its entry is built exactly as before). Its frames
    * add kind:'league'.
    */
