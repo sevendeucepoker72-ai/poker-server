@@ -43,3 +43,28 @@ export function partitionByPresence<T extends PresenceRegistrant>(
   for (const p of players) (lastSeenAt(p) >= now - graceMs ? present : absent).push(p);
   return { present, absent };
 }
+
+/**
+ * 2026-11-25 (owner: "It currently says if your not online at start you are
+ * removed. It should seat you and blind you out", then "Online League only")
+ * — an ONLINE LEAGUE night (kind 'league') KEEPS its no-shows. Each one is
+ * seated ABSENT at the start and blinded out: dealt in, blinds posted, acted
+ * for by the absent act (check when nothing is owed, else fold) until a
+ * sign-in or "Go to my table" puts them back on the seat. Nothing is
+ * released, no notice waits for the sign-in. The Sunday weekly and the
+ * monthly keep the rule above (released, credit refunded).
+ */
+export function noShowsSeatedAbsent(kind: string | null | undefined): boolean {
+  return kind === 'league';
+}
+
+/**
+ * How many registrants must be HERE (partitionByPresence) before the start
+ * deals: 2 for the weekly / monthly (2026-10-20, unchanged); 1 for a league
+ * night, whose no-shows are seated and blinded out, so one player here plays
+ * the field. Nobody here: it waits, and is cancelled at its late close, as
+ * before. Every start still needs 2 registrants.
+ */
+export function presentNeededToStart(kind: string | null | undefined): number {
+  return noShowsSeatedAbsent(kind) ? 1 : 2;
+}

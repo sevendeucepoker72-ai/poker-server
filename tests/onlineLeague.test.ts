@@ -32,7 +32,7 @@ import {
   qualifierOverflowCapLabel, QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText,
   notQualifiedText, onlineLeagueGivesWeeklyCredits,
 } from '../src/game/qualifierSchedule';
-import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from '../src/game/qualifierNoShow';
+import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart } from '../src/game/qualifierNoShow';
 import { resolveEventKey, resolveNext, isBroadcastableQualifier, type EventWorld } from '../src/broadcast/eventKey';
 import { SRC, slice, fnSrc, handlerSrc, load, flush } from './helpers/indexSource';
 import { qualifierWorld } from './helpers/broadcastWorld';
@@ -317,7 +317,7 @@ function world(opts: { overflowMax?: number; qualified?: (masterId: string, tier
     notQualifiedText, onlineLeagueGivesWeeklyCredits,
     qualifierWindows, qualifierStatusOf, seatsForTopOf, seatsForTopWith, seatsWonAt, qualifierStructure, QUALIFIER_BASE_STACK,
     QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(),
-    samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS,
+    samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart,
     assertPlayable: async () => null,
     isPlayerQualified: async (masterId: string, tier: string) => { qualifiedChecks.push({ masterId, tier }); return opts.qualified ? opts.qualified(masterId, tier) : true; },
     consumeQualifierCreditOnMaster: async (masterId: string, tier: string, _q: string, label: string) => {
@@ -767,6 +767,102 @@ describe('the night itself: start, too-few cancel at 7:00 PM, overflow tables, r
     await flush();
     expect(w.of('SW', 'qualifierCancelled')).toEqual([{ qualifierId: WEEKLY, reason: 'too_few_players', creditRefunded: true }]);
     expect(w.started).toEqual([]);
+  });
+
+  // 2026-11-25 (owner: "It currently says if your not online at start you are
+  // removed. It should seat you and blind you out", then "Online League only").
+  describe('owner 2026-11-25: a league night SEATS its no-shows (blinded out); the weekly still releases them', () => {
+    /** Player `sid` leaves (no live socket of his master any more). */
+    const offline = (w: World, sid: string) => { const s = w.sockets.get(sid); if (s) s.connected = false; w.sockets.delete(sid); w.authSessions.delete(sid); };
+    const actions = (w: World) => w.audits.map((a) => a.action);
+
+    it('one here + one away at 6:00 PM: it STARTS with both (the away one seated absent); nothing released, no DELETE, no refund, no sign-in notice queued', async () => {
+      const w = world();
+      const at = Date.now() + H;
+      w.sync([leagueItem(at)]);
+      const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+      const b = w.mkSocket('SB', BOB, 'm-bob', 'Bob');
+      await enter(a);
+      await enter(b);
+      offline(w, 'SB');
+      w.m.tickQualifierAutoStart(at + 1000);
+      expect(w.started).toHaveLength(1);
+      expect(w.started[0].players.map((p: any) => p.masterId).sort()).toEqual(['m-alice', 'm-bob']);
+      const qt = w.qualifierTournaments.get(LEAGUE);
+      expect(qt).toMatchObject({ status: 'running', tournamentId: 'TQ' });
+      expect(qt.players.map((p: any) => p.masterPlayerId).sort()).toEqual(['m-alice', 'm-bob']);
+      await flush();
+      expect(actions(w)).not.toContain('QUALIFIER_NO_SHOW_RELEASED');
+      expect(w.audits.filter((x) => x.action === 'QUALIFIER_NO_SHOW_SEATED_ABSENT').map((x) => x.d)).toEqual([
+        expect.objectContaining({ qualifierId: LEAGUE, masterId: 'm-bob', where: 'start' }),
+      ]);
+      expect(w.fetches.filter((f) => f.method === 'DELETE')).toEqual([]);
+      expect(w.creditRefunds).toEqual([]);
+      expect(w.of('SA', 'qualifierCancelled')).toEqual([]);
+      // The weekly's helper rule, unchanged: a league night needs one here.
+      expect([presentNeededToStart('league'), presentNeededToStart(undefined), presentNeededToStart('weekly')]).toEqual([1, 2, 2]);
+      expect([noShowsSeatedAbsent('league'), noShowsSeatedAbsent(undefined), noShowsSeatedAbsent('weekly')]).toEqual([true, false, false]);
+      expect([...w.stubbed].filter((n) => /noShowsSeatedAbsent|presentNeededToStart|noteLeagueNoShowsSeatedAbsent|qualifierLeagueNoShowsSeated/.test(n))).toEqual([]);
+    });
+
+    it('NOBODY here: it waits (nobody released) and is cancelled after 7:00 PM, as before; one registrant alone never starts', async () => {
+      const w = world();
+      const at = Date.now() + H;
+      w.sync([leagueItem(at)]);
+      const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+      const b = w.mkSocket('SB', BOB, 'm-bob', 'Bob');
+      await enter(a);
+      await enter(b);
+      offline(w, 'SA');
+      offline(w, 'SB');
+      w.m.tickQualifierAutoStart(at + 1000);
+      w.m.tickQualifierAutoStart(at + 59 * MIN);
+      expect(w.qualifierTournaments.get(LEAGUE).status).toBe('registering');
+      expect(w.started).toEqual([]);
+      expect(actions(w)).not.toContain('QUALIFIER_NO_SHOW_RELEASED');
+      expect(actions(w)).not.toContain('QUALIFIER_NO_SHOW_SEATED_ABSENT');
+      w.m.tickQualifierAutoStart(at + 61 * MIN);
+      await flush();
+      expect(w.qualifierTournaments.get(LEAGUE)).toMatchObject({ status: 'finished', cancelled: true });
+      // One registrant, here: never a one-player start (2 registered, as always).
+      const w2 = world();
+      w2.sync([leagueItem(at)]);
+      await enter(w2.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
+      w2.m.tickQualifierAutoStart(at + 1000);
+      expect(w2.started).toEqual([]);
+      expect(w2.qualifierTournaments.get(LEAGUE).status).toBe('registering');
+    });
+
+    it('CONTROL — the WEEKLY in the same states: the away one is released (credit refunded, master row deleted); one here + one away waits', async () => {
+      const w = world();
+      const at = Date.now() + H;
+      w.sync([weeklyItem(at)]);
+      const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+      const b = w.mkSocket('SB', BOB, 'm-bob', 'Bob');
+      const c = w.mkSocket('SC', 103, 'm-carl', 'Carl');
+      await enter(a, WEEKLY);
+      await enter(b, WEEKLY);
+      await enter(c, WEEKLY);
+      offline(w, 'SC');
+      w.m.tickQualifierAutoStart(at + 1000);
+      await flush();
+      expect(w.started).toHaveLength(1);
+      expect(w.started[0].players.map((p: any) => p.masterId).sort()).toEqual(['m-alice', 'm-bob']);
+      expect(w.audits.filter((x) => x.action === 'QUALIFIER_NO_SHOW_RELEASED').map((x) => x.d.masterId)).toEqual(['m-carl']);
+      expect(actions(w)).not.toContain('QUALIFIER_NO_SHOW_SEATED_ABSENT');
+      expect(w.creditRefunds).toHaveLength(1);
+      expect(w.fetches.filter((f) => f.method === 'DELETE')).toHaveLength(1);
+      // One here + one away: the weekly waits (2 here needed), nobody released.
+      const w2 = world();
+      w2.sync([weeklyItem(at)]);
+      await enter(w2.mkSocket('SA', ALICE, 'm-alice', 'Alice'), WEEKLY);
+      await enter(w2.mkSocket('SB', BOB, 'm-bob', 'Bob'), WEEKLY);
+      offline(w2, 'SB');
+      w2.m.tickQualifierAutoStart(at + 1000);
+      expect(w2.started).toEqual([]);
+      expect(w2.qualifierTournaments.get(WEEKLY).status).toBe('registering');
+      expect(w2.audits.map((x) => x.action)).not.toContain('QUALIFIER_NO_SHOW_RELEASED');
+    });
   });
 
   it('an overflow table of a league night is an "Online League Table"', async () => {

@@ -25,7 +25,7 @@ import {
   QUALIFIER_BASE_STACK, QUALIFIER_LATE_REG_MS, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft,
   QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel,
 } from '../src/game/qualifierSchedule';
-import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from '../src/game/qualifierNoShow';
+import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart } from '../src/game/qualifierNoShow';
 import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
 // Review fix-up (ff9a1cb) — the runtime overflow cap's X-Internal-Token check.
 import { createHash, timingSafeEqual } from 'crypto';
@@ -241,7 +241,7 @@ function world(opts: {
     // 2026-11-21 (Online League) — the event config + the finish frames' league fields (the REAL pure module).
     qualifierEventConfig: QS.qualifierEventConfig, leagueFinishFrameFields: QS.leagueFinishFrameFields,
     QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers,
-    samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS,
+    samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart,
     assertPlayable: async () => null,
     isPlayerQualified: async () => true,
     consumeQualifierCreditOnMaster: async (masterId: string, tier: string, _q: string, label: string) => {
@@ -2332,7 +2332,7 @@ function earlyRoomsWorld(opts: { leadEnv?: string; overflowMax?: number; balance
     // 2026-11-21 (Online League) — the event config + the finish frames' league fields (the REAL pure module).
     qualifierEventConfig: QS.qualifierEventConfig, leagueFinishFrameFields: QS.leagueFinishFrameFields,
     QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(),
-    samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS,
+    samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart,
     qualifierBlindLevels, qualifierBreakConfig: s4BreakConfig, qualifierTestTimeScale: s4TimeScale,
     qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate,
     partitionSuspendedRegistrants: s4PartitionSuspended,
@@ -2721,6 +2721,61 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     await flush();
     expect(w.creditRefunds).toHaveLength(4);
     expect(w.m.qualifierPreStart.dealt).toBe(0);
+  });
+
+  // 2026-11-25 (owner: "It should seat you and blind you out", Online League
+  // only) — the same states as E7 / E7b on a LEAGUE night (kind 'league'; set
+  // after the registrations, so the credits were taken as a weekly's: the
+  // point is that nothing is refunded or released).
+  it('E7c — LEAGUE night, ONE present at the start second: DEALT with everyone — the seated one who left keeps his seat, the 2 offline pending ones are seated ABSENT; nobody released, nothing refunded', async () => {
+    const { w } = await openedEarly(4, 2);                                   // S1, S2 seated; S3, S4 pending (offline)
+    w.qt().kind = 'league';
+    const tid = w.qt().tournamentId;
+    w.offline('S2');                                                         // one seated leaves: 1 present
+    jest.advanceTimersByTime(10 * S4_MIN);                                   // 11:00:00 — the hold's timer deals
+    await flush();
+    const t = w.tour();
+    expect(w.m.qualifierPreStartHolds.has(tid)).toBe(false);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.audits.map((a) => a.action)).not.toContain('QUALIFIER_NO_SHOW_RELEASED');
+    expect(w.audits.filter((a) => a.action === 'QUALIFIER_NO_SHOW_SEATED_ABSENT').map((a) => [a.d.masterId, a.d.where]).sort())
+      .toEqual([['m-2', 'deal'], ['m-3', 'deal'], ['m-4', 'deal']]);
+    expect(w.qt().players.map((p: any) => p.masterPlayerId)).toEqual(['m-1', 'm-2', 'm-3', 'm-4']);
+    expect(t.players.map((p: any) => p.playerId).sort()).toEqual(['user-1001', 'user-1002', 'user-1003', 'user-1004']);
+    // S3 / S4: a seat each, no session (absent — blinded out until a sign-in / "Go to my table").
+    const seated = (pid: string) => t.tableIds.some((id) => w.tables.get(id)!.seats.some((s) => s.state === 'occupied' && s.playerId === pid));
+    for (const pid of ['user-1002', 'user-1003', 'user-1004']) expect({ pid, seated: seated(pid) }).toEqual({ pid, seated: true });
+    // (The world's offline() leaves S2's old session behind — the real disconnect handler ends it.)
+    expect([...w.playerSessions.values()].map((s: any) => s.playerId).filter((p: string) => p === 'user-1003' || p === 'user-1004')).toEqual([]);
+    expect(w.tableAlive().reduce((a, b) => a + b, 0)).toBe(4);
+    for (const id of t.tableIds) expect(w.tables.get(id)!.handNumber).toBe(1);
+    expect(t).toMatchObject({ paused: false, pauseReason: null, levelEndsAt: S4_AT + 12 * S4_MIN });
+    expect(w.m.qualifierPreStart).toMatchObject({ dealt: 1, released: 0, dealsWaiting: 0, seatFailures: 0, holdErrors: 0 });
+    expect(w.logEvents('qualifier_prestart_deal')).toEqual([expect.objectContaining({ seated: 0, seatedAbsent: 2, released: 0, alive: 4 })]);
+    expect(w.logEvents('qualifier_no_shows_seated_absent')).toEqual([expect.objectContaining({ kind: 'league', where: 'deal', absent: 3, field: 4 })]);
+    expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
+  });
+
+  it('E7d — LEAGUE night, NOBODY present at the start second: no card and nobody released, the hold stays (as E7); one back → the next sweep deals with all four', async () => {
+    const { w } = await openedEarly(4, 2);
+    w.qt().kind = 'league';
+    const tid = w.qt().tournamentId;
+    w.offline('S1'); w.offline('S2');
+    jest.advanceTimersByTime(10 * S4_MIN);
+    await flush();
+    expect(w.m.qualifierPreStartHolds.has(tid)).toBe(true);
+    for (const id of w.tour().tableIds) expect(w.tables.get(id)!.handNumber).toBe(0);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.logEvents('qualifier_prestart_deal_waiting')).toEqual([expect.objectContaining({ present: 0, registrants: 4 })]);
+    w.mkSocket('S3', 3);                                                     // a pending one is back
+    w.m.sweepTournamentRebalances();
+    await flush();
+    expect(w.m.qualifierPreStartHolds.has(tid)).toBe(false);
+    expect(w.creditRefunds).toEqual([]);
+    expect(w.tour().players.map((p: any) => p.playerId).sort()).toEqual(['user-1001', 'user-1002', 'user-1003', 'user-1004']);
+    expect(w.playerSessions.get('S3')).toMatchObject({ playerId: 'user-1003' });
+    for (const id of w.tour().tableIds) expect(w.tables.get(id)!.handNumber).toBe(1);
+    expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
   });
 
   it('E8 — lead 0 (QUALIFIER_TABLES_OPEN_BEFORE_MIN=0): nothing opens early; the start second takes the path of before (dealt at once, no hold)', async () => {

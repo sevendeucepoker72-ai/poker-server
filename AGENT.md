@@ -1886,10 +1886,28 @@ type answers today's exact values (pinned in `tests/onlineLeague.test.ts`).
 - Everything else is the weekly's: the 50,000 stack, the same blind ladder, a
   5-minute break after every 5th level (`QUALIFIER_BREAKS` / POST
   /api/qualifiers/breaks apply), buy-in 0, overflow tables, table balancing,
-  early rooms (T-10), the no-show release at the start, help tools off, voice
+  early rooms (T-10), help tools off, voice
   off, fairness seeds held until it ends, one turn timeout sits a player out.
   The longest possible night (26 levels x 10 min + 5 breaks x 5 min = 285 min)
   ends about 10:45 PM MT.
+- **No-shows are SEATED and BLINDED OUT, never released** (owner 2026-11-25:
+  "It currently says if your not online at start you are removed. It should
+  seat you and blind you out", then "Online League only"). Rule:
+  `qualifierNoShow.noShowsSeatedAbsent(qt.kind)` (true only for `kind
+  'league'`) and `presentNeededToStart(qt.kind)` (1 for a league night, 2 for
+  the weekly / monthly). The 6:00 PM start (`tickQualifierAutoStart`) deals
+  every registrant, the absent ones with no socket (absent seats: blinds
+  posted, the 500 ms absent act checks or folds); the early rooms' deal
+  (`runPreStartDeal` step 2b) seats every absent PENDING registrant absent
+  after the present ones and keeps a seated one who left. Nothing is refunded
+  or DELETEd, no `absent_at_start` notice is queued; a sign-in restores the seat
+  by account (`restoreAbsentTournamentSeat`), and the lobby's "Go to my table"
+  works. One registrant here is enough to start (2 registered, as always);
+  NOBODY here = the wait, then the 7:00 PM cancel, as before. Audit
+  `QUALIFIER_NO_SHOW_SEATED_ABSENT`, log `qualifier_no_shows_seated_absent`,
+  health `r2Play.qualifiers.leagueNoShowsSeated {atStart, atDeal}`. Tests:
+  `tests/onlineLeague.test.ts` ("SEATS its no-shows"), `tests/r2Qualifiers.test.ts`
+  E7c / E7d. The weekly keeps the 2026-10-20 release + refund.
 - **No championship seats:** `seatsForTopOf('online_league')` = 0, so no seat
   bubble, no late close at the bubble (`qualifierLateEntryBubbleOf` null), no
   hand-for-hand. Places are the engine's bust order (same-hand busts by

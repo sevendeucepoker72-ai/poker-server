@@ -17,7 +17,7 @@ import {
 } from './game/PokerTable';
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
 import { parseMasterSchedule, MasterScheduleEntry, qualifierEventConfig, leagueFinishFrameFields, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT, QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText, QUALIFIER_HELP_TOOLS_OFF_TEXT, notQualifiedText, onlineLeagueGivesWeeklyCredits } from './game/qualifierSchedule';
-import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS } from './game/qualifierNoShow';
+import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart } from './game/qualifierNoShow';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
 import { createTournamentResultsStore, tournamentResultsStats, ResultsEntrant } from './game/tournamentResults';
@@ -3460,6 +3460,8 @@ app.get('/api/health', async (_req, res) => {
         qualifiers: {
           sync: { ...qualifierSyncStats }, registry: qualifierTournaments.size, cancellations: { ...qualifierCancellations },
           lateEntries: { ...qualifierLateEntries }, resultPosts: { ...qualifierResultPosts }, noShows: { ...qualifierNoShows },
+          // 2026-11-25 (owner) — Online League no-shows seated absent (blinded out), never released: at the start / at the early rooms' deal.
+          leagueNoShowsSeated: { ...qualifierLeagueNoShowsSeated },
           // 2026-10-22 (owner: "Build it for Sunday") — overflow tables: opened / fed /
           // first deals; live = open now; cap = QUALIFIER_OVERFLOW_TABLES_MAX in force (0 = off).
           overflow: { ...qualifierOverflow, live: qualifierOverflowTables.size, cap: qualifierOverflowCapLabel(qualifierOverflowTablesMax) },
@@ -5508,6 +5510,30 @@ function releaseQualifierNoShows(qualId: string, qt: QualifierTournamentReg, abs
 }
 
 /**
+ * 2026-11-25 (owner: "It should seat you and blind you out", Online League
+ * only — qualifierNoShow.noShowsSeatedAbsent) — a LEAGUE night's registrants
+ * who are not here at the start are NOT released: the caller seats them
+ * absent (the start's own seating in tickQualifierAutoStart; the early rooms'
+ * deal through seatPresentPendingAtDeal), and they are blinded out until a
+ * sign-in or "Go to my table" puts them back on the seat. This only counts
+ * (health r2Play.qualifiers.leagueNoShowsSeated), audits each one
+ * (QUALIFIER_NO_SHOW_SEATED_ABSENT) and logs `qualifier_no_shows_seated_absent`.
+ */
+const qualifierLeagueNoShowsSeated = { atStart: 0, atDeal: 0 };
+function noteLeagueNoShowsSeatedAbsent(qualId: string, qt: QualifierTournamentReg, absent: QualifierRegistrant[], where: 'start' | 'deal'): void {
+  if (absent.length === 0) return;
+  if (where === 'start') qualifierLeagueNoShowsSeated.atStart += absent.length;
+  else qualifierLeagueNoShowsSeated.atDeal += absent.length;
+  for (const p of absent) {
+    auditLog(p.playerId, 'QUALIFIER_NO_SHOW_SEATED_ABSENT', {
+      qualifierId: qualId, masterId: p.masterPlayerId || null, where,
+      lastSeenAt: Math.max(p.lastOnlineAt || 0, p.registeredAt || 0) || null,
+    });
+  }
+  console.warn(`[Qualifier] ${JSON.stringify({ event: 'qualifier_no_shows_seated_absent', qualifierId: qualId, kind: qt.kind || null, where, absent: absent.length, field: qt.players.length })}`);
+}
+
+/**
  * 2026-10-20 — after a sign-in: tell this socket about qualifier entries that
  * were released because the account was offline at the start
  * ('qualifierCancelled' {qualifierId, reason:'absent_at_start', qualifierName,
@@ -5607,13 +5633,21 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
     // than 2 here: nobody is released, it waits (a registrant who comes back
     // counts at the next tick) and is cancelled, everyone refunded, when late
     // registration ends — as with fewer than 2 registered.
+    // 2026-11-25 (owner: "seat you and blind you out", Online League only) —
+    // a LEAGUE night releases nobody: its absent registrants are seated with
+    // everyone below (startQualifierTournament deals a registrant with no live
+    // socket in ABSENT) and blinded out until they arrive. One registrant here
+    // is enough to start it (presentNeededToStart); 2 registered, as always.
     const { present, absent } = partitionByPresence(qt.players, now);
-    if (present.length < 2) {
+    if (present.length < presentNeededToStart(qt.kind) || qt.players.length < 2) {
       // 2026-11-21 — at the event's own late close (a league night: 7:00 PM).
       if (now > qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil) void cancelQualifierEvent(qualId, qt, 'too_few_players');
       continue;
     }
-    if (absent.length > 0) releaseQualifierNoShows(qualId, qt, absent, now);
+    if (absent.length > 0) {
+      if (noShowsSeatedAbsent(qt.kind)) noteLeagueNoShowsSeatedAbsent(qualId, qt, absent, 'start');
+      else releaseQualifierNoShows(qualId, qt, absent, now);
+    }
 
     // Time to start!
     qt.status = 'starting';
@@ -6304,7 +6338,8 @@ function preStartDealMustWait(tournamentId: string, hold: QualifierPreStartHold,
     console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: hold.qualId, tournamentId, step: 'presence', error: String(e?.message || e) })}`);
     return false;
   }
-  if (present >= 2) return false;
+  // 2026-11-25 — a league night deals with ONE registrant here (its no-shows are seated and blinded out).
+  if (present >= presentNeededToStart(qt.kind) && qt.players.length >= 2) return false;
   if (hold.timer) { clearTimeout(hold.timer); hold.timer = null; }
   if (now > qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil) {
     try {
@@ -6378,6 +6413,9 @@ function seatPresentPendingAtDeal(qualId: string, qt: QualifierTournamentReg, re
  *      told at the next sign-in) — a SEATED one is stood up first
  *      (unseatPreStartEntrant); (a defensive fallback only — (0) waits when
  *      fewer than 2 are present: then only the absent PENDING ones go);
+ *      2026-11-25 (owner) — a LEAGUE night releases nobody: (0) waits only
+ *      while NOBODY is here, and (2b) seats every absent pending one ABSENT
+ *      after (3), to be blinded out (qualifierNoShow.noShowsSeatedAbsent);
  *  (3) every present pending registrant is seated (seatPresentPendingAtDeal);
  *  (4) review fix-up — every present SEATED entrant nobody plays (back in the
  *      lobby during the hold) is put back on his seat on a free live socket
@@ -6407,6 +6445,7 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
   const qualId = hold.qualId;
   const qt = qualifierTournaments.get(qualId);
   let seated = 0;
+  let seatedAbsent = 0;   // 2026-11-25 — a league night's no-shows seated absent at the deal
   let released = 0;
   let rebound = 0;
   let breaks = 0;
@@ -6417,7 +6456,10 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
     if (qt && qt.tournamentId === tournamentId && t && t.status === 'running') {
       samplePresence(qt.players, qualifierRegistrantOnline, now);
       const { present, absent } = partitionByPresence(qt.players, now);
-      const release = present.length >= 2 ? absent : absent.filter((p) => qualifierRegistrantIsPending(tournamentId, p));
+      // 2026-11-25 (owner: "seat you and blind you out", Online League only) —
+      // a league night releases NOBODY: (2b) below seats its absent ones.
+      const keepNoShows = noShowsSeatedAbsent(qt.kind);
+      const release = keepNoShows ? [] : (present.length >= 2 ? absent : absent.filter((p) => qualifierRegistrantIsPending(tournamentId, p)));
       for (const p of release) if (!qualifierRegistrantIsPending(tournamentId, p)) unseatPreStartEntrant(tournamentId, p);
       if (release.length > 0) releaseQualifierNoShows(qualId, qt, release, now);
       released = release.length;
@@ -6425,6 +6467,19 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
       for (const p of present) {
         if (!qt.players.includes(p) || !qualifierRegistrantIsPending(tournamentId, p)) continue;
         if (seatPresentPendingAtDeal(qualId, qt, p)) seated++;
+      }
+      // (2b) 2026-11-25 — a league night's ABSENT registrants, AFTER the present
+      // ones (a seat short goes to a player who is here): every PENDING one is
+      // seated ABSENT (seatPresentPendingAtDeal finds no live socket of his and
+      // seats him with none — blinded out until a sign-in / "Go to my table";
+      // no seat at all: released 'no_seat' as for anyone). A SEATED one who left
+      // keeps his seat.
+      if (keepNoShows && absent.length > 0) {
+        noteLeagueNoShowsSeatedAbsent(qualId, qt, absent, 'deal');
+        for (const p of absent) {
+          if (!qt.players.includes(p) || !qualifierRegistrantIsPending(tournamentId, p)) continue;
+          if (seatPresentPendingAtDeal(qualId, qt, p)) seatedAbsent++;
+        }
       }
       // (4) Review fix-up — each one in its own try: one failure never blocks the deal.
       for (const p of present) {
@@ -6486,7 +6541,7 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
   }
   console.log(`[Qualifier] ${JSON.stringify({
     event: 'qualifier_prestart_deal', qualifierId: qualId, tournamentId, lateByMs: Date.now() - hold.dealsAt, tables, dealtTables,
-    seated, released, rebound, breaks, balanceMoves, alive: tournamentManager.getAliveCount(tournamentId),
+    seated, ...(seatedAbsent > 0 ? { seatedAbsent } : {}), released, rebound, breaks, balanceMoves, alive: tournamentManager.getAliveCount(tournamentId),
     ...(hold.waitingSince != null ? { waitedMs: Date.now() - hold.waitingSince } : {}), ...(error ? { error } : {}),
   })}`);
 }

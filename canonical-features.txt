@@ -2556,3 +2556,5 @@ qualifiers/schedule?kinds=league
 # 2026-11-21 repair round 2 - the not_qualified refusal never names the hidden monthly route and
 # names the Online League's top-5 weekly-credit route while a league night gives it.
 notQualifiedText
+# 2026-11-25 (owner: "It should seat you and blind you out", Online League only) - league no-shows seated absent, never released.
+QUALIFIER_NO_SHOW_SEATED_ABSENT
