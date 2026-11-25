@@ -9063,10 +9063,16 @@ function recordHandHistoryCopiesForEverySeat(
 }
 // ===== end hand-history copies =====
 
-// Target occupancy for cash tables. Keeps the game alive without hogging
-// every seat — humans walking into the lobby always see open seats at
-// every table. 5 = roughly half a 9-max, feels like a "busy" cash game.
-const CASH_TABLE_TARGET_OCCUPIED = 5;
+// Target occupancy for cash tables: bots top a table with a player at it up to
+// this many SEATED players (humans count), at the sit-down and between hands,
+// and trim back down to it as more people sit. fillWithAI / backfillAIToMin /
+// trimExcessAI always leave at least one takeable seat open, so a 9-max shows
+// 7 seated and 2 open; a table capped lower (home game / club maxSeats, a
+// variant's deck cap) fills to its cap - 1. Owner 2026-11-25: "Lets make it to
+// where bots auto fill room to 7 players" (was 5). The env var of the same name
+// overrides it (a whole number 2..8; unset or junk = 7). A table nobody sits at
+// keeps the heartbeat's floor of LIVE_ROOM_MIN_OCCUPIED (3), unchanged.
+const CASH_TABLE_TARGET_OCCUPIED: number = ((n: number) => (Number.isInteger(n) && n >= 2 && n <= MAX_SEATS - 1 ? n : 7))(Number(process.env.CASH_TABLE_TARGET_OCCUPIED));
 
 // 2026-06-11: AI seats may only be added or removed BETWEEN hands. Mutating the
 // roster mid-hand (trimming a folded bot, or a join/leave event firing a refill
@@ -10668,7 +10674,7 @@ function autoStartNextHand(tableId: string): void {
   // by default, so this is a no-op at or above cap). Skip for tournament
   // tables — they manage their own seating via the rebalance flow — and for
   // quick/heads-up tables (#5) which have a fixed roster (else a heads-up match
-  // gets backfilled to 5-handed at the first hand boundary).
+  // gets backfilled to the cash target, 7-handed, at the first hand boundary).
   const humanCount = table.seats.filter(
     (s) => s.state === 'occupied' && !s.isAI
   ).length;
