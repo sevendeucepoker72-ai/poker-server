@@ -1877,7 +1877,7 @@ type answers today's exact values (pinned in `tests/onlineLeague.test.ts`).
 | `kind` | `'qualifier'` | `'league'` |
 | `requiresQualifierCredit` | true | **false** (no `isPlayerQualified`, no consume, no refund) |
 | `maxReEntries` | `QUALIFIER_MAX_REENTRIES` (null = credits are the limit) | **1** (a 2nd re-entry: `reentry_limit` "Re-entry limit reached (1)") |
-| sign-up opens | 3 h before (8:00 AM) | **2 h before = 4:00 PM** |
+| sign-up opens | 3 h before (8:00 AM) | **3 h before = 3:00 PM** (owner 2026-11-25; was 2 h / 4:00 PM). A restart after 3:00 PM MT releases that night's registrants. |
 | late entry + re-entry close | 3 h after (2:00 PM) or the seat bubble | **60 min after = 7:00 PM** (no bubble) |
 | level length | 12 min | **10 min** |
 | tournament / table names | 'Qualifier Tournament' / 'Qualifier Table N' | 'Online League' / 'Online League Table N' (overflow tables too) |
@@ -1972,7 +1972,7 @@ type answers today's exact values (pinned in `tests/onlineLeague.test.ts`).
 - **Launch check (Wed 2026-11-25):** after the master's `ONLINE_LEAGUE_ENABLED=1`,
   the next 10-minute sync must list the night (the master's `?kinds=league`
   read creates it if missing and is never cached): `listed >= 1` here, or the
-  `online_league_night_listed` log line, BEFORE 4:00 PM MT.
+  `online_league_night_listed` log line, BEFORE 3:00 PM MT (sign-up opens then).
 - **Tests:** `tests/onlineLeague.test.ts`. **Manifest:** `qualifierEventConfig`,
   `online_league`, `requiresCredit:`, `isBroadcastableQualifier`,
   `qualifiers/schedule?kinds=league`.

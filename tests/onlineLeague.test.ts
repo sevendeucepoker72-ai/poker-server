@@ -8,7 +8,7 @@
  *
  *  - free: no qualifier credit is checked or consumed, buy-in 0;
  *  - ONE re-entry (a 2nd is refused 'reentry_limit');
- *  - sign-up opens at 4:00 PM (2 h before), late entry and the re-entry until
+ *  - sign-up opens at 3:00 PM (3 h before; owner 2026-11-25, was 2 h), late entry and the re-entry until
  *    7:00 PM (1 h after), 10-minute levels, a 5-minute break every 5 levels,
  *    the weekly's 50,000 stack, no seats / bubble / hand-for-hand;
  *  - never broadcast (it never takes the weekly / main channels);
@@ -67,7 +67,7 @@ const QUALIFIER_CFG = {
 };
 const LEAGUE_CFG = {
   kind: 'league', requiresQualifierCredit: false, maxReEntries: 1,
-  signupOpensBeforeMs: 2 * H, lateRegMs: 60 * MIN, levelMinutes: 10,
+  signupOpensBeforeMs: 3 * H, lateRegMs: 60 * MIN, levelMinutes: 10,
   tournamentName: 'Online League', tableLabel: 'Online League Table', noun: 'Online League game',
 };
 
@@ -107,23 +107,24 @@ describe('qualifierSchedule (pure): the event config, windows, structure and the
       .toEqual({ kind: 'league', leagueId: null, leaguePoints: null, leaguePrize: null, leagueAwardsMinField: null, field: 0 });
   });
 
-  it('qualifierWindows: no type === \'weekly\' === today, byte for byte; the league opens 2 h before (4:00 PM) and closes 60 min after (7:00 PM)', () => {
+  it('qualifierWindows: no type === \'weekly\' === today, byte for byte; the league opens 3 h before (3:00 PM) and closes 60 min after (7:00 PM)', () => {
     const at = Date.parse('2026-11-29T18:00:00.000Z');           // Sun 11:00 AM MST
     expect(JSON.stringify(qualifierWindows(at))).toBe(JSON.stringify(qualifierWindows(at, 'weekly')));
     expect(qualifierWindows(at)).toEqual({ signupOpensAt: at - 3 * H, signupClosesAt: at + 3 * H, lateRegUntil: at + 3 * H });
     for (const t of ['monthly', 'toc', 'console_weekly']) expect(qualifierWindows(at, t)).toEqual(qualifierWindows(at));
     const w = qualifierWindows(FIRST_NIGHT, 'online_league');
-    expect(new Date(w.signupOpensAt).toISOString()).toBe('2026-11-25T23:00:00.000Z');     // 4:00 PM MST
+    expect(new Date(w.signupOpensAt).toISOString()).toBe('2026-11-25T22:00:00.000Z');     // 3:00 PM MST
     expect(new Date(w.lateRegUntil).toISOString()).toBe('2026-11-26T02:00:00.000Z');      // 7:00 PM MST
     expect(w.signupClosesAt).toBe(w.lateRegUntil);
   });
 
   it('qualifierStatusOf follows the type\'s signup window', () => {
-    const now = FIRST_NIGHT - 150 * MIN;                          // 3:30 PM: inside the weekly's 3 h, before the league's 2 h
+    const now = FIRST_NIGHT - 150 * MIN;                          // 3:30 PM: inside the weekly's 3 h AND the league's 3 h (owner 2026-11-25)
     expect(qualifierStatusOf('pending', FIRST_NIGHT, now)).toBe('registering');
     expect(qualifierStatusOf('pending', FIRST_NIGHT, now, 'weekly')).toBe('registering');
-    expect(qualifierStatusOf('pending', FIRST_NIGHT, now, 'online_league')).toBe('scheduled');
-    expect(qualifierStatusOf('pending', FIRST_NIGHT, FIRST_NIGHT - 119 * MIN, 'online_league')).toBe('registering');
+    expect(qualifierStatusOf('pending', FIRST_NIGHT, now, 'online_league')).toBe('registering');
+    expect(qualifierStatusOf('pending', FIRST_NIGHT, FIRST_NIGHT - 181 * MIN, 'online_league')).toBe('scheduled');   // 2:59 PM
+    expect(qualifierStatusOf('pending', FIRST_NIGHT, FIRST_NIGHT - 179 * MIN, 'online_league')).toBe('registering'); // 3:01 PM
     expect(qualifierStatusOf('running', FIRST_NIGHT, now, 'online_league')).toBe('running');
   });
 
@@ -490,7 +491,7 @@ describe('the lobby list: league items only for a caller that asks', () => {
     expect(league).toMatchObject({
       qualifierId: LEAGUE, type: 'online_league', name: 'Online League — Wed, Nov 25', kind: 'league', requiresCredit: false,
       leagueId: LEAGUE_ID, leaguePoints: true, leaguePrize: 'chair_month', leagueAwardsMinField: 1, maxReEntries: 1,
-      scheduledAt: new Date(at).toISOString(), signupOpensAt: new Date(at - 2 * H).toISOString(),
+      scheduledAt: new Date(at).toISOString(), signupOpensAt: new Date(at - 3 * H).toISOString(),
       signupClosesAt: new Date(at + H).toISOString(), lateRegUntil: new Date(at + H).toISOString(),
       status: 'registering', seatsForTop: 0, seatPackage: null, lateRegClosesAtBubble: false,
     });
@@ -506,9 +507,13 @@ describe('the lobby list: league items only for a caller that asks', () => {
     expect([...w.stubbed].filter((n) => /qualifierEventConfig|qualifierWindows|qualifierStatusOf|qualifierStructure|onlineLeagueStats/.test(n))).toEqual([]);
   });
 
-  it('signup opens at 4:00 PM: 2.5 h before the start the league card says scheduled (the weekly would say registering)', () => {
+  it('signup opens at 3:00 PM: 3.5 h before the start the league card says scheduled; 2.5 h before it says registering', () => {
+    const w0 = world();
+    const at0 = Date.now() + 150 * MIN;
+    w0.sync([leagueItem(at0)]);
+    expect(w0.m.qualifierList(null, Date.now(), { includeLeague: true })[0].status).toBe('registering');
     const w = world();
-    const at = Date.now() + 150 * MIN;
+    const at = Date.now() + 210 * MIN;
     w.sync([leagueItem(at)]);
     expect(w.m.qualifierList(null, Date.now(), { includeLeague: true })[0].status).toBe('scheduled');
   });
@@ -615,13 +620,13 @@ describe('registerQualifierTournament: the league is FREE (no credit), ONE re-en
     expect(onlineLeagueGivesWeeklyCredits(new Map([['x', { qualifierType: 'online_league', leaguePoints: true }]]).values())).toBe(true);
   });
 
-  it('sign-up before 4:00 PM is refused signup_not_open (2 h, not 3 h); after 7:00 PM signup_closed — no credit ever touched', async () => {
+  it('sign-up before 3:00 PM is refused signup_not_open (3 h; owner 2026-11-25); after 7:00 PM signup_closed — no credit ever touched', async () => {
     const w = world();
-    const at = Date.now() + 150 * MIN;
+    const at = Date.now() + 210 * MIN;
     w.sync([leagueItem(at)]);
     const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
     await enter(a);
-    expect(w.last('SA')).toEqual(expect.objectContaining({ success: false, code: 'signup_not_open', signupOpensAt: new Date(at - 2 * H).toISOString() }));
+    expect(w.last('SA')).toEqual(expect.objectContaining({ success: false, code: 'signup_not_open', signupOpensAt: new Date(at - 3 * H).toISOString() }));
     const { w: w2 } = runningLeague(50 * MIN);
     const b = w2.mkSocket('SB', BOB, 'm-bob', 'Bob');
     const realNow = Date.now;

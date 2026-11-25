@@ -4032,7 +4032,7 @@ function applyQualifierSchedule(list: MasterScheduleEntry[], now: number): void 
     listed.add(q.id);
     // 2026-11-21 (Online League, owner) — the event's rules come from its TYPE
     // (qualifierEventConfig): an 'online_league' night is free (no credit), ONE
-    // re-entry, sign-up 4:00 PM, late entry until 7:00 PM, 10-minute levels. Every
+    // re-entry, sign-up 3:00 PM, late entry until 7:00 PM, 10-minute levels. Every
     // other type: exactly the values (and the registry entry) of before.
     const cfg = qualifierEventConfig(q.type);
     const existing = qualifierTournaments.get(q.id);
@@ -4138,7 +4138,7 @@ function qualifierEventFor(qualifierId: unknown): [string, QualifierTournamentRe
 function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, viewerMasterId: string | null): Record<string, unknown> {
   const at = new Date(qt.scheduledAt).getTime();
   // 2026-11-21 (Online League, owner) — the event's rules from its type
-  // (qualifierEventConfig): its windows (a league night: 4:00 PM / 7:00 PM), its
+  // (qualifierEventConfig): its windows (a league night: 3:00 PM / 7:00 PM), its
   // structure (10-minute levels), its kind and whether an entry needs a credit.
   const cfg = qualifierEventConfig(qt.qualifierType);
   const isLeague = cfg.kind === 'league';
@@ -15138,7 +15138,7 @@ io.on('connection', (socket: Socket) => {
     // (2026-10-22 owner: 3 hours, 11:00 AM start → 2:00 PM Denver; was 90 min).
     const scheduledTime = new Date(qt.scheduledAt).getTime();
     const now = Date.now();
-    // 2026-11-21 — the event's own windows (a league night: 4:00 PM / 7:00 PM).
+    // 2026-11-21 — the event's own windows (a league night: 3:00 PM / 7:00 PM).
     const windows = qualifierWindows(scheduledTime, qt.qualifierType);
     if (qt.status === 'finished') {
       refuseQualifier('registration_closed', qt.cancelled ? `This ${qCfg.noun} was cancelled.` : `This ${qCfg.noun} has finished.`);

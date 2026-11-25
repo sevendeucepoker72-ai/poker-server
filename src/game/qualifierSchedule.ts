@@ -50,7 +50,7 @@ export const ONLINE_LEAGUE_TYPE = 'online_league';
  * 2026-11-21 — the rules an online event runs by, from its TYPE. The ONE place
  * they live (qualifierEventConfig): every existing type keeps today's exact
  * values; the Online League is free (no qualifier credit checked or consumed),
- * ONE re-entry, sign-up from 4:00 PM, late entry and the re-entry until 7:00 PM,
+ * ONE re-entry, sign-up from 3:00 PM, late entry and the re-entry until 7:00 PM,
  * 10-minute levels.
  */
 export interface QualifierEventConfig {
@@ -73,8 +73,8 @@ export interface QualifierEventConfig {
   noun: string;
 }
 
-/** Online League sign-up: 2 hours before the 6:00 PM start = 4:00 PM MT (owner 2026-11-21). */
-export const ONLINE_LEAGUE_SIGNUP_OPENS_BEFORE_MS = 2 * 60 * 60 * 1000;
+/** Online League sign-up: 3 hours before the 6:00 PM start = 3:00 PM MT (owner 2026-11-25: "signup should be 3 hours before"; was 2 h / 4:00 PM). Change together with the API's ONLINE_LEAGUE_SIGNUP_OPENS_BEFORE_MINUTES (utils/onlineLeague.js) and the .online card / rules text. */
+export const ONLINE_LEAGUE_SIGNUP_OPENS_BEFORE_MS = 3 * 60 * 60 * 1000;
 /** Online League late entry + the re-entry: until 1 hour after the start = 7:00 PM MT (owner 2026-11-21). */
 export const ONLINE_LEAGUE_LATE_REG_MS = 60 * 60 * 1000;
 /** Online League levels: 10 minutes (owner 2026-11-21). Breaks are the weekly's: 5 minutes after every 5th level. */
@@ -366,7 +366,7 @@ export function qualifierReEntriesLeft(creditsHeld: number | null, cap: number |
 /**
  * 2026-11-21 (Online League) — `type` (the event's qualifierType): its own windows
  * (qualifierEventConfig). No type / any qualifier type = today's 3 h / 3 h, byte for
- * byte; 'online_league' = sign-up 2 h before (4:00 PM), closes 60 min after (7:00 PM).
+ * byte; 'online_league' = sign-up 3 h before (3:00 PM), closes 60 min after (7:00 PM).
  */
 export function qualifierWindows(scheduledAt: number, type?: unknown): { signupOpensAt: number; signupClosesAt: number; lateRegUntil: number } {
   const cfg = qualifierEventConfig(type);
