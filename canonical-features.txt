@@ -2558,3 +2558,16 @@ qualifiers/schedule?kinds=league
 notQualifiedText
 # 2026-11-25 (owner: "It should seat you and blind you out", Online League only) - league no-shows seated absent, never released.
 QUALIFIER_NO_SHOW_SEATED_ABSENT
+# 2026-11-25 (owner: "for all online tournaments to be able to see who is registered in the lobby and a list for it to show
+# who busted in each position") - lobby lists (src/game/lobbyLists.ts). Qualifier items (socket list only; REST stays name-free)
+# and tournament items carry registrantNames (PUBLIC names via publicNameOf, registration order, each entry once, <= 300) and
+# resultsTournamentId (+ qualifier resultsQualifierId); getTournamentStandings answers a FINISHED tournament from the roster
+# TournamentManager keeps >= 24 h (25 h, <= 200 rosters). Health r2Play.lobbyLists. tests/lobbyLists.test.ts.
+registrantNames:
+resultsTournamentId:
+resultsQualifierId
+function registrantNamesOf(
+function qualifierResultsPointer(
+function qualifierLobbyListFields(
+finished_standings_note_failed
+r2Play.lobbyLists

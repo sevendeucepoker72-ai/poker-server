@@ -19,6 +19,7 @@
  * handler with a throwing liveBotChips answers 503 (see CONTROL (4)).
  */
 import { slice, load } from './helpers/indexSource';
+import { TournamentManager } from '../src/game/TournamentManager';
 
 const HELPER = slice('const healthSectionStats = { errors: 0 };', '\n}\n');
 const ROUTE = slice("app.get('/api/health', async (_req, res) => {", '\n});\n');
@@ -56,6 +57,9 @@ function health(opts: Opts = {}) {
     // qualifier registry and its counters.
     qualifierTournaments: new Map(),
     onlineLeagueStats: { eventsOpened: 0, listRequests: 0, entries: 0, reEntries: 0, reEntryRefused: 0, cancelled: 0, finished: 0 },
+    // 2026-11-25 (owner: lobby lists) — r2Play.lobbyLists (a healthSection) reads the REAL
+    // TournamentManager's kept finished rosters.
+    tournamentManager: new TournamentManager(),
     console: { log() {}, warn() {}, error: (m: unknown) => errors.push(String(m)) },
   };
   load(`${HELPER}\n${ROUTE}`, scope, '{}');
@@ -86,6 +90,7 @@ describe('/api/health — the bots-review sections are built fail-safe; the depl
     expect(body.engine.commentary).toEqual({ keyConfigured: !!process.env.ANTHROPIC_API_KEY, minIntervalMs: 60000, calls: 0, delivered: 0, emptyReplies: 0, failed: 0, skippedNoAudience: 3 });
     expect(body.r2Play.quickGames).toMatchObject({ live: 1, byFormat: { spinGo: { started: 1, humanWins: 1 } } });
     expect(body.r2Play.clubTables).toMatchObject({ idleDealsSkipped: 4 });
+    expect(body.r2Play.lobbyLists).toEqual({ noted: 0, served: 0, expired: 0, evicted: 0, noteErrors: 0, kept: 0 });   // 2026-11-25
     expect(body.healthSectionErrors).toBe(0);
     expect(h.errors).toEqual([]);
   });

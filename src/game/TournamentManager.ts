@@ -1,4 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
+import { FinishedStandingsStore, FinishedStandingsRecord, registrantNamesOf } from './lobbyLists';
 
 export interface BlindLevel {
   sb: number;
@@ -438,6 +439,15 @@ export class TournamentManager {
    * consumed, so this is the second lock).
    */
   readonly lateEntryBubbleStats = { closed: 0, resolverErrors: 0, lockRefusals: 0 };
+  /**
+   * 2026-11-25 (owner: "a list for it to show who busted in each position") —
+   * every FINISHED tournament's roster, kept >= 24 h after its finish
+   * (src/game/lobbyLists.ts; bounded). getTournamentStandings answers from it
+   * once this record is dropped (a template 10 s after its finish, any other an
+   * hour after), and the lobby items' resultsTournamentId points into it.
+   * Health r2Play.lobbyLists (finishedStandingsHealth).
+   */
+  private readonly finishedStandings = new FinishedStandingsStore();
 
   constructor() {
     this.createTemplateTournaments();
@@ -547,6 +557,8 @@ export class TournamentManager {
       this.dropTournament(id);
       dropped.push(id);
     }
+    // 2026-11-25 — kept finished rosters past their 24 h+ window go too (the 10 s sweep calls this).
+    this.finishedStandings.prune(now);
     return dropped;
   }
 
@@ -627,6 +639,19 @@ export class TournamentManager {
         // tournament's fairness seeds until it ends (index.ts fairnessSeedHoldOf) and
         // keeps every hand of it 7 days. Absent on an older server.
         seedsHeldUntilEnd: true,
+        // 2026-11-25 (owner: "see who is registered in the lobby") — additive:
+        // registrantNames = the PUBLIC names of the field in registration order
+        // (lobbyLists.registrantNamesOf: publicNameOf, each entry once, at most
+        // REGISTRANT_NAMES_MAX — registeredPlayers is the full count; never an id,
+        // a login or a phone). Only on items this viewer sees (a club tournament:
+        // its own entrants, above).
+        registrantNames: registrantNamesOf(t.players.map((p) => ({ key: p.playerId, name: p.playerName }))),
+        // 2026-11-25 (owner: "a list ... who busted in each position") — additive:
+        // the tournament whose finish order this card opens (socket
+        // getTournamentStandings {tournamentId}): its own while running / finished,
+        // else the latest finished instance of the same template still kept
+        // (>= 24 h), else null.
+        resultsTournamentId: this.resultsTournamentIdOf(id, t),
         // F21 (2026-10-24) — the structure, for the lobby card / detail (additive):
         // the starting stack, the one level length in seconds (null when the
         // levels differ) and every level.
@@ -677,6 +702,65 @@ export class TournamentManager {
     if (!p || !p.eliminated || !(p.finishPosition > 0) || p.tieGroup !== undefined || p.disqualified) return null;
     const row = this.payoutTableOf(t).payouts.find((x) => x.place === p.finishPosition);
     return row && row.amount > 0 ? row.amount : null;
+  }
+
+  /** 2026-11-25 — the card a finished roster belongs to: its template, else the tournament itself. */
+  private standingsCardKeyOf(tournamentId: string, t: Tournament): string {
+    return t.config.fromTemplate ? `template:${t.config.name}` : `tournament:${tournamentId}`;
+  }
+
+  /** 2026-11-25 — a lobby item's resultsTournamentId (see getTournamentList). */
+  private resultsTournamentIdOf(tournamentId: string, t: Tournament): string | null {
+    if (t.status === 'running' || t.status === 'finished') return tournamentId;
+    if (t.status !== 'registering') return null;
+    return this.finishedStandings.latestIdFor(this.standingsCardKeyOf(tournamentId, t));
+  }
+
+  /**
+   * 2026-11-25 — getTournamentStandings can answer for this id: a live record
+   * (any status), or a finished roster still kept. index.ts's qualifier list
+   * points its resultsTournamentId only at ids this answers true for.
+   */
+  hasStandings(tournamentId: string, now: number = Date.now()): boolean {
+    return this.tournaments.has(tournamentId) || this.finishedStandings.has(tournamentId, now);
+  }
+
+  /** 2026-11-25 — health r2Play.lobbyLists: the kept finished rosters (see lobbyLists.FinishedStandingsStats) + how many are kept now. */
+  finishedStandingsHealth(): Record<string, number> {
+    return { ...this.finishedStandings.stats, kept: this.finishedStandings.size };
+  }
+
+  /**
+   * 2026-11-25 — record a FINISHED tournament's roster (the
+   * getTournamentStandings shape: everyone has his place, so no live stack is
+   * read). Called by finishTournament before 'tournamentFinished' is emitted;
+   * never throws (a failure is counted + logged and the finish goes on).
+   */
+  private noteFinishedStandings(tournamentId: string, t: Tournament): void {
+    try {
+      const rec: FinishedStandingsRecord = {
+        tournamentId,
+        name: t.config.name,
+        status: 'finished',
+        eliminationOrder: [...(t.eliminationOrder || [])],
+        players: t.players.map((p) => {
+          const placed = !!p.finishPosition && p.finishPosition > 0;
+          const out = !!p.eliminated || placed;
+          return {
+            playerId: p.playerId,
+            playerName: p.playerName,
+            chipCount: out ? 0 : (p.chips ?? 0),
+            finishPosition: placed ? p.finishPosition : null,
+          };
+        }),
+        finishedAt: t.finishedAt ?? Date.now(),
+        cardKey: this.standingsCardKeyOf(tournamentId, t),
+      };
+      this.finishedStandings.note(rec);
+    } catch (e: any) {
+      this.finishedStandings.stats.noteErrors++;
+      console.warn(`[Tournament] ${JSON.stringify({ event: 'finished_standings_note_failed', tournamentId, error: String(e?.message || e) })}`);
+    }
   }
 
   /** F8 — the stall-cancel fields of a lobby item (see getTournamentList). */
@@ -1612,6 +1696,11 @@ export class TournamentManager {
       ...(r.tied ? { tied: true } : {}), ...(r.disqualified ? { disqualified: true } : {}),
     }));
 
+    // 2026-11-25 (owner: "a list ... who busted in each position") — the finish
+    // order kept >= 24 h (this record is dropped 10 s / 1 h from now), BEFORE the
+    // event: a listener that asks for the standings already finds them. Never throws.
+    this.noteFinishedStandings(tournamentId, tournament);
+
     this.emitEvent(tournamentId, 'tournamentFinished', {
       tournamentId,
       results,
@@ -1856,6 +1945,13 @@ export class TournamentManager {
    * the start/alive value 0 -> null. TournamentPlayer.chips is start-only, so we
    * resolve each alive player's LIVE stack from their seat via playerTableMap +
    * tableManager. Eliminated players report 0.
+   *
+   * 2026-11-25 (owner: "a list ... who busted in each position") — a FINISHED
+   * tournament answers too: from its live record while it is kept (+ additive
+   * `finishedAt`), then from the roster finishTournament kept (>= 24 h,
+   * lobbyLists.FinishedStandingsStore) once the record is dropped. Places are
+   * always the STORED finishPosition (ties, hand-for-hand, late-entry shifts:
+   * whatever the engine recorded), never recomputed.
    */
   getTournamentStandings(tournamentId: string, tableManager: any): {
     tournamentId: string;
@@ -1863,9 +1959,18 @@ export class TournamentManager {
     status: TournamentStatus;
     eliminationOrder: string[];
     players: { playerId: string; playerName: string; chipCount: number; finishPosition: number | null }[];
+    finishedAt?: number;
   } | null {
     const t = this.tournaments.get(tournamentId);
-    if (!t) return null;
+    if (!t) {
+      const kept = this.finishedStandings.get(tournamentId);
+      if (!kept) return null;
+      this.finishedStandings.stats.served++;
+      return {
+        tournamentId: kept.tournamentId, name: kept.name, status: kept.status,
+        eliminationOrder: kept.eliminationOrder, players: kept.players, finishedAt: kept.finishedAt,
+      };
+    }
     const players = t.players.map((p) => {
       const eliminated = !!p.eliminated || (p.finishPosition && p.finishPosition > 0);
       let chipCount = 0;
@@ -1896,6 +2001,8 @@ export class TournamentManager {
       status: t.status,
       eliminationOrder: t.eliminationOrder || [],
       players,
+      // 2026-11-25 — additive, a finished tournament only: when it finished (ms).
+      ...(t.status === 'finished' && t.finishedAt !== null ? { finishedAt: t.finishedAt } : {}),
     };
   }
 }

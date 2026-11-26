@@ -18,6 +18,7 @@ import {
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
 import { parseMasterSchedule, MasterScheduleEntry, qualifierEventConfig, leagueFinishFrameFields, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT, QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText, QUALIFIER_HELP_TOOLS_OFF_TEXT, notQualifiedText, onlineLeagueGivesWeeklyCredits } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart } from './game/qualifierNoShow';
+import { registrantNamesOf, qualifierResultsPointer } from './game/lobbyLists';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
 import { createTournamentResultsStore, tournamentResultsStats, ResultsEntrant } from './game/tournamentResults';
@@ -3513,6 +3514,11 @@ app.get('/api/health', async (_req, res) => {
         // getClubTables from a non-member that would have (re)created a table (the list
         // is still answered); idleDealsSkipped = a club table nobody sits at not dealt.
         clubTables: healthSection('r2Play.clubTables', () => ({ ...clubTableRuntimeStats })),
+        // 2026-11-25 (owner: who is registered / who busted in each position) — the
+        // finished rosters kept >= 24 h (lobbyLists.ts): noted / served (answered after
+        // the live record was dropped) / expired / kept now; evicted (the size bound)
+        // and noteErrors should stay 0.
+        lobbyLists: healthSection('r2Play.lobbyLists', () => ({ ...tournamentManager.finishedStandingsHealth() })),
       },
       // Fix round 2 — sections above that answered { error } instead of failing this response (counted; last, so this one is in it).
       healthSectionErrors: healthSectionStats.errors,
@@ -4258,19 +4264,48 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
 }
 
 /**
+ * 2026-11-25 (owner: "for all online tournaments to be able to see who is
+ * registered in the lobby and a list for it to show who busted in each
+ * position") — the additive lobby-list fields of one qualifier item
+ * (src/game/lobbyLists.ts):
+ *  - resultsTournamentId / resultsQualifierId (every item, socket AND REST):
+ *    the tournament whose finish order the card opens (socket
+ *    getTournamentStandings {tournamentId}) and the event it belongs to — its
+ *    own while it runs / once it finished played, else (scheduled /
+ *    registering) the latest finished played event of the SAME type whose
+ *    standings TournamentManager still has (kept >= 24 h), else null; a
+ *    cancelled event: null.
+ *  - registrantNames (only `withNames`: the socket lobby list): the PUBLIC
+ *    names (publicNameOf, via registrantNamesOf) of the registrations in
+ *    registration order, each account once (a re-entry is the same
+ *    registration), at most REGISTRANT_NAMES_MAX (`players` is the count); [] for a
+ *    cancelled event (everyone was released). Never an id, master id, login
+ *    handle or phone. The anonymous REST list stays name-free (R2 C3).
+ */
+function qualifierLobbyListFields(id: string, qt: QualifierTournamentReg, withNames: boolean, now: number = Date.now()): Record<string, unknown> {
+  const pointer = qualifierResultsPointer(id, qt, qualifierTournaments.entries(), (tid) => tournamentManager.hasStandings?.(tid, now) === true);
+  if (!withNames) return { ...pointer };
+  const registrantNames = qt.cancelled ? [] : registrantNamesOf(qt.players.map((p) => ({ key: p.masterPlayerId || p.playerId, name: p.playerName })));
+  return { ...pointer, registrantNames };
+}
+
+/**
  * C3 — every listed qualifier (finished ones for a day, for their results), soonest first.
  * 2026-10-23 (qualifier lifecycle S4) — + additive, ONLY while the tables are
  * open and held before the first deal (the early rooms): tablesOpen: true,
  * dealsAt (ISO, the start second); absent otherwise (poker-3d reads absent as
  * false / null). The REST item (/api/qualifier-tournaments/:id) adds the same.
  */
-function qualifierList(viewerMasterId: string | null, now: number = Date.now(), opts: { includeLeague?: boolean } = {}): Array<Record<string, unknown>> {
+function qualifierList(viewerMasterId: string | null, now: number = Date.now(), opts: { includeLeague?: boolean; withNames?: boolean } = {}): Array<Record<string, unknown>> {
   return [...qualifierTournaments.entries()]
     .sort((a, b) => new Date(a[1].scheduledAt).getTime() - new Date(b[1].scheduledAt).getTime())
     .map(([id, qt]): Record<string, unknown> => ({
       ...qualifierListItem(id, qt, now, viewerMasterId),
       // (Held = the 'prestart' pause, which only the early rooms set.)
       ...((!!qt.tournamentId && tournamentManager.getTournament(qt.tournamentId)?.pauseReason === 'prestart') ? qualifierTablesOpenFields(qt) : {}),
+      // 2026-11-25 (owner) — the lobby lists: resultsTournamentId / resultsQualifierId on
+      // every item; registrantNames only for opts.withNames (the socket lobby list).
+      ...qualifierLobbyListFields(id, qt, opts.withNames === true, now),
     }))
     // 2026-11-21 (Online League, owner) — league items ONLY for a caller that asks
     // (opts.includeLeague: socket {kinds:['league']} / REST ?kinds=league). An older
@@ -5462,6 +5497,8 @@ app.get('/api/qualifier-tournaments/:qualifierId', (req, res) => {
     tournament: {
       ...qualifierListItem(found[0], heldQt, Date.now(), null),
       ...((!!heldQt.tournamentId && tournamentManager.getTournament(heldQt.tournamentId)?.pauseReason === 'prestart') ? qualifierTablesOpenFields(heldQt) : {}),
+      // 2026-11-25 — + resultsTournamentId / resultsQualifierId, as the list (no names: anonymous REST).
+      ...qualifierLobbyListFields(found[0], heldQt, false),
     },
   });
 });
@@ -15894,7 +15931,8 @@ io.on('connection', (socket: Socket) => {
     const kinds = data?.kinds;
     const includeLeague = Array.isArray(kinds) && kinds.includes('league');
     if (includeLeague) onlineLeagueStats.listRequests++;
-    socket.emit('qualifierTournamentList', qualifierList(viewerMasterId, Date.now(), { includeLeague }));
+    // 2026-11-25 (owner) — + registrantNames (public names) on every item of the lobby's list.
+    socket.emit('qualifierTournamentList', qualifierList(viewerMasterId, Date.now(), { includeLeague, withNames: true }));
   });
 
   // ========== Tournament Spectator Mode ==========
