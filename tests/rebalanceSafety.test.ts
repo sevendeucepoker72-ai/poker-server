@@ -477,7 +477,11 @@ describe('P1 — a rebalance never leaves an alive entrant without a seat', () =
     expect(w.tables.get('TA')!.seats.filter((s) => s.state === 'occupied')).toHaveLength(9);   // 6 + 3 busted
   });
 
-  it('a short table that cannot be broken DEALS (it used to wait for a rebalance that never came — a stall)', () => {
+  // FIX 1 (owner 2026-11-25: "While 2 or more tables are in play, a tournament table must never deal
+  // with fewer than 4 players") — this pin is about 4 alive, which still deals. With 1-3 alive the
+  // table is HELD now, but never the stall below: the short-table fill always brings it to 4 (or a
+  // break takes it) — FIX1-1 .. FIX1-10 and H-FIX1 at the end of the S2 block / the H block.
+  it('a short table (4 alive) that cannot be broken DEALS (it used to wait for a rebalance that never came — a stall)', () => {
     const w = world({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 4, 5000, 200) } });
     const TB = w.tables.get('TB')!;
     (TB as any).currentPhase = GamePhase.HandComplete;
@@ -490,7 +494,8 @@ describe('P1 — a rebalance never leaves an alive entrant without a seat', () =
   it('CONTROL — the pre-P1 guard (< 5 alive → wait for a rebalance) never deals that table', () => {
     const NEW = 'if (aliveOnTable < 5 && planTournamentRebalance(tId)) {';
     expect(P.autoStart).toContain(NEW);
-    // The P1 plan says "no break possible"; the old guard waits for one anyway — forever.
+    // The P1 plan says "no break possible"; the old guard waits for one anyway — forever. (FIX 1's
+    // hold differs: it waits only below 4, and only while its fill — which always exists — has not run.)
     const w = world({ layout: { TA: field('a', 6, 5000, 100), TB: field('b', 4, 5000, 200) }, over: { autoStart: P.autoStart.replace(NEW, 'if (aliveOnTable < 5) {') } });
     const TB = w.tables.get('TB')!;
     (TB as any).currentPhase = GamePhase.HandComplete;
@@ -4152,12 +4157,17 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
   }
   const dealt = (t: PokerTable) => t.seats.filter((s) => s.state === 'occupied' && !s.eliminated && s.holeCards.length === 2).length;
 
-  it('C1 — the lone entrant is FED at the fullest table\'s hand boundary: the player due the big blind moves (TDA), his stack exact, every pointer follows him; TL deals its first hand, TA deals 8-handed', () => {
+  // FIX 1 (owner 2026-11-25: "a tournament table must never deal with fewer than 4 players" while 2+
+  // tables play) — the feed still moves ONE player (its own rules, unchanged), but TL is held at 2:
+  // the short-table fill that runs right after the feed tops it up to 4 from the same boundary, and
+  // TL's first hand is 4-handed (it used to be heads-up).
+  it('C1 — the lone entrant is FED at the fullest table\'s hand boundary: the player due the big blind moves (TDA), his stack exact, every pointer follows him; FIX 1: TL is held at 2, the fill brings it to 4 (the next big-blind-due seats), TL deals its first hand 4-handed, TA deals 6-handed', async () => {
     const x = lone();
     const { w, TA, TL } = x;
     handOn(TA);
     expect(TA.previousBigBlindSeat).toBe(2);                                  // a3 is due the big blind next
     const a3Stack = TA.seats[3].chipCount;
+    const stacks = [4, 5].map((i) => TA.seats[i].chipCount);
     const total = w.chipsInPlay();
     // Stale pointers at TA:3 that are not his: another account's reservation, a dead socket's extra-table session.
     w.reservedSeats.set(999, { tableId: 'TA', seatIndex: 3, playerName: 'ghost', chips: 0, expiresAt: Date.now() + 3600e3, cleanupTimer: setTimeout(() => {}, 1e9), handsRemaining: 20, tournament: true });
@@ -4168,12 +4178,18 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     expect(TA.seats[3].state).toBe('empty');
     expect(TL.seats[1]).toMatchObject({ state: 'occupied', playerId: 'a3', isAI: false });
     expect(TL.seats[1].chipCount + TL.seats[1].totalInvestedThisHand).toBe(a3Stack);
+    // FIX 1 — the fill: a4 and a5 (the next seats due TA's big blind) take TL's next seats, stacks exact.
+    expect([2, 3].map((i) => TL.seats[i].playerId)).toEqual(['a4', 'a5']);
+    expect([2, 3].map((i) => TL.seats[i].chipCount + TL.seats[i].totalInvestedThisHand)).toEqual(stacks);
     expect(w.chipsInPlay()).toBe(total);                                      // nothing minted, nothing lost
     const sock = w.live.get('S-a3');
     expect(w.playerSessions.get('S-a3')).toMatchObject({ tableId: 'TL', seatIndex: 1 });
     expect(sock.rooms.has('table:TL')).toBe(true);
     expect(sock.rooms.has('table:TA')).toBe(false);
     expect(sock.emitted.filter(([ev]: [string]) => ev === 'playerMoved')).toEqual([['playerMoved', { fromTable: 'TA', toTable: 'TL', toSeat: 1, tableId: 'TL' }]]);
+    // The fill's movers are told why (additive 'playerMoved' reason).
+    expect(w.live.get('S-a4').emitted.filter(([ev]: [string]) => ev === 'playerMoved'))
+      .toEqual([['playerMoved', { fromTable: 'TA', toTable: 'TL', toSeat: 2, tableId: 'TL', reason: 'short_table' }]]);
     // Nothing points at TA:3 any more (a seat a later mover or late entrant takes).
     expect([...w.playerSessions.values()].filter((s) => s.tableId === 'TA' && s.seatIndex === 3)).toEqual([]);
     expect([...w.multiTableSessions.values()].flat().filter((s) => s.tableId === 'TA' && s.seatIndex === 3)).toEqual([]);
@@ -4181,32 +4197,38 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     expect(x.sitOutTracker.get('TA')?.has(3) ?? false).toBe(false);
     expect(x.pendingSeatRemovalAfterHand.get('TA')?.has(3) ?? false).toBe(false);
     expect(w.tm.getTournament(w.tid)!.playerTableMap.get('a3')).toBe('TL');
-    // TL's first hand, heads-up: l0 the button / small blind, a3 the big blind (TDA: the worst position).
+    // FIX 1 — at 2 alive TL was HELD (the feed's first deal refused: never heads-up); the fill
+    // re-kicked its first deal at 4 (as the feed does: startFreshTournamentTable).
+    expect(w.logs.filter((l) => l.includes('"event":"tournament_short_table_held"'))).toEqual([expect.stringContaining('"tableId":"TL"')]);
+    await flush();
     expect(TL.handNumber).toBe(1);
-    expect(TL.dealerButtonSeat).toBe(0);
-    expect(TL.previousBigBlindSeat).toBe(1);
-    expect(dealt(TL)).toBe(2);
+    expect(dealt(TL)).toBe(4);
     expect(TA.handNumber).toBe(2);
-    expect(dealt(TA)).toBe(8);
+    expect(dealt(TA)).toBe(6);
     expect(w.m.qualifierOverflow).toMatchObject({ feeds: 1, firstDeals: 1, feedErrors: 0 });
     expect(w.seatless()).toEqual([]);
     expect(w.couldNotPlace()).toEqual([]);
     expect(w.logs.filter((l) => l.includes('"event":"qualifier_overflow_fed"'))).toHaveLength(1);
     expect(w.logs.filter((l) => l.includes('"event":"qualifier_overflow_first_deal"'))).toHaveLength(1);
-    // Stable: at the next boundaries nobody else is fed (TL has 2).
+    expect(w.logs.filter((l) => l.includes('"event":"tournament_short_table_filled"'))).toHaveLength(2);
+    // Stable: at the next boundaries nobody else is fed (TL has 4).
     foldOut(TA);
     w.m.autoStartNextHand('TA');
     expect(w.m.qualifierOverflow.feeds).toBe(1);
+    expect(w.logs.filter((l) => l.includes('"event":"tournament_short_table_filled"'))).toHaveLength(2);
   });
 
-  it('C2 (a) — no feed when the lone entrant has no live session (an absent seat is dealt in on the clock: feeding him only gives chips away)', () => {
+  it('C2 (a) — no FEED when the lone entrant has no live session (the feed\'s own rule); FIX 1: the short-table fill (owner: "present or away") still brings his table to 4 and it deals 4-handed', async () => {
     const { w, TA, TL } = lone({ absent: ['l0'] });
     handOn(TA);
     w.m.autoStartNextHand('TA');
     expect(w.m.qualifierOverflow.feeds).toBe(0);
-    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(1);
-    expect(TL.handNumber).toBe(0);
-    expect(dealt(TA)).toBe(9);
+    expect(TL.seats.filter((s) => s.state === 'occupied').map((s) => s.playerId)).toEqual(['l0', 'a3', 'a4', 'a5']);
+    expect(dealt(TA)).toBe(6);
+    await flush();
+    expect(TL.handNumber).toBe(1);
+    expect(dealt(TL)).toBe(4);
+    expect(w.seatless()).toEqual([]);
   });
 
   it('C2 (b) — no feed while a free seat exists elsewhere (empty or busted): Rule 1 breaks TL instead and the lone entrant takes that seat', () => {
@@ -4251,12 +4273,13 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     expect(notFullest.TL.seats[1]).toMatchObject({ playerId: 'b3' });
   });
 
-  it('C2 (d) — no feed for a table that is not an overflow table (a lone ORIGINAL table is left as before)', () => {
+  it('C2 (d) — no feed for a table that is not an overflow table; FIX 1: a lone ORIGINAL table is filled to 4 by the short-table fill (every table, not only overflow ones)', () => {
     const { w, TA, TL } = lone({ overflow: false });
     handOn(TA);
     w.m.autoStartNextHand('TA');
     expect(w.m.qualifierOverflow.feeds).toBe(0);
-    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(1);
+    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(4);
+    expect(w.tm.getAlivePlayersOnTable(w.tid, 'TL')).toHaveLength(4);
   });
 
   it('C2 (e) — no feed while TL is mid-hand or has a break pending', () => {
@@ -4285,12 +4308,15 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     expect(TA.currentPhase).toBe(GamePhase.HandComplete);                     // held at its boundary, as before
   });
 
-  it('C3 — a fed (heads-up) TL and one bust at TB: Rule 1 breaks TL — deferred while TL is mid-hand, run at TL\'s own boundary; both placed, chips conserved; the sweep forgets TL', () => {
+  it('C3 — a fed TL (FIX 1: filled to 4, dealt 4-handed) and one bust at TB: Rule 1 breaks TL — deferred while TL is mid-hand, run at TL\'s own boundary; all placed, chips conserved; the sweep forgets TL', async () => {
     const { w, TA, TB, TL } = lone();
     handOn(TA);
-    w.m.autoStartNextHand('TA');                                              // a3 fed to TL; TL and TA mid-hand
+    w.m.autoStartNextHand('TA');                                              // a3 fed to TL, a4 + a5 filled in; TA mid-hand
+    await flush();                                                            // TL's first deal (re-kicked, deferred): mid-hand
     expect(w.m.qualifierOverflow.feeds).toBe(1);
-    bust(w, 'TB', [4]);
+    expect(TL.isHandInProgress()).toBe(true);
+    expect(dealt(TL)).toBe(4);
+    bust(w, 'TB', [4]);                                                       // 6 + 8 + 4 = 18 alive fit two tables
     const total = w.chipsInPlay();
     w.m.handleTableRebalance(w.tid);
     expect(w.m.tournamentBreaksAwaitingHandEnd.get('TL')).toBe(w.tid);      // never mid-hand
@@ -4300,6 +4326,8 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TA', 'TB']);
     expect(w.tournamentTables.has('TL')).toBe(false);
     expect(TA.seats[3]).toMatchObject({ state: 'occupied', playerId: 'a3' });
+    expect(TA.seats[4]).toMatchObject({ state: 'occupied', playerId: 'a4' });
+    expect(TA.seats[5]).toMatchObject({ state: 'occupied', playerId: 'a5' });
     expect(TB.seats[4]).toMatchObject({ state: 'occupied', playerId: 'l0' });
     expect(w.chipsInPlay()).toBe(total);
     expect(w.seatless()).toEqual([]);
@@ -4340,21 +4368,30 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     expect(TB.seats.filter((s) => s.state === 'occupied' && !s.eliminated)).toHaveLength(4);   // the broken table, removed 5s later
   });
 
-  it('C6 — the 5s sweep backstop deals an overflow table once 2 are alive and nothing holds it; never a non-overflow table, never paused, never alone', () => {
+  it('C6 — the 5s sweep backstop deals an overflow table once 4 are alive (FIX 1: at 2 or 3 it is held, short_table) and nothing holds it; never a non-overflow table, never paused, never alone', () => {
+    // FIX 1 (owner 2026-11-25) — 2 alive while 2+ tables play: held, never dealt heads-up.
     const two = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 2, 5000, 300) } });
     two.w.m.serviceQualifierOverflowTables();
-    expect(two.TL.handNumber).toBe(1);
-    expect(dealt(two.TL)).toBe(2);
+    expect(two.TL.handNumber).toBe(0);
+    expect(two.w.logs.filter((l) => l.includes('"event":"tournament_short_table_held"'))).toEqual([expect.stringContaining('"via":"deal_hold"')]);
     two.w.m.serviceQualifierOverflowTables();
-    expect(two.TL.handNumber).toBe(1);                                        // once: it is in its hand now
-    expect(two.TB.handNumber).toBe(0);                                        // an ORIGINAL waiting table is not the backstop's
-    expect(two.w.m.qualifierOverflow.firstDeals).toBe(1);
+    expect(two.w.logs.filter((l) => l.includes('"event":"tournament_short_table_held"'))).toHaveLength(1);   // once per episode
+    expect(two.w.m.qualifierOverflow.firstDeals).toBe(0);
 
-    const notOverflow = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 2, 5000, 300) }, overflow: false });
+    const four = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 4, 5000, 300) } });
+    four.w.m.serviceQualifierOverflowTables();
+    expect(four.TL.handNumber).toBe(1);
+    expect(dealt(four.TL)).toBe(4);
+    four.w.m.serviceQualifierOverflowTables();
+    expect(four.TL.handNumber).toBe(1);                                       // once: it is in its hand now
+    expect(four.TB.handNumber).toBe(0);                                       // an ORIGINAL waiting table is not the backstop's
+    expect(four.w.m.qualifierOverflow.firstDeals).toBe(1);
+
+    const notOverflow = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 4, 5000, 300) }, overflow: false });
     notOverflow.w.m.serviceQualifierOverflowTables();
     expect(notOverflow.TL.handNumber).toBe(0);
 
-    const paused = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 2, 5000, 300) } });
+    const paused = lone({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 4, 5000, 300) } });
     paused.w.tm.pauseTournament(paused.w.tid, true);
     paused.w.m.serviceQualifierOverflowTables();
     expect(paused.TL.handNumber).toBe(0);
@@ -4412,7 +4449,9 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     expect(w.m.qualifierOverflow.feedFollowUpErrors).toBe(0);
   });
 
-  it('C10 — review fix-up: the feed MOVED him, then a follow-up threw (the lone table\'s broadcast) — counted as a feed + feedFollowUpErrors, never as a failed feed; the move stands, chips conserved, nothing points at the old seat; the 5s sweep deals TL', () => {
+  // FIX 1 (owner 2026-11-25) — the feed's follow-up threw before its own first-deal call; the
+  // short-table fill that follows brings TL to 4 and ITS re-kick deals TL (the sweep used to).
+  it('C10 — review fix-up: the feed MOVED him, then a follow-up threw (the lone table\'s broadcast) — counted as a feed + feedFollowUpErrors, never as a failed feed; the move stands, chips conserved, nothing points at the old seat; FIX 1: the fill (its own follow-up errors counted) brings TL to 4 and deals it', () => {
     let armed = true;
     const { w, TA, TL } = lone({ scope: { broadcastGameState: (id: string) => { if (armed && id === 'TL') throw new Error('broadcast boom'); } } });
     handOn(TA);
@@ -4420,48 +4459,66 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     const total = w.chipsInPlay();
     w.m.autoStartNextHand('TA');
     // ff9a1cb: feeds 1 AND feedErrors 1 + 'qualifier_overflow_feed_failed' — read as "rolled back" while he had moved.
-    expect(w.m.qualifierOverflow).toMatchObject({ feeds: 1, feedErrors: 0, feedFollowUpErrors: 1, firstDeals: 0 });
+    expect(w.m.qualifierOverflow).toMatchObject({ feeds: 1, feedErrors: 0, feedFollowUpErrors: 1 });
     expect(TA.seats[3].state).toBe('empty');
-    expect(TL.seats[1]).toMatchObject({ state: 'occupied', playerId: 'a3', chipCount: a3Stack });
+    expect(TL.seats[1]).toMatchObject({ state: 'occupied', playerId: 'a3' });
+    expect(TL.seats[1].chipCount + TL.seats[1].totalInvestedThisHand).toBe(a3Stack);   // FIX 1: TL is dealt (blinds posted)
     expect(w.chipsInPlay()).toBe(total);
     expect(w.playerSessions.get('S-a3')).toMatchObject({ tableId: 'TL', seatIndex: 1 });
     expect(w.tm.getTournament(w.tid)!.playerTableMap.get('a3')).toBe('TL');
     expect([...w.playerSessions.values()].filter((s) => s.tableId === 'TA' && s.seatIndex === 3)).toEqual([]);
+    // FIX 1 — the short-table fill that follows the feed moved a4 + a5 (TL at 4); ITS broadcasts of TL
+    // threw too: counted as its own follow-up errors, never as failed moves (the moves stand).
+    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(4);
+    expect(w.logs.filter((l) => l.includes('tournament_short_table_fill_followup_failed'))).toHaveLength(2);
+    expect(w.logs.some((l) => l.includes('"event":"tournament_short_table_fill_failed"'))).toBe(false);
     expect(TA.handNumber).toBe(2);                                            // the source still deals
-    expect(dealt(TA)).toBe(8);
-    expect(TL.handNumber).toBe(0);                                            // its first deal never ran
+    expect(dealt(TA)).toBe(6);
+    // The fill's re-kick dealt TL 4-handed; that deal's own broadcast threw: counted as a
+    // first-deal error, the deal stands (returned dealt), nothing re-dealt by the backstop.
+    expect(TL.handNumber).toBe(1);
+    expect(dealt(TL)).toBe(4);
+    expect(w.m.qualifierOverflow).toMatchObject({ firstDeals: 1, firstDealErrors: 1 });
     const followUp = w.logs.filter((l) => l.includes('qualifier_overflow_feed_followup_failed'));
     expect(followUp).toHaveLength(1);
     expect(followUp[0]).toContain('"moved":true');
     expect(w.logs.some((l) => l.includes('qualifier_overflow_feed_failed'))).toBe(false);
     armed = false;
-    w.m.serviceQualifierOverflowTables();                                     // the backstop
+    w.m.serviceQualifierOverflowTables();                                     // the backstop: nothing left to deal
     expect(TL.handNumber).toBe(1);
-    expect(dealt(TL)).toBe(2);
     expect(w.m.qualifierOverflow).toMatchObject({ firstDeals: 1, feeds: 1 });
+    expect(w.chipsInPlay()).toBe(total);
   });
 
-  it('C11 — review fix-up: the runtime kill switch (cap 0) stops the feed too: the lone entrant waits as before, the source deals 9-handed', () => {
+  // FIX 1 (owner 2026-11-25) — the short-table fill reads NO switch (a held table nothing fills
+  // would wait forever: the P1 stall). The overflow cap still stops new overflow tables and the feed.
+  it('C11 — review fix-up: the runtime kill switch (cap 0) stops the feed too; FIX 1: the short-table fill does not read it — the lone table is brought to 4 and deals 4-handed, the source 6-handed', async () => {
     const { w, TA, TL } = lone({ scope: { qualifierOverflowTablesMax: 0 } });
     handOn(TA);
     w.m.autoStartNextHand('TA');
     expect(w.m.qualifierOverflow).toMatchObject({ feeds: 0, feedErrors: 0, feedFollowUpErrors: 0 });
-    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(1);
-    expect(TL.handNumber).toBe(0);
-    expect(dealt(TA)).toBe(9);
+    expect(TL.seats.filter((s) => s.state === 'occupied')).toHaveLength(4);
+    expect(dealt(TA)).toBe(6);
+    await flush();
+    expect(TL.handNumber).toBe(1);
+    expect(dealt(TL)).toBe(4);
   });
 
-  it('C12 — pins the documented heads-up (review): the FINAL table full (9 alive, nothing busted) + a lone overflow entrant → the feed moves the player due its big blind and TL plays HEADS-UP until the next bust anywhere; then Rule 1 merges TL back (at TL\'s hand end); chips conserved', () => {
+  // FIX 1 (owner 2026-11-25: "a tournament table must never deal with fewer than 4 players") — the
+  // documented heads-up of this test (review 2026-10-22) is gone: the feed + the short-table fill make
+  // it [6,4] and TL deals 4-handed; the next bust still merges TL back (Rule 1, at TL's hand end).
+  it('C12 — the FINAL table full (9 alive, nothing busted) + a lone overflow entrant → the feed moves the player due its big blind and (FIX 1) the fill two more: TL deals 4-handed, never heads-up; the next bust anywhere merges TL back (Rule 1, at TL\'s hand end); chips conserved', async () => {
     const { w, TA, TL } = lone({ layout: { TA: field('a', 9, 5000, 100), TL: field('l', 1, 5000, 300) } });
     handOn(TA);
     w.m.autoStartNextHand('TA');
     expect(w.m.qualifierOverflow.feeds).toBe(1);
-    expect(TL.seats.filter((s) => s.state === 'occupied' && !s.eliminated).map((s) => s.playerId).sort()).toEqual(['a3', 'l0']);
+    expect(TL.seats.filter((s) => s.state === 'occupied' && !s.eliminated).map((s) => s.playerId).sort()).toEqual(['a3', 'a4', 'a5', 'l0']);
+    await flush();
     expect(TL.handNumber).toBe(1);
-    expect(dealt(TL)).toBe(2);                                                // heads-up
-    expect(dealt(TA)).toBe(8);
+    expect(dealt(TL)).toBe(4);                                                // never heads-up
+    expect(dealt(TA)).toBe(6);
     foldOut(TA);
-    bust(w, 'TA', [4]);                                                       // the next bust: 7 + 2 = 9 alive fit one table
+    bust(w, 'TA', [6]);                                                       // the next bust: 5 + 4 = 9 alive fit one table
     const total = w.chipsInPlay();
     w.m.handleTableRebalance(w.tid);
     expect(w.m.tournamentBreaksAwaitingHandEnd.get('TL')).toBe(w.tid);      // never mid-hand
@@ -4469,7 +4526,7 @@ describe('2026-10-22 (owner: "Build it for Sunday") — a qualifier OVERFLOW tab
     w.m.autoStartNextHand('TL');
     expect(w.tm.getTournament(w.tid)!.tableIds).toEqual(['TA']);
     expect(TA.seats.filter((s) => s.state === 'occupied' && !s.eliminated).map((s) => s.playerId).sort())
-      .toEqual(['a0', 'a1', 'a2', 'a3', 'a5', 'a6', 'a7', 'a8', 'l0']);
+      .toEqual(['a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a7', 'a8', 'l0']);
     expect(w.chipsInPlay()).toBe(total);
     expect(w.seatless()).toEqual([]);
     expect(w.couldNotPlace()).toEqual([]);
@@ -4522,6 +4579,9 @@ describe('2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — 
   const OUT = `
 s2x.balance = balanceQualifierTables; s2x.balanceNow = balanceQualifierTablesNow; s2x.stats = qualifierBalance;
 s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.busted = seatQualifierReentrantOnBustedSeat;
+s2x.short = tournamentShortTableHolds; s2x.holdReason = tournamentDealHoldReason; s2x.sweep = serviceShortTournamentTables;
+s2x.fillNow = fillShortTournamentTablesNow; s2x.episodes = tournamentShortTableEpisodes;
+s2x.restartWaiting = restartWaitingTournamentTables; s2x.isShort = tournamentTableShortHeld;
 `;
   const BALANCED = '"event":"qualifier_table_balanced"';
 
@@ -4544,6 +4604,8 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
   function bal(o: {
     layout: Record<string, Entrant[]>; absent?: string[]; env?: Record<string, string>; qualifier?: boolean;
     overflow?: string[]; over?: (helpers: string) => string; scope?: Record<string, unknown>;
+    /** FIX 1 CONTROLs — other slices replaced (e.g. autoStartNextHand without the short-table hold). */
+    overP?: Partial<typeof P>;
   }) {
     const qualifierTournaments = new Map<string, any>();
     const routes = new Map<string, (req: any, res: any) => void>();
@@ -4552,7 +4614,7 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
     const helpers = `${P.helpers}\n${QOT}\n${DEAL_HOOK}\n${LATE_SEAT}\n${BUSTED_SEAT}\n${SWITCH}\n${OUT}`;
     const w = world({
       layout: o.layout,
-      over: { helpers: o.over ? o.over(helpers) : helpers },
+      over: { ...(o.overP || {}), helpers: o.over ? o.over(helpers) : helpers },
       scope: {
         qualifierTournaments, s2x, process: proc, sitOutTracker: new Map(), pendingSeatRemovalAfterHand: new Map(),
         app: { post: (p: string, fn: (req: any, res: any) => void) => { routes.set(p, fn); } }, createHash, timingSafeEqual,
@@ -4604,40 +4666,46 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
   }
   const dealt = (t: PokerTable) => t.seats.filter((s) => s.state === 'occupied' && !s.eliminated && s.holeCards.length === 2).length;
 
-  it('S2-1 — [9,2] reaches [6,5] after 3 of the source\'s hand ends: each time the player due ITS big blind moves (stack exact, session + playerMoved follow, TB\'s deal kicked — F95); never a break, chips conserved, the source deals its own hand', async () => {
+  // FIX 1 (owner 2026-11-25: "a tournament table must never deal with fewer than 4 players") — TB (2)
+  // is a SHORT table now: at TA's first hand end the short-table fill brings it to 4 (the two seats due
+  // TA's big blind), then the balance (same boundary, its own rules) evens it to [6,5]. It used to take
+  // three TA hand ends, one balance move each, and TB dealt 3- and 4-handed meanwhile.
+  it('S2-1 — [9,2] reaches [6,5] at the source\'s FIRST hand end: FIX 1\'s fill moves the two seats due ITS big blind (TB at 4), the balance one more; each stack exact, session + playerMoved follow, TB\'s deal kicked (F95); never a break, chips conserved, the source deals its own hand', async () => {
     const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) } });
     handOn(x.t('TA'));
     handOn(x.t('TB'));
     const total = x.w.chipsInPlay();
-    const movers: string[] = [];
-    for (let k = 0; k < 3; k++) {
-      const d = x.due('TA');
-      const stack = x.t('TA').seats[d.seat].chipCount;
-      x.w.scheduled.length = 0;
-      await boundary(x, 'TA');
-      movers.push(d.playerId);
-      const at = x.t('TB').seats.findIndex((s) => s.state === 'occupied' && s.playerId === d.playerId);
-      expect({ k, moved: d.playerId, at }).toEqual({ k, moved: d.playerId, at: 2 + k });   // TB's first placeable seat
-      expect(x.t('TB').seats[at].chipCount).toBe(stack);
-      expect(x.t('TA').seats[d.seat].state).toBe('empty');
-      expect(x.w.playerSessions.get(`S-${d.playerId}`)).toMatchObject({ tableId: 'TB', seatIndex: at });
-      expect(x.w.live.get(`S-${d.playerId}`).emitted.filter(([ev]: [string]) => ev === 'playerMoved'))
-        .toEqual([['playerMoved', { fromTable: 'TA', toTable: 'TB', toSeat: at, tableId: 'TB' }]]);
-      expect([...x.w.playerSessions.values()].filter((s) => s.tableId === 'TA' && s.seatIndex === d.seat)).toEqual([]);
-      expect(x.w.tm.getTournament(x.w.tid)!.playerTableMap.get(d.playerId)).toBe('TB');
-      expect(x.w.scheduled).toContain('TB');                                 // F95: TB (HandComplete, idle) deals again
-      expect(x.t('TA').handNumber).toBe(2 + k);                               // the source still deals
-      invariants(x, ['TA', 'TB'], total);
+    expect(x.due('TA')).toEqual({ seat: 3, playerId: 'a3' });
+    const stacks = new Map([3, 4, 5].map((i) => [x.t('TA').seats[i].playerId, x.t('TA').seats[i].chipCount]));
+    x.w.scheduled.length = 0;
+    await boundary(x, 'TA');
+    for (const [k, pid] of ['a3', 'a4', 'a5'].entries()) {
+      const at = x.t('TB').seats.findIndex((s) => s.state === 'occupied' && s.playerId === pid);
+      expect({ k, pid, at }).toEqual({ k, pid, at: 2 + k });                 // TB's first placeable seat, in big-blind order
+      expect(x.t('TB').seats[at].chipCount).toBe(stacks.get(pid));
+      expect(x.t('TA').seats[3 + k].state).toBe('empty');
+      expect(x.w.playerSessions.get(`S-${pid}`)).toMatchObject({ tableId: 'TB', seatIndex: at });
+      // The fill's movers carry reason 'short_table'; the balance's move does not.
+      expect(x.w.live.get(`S-${pid}`).emitted.filter(([ev]: [string]) => ev === 'playerMoved'))
+        .toEqual([['playerMoved', { fromTable: 'TA', toTable: 'TB', toSeat: at, tableId: 'TB', ...(k < 2 ? { reason: 'short_table' } : {}) }]]);
+      expect([...x.w.playerSessions.values()].filter((s) => s.tableId === 'TA' && s.seatIndex === 3 + k)).toEqual([]);
+      expect(x.w.tm.getTournament(x.w.tid)!.playerTableMap.get(pid)).toBe('TB');
     }
+    expect(x.w.scheduled).toContain('TB');                                   // F95: TB (HandComplete, idle) deals again
+    expect(x.t('TA').handNumber).toBe(2);                                    // the source still deals
+    invariants(x, ['TA', 'TB'], total);
     expect(x.counts()).toEqual([6, 5]);
-    expect(movers).toEqual(['a3', 'a5', 'a7']);                               // each the seat due TA's big blind
-    expect(x.balanced().map((b) => [b.fromAlive, b.toAlive, b.via])).toEqual([[8, 3, 'hand_end'], [7, 4, 'hand_end'], [6, 5, 'hand_end']]);
-    expect(x.balanced().every((b) => b.fromAlive >= 5)).toBe(true);          // the source never drops below 5
+    const filled = x.w.logs.filter((l) => l.includes('"event":"tournament_short_table_filled"')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    expect(filled.map((b) => [b.fromAlive, b.toAlive, b.via])).toEqual([[8, 3, 'hand_end'], [7, 4, 'hand_end']]);
+    expect(x.balanced().map((b) => [b.fromAlive, b.toAlive, b.via])).toEqual([[6, 5, 'hand_end']]);
+    expect([...filled, ...x.balanced()].every((b) => b.fromAlive >= 5)).toBe(true);   // the source never drops below 5
+    expect(x.s2x.short).toMatchObject({ fills: 1, playersMoved: 2, errors: 0, followUpErrors: 0 });
     // Stable: [6,5] is within one — the next boundaries move nobody.
     await boundary(x, 'TA');
     await boundary(x, 'TA');
     expect(x.counts()).toEqual([6, 5]);
-    expect(x.s2x.stats).toMatchObject({ moves: 3, preDealMoves: 0, errors: 0, followUpErrors: 0 });
+    expect(x.s2x.stats).toMatchObject({ moves: 1, preDealMoves: 0, errors: 0, followUpErrors: 0 });
+    expect(x.s2x.short.playersMoved).toBe(2);
     expect(dealt(x.t('TA'))).toBe(6);
     invariants(x, ['TA', 'TB'], total);
   });
@@ -4654,7 +4722,10 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
     expect(x.s2x.stats.moves).toBe(2);
   });
 
-  it('S2-3 — [9,9,9,1] (a lone OVERFLOW table, its entrant present) reaches [7,7,7,7]: the feed makes it 2, then the balance — movers into a MID-HAND table sit that hand out; no break ever; chips conserved', async () => {
+  // FIX 1 (owner 2026-11-25) — the feed makes TD 2 and the short-table fill (same TA boundary) 4, so
+  // TD's first hand is 4-handed; the balance evens the rest (4 moves, one of them into TA, where it used
+  // to be 5 moves all into TD while TD dealt heads-up / 3-handed).
+  it('S2-3 — [9,9,9,1] (a lone OVERFLOW table, its entrant present) reaches [7,7,7,7]: the feed makes it 2, FIX 1\'s fill 4, then the balance — movers into a MID-HAND table sit that hand out; no break ever; chips conserved', async () => {
     const x = bal({
       layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TC: field('c', 9, 5000, 300), TD: field('d', 1, 5000, 400) },
       overflow: ['TD'],
@@ -4678,9 +4749,12 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
     }
     expect(x.counts()).toEqual([7, 7, 7, 7]);
     expect(x.w.m.qualifierOverflow.feeds).toBe(1);
-    expect(x.s2x.stats).toMatchObject({ moves: 5, errors: 0, followUpErrors: 0 });
+    expect(x.s2x.short).toMatchObject({ playersMoved: 2, errors: 0, followUpErrors: 0 });
+    expect(x.s2x.stats).toMatchObject({ moves: 4, errors: 0, followUpErrors: 0 });
     expect(sawMidHandMove).toBe(true);
-    expect(x.balanced().every((b) => b.fromAlive >= 5 && b.toTableId === 'TD')).toBe(true);
+    expect(x.balanced().every((b) => b.fromAlive >= 5)).toBe(true);
+    // TD never dealt with fewer than 4 (its first hand was 4-handed).
+    expect(x.w.logs.filter((l) => l.includes('"event":"tournament_short_table_filled"')).map((l) => JSON.parse(l.slice(l.indexOf('{'))).toAlive)).toEqual([3, 4]);
   });
 
   it('S2-4 — a MID-HAND target: the mover sits out its live hand (folded, no cards, his stack untouched) and is dealt the next one', async () => {
@@ -4705,7 +4779,9 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
 
   it('S2-5 — the mover is the seat due the big blind even when he is ABSENT (presence is not required into a target of 3+ alive): his reservation follows the stack', async () => {
     // (Review fix-up: TB has 3 alive — a target of <= 2 takes only a PRESENT mover, S2-15.)
-    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 3, 5000, 200) }, absent: ['a3'] });
+    // FIX 1 (2026-11-25): TB has 4 alive — a 3-alive TB is a SHORT table now, filled by the
+    // short-table fill (absent movers too) before the balance runs; this test pins the BALANCE.
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 4, 5000, 200) }, absent: ['a3'] });
     handOn(x.t('TA'));
     handOn(x.t('TB'));
     expect(x.due('TA')).toEqual({ seat: 3, playerId: 'a3' });
@@ -4714,26 +4790,36 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
       handsRemaining: 20, tournament: true, masterUserId: 'm-a3',
     });
     await boundary(x, 'TA');
-    expect(x.t('TB').seats[3]).toMatchObject({ state: 'occupied', playerId: 'a3' });
-    expect(x.w.reservedSeats.get(103)).toMatchObject({ tableId: 'TB', seatIndex: 3 });
+    expect(x.t('TB').seats[4]).toMatchObject({ state: 'occupied', playerId: 'a3' });
+    expect(x.w.reservedSeats.get(103)).toMatchObject({ tableId: 'TB', seatIndex: 4 });
     expect(x.balanced()).toHaveLength(1);
     expect(x.s2x.stats).toMatchObject({ moves: 1, skippedAbsentMover: 0 });
+    expect(x.s2x.short.playersMoved).toBe(0);                                // not a short table: the fill moved nobody
   });
 
-  it('S2-6 — a LONE target whose only player is ABSENT is skipped (feeding an absent seat gives chips away); CONTROL: the same lone table with him present gets the mover', async () => {
+  // FIX 1 (owner 2026-11-25: a table never deals with fewer than 4 "present or away") — the BALANCE's
+  // own rule still skips an absent lone target (pinned here through the balance itself), but at the
+  // hand boundary the short-table fill runs first and brings that table to 4 — away or not.
+  it('S2-6 — the BALANCE skips a LONE target whose only player is ABSENT (feeding an absent seat gives chips away); CONTROL: him present, the balance gives him the mover; FIX 1: at the hand boundary the short-table fill brings the absent lone table to 4 anyway', async () => {
     for (const overflow of [true, false]) {
       const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 1, 5000, 300) }, absent: ['l0'], overflow: overflow ? ['TL'] : [] });
       handOn(x.t('TA'));
-      await boundary(x, 'TA');
+      expect(x.s2x.balance(x.w.tid, 'TA', x.t('TA'))).toBe(false);
       expect(x.counts()).toEqual([9, 9, 1]);
       expect(x.s2x.stats.moves).toBe(0);
       expect(x.s2x.stats.skippedAbsentTarget).toBeGreaterThanOrEqual(1);
+      await boundary(x, 'TA');
+      expect(x.counts()).toEqual([6, 9, 4]);                                 // FIX 1: filled (a3, a4, a5)
+      expect(x.s2x.short.playersMoved).toBe(3);
+      expect(x.s2x.stats.moves).toBe(0);
       expect(x.w.m.qualifierOverflow.feeds).toBe(0);
-      expect(dealt(x.t('TA'))).toBe(9);
+      expect(dealt(x.t('TA'))).toBe(6);
+      expect(x.t('TL').handNumber).toBe(1);                                  // re-kicked: its first hand, 4-handed
+      expect(dealt(x.t('TL'))).toBe(4);
     }
     const ctl = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 1, 5000, 300) } });
     handOn(ctl.t('TA'));
-    await boundary(ctl, 'TA');
+    expect(ctl.s2x.balance(ctl.w.tid, 'TA', ctl.t('TA'))).toBe(true);
     expect(ctl.counts()).toEqual([8, 9, 2]);
     expect(ctl.s2x.stats).toMatchObject({ moves: 1, skippedAbsentTarget: 0 });
   });
@@ -4751,13 +4837,17 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
     invariants(x, ['TA', 'TB'], total);
   });
 
-  it('S2-8 — the switch OFF (Railway env QUALIFIER_TABLE_BALANCE=0 at boot) → zero balance moves (hand end and pre-deal); not a qualifier → zero moves', async () => {
+  // FIX 1 (owner 2026-11-25) — the short-table fill reads no switch and serves every tournament: with
+  // the balance OFF, or in a tournament that is not a qualifier, TB (2) is still brought to 4 — and
+  // nothing more (the balance moves nobody).
+  it('S2-8 — the switch OFF (Railway env QUALIFIER_TABLE_BALANCE=0 at boot) → zero balance moves (hand end and pre-deal); not a qualifier → zero balance moves; FIX 1: the short-table fill still brings TB to 4 in both', async () => {
     for (const o of [{ env: { QUALIFIER_TABLE_BALANCE: '0' } }, { qualifier: false }]) {
       const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 2, 5000, 200) }, ...o });
       handOn(x.t('TA'));
       handOn(x.t('TB'));
       for (let k = 0; k < 3; k++) await boundary(x, 'TA');
-      expect(x.counts()).toEqual([9, 2]);
+      expect(x.counts()).toEqual([7, 4]);
+      expect(x.s2x.short.playersMoved).toBe(2);
       expect(x.s2x.stats.moves).toBe(0);
       expect(x.balanced()).toEqual([]);
       expect(x.t('TA').handNumber).toBe(4);
@@ -4788,11 +4878,11 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
     expect(x.post({ on: 0 }, 'tok')).toEqual({ status: 200, body: { success: true, previous: true, on: false } });
     await boundary(x, 'TA');
     expect(x.s2x.stats.moves).toBe(0);
-    expect(x.counts()).toEqual([9, 2]);
+    expect(x.counts()).toEqual([7, 4]);                                      // FIX 1: the short-table fill reads no switch
     expect(x.post({ on: true }, 'tok')).toEqual({ status: 200, body: { success: true, previous: false, on: true } });
     await boundary(x, 'TA');
     expect(x.s2x.stats.moves).toBe(1);
-    expect(x.counts()).toEqual([8, 3]);
+    expect(x.counts()).toEqual([6, 5]);
     expect(x.post({ on: false }, 'tok').body).toEqual({ success: true, previous: true, on: false });
     expect(x.w.audits.filter((a) => a.action === 'QUALIFIER_BALANCE_SET').map((a) => [a.d.previous, a.d.on])).toEqual([[true, false], [false, true], [true, false]]);
     expect(x.w.logs.filter((l) => l.includes('"event":"qualifier_balance_set"'))).toHaveLength(3);
@@ -4933,17 +5023,21 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
   // ABSENT big-blind-due seat into a lone PRESENT table (or a 2-alive one): heads-up /
   // 3-handed his stack posts a blind every hand or two and is checked or folded for —
   // chips handed to the present player. The feed has always required a present mover.
-  it('S2-15 — a SHORT target (<= 2 alive) takes only a PRESENT mover: the first present entrant after the absent big-blind-due seat moves; none present → no move; CONTROL: a 3-alive target still takes the absent big-blind-due seat', async () => {
-    /** One TA hand end; the mover the balance picked (null = nobody moved). */
+  // FIX 1 (owner 2026-11-25) — every target here has 1-3 alive, a SHORT table now: at a hand boundary
+  // the short-table fill (absent movers too: the table deals only once it has 4) runs before the
+  // balance. The balance's own presence rule is pinned through the balance itself (balanceQualifierTables
+  // at TA's hand end, as autoStartNextHand calls it); (c) also shows the fill at the boundary.
+  it('S2-15 — a SHORT target (<= 2 alive) takes only a PRESENT mover from the BALANCE: the first present entrant after the absent big-blind-due seat moves; none present → no move; CONTROL: a 3-alive target still takes the absent big-blind-due seat; FIX 1: the fill at the boundary moves absent seats too', async () => {
+    /** TA's hand end, the BALANCE step alone; the mover it picked (null = nobody moved). */
     const run = async (layout: Record<string, Entrant[]>, absent: string[], dealt: string[]) => {
       const x = bal({ layout, absent });
       for (const id of dealt) handOn(x.t(id));
       const total = x.w.chipsInPlay();
       expect(x.due('TA')).toEqual({ seat: 3, playerId: 'a3' });
-      await boundary(x, 'TA');
+      x.s2x.balance(x.w.tid, 'TA', x.t('TA'));
+      await flush();
       expect(x.w.chipsInPlay()).toBe(total);
       expect(x.w.seatless()).toEqual([]);
-      expect(x.t('TA').handNumber).toBe(2);                                    // the source still deals its own hand
       const b = x.balanced();
       return { x, mover: b.length ? b[0] : null };
     };
@@ -4977,6 +5071,17 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
       expect(x.s2x.stats.skippedAbsentMover).toBeGreaterThanOrEqual(1);
       expect(x.s2x.balanceNow(x.w.tid)).toBe(0);
       expect(x.counts()).toEqual([9, 2]);
+      // FIX 1 — at TA's real hand boundary the short-table fill moves the two seats due its big
+      // blind, away or not (a3, a4): TB deals only once it has 4. TB (4) is no longer a short
+      // target for the balance either, so its TDA move (absent a5) follows in the same boundary.
+      const total = x.w.chipsInPlay();
+      await boundary(x, 'TA');
+      expect(x.counts()).toEqual([6, 5]);
+      expect([2, 3, 4].map((i) => x.t('TB').seats[i].playerId)).toEqual(['a3', 'a4', 'a5']);
+      expect(x.s2x.short.playersMoved).toBe(2);
+      expect(x.s2x.stats.moves).toBe(1);
+      expect(x.t('TA').handNumber).toBe(2);                                    // the source still deals its own hand
+      expect(x.w.chipsInPlay()).toBe(total);
     }
     // CONTROL: the same all-absent TA, a 3-alive target → the absent big-blind-due seat moves (TDA; S2-5).
     {
@@ -5008,6 +5113,329 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
     expect(busted && busted.tableId).toBe('TB');
     for (const src of [LATE_SEAT, BUSTED_SEAT, REENTRY]) expect(src).not.toContain('qualifierBalanceOn');
     expect(REENTRY).toContain('reentryTables');
+  });
+
+  // ═══════════ FIX 1 (owner 2026-11-25) — a SHORT table never deals while 2+ tables play ═══════════
+  // Owner: "While 2 or more tables are in play, a tournament table must never deal with fewer than 4
+  // players ... dealing on THAT table pauses until auto-balancing brings it to 4+ (players moved in from
+  // fuller tables, or the table broken / merged when the others have room). The final table plays with
+  // any number." Every tournament kind; the fill reads no switch. Real autoStartNextHand,
+  // tournamentDealHoldReason, restartWaitingTournamentTables, the play gate and the 5 s sweep step.
+  /** autoStartNextHand's FIX 1 hold, removed by the CONTROLs (the pre-FIX-1 deal). */
+  const HOLD_LINE = "    if (tournamentShortTableHoldsDeal(tId, tableId, 'hand_end', true)) return;\n";
+  const heldLogs = (x: Bal) => x.w.logs.filter((l) => l.includes('"event":"tournament_short_table_held"')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+  const filledLogs = (x: Bal) => x.w.logs.filter((l) => l.includes('"event":"tournament_short_table_filled"')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+  const seven3 = () => ({ TA: field('a', 7, 5000, 100), TB: field('b', 3, 5000, 200) });
+
+  it('FIX1-1 — [7,3] qualifier: TB (3) is HELD at its own hand end (no deal, logged once, tournamentDealHoldReason short_table); TA\'s next hand end moves the seat due ITS big blind in, TB is re-kicked and deals 4-handed; chips conserved, nobody seatless; CONTROL: without the hold TB deals 3-handed', async () => {
+    const x = bal({ layout: seven3() });
+    handOn(x.t('TA'));
+    handOn(x.t('TB'));
+    const total = x.w.chipsInPlay();
+    expect(x.s2x.plan(x.w.tid)).toBeNull();                                 // 10 alive: no Rule 1; TB's 3 do not fit TA's 2 free seats
+    expect(x.t('TA').startNewHand()).toBe(true);                             // TA mid-hand: no idle table to pull from
+    await boundary(x, 'TB');
+    expect(x.t('TB').handNumber).toBe(1);                                   // HELD (it used to deal 3-handed here)
+    expect(x.s2x.isShort(x.w.tid, 'TB')).toBe(true);
+    expect(x.s2x.holdReason('TB', x.w.tid, x.t('TB'))).toBe('short_table');
+    expect(heldLogs(x)).toEqual([expect.objectContaining({ tableId: 'TB', alive: 3, tables: 2, via: 'hand_end' })]);
+    await boundary(x, 'TB');                                                 // asked again (an elimination elsewhere): still held, logged once
+    expect(x.t('TB').handNumber).toBe(1);
+    expect(heldLogs(x)).toHaveLength(1);
+    expect(x.s2x.episodes.get('TB')).toBe(x.w.tid);
+    const d = x.due('TA');
+    x.w.scheduled.length = 0;
+    await boundary(x, 'TA');                                                 // TA's hand ends: the fill, then the balance
+    expect(x.t('TB').seats[3]).toMatchObject({ state: 'occupied', playerId: d.playerId });
+    expect(filledLogs(x)).toEqual([expect.objectContaining({ fromTableId: 'TA', toTableId: 'TB', fromAlive: 6, toAlive: 4, via: 'hand_end' })]);
+    expect(x.counts()).toEqual([5, 5]);                                      // + the qualifier balance's own move (6 vs 4)
+    expect(x.w.scheduled).toContain('TB');                                   // re-kicked
+    expect(x.s2x.isShort(x.w.tid, 'TB')).toBe(false);
+    x.w.m.autoStartNextHand('TB');
+    expect(x.t('TB').handNumber).toBe(2);
+    expect(dealt(x.t('TB'))).toBe(5);
+    expect(x.s2x.short).toMatchObject({ held: 1, fills: 1, playersMoved: 1, errors: 0, followUpErrors: 0 });
+    expect(x.s2x.episodes.has('TB')).toBe(false);
+    invariants(x, ['TA', 'TB'], total);
+
+    // CONTROL — the pre-FIX-1 autoStartNextHand (no hold): TB deals 3-handed while two tables play.
+    expect(P.autoStart).toContain(HOLD_LINE);
+    const ctl = bal({ layout: seven3(), overP: { autoStart: P.autoStart.replace(HOLD_LINE, '') } });
+    handOn(ctl.t('TA'));
+    handOn(ctl.t('TB'));
+    expect(ctl.t('TA').startNewHand()).toBe(true);
+    await boundary(ctl, 'TB');
+    expect(ctl.t('TB').handNumber).toBe(2);
+    expect(dealt(ctl.t('TB'))).toBe(3);
+  });
+
+  it('FIX1-2 — the same [7,3] in a tournament that is NOT a qualifier (club / custom / template event / simulation): held, filled at TA\'s hand end ([6,4]: no balance there) and dealt 4-handed; with TA IDLE between hands TB pulls the player at its own hand end and deals at once; CONTROL: without the hold it deals 3-handed', async () => {
+    const x = bal({ layout: seven3(), qualifier: false });
+    handOn(x.t('TA'));
+    handOn(x.t('TB'));
+    const total = x.w.chipsInPlay();
+    expect(x.t('TA').startNewHand()).toBe(true);
+    await boundary(x, 'TB');
+    expect(x.t('TB').handNumber).toBe(1);
+    expect(heldLogs(x)).toHaveLength(1);
+    await boundary(x, 'TA');
+    expect(x.counts()).toEqual([6, 4]);
+    expect(x.s2x.stats.moves).toBe(0);                                       // the qualifier balance never runs here
+    x.w.m.autoStartNextHand('TB');
+    expect(x.t('TB').handNumber).toBe(2);
+    expect(dealt(x.t('TB'))).toBe(4);
+    invariants(x, ['TA', 'TB'], total);
+    expect(x.w.seatless()).toEqual([]);
+
+    // The pull: TA idle at its hand boundary (nobody in a hand) — TB takes the player itself and deals.
+    const y = bal({ layout: seven3(), qualifier: false });
+    handOn(y.t('TA'));
+    handOn(y.t('TB'));
+    await boundary(y, 'TB');
+    expect(y.counts()).toEqual([6, 4]);
+    expect(y.t('TB').handNumber).toBe(2);
+    expect(dealt(y.t('TB'))).toBe(4);
+    expect(heldLogs(y)).toEqual([]);                                         // never held: the pull came first
+    expect(filledLogs(y)).toEqual([expect.objectContaining({ fromTableId: 'TA', toTableId: 'TB', via: 'held' })]);
+
+    const ctl = bal({ layout: seven3(), qualifier: false, overP: { autoStart: P.autoStart.replace(HOLD_LINE, '') } });
+    handOn(ctl.t('TA'));
+    handOn(ctl.t('TB'));
+    expect(ctl.t('TA').startNewHand()).toBe(true);
+    await boundary(ctl, 'TB');
+    expect(dealt(ctl.t('TB'))).toBe(3);
+  });
+
+  // (A 5-alive table beside a short one cannot exist outside Rule 1's domain on 9-seat tables — the
+  // proof at the FIX 1 block in index.ts — so "the source keeps >= 5" is pinned by fromAlive.)
+  it('FIX1-3 — [9,9,3]: a source at its hand end gives ONE (TC 4, it keeps 8); [9,7,3]: the NON-fullest table (7) gives too and keeps 6; chips conserved', async () => {
+    const a = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TC: field('c', 3, 5000, 300) }, qualifier: false });
+    for (const id of ['TA', 'TB', 'TC']) handOn(a.t(id));
+    const totalA = a.w.chipsInPlay();
+    await boundary(a, 'TB');
+    expect(a.counts()).toEqual([9, 8, 4]);
+    expect(a.w.chipsInPlay()).toBe(totalA);
+
+    const b = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 7, 5000, 200), TC: field('c', 3, 5000, 300) } });
+    for (const id of ['TA', 'TB', 'TC']) handOn(b.t(id));
+    expect(b.s2x.plan(b.w.tid)).toBeNull();
+    await boundary(b, 'TB');
+    expect(b.counts()).toEqual([9, 6, 4]);                                   // TB was not the fullest: it gave anyway
+    expect(filledLogs(b)).toEqual([expect.objectContaining({ fromTableId: 'TB', toTableId: 'TC', fromAlive: 6, toAlive: 4 })]);
+    expect([...filledLogs(a), ...filledLogs(b)].every((f) => f.fromAlive >= 5)).toBe(true);
+  });
+
+  it('FIX1-4 — a LATE ENTRY onto a 1-alive table (the fewest-alive placement): no heads-up first deal (short_table); the next source hand end fills it to 4 and it deals (a non-overflow waiting table: startFreshTournamentTable, waitingDeals)', async () => {
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TL: field('l', 1, 5000, 300) } });
+    expect(x.t('TA').startNewHand()).toBe(true);
+    expect(x.t('TB').startNewHand()).toBe(true);                             // both mid-hand: nothing idle to pull from
+    const seat = x.s2x.late(x.w.mkSocket('S-late'), { tournamentId: x.w.tid, startingStack: 5000 }, { playerId: 'late1', playerName: 'late1', masterPlayerId: 'm-late1' });
+    expect(seat && seat.tableId).toBe('TL');
+    await flush();                                                           // its (deferred) seat hook
+    expect(x.t('TL').handNumber).toBe(0);                                    // never heads-up
+    expect(x.s2x.holdReason('TL', x.w.tid, x.t('TL'))).toBe('short_table');
+    expect(heldLogs(x)).toEqual([expect.objectContaining({ tableId: 'TL', alive: 2, via: 'deal_hold' })]);
+    const total = x.w.chipsInPlay();
+    await boundary(x, 'TA');
+    expect(x.counts()).toEqual([7, 9, 4]);
+    expect(x.t('TL').handNumber).toBe(1);
+    expect(dealt(x.t('TL'))).toBe(4);
+    expect(x.s2x.short.waitingDeals).toBe(1);
+    expect(x.w.logs.filter((l) => l.includes('"event":"tournament_waiting_table_dealt"'))).toHaveLength(1);
+    expect(x.w.chipsInPlay()).toBe(total);
+    expect(x.w.seatless()).toEqual([]);
+  });
+
+  it('FIX1-5 — restartWaitingTournamentTables (after a break, the early rooms\' deal, a hand-for-hand round) never deals a waiting table short: [9,7,3] deals TA and TB only; the sweep cannot fill TC while both are in a hand; TB\'s hand end fills it and TC\'s first hand is dealt 4-handed', async () => {
+    const x = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 7, 5000, 200), TC: field('c', 3, 5000, 300) }, qualifier: false });
+    x.s2x.restartWaiting(x.w.tid, { startWaiting: true });
+    expect(['TA', 'TB', 'TC'].map((id) => x.t(id).handNumber)).toEqual([1, 1, 0]);
+    expect(heldLogs(x)).toEqual([expect.objectContaining({ tableId: 'TC', alive: 3, via: 'restart_waiting' })]);
+    x.s2x.sweep();                                                           // TA and TB in a hand: no idle source
+    expect(x.counts()).toEqual([9, 7, 3]);
+    expect(x.t('TC').handNumber).toBe(0);
+    await boundary(x, 'TB');
+    expect(x.counts()).toEqual([9, 6, 4]);
+    expect(x.t('TC').handNumber).toBe(1);
+    expect(dealt(x.t('TC'))).toBe(4);
+    expect(x.s2x.short).toMatchObject({ waitingDeals: 1, playersMoved: 1, errors: 0 });
+  });
+
+  it('FIX1-6 — the PLAY GATE\'s disqualification leaves a 4-alive table at 3 INSIDE startNewHand: the deal is VETOED (tournament_table_short); the 5 s sweep fills it from an idle table and re-kicks it; it deals 4-handed', async () => {
+    const x = bal({ layout: { TA: field('a', 7, 5000, 100), TB: field('b', 4, 5000, 200) }, absent: ['b3'], qualifier: false });
+    // b3 away (a disconnect's reservation) and suspended (cached): the gate disqualifies him at TB's next deal.
+    x.w.reservedSeats.set(203, {
+      tableId: 'TB', seatIndex: 3, playerName: 'b3', chips: 5000, expiresAt: Date.now() + 3600e3, cleanupTimer: setTimeout(() => {}, 1e9),
+      handsRemaining: 20, tournament: true, masterUserId: 'm-b3',
+    });
+    x.w.statusCache.set('m-b3', true);
+    expect(x.t('TA').startNewHand()).toBe(true);                             // TA mid-hand
+    (x.t('TB') as any).currentPhase = GamePhase.HandComplete;
+    x.w.m.autoStartNextHand('TB');                                           // 4 alive → it deals → the gate takes b3 → 3
+    expect(x.w.tm.getTournament(x.w.tid)!.players.find((p) => p.playerId === 'b3')!.eliminated).toBe(true);
+    expect(x.t('TB').handNumber).toBe(0);                                    // vetoed: never dealt 3-handed
+    expect(x.s2x.short).toMatchObject({ dealsVetoed: 1, held: 1 });
+    expect(heldLogs(x)).toEqual([expect.objectContaining({ tableId: 'TB', via: 'play_gate' })]);
+    expect(x.w.m.tournamentHandStartSafety.handStartsVetoed).toBe(0);       // that counter stays the broken-table veto's
+    // TA's hand ends and (a missed boundary) nobody deals it: the sweep fills TB from idle TA and re-kicks it.
+    foldOut(x.t('TA'));
+    x.w.scheduled.length = 0;
+    x.s2x.sweep();
+    expect(x.counts()).toEqual([6, 4]);
+    expect(filledLogs(x)).toEqual([expect.objectContaining({ fromTableId: 'TA', toTableId: 'TB', via: 'sweep' })]);
+    expect(x.s2x.short.sweepFills).toBe(1);
+    expect(x.w.scheduled).toContain('TB');
+    x.w.m.autoStartNextHand('TB');
+    expect(x.t('TB').handNumber).toBe(1);
+    expect(dealt(x.t('TB'))).toBe(4);
+    expect(x.s2x.episodes.has('TB')).toBe(false);
+    expect(x.w.seatless()).toEqual([]);
+  });
+
+  it('FIX1-7 — the sweep backstop re-kicks a table FIX 1 held that is no longer short and sits idle with no timer (a lost re-kick); never a table FIX 1 did not hold, never a paused tournament', () => {
+    const x = bal({ layout: { TA: field('a', 7, 5000, 100), TB: field('b', 4, 5000, 200) }, qualifier: false });
+    handOn(x.t('TA'));
+    handOn(x.t('TB'));
+    x.s2x.sweep();
+    expect(x.w.scheduled).toEqual([]);                                       // nobody FIX 1 held
+    x.s2x.episodes.set('TB', x.w.tid);                                       // held, then filled — its re-kick lost
+    x.w.tm.pauseTournament(x.w.tid, true);
+    x.s2x.sweep();
+    expect(x.w.scheduled).toEqual([]);                                       // paused: the resume re-kicks
+    x.w.tm.pauseTournament(x.w.tid, false);
+    x.s2x.sweep();
+    expect(x.w.scheduled).toEqual(['TB']);
+    expect(x.s2x.short.sweepRekicks).toBe(1);
+    expect(x.w.logs.filter((l) => l.includes('"event":"tournament_short_table_rekicked"'))).toHaveLength(1);
+    x.w.m.autoStartNextHand('TB');
+    expect(x.t('TB').handNumber).toBe(2);
+    expect(x.s2x.episodes.has('TB')).toBe(false);                            // the episode ends at its deal
+  });
+
+  it('FIX1-8 — the FINAL table is never held: [5,4] and [6,3] MERGE (Rule 1 — the under-5 planned break runs before the hold); one table left deals 3-handed; a single-table event (no tableIds: Sit & Go) deals heads-up', () => {
+    for (const [na, nb] of [[5, 4], [6, 3]]) {
+      const w = world({ layout: { TA: field('a', na, 5000, 100), TB: field('b', nb, 5000, 200) } });
+      (w.tables.get('TB') as any).currentPhase = GamePhase.HandComplete;
+      w.m.autoStartNextHand('TB');
+      expect({ na, nb, tables: w.tm.getTournament(w.tid)!.tableIds }).toEqual({ na, nb, tables: ['TA'] });
+      expect(w.tm.getAlivePlayersOnTable(w.tid, 'TA')).toHaveLength(9);
+      expect(w.logs.filter((l) => l.includes('tournament_short_table_held'))).toEqual([]);
+      expect(w.seatless()).toEqual([]);
+    }
+    const one = world({ layout: { TA: field('a', 3, 5000, 100) } });
+    (one.tables.get('TA') as any).currentPhase = GamePhase.HandComplete;
+    one.m.autoStartNextHand('TA');
+    expect(one.tables.get('TA')!.handNumber).toBe(1);
+    expect(one.tables.get('TA')!.seats.filter((s) => s.holeCards.length === 2)).toHaveLength(3);
+    const sng = world({ layout: { TA: field('a', 2, 5000, 100) } });
+    sng.tm.setTableIds(sng.tid, []);                                         // a single-table event: tableIds stay empty
+    (sng.tables.get('TA') as any).currentPhase = GamePhase.HandComplete;
+    sng.m.autoStartNextHand('TA');
+    expect(sng.tables.get('TA')!.handNumber).toBe(1);
+    expect(sng.tables.get('TA')!.seats.filter((s) => s.holeCards.length === 2)).toHaveLength(2);
+    expect([...one.logs, ...sng.logs].filter((l) => l.includes('tournament_short_table_held'))).toEqual([]);
+  });
+
+  it('FIX1-9 — the hold is decided AFTER the bust check: [7,4] with a 0-chip seat at TB waits for its bust check (b3 still counts alive — never a short_table decision then); once b3 is out TB (3) is held', async () => {
+    const hold = deferred();
+    const w = world({ layout: { TA: field('a', 7, 5000, 100), TB: field('b', 4, 5000, 200) }, scope: persistenceScope(hold.p) });
+    const TA = w.tables.get('TA')!;
+    const TB = w.tables.get('TB')!;
+    expect(TA.startNewHand()).toBe(true);                                    // TA mid-hand: nothing to pull from
+    w.seatLive('S-b1', 'TB', 1, 201, 'm-b1');
+    TB.seats[3].chipCount = 0;
+    TB.seats[0].chipCount = 10000;
+    (TB as any).currentPhase = GamePhase.HandComplete;
+    const done = w.m.handleHandComplete('TB', [{ seatIndex: 0, amount: 5000 }]);
+    await flush();
+    w.m.autoStartNextHand('TB');
+    expect(TB.handNumber).toBe(0);
+    expect(w.m.tournamentHandStartSafety.dealsHeldForBustCheck).toBe(1);   // held for the bust check, nothing else
+    expect(w.logs.filter((l) => l.includes('tournament_short_table_held'))).toEqual([]);
+    hold.resolve();
+    await done;
+    await flush();
+    expect(w.tm.getTournament(w.tid)!.players.find((p) => p.playerId === 'b3')!.eliminated).toBe(true);
+    expect(w.scheduled).toContain('TB');                                     // re-kicked by the check
+    w.m.autoStartNextHand('TB');
+    expect(TB.handNumber).toBe(0);                                           // 3 alive now: held
+    expect(w.logs.filter((l) => l.includes('"event":"tournament_short_table_held"'))).toHaveLength(1);
+  });
+
+  it('FIX1-10 — the simulation: a BOT is moved by the fill (it sits down as a bot, its AI profile follows the stack); a pre-deal fill while paused (a break end / resume) fills from idle tables, never deals', async () => {
+    const aiProfiles = new Map<string, Map<number, any>>();
+    const all = [...Array.from({ length: 7 }, (_, i) => `a${i}`), ...Array.from({ length: 3 }, (_, i) => `b${i}`)];
+    const x = bal({ layout: seven3(), qualifier: false, absent: all, scope: { aiProfiles } });
+    for (const id of ['TA', 'TB']) x.t(id).seats.forEach((s) => { if (s.state === 'occupied') s.isAI = true; });
+    const profiles = new Map<number, any>();
+    for (let i = 0; i < 7; i++) profiles.set(i, { name: `bot-a${i}` });
+    aiProfiles.set('TA', profiles);
+    handOn(x.t('TA'));
+    handOn(x.t('TB'));
+    const total = x.w.chipsInPlay();
+    const d = x.due('TA');
+    await boundary(x, 'TA');
+    expect(x.t('TB').seats[3]).toMatchObject({ state: 'occupied', playerId: d.playerId, isAI: true });
+    expect(aiProfiles.get('TB')?.get(3)).toEqual({ name: `bot-${d.playerId}` });
+    expect(aiProfiles.get('TA')?.has(d.seat)).toBe(false);
+    expect(x.w.chipsInPlay()).toBe(total);
+
+    const p = bal({ layout: { TA: field('a', 9, 5000, 100), TB: field('b', 9, 5000, 200), TC: field('c', 3, 5000, 300) }, qualifier: false });
+    expect(p.w.tm.pauseTournament(p.w.tid, true)).toBe(true);
+    expect(p.s2x.fillNow(p.w.tid, 'break_end')).toBe(1);
+    expect(p.counts()).toEqual([8, 9, 4]);                                   // the fullest first (a tie: table order)
+    expect(p.t('TC').handNumber).toBe(0);                                    // paused: never dealt (the break end / resume kicks it)
+  });
+
+  it('FIX1-W — wiring + locks: the hold sits in every deal path (after the bust check, the under-5 break and the hand-for-hand gate; after the feed, the fill and the balance; before the deal); every fill caller; the gameState field; the lobby flag; health; manifest tokens', () => {
+    const A = P.autoStart;
+    const order = [
+      'if (tournamentDealWaitsForBustCheck(tableId, tId, table)) {',
+      'if (aliveOnTable < 5 && planTournamentRebalance(tId)) {',
+      'if (handForHandHoldsDeal(tId, tableId, table)) return;',
+      'const fed = feedLoneQualifierTable(tId, tableId, table);',
+      'fillShortTournamentTables(tId, tableId, table);',
+      'if (!fed) balanceQualifierTables(tId, tableId, table);',
+      HOLD_LINE.trim(),
+      'const started = table.startNewHand();',
+    ].map((s) => ({ s, at: A.indexOf(s) }));
+    for (const o of order) expect({ s: o.s, found: o.at > 0 }).toEqual({ s: o.s, found: true });
+    for (let i = 1; i < order.length; i++) expect({ after: order[i].s, at: order[i].at > order[i - 1].at }).toEqual({ after: order[i].s, at: true });
+    expect(A.split('fillShortTournamentTables(').length).toBe(2);
+    const R = fnSrc('function tournamentDealHoldReason(');
+    expect(R.indexOf("if (tournamentShortTableHoldsDeal(tournamentId, tableId, 'deal_hold')) return 'short_table';")).toBeGreaterThan(R.indexOf("return 'hand_for_hand'"));
+    const W = fnSrc('function restartWaitingTournamentTables(');
+    const wHold = W.indexOf("if (tournamentShortTableHoldsDeal(tournamentId, tid, 'restart_waiting')) continue;");
+    expect(wHold).toBeGreaterThan(W.indexOf('if (handForHandHoldsDeal(tournamentId, tid, table)) continue;'));
+    expect(wHold).toBeLessThan(W.indexOf('table.startNewHand()'));
+    expect(fnSrc('function releaseTournamentRebalance(')).toContain("table.vetoHandStart('tournament_table_short');");
+    expect(fnSrc('function bootstrapTournamentTables(')).toContain("if (deal && !tournamentShortTableHoldsDeal(tournamentId, tid, 'bootstrap')) {");
+    const round = fnSrc('function startHandForHandRound(');
+    expect(round).toContain("fillShortTournamentTablesNow(tournamentId, 'hand_for_hand', { rekick: false });");
+    expect(round).toContain('tournamentShortTableHolds.hfhMarked++;');
+    expect(round.indexOf("fillShortTournamentTablesNow(tournamentId, 'hand_for_hand'")).toBeLessThan(round.indexOf('r.base.set(tid, table.handNumber);'));
+    expect(fnSrc('function sweepTournamentRebalances(')).toContain('serviceShortTournamentTables();');
+    expect(fnSrc('function runPreStartDeal(')).toContain("fillShortTournamentTablesNow(tournamentId, 'pre_start', { rekick: false });");
+    expect(fnSrc('function applyDirectorPause(')).toContain("fillShortTournamentTablesNow(tournamentId, 'resume');");
+    expect(P.events).toContain("fillShortTournamentTablesNow(tournamentId, 'break_end');");
+    expect(fnSrc('function getGameStateForPlayer(')).toContain("stateObj.tableHold = stateTournamentId && tournamentTableShortHeld(stateTournamentId, table.config.tableId) ? 'short_table' : null;");
+    expect(fnSrc('function qualifierListItem(')).toContain('minTablePlayers: 4,');
+    expect(fnSrc('function executeShortTableFillMove(')).toContain("m.dstTid, m.dst, m.to, 'short_table')");
+    expect(SRC).toContain('shortTableHolds: { ...tournamentShortTableHolds, heldNow: tournamentShortTableEpisodes.size },');
+    expect(SRC).toContain('const TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL = 4;');
+    // Nothing switches the fill off: it reads neither the balance switch nor the overflow cap.
+    for (const fn of ['function planShortTableFill(', 'function runShortTableFill(', 'function tournamentShortTableHoldsDeal(']) {
+      expect(fnSrc(fn)).not.toMatch(/qualifierBalanceOn|qualifierOverflowTablesMax|qualifierOfTournament/);
+    }
+    const manifest = fs.readFileSync(path.join(__dirname, '..', 'canonical-features.txt'), 'utf8').split(/\r?\n/).map((l) => l.trim());
+    for (const tok of ['tournament_short_table_held', 'tournament_short_table_filled', 'tournament_waiting_table_dealt',
+      'tournament_short_table_rekicked', 'tournament_short_table_fill_failed', 'tournament_short_table_fill_refused',
+      'tournament_short_table_fill_followup_failed', 'tournament_short_table_check_failed', 'tournament_short_table_sweep_failed',
+      'tournament_waiting_table_deal_failed', "return 'short_table';", 'shortTableHolds',
+      'TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL = 4', 'stateObj.tableHold =', 'minTablePlayers: 4', 'tournament_table_short',
+      'fillShortTournamentTables(tId, tableId, table);', 'serviceShortTournamentTables();']) {
+      expect({ tok, listed: manifest.includes(tok), inSource: SRC.includes(tok) }).toEqual({ tok, listed: true, inSource: true });
+    }
   });
 });
 
@@ -5053,6 +5481,8 @@ describe('2026-10-24 (owner 2026-10-23: "Build it for Sunday") — H: HAND-FOR-H
     config?: Record<string, unknown>;
     /** qualifierOfTournament answers this many calls, then throws (H12). */
     qotThrowsAfter?: number;
+    /** FIX 1 (2026-11-25) — the composed helpers slice rewritten (e.g. a move that throws). */
+    helpersOver?: (helpers: string) => string;
   }
 
   /**
@@ -5078,6 +5508,7 @@ hx.isOn = () => qualifierHandForHandOn;
 hx.drains = handForHandDrains; hx.pending = handForHandBustPending;
 hx.outcome = tournamentEntryOutcomeOfAccount; hx.tellDead = tellDeadTournamentSeat;
 hx.bubbleOf = qualifierLateEntryBubbleOf;
+hx.short = tournamentShortTableHolds;
 `;
     // 2026-10-24 (owner 2026-10-23: "Fix both") — the per-event seat bubble TournamentManager asks
     // (H18 / H19 assign it; on 9c37499 it does not exist and resolves to an inert stub).
@@ -5111,7 +5542,7 @@ hx.bubbleOf = qualifierLateEntryBubbleOf;
     const w = world({
       layout,
       config: o.config,
-      over: { helpers: `${P.helpers}\n${o.qotThrowsAfter === undefined ? QOT : ''}\n${DEAL_HOOK}\n${SWITCH}\n${BUBBLE}\n${OUT}` },
+      over: { helpers: ((h: string) => (o.helpersOver ? o.helpersOver(h) : h))(`${P.helpers}\n${o.qotThrowsAfter === undefined ? QOT : ''}\n${DEAL_HOOK}\n${SWITCH}\n${BUBBLE}\n${OUT}`) },
       scope: {
         ...persistenceScope(null),
         qualifierTournaments, hx, process: proc, io,
@@ -5886,5 +6317,48 @@ hx.bubbleOf = qualifierLateEntryBubbleOf;
     x.w.m.autoStartNextHand('TA');
     expect(TA.handNumber).toBe(2);                                           // deals on: 10 alive is past the bubble
     expect(x.lines('qualifier_hand_for_hand_engaged')).toEqual([]);
+  });
+
+  // FIX 1 (owner 2026-11-25: "a tournament table must never deal with fewer than 4 players" while 2+
+  // tables play) — at the seat bubble a SHORT table must never keep a round unsettled (the watchdog
+  // would trip hand-for-hand for the rest of the bubble, where places award championship seats).
+  it('H-FIX1 — a SHORT table at the bubble never wedges a round: (a) the round start fills it from the idle tables (with the balance switch OFF) and both tables deal their round hand; (b) a fill that fails leaves it short: it is marked played (hfhMarked), the round settles on the other table alone and the next one starts; nothing trips', async () => {
+    const layout = () => ({ TA: field('a', 9, 5000, 100), TB: field('b', 3, 5000, 200) });
+    const gather = async (x: H) => {
+      expect(x.w.tm.getAliveCount(x.w.tid)).toBe(11);                       // the bubble (top 10)
+      for (const id of x.ids()) (x.t(id) as any).currentPhase = GamePhase.HandComplete;
+      x.w.m.autoStartNextHand('TA');
+      x.w.m.autoStartNextHand('TB');
+      expect(x.t('TA').handNumber + x.t('TB').handNumber).toBe(0);
+      await flush();
+    };
+    // (a) the balance OFF: only FIX 1's fill can bring TB to 4.
+    const a = hfh({ layout: layout(), earlier: { TA: [8] }, env: { QUALIFIER_TABLE_BALANCE: '0' } });
+    await gather(a);
+    expect(a.w.tm.getAlivePlayersOnTable(a.w.tid, 'TB')).toHaveLength(4);
+    expect(runScheduled(a)).toEqual(['TA', 'TB']);
+    expect([a.t('TA').handNumber, a.t('TB').handNumber]).toEqual([1, 1]);
+    expect(a.t('TB').seats.filter((s) => s.holeCards.length === 2)).toHaveLength(4);
+    expect(a.hx.short).toMatchObject({ playersMoved: 1, hfhMarked: 0 });
+    expect(a.hx.tripped.size).toBe(0);
+
+    // (b) every fill move throws (rolled back): TB stays at 3 — marked played, never waited for.
+    const NAME = 'function moveTournamentSeatPointers(';
+    const b = hfh({
+      layout: layout(), earlier: { TA: [8] }, env: { QUALIFIER_TABLE_BALANCE: '0' },
+      helpersOver: (h) => `${h.replace(NAME, 'function moveTournamentSeatPointersReal(')}\nfunction moveTournamentSeatPointers() { throw new Error('fill boom'); }\n`,
+    });
+    await gather(b);
+    expect(b.w.tm.getAlivePlayersOnTable(b.w.tid, 'TB')).toHaveLength(3);
+    expect(b.hx.short).toMatchObject({ hfhMarked: 1, errors: 1 });
+    expect(runScheduled(b)).toEqual(['TA', 'TB']);
+    expect([b.t('TA').handNumber, b.t('TB').handNumber]).toEqual([1, 0]); // TB never dealt 3-handed
+    await endHand(b, 'TA');                                                  // TA's round hand ends: the round settles
+    b.w.m.autoStartNextHand('TA');
+    await flush();
+    expect(b.hx.states.get(b.w.tid).rounds).toBe(2);                         // the next round started — no wedge
+    expect(b.hx.short.hfhMarked).toBe(2);
+    expect(b.hx.tripped.size).toBe(0);
+    expect(b.hx.stats).toMatchObject({ errors: 0 });
   });
 });

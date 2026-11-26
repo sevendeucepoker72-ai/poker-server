@@ -438,7 +438,10 @@ qualifierEntrantMasterId
 # P1: a rebalance never strands an alive entrant — capacity-checked breaks
 # (TournamentManager.checkRebalance freeSeatsOf), busted seats stood up before
 # they are reused, no break in the middle of a hand, a pending bust never
-# moved; the short table plays on (tests/rebalanceSafety.test.ts).
+# moved; the short table plays on (tests/rebalanceSafety.test.ts) — with 4 or
+# more alive. FIX 1 (owner 2026-11-25): with fewer than 4 while 2+ tables play
+# it is HELD until the short-table fill brings it to 4 (tokens below the S2
+# balance block: tournament_short_table_held ...).
 table_break_aborted_no_seats
 breaksAbortedNoSeats
 breaksDeferredMidHand
@@ -1944,6 +1947,37 @@ tournament_bootstrap_no_table_dealt
 qualifier_table_balanced
 balanceQualifierTables(tId, tableId, table);
 /api/qualifiers/balance
+
+# 2026-11-25 FIX 1 (owner: "While 2 or more tables are in play, a tournament
+# table must never deal with fewer than 4 players"; every tournament kind). A
+# short table (1-3 alive, 2+ tables) is HELD at every deal path
+# (autoStartNextHand, tournamentDealHoldReason 'short_table',
+# restartWaitingTournamentTables, the play gate's veto, the bootstrap) until the
+# short-table FILL (no switch) moves big-blind-due players in from a table with
+# >= 6 (it keeps >= 5): at a source's hand end, the held table's own pull from
+# idle tables, the 5 s sweep (which also re-kicks held tables once filled), a
+# break end, a resume, the early rooms' deal, a hand-for-hand round start (a
+# table still short is marked played: never waited for). The final table and
+# single-table events are never held. gameState tableHold; lobby
+# minTablePlayers; health tournamentSafety.shortTableHolds. tests/rebalanceSafety.test.ts FIX1-*.
+TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL = 4
+tournament_short_table_held
+tournament_short_table_filled
+tournament_short_table_fill_failed
+tournament_short_table_fill_refused
+tournament_short_table_fill_followup_failed
+tournament_short_table_check_failed
+tournament_short_table_sweep_failed
+tournament_short_table_rekicked
+tournament_waiting_table_dealt
+tournament_waiting_table_deal_failed
+tournament_table_short
+return 'short_table';
+fillShortTournamentTables(tId, tableId, table);
+serviceShortTournamentTables();
+shortTableHolds
+stateObj.tableHold =
+minTablePlayers: 4
 
 # 2026-10-23 qualifier lifecycle S3 (owner 2026-10-22: "run the blinds and raise
 # them, take breaks"): the level clock in every tournament table's state

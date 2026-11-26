@@ -161,6 +161,15 @@ const REAL_DEAL_HOLD = [
   fnSrc('function tournamentUnsettledBustSeat('),
   fnSrc('function tournamentEntrantHasLiveSeat('),
   fnSrc('function planTournamentRebalance('),
+  // FIX 1 (owner 2026-11-25) — the short-table hold the deal hold asks ('short_table': fewer than 4
+  // alive while 2+ tables play) and its episode bookkeeping (the fill itself lives in the rebalance
+  // helpers; this world has none, so a held overflow table here waits — see B3 / B11 / B12).
+  slice('const TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL = 4', ';\n'),
+  fnSrc('function tournamentTableShortHeld('),
+  slice('const tournamentShortTableHolds = {', '};\n'),
+  slice('const tournamentShortTableEpisodes = new Map', ';\n'),
+  fnSrc('function noteTournamentShortTableHeld('),
+  fnSrc('function tournamentShortTableHoldsDeal('),
 ].join('\n');
 const HANDLERS = ['registerQualifierTournament', 'unregisterQualifierTournament', 'getQualifierTournaments', 'spectateTournament']
   .map((ev) => handlerSrc(ev, '\n  });\n')).join('\n  ');
@@ -1924,7 +1933,11 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     expect(w.audits.find((x) => x.action === 'QUALIFIER_LATE_ENTRY_SEATED')?.d).toMatchObject({ tableId: 'OV1', overflowTable: true });
   });
 
-  it('B3 — a second late entrant joins THAT table (no second table): its FIRST hand is dealt through the REAL deal hold, right AFTER his registration is recorded and told; he is not told "waiting"', async () => {
+  // FIX 1 (owner 2026-11-25: "While 2 or more tables are in play, a tournament table must never deal
+  // with fewer than 4 players") — the overflow table's first hand waits for its 4th player (in
+  // production the short-table fill of the rebalance helpers brings players in from Q1 at its hand
+  // end — tests/rebalanceSafety.test.ts C1 / FIX1-4; this world has no fill: late entrants fill it).
+  it('B3 — a second late entrant joins THAT table (no second table); FIX 1: at 2 alive its first deal is HELD (short_table), at 4 its FIRST hand is dealt through the REAL deal hold, right AFTER the 4th registration is recorded and told; nobody is told "waiting" past the first', async () => {
     // Review fix-up (ff9a1cb): production-shaped (9-seat Q1, every seat alive) with the REAL
     // tournamentDealHoldReason — this test used to run against a stub that always allowed the deal.
     const { w, tid, qt } = fullNine();
@@ -1942,14 +1955,25 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     expect(started).toEqual(expect.objectContaining({ tableId: 'OV1', tableCount: 2, overflowTable: true }));
     expect(started.waitingForPlayers).toBeUndefined();
     expect(OV.handNumber).toBe(0);                                            // ff9a1cb: dealt INSIDE the handler, before all of the above
-    // The REAL hold lets it deal: 11 alive on 2 tables — Rule 1 (11 > 9) and Rule 2 (Q1 has no room for OV1's 2) plan nothing.
+    // 11 alive on 2 tables — Rule 1 (11 > 9) and Rule 2 (Q1 has no room for OV1's 2) plan nothing; FIX 1 holds OV1 at 2.
+    expect(w.m.tournamentDealHoldReason('OV1', tid, OV)).toBe('short_table');
+    await flush();
+    expect(OV.handNumber).toBe(0);                                            // never heads-up
+    await enter(w.mkSocket('SE', 104, 'm-eve', 'Eve'));
+    await flush();
+    expect(OV.handNumber).toBe(0);                                            // 3: still held
+    await enter(w.mkSocket('SF', 105, 'm-finn', 'Finn'));
+    expect(qt.players.map((p: any) => p.playerId)).toContain('user-105');
+    expect(last(w, 'SF')).toEqual(expect.objectContaining({ success: true, lateEntry: true, tableId: 'OV1', overflowTable: true }));
+    expect(OV.handNumber).toBe(0);                                            // deferred: after his registration
     expect(w.m.tournamentDealHoldReason('OV1', tid, OV)).toBeNull();
     await flush();
     expect(OV.handNumber).toBe(1);
     expect(OV.currentPhase).toBe(GamePhase.PreFlop);
-    expect(OV.seats.filter((s) => s.state === 'occupied' && s.holeCards.length === 2)).toHaveLength(2);
+    expect(OV.seats.filter((s) => s.state === 'occupied' && s.holeCards.length === 2)).toHaveLength(4);
     expect(w.aiKicks).toEqual(['OV1']);
     expect(w.creditRefunds).toEqual([]);
+    // (Eve and Finn took OV1's empty seats through the ordinary late-entry seating: OV1 is one of the tables now.)
     expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, firstDeals: 1, lateEntriesSeated: 1, firstDealErrors: 0 });
   });
 
@@ -1965,7 +1989,9 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     expect(w.m.qualifierOverflow.firstDeals).toBe(0);
   });
 
-  it('B11 — a RE-ENTRY onto a lone overflow table (production shape, REAL hold): seated on its empty seat, his re-entry recorded and told FIRST, then the table\'s first hand is dealt', async () => {
+  // FIX 1 (owner 2026-11-25) — at 2 alive the overflow table's first deal is held (short_table); two
+  // more late entrants (the fewest-alive table: OV1) make it 4 and it deals.
+  it('B11 — a RE-ENTRY onto a lone overflow table (production shape, REAL hold): seated on its empty seat, his re-entry recorded and told FIRST; FIX 1: the table\'s first hand is dealt once it has 4', async () => {
     const { w, tid, t, qt } = fullNine();
     await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));                // OV1: Alice alone, waiting
     expect(last(w, 'SA')).toEqual(expect.objectContaining({ tableId: 'OV1', waitingForPlayers: true }));
@@ -1981,34 +2007,46 @@ describe('2026-10-22 (owner: "Build it for Sunday") — every seat alive: a late
     expect(last(w, 'S201').waitingForPlayers).toBeUndefined();
     expect(last(w, 'S201', 'qualifierTournamentStarted')).toEqual(expect.objectContaining({ tableId: 'OV1', reentry: true, overflowTable: true }));
     expect(OV.handNumber).toBe(0);
-    expect(w.m.tournamentDealHoldReason('OV1', tid, OV)).toBeNull();          // 8 + 2 alive; Q1's 1 busted seat cannot take OV1's 2
+    // 8 + 2 alive; Q1's 1 busted seat cannot take OV1's 2 (no break) — FIX 1 holds OV1 at 2.
+    expect(w.m.tournamentDealHoldReason('OV1', tid, OV)).toBe('short_table');
+    await flush();
+    expect(OV.handNumber).toBe(0);
+    await enter(w.mkSocket('SE', 104, 'm-eve', 'Eve'));                      // the fewest-alive table: OV1
+    await enter(w.mkSocket('SF', 105, 'm-finn', 'Finn'));
     await flush();
     expect(OV.handNumber).toBe(1);
-    expect(OV.seats.filter((s) => s.state === 'occupied' && s.holeCards.length === 2)).toHaveLength(2);
+    expect(OV.seats.filter((s) => s.state === 'occupied' && s.holeCards.length === 2)).toHaveLength(4);
     expect(w.creditRefunds).toEqual([]);
-    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 're-entry']);
+    expect(w.consumed.map((c) => c.label)).toEqual(['entry', 're-entry', 'entry', 'entry']);
     expect(w.m.qualifierOverflow).toMatchObject({ opened: 1, firstDeals: 1, firstDealErrors: 0 });
   });
 
+  // FIX 1 (owner 2026-11-25) — a first deal is attempted only at 4 alive: Alice, Dan and Eve (3, held)
+  // come first; the 4th entrant's seat hook is the deal that throws.
   it('B12 — the first deal THROWS (late entry, then re-entry): the registration is recorded, told and keeps its credit; nothing escapes; firstDealErrors counts it and the 5s sweep deals the table later', async () => {
     const { w, tid, t, qt } = fullNine();
     await enter(w.mkSocket('SA', ALICE, 'm-alice', 'Alice'));
     await flush();                                                            // her own (deferred) seat hook: alone, nothing to deal
+    await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
+    await enter(w.mkSocket('SE', 104, 'm-eve', 'Eve'));
+    await flush();                                                            // 3 alive: held (FIX 1), never attempted
     const OV = w.tables.get('OV1')!;
+    expect(OV.handNumber).toBe(0);
+    expect(w.m.qualifierOverflow).toMatchObject({ firstDeals: 0, firstDealErrors: 0 });
     const realStart = OV.startNewHand.bind(OV);
     OV.startNewHand = () => { throw new Error('deal boom'); };
-    await enter(w.mkSocket('SD', 103, 'm-dan', 'Dan'));
+    await enter(w.mkSocket('SF', 105, 'm-finn', 'Finn'));
     await flush();
-    expect(qt.players.map((p: any) => p.playerId)).toContain('user-103');
-    expect(last(w, 'SD')).toEqual(expect.objectContaining({ success: true, lateEntry: true, tableId: 'OV1' }));
-    expect(w.m.qualifierLateEntries.seated).toBe(2);
+    expect(qt.players.map((p: any) => p.playerId)).toContain('user-105');
+    expect(last(w, 'SF')).toEqual(expect.objectContaining({ success: true, lateEntry: true, tableId: 'OV1' }));
+    expect(w.m.qualifierLateEntries.seated).toBe(4);
     expect(OV.handNumber).toBe(0);
     expect(w.m.qualifierOverflow).toMatchObject({ firstDeals: 0, firstDealErrors: 1 });
     // A re-entry whose seat hook hits the same throwing deal: still recorded (the shutdown flush refunds by these ids).
     bust(w, tid, t, 'user-202');
     await enter(w.mkSocket('S202', 202, 'm-202', 'P202'));
     await flush();
-    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-202')).toMatchObject({ reEntries: 1, reentryCreditIds: ['credit-3'] });
+    expect(qt.players.find((p: any) => p.masterPlayerId === 'm-202')).toMatchObject({ reEntries: 1, reentryCreditIds: ['credit-5'] });
     expect(last(w, 'S202')).toEqual(expect.objectContaining({ success: true, reentry: true, tableId: 'OV1' }));
     expect(w.m.qualifierOverflow.firstDealErrors).toBe(2);
     expect(w.creditRefunds).toEqual([]);

@@ -3311,6 +3311,11 @@ app.get('/api/health', async (_req, res) => {
         reentrantStartsRefused: PokerTable.reentrantStartsRefused,
         completingHandStartsRefused: PokerTable.completingHandStartsRefused,
         brokenTablesRetained: brokenTournamentTables.size,
+        // FIX 1 (owner 2026-11-25) — short tables (fewer than 4 alive while 2+
+        // tables play) held and filled: held = hold episodes, heldNow = tables
+        // held right now, fills / playersMoved / sweepFills / sweepRekicks /
+        // hfhMarked / dealsVetoed / waitingDeals; errors / followUpErrors should stay 0.
+        shortTableHolds: { ...tournamentShortTableHolds, heldNow: tournamentShortTableEpisodes.size },
         // 2026-10-10 — tournament starts whose registration socket was no
         // longer the registrant's: rebound = seat bound to his own other
         // socket, unbound = dealt in absent (bindRegistrantSocket).
@@ -4239,6 +4244,10 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     // 2026-10-24 (owner 2026-10-23: "Fix both") — additive capability flag: this server keeps a
     // running qualifier's fairness seeds private until it ends (poker-3d's rules page reads it).
     seedsHeldUntilEnd: true,
+    // FIX 1 (owner 2026-11-25) — additive capability flag: while 2+ tables play, no table of
+    // this server deals with fewer than this many players (poker-3d's rules page shows the
+    // line only when present). A literal: the lobby harnesses slice this function alone.
+    minTablePlayers: 4,
     lateRegOpen,
     lateRegClosedAt,
     lateRegClosedReason,
@@ -4426,7 +4435,9 @@ function scheduleDealAfterTournamentSeat(tableId: string): void {
   if (!table) return;
   // 2026-10-22 (owner: "Build it for Sunday") — a table that never dealt: an
   // OVERFLOW table's first hand once two are alive there (startFreshTournamentTable
-  // acts on overflow tables only, through every tournament deal hold).
+  // acts through every tournament deal hold). FIX 1 (owner 2026-11-25): also any
+  // waiting table of a multi-table tournament (one held short before its first
+  // deal), and never with fewer than 4 alive while 2+ tables play ('short_table').
   // Review fix-up: DEFERRED (setImmediate), never inline — the caller is a
   // registration that still has to record the entry (qt.players, the re-entry
   // credit ids the shutdown flush refunds) and send its result frames; the deal
@@ -4773,6 +4784,13 @@ function applyDirectorPause(
   // Never throws here.
   if (!paused && wasPaused) {
     try { balanceQualifierTablesNow(tournamentId); } catch (_) { /* never blocks the resume */ }
+  }
+  // FIX 1 (owner 2026-11-25) — then short tables (fewer than 4 alive while 2+
+  // tables play) are filled from the idle tables, every tournament, no switch
+  // (a filled waiting table's first deal is re-kicked; the loop below re-kicks
+  // the others). Never throws.
+  if (!paused && wasPaused) {
+    try { fillShortTournamentTablesNow(tournamentId, 'resume'); } catch (_) { /* never blocks the resume */ }
   }
   const evt = paused ? 'tournamentPaused' : 'tournamentResumed';
   // F90 (2026-10-21) — a SINGLE-table tournament (startTournamentGame, 9 or
@@ -6498,6 +6516,10 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
       }
       // (6) Review fix-up — the start's seating: even with the balance switch off.
       balanceMoves = balanceQualifierTablesNow(tournamentId, { ignoreSwitch: true });
+      // FIX 1 (owner 2026-11-25) — a table still short (fewer than 4 alive: the
+      // balance's present-mover rule left it) is filled before the deal below;
+      // one that stays short is held by the deal (and filled / dealt later).
+      fillShortTournamentTablesNow(tournamentId, 'pre_start', { rekick: false });
       // Every table's progress listener (bust check, hand results) before its first hand.
       for (const tid of t.tableIds) {
         const table = tableManager.getTable(tid);
@@ -7157,6 +7179,12 @@ function getGameStateForPlayer(
   stateObj.nextBlindIn = levelClock ? levelClock.nextBlindIn : 0;
   stateObj.blindLevelDuration = levelClock ? levelClock.blindLevelDuration : null;
   stateObj.tournamentClock = levelClock ? levelClock.tournamentClock : null;
+  // FIX 1 (owner 2026-11-25) — ALWAYS present (null off a held table and on a
+  // cash table, so the per-socket delta clears it): 'short_table' while this
+  // tournament table is HELD with fewer than 4 alive while 2+ tables play
+  // (poker-3d shows "Waiting for players to be moved to this table." and hides
+  // Deal now).
+  stateObj.tableHold = stateTournamentId && tournamentTableShortHeld(stateTournamentId, table.config.tableId) ? 'short_table' : null;
 
   // 2026-10-11 (R1 contract #2) — what kind of table this is and whether a
   // rebuy is allowed here, ALWAYS present (the `rebuy` handler refuses with
@@ -10750,7 +10778,9 @@ function autoStartNextHand(tableId: string): void {
   }
 
   // Tournament table guard: don't start a new hand if table has < 5 alive players
-  // and there are multiple tables still in play. Wait for rebalance to fill it.
+  // and there are multiple tables still in play while a break can happen (P1).
+  // FIX 1 (2026-11-25): and never with fewer than 4 while 2+ tables play (the
+  // short-table hold at the end of this block).
   const tId = tournamentTables.get(tableId);
   // 2026-07-07 gap-fill [15] — director pause. Hold at the hand boundary while
   // paused; the resume handler re-kicks each table. This never interrupts a live
@@ -10786,7 +10816,10 @@ function autoStartNextHand(tableId: string): void {
       ).length;
       // P1 — wait for a rebalance only when one CAN happen: when no table can
       // be broken (not enough free seats elsewhere), this table plays on
-      // short-handed instead of waiting forever.
+      // short-handed instead of waiting forever — with 4 alive; FIX 1
+      // (2026-11-25): with fewer than 4 it is held below until the short-table
+      // fill brings it to 4 (a fill that can always happen: see the proof at
+      // the FIX 1 block in the rebalance helpers).
       if (aliveOnTable < 5 && planTournamentRebalance(tId)) {
         // Trigger rebalance and don't start hand
         handleTableRebalance(tId);
@@ -10804,6 +10837,13 @@ function autoStartNextHand(tableId: string): void {
     // hand boundary (TDA balancing: the player due the big blind moves). Never
     // throws; never stops this table's own deal below.
     const fed = feedLoneQualifierTable(tId, tableId, table);
+    // FIX 1 (owner 2026-11-25, every tournament) — the SHORT-TABLE FILL: a table
+    // held short (fewer than 4 alive while 2+ tables play) takes this table's
+    // big-blind-due players until it has 4, while this one keeps >= 5 (it needs
+    // >= 6 to give). Any table with >= 6 gives at its own hand boundary, not
+    // only the fullest; away players and bots move too; no switch stops it (a
+    // possible break always wins). Never throws; this table still deals below.
+    fillShortTournamentTables(tId, tableId, table);
     // 2026-10-23 (qualifier lifecycle S2, owner: "auto balance tables") — when
     // the feed moved nobody: TDA balancing. If this is the fullest table (>= 6
     // alive) and another has at least two fewer, the player due THIS table's big
@@ -10811,6 +10851,15 @@ function autoStartNextHand(tableId: string): void {
     // wins; runtime switch POST /api/qualifiers/balance. Never throws; this
     // table still deals its own hand below.
     if (!fed) balanceQualifierTables(tId, tableId, table);
+    // FIX 1 (owner 2026-11-25: "a tournament table must never deal with fewer
+    // than 4 players" while 2 or more tables are in play) — THE HOLD, after every
+    // other step: the bust check has run (a 0-chip seat no longer counts), a
+    // possible break ran above (the final merges [5,4] / [6,3]), the
+    // hand-for-hand gate marked a held table's round hand as played (a round
+    // never waits on it), and this table could still GIVE as a source. A short
+    // table first pulls from idle tables; still short → it waits (no timer: the
+    // fill that brings it to 4 re-kicks it; the 5 s sweep is the backstop).
+    if (tournamentShortTableHoldsDeal(tId, tableId, 'hand_end', true)) return;
   }
 
   // Bots review 2026-11-04 — a CLUB table nobody sits at is never dealt bots-only
@@ -12422,6 +12471,20 @@ function releaseTournamentRebalance(tournamentId: string, table: PokerTable, tab
     // not be dealt (blinds would be posted on a table that is being removed).
     table.vetoHandStart('tournament_table_broken');
     tournamentHandStartSafety.handStartsVetoed++;
+  } else if (table.isStartingHand()) {
+    // FIX 1 (owner 2026-11-25) — the disqualifications left THIS table short
+    // (fewer than 4 alive while 2+ tables play): no deal. Its hold episode is
+    // noted, so the 5 s sweep fills it and deals it again (nothing else
+    // re-kicks a vetoed tournament deal). Never throws out of the play gate.
+    try {
+      if (tournamentShortTableHoldsDeal(tournamentId, tableId, 'play_gate')) {
+        table.vetoHandStart('tournament_table_short');
+        tournamentShortTableHolds.dealsVetoed++;
+      }
+    } catch (e: any) {
+      tournamentHandStartSafety.heldRebalanceErrors++;
+      console.error(`[play-gate] short-table check failed (tournament ${tournamentId}, table ${tableId}):`, e?.message || e);
+    }
   }
 }
 
@@ -27948,7 +28011,10 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[], opt
     if (!table) continue;
     try {
       ensureTableProgressListener(table, tid);
-      if (deal) {
+      // FIX 1 (owner 2026-11-25) — a table seated short (fewer than 4 alive while
+      // 2+ tables play: a seating that partly failed) is not dealt; the short-table
+      // fill brings it to 4 and deals it (the 5 s sweep is the backstop).
+      if (deal && !tournamentShortTableHoldsDeal(tournamentId, tid, 'bootstrap')) {
         try {
           if (table.startNewHand()) dealtTables++;
         } catch (err) {
@@ -28040,6 +28106,10 @@ function bootstrapTournamentTables(tournamentId: string, tableIds: string[], opt
       try {
         let balanceMoves = 0;
         try { balanceMoves = balanceQualifierTablesNow(tournamentId); } catch (_) { balanceMoves = 0; }
+        // FIX 1 (owner 2026-11-25) — a short table (fewer than 4 alive) is filled
+        // first, whatever the balance switch says (a filled waiting table's first
+        // deal is re-kicked; the loop below re-kicks the others). Never throws.
+        fillShortTournamentTablesNow(tournamentId, 'break_end');
         const resumeTables = tournamentManager.getTournament(tournamentId)?.tableIds || [];
         for (const tid of resumeTables) {
           try {
@@ -28772,6 +28842,35 @@ function planTournamentRebalance(tournamentId: string): ReturnType<TournamentMan
 }
 
 /**
+ * FIX 1 (owner 2026-11-25, every tournament: weekly / monthly qualifiers, the
+ * Online League, Sit & Go, club, custom, template events, the simulation) —
+ * while 2 or more tables are in play, a tournament table never DEALS with
+ * fewer than this many alive entrants mapped to it (present or away). The
+ * final table (one table left) and single-table events play with any number.
+ */
+const TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL = 4;
+
+/**
+ * FIX 1 — is `tableId` a SHORT table its tournament must hold (no deal) until
+ * auto-balancing brings it to TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL? true when
+ * the tournament is running, has more than one table, `tableId` is one of them
+ * and fewer than 4 alive entrants are mapped there (TournamentManager's count:
+ * present or away). Pure (no side effect): the gameState's `tableHold` reads it.
+ * Every deal path asks it AFTER its bust-check wait (a 0-chip entrant counts
+ * alive until his bust check ran) and after the under-5 planned break (so the
+ * final merges [5,4] / [6,3] still run): autoStartNextHand,
+ * tournamentDealHoldReason ('short_table'), restartWaitingTournamentTables,
+ * releaseTournamentRebalance (the play gate's veto) and the bootstrap deal —
+ * through tournamentShortTableHoldsDeal. Single-table events (tableIds <= 1)
+ * are never held.
+ */
+function tournamentTableShortHeld(tournamentId: string, tableId: string): boolean {
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t || t.status !== 'running' || t.tableIds.length <= 1 || !t.tableIds.includes(tableId)) return false;
+  return tournamentManager.getAlivePlayersOnTable(tournamentId, tableId).length < TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL;
+}
+
+/**
  * P1 — stand a BUSTED seat up so a moved player can take it (0 chips: nothing
  * to credit). The eliminated entrant keeps watching that table as a
  * spectator, and every pointer at the seat goes with it, so none can act on —
@@ -28846,6 +28945,8 @@ function moveTournamentSeatPointers(
   tp: { playerId: string; socketId: string; userId?: number; masterUserId?: string } | undefined,
   fromTableId: string, fromSeat: number, toTableId: string, toSeat: number,
   tournamentId?: string,
+  // FIX 1 (2026-11-25) — additive 'playerMoved' reason ('short_table': the move filled a held short table).
+  reason?: string,
 ): void {
   const notTheirs = (auth: { userId: number; masterUserId?: string } | undefined): boolean => {
     if (!tp || !auth) return false;
@@ -28881,7 +28982,7 @@ function moveTournamentSeatPointers(
     // fragment of the new table.
     lastSentState.delete(sid);
     lastSentJson.delete(sid);
-    sock.emit('playerMoved', { fromTable: fromTableId, toTable: toTableId, toSeat, tableId: toTableId });
+    sock.emit('playerMoved', { fromTable: fromTableId, toTable: toTableId, toSeat, tableId: toTableId, ...(reason ? { reason } : {}) });
     if (sid !== tp?.socketId) tournamentHandStartSafety.reconnectedSessionsMoved++;
     if (!firstLive) firstLive = sid;
   }
@@ -28954,7 +29055,11 @@ function carryAwayStateOnMove(fromTableId: string, fromSeat: number, toTableId: 
  * commitment before its seed was revealed (P2). A table already holding a
  * scheduled start is left alone. Only a WaitingForPlayers table is started
  * directly — and only after a break (`startWaiting`), as before P1. With no
- * rebalance possible, a short table plays on (>= 2 alive).
+ * rebalance possible, a short table used to play on (>= 2 alive); FIX 1 (owner
+ * 2026-11-25): while 2+ tables are in play a waiting table with fewer than 4
+ * alive is HELD here too (tournamentShortTableHoldsDeal) — the short-table fill
+ * brings it to 4 and re-kicks it (a HandComplete one is handed to
+ * autoStartNextHand, which holds it the same way).
  */
 function restartWaitingTournamentTables(tournamentId: string, opts: { startWaiting: boolean }): void {
   const t = tournamentManager.getTournament(tournamentId);
@@ -28972,6 +29077,8 @@ function restartWaitingTournamentTables(tournamentId: string, opts: { startWaiti
     if (!opts.startWaiting || t.paused) continue;
     // 2026-10-24 — hand-for-hand: a waiting table deals only its round's ONE hand (never throws).
     if (handForHandHoldsDeal(tournamentId, tid, table)) continue;
+    // FIX 1 (owner 2026-11-25) — never a first deal with fewer than 4 while 2+ tables play.
+    if (tournamentShortTableHoldsDeal(tournamentId, tid, 'restart_waiting')) continue;
     let dealt: boolean;
     try { dealt = table.startNewHand(); } catch (err) { if (!settleDealThrow(tid, table, 'tournament_restart', err)) throw err; dealt = true; }   // fix round 3
     if (dealt) {
@@ -29626,6 +29733,7 @@ function holdTournamentDealForBustCheck(tableId: string, tournamentId: string): 
  * S1 (b) — why a LIVE tournament table that is NOT at a hand end (its first
  * deal never happened) must not be dealt by a client 'startHand' right now —
  * the same holds autoStartNextHand applies at a hand end. null = it may deal.
+ * FIX 1 (2026-11-25): + 'short_table' (fewer than 4 alive while 2+ tables play).
  */
 function tournamentDealHoldReason(tableId: string, tournamentId: string, table: PokerTable): string | null {
   const t = tournamentManager.getTournament(tournamentId);
@@ -29641,6 +29749,11 @@ function tournamentDealHoldReason(tableId: string, tournamentId: string, table: 
   // 2026-10-24 — hand-for-hand at the seat bubble (overflow first deals, the
   // pre-start backstop, the client's 'startHand' at WaitingForPlayers). Never throws.
   if (handForHandHoldsDeal(tournamentId, tableId, table)) return 'hand_for_hand';
+  // FIX 1 (owner 2026-11-25) — a short table (fewer than 4 alive while 2+ tables
+  // play) waits for the short-table fill. AFTER the hand-for-hand gate, as in
+  // autoStartNextHand: a held table due its round hand is marked attempted there,
+  // so a round never waits on it.
+  if (tournamentShortTableHoldsDeal(tournamentId, tableId, 'deal_hold')) return 'short_table';
   return null;
 }
 
@@ -29780,19 +29893,35 @@ function closeUnusedQualifierOverflowTable(tournamentId: string, tableId: string
 /**
  * An overflow table's FIRST deal. A fresh table sits in WaitingForPlayers and
  * nothing else deals it (scheduleDealAfterTournamentSeat only restarts a
- * HandComplete table; the heartbeat skips tournament tables). Acts ONLY on an
- * overflow table of its tournament that never dealt, is not starting / completing
+ * HandComplete table; the heartbeat skips tournament tables). Acts on an
+ * overflow table of its tournament (FIX 1: or a waiting table of a multi-table
+ * tournament, below) that is waiting, is not starting / completing
  * a hand, has at least 2 alive, and no tournament deal hold applies
  * (tournamentDealHoldReason: paused, bust check pending, closed, break pending,
- * rebalance pending). Called by the seat hook (deferred), the feed and the 5s
+ * rebalance pending, hand-for-hand, short_table — FIX 1: so in practice it
+ * deals at 4 alive while 2+ tables play). Called by the seat hook (deferred), the feed and the 5s
  * sweep (backstop). true = dealt. Review fix-up: NEVER throws — a throw
  * (firstDealErrors, log `qualifier_overflow_first_deal_failed`) is retried by
  * the 5s sweep while the table still waits; it can never unwind a caller (a
  * registration's bookkeeping, the source table's deal in the feed).
+ * FIX 1 (owner 2026-11-25) — also ANY waiting table of a MULTI-table tournament
+ * (one of its tableIds: a table held short before its first deal — at the
+ * bootstrap, the early rooms' deal, after a break or a pre-start move): the
+ * short-table fill and the 5s sweep re-kick it through here once it reached 4
+ * (tournamentDealHoldReason holds it while it is short: 'short_table'). Such a
+ * deal is counted in shortTableHolds.waitingDeals (log
+ * `tournament_waiting_table_dealt`; a throw: shortTableHolds.errors, log
+ * `tournament_waiting_table_deal_failed`); an overflow table keeps its own counters.
  */
 function startFreshTournamentTable(tableId: string): boolean {
-  const tournamentId = qualifierOverflowTables.get(tableId);
+  const overflowOf = qualifierOverflowTables.get(tableId);
+  const tournamentId = overflowOf ?? tournamentTables.get(tableId);
   if (!tournamentId || tournamentTables.get(tableId) !== tournamentId) return false;
+  // FIX 1 — a non-overflow table only when it is one of a MULTI-table tournament's tables.
+  if (!overflowOf) {
+    const owner = tournamentManager.getTournament(tournamentId);
+    if (!owner || owner.tableIds.length <= 1 || !owner.tableIds.includes(tableId)) return false;
+  }
   let dealt = false;
   try {
     const table = tableManager.getTable(tableId);
@@ -29805,14 +29934,24 @@ function startFreshTournamentTable(tableId: string): boolean {
     try { started = table.startNewHand(); } catch (err) { if (!settleDealThrow(tableId, table, 'overflow_first_deal', err)) throw err; started = true; }   // fix round 3
     if (!started) return false;
     dealt = true;
-    qualifierOverflow.firstDeals++;
-    console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_first_deal', tournamentId, tableId, handNumber: table.handNumber })}`);
+    if (overflowOf) {
+      qualifierOverflow.firstDeals++;
+      console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_first_deal', tournamentId, tableId, handNumber: table.handNumber })}`);
+    } else {
+      tournamentShortTableHolds.waitingDeals++;
+      console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_waiting_table_dealt', tournamentId, tableId, handNumber: table.handNumber })}`);
+    }
     broadcastGameState(tableId);
     scheduleAIAction(tableId);
     return true;
   } catch (e: any) {
-    qualifierOverflow.firstDealErrors++;
-    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_first_deal_failed', tournamentId, tableId, dealt, error: String(e?.message || e) })}`);
+    if (overflowOf) {
+      qualifierOverflow.firstDealErrors++;
+      console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_overflow_first_deal_failed', tournamentId, tableId, dealt, error: String(e?.message || e) })}`);
+    } else {
+      tournamentShortTableHolds.errors++;
+      console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_waiting_table_deal_failed', tournamentId, tableId, dealt, error: String(e?.message || e) })}`);
+    }
     return dealt;
   }
 }
@@ -29875,13 +30014,19 @@ function liveSessionAt(tableId: string, seatIndex: number): string | null {
  * stack never left its seat, nothing points at the new one — and re-thrown, so
  * the caller counts a failure that moved nothing. The caller still clears the
  * emptied source seat's stale pointers (forgetSeatPointers).
+ * FIX 1 (owner 2026-11-25) — the short-table fill may move a BOT (the admin
+ * simulation's AI entrants; the feed and the balance never pick one): it sits
+ * down as a bot and its AI profile follows the stack, as a table break moves
+ * one (no session, no reservation, no notice). `reason` rides on 'playerMoved'
+ * (additive; the fill sends 'short_table').
  */
 function moveTournamentStack(
   tournamentId: string, srcTid: string, srcTable: PokerTable, from: number, mover: TournamentPlayer,
-  dstTid: string, dst: PokerTable, to: number,
+  dstTid: string, dst: PokerTable, to: number, reason?: string,
 ): boolean {
   const src = srcTable.seats[from];
   const chips = src.chipCount;
+  const isAI = !!src.isAI;
   // What points at the source seat now (restored if the move fails half-way) —
   // read BEFORE the sit-down, so nothing unguarded runs between it and the move.
   const sessionsAtSource = [...playerSessions].filter(([, s]) => s.tableId === srcTid && s.seatIndex === from);
@@ -29889,10 +30034,19 @@ function moveTournamentStack(
   const reservationsAtSource = [...reservedSeats.values()].filter((r) => r.tableId === srcTid && r.seatIndex === from);
   if (dst.seats[to].state !== 'empty') vacateBustedTournamentSeat(dst, dstTid, to);
   // A RELOCATION (allowBelowMin): the stack is below the starting stack more often than not.
-  if (!dst.sitDown(to, src.playerName, chips, src.playerId, false, true)) return false;
+  if (!dst.sitDown(to, src.playerName, chips, src.playerId, isAI, true)) return false;
   try {
     tournamentManager.setPlayerTable(tournamentId, mover.playerId, dstTid);
-    moveTournamentSeatPointers(mover, srcTid, from, dstTid, to, tournamentId);
+    if (isAI) {
+      // FIX 1 — a bot: its profile follows the stack (the break's own rule); nothing else points at it.
+      const profile = aiProfiles.get(srcTid)?.get(from);
+      if (profile) {
+        if (!aiProfiles.has(dstTid)) aiProfiles.set(dstTid, new Map());
+        aiProfiles.get(dstTid)!.set(to, profile);
+      }
+    } else {
+      moveTournamentSeatPointers(mover, srcTid, from, dstTid, to, tournamentId, reason);
+    }
   } catch (e) {
     // Rolled back: the stack never left its seat; nothing points at the new one.
     for (const [sid, s] of sessionsAtSource) {
@@ -29908,6 +30062,7 @@ function moveTournamentStack(
     }
     for (const ms of extrasAtSource) if (ms.tableId === dstTid && ms.seatIndex === to) { ms.tableId = srcTid; ms.seatIndex = from; }
     for (const r of reservationsAtSource) if (r.tableId === dstTid && r.seatIndex === to) { r.tableId = srcTid; r.seatIndex = from; }
+    if (isAI) aiProfiles.get(dstTid)?.delete(to);   // FIX 1 — the bot's copied profile goes again
     tournamentManager.setPlayerTable(tournamentId, mover.playerId, srcTid);
     if (dst.seats[to].state === 'occupied' && dst.seats[to].playerId === mover.playerId) dst.standUp(to);
     throw e;
@@ -29968,6 +30123,10 @@ function forgetSeatPointers(tableId: string, seatIndex: number): void {
  *    `qualifier_overflow_feed_followup_failed` (moved:true) — the move stands,
  *    chips are conserved, and the 5s sweep deals the lone table if it still waits.
  * Off with the runtime kill switch (qualifierOverflowTablesMax 0).
+ * FIX 1 (owner 2026-11-25) — the fed table no longer deals heads-up: while 2+
+ * tables play it is held until it has 4 (tournamentTableShortHeld), and the
+ * short-table fill that runs right after the feed in autoStartNextHand (no
+ * switch, absent movers too) tops it up from the same source boundary.
  */
 function feedLoneQualifierTable(tournamentId: string, sourceTableId: string, sourceTable: PokerTable): boolean {
   if (qualifierOverflowTables.size === 0) return false;
@@ -30362,6 +30521,353 @@ function balanceQualifierTablesNow(tournamentId: string, opts: { ignoreSwitch?: 
   if (n > 0) console.log(`[Qualifier] ${JSON.stringify({ event: 'qualifier_tables_balanced_pre_deal', tournamentId, moves: n })}`);
   return n;
 }
+
+// ── FIX 1 (owner 2026-11-25) — a SHORT table never deals while 2+ tables play; it is FILLED ──
+// Owner: "While 2 or more tables are in play, a tournament table must never deal
+// with fewer than 4 players ... dealing on THAT table pauses until auto-balancing
+// brings it to 4 (players moved in from fuller tables, or the table broken /
+// merged when the others have room). The final table plays with any number."
+// Every tournament kind (qualifiers, the Online League, Sit & Go, club, custom,
+// template events, the simulation); NO switch reads it (the qualifier balance
+// switch and the overflow cap do not stop it: a held table that nothing fills
+// would wait forever — the P1 stall, 2026-10-10).
+//
+// THE HOLD — tournamentTableShortHeld (next to planTournamentRebalance), asked
+// through tournamentShortTableHoldsDeal by every deal path, AFTER the bust-check
+// wait and the under-5 planned break (a break always wins: [5,4] / [6,3] merge).
+//
+// THE FILL — planShortTableFill / runShortTableFill: a source table with >= 6
+// alive (QUALIFIER_OVERFLOW_FEED_MIN_SOURCE: it keeps >= 5) gives its big-blind-
+// due players (TDA order; AWAY ones and bots too) to the held table until it has
+// 4 — min(4 - short, source - 5) per source — through the guarded
+// moveTournamentStack. ANY source may give, not only the fullest. When:
+//  - hand_end: the source at its own hand boundary (autoStartNextHand, after the
+//    feed, before the balance) — the usual path: a held table waits at most one
+//    hand of some source with >= 6;
+//  - held: the held table itself, at its hand boundary, pulls from IDLE sources
+//    (not in a hand) before it holds;
+//  - sweep (5 s), break_end, resume, pre_start, hand_for_hand (the round start):
+//    from idle sources, fullest first.
+// No fill while a break is possible (it seats them) or while everyone fits in
+// one table fewer (alive <= (tables-1) x 9: Rule 1's domain, the break's
+// business); none while hand-for-hand is engaged except at its round start.
+//
+// PROOF that a held table is always filled or broken (9-seat tables, T >= 2
+// tables, A alive, the held table has c <= 3): if A <= 9(T-1) Rule 1 breaks the
+// smallest table (the others' free seats >= 9(T-1) - (A - s) >= s). Otherwise
+// A >= 9(T-1) + 1, so the OTHER T-1 tables hold A - c >= 9(T-1) - 2 players:
+//  - at most ONE table is short (k short tables leave 9(T-k) >= A - 3k seats for
+//    the rest: 9T - 9k >= 9T - 8 - 3k gives k <= 1);
+//  - some other table has >= 7 (all <= 6 would give 6(T-1) >= 9(T-1) - 2, i.e.
+//    3(T-1) <= 2 — impossible), so a source always exists;
+//  - the sources' total surplus over 5 is >= (9(T-1) + 1 - c) - 5(T-1)
+//    = 4(T-1) + 1 - c > 4 - c: enough to bring the short table to 4 while every
+//    source keeps >= 5.
+// INVARIANT (as the balance's): a fill move takes one placeable seat at the
+// target and frees one at the source (free seats conserved), alive and table
+// counts unchanged, the source keeps >= 5 and the target ends at <= 4 — Rule 1
+// and Rule 2 test the same before and after, so a fill never NEWLY makes a
+// break fire (and never stops one: none was possible).
+// RE-KICK — the target is dealt again as the feed re-kicks its lone table
+// (HandComplete: scheduleAutoStart; WaitingForPlayers: startFreshTournamentTable)
+// — never startNewHand inside a handResult emit (P2: no fill runs inside one;
+// restartWaitingTournamentTables, which does, never fills). The 5 s sweep
+// re-kicks every table FIX 1 held (tournamentShortTableEpisodes) that is no
+// longer short and sits idle with no timer (a play-gate veto, a missed re-kick).
+/**
+ * Health tournamentSafety.shortTableHolds: held = hold EPISODES (a table found
+ * short; logged once each, `tournament_short_table_held`); fills = fill passes
+ * that moved someone; playersMoved = stacks moved (one log
+ * `tournament_short_table_filled` each); sweepFills = fills the 5 s sweep made;
+ * sweepRekicks = held tables the sweep dealt again; hfhMarked = short tables a
+ * hand-for-hand round marked as played (never waited for); dealsVetoed = deals
+ * the play gate's disqualifications left short (vetoed); waitingDeals = first
+ * deals of a non-overflow waiting table (startFreshTournamentTable); errors /
+ * followUpErrors (should stay 0) = a fill that moved nothing because something
+ * threw / a move that stands whose follow-up threw.
+ */
+const tournamentShortTableHolds = {
+  held: 0, fills: 0, playersMoved: 0, sweepFills: 0, sweepRekicks: 0, hfhMarked: 0, dealsVetoed: 0, waitingDeals: 0,
+  errors: 0, followUpErrors: 0,
+};
+/** FIX 1 — table id → tournament id of every table held short now (one episode each; the sweep's re-kick list). */
+const tournamentShortTableEpisodes = new Map<string, string>();
+/** A fill pass makes at most this many moves (each one brings a target one closer to 4). */
+const TOURNAMENT_SHORT_TABLE_FILL_MAX_MOVES = 36;
+type ShortTableFillVia = 'hand_end' | 'held' | 'sweep' | 'break_end' | 'resume' | 'pre_start' | 'hand_for_hand';
+
+/** FIX 1 — a new hold episode for `tableId`: counted + logged ONCE, and its players shown the hold (tableHold). */
+function noteTournamentShortTableHeld(tournamentId: string, tableId: string, via: string): void {
+  if (tournamentShortTableEpisodes.get(tableId) === tournamentId) return;
+  tournamentShortTableEpisodes.set(tableId, tournamentId);
+  tournamentShortTableHolds.held++;
+  const t = tournamentManager.getTournament(tournamentId);
+  console.log(`[Tournament] ${JSON.stringify({
+    event: 'tournament_short_table_held', tournamentId, tableId,
+    alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tableId).length, tables: t ? t.tableIds.length : 0, via,
+  })}`);
+  try { broadcastGameState(tableId); } catch (_) { /* a broadcast never blocks the hold */ }
+}
+
+/**
+ * FIX 1 — must `tableId` NOT deal now because it is short? false = not short
+ * (its episode, if any, ends: it is about to deal). true = held: the episode is
+ * noted (logged once). `pull` (autoStartNextHand only, at the table's own hand
+ * boundary): first pull players from IDLE source tables (runShortTableFill
+ * 'held') — a table that reached 4 deals at once. Never throws: a check that
+ * throws FAILS OPEN (counted in errors, log `tournament_short_table_check_failed`;
+ * the table deals as before FIX 1) — a broken check must never freeze a table.
+ */
+function tournamentShortTableHoldsDeal(tournamentId: string, tableId: string, via: string, pull: boolean = false): boolean {
+  try {
+    if (!tournamentTableShortHeld(tournamentId, tableId)) {
+      tournamentShortTableEpisodes.delete(tableId);
+      return false;
+    }
+    if (pull) {
+      runShortTableFill(tournamentId, 'held', { target: tableId, rekick: false });
+      if (!tournamentTableShortHeld(tournamentId, tableId)) {
+        tournamentShortTableEpisodes.delete(tableId);
+        return false;
+      }
+    }
+    noteTournamentShortTableHeld(tournamentId, tableId, via);
+    return true;
+  } catch (e: any) {
+    tournamentShortTableHolds.errors++;
+    console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_short_table_check_failed', tournamentId, tableId, via, error: String(e?.message || e) })}`);
+    return false;
+  }
+}
+
+/**
+ * FIX 1 — the next short-table FILL move of `tournamentId`, or null. `preDeal`
+ * = sources (and targets) must be idle (no hand in progress); otherwise
+ * `source` is the table at its own hand boundary (it gives if it has >= 6) and a
+ * target may be mid-hand (the mover sits that hand out, folded, and is dealt the
+ * next one — as a balance move or a late entry). `onlyTarget` = fill that table
+ * only (the 'held' pull). Rules: the tournament runs with 2+ tables (not paused
+ * at a hand end); a target is a SHORT table (1-3 alive) that is settled (no
+ * break awaiting its hand end, no pending / unsettled bust, not inside
+ * startNewHand or a hand completion) with a placeable seat (its first one is
+ * taken); fewest-alive target first. No move while a break is possible
+ * (planTournamentRebalance: a break always wins) or everyone fits in one table
+ * fewer (alive <= (tables-1) x 9: Rule 1's domain). A source is settled, not
+ * the target, with >= QUALIFIER_OVERFLOW_FEED_MIN_SOURCE (6) alive — ANY such
+ * source (fullest first in the pre-deal modes); the mover is its seat due the
+ * big blind next (getNextOccupiedSeat from the last big blind + 1), then
+ * clockwise: a live, alive entrant of that table with chips — AWAY or present,
+ * human or bot (no switch, no presence rule: the short table deals only once it
+ * has 4).
+ */
+function planShortTableFill(
+  tournamentId: string, preDeal: boolean, source?: { tid: string; table: PokerTable }, onlyTarget?: string,
+): QualifierBalanceMove | null {
+  const t = tournamentManager.getTournament(tournamentId);
+  if (!t || t.status !== 'running' || t.tableIds.length <= 1) return null;
+  if (!preDeal && t.paused) return null;
+  const tables: Array<{ tid: string; table: PokerTable; alive: number }> = [];
+  for (const tid of t.tableIds) {
+    const table = tableManager.getTable(tid);
+    if (!table || tournamentTables.get(tid) !== tournamentId) continue;
+    tables.push({ tid, table, alive: tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length });
+  }
+  const settled = (x: { tid: string; table: PokerTable }): boolean =>
+    tournamentBreaksAwaitingHandEnd.get(x.tid) !== tournamentId
+    && (tournamentBustChecksPending.get(x.tid)?.size || 0) === 0
+    && tournamentUnsettledBustSeat(tournamentId, x.table) < 0
+    && !x.table.isStartingHand() && !x.table.isCompletingHand()
+    && (!preDeal || !x.table.isHandInProgress());
+  const targets = tables
+    .filter((x) => x.alive >= 1 && x.alive < TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL && (!onlyTarget || x.tid === onlyTarget)
+      && (!source || x.tid !== source.tid) && settled(x))
+    .sort((a, b) => a.alive - b.alive);
+  if (targets.length === 0) return null;
+  // A break always wins; Rule 1's domain (everyone fits in one table fewer) is the break's.
+  if (planTournamentRebalance(tournamentId)) return null;
+  if (tournamentManager.getAliveCount(tournamentId) <= (t.tableIds.length - 1) * 9) return null;
+  let sources: Array<{ tid: string; table: PokerTable; alive: number }>;
+  if (source) {
+    const src = tables.find((x) => x.tid === source.tid && x.table === source.table);
+    sources = src ? [src] : [];
+  } else {
+    sources = tables.filter((x) => !targets.includes(x)).sort((a, b) => b.alive - a.alive);
+  }
+  sources = sources.filter((x) => x.alive >= QUALIFIER_OVERFLOW_FEED_MIN_SOURCE && settled(x));
+  if (sources.length === 0) return null;
+  for (const dst of targets) {
+    let to = -1;
+    for (let i = 0; i < MAX_SEATS; i++) if (tournamentSeatIsPlaceable(tournamentId, dst.table, i)) { to = i; break; }
+    if (to < 0) continue;
+    for (const src of sources) {
+      const first = src.table.getNextOccupiedSeat(src.table.previousBigBlindSeat + 1);
+      if (first < 0) continue;
+      for (let k = 0; k < MAX_SEATS; k++) {
+        const i = (first + k) % MAX_SEATS;
+        const seat = src.table.seats[i];
+        if (!seat || seat.state !== 'occupied' || seat.eliminated || !(seat.chipCount > 0)) continue;
+        const tp = t.players.find((p) => p.playerId === seat.playerId);
+        if (!tp || tp.eliminated || t.playerTableMap.get(tp.playerId) !== src.tid) continue;
+        if (tournamentLiveSeatIndex(src.table, tp.playerId) !== i) continue;
+        return {
+          srcTid: src.tid, src: src.table, from: i, mover: tp, srcAlive: src.alive,
+          dstTid: dst.tid, dst: dst.table, to, dstAlive: dst.alive,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * FIX 1 — carries out one fill move (the guarded moveTournamentStack, reason
+ * 'short_table' on 'playerMoved'). Never throws: a throw before the move is
+ * complete is rolled back (errors, log `tournament_short_table_fill_failed`
+ * moved:false, false); a refused sit-down changes nothing (log
+ * `tournament_short_table_fill_refused`, false); a stack that sits at the target
+ * counts (playersMoved, log `tournament_short_table_filled` {tournamentId,
+ * fromTableId, toTableId, fromAlive, toAlive — the counts AFTER the move —,
+ * fromSeat, toSeat, via}); its follow-ups (the emptied seat's pointers, both
+ * broadcasts) throwing is followUpErrors (the move stands, chips conserved).
+ */
+function executeShortTableFillMove(tournamentId: string, m: QualifierBalanceMove, via: ShortTableFillVia): boolean {
+  let moved = false;
+  try {
+    if (!moveTournamentStack(tournamentId, m.srcTid, m.src, m.from, m.mover, m.dstTid, m.dst, m.to, 'short_table')) {
+      console.warn(`[Tournament] ${JSON.stringify({ event: 'tournament_short_table_fill_refused', tournamentId, fromTableId: m.srcTid, toTableId: m.dstTid, toSeat: m.to, via })}`);
+      return false;
+    }
+    moved = true;
+    tournamentShortTableHolds.playersMoved++;
+    console.log(`[Tournament] ${JSON.stringify({
+      event: 'tournament_short_table_filled', tournamentId, fromTableId: m.srcTid, toTableId: m.dstTid,
+      fromAlive: m.srcAlive - 1, toAlive: m.dstAlive + 1, fromSeat: m.from, toSeat: m.to, via,
+    })}`);
+  } catch (e: any) {
+    if (!moved) {
+      tournamentShortTableHolds.errors++;
+      console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_short_table_fill_failed', tournamentId, tableId: m.srcTid, toTableId: m.dstTid, moved: false, via, error: String(e?.message || e) })}`);
+      return false;
+    }
+    tournamentShortTableHolds.followUpErrors++;   // (only the log line can throw here: the move stands)
+  }
+  try {
+    forgetSeatPointers(m.srcTid, m.from);
+    broadcastGameState(m.srcTid);
+    broadcastGameState(m.dstTid);
+  } catch (e: any) {
+    tournamentShortTableHolds.followUpErrors++;
+    console.error(`[Tournament] ${JSON.stringify({
+      event: 'tournament_short_table_fill_followup_failed', tournamentId, fromTableId: m.srcTid, toTableId: m.dstTid, moved: true, via, error: String(e?.message || e),
+    })}`);
+  }
+  return true;
+}
+
+/**
+ * FIX 1 — one fill pass: moves (planShortTableFill, one at a time, re-planned
+ * after each) until no move is left, at most TOURNAMENT_SHORT_TABLE_FILL_MAX_MOVES.
+ * 'hand_end' = `source` gives at its own hand boundary; every other mode takes
+ * from IDLE sources. None while hand-for-hand is engaged, except at its round
+ * start ('hand_for_hand'). `rekick` (default): every filled target is dealt
+ * again as the feed re-kicks its lone table (waiting: startFreshTournamentTable;
+ * idle HandComplete: scheduleAutoStart) — never startNewHand inside a handResult
+ * emit: no caller runs inside one (its callers that re-kick every table
+ * themselves pass false). Never throws. Returns the stacks moved.
+ */
+function runShortTableFill(
+  tournamentId: string, via: ShortTableFillVia,
+  o: { source?: { tid: string; table: PokerTable }; target?: string; rekick?: boolean } = {},
+): number {
+  let n = 0;
+  const filled = new Set<string>();
+  try {
+    if (via !== 'hand_for_hand' && handForHandStates.has(tournamentId)) return 0;
+    while (n < TOURNAMENT_SHORT_TABLE_FILL_MAX_MOVES) {
+      const plan = planShortTableFill(tournamentId, via !== 'hand_end', via === 'hand_end' ? o.source : undefined, o.target);
+      if (!plan || !executeShortTableFillMove(tournamentId, plan, via)) break;
+      filled.add(plan.dstTid);
+      n++;
+    }
+  } catch (e: any) {
+    tournamentShortTableHolds.errors++;
+    console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_short_table_fill_failed', tournamentId, moved: n > 0, moves: n, via, error: String(e?.message || e) })}`);
+  }
+  if (n > 0) {
+    tournamentShortTableHolds.fills++;
+    if (via === 'sweep') tournamentShortTableHolds.sweepFills++;
+  }
+  if (o.rekick !== false) {
+    for (const dstTid of filled) {
+      try {
+        // As the feed re-kicks its lone table: a table that never dealt gets its first deal now
+        // (startFreshTournamentTable: every tournament deal hold, never throws); an idle
+        // HandComplete one goes through the hand-boundary scheduler; a mid-hand one deals at its own end.
+        const dst = tableManager.getTable(dstTid);
+        if (dst && dst.currentPhase === GamePhase.WaitingForPlayers) startFreshTournamentTable(dstTid);
+        else if (dst && dst.currentPhase === GamePhase.HandComplete && !pendingAutoStartTimers.has(dstTid)) scheduleAutoStart(dstTid);
+      } catch (e: any) {
+        tournamentShortTableHolds.followUpErrors++;
+        console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_short_table_fill_followup_failed', tournamentId, toTableId: dstTid, moved: true, via, error: String(e?.message || e) })}`);
+      }
+    }
+  }
+  return n;
+}
+
+/** FIX 1 — the hand-end fill: `sourceTableId`, at its own hand boundary (autoStartNextHand), gives to a held short table. Never throws. */
+function fillShortTournamentTables(tournamentId: string, sourceTableId: string, sourceTable: PokerTable): number {
+  return runShortTableFill(tournamentId, 'hand_end', { source: { tid: sourceTableId, table: sourceTable } });
+}
+
+/** FIX 1 — a pre-deal fill from IDLE sources (the sweep, a break end, a resume, the early rooms' deal, a hand-for-hand round start). Never throws. */
+function fillShortTournamentTablesNow(tournamentId: string, via: ShortTableFillVia, opts: { rekick?: boolean } = {}): number {
+  return runShortTableFill(tournamentId, via, { rekick: opts.rekick });
+}
+
+/**
+ * FIX 1 — the 5 s sweep's step (sweepTournamentRebalances): for every running
+ * multi-table tournament that is not paused, not held before its first deal
+ * (the early rooms) and not engaged in hand-for-hand (its round service owns its
+ * tables): (a) a fill from idle sources (a held table whose sources were all
+ * mid-hand when it was held); (b) every table FIX 1 held that is no longer short,
+ * sits idle and has no scheduled start is dealt again (HandComplete:
+ * scheduleAutoStart → autoStartNextHand, every hold re-checked; WaitingForPlayers:
+ * startFreshTournamentTable) — a play-gate veto or a missed re-kick never leaves
+ * it idle. Episodes of tables / tournaments that are gone are forgotten. Never throws.
+ */
+function serviceShortTournamentTables(): void {
+  for (const [tableId, tId] of [...tournamentShortTableEpisodes]) {
+    if (tournamentTables.get(tableId) !== tId || tournamentManager.getTournament(tId)?.status !== 'running') tournamentShortTableEpisodes.delete(tableId);
+  }
+  for (const tournamentId of new Set(tournamentTables.values())) {
+    try {
+      const t = tournamentManager.getTournament(tournamentId);
+      if (!t || t.status !== 'running' || t.tableIds.length <= 1 || t.paused) continue;
+      if (qualifierPreStartHolds.has(tournamentId) || handForHandStates.has(tournamentId)) continue;
+      runShortTableFill(tournamentId, 'sweep');
+      for (const tid of [...t.tableIds]) {
+        if (tournamentShortTableEpisodes.get(tid) !== tournamentId) continue;
+        const table = tableManager.getTable(tid);
+        if (!table || table.isHandInProgress() || table.isStartingHand() || table.isCompletingHand()) continue;
+        if (tournamentTableShortHeld(tournamentId, tid)) continue;
+        if (tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length < 2) continue;
+        if (table.currentPhase === GamePhase.HandComplete) {
+          if (pendingAutoStartTimers.has(tid)) continue;
+          scheduleAutoStart(tid);
+          tournamentShortTableHolds.sweepRekicks++;
+          console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_short_table_rekicked', tournamentId, tableId: tid })}`);
+        } else if (table.currentPhase === GamePhase.WaitingForPlayers) {
+          if (startFreshTournamentTable(tid)) tournamentShortTableHolds.sweepRekicks++;
+        }
+      }
+    } catch (e: any) {
+      tournamentShortTableHolds.errors++;
+      console.error(`[Tournament] ${JSON.stringify({ event: 'tournament_short_table_sweep_failed', tournamentId, error: String(e?.message || e) })}`);
+    }
+  }
+}
+// ── end FIX 1 short tables ──
 // ===== Hand-for-hand at the qualifier seat bubble (2026-10-24) =====
 /**
  * Owner 2026-10-23: "Build it for Sunday" — HAND-FOR-HAND at an online
@@ -30814,8 +31320,9 @@ function serviceAllHandForHand(): void {
 /**
  * The next round: (a) a table break still pending runs first; (b) S2's pre-deal
  * balance pass (every table idle: within one player — a no-op with its switch
- * off); (c) every table's hand number is the round's base, a table with fewer
- * than 2 alive is skipped; (e) the watchdog runs from now; (g) every table is
+ * off), then FIX 1's short-table fill (no switch); (c) every table's hand number
+ * is the round's base, a table with fewer than 2 alive — or held short (FIX 1)
+ * — is skipped; (e) the watchdog runs from now; (g) every table is
  * kicked in ONE pass (HandComplete: scheduleAutoStart, all armed together;
  * WaitingForPlayers: restartWaitingTournamentTables) — each deals once, through
  * the gate; (h) every table's state (the clock's round).
@@ -30827,6 +31334,10 @@ function startHandForHandRound(st: HandForHandState): void {
     try { handleTableRebalance(tournamentId); } catch (e) { handForHandFailed(tournamentId, 'round_break', e); }
   }
   try { balanceQualifierTablesNow(tournamentId); } catch (e) { handForHandFailed(tournamentId, 'round_balance', e); }
+  // FIX 1 (owner 2026-11-25) — a SHORT table (fewer than 4 alive) is filled from
+  // the idle tables first, whatever the balance switch says (the round kicks
+  // every table itself below). One still short is marked played (never waited for).
+  try { fillShortTournamentTablesNow(tournamentId, 'hand_for_hand', { rekick: false }); } catch (e) { handForHandFailed(tournamentId, 'round_short_fill', e); }
   // A break just now can end it (one table left / the tournament over).
   const end = handForHandEndReason(tournamentId);
   if (end) { releaseHandForHand(tournamentId, end); return; }
@@ -30840,6 +31351,12 @@ function startHandForHandRound(st: HandForHandState): void {
     r.base.set(tid, table.handNumber);
     const alive = tournamentManager.getAlivePlayersOnTable(tournamentId, tid).length;
     if (alive < 2) r.attempted.add(tid);   // cannot deal: never waited for
+    else if (tournamentTableShortHeld(tournamentId, tid)) {
+      // FIX 1 — held short (it will not deal): never waited for either, so a
+      // held table can never wedge the round or trip the watchdog.
+      r.attempted.add(tid);
+      tournamentShortTableHolds.hfhMarked++;
+    }
     tables.push({ tableId: tid, hand: table.handNumber + 1, alive });
   }
   st.rounds = r.no;
@@ -31522,6 +32039,9 @@ function sweepTournamentRebalances(): void {
       continue; // never stop servicing the other tournaments (a deferred break re-asks every tick)
     }
   }
+  // FIX 1 (owner 2026-11-25) — held short tables: filled from idle tables, and
+  // dealt again once they have 4 (after the breaks above). Never throws.
+  serviceShortTournamentTables();
 }
 setInterval(sweepTournamentRebalances, 5000);
 
