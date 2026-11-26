@@ -3454,8 +3454,11 @@ app.get('/api/health', async (_req, res) => {
         // warned (3-hand warnings), removed, removedProtectedAfterHour (league entrants who never
         // played a hand, removed after 7:00 PM), protectedHands (hands at 30+ inside the first
         // hour), resetsByAction / resetsByBack, removalsSkipped (re-check said no at the bust
-        // check), noShowsProtected (entrants with no hand played yet when a league first hour
-        // was marked), toldOnSignIn, errors (should stay 0).
+        // check), firstHourEntrants (alive entrants with no hand played yet when a league first
+        // hour was marked: the whole field, both starts run before any hand ends; was
+        // noShowsProtected), noShowsAtHourEnd (the REAL no-shows: alive entrants still with no
+        // hand played at a night's first hand end after its first hour, once per night),
+        // toldOnSignIn, errors (should stay 0).
         tournamentSitOutLimit: { ...awayStreakStats, handsLimit: TOURNAMENT_SIT_OUT_HANDS_LIMIT, pendingSignInNotices: removalSignInNotices.size },
         // 2026-10-28 — handComplete is NOT a freeze count: it includes the
         // benign re-seeds of a public table everyone left (~29 per 45 h) and
@@ -7723,15 +7726,42 @@ const tournamentTimeoutSitOutStats = {
   satOut: 0, sessionsMarked: 0, reservationsMarked: 0, backByAction: 0, shortClockRearmed: 0, awayMoved: 0,
   sitOutFallbacks: 0, sitOutRefusals: 0, backFallbacks: 0, backRefusals: 0,
 };
+/**
+ * Review fix (2026-11-26) — the Online League first-hour fields of the timeout's
+ * 'sitOutToggled' {reason:'timeout'} (ONLY that event): `protectedUntil` = the
+ * 7:00 PM MT ms while this entrant is inside his first hour (no hand played yet),
+ * else null; `noShowDue` = a league entrant who never played a hand, now past
+ * late entry (awayStreakNoShowDue: still away at this hand's end, he is removed
+ * whatever his count). The client's toast promised "30 hands in a row" to both.
+ * Weekly / every other tournament: {protectedUntil: null, noShowDue: false}.
+ * Never throws.
+ */
+function timeoutSitOutFirstHourFields(tableId: string, seatIndex: number): { protectedUntil: number | null; noShowDue: boolean } {
+  try {
+    const tournamentId = tournamentTables.get(tableId);
+    const tp = tournamentId ? awayStreakEntrantAt(tournamentId, tableManager.getTable(tableId), seatIndex) : null;
+    if (!tournamentId || !tp) return { protectedUntil: null, noShowDue: false };
+    const t = tournamentManager.getTournament(tournamentId);
+    const now = Date.now();
+    return {
+      protectedUntil: awayStreakProtected(t, tp, now) ? awayStreakFirstHourUntil(t, tp) : null,
+      noShowDue: awayStreakNoShowDue(t, tp, now),
+    };
+  } catch {
+    return { protectedUntil: null, noShowDue: false };
+  }
+}
 /** Sit out this tournament seat after its turn timed out: every session playing it, else his live reservation. True when one was. */
 function sitOutTournamentSeatAfterTimeout(tableId: string, seatIndex: number): boolean {
   if (!isTournamentTable(tableId)) return false;
   let marked = 0;
+  let firstHour: { protectedUntil: number | null; noShowDue: boolean } | null = null;   // read once, for the first socket told
   const mark = (sid: string, s: PlayerSession | undefined): void => {
     if (!s || s.tableId !== tableId || s.seatIndex !== seatIndex || s.sittingOut) return;
     s.sittingOut = true;
     marked++;
-    io.sockets.sockets.get(sid)?.emit('sitOutToggled', { sittingOut: true, reason: 'timeout', tableId });
+    firstHour = firstHour ?? timeoutSitOutFirstHourFields(tableId, seatIndex);
+    io.sockets.sockets.get(sid)?.emit('sitOutToggled', { sittingOut: true, reason: 'timeout', tableId, ...firstHour });
   };
   for (const [sid, s] of playerSessions) mark(sid, s);
   for (const [sid, list] of multiTableSessions) for (const s of list || []) mark(sid, s);
@@ -7824,10 +7854,17 @@ function currentTurnTimeoutMs(tableId: string): number {
  */
 const TOURNAMENT_SIT_OUT_HANDS_LIMIT = 30;
 const TOURNAMENT_SIT_OUT_WARN_AT = 3;
-/** Health engine.tournamentSitOutLimit. */
+/**
+ * Health engine.tournamentSitOutLimit. Review fix (2026-11-26) — `firstHourEntrants`
+ * (was `noShowsProtected`: it always equalled the whole field, since a night is
+ * marked before any of its hands ends) = the alive entrants with no hand played
+ * when a night's first hour was marked; `noShowsAtHourEnd` = the REAL no-show
+ * count: alive entrants still with no hand played at the night's first hand end
+ * after its first hour (once per night, noteLeagueNoShowsAtHourEnd).
+ */
 const awayStreakStats = {
   counted: 0, warned: 0, removed: 0, removedProtectedAfterHour: 0, protectedHands: 0,
-  resetsByAction: 0, resetsByBack: 0, removalsSkipped: 0, noShowsProtected: 0, toldOnSignIn: 0, errors: 0,
+  resetsByAction: 0, resetsByBack: 0, removalsSkipped: 0, firstHourEntrants: 0, noShowsAtHourEnd: 0, toldOnSignIn: 0, errors: 0,
 };
 /** A voluntary action of the seat THIS hand: fold / check / call / bet / raise / all-in, never auto-stamped. */
 function awayStreakActed(table: PokerTable, seatIndex: number): boolean {
@@ -8013,6 +8050,7 @@ function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: Tourname
       if (!check.awayLimitSeats) check.awayLimitSeats = new Map();
       check.awayLimitSeats.set(i, tp.playerId);
     }
+    noteLeagueNoShowsAtHourEnd(t, tournamentId, now);   // review fix 2026-11-26 — after this hand's played flags
   } catch (e: any) {
     awayStreakStats.errors++;
     console.warn(`[Tournament] ${JSON.stringify({ event: 'tournament_sit_out_count_failed', tableId, error: String(e?.message || e) })}`);
@@ -8029,7 +8067,10 @@ function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: Tourname
  * elsewhere, dropped in the start's grace, a late entrant); nobody is named.
  * Both league starts call it (the 6:00 PM start, the early rooms' deal); no
  * other tournament ever has it. Returns how many alive entrants have not played
- * a hand yet (health noShowsProtected).
+ * a hand yet (health firstHourEntrants, log `entrants`): both starts run before
+ * any hand of the night ends, so that is the whole field — the night's real
+ * no-shows are counted at the first hand end after the hour
+ * (noteLeagueNoShowsAtHourEnd, health noShowsAtHourEnd).
  */
 function markLeagueFirstHour(tournamentId: string, until: number): number {
   try {
@@ -8037,13 +8078,30 @@ function markLeagueFirstHour(tournamentId: string, until: number): number {
     if (!t || !Number.isFinite(until)) return 0;
     t.leagueFirstHourUntil = until;
     const n = t.players.filter((tp) => !tp.eliminated && !tp.playedAHand).length;
-    awayStreakStats.noShowsProtected += n;
-    console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_no_show_protected', tournamentId, until, notPlayedYet: n })}`);
+    awayStreakStats.firstHourEntrants += n;
+    console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_no_show_protected', tournamentId, until, entrants: n })}`);
     return n;
   } catch {
     awayStreakStats.errors++;
     return 0;
   }
+}
+/**
+ * Review fix (2026-11-26) — an Online League night's REAL no-show count: at its
+ * FIRST hand end (any table) after leagueFirstHourUntil, once per night
+ * (Tournament.leagueNoShowsCounted), the alive entrants who still have not
+ * played a hand (this hand's own played flags already set: one who plays it is
+ * no no-show). They are the ones the first hour's end removes when away (health
+ * noShowsAtHourEnd, log `tournament_no_shows_at_hour_end` {tournamentId, until,
+ * noShows}). Called by awayStreakAtHandEnd (inside its try).
+ */
+function noteLeagueNoShowsAtHourEnd(t: Tournament, tournamentId: string, now: number): void {
+  const until = t.leagueFirstHourUntil;
+  if (typeof until !== 'number' || !Number.isFinite(until) || now <= until || t.leagueNoShowsCounted) return;
+  t.leagueNoShowsCounted = true;
+  const n = t.players.filter((tp) => !tp.eliminated && !tp.playedAHand).length;
+  awayStreakStats.noShowsAtHourEnd += n;
+  console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_no_shows_at_hour_end', tournamentId, until, noShows: n })}`);
 }
 // --- end tournament sit-out limit ---
 // ===== end absent tournament seat clock =====
@@ -29876,9 +29934,13 @@ function removalNoticeFields(tournamentId: string, playerId: string): { reason?:
  * event already tells him at sign-in through its untold result row
  * (tellUnseenTournamentResults), so it is never told twice. Any later direct
  * notice of his elimination (the G183 dead-seat notice at sign-in) consumes it.
+ * Review fix (2026-11-26) — the queued notice carries WHY (`handsSatOut`, `noShow`)
+ * itself: a qualifier / league record is pruned an hour after its finish
+ * (pruneEndedTournaments) while the notice waits 24 h, and a no-show who signed
+ * in the next morning was told "removed for sitting out 30 hands in a row".
  */
 const REMOVAL_SIGN_IN_NOTICE_TTL_MS = 24 * 60 * 60 * 1000;
-const removalSignInNotices = new Map<string, { tournamentId: string; playerId: string; playerName: string; position: number; userId: number | null; masterId: string | null; tournamentName: string; at: number }>();
+const removalSignInNotices = new Map<string, { tournamentId: string; playerId: string; playerName: string; position: number; userId: number | null; masterId: string | null; tournamentName: string; at: number; handsSatOut: number; noShow: boolean }>();
 function removalNoticeKey(tournamentId: string, playerId: string): string {
   return `${tournamentId}\u0000${playerId}`;
 }
@@ -29890,7 +29952,11 @@ function dropRemovalSignInNotice(tournamentId: string, playerId: string): void {
  * still running → 'playerEliminated' {tournamentId, playerId, playerName,
  * position, prize?, atSignIn:true, reason:'sat_out_limit', handsSatOut};
  * finished → 'tournamentFinishedForEntrant' {tournamentId, position, prize?,
- * tournamentName, atSignIn:true, reason, handsSatOut}. Each once. Never throws.
+ * tournamentName, atSignIn:true, reason, handsSatOut, noShow?}. Each once. Never throws.
+ * Review fix (2026-11-26) — once the live record is pruned (an hour after the
+ * finish): `handsSatOut` / `noShow` come from the queued notice, and his place
+ * from the kept finished roster (TournamentManager.keptFinishPositionOf, 25 h:
+ * the STORED place, after any later late-entry shift), the queued place last.
  */
 function tellRemovalSignInNotices(socket: Socket, auth: SocketAuthSession, via: string): number {
   try {
@@ -29905,11 +29971,13 @@ function tellRemovalSignInNotices(socket: Socket, auth: SocketAuthSession, via: 
       removalSignInNotices.delete(k);
       const t = tournamentManager.getTournament(n.tournamentId);
       const tp = t?.players.find((p) => p.playerId === n.playerId);
-      const position = tp && tp.eliminated && tp.finishPosition > 0 ? tp.finishPosition : n.position;
+      const position = tp && tp.eliminated && tp.finishPosition > 0
+        ? tp.finishPosition
+        : (!tp ? tournamentManager.keptFinishPositionOf(n.tournamentId, n.playerId, now) : null) ?? n.position;
       const prize = tournamentManager.prizeForEntrant(n.tournamentId, n.playerId);
       const why = {
-        reason: 'sat_out_limit' as const, handsSatOut: tp?.removedSatOutHands ?? TOURNAMENT_SIT_OUT_HANDS_LIMIT,
-        ...(tp?.removedNoShow ? { noShow: true as const } : {}),   // review fix 2026-11-26
+        reason: 'sat_out_limit' as const, handsSatOut: tp?.removedSatOutHands ?? n.handsSatOut,
+        ...(tp?.removedNoShow || n.noShow ? { noShow: true as const } : {}),   // review fix 2026-11-26
       };
       if (t && t.status === 'running') {
         socket.emit('playerEliminated', {
@@ -30341,6 +30409,8 @@ function queueRemovalSignInNotice(tournamentId: string, playerId: string, player
     removalSignInNotices.set(removalNoticeKey(tournamentId, playerId), {
       tournamentId, playerId, playerName, position, userId, masterId: masterId ? String(masterId) : null,
       tournamentName: t.config.name || 'Tournament', at: now,
+      // Review fix (2026-11-26) — WHY, kept with the notice: the record is pruned an hour after the finish.
+      handsSatOut: tp.removedSatOutHands ?? TOURNAMENT_SIT_OUT_HANDS_LIMIT, noShow: !!tp.removedNoShow,
     });
   } catch {
     awayStreakStats.errors++;

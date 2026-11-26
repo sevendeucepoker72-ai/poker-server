@@ -1272,7 +1272,8 @@ describe('the Online League first hour: protected until he plays a hand, removed
     expectFirstHour(r);
     // a0 never came: protected too, removed at the same hand end at his real count.
     expect(r.w.tp('a0')).toMatchObject({ eliminated: true, sitOutHands: 2, removedNoShow: true, removedSatOutHands: 2 });
-    expect(r.w.m.awayStreakStats).toMatchObject({ noShowsProtected: 4, protectedHands: 1, removed: 2, removedProtectedAfterHour: 2 });
+    // Review fix (2026-11-26): the mark counts the whole field (firstHourEntrants); the REAL no-shows (a0, a1) at 7:00 PM.
+    expect(r.w.m.awayStreakStats).toMatchObject({ firstHourEntrants: 4, noShowsAtHourEnd: 2, protectedHands: 1, removed: 2, removedProtectedAfterHour: 2 });
     const ctl = await runNight({ before: leftHisSeat, previous: ['a0'] });
     expectRemovedAt30(ctl);
     expect(ctl.w.tp('a0')).toMatchObject({ eliminated: true, removedNoShow: true });   // the named no-show: as now
@@ -1417,8 +1418,227 @@ describe('the Online League first hour: protected until he plays a hand, removed
     expect(w.tm.getTournament(w.tid)!.leagueFirstHourUntil).toBeUndefined();
     expect(w.m.markLeagueFirstHour(w.tid, SEVEN_PM_MT)).toBe(1);   // a0 is the only one who has not played
     expect(w.tm.getTournament(w.tid)!.leagueFirstHourUntil).toBe(SEVEN_PM_MT);
-    expect(w.m.awayStreakStats.noShowsProtected).toBe(1);
-    expect(w.logs.filter((l) => l.includes('"event":"tournament_no_show_protected"'))).toHaveLength(1);
+    expect(w.m.awayStreakStats.firstHourEntrants).toBe(1);
+    expect(w.logs.filter((l) => l.includes('"event":"tournament_no_show_protected"')).map((l) => JSON.parse(l.slice(l.indexOf('{'))))).toEqual([
+      { event: 'tournament_no_show_protected', tournamentId: w.tid, until: SEVEN_PM_MT, entrants: 1 },
+    ]);
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Review fix (2026-11-26) — health: `noShowsProtected` always equalled the whole field (both
+  // league starts mark the night before any of its hands ends). Renamed `firstHourEntrants`; the
+  // REAL no-show count is `noShowsAtHourEnd`: the alive entrants still with no hand played at the
+  // night's FIRST hand end (any table) after 7:00 PM, once per night (Tournament.leagueNoShowsCounted).
+  // ---------------------------------------------------------------------------------------------
+  const NOTE_NO_SHOWS = '    noteLeagueNoShowsAtHourEnd(t, tournamentId, now);   // review fix 2026-11-26 — after this hand\'s played flags\n';
+  const ONCE_GUARD = ' || t.leagueNoShowsCounted) return;\n  t.leagueNoShowsCounted = true;\n';
+  /** 12 entrants on two tables; a0 (TA) and b0 (TB) never came; everyone else plays a hand at 6:10 PM. */
+  const twoTableNight = async (o: { league?: boolean; over?: Partial<typeof P> } = {}) => {
+    const w = world({ layout: { TA: field('a', 6, 20000, 100), TB: field('b', 6, 20000, 200) }, over: o.over });
+    w.seatEveryoneExcept('a0', 'b0');
+    let now = SIX_PM_MT;
+    const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      if (o.league !== false) expect(w.m.markLeagueFirstHour(w.tid, SEVEN_PM_MT)).toBe(12);   // the whole field
+      now = SIX_PM_MT + 10 * MIN;
+      await w.playHand('TA');
+      await w.playHand('TB');
+      now = SEVEN_PM_MT - 1000;
+      await w.playHand('TA');                                   // inside the hour: nothing counted
+      const before = w.m.awayStreakStats.noShowsAtHourEnd;
+      now = SEVEN_PM_MT + 1000;
+      await w.playHand('TA');                                   // the night's FIRST hand end after 7:00 PM
+      const atFirst = w.m.awayStreakStats.noShowsAtHourEnd;
+      now = SEVEN_PM_MT + 5 * MIN;
+      await w.playHand('TA');                                   // later hand ends, either table: never again
+      await w.playHand('TB');
+      const noShowLogs = w.logs.filter((l) => l.includes('"event":"tournament_no_shows_at_hour_end"')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+      return { w, before, atFirst, stats: { ...w.m.awayStreakStats }, noShowLogs };
+    } finally {
+      spy.mockRestore();
+    }
+  };
+
+  it('noShowsAtHourEnd = the night\'s REAL no-shows (2 of 12), counted ONCE at its first hand end after 7:00 PM, across tables; firstHourEntrants = the whole field; a weekly counts nothing', async () => {
+    const r = await twoTableNight();
+    expect(r.before).toBe(0);
+    expect(r.atFirst).toBe(2);                                  // a0 (this table) AND b0 (the other table)
+    expect(r.stats).toMatchObject({ firstHourEntrants: 12, noShowsAtHourEnd: 2 });
+    expect(r.noShowLogs).toEqual([{ event: 'tournament_no_shows_at_hour_end', tournamentId: r.w.tid, until: SEVEN_PM_MT, noShows: 2 }]);
+    expect(r.w.tm.getTournament(r.w.tid)!.leagueNoShowsCounted).toBe(true);
+    // Both were removed as no-shows (the count is taken before this hand's bust check removes them).
+    expect(r.w.tp('a0')).toMatchObject({ eliminated: true, removedNoShow: true });
+    expect(r.w.tp('b0')).toMatchObject({ eliminated: true, removedNoShow: true });
+    expect(r.stats.removedProtectedAfterHour).toBe(2);
+    expect('noShowsProtected' in r.stats).toBe(false);
+    const weekly = await twoTableNight({ league: false });
+    expect(weekly.stats).toMatchObject({ firstHourEntrants: 0, noShowsAtHourEnd: 0 });
+    expect(weekly.noShowLogs).toEqual([]);
+    expect(weekly.w.tm.getTournament(weekly.w.tid)!.leagueNoShowsCounted).toBeUndefined();
+  });
+
+  it('CONTROL: before the fix only the mark-time counter existed — it says 12 (the whole field), the no-shows are never counted; without the once-per-night flag every later hand end adds them again', async () => {
+    expect(P.absentClock.split(NOTE_NO_SHOWS).length).toBe(2);
+    const noCount = await twoTableNight({ over: { absentClock: P.absentClock.replace(NOTE_NO_SHOWS, '') } });
+    expect(noCount.stats).toMatchObject({ firstHourEntrants: 12, noShowsAtHourEnd: 0 });
+    expect(P.absentClock.split(ONCE_GUARD).length).toBe(2);
+    const everyHand = await twoTableNight({ over: { absentClock: P.absentClock.replace(ONCE_GUARD, ') return;\n') } });
+    expect(everyHand.atFirst).toBe(2);
+    expect(everyHand.stats.noShowsAtHourEnd).toBeGreaterThan(2);   // b0 again at 7:05 (TA), and at TB's hand end
+    expect(everyHand.noShowLogs.length).toBeGreaterThan(1);
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Review fix (2026-11-26) — the client's timeout toast promised "You can't sit out more than 30
+  // hands in a row" to a league entrant who has not played a hand: the server removes him at the
+  // first hand end after 7:00 PM whatever his count. The timeout's 'sitOutToggled' {reason:'timeout'}
+  // now says which: protectedUntil (7:00 PM ms, inside his first hour) / noShowDue (past it).
+  // CONTROL = the pre-fix emit (neither field).
+  // ---------------------------------------------------------------------------------------------
+  const NEW_TIMEOUT_EMIT = "    io.sockets.sockets.get(sid)?.emit('sitOutToggled', { sittingOut: true, reason: 'timeout', tableId, ...firstHour });";
+  const OLD_TIMEOUT_EMIT = "    io.sockets.sockets.get(sid)?.emit('sitOutToggled', { sittingOut: true, reason: 'timeout', tableId });";
+  const timeoutToggles = async (over?: Partial<typeof P>, league = true) => {
+    const w = noShowNight(over);                                // a1..a3 at their seats, a0 never came
+    let now = SIX_PM_MT;
+    const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const timeOut = (pid: string, at: number) => {
+      now = at;
+      const sid = `S-${pid}`;
+      w.playerSessions.get(sid).sittingOut = false;
+      const s = w.live.get(sid);
+      s.emitted.length = 0;
+      expect(w.m.sitOutTournamentSeatAfterTimeout('TA', w.seatOf(pid)!.seatIndex)).toBe(true);
+      return evs(s, 'sitOutToggled');
+    };
+    try {
+      if (league) w.m.markLeagueFirstHour(w.tid, SEVEN_PM_MT);
+      w.tp('a2').playedAHand = true;                            // a2 has played a hand (the flag a played hand end sets)
+      const out = {
+        inHour: timeOut('a1', SIX_PM_MT + 40 * MIN),            // 6:40 PM, never played
+        dueNow: timeOut('a1', SEVEN_PM_MT + 60_000),            // 7:01 PM, never played
+        played: timeOut('a2', SEVEN_PM_MT + 60_000),            // 7:01 PM, played a hand
+      };
+      // Every other 'sitOutToggled' stays as it was (acting from sit-out: reason 'action').
+      const s1 = w.live.get('S-a1');
+      s1.emitted.length = 0;
+      w.m.returnTournamentSessionFromSitOut(s1, w.playerSessions.get('S-a1'), 'action');
+      return { ...out, back: evs(s1, 'sitOutToggled') };
+    } finally {
+      spy.mockRestore();
+    }
+  };
+
+  it('the timeout\'s sitOutToggled says the first hour: protectedUntil = 7:00 PM inside it, noShowDue once it is over (never played), neither once he played or on a weekly; other sitOutToggled events unchanged; CONTROL: the pre-fix payload had neither', async () => {
+    const r = await timeoutToggles();
+    expect(r.inHour).toEqual([{ sittingOut: true, reason: 'timeout', tableId: 'TA', protectedUntil: SEVEN_PM_MT, noShowDue: false }]);
+    expect(r.dueNow).toEqual([{ sittingOut: true, reason: 'timeout', tableId: 'TA', protectedUntil: null, noShowDue: true }]);
+    expect(r.played).toEqual([{ sittingOut: true, reason: 'timeout', tableId: 'TA', protectedUntil: null, noShowDue: false }]);
+    expect(r.back).toEqual([{ sittingOut: false, reason: 'action', tableId: 'TA' }]);
+    const weekly = await timeoutToggles(undefined, false);
+    expect(weekly.inHour).toEqual([{ sittingOut: true, reason: 'timeout', tableId: 'TA', protectedUntil: null, noShowDue: false }]);
+    expect(weekly.dueNow).toEqual([{ sittingOut: true, reason: 'timeout', tableId: 'TA', protectedUntil: null, noShowDue: false }]);
+    // CONTROL: the pre-fix emit — the client could not tell (its toast promised 30 hands to both).
+    expect(P.absentClock.split(NEW_TIMEOUT_EMIT).length).toBe(2);
+    const ctl = await timeoutToggles({ absentClock: P.absentClock.replace(NEW_TIMEOUT_EMIT, OLD_TIMEOUT_EMIT) });
+    expect(ctl.inHour).toEqual([{ sittingOut: true, reason: 'timeout', tableId: 'TA' }]);
+    expect(ctl.dueNow).toEqual([{ sittingOut: true, reason: 'timeout', tableId: 'TA' }]);
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // Review fix (2026-11-26) — a removal nobody could tell waits up to 24 h for his sign-in, but a
+  // qualifier / league record is pruned an hour after the finish: the notice then said "30 hands",
+  // without noShow, and the place he had at the removal (before later late-entry shifts). The queued
+  // notice now keeps handsSatOut / noShow; the place comes from the kept finished roster (25 h).
+  // CONTROL = the pre-fix queue + tell lines.
+  // ---------------------------------------------------------------------------------------------
+  const SIGN_IN_FIX: Array<[string, string]> = [
+    [
+      '\n      // Review fix (2026-11-26) — WHY, kept with the notice: the record is pruned an hour after the finish.\n      handsSatOut: tp.removedSatOutHands ?? TOURNAMENT_SIT_OUT_HANDS_LIMIT, noShow: !!tp.removedNoShow,',
+      '',
+    ],
+    [
+      '      const position = tp && tp.eliminated && tp.finishPosition > 0\n        ? tp.finishPosition\n        : (!tp ? tournamentManager.keptFinishPositionOf(n.tournamentId, n.playerId, now) : null) ?? n.position;',
+      '      const position = tp && tp.eliminated && tp.finishPosition > 0 ? tp.finishPosition : n.position;',
+    ],
+    [
+      "        reason: 'sat_out_limit' as const, handsSatOut: tp?.removedSatOutHands ?? n.handsSatOut,\n        ...(tp?.removedNoShow || n.noShow ? { noShow: true as const } : {}),",
+      "        reason: 'sat_out_limit' as const, handsSatOut: tp?.removedSatOutHands ?? TOURNAMENT_SIT_OUT_HANDS_LIMIT,\n        ...(tp?.removedNoShow ? { noShow: true as const } : {}),",
+    ],
+  ];
+  const preSignInFix = (): Partial<typeof P> => {
+    let helpers = P.helpers;
+    for (const [now, was] of SIGN_IN_FIX) {
+      expect(helpers.split(now).length).toBe(2);
+      helpers = helpers.replace(now, was);
+    }
+    return { helpers };
+  };
+  /** Sign in as a0 (uid 100) on a fresh socket; his notices. */
+  const signInAsA0 = (w: World) => {
+    const s = w.mkSocket(`S-signin-${w.live.size}`, 100);
+    w.m.tellKeptTournamentSeats(s, w.authSessions.get(s.id), 'voluntary', 'oauthLogin');
+    return { finished: evs(s, 'tournamentFinishedForEntrant'), running: evs(s, 'playerEliminated') };
+  };
+
+  it('a league NO-SHOW removed while away (no socket), told at the next morning\'s sign-in AFTER the night\'s record was pruned: noShow + his real count; CONTROL: the pre-fix notice said 30 hands with no noShow', async () => {
+    const night = async (over?: Partial<typeof P>) => {
+      const w = noShowNight(over);
+      let now = SIX_PM_MT;
+      const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        w.m.markLeagueFirstHour(w.tid, SEVEN_PM_MT);
+        await w.playHand('TA');                                 // 6:00 PM: a1..a3 play a hand, a0 never came
+        now = SEVEN_PM_MT + 1000;
+        await w.playHand('TA');                                 // the first hand end after 7:00 PM: a0 removed
+        expect(w.tp('a0')).toMatchObject({ eliminated: true, finishPosition: 4, removedNoShow: true, removedSatOutHands: 2 });
+        expect(w.m.removalSignInNotices.size).toBe(1);          // nobody to tell: queued for his sign-in
+        for (const id of ['a3', 'a2']) w.tm.eliminatePlayer(w.tid, id);   // the night plays out (a1 wins)
+        expect(w.tm.getTournament(w.tid)!.status).toBe('finished');
+        now += 61 * MIN;
+        expect(w.tm.pruneEndedTournaments(now)).toEqual([w.tid]);   // its record goes an hour after the finish
+        expect(w.tm.getTournament(w.tid)).toBeUndefined();
+        now = SEVEN_PM_MT + 14 * 60 * MIN;                       // 9:00 AM: he signs in
+        return signInAsA0(w);
+      } finally {
+        spy.mockRestore();
+      }
+    };
+    const fixed = await night();
+    expect(fixed.running).toEqual([]);
+    expect(fixed.finished).toEqual([{
+      tournamentId: expect.any(String), position: 4, tournamentName: 'Sit Out Cup', atSignIn: true,
+      reason: 'sat_out_limit', handsSatOut: 2, noShow: true,
+    }]);
+    const ctl = await night(preSignInFix());
+    expect(ctl.finished).toEqual([{
+      tournamentId: expect.any(String), position: 4, tournamentName: 'Sit Out Cup', atSignIn: true,
+      reason: 'sat_out_limit', handsSatOut: 30,
+    }]);
+  });
+
+  it('a WEEKLY-style removal at 30, then a late entry moves every busted place down one: told after the prune with his STORED place from the kept roster (5th); CONTROL: the pre-fix notice used the place at the removal (4th)', async () => {
+    const run = async (over?: Partial<typeof P>) => {
+      const w = world({ layout: { TA: field('a', 4, 20000, 100) }, over });
+      w.seatEveryoneExcept('a0');
+      preCount(w, 'a0', LIMIT - 1);
+      await w.playHand('TA');                                   // his 30th: removed 4th, nobody to tell
+      expect(w.tp('a0')).toMatchObject({ eliminated: true, finishPosition: 4, removedSatOutHands: LIMIT });
+      expect(w.m.removalSignInNotices.size).toBe(1);
+      expect(w.tm.addLateEntrant(w.tid, 'late', 'late', 'sock-late', 20000, { userId: 999 })).toBeTruthy();
+      expect(w.tp('a0').finishPosition).toBe(5);                // the field grew: he is 5th now
+      for (const id of ['late', 'a3', 'a2']) w.tm.eliminatePlayer(w.tid, id);
+      expect(w.tm.getTournament(w.tid)!.status).toBe('finished');
+      expect(w.tp('a0').finishPosition).toBe(5);
+      expect(w.tm.pruneEndedTournaments(Date.now() + 61 * MIN)).toEqual([w.tid]);
+      expect(w.tm.keptFinishPositionOf(w.tid, 'a0')).toBe(5);   // the kept roster (25 h)
+      return signInAsA0(w);
+    };
+    const fixed = await run();
+    expect(fixed.finished).toEqual([{
+      tournamentId: expect.any(String), position: 5, tournamentName: 'Sit Out Cup', atSignIn: true, reason: 'sat_out_limit', handsSatOut: LIMIT,
+    }]);
+    const ctl = await run(preSignInFix());
+    expect(ctl.finished).toEqual([expect.objectContaining({ position: 4, handsSatOut: LIMIT })]);
   });
 });
 
@@ -1506,7 +1726,12 @@ describe('wiring + locks (source)', () => {
     expect(read('src/game/TournamentManager.ts')).toContain("...(player.removedFor ? { reason: player.removedFor, handsSatOut: player.removedSatOutHands, ...(player.removedNoShow ? { noShow: true } : {}) } : {}),");
     // Review fix (2026-11-26): the no-show flag rides on every copy (removalNoticeFields, the sign-in notice).
     expect(fnSrc('function removalNoticeFields(')).toContain('...(tp.removedNoShow ? { noShow: true as const } : {})');
-    expect(fnSrc('function tellRemovalSignInNotices(')).toContain('...(tp?.removedNoShow ? { noShow: true as const } : {}),');
+    // Review fix (2026-11-26): + the queued notice's own noShow (the record is pruned an hour after the finish).
+    expect(fnSrc('function tellRemovalSignInNotices(')).toContain('...(tp?.removedNoShow || n.noShow ? { noShow: true as const } : {}),');
+    expect(fnSrc('function queueRemovalSignInNotice(')).toContain('handsSatOut: tp.removedSatOutHands ?? TOURNAMENT_SIT_OUT_HANDS_LIMIT, noShow: !!tp.removedNoShow,');
+    // The timeout's first-hour fields ride ONLY on the timeout's sitOutToggled.
+    expect(SRC.split('...firstHour }').length).toBe(2);
+    expect(fnSrc('function sitOutTournamentSeatAfterTimeout(')).toContain("emit('sitOutToggled', { sittingOut: true, reason: 'timeout', tableId, ...firstHour });");
   });
 
   it('a removal is a DURABLE audit row (it decides places / seats); the warning stays stdout-only', () => {
@@ -1528,6 +1753,13 @@ describe('wiring + locks (source)', () => {
       expect(manifest.split('\n')).toContain(tok);
       expect(SRC + read('src/game/TournamentManager.ts')).toContain(tok);
     }
+    // Review fixes (2026-11-26, tourney-1126): the renamed / new health counters, the timeout's first-hour fields, the kept place.
+    for (const tok of ['firstHourEntrants', 'noShowsAtHourEnd', 'tournament_no_shows_at_hour_end', 'function timeoutSitOutFirstHourFields(', 'keptFinishPositionOf']) {
+      expect(manifest.split('\n')).toContain(tok);
+      expect(SRC + read('src/game/TournamentManager.ts')).toContain(tok);
+    }
+    expect(slice('const awayStreakStats = {', '\n};\n')).not.toContain('noShowsProtected');
+    expect(SRC).not.toContain('awayStreakStats.noShowsProtected');
     // No token of the replaced "never arrived" rule is left in the manifest.
     for (const gone of ['markNoShowProtection', 'sitOutProtectedUntil', 'awayStreakArrivedAt']) expect(manifest).not.toContain(gone);
     // The existing locks stay.

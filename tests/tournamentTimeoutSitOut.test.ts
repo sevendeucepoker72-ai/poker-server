@@ -152,7 +152,8 @@ describe('2026-10-26 — ONE timeout sits a tournament player out (owner: "After
     expect(acted()).toBe(true);
     expect(w.playerSessions.get('S-A').sittingOut).toBe(true);
     expect(w.sitOutTracker.get('t1')?.has(0)).toBe(true);
-    expect(w.emitted).toContainEqual(['S-A', 'sitOutToggled', { sittingOut: true, reason: 'timeout', tableId: 't1' }]);
+    // + the league first-hour fields (review fix 2026-11-26): not a league night -> null / false.
+    expect(w.emitted).toContainEqual(['S-A', 'sitOutToggled', { sittingOut: true, reason: 'timeout', tableId: 't1', protectedUntil: null, noShowDue: false }]);
     expect(w.m.tournamentTimeoutSitOutStats).toMatchObject({ satOut: 1, sessionsMarked: 1 });
     expect(w.infos.some((l) => l.includes('"event":"tournament_timeout_sit_out"'))).toBe(true);
     expect(w.playerSessions.get('S-B').sittingOut).toBe(false);   // Bob untouched

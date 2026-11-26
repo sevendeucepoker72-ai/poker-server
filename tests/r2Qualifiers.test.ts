@@ -2914,7 +2914,7 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     expect(w.tour().leagueFirstHourUntil).toBe(until);
     expect(protectionOf(w)).toEqual({ 'user-1001': until, 'user-1002': until, 'user-1003': until, 'user-1004': until });
     expect(w.tour().players.some((p: any) => p.playedAHand)).toBe(false);   // the deal itself is no played hand
-    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ tournamentId: w.qt().tournamentId, until, notPlayedYet: 4 })]);
+    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ tournamentId: w.qt().tournamentId, until, entrants: 4 })]);
     expect(w.logEvents('qualifier_prestart_deal')).toEqual([expect.objectContaining({ seated: 0, seatedAbsent: 2, released: 0, alive: 4 })]);
     expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
   });
@@ -2950,7 +2950,7 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     expect(w.audits.filter((a) => a.action === 'QUALIFIER_NO_SHOW_SEATED_ABSENT').map((a) => [a.d.masterId, a.d.where])).toEqual([['m-4', 'start']]);
     expect(w.tour().leagueFirstHourUntil).toBe(until);
     expect(protectionOf(w)).toEqual({ 'user-1001': until, 'user-1002': until, 'user-1003': until, 'user-1004': until });
-    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ until, notPlayedYet: 4 })]);
+    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ until, entrants: 4 })]);
     expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
   });
 
@@ -3010,7 +3010,7 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     expect(w.logEvents('qualifier_prestart_deal_failed')).toEqual([expect.objectContaining({ step: 'prepare', error: 'balance blew up' })]);
     expect(w.tour().leagueFirstHourUntil).toBe(until);
     expect(protectionOf(w)).toEqual({ 'user-1001': until, 'user-1002': until, 'user-1003': until, 'user-1004': until });
-    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ tournamentId: w.qt().tournamentId, until, notPlayedYet: 4 })]);
+    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ tournamentId: w.qt().tournamentId, until, entrants: 4 })]);
     expect(w.logEvents('qualifier_prestart_deal')).toEqual([expect.objectContaining({ seatedAbsent: 2, error: 'balance blew up' })]);
     const ctl = await leagueDealThatThrows('balance', true);
     expect(ctl.w.m.qualifierPreStartHolds.size).toBe(0);

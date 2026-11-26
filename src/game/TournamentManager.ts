@@ -275,6 +275,12 @@ export interface Tournament {
    * other tournament (weekly / monthly / Sit & Go / ...: no first hour).
    */
   leagueFirstHourUntil?: number;
+  /**
+   * Review fix (2026-11-26) — the night's no-shows were counted (index.ts
+   * noteLeagueNoShowsAtHourEnd, health noShowsAtHourEnd): once per night, at its
+   * first hand end after leagueFirstHourUntil.
+   */
+  leagueNoShowsCounted?: boolean;
 }
 
 /**
@@ -847,6 +853,19 @@ export class TournamentManager {
    */
   hasStandings(tournamentId: string, now: number = Date.now()): boolean {
     return this.tournaments.has(tournamentId) || this.finishedStandings.has(tournamentId, now);
+  }
+
+  /**
+   * Review fix (2026-11-26) — an entrant's STORED place in the kept finished
+   * roster (the live record is gone: pruned an hour after the finish), or null
+   * (not kept / past the window / no place: disqualified). index.ts
+   * tellRemovalSignInNotices: a removal told at the next sign-in carries his
+   * place after every later late-entry shift. Not counted as `served`.
+   */
+  keptFinishPositionOf(tournamentId: string, playerId: string, now: number = Date.now()): number | null {
+    const row = this.finishedStandings.get(tournamentId, now)?.players.find((p) => p.playerId === playerId);
+    const fp = row?.finishPosition;
+    return typeof fp === 'number' && Number.isInteger(fp) && fp > 0 ? fp : null;
   }
 
   /** 2026-11-25 — health r2Play.lobbyLists: the kept finished rosters (see lobbyLists.FinishedStandingsStats) + how many are kept now. */

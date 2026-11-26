@@ -2633,6 +2633,16 @@ tp.playedAHand = true
 # plays the hand only when the server never acted for the seat that hand (his clock ran out with the tab open is
 # NOT a played hand; it is counted as sat out).
 function awayStreakServerActed(
+# 2026-11-26 review fixes (tourney-1126): health firstHourEntrants (was noShowsProtected: always the whole field) +
+# noShowsAtHourEnd (the night's REAL no-shows, once per night at its first hand end after 7:00 PM); the timeout's
+# 'sitOutToggled' {reason:'timeout'} carries protectedUntil / noShowDue (the client's toast stops promising 30 hands to a
+# league entrant who has not played a hand); a removal told at the next sign-in keeps handsSatOut / noShow on the queued
+# notice and reads his place from the kept finished roster once the record is pruned.
+firstHourEntrants
+noShowsAtHourEnd
+tournament_no_shows_at_hour_end
+function timeoutSitOutFirstHourFields(
+keptFinishPositionOf
 # 2026-11-25 (owner: "for all online tournaments to be able to see who is registered in the lobby and a list for it to show
 # who busted in each position") - lobby lists (src/game/lobbyLists.ts). Qualifier items (socket list only; REST stays name-free)
 # and tournament items carry registrantNames (PUBLIC names via publicNameOf, registration order, each entry once, <= 300) and
