@@ -1131,7 +1131,8 @@ reloadAndCapBotStacks(table, tableId, isFixedRosterQuickTable(tableId));
 Number(process.env.BOT_STACK_CAP_BUYINS)
 BOT_STACK_CAP_BUYINS > 0 && seat.chipCount > BOT_STACK_CAP_BUYINS * buyIn
 dealtInSeats.has(session.seatIndex)
-SIT_OUT_HANDS_LIMIT = 30
+# 2026-11-26 review fix: `const ` in front, so the tournament line ('TOURNAMENT_SIT_OUT_HANDS_LIMIT = 30') can no longer satisfy the cash lock.
+const SIT_OUT_HANDS_LIMIT = 30
 sit_out_limit
 tableWantsFastBots(tableId)
 stateObj.isFirstActor =
@@ -2577,3 +2578,8 @@ sitOutLimitHands
 tournamentSitOutLimit
 tournament_no_show_protected
 tournament_sit_out_removal_told_on_sign_in
+# 2026-11-26 review fix: an Online League no-show still away when late entry closes is removed at the first hand
+# end after it WHATEVER his count (owner order), notices + noShow: true; 'sitOut' {sittingOut:false} (the app's
+# "Sitting Out - I'm back" button) resets the sat-out run like playerBack.
+function awayStreakNoShowDue(
+removedNoShow

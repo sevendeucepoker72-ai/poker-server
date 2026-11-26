@@ -139,8 +139,13 @@ export interface TournamentPlayer {
   sitOutProtectedUntil?: number;
   /** Set by the bust check that REMOVED him for sitting out: the elimination notices say why. */
   removedFor?: 'sat_out_limit';
-  /** The hand limit he was removed at (the notices' `handsSatOut`). */
+  /** The hand limit he was removed at (the notices' `handsSatOut`; a no-show: his real count). */
   removedSatOutHands?: number;
+  /**
+   * Review fix (2026-11-26) — removed as an Online League NO-SHOW still away when
+   * late entry closed (whatever his count): the notices add `noShow: true`.
+   */
+  removedNoShow?: boolean;
 }
 
 /**
@@ -154,6 +159,7 @@ export function clearAwayStreak(p: TournamentPlayer): void {
   delete p.sitOutProtectedUntil;
   delete p.removedFor;
   delete p.removedSatOutHands;
+  delete p.removedNoShow;
 }
 
 export type TournamentStatus = 'registering' | 'running' | 'finished' | 'cancelled';
@@ -1374,7 +1380,8 @@ export class TournamentManager {
       eliminatorId,
       // 2026-11-25 (owner) — additive, only for an entrant REMOVED for sitting out
       // (index.ts sets removedFor before it eliminates him): the room copy says why.
-      ...(player.removedFor ? { reason: player.removedFor, handsSatOut: player.removedSatOutHands } : {}),
+      // Review fix (2026-11-26): + noShow: true for a league no-show removed when late entry closed.
+      ...(player.removedFor ? { reason: player.removedFor, handsSatOut: player.removedSatOutHands, ...(player.removedNoShow ? { noShow: true } : {}) } : {}),
     });
 
     // Check if tournament is over

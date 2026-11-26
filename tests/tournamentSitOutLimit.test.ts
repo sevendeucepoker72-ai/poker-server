@@ -15,7 +15,11 @@
  *    place, no bounty, not disqualified, chips out of play, same-hand ties and
  *    hand-for-hand rounds like busts), never mid-hand, never twice, never the
  *    last one standing; the notices say why (reason 'sat_out_limit').
- *  - An Online League no-show is protected until lateRegUntil (7:00 PM MT).
+ *  - An Online League no-show is protected until lateRegUntil (7:00 PM MT); if
+ *    still away then, he is removed at the first hand end after it whatever his
+ *    count (review fix 2026-11-26; notices add noShow: true).
+ *  - Sitting back IN through 'sitOut' {sittingOut:false} resets like I'm back
+ *    (review fix 2026-11-26).
  *
  * Runs the REAL source of src/index.ts (sliced + transpiled) with the REAL
  * PokerTable and TournamentManager. CONTROL cases put the pre-fix code back.
@@ -389,6 +393,62 @@ describe('the count: per ENTRY, only dealt-in hands nobody plays and the seat ne
     expect(w.tp('a0').sitOutHands).toBe(0);
     expect(w.m.awayStreakStats.resetsByAction).toBe(1);
     expect([...w.stubbed].filter((n) => /awayStreak|SIT_OUT|removal|Removal|NoShow/.test(n))).toEqual([]);
+  });
+
+  // Review fix (2026-11-26) — the app's "Sitting Out · I'm back" menu button and the quick Sit Out
+  // button come back through 'sitOut' {sittingOut:false} (tableStore.toggleSitOut), not 'playerBack'.
+  // That sit-in used to leave the run (and the warned flag) as it was: one timeout before his first
+  // action and a 27-hand run went on from 28.
+  const sitOutWorld = (over?: Partial<typeof P>) => {
+    const w = world({ layout: { TA: field('a', 3, 20000, 100) }, over, scope: { DrawPhases: [] } });
+    w.seatEveryoneExcept();
+    const sock = w.live.get('S-a0');
+    sock.handlers = {};
+    sock.on = (ev: string, fn: any) => { sock.handlers[ev] = fn; };
+    w.m.wireSocket(sock);
+    return { w, sock, TA: w.tables.get('TA')! };
+  };
+
+  it('sitting back IN through the REAL \'sitOut\' handler ({sittingOut:false}, and its toggle) resets the run to 0 like I\'m back', async () => {
+    const { w, sock, TA } = sitOutWorld();
+    expect(TA.activeSeatIndex).not.toBe(0);                   // between hands: the sit-out never acts for him
+    await sock.handlers.sitOut({ tableId: 'TA', sittingOut: true });
+    expect(w.playerSessions.get('S-a0').sittingOut).toBe(true);
+    await hands(w, 'TA', 4);
+    expect(w.tp('a0')).toMatchObject({ sitOutHands: 4, sitOutWarned: true });
+    await sock.handlers.sitOut({ tableId: 'TA', sittingOut: false });
+    expect(w.playerSessions.get('S-a0').sittingOut).toBe(false);
+    expect(evs(sock, 'sitOutToggled').pop()).toEqual({ sittingOut: false, tableId: 'TA' });
+    expect(w.tp('a0')).toMatchObject({ sitOutHands: 0, sitOutWarned: false });
+    expect(w.m.awayStreakStats.resetsByBack).toBe(1);
+    // The toggle (no boolean), out and back in again.
+    await sock.handlers.sitOut({ tableId: 'TA' });
+    expect(w.playerSessions.get('S-a0').sittingOut).toBe(true);
+    await hands(w, 'TA', 2);
+    expect(w.tp('a0').sitOutHands).toBe(2);
+    await sock.handlers.sitOut({ tableId: 'TA' });
+    expect(w.playerSessions.get('S-a0').sittingOut).toBe(false);
+    expect(w.tp('a0').sitOutHands).toBe(0);
+    expect(w.m.awayStreakStats.resetsByBack).toBe(2);
+    // Sitting OUT never resets anything.
+    await sock.handlers.sitOut({ tableId: 'TA', sittingOut: true });
+    await hands(w, 'TA', 1);
+    await sock.handlers.sitOut({ tableId: 'TA', sittingOut: true });   // 'unchanged'
+    expect(w.tp('a0').sitOutHands).toBe(1);
+    expect([...w.stubbed].filter((n) => /awayStreak|SIT_OUT|isTournamentTable|seatSessionFor/.test(n))).toEqual([]);
+  });
+
+  it('CONTROL: without the reset in the sit-in branch, the run and the warned flag survive his return (27 stays 27)', async () => {
+    const line = "      awayStreakResetAt(session.tableId, session.seatIndex, 'back');\n";
+    expect(P.sitOut).toContain(line);
+    const { w, sock } = sitOutWorld({ sitOut: P.sitOut.replace(line, '') });
+    await sock.handlers.sitOut({ tableId: 'TA', sittingOut: true });
+    await hands(w, 'TA', 3);
+    preCount(w, 'a0', 27);
+    await sock.handlers.sitOut({ tableId: 'TA', sittingOut: false });
+    expect(w.playerSessions.get('S-a0').sittingOut).toBe(false);
+    expect(w.tp('a0')).toMatchObject({ sitOutHands: 27, sitOutWarned: true });
+    expect(w.m.awayStreakStats.resetsByBack).toBe(0);
   });
 
   it('a RESTORE alone never resets it (restoreAbsentTournamentSeat / restoreSeatReservation); the count follows the ENTRY through a reservation', async () => {
@@ -864,6 +924,139 @@ describe('the Online League no-show: protected for the first hour, removed at th
     }
   });
 
+  // Review fix (2026-11-26) — the owner's order: "if still away then, removed at the first hand end
+  // after lateRegUntil". The removal used to wait for 30 as well: a no-show at 22 hands at 7:00 PM
+  // stayed in, blinded, until about his 30th hand — against his own warning ("If you are still away
+  // when late entry closes, you will be removed") and the client's noShow line (never sent).
+  const SIX_PM_MT = Date.parse('2026-11-26T01:00:00.000Z');          // 6:00 PM MT
+  const noShowNight = (over?: Partial<typeof P>) => {
+    const w = world({ layout: { TA: field('a', 4, 20000, 100) }, over });
+    w.seatEveryoneExcept('a0');                                   // a1 is HERE at the start: not a no-show
+    return w;
+  };
+
+  it('a no-show still away when late entry closes is removed at the FIRST hand end after it at ANY count (22 here): noShow: true, his real count, next place', async () => {
+    const w = noShowNight();
+    let now = SIX_PM_MT;
+    const until = now + 60 * 60_000;                              // 7:00 PM MT
+    const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      expect(w.m.markNoShowProtection(w.tid, until)).toBe(1);   // a0 only
+      w.playerSessions.delete('S-a1');                            // a1 leaves later: away, NOT protected
+      const lobby = w.mkSocket('L1', 100);
+      preCount(w, 'a0', 21);
+      preCount(w, 'a1', 21);
+      now = until - 1000;
+      await w.playHand('TA');
+      expect(w.tp('a0')).toMatchObject({ eliminated: false, sitOutHands: 22 });
+      // Before 7:00 PM his view is protected; after it, he goes at THIS hand's end: 1 left.
+      expect(w.m.awayStreakViewOf(w.tid, w.tables.get('TA'), 0)).toEqual({ handsSatOut: 22, handsLimit: 30, handsLeft: 8, protectedUntil: until });
+      now = until + 1000;
+      expect(w.m.awayStreakViewOf(w.tid, w.tables.get('TA'), 0)).toEqual({ handsSatOut: 22, handsLimit: 30, handsLeft: 1, protectedUntil: null });
+      await w.playHand('TA');
+      expect(w.tp('a0')).toMatchObject({
+        eliminated: true, finishPosition: 4, sitOutHands: 23, removedFor: 'sat_out_limit', removedSatOutHands: 23, removedNoShow: true,
+      });
+      expect(w.tp('a0').disqualified).toBeUndefined();
+      // a1 (away, never protected, 23) is NOT touched by the no-show rule: he still has 7 hands.
+      expect(w.tp('a1')).toMatchObject({ eliminated: false, sitOutHands: 23 });
+      expect(w.tp('a1').removedNoShow).toBeUndefined();
+      expect(evs(lobby, 'playerEliminated')).toEqual([{
+        tournamentId: w.tid, playerId: 'a0', playerName: 'a0', position: 4, reason: 'sat_out_limit', handsSatOut: 23, noShow: true,
+      }]);
+      // The room copy (TournamentManager's, its player id masked for the room) carries the flag too.
+      const room = w.roomEmits.filter(([, ev, d]) => ev === 'playerEliminated' && d.reason === 'sat_out_limit');
+      expect(room).toHaveLength(1);
+      expect(room[0][2]).toMatchObject({ position: 4, reason: 'sat_out_limit', handsSatOut: 23, noShow: true });
+      expect(w.audits.find((a) => a.action === 'TOURNAMENT_SIT_OUT_REMOVED')!.d).toMatchObject({ playerId: 'a0', place: 4, noShow: true, handsSatOut: 23 });
+      expect(w.m.awayStreakStats.removedProtectedAfterHour).toBe(1);
+      // A re-entry clears the no-show reason with the rest.
+      expect(w.tm.reinstateForReentry(w.tid, 'a0', 20000)).toBe(true);
+      expect(w.tp('a0')).not.toHaveProperty('removedNoShow');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('CONTROL: with the pre-fix hand-end rule (30 needed) the same no-show stays in after 7:00 PM, blinded', async () => {
+    const old = P.absentClock.replace(
+      '      if (tp.sitOutHands < TOURNAMENT_SIT_OUT_HANDS_LIMIT && !noShowDue) continue;',
+      '      if (tp.sitOutHands < TOURNAMENT_SIT_OUT_HANDS_LIMIT) continue;',
+    );
+    expect(old).not.toBe(P.absentClock);
+    const w = noShowNight({ absentClock: old });
+    let now = SIX_PM_MT;
+    const until = now + 60 * 60_000;
+    const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      expect(w.m.markNoShowProtection(w.tid, until)).toBe(1);
+      preCount(w, 'a0', 21);
+      now = until + 1000;
+      await w.playHand('TA');
+      expect(w.tp('a0')).toMatchObject({ eliminated: false, sitOutHands: 22 });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('the bust check re-checks the same rule: a due no-show at 10 is removed; one who ARRIVED during the awaits (mark gone) is skipped as back; CONTROL: the pre-fix re-check skipped the due one', () => {
+    const mk = () => ({
+      handNumber: 4, capturedAt: Date.now(), orderedWinnerIds: [], eliminatorBySeat: new Map(), ran: false,
+      startChips: new Map([[0, 20000], [1, 20000], [2, 20000], [3, 20000]]), bustedThisHand: new Map(), awayLimitSeats: new Map([[0, 'a0']]),
+    });
+    const due = (w: World) => Object.assign(w.tp('a0'), { sitOutHands: 10, sitOutWarned: true, sitOutProtectedUntil: Date.now() - 1000 });
+    const w = noShowNight();
+    due(w);
+    w.m.runTournamentBustCheck('TA', w.tables.get('TA'), mk(), 'test');
+    expect(w.tp('a0')).toMatchObject({ eliminated: true, removedNoShow: true, removedSatOutHands: 10 });
+    // Arrived during the awaits (a restore / I'm back deleted the mark): not removed at 10.
+    const w2 = noShowNight();
+    due(w2);
+    delete w2.tp('a0').sitOutProtectedUntil;
+    w2.m.runTournamentBustCheck('TA', w2.tables.get('TA'), mk(), 'test');
+    expect(w2.tp('a0').eliminated).toBe(false);
+    expect(w2.logs.some((l) => l.includes('"skip":"back"'))).toBe(true);
+    // CONTROL: the pre-fix re-check.
+    const helpers = P.helpers.replace(
+      '    else if ((tp.sitOutHands || 0) < TOURNAMENT_SIT_OUT_HANDS_LIMIT && !awayStreakNoShowDue(tp, now)) skip = \'back\';',
+      '    else if ((tp.sitOutHands || 0) < TOURNAMENT_SIT_OUT_HANDS_LIMIT) skip = \'back\';',
+    );
+    expect(helpers).not.toBe(P.helpers);
+    const w3 = noShowNight({ helpers });
+    due(w3);
+    w3.m.runTournamentBustCheck('TA', w3.tables.get('TA'), mk(), 'test');
+    expect(w3.tp('a0').eliminated).toBe(false);
+  });
+
+  it('a no-show whose 3rd hand ends after 7:00 PM is removed WITHOUT a "come back within 27 hands" warning first (CONTROL: the warning went out)', async () => {
+    const run = async (over?: Partial<typeof P>) => {
+      const w = noShowNight(over);
+      let now = SIX_PM_MT;
+      const until = now + 60 * 60_000;
+      const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        w.m.markNoShowProtection(w.tid, until);
+        const lobby = w.mkSocket('L1', 100);
+        preCount(w, 'a0', 2);
+        now = until + 1000;
+        await w.playHand('TA');
+        return { w, warned: evs(lobby, 'tournamentSitOutWarning') };
+      } finally {
+        spy.mockRestore();
+      }
+    };
+    const fixed = await run();
+    expect(fixed.w.tp('a0')).toMatchObject({ eliminated: true, removedNoShow: true, removedSatOutHands: 3 });
+    expect(fixed.warned).toEqual([]);
+    const old = P.absentClock.replace(
+      '!tp.sitOutWarned && !noShowDue) awayStreakWarn(',
+      '!tp.sitOutWarned) awayStreakWarn(',
+    );
+    expect(old).not.toBe(P.absentClock);
+    const ctl = await run({ absentClock: old });
+    expect(ctl.warned).toHaveLength(1);
+  });
+
   it('a player who ARRIVED (a sign-in restored his seat) and then left is NOT protected', async () => {
     const w = world({ layout: { TA: field('a', 3, 20000, 100) } });
     w.seatEveryoneExcept('a0');
@@ -905,6 +1098,12 @@ describe('wiring + locks (source)', () => {
 
   it('the resets are wired: I\'m back, acting from sit-out, any voluntary action; a restore only ends the no-show mark', () => {
     expect(handlerSrc('playerBack', '\n  });\n')).toContain("awayStreakResetAt(session.tableId, session.seatIndex, 'back');");
+    // Review fix (2026-11-26) — the sit-IN branch of 'sitOut' (the app's "Sitting Out · I'm back" button), never its sit-out branch.
+    const sitOut = handlerSrc('sitOut', '\n  });\n');
+    const sitIn = sitOut.indexOf('// Returning from sit-out');
+    expect(sitIn).toBeGreaterThan(0);
+    expect(sitOut.indexOf("awayStreakResetAt(session.tableId, session.seatIndex, 'back');")).toBeGreaterThan(sitIn);
+    expect(sitOut.split('awayStreakResetAt(').length).toBe(2);
     expect(fnSrc('function returnTournamentSessionFromSitOut(')).toContain("awayStreakResetAt(session.tableId, session.seatIndex, 'action');");
     const action = handlerSrc('action', '\n  );\n');
     expect(action).toContain("else awayStreakResetAt(session.tableId, session.seatIndex, 'action');");
@@ -930,7 +1129,10 @@ describe('wiring + locks (source)', () => {
     expect(fnSrc('function tellTournamentBustNow(')).toContain('...removalNoticeFields(tournamentId, bust.playerId),');
     expect(fnSrc('function noticeTournamentEliminationToEntrant(')).toContain('...removalNoticeFields(tournamentId, playerId),');
     expect(fnSrc('function emitHandForHandRoomBust(')).toContain('...removalNoticeFields(tournamentId, payload.playerId),');
-    expect(read('src/game/TournamentManager.ts')).toContain("...(player.removedFor ? { reason: player.removedFor, handsSatOut: player.removedSatOutHands } : {}),");
+    expect(read('src/game/TournamentManager.ts')).toContain("...(player.removedFor ? { reason: player.removedFor, handsSatOut: player.removedSatOutHands, ...(player.removedNoShow ? { noShow: true } : {}) } : {}),");
+    // Review fix (2026-11-26): the no-show flag rides on every copy (removalNoticeFields, the sign-in notice).
+    expect(fnSrc('function removalNoticeFields(')).toContain('...(tp.removedNoShow ? { noShow: true as const } : {})');
+    expect(fnSrc('function tellRemovalSignInNotices(')).toContain('...(tp?.removedNoShow ? { noShow: true as const } : {}),');
   });
 
   it('a removal is a DURABLE audit row (it decides places / seats); the warning stays stdout-only', () => {
@@ -946,7 +1148,27 @@ describe('wiring + locks (source)', () => {
       'TOURNAMENT_SIT_OUT_WARNED', 'tournament_sit_out_removed', 'TOURNAMENT_SIT_OUT_REMOVED', 'sat_out_limit', 'mySitOutLimit',
       'sitOutLimitHands', 'tournamentSitOutLimit', 'tournament_no_show_protected', 'tournament_sit_out_removal_told_on_sign_in',
     ]) expect(manifest).toContain(tok);
+    // Review fix (2026-11-26) tokens.
+    for (const tok of ['function awayStreakNoShowDue(', 'removedNoShow']) {
+      expect(manifest.split('\n')).toContain(tok);
+      expect(SRC + read('src/game/TournamentManager.ts')).toContain(tok);
+    }
     // The existing locks stay.
-    for (const tok of ['SIT_OUT_HANDS_LIMIT = 30', 'tournament_timeout_sit_out', 'QUALIFIER_NO_SHOW_SEATED_ABSENT']) expect(manifest).toContain(tok);
+    for (const tok of ['tournament_timeout_sit_out', 'QUALIFIER_NO_SHOW_SEATED_ABSENT']) expect(manifest).toContain(tok);
+  });
+
+  it('the CASH sit-out lock cannot be satisfied by the tournament constant (review fix 2026-11-26: \'SIT_OUT_HANDS_LIMIT = 30\' was a substring of it)', () => {
+    const tokens = read('canonical-features.txt').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#'));
+    expect(tokens).toContain('const SIT_OUT_HANDS_LIMIT = 30');
+    expect(tokens).not.toContain('SIT_OUT_HANDS_LIMIT = 30');
+    // The CI check is `blob.includes(token)`: with the cash constant gone (or changed), only the
+    // tournament line is left, and the cash token must then be MISSING.
+    const cashLine = 'const SIT_OUT_HANDS_LIMIT = 30;';
+    expect(SRC).toContain(cashLine);
+    const withoutCash = SRC.replace(cashLine, 'const SIT_OUT_HANDS_LIMIT = 20;');
+    expect(withoutCash.includes('const SIT_OUT_HANDS_LIMIT = 30')).toBe(false);
+    expect(withoutCash.includes('const TOURNAMENT_SIT_OUT_HANDS_LIMIT = 30')).toBe(true);
+    // CONTROL: the old bare token still "passed" with the cash constant changed.
+    expect(withoutCash.includes('SIT_OUT_HANDS_LIMIT = 30')).toBe(true);
   });
 });
