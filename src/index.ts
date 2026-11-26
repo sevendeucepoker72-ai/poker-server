@@ -14397,6 +14397,11 @@ function publicTournamentStandings(standings: any): any {
       playerId: token(p.playerId),
       playerName: publicNameOf(p.playerName),
       chipCount: p.chipCount,
+      // 2026-11-26 (lobby-lists review fix, finding 4) — additive, only when true:
+      // a disqualified entrant (finishPosition already null: he holds no place) and a
+      // TDA tie (his stored place, tied). TournamentManager / lobbyLists.standingsPlaceOf.
+      ...(p.disqualified === true ? { disqualified: true } : {}),
+      ...(p.tied === true ? { tied: true } : {}),
       finishPosition: p.finishPosition,
     })),
   };
@@ -27867,6 +27872,10 @@ function startQualifierTournament(
     // S3 (owner: "take breaks") — a 5-minute break after every 5th level
     // (qualifierBreakConfig; switch: tournamentManager.breaksEnabled).
     breaks: qualifierBreakConfig(timeScale),
+    // 2026-11-26 (lobby-lists review fix, finding 5) — the event's type: its finished
+    // roster's results card is `qualifier:<type>`, which the kept rosters' size bound
+    // evicts LAST (a day of club / custom finishes never pushes out the league / weekly).
+    ...(opts.eventType ? { qualifierType: opts.eventType } : {}),
   });
 
   // F10 review fix-up (2026-10-24) — a qualifier's tournament, known as one

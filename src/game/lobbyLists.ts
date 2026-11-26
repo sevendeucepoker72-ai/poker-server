@@ -14,9 +14,15 @@
  *     TournamentManager drops its record (a template 10 s after its finish,
  *     every other one an hour after), so the lobby can still open the finish
  *     order of the latest finished event of each card. Bounded: at most
- *     FINISHED_STANDINGS_MAX records; past it the OLDEST record that is not the
- *     latest of its card is dropped first (a busy Sit & Go template never pushes
- *     out a qualifier's or the league's results), then the oldest of all.
+ *     FINISHED_STANDINGS_MAX records; past it the record dropped first is the
+ *     lowest `evictionRankOf` (2026-11-26 review fix, finding 5 — it used to be
+ *     "the oldest that is not its card's latest, else the oldest of all", and
+ *     every one-off event is its own card, so a day of club / custom finishes
+ *     pushed last night's league out): a superseded template run, then a
+ *     one-off (custom / club / admin simulation) event, then a template's latest
+ *     run, then a qualifier / league night that is not the latest of its type,
+ *     and only then the latest qualifier / league night of each type — the
+ *     oldest first within a rank.
  *
  * 2026-11-26 review fixes:
  *  - SURVIVES A RESTART (finding 1): every kept roster is written through a
@@ -35,6 +41,22 @@
  *    only to its own entrants (`rosterHasAccount`, the entryOfAccount rule).
  *    Template rosters are reached from the template's registering card
  *    (resultsTournamentId), qualifier rosters from the qualifier lobby.
+ *  - DISQUALIFIED / TIED ROWS (finding 4): every standings row (live and kept)
+ *    goes through `standingsPlaceOf`, the server's own treatment. A
+ *    DISQUALIFIED entrant (suspended mid-tournament) holds NO place:
+ *    finishPosition null + additive `disqualified: true` — finishTournament pays
+ *    him nothing, payTournamentPrizes records no result / no champion for him,
+ *    and the qualifier results (markQualifierFinished, the master POST) drop his
+ *    row, so no list may read him as 1st or in a paid / seat place. A TDA TIE
+ *    (busted in the same hand with an equal stack: a tie group; the finish
+ *    splits the places' money and marks finalResults `tied`) keeps the STORED
+ *    place (the places stay distinct: the seat award and the master results use
+ *    them) + additive `tied: true`.
+ *  - QUALIFIER RESULTS ARE EVICTED LAST (finding 5): a qualifier / league
+ *    engine tournament's roster has the card `qualifierCardKey(type)`
+ *    (TournamentManager: config.qualifierType, set by index.ts
+ *    startQualifierTournament) and its tag (markQualifierFinished); see the
+ *    size bound above.
  */
 import { publicNameOf } from '../social/publicIdentity';
 
@@ -72,15 +94,61 @@ export const FINISHED_STANDINGS_KEEP_MS = 25 * 60 * 60_000;
 /** At most this many finished standings are kept. */
 export const FINISHED_STANDINGS_MAX = 200;
 
+/**
+ * One standings row (getTournamentStandings, live and kept). 2026-11-26 review
+ * fix (finding 4) — additive `disqualified` / `tied` (present only when true):
+ * see standingsPlaceOf.
+ */
+export interface StandingsRow {
+  playerId: string;
+  playerName: string;
+  chipCount: number;
+  finishPosition: number | null;
+  disqualified?: true;
+  tied?: true;
+}
+
+/**
+ * 2026-11-26 review fix (finding 4) — one entrant's place + flags in the
+ * standings, the server's own treatment (never recomputed from counts):
+ *  - DISQUALIFIED (suspended mid-tournament: TournamentManager.disqualifyPlayers,
+ *    which still records a finishPosition — a flagged survivor even gets 1):
+ *    finishTournament pays him 0, payTournamentPrizes records no result and
+ *    never makes him the champion, markQualifierFinished / postQualifierResults
+ *    drop his row (no seat, no master result). He holds NO place →
+ *    `{finishPosition: null, disqualified: true}` — no list, old or new client,
+ *    can show him as 1st or in a paid / seat place. The other entrants keep
+ *    their own stored places (nobody is renumbered, as in the master results).
+ *  - TIED (a tie group of 2+ eliminated entrants: markSimultaneousBustTie /
+ *    placeSimultaneousBusts; finishTournament splits their places' money and
+ *    marks finalResults `tied`): his STORED place + `tied: true`. The stored
+ *    places stay distinct (the seat award and the master results use them).
+ *  - otherwise: the stored place (> 0), else null (still in).
+ */
+export function standingsPlaceOf(
+  p: { finishPosition?: number | null; disqualified?: boolean } | null | undefined,
+  tied: boolean,
+): { finishPosition: number | null; disqualified?: true; tied?: true } {
+  if (p && p.disqualified === true) return { finishPosition: null, disqualified: true };
+  const fp = p ? p.finishPosition : null;
+  const place = typeof fp === 'number' && Number.isInteger(fp) && fp > 0 ? fp : null;
+  return place !== null && tied ? { finishPosition: place, tied: true } : { finishPosition: place };
+}
+
 /** One kept roster: the getTournamentStandings shape of a finished tournament. */
 export interface FinishedStandingsRecord {
   tournamentId: string;
   name: string;
   status: 'finished';
   eliminationOrder: string[];
-  players: Array<{ playerId: string; playerName: string; chipCount: number; finishPosition: number | null }>;
+  players: StandingsRow[];
   finishedAt: number;
-  /** Whose card it belongs to: a template's name ('template:<name>'), else the tournament itself ('tournament:<id>'). */
+  /**
+   * Whose card it belongs to: a template's name ('template:<name>'), a
+   * qualifier / league engine tournament's type ('qualifier:<type>',
+   * qualifierCardKey — 2026-11-26, finding 5), else the tournament itself
+   * ('tournament:<id>').
+   */
   cardKey: string;
   /** 2026-11-26 review fix — a club (unlisted) event: its kept 'finished' item reaches only its own entrants. */
   unlisted?: boolean;
@@ -107,6 +175,37 @@ export interface FinishedStandingsPersistence {
   save(rec: FinishedStandingsRecord, ttlMs: number): unknown;
   /** The roster left the store before its window ended (the size bound). */
   drop(tournamentId: string): unknown;
+}
+
+/** 2026-11-26 review fix (finding 5) — the results card of a qualifier / league engine tournament: one per qualifierType. */
+export function qualifierCardKey(qualifierType: string): string {
+  return `qualifier:${qualifierType}`;
+}
+
+/** 2026-11-26 (finding 5) — a qualifier / league night's roster: its card (qualifierCardKey) or its markQualifierFinished tag. */
+function isQualifierRoster(r: FinishedStandingsRecord): boolean {
+  return !!r.qualifier || r.cardKey.startsWith('qualifier:');
+}
+
+/** 2026-11-26 (finding 5) — what a roster is "the latest" of for the size bound: a qualifier's TYPE (the tag first), else its card. */
+function evictionGroupOf(r: FinishedStandingsRecord): string {
+  return r.qualifier ? qualifierCardKey(r.qualifier.type) : r.cardKey;
+}
+
+/**
+ * 2026-11-26 review fix (finding 5) — which kept roster the size bound drops
+ * first: the LOWEST rank, the oldest within a rank.
+ *   0  a superseded template run (not its template's latest: nothing points at it);
+ *   1  a ONE-OFF non-qualifier event (custom / club / admin simulation — each its own card);
+ *   2  a template's latest run (its registering card's "Last results");
+ *   3  a qualifier / league night that is not the latest of its type (its finished card can still be listed);
+ *   4  the latest qualifier / league night of each type (the type's next card opens it).
+ * So a day of one-off finishes never pushes out last night's league or Sunday's weekly.
+ */
+export function evictionRankOf(r: FinishedStandingsRecord, latestOfGroup: boolean): number {
+  if (isQualifierRoster(r)) return latestOfGroup ? 4 : 3;
+  if (r.cardKey.startsWith('template:')) return latestOfGroup ? 2 : 0;
+  return latestOfGroup ? 1 : 0;
 }
 
 export interface FinishedStandingsStats {
@@ -256,24 +355,30 @@ export class FinishedStandingsStore {
     return best ? best.tournamentId : null;
   }
 
-  /** Drop what is past the keep window, then enforce the size bound (oldest non-latest-of-its-card first). */
+  /**
+   * Drop what is past the keep window, then enforce the size bound: the lowest
+   * evictionRankOf first, the oldest within a rank (2026-11-26, finding 5 — a
+   * qualifier / league night's results go last).
+   */
   prune(now: number = Date.now()): void {
     for (const [id, r] of this.records) {
       if (now - r.finishedAt > this.keepMs) { this.records.delete(id); this.stats.expired++; }
     }
     while (this.records.size > this.max) {
-      const latestOfCard = new Map<string, FinishedStandingsRecord>();
+      const latestOfGroup = new Map<string, FinishedStandingsRecord>();
       for (const r of this.records.values()) {
-        const b = latestOfCard.get(r.cardKey);
-        if (!b || r.finishedAt >= b.finishedAt) latestOfCard.set(r.cardKey, r);
+        const g = evictionGroupOf(r);
+        const b = latestOfGroup.get(g);
+        if (!b || r.finishedAt >= b.finishedAt) latestOfGroup.set(g, r);
       }
       let victim: FinishedStandingsRecord | null = null;
+      let victimRank = Infinity;
       for (const r of this.records.values()) {
-        if (latestOfCard.get(r.cardKey) === r) continue;
-        if (!victim || r.finishedAt < victim.finishedAt) victim = r;
-      }
-      if (!victim) {
-        for (const r of this.records.values()) if (!victim || r.finishedAt < victim.finishedAt) victim = r;
+        const rank = evictionRankOf(r, latestOfGroup.get(evictionGroupOf(r)) === r);
+        if (!victim || rank < victimRank || (rank === victimRank && r.finishedAt < victim.finishedAt)) {
+          victim = r;
+          victimRank = rank;
+        }
       }
       if (!victim) break;
       this.records.delete(victim.tournamentId);
@@ -381,7 +486,12 @@ export function serializeFinishedStandings(rec: FinishedStandingsRecord): string
   return JSON.stringify({
     v: FINISHED_STANDINGS_FORMAT,
     ...rec,
-    players: rec.players.map((p) => ({ playerId: p.playerId, playerName: publicNameOf(p.playerName), chipCount: p.chipCount, finishPosition: p.finishPosition })),
+    players: rec.players.map((p) => ({
+      playerId: p.playerId, playerName: publicNameOf(p.playerName), chipCount: p.chipCount, finishPosition: p.finishPosition,
+      // 2026-11-26 (finding 4) — the flags travel with the row (a DQ row's place is already null).
+      ...(p.disqualified === true ? { disqualified: true } : {}),
+      ...(p.tied === true ? { tied: true } : {}),
+    })),
   });
 }
 
@@ -391,8 +501,9 @@ const str = (v: unknown, max = 200): string | null => (typeof v === 'string' && 
  * 2026-11-26 (finding 1) — a persisted roster read back (a JSON string or the
  * parsed object), validated field by field; null for anything malformed, of
  * another format version, or without a usable id / finish time. Players keep
- * exactly {playerId, playerName, chipCount, finishPosition}; the card is
- * re-whitelisted (keptCardOf).
+ * exactly {playerId, playerName, chipCount, finishPosition} (+ `disqualified` /
+ * `tied` when true, through standingsPlaceOf: a DQ row has no place); the card
+ * is re-whitelisted (keptCardOf).
  */
 export function parseFinishedStandings(raw: unknown): FinishedStandingsRecord | null {
   let o: unknown = raw;
@@ -407,12 +518,12 @@ export function parseFinishedStandings(raw: unknown): FinishedStandingsRecord | 
   const players: FinishedStandingsRecord['players'] = [];
   for (const p of o.players) {
     if (!isPlainObject(p) || typeof p.playerId !== 'string') return null;
-    const fp = p.finishPosition;
     players.push({
       playerId: p.playerId,
       playerName: typeof p.playerName === 'string' ? p.playerName : '',
       chipCount: typeof p.chipCount === 'number' && Number.isFinite(p.chipCount) ? p.chipCount : 0,
-      finishPosition: typeof fp === 'number' && Number.isInteger(fp) && fp > 0 ? fp : null,
+      // 2026-11-26 (finding 4) — through standingsPlaceOf again: a DQ row never comes back with a place.
+      ...standingsPlaceOf({ finishPosition: p.finishPosition as number | null, disqualified: p.disqualified === true }, p.tied === true),
     });
   }
   const eliminationOrder = Array.isArray(o.eliminationOrder) ? o.eliminationOrder.filter((x): x is string => typeof x === 'string') : [];

@@ -35,11 +35,14 @@ import {
   registrantNamesOf, REGISTRANT_NAMES_MAX, FinishedStandingsStore, FinishedStandingsRecord, FINISHED_STANDINGS_KEEP_MS,
   FINISHED_STANDINGS_MAX, qualifierResultsPointer, serializeFinishedStandings, parseFinishedStandings, keptCardOf,
   keptFinishedItemOf, rosterHasAccount, FINISHED_STANDINGS_FORMAT, KEPT_CARD_FIELDS, FinishedStandingsPersistence,
+  standingsPlaceOf, evictionRankOf, qualifierCardKey,
 } from '../src/game/lobbyLists';
 import { publicNameOf } from '../src/social/publicIdentity';
+import { PokerTable } from '../src/game/PokerTable';
 import {
   qualifierWindows, qualifierStatusOf, seatsForTopWith, qualifierStructure, QUALIFIER_BASE_STACK,
   QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifierEventConfig, seatsWonAt, leagueFinishFrameFields,
+  qualifierBlindLevels, qualifierBreakConfig, qualifierTestTimeScale,
 } from '../src/game/qualifierSchedule';
 import { SRC, slice, fnSrc, handlerSrc, load } from './helpers/indexSource';
 
@@ -928,6 +931,309 @@ describe('index.ts (REAL) — the qualifier lobby list: registrantNames + the re
   });
 });
 
+// ═════════════════════════════════════════════ 2026-11-26 review fixes (minor findings 4 + 5)
+describe('2026-11-26 review fix (finding 4) — a DISQUALIFIED entrant holds no place; a TDA TIE keeps its stored place + tied', () => {
+  const flags = (s: any) => Object.fromEntries(s.players.map((p: any) => [p.playerId, [p.finishPosition, p.tied === true, p.disqualified === true]]));
+
+  it('standingsPlaceOf: DQ = no place + disqualified (even a stored 1st); a tie with a place = that place + tied; CONTROL: a plain row is only its stored place (no flag keys)', () => {
+    expect(standingsPlaceOf({ finishPosition: 1, disqualified: true }, false)).toEqual({ finishPosition: null, disqualified: true });
+    expect(standingsPlaceOf({ finishPosition: 3, disqualified: true }, true)).toEqual({ finishPosition: null, disqualified: true });
+    expect(standingsPlaceOf({ finishPosition: 3 }, true)).toEqual({ finishPosition: 3, tied: true });
+    expect(standingsPlaceOf({ finishPosition: 0 }, true)).toEqual({ finishPosition: null });   // still in: never "tied"
+    // CONTROL
+    expect(standingsPlaceOf({ finishPosition: 4 }, false)).toEqual({ finishPosition: 4 });
+    expect(standingsPlaceOf({ finishPosition: 4, disqualified: false }, false)).toEqual({ finishPosition: 4 });
+    expect(standingsPlaceOf({ finishPosition: 0 }, false)).toEqual({ finishPosition: null });
+    expect(standingsPlaceOf(null, false)).toEqual({ finishPosition: null });
+    expect(standingsPlaceOf({ finishPosition: 2.5 }, false)).toEqual({ finishPosition: null });
+  });
+
+  it('the review\'s case 1 (two suspended at one hand boundary): neither reads 1st / 2nd, live AND kept; the third keeps his stored 3rd; CONTROL: the engine\'s own record is unchanged (b 1st and a 2nd, both flagged, paid 0)', () => {
+    const tm = new TournamentManager();
+    const tid = custom(tm, 'DQ Cup', 9, { prizePool: 1000 });
+    for (const [pid, nm] of [['a', 'Ann'], ['b', 'Bob'], ['c', 'Cy']]) tm.registerPlayer(tid, pid, nm, `s${pid}`);
+    tm.startTournament(tid);
+    tm.eliminatePlayer(tid, 'c');
+    tm.disqualifyPlayers(tid, ['a', 'b']);
+    const t = tm.getTournament(tid)!;
+    expect(t.status).toBe('finished');
+    // CONTROL — what the engine stored (payTournamentPrizes / the master read it): places 1 / 2, flagged, paid 0.
+    expect(storedPlacesOf(tm, tid)).toEqual({ a: 2, b: 1, c: 3 });
+    expect(t.finalResults).toEqual(expect.arrayContaining([
+      { playerId: 'b', position: 1, payout: 0, disqualified: true },
+      { playerId: 'a', position: 2, payout: 0, disqualified: true },
+      { playerId: 'c', position: 3, payout: 200 },
+    ]));
+    const live = tm.getTournamentStandings(tid, null)!;
+    expect(live.players).toEqual([
+      { playerId: 'a', playerName: 'Ann', chipCount: 0, finishPosition: null, disqualified: true },
+      { playerId: 'b', playerName: 'Bob', chipCount: 0, finishPosition: null, disqualified: true },
+      { playerId: 'c', playerName: 'Cy', chipCount: 0, finishPosition: 3 },
+    ]);
+    expect(live.players.filter((p) => p.finishPosition === 1 || p.finishPosition === 2)).toEqual([]);
+    tm.pruneEndedTournaments(Date.now() + H + 1);
+    expect(tm.getTournament(tid)).toBeUndefined();
+    expect(tm.getTournamentStandings(tid, null)).toEqual(live);   // the kept roster: the same rows
+  });
+
+  it('heads-up (the review\'s case 2) and RUNNING: a suspended entrant is out with no place at once; the others keep their stored places; CONTROL: nobody else carries a flag key', () => {
+    const tm = new TournamentManager();
+    const tid = custom(tm, 'Live DQ Cup');
+    for (const [pid, nm] of [['a', 'Ann'], ['b', 'Bob'], ['c', 'Cy'], ['d', 'Dee']]) tm.registerPlayer(tid, pid, nm, `s${pid}`);
+    tm.startTournament(tid);
+    tm.eliminatePlayer(tid, 'd');                                                    // 4th
+    expect(tm.disqualifyPlayer(tid, 'b')).toEqual({ finished: false, position: 3 }); // the engine stores 3rd
+    let st = tm.getTournamentStandings(tid, null)!;
+    expect(st.status).toBe('running');
+    expect(st.players.find((p) => p.playerId === 'b')).toEqual({ playerId: 'b', playerName: 'Bob', chipCount: 0, finishPosition: null, disqualified: true });
+    expect(placesOf(st)).toEqual({ a: null, b: null, c: null, d: 4 });
+    for (const p of st.players.filter((x) => x.playerId !== 'b')) {
+      expect(p).not.toHaveProperty('disqualified');
+      expect(p).not.toHaveProperty('tied');
+    }
+    expect(st.players.find((p) => p.playerId === 'a')!.chipCount).toBeGreaterThan(0);   // still in: his stack
+    // Heads-up now: c suspended → a wins; c never reads 2nd.
+    expect(tm.disqualifyPlayer(tid, 'c')).toMatchObject({ finished: true, position: 2 });
+    st = tm.getTournamentStandings(tid, null)!;
+    expect(flags(st)).toEqual({ a: [1, false, false], b: [null, false, true], c: [null, false, true], d: [4, false, false] });
+  });
+
+  it('a TDA tie (same hand, equal stacks): both keep their STORED places (3rd / 4th: the seat award and the master use them) + tied — live from the 2nd bust, at the finish, kept; CONTROL: a group with one member out is not tied; unequal stacks re-placed are not tied', () => {
+    const tm = new TournamentManager();
+    const tid = custom(tm, 'Tie Cup', 9, { prizePool: 1000 });
+    for (const pid of ['p1', 'p2', 'p3', 'p4', 'p5', 'p6']) tm.registerPlayer(tid, pid, pid.toUpperCase(), `s${pid}`);
+    tm.startTournament(tid);
+    tm.eliminatePlayer(tid, 'p6');
+    tm.eliminatePlayer(tid, 'p5');
+    tm.placeSimultaneousBusts(tid, [{ playerId: 'p6', startStack: 900, order: 1 }, { playerId: 'p5', startStack: 100, order: 2 }]);   // unequal: re-placed, no tie
+    expect(tm.markSimultaneousBustTie(tid, ['p4', 'p3'])).toBe(true);
+    tm.eliminatePlayer(tid, 'p4');
+    expect(tm.getTournamentStandings(tid, null)!.players.filter((p) => p.tied)).toEqual([]);   // CONTROL: only one of the group is out
+    tm.eliminatePlayer(tid, 'p3');
+    expect(flags(tm.getTournamentStandings(tid, null))).toEqual({
+      p1: [null, false, false], p2: [null, false, false], p3: [3, true, false], p4: [4, true, false], p5: [6, false, false], p6: [5, false, false],
+    });
+    tm.eliminatePlayer(tid, 'p2');
+    expect(tm.getTournament(tid)!.finalResults!.filter((r) => r.tied).map((r) => r.playerId).sort()).toEqual(['p3', 'p4']);   // the finish's split
+    const done = tm.getTournamentStandings(tid, null)!;
+    expect(flags(done)).toEqual({
+      p1: [1, false, false], p2: [2, false, false], p3: [3, true, false], p4: [4, true, false], p5: [6, false, false], p6: [5, false, false],
+    });
+    expect(placesOf(done)).toEqual(storedPlacesOf(tm, tid));     // never renumbered
+    tm.pruneEndedTournaments(Date.now() + H + 1);
+    expect(tm.getTournamentStandings(tid, null)).toEqual(done);  // kept: the same flags
+  });
+
+  it('a hand-for-hand bust with EQUAL starting stacks ties (placeSimultaneousBusts\' fresh tie group): the stored places + tied', () => {
+    const tm = new TournamentManager();
+    const tid = custom(tm, 'HFH Tie Cup');
+    for (const pid of ['p1', 'p2', 'p3', 'p4']) tm.registerPlayer(tid, pid, pid.toUpperCase(), `s${pid}`);
+    tm.startTournament(tid);
+    tm.eliminatePlayer(tid, 'p4');
+    tm.eliminatePlayer(tid, 'p3');
+    tm.placeSimultaneousBusts(tid, [{ playerId: 'p4', startStack: 500, order: 1 }, { playerId: 'p3', startStack: 500, order: 2 }]);
+    const st = tm.getTournamentStandings(tid, null)!;
+    expect(placesOf(st)).toEqual(storedPlacesOf(tm, tid));
+    expect(st.players.filter((p) => p.tied).map((p) => [p.playerId, p.finishPosition]).sort()).toEqual([['p3', 3], ['p4', 4]]);
+  });
+
+  it('a restart keeps the flags (serialize -> parse); CONTROL: a tampered row {place 1, disqualified} comes back with NO place; tied without a place / non-true flags are dropped', () => {
+    const r: FinishedStandingsRecord = {
+      ...rec('t9', 'tournament:t9', 5),
+      players: [
+        { playerId: 'a', playerName: 'Ann', chipCount: 0, finishPosition: null, disqualified: true },
+        { playerId: 'b', playerName: 'Bob', chipCount: 0, finishPosition: 3, tied: true },
+        { playerId: 'c', playerName: 'Cy', chipCount: 0, finishPosition: 4, tied: true },
+        { playerId: 'd', playerName: 'Dee', chipCount: 0, finishPosition: 1 },
+      ],
+    };
+    expect(parseFinishedStandings(serializeFinishedStandings(r))).toEqual(r);
+    const tampered = parseFinishedStandings(JSON.stringify({
+      v: FINISHED_STANDINGS_FORMAT, ...r,
+      players: [
+        { playerId: 'a', playerName: 'Ann', chipCount: 0, finishPosition: 1, disqualified: true },
+        { playerId: 'b', playerName: 'Bob', chipCount: 0, finishPosition: null, tied: true },
+        { playerId: 'c', playerName: 'Cy', chipCount: 0, finishPosition: 2, tied: 'yes', disqualified: 'no' },
+      ],
+    }))!;
+    expect(tampered.players).toEqual([
+      { playerId: 'a', playerName: 'Ann', chipCount: 0, finishPosition: null, disqualified: true },
+      { playerId: 'b', playerName: 'Bob', chipCount: 0, finishPosition: null },
+      { playerId: 'c', playerName: 'Cy', chipCount: 0, finishPosition: 2 },
+    ]);
+  });
+
+  it('publicTournamentStandings (REAL): the flags pass through only as a literal true, after the public name / opaque id; CONTROL: a plain row has exactly the four keys', () => {
+    const { exports: m, stubbed } = load(fnSrc('function publicTournamentStandings('), { createHash, publicNameOf }, '{ publicTournamentStandings }');
+    const out = m.publicTournamentStandings({
+      tournamentId: 'T', name: 'X', status: 'finished', eliminationOrder: ['user-3', 'user-1'],
+      players: [
+        { playerId: 'user-1', playerName: 'Ann', chipCount: 0, finishPosition: null, disqualified: true },
+        { playerId: 'user-2', playerName: 'Bob', chipCount: 0, finishPosition: 3, tied: true },
+        { playerId: 'user-3', playerName: '3035551234', chipCount: 0, finishPosition: 4, tied: 'yes', disqualified: 1 },
+        { playerId: 'user-4', playerName: 'Dee', chipCount: 0, finishPosition: 1 },
+      ],
+    });
+    expect([...stubbed]).toEqual([]);
+    const [ann, bob, cy, dee] = out.players;
+    expect(ann).toEqual({ playerId: expect.stringMatching(/^e[0-9a-f]{12}$/), playerName: 'Ann', chipCount: 0, disqualified: true, finishPosition: null });
+    expect(bob).toEqual({ playerId: expect.stringMatching(/^e[0-9a-f]{12}$/), playerName: 'Bob', chipCount: 0, tied: true, finishPosition: 3 });
+    for (const plain of [cy, dee]) expect(Object.keys(plain).sort()).toEqual(['chipCount', 'finishPosition', 'playerId', 'playerName']);
+    expect(cy.playerName).toBe('Player');
+    expect(JSON.stringify(out)).not.toMatch(/user-[1-4]|3035551234/);
+  });
+
+  it('index.ts (REAL): the lobby Results list and the qualifier\'s OWN results agree — the suspended entrant has no place in either, nobody is renumbered; the socket answer carries disqualified', async () => {
+    const w = qualWorld();
+    const tid = custom(w.tm, 'Qualifier Tournament', 999);
+    const finished: any[] = [];
+    w.tm.onEvent(tid, (ev, data) => { if (ev === 'tournamentFinished') finished.push(data); });
+    const field: Array<[string, string]> = [['user-1', 'Ann'], ['user-2', 'Bob'], ['user-3', 'Cy'], ['user-4', 'Dee']];
+    for (const [pid, nm] of field) w.tm.registerPlayer(tid, pid, nm, `s-${pid}`);
+    w.tm.startTournament(tid);
+    w.tm.eliminatePlayer(tid, 'user-4');                    // 4th
+    w.tm.disqualifyPlayer(tid, 'user-1');                   // suspended: the engine stores 3rd
+    w.tm.eliminatePlayer(tid, 'user-3');                    // 2nd → Bob wins
+    expect(finished).toHaveLength(1);
+    w.qualifierTournaments.set('W1', w.qt({ status: 'running', tournamentId: tid, scheduledAt: new Date(Date.now() - H).toISOString(),
+      players: field.map(([pid, nm], i) => w.reg(pid, `m-${i + 1}`, nm)) }));
+    const markScope: Record<string, unknown> = {
+      qualifierTournaments: w.qualifierTournaments, tournamentManager: w.tm, seatsForTopWith, seatsWonAt, publicNameOf, leagueFinishFrameFields,
+      onlineLeagueStats: { finished: 0 }, socketsOfMaster: () => [], io: { emit() {} },
+    };
+    const marked = load(fnSrc('function markQualifierFinished('), markScope, '{ markQualifierFinished }');
+    marked.exports.markQualifierFinished(tid, finished[0]);
+    expect([...marked.stubbed]).toEqual([]);
+    const own = (w.qualifierTournaments.get('W1').results as any[]).map((r) => [r.playerName, r.place]);
+    expect(own).toEqual([['Bob', 1], ['Cy', 2], ['Dee', 4]]);   // the server's own results: no Ann, no renumbering
+    const st = w.standings({ tournamentId: tid });
+    const placed = st.players.filter((p: any) => p.finishPosition !== null).map((p: any) => [p.playerName, p.finishPosition]).sort((a: any, b: any) => a[1] - b[1]);
+    expect(placed).toEqual(own);
+    expect(st.players.find((p: any) => p.playerName === 'Ann')).toMatchObject({ finishPosition: null, disqualified: true, chipCount: 0 });
+    expect(JSON.stringify(st)).not.toMatch(/user-[1-4]|m-[1-4]/);
+  });
+});
+
+describe('2026-11-26 review fix (finding 5) — the size bound evicts one-off rosters before any qualifier / league night', () => {
+  const flood = (s: FinishedStandingsStore) => {
+    for (let i = 0; i < FINISHED_STANDINGS_MAX; i++) s.note(rec(`CLUB-${i}`, `tournament:CLUB-${i}`, 2000 + i), 2000 + i);
+  };
+
+  it('the review\'s probe: last night\'s league + 200 one-off club finishes — the league stays, the OLDEST club goes; a TAGGED roster too; CONTROL: the same night on a one-off card is the one evicted (the bug)', () => {
+    const s = new FinishedStandingsStore();
+    s.note(rec('LEAGUE-NIGHT', qualifierCardKey('online_league'), 1000), 1000);
+    flood(s);
+    expect(s.size).toBe(FINISHED_STANDINGS_MAX);
+    expect(s.has('LEAGUE-NIGHT', 3000)).toBe(true);
+    expect(s.has('CLUB-0', 3000)).toBe(false);
+    expect(s.has('CLUB-1', 3000)).toBe(true);
+    expect(s.stats.evicted).toBe(1);
+    // A roster tagged by markQualifierFinished (whatever its card) is protected the same way.
+    const tagged = new FinishedStandingsStore();
+    tagged.note(rec('WEEKLY', 'tournament:WEEKLY', 1000), 1000);
+    expect(tagged.tagQualifier('WEEKLY', { type: 'weekly', id: 'W1' }, 1000)).toBe(true);
+    flood(tagged);
+    expect(tagged.has('WEEKLY', 3000)).toBe(true);
+    // CONTROL — an untagged one-off card (what every qualifier roster had before): evicted first.
+    const ctl = new FinishedStandingsStore();
+    ctl.note(rec('LEAGUE-NIGHT', 'tournament:LEAGUE-NIGHT', 1000), 1000);
+    flood(ctl);
+    expect(ctl.has('LEAGUE-NIGHT', 3000)).toBe(false);
+    expect(ctl.stats.evicted).toBe(1);
+  });
+
+  it('the order: a superseded template run, then one-offs, then a template\'s latest, then an older night of a type, the latest night of each type LAST — the oldest first within a rank (not the oldest of all)', () => {
+    const all = [
+      rec('Q-W', qualifierCardKey('weekly'), 5),            // the OLDEST of all, but its type's latest
+      rec('Q-L1', qualifierCardKey('online_league'), 10),   // an older league night
+      rec('Q-L2', qualifierCardKey('online_league'), 20),   // the latest league night
+      rec('T-1', 'template:Sit & Go', 30),                  // superseded by T-2
+      rec('C-1', 'tournament:C-1', 40),
+      rec('C-2', 'tournament:C-2', 50),
+      rec('T-2', 'template:Sit & Go', 60),
+    ];
+    const order = ['T-1', 'C-1', 'C-2', 'T-2', 'Q-L1', 'Q-W', 'Q-L2'];
+    for (let n = 0; n <= all.length; n++) {
+      const s = new FinishedStandingsStore(FINISHED_STANDINGS_KEEP_MS, all.length - n);
+      s.restore(all.map((r) => ({ ...r })), 100);
+      expect({ n, kept: all.map((r) => r.tournamentId).filter((id) => s.has(id, 100)) })
+        .toEqual({ n, kept: all.map((r) => r.tournamentId).filter((id) => !order.slice(0, n).includes(id)) });
+      expect(s.stats.evicted).toBe(n);
+    }
+    expect([evictionRankOf(all[3], false), evictionRankOf(all[4], true), evictionRankOf(all[6], true), evictionRankOf(all[1], false), evictionRankOf(all[2], true)])
+      .toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it('TournamentManager: an engine tournament with config.qualifierType keeps its results through 200 one-off finishes and is never a tournament-lobby item; CONTROL: the same night without it is pushed out', () => {
+    const run = (qualifierType?: string) => {
+      const tm = new TournamentManager();
+      const night = custom(tm, 'Online League', 999, qualifierType ? { qualifierType } : {});
+      for (const [pid, nm] of [['user-1', 'Ann'], ['user-2', 'Bob']]) tm.registerPlayer(night, pid, nm, `s-${pid}`);
+      tm.startTournament(night);
+      tm.eliminatePlayer(night, 'user-2');
+      for (let i = 0; i < FINISHED_STANDINGS_MAX; i++) {
+        jest.setSystemTime(Date.now() + 1000);
+        const c = custom(tm, `Club ${i}`, 9, { unlisted: true });
+        tm.registerPlayer(c, `c${i}-a`, 'Xi', 'sx');
+        tm.registerPlayer(c, `c${i}-b`, 'Yu', 'sy');
+        tm.startTournament(c);
+        tm.eliminatePlayer(c, `c${i}-b`);
+      }
+      tm.pruneEndedTournaments(Date.now() + H + 1);
+      return { tm, night };
+    };
+    const q = run('online_league');
+    expect(q.tm.getTournament(q.night)).toBeUndefined();
+    expect(q.tm.getTournamentStandings(q.night, null)).toMatchObject({ status: 'finished', players: [{ playerName: 'Ann', finishPosition: 1 }, { playerName: 'Bob', finishPosition: 2 }] });
+    expect(q.tm.finishedStandingsHealth()).toMatchObject({ evicted: 1, kept: FINISHED_STANDINGS_MAX });
+    expect((q.tm.getTournamentList() as any[]).some((x) => x.tournamentId === q.night)).toBe(false);   // its home is the qualifier lobby
+    // CONTROL — no qualifierType: a one-off card, the oldest, evicted.
+    const c = run(undefined);
+    expect(c.tm.getTournamentStandings(c.night, null)).toBeNull();
+    expect(c.tm.finishedStandingsHealth()).toMatchObject({ evicted: 1 });
+  });
+
+  it('index.ts (REAL startQualifierTournament): the engine tournament carries the event\'s type, so its finished roster\'s card is qualifier:<type>; CONTROL: no eventType = no type (a one-off card)', () => {
+    const START_Q = fnSrc('function startQualifierTournament(');
+    const start = (eventType?: string) => {
+      const tm = new TournamentManager();
+      const tables = new Map<string, PokerTable>();
+      const { exports: m, stubbed } = load(START_Q, {
+        tournamentManager: tm, tournamentTables: new Map(), fastModeTables: new Map(),
+        qualifierEventConfig, qualifierBlindLevels, qualifierBreakConfig, qualifierTestTimeScale, process: { env: { RAILWAY_ENVIRONMENT: 'production' } },
+        playerSessions: new Map(), io: { to: () => ({ emit() {} }), emit() {}, sockets: { sockets: new Map() } },
+        tableManager: {
+          createQuickTable: (name: string, seats: number, sb: number, bb: number, buyIn: number) => {
+            const id = `T${tables.size + 1}`;
+            tables.set(id, new PokerTable({ tableId: id, tableName: name, smallBlind: sb, bigBlind: bb, minBuyIn: buyIn, maxBuyIn: buyIn * 10, maxPlayers: seats } as any));
+            return id;
+          },
+          getTable: (id: string) => tables.get(id),
+        },
+        bindRegistrantSocket: () => '', bootstrapTournamentTables() {}, randomInt: () => 0, markQualifierEngineTournament() {},
+        console: { log() {}, warn() {}, error() {} },
+      }, '{ startQualifierTournament }');
+      const players = Array.from({ length: 3 }, (_, i) => ({ id: `q${i}`, name: `P${i}`, socketId: `S${i}`, masterId: `m${i}` }));
+      const r = m.startQualifierTournament(players, 50_000, false, eventType === undefined ? undefined : { eventType });
+      return { tm, tid: r.tournamentId as string, stubbed };
+    };
+    for (const type of ['weekly', 'monthly', 'online_league']) {
+      const { tm, tid, stubbed } = start(type);
+      expect([...stubbed].filter((n) => /qualifierEventConfig|qualifierBlindLevels|qualifierBreakConfig/.test(n))).toEqual([]);
+      expect(tm.getTournament(tid)!.config.qualifierType).toBe(type);
+      tm.eliminatePlayer(tid, 'q2');
+      tm.eliminatePlayer(tid, 'q1');
+      expect(tm.getTournament(tid)!.status).toBe('finished');
+      expect((tm as any).finishedStandings.get(tid).cardKey).toBe(qualifierCardKey(type));
+    }
+    const ctl = start(undefined);
+    expect(ctl.tm.getTournament(ctl.tid)!.config).not.toHaveProperty('qualifierType');
+    ctl.tm.eliminatePlayer(ctl.tid, 'q2');
+    ctl.tm.eliminatePlayer(ctl.tid, 'q1');
+    expect((ctl.tm as any).finishedStandings.get(ctl.tid).cardKey).toBe(`tournament:${ctl.tid}`);
+  });
+});
+
 describe('wiring: the socket list asks for names, REST does not; the update broadcast stays a count; health; manifest', () => {
   it('only the socket lobby list passes withNames; the REST list and the qualifierTournamentUpdate frame carry no names', () => {
     expect(handlerSrc('getQualifierTournaments', '\n  });\n')).toContain("qualifierList(viewerMasterId, Date.now(), { includeLeague, withNames: true })");
@@ -967,7 +1273,9 @@ describe('wiring: the socket list asks for names, REST does not; the update broa
     const manifest = fs.readFileSync(path.join(__dirname, '..', 'canonical-features.txt'), 'utf8').split('\n').map((l) => l.trim());
     for (const tok of ['registrantNames:', 'resultsTournamentId:', 'resultsQualifierId', 'function registrantNamesOf(', 'function qualifierResultsPointer(', 'finished_standings_note_failed', 'function qualifierLobbyListFields(', 'r2Play.lobbyLists',
       // 2026-11-26 review fixes (finding 1: restart; finding 3: finished custom / club events stay listed).
-      'finished_standings_restored', 'poker:finishedStandings:', 'tagFinishedStandingsQualifier', 'resultsKept: true']) {
+      'finished_standings_restored', 'poker:finishedStandings:', 'tagFinishedStandingsQualifier', 'resultsKept: true',
+      // 2026-11-26 minor findings (4: DQ / tie rows; 5: qualifier results evicted last).
+      'function standingsPlaceOf(', 'function evictionRankOf(', 'function qualifierCardKey(']) {
       expect({ tok, listed: manifest.includes(tok) }).toEqual({ tok, listed: true });
     }
   });

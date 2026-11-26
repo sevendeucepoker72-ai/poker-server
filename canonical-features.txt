@@ -2579,3 +2579,10 @@ finished_standings_restored
 poker:finishedStandings:
 tagFinishedStandingsQualifier
 resultsKept: true
+# 2026-11-26 lobby-lists minor review fixes - (4) every standings row goes through standingsPlaceOf: a disqualified
+# (suspended) entrant has NO place (finishPosition null + disqualified: true, as payTournamentPrizes and the master
+# results treat him), a TDA tie keeps its stored place + tied: true. (5) the kept rosters' size bound evicts by
+# evictionRankOf: one-off events before templates, qualifier / league nights (card qualifier:<type>) LAST.
+function standingsPlaceOf(
+function evictionRankOf(
+function qualifierCardKey(

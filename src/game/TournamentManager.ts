@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from 'uuid';
 import {
   FinishedStandingsStore, FinishedStandingsRecord, FinishedStandingsPersistence, registrantNamesOf, keptCardOf,
-  keptFinishedItemOf, rosterHasAccount,
+  keptFinishedItemOf, rosterHasAccount, standingsPlaceOf, qualifierCardKey, StandingsRow,
 } from './lobbyLists';
 
 export interface BlindLevel {
@@ -49,6 +49,14 @@ export interface TournamentConfig {
    * qualifier event never is, whatever its name.
    */
   fromTemplate?: boolean;
+  /**
+   * 2026-11-26 (lobby-lists review fix, finding 5) — the qualifier event type
+   * this engine tournament plays ('weekly', 'monthly', 'online_league', …):
+   * set only by index.ts startQualifierTournament. Its finished roster's card
+   * is then `qualifier:<type>` (lobbyLists.qualifierCardKey), which the kept
+   * rosters' size bound evicts LAST. Nothing else reads it.
+   */
+  qualifierType?: string;
 }
 
 /** S3 — the break schedule: `seconds` of break after every `everyLevels`-th level. */
@@ -256,6 +264,8 @@ export interface TournamentTemplate {
   unlisted?: boolean;
   /** S3 (2026-10-23) — see TournamentConfig.breaks (qualifiers only). */
   breaks?: TournamentBreaks;
+  /** 2026-11-26 (finding 5) — see TournamentConfig.qualifierType (qualifier engine tournaments only). */
+  qualifierType?: string;
 }
 
 /**
@@ -479,6 +489,8 @@ export class TournamentManager {
       ...(template.unlisted ? { unlisted: true } : {}),
       ...(template.breaks ? { breaks: { everyLevels: template.breaks.everyLevels, seconds: template.breaks.seconds } } : {}),
       ...(opts?.fromTemplate ? { fromTemplate: true } : {}),   // F9
+      // 2026-11-26 (lobby-lists finding 5) — a qualifier / league engine tournament's type (its results card).
+      ...(typeof template.qualifierType === 'string' && template.qualifierType ? { qualifierType: template.qualifierType } : {}),
     };
 
     const now = Date.now();
@@ -728,9 +740,35 @@ export class TournamentManager {
     return row && row.amount > 0 ? row.amount : null;
   }
 
-  /** 2026-11-25 — the card a finished roster belongs to: its template, else the tournament itself. */
+  /**
+   * 2026-11-25 — the card a finished roster belongs to: its template, else the
+   * tournament itself. 2026-11-26 (finding 5) — a qualifier / league engine
+   * tournament (config.qualifierType): `qualifier:<type>`, evicted last by the
+   * kept rosters' size bound (lobbyLists.evictionRankOf).
+   */
   private standingsCardKeyOf(tournamentId: string, t: Tournament): string {
+    if (t.config.qualifierType) return qualifierCardKey(t.config.qualifierType);
     return t.config.fromTemplate ? `template:${t.config.name}` : `tournament:${tournamentId}`;
+  }
+
+  /**
+   * 2026-11-26 (lobby-lists review fix, finding 4) — the entrants who TIE
+   * (TDA): once finished, the stored finalResults `tied` rows; before that the
+   * same rule finishTournament applies — a tie group (markSimultaneousBustTie /
+   * placeSimultaneousBusts) with 2+ ELIMINATED members.
+   */
+  private tiedPlayerIdsOf(t: Tournament): Set<string> {
+    if (Array.isArray(t.finalResults)) return new Set(t.finalResults.filter((r) => r.tied === true).map((r) => r.playerId));
+    const groups = new Map<number, string[]>();
+    for (const p of t.players) {
+      if (p.tieGroup === undefined || !p.eliminated) continue;
+      const g = groups.get(p.tieGroup) || [];
+      g.push(p.playerId);
+      groups.set(p.tieGroup, g);
+    }
+    const out = new Set<string>();
+    for (const ids of groups.values()) if (ids.length >= 2) for (const id of ids) out.add(id);
+    return out;
   }
 
   /** 2026-11-25 — a lobby item's resultsTournamentId (see getTournamentList). */
@@ -789,6 +827,9 @@ export class TournamentManager {
    * 2026-11-26 review fix (finding 3) — + the event's lobby card at the
    * finish (keptCardOf), `unlisted` and the entrants' account keys
    * (server-side only), so its kept 'finished' item can stay listed.
+   * 2026-11-26 review fix (finding 4) — each row through standingsPlaceOf
+   * (the live path's rule): a disqualified entrant has no place
+   * (`disqualified: true`), a TDA tie keeps its stored place + `tied: true`.
    */
   private noteFinishedStandings(tournamentId: string, t: Tournament): void {
     try {
@@ -799,19 +840,20 @@ export class TournamentManager {
         if (p.masterUserId) a.masterUserId = String(p.masterUserId);
         if (a.userId !== undefined || a.masterUserId !== undefined) accounts.push(a);
       }
+      const tied = this.tiedPlayerIdsOf(t);
       const rec: FinishedStandingsRecord = {
         tournamentId,
         name: t.config.name,
         status: 'finished',
         eliminationOrder: [...(t.eliminationOrder || [])],
-        players: t.players.map((p) => {
+        players: t.players.map((p): StandingsRow => {
           const placed = !!p.finishPosition && p.finishPosition > 0;
           const out = !!p.eliminated || placed;
           return {
             playerId: p.playerId,
             playerName: p.playerName,
             chipCount: out ? 0 : (p.chips ?? 0),
-            finishPosition: placed ? p.finishPosition : null,
+            ...standingsPlaceOf(p, tied.has(p.playerId)),
           };
         }),
         finishedAt: t.finishedAt ?? Date.now(),
@@ -2016,13 +2058,20 @@ export class TournamentManager {
    * lobbyLists.FinishedStandingsStore) once the record is dropped. Places are
    * always the STORED finishPosition (ties, hand-for-hand, late-entry shifts:
    * whatever the engine recorded), never recomputed.
+   *
+   * 2026-11-26 (lobby-lists review fix, finding 4) — additive row flags, the
+   * server's own treatment (lobbyLists.standingsPlaceOf, the kept roster's
+   * rule too): a DISQUALIFIED entrant (suspended mid-tournament: paid nothing,
+   * no qualifier / master result, never the champion) holds no place —
+   * finishPosition null + `disqualified: true`, chipCount 0; a TDA TIE keeps its
+   * stored place + `tied: true`. Nobody else's place changes.
    */
   getTournamentStandings(tournamentId: string, tableManager: any): {
     tournamentId: string;
     name: string;
     status: TournamentStatus;
     eliminationOrder: string[];
-    players: { playerId: string; playerName: string; chipCount: number; finishPosition: number | null }[];
+    players: StandingsRow[];
     finishedAt?: number;
   } | null {
     const t = this.tournaments.get(tournamentId);
@@ -2035,7 +2084,8 @@ export class TournamentManager {
         eliminationOrder: kept.eliminationOrder, players: kept.players, finishedAt: kept.finishedAt,
       };
     }
-    const players = t.players.map((p) => {
+    const tied = this.tiedPlayerIdsOf(t);
+    const players = t.players.map((p): StandingsRow => {
       const eliminated = !!p.eliminated || (p.finishPosition && p.finishPosition > 0);
       let chipCount = 0;
       if (!eliminated) {
@@ -2056,7 +2106,7 @@ export class TournamentManager {
         playerId: p.playerId,
         playerName: p.playerName,
         chipCount,
-        finishPosition: (p.finishPosition && p.finishPosition > 0) ? p.finishPosition : null,
+        ...standingsPlaceOf(p, tied.has(p.playerId)),
       };
     });
     return {
