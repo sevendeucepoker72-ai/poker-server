@@ -2571,3 +2571,11 @@ function qualifierResultsPointer(
 function qualifierLobbyListFields(
 finished_standings_note_failed
 r2Play.lobbyLists
+# 2026-11-26 lobby-lists review fixes - (1) the kept finished rosters survive a restart: written to Redis
+# (poker:finishedStandings:<id>, TTL = rest of the 25 h window) and read back at boot; a qualifier's roster is tagged
+# (tagFinishedStandingsQualifier) so tonight's card still opens last night's results after a deploy. (3) a finished
+# custom / club event stays LISTED from its kept roster for the keep window (resultsKept: true; club = own entrants only).
+finished_standings_restored
+poker:finishedStandings:
+tagFinishedStandingsQualifier
+resultsKept: true

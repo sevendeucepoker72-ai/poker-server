@@ -90,7 +90,7 @@ describe('/api/health — the bots-review sections are built fail-safe; the depl
     expect(body.engine.commentary).toEqual({ keyConfigured: !!process.env.ANTHROPIC_API_KEY, minIntervalMs: 60000, calls: 0, delivered: 0, emptyReplies: 0, failed: 0, skippedNoAudience: 3 });
     expect(body.r2Play.quickGames).toMatchObject({ live: 1, byFormat: { spinGo: { started: 1, humanWins: 1 } } });
     expect(body.r2Play.clubTables).toMatchObject({ idleDealsSkipped: 4 });
-    expect(body.r2Play.lobbyLists).toEqual({ noted: 0, served: 0, expired: 0, evicted: 0, noteErrors: 0, kept: 0 });   // 2026-11-25
+    expect(body.r2Play.lobbyLists).toEqual({ noted: 0, served: 0, expired: 0, evicted: 0, noteErrors: 0, persisted: 0, persistErrors: 0, restored: 0, kept: 0 });   // 2026-11-25 (+ persistence 11-26)
     expect(body.healthSectionErrors).toBe(0);
     expect(h.errors).toEqual([]);
   });

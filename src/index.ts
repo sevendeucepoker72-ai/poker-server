@@ -18,7 +18,7 @@ import {
 import { quickGameOutcome, QuickFormat, spinGoMultiplierFor } from './game/quickGames';
 import { parseMasterSchedule, MasterScheduleEntry, qualifierEventConfig, leagueFinishFrameFields, qualifierWindows, qualifierStatusOf, seatsForTopWith, seatsWonAt, qualifierStructure, qualifierBlindLevels, QUALIFIER_BASE_STACK, QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, QUALIFIER_OVERFLOW_TABLES_MAX, qualifierOverflowTablesCap, parseQualifierOverflowCapUpdate, qualifierOverflowCapLabel, qualifierTestTimeScale, qualifierBreakConfig, QUALIFIER_BREAK_EVERY_LEVELS, QUALIFIER_BREAK_MINUTES, qualifierTablesOpenBeforeMin, parseQualifierTablesOpenUpdate, handForHandApplies, qualifierHandForHandOnAtBoot, qualifierHandForHandWatchdogMs, qualifierHandForHandHardCapMs, QUALIFIER_HAND_FOR_HAND_STALL_MS, qualifierHandForHandOnText, QUALIFIER_HAND_FOR_HAND_TEXT, QUALIFIER_HAND_FOR_HAND_OFF_TEXT, QUALIFIER_LATE_REG_CLOSED_BUBBLE_TEXT, qualifierLateRegClosedText, QUALIFIER_HELP_TOOLS_OFF_TEXT, notQualifiedText, onlineLeagueGivesWeeklyCredits } from './game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart } from './game/qualifierNoShow';
-import { registrantNamesOf, qualifierResultsPointer } from './game/lobbyLists';
+import { registrantNamesOf, qualifierResultsPointer, serializeFinishedStandings, parseFinishedStandings, FinishedStandingsPersistence } from './game/lobbyLists';
 import { clubTournamentBlindLevels } from './game/clubTournaments';
 import { createPrizeLedger, prizeLedgerStats, LedgerCredit } from './game/prizeLedger';
 import { createTournamentResultsStore, tournamentResultsStats, ResultsEntrant } from './game/tournamentResults';
@@ -33,6 +33,9 @@ import {
   pingRedis,
   appendFairnessCommitment,
   scanFairnessBuffers,
+  saveFinishedStandings,
+  deleteFinishedStandings,
+  scanFinishedStandings,
 } from './redisStore';
 // Re-export GamePhase values for draw/stud phase checks
 const DrawPhases = [GamePhase.Draw1, GamePhase.Draw2, GamePhase.Draw3];
@@ -858,6 +861,34 @@ tournamentManager.breaksEnabled = process.env.QUALIFIER_BREAKS !== '0';
 // qualifier's SEAT BUBBLE (or 2:00 PM, whichever comes first): TournamentManager asks
 // each event's bubble at every elimination (non-qualifier tournaments: null, never).
 tournamentManager.lateEntryBubbleOf = qualifierLateEntryBubbleOf;
+// 2026-11-26 (lobby-lists review fix, finding 1) — the finished rosters kept >= 24 h
+// (who busted in each place) are written to Redis (`poker:finishedStandings:<id>`,
+// TTL = the rest of the keep window) and read back at boot (the listen callback's
+// Redis block: restoreFinishedStandingsFromRedis), so a deploy / variable change no
+// longer wipes last night's league or Sunday's weekly results. Redis-less: memory only.
+// Health r2Play.lobbyLists {persisted, persistErrors, restored}.
+const finishedStandingsRedisPersistence: FinishedStandingsPersistence = {
+  save: (rec, ttlMs) => saveFinishedStandings(rec.tournamentId, serializeFinishedStandings(rec), Math.ceil(ttlMs / 1000)),
+  drop: (tournamentId) => deleteFinishedStandings(tournamentId),
+};
+tournamentManager.setFinishedStandingsPersistence(finishedStandingsRedisPersistence);
+/**
+ * 2026-11-26 (finding 1) — boot: the previous process's kept rosters back into
+ * TournamentManager (each parsed + validated: parseFinishedStandings; past the
+ * keep window or malformed = skipped). Never throws; returns how many were kept.
+ */
+async function restoreFinishedStandingsFromRedis(): Promise<number> {
+  try {
+    const raws = await scanFinishedStandings();
+    const recs = raws.map((raw) => parseFinishedStandings(raw)).filter((r): r is NonNullable<typeof r> => !!r);
+    const n = tournamentManager.restoreFinishedStandings(recs);
+    console.log(`[Rehydrate] ${JSON.stringify({ event: 'finished_standings_restored', read: raws.length, valid: recs.length, kept: n })}`);
+    return n;
+  } catch (err) {
+    console.warn(`[Rehydrate] ${JSON.stringify({ event: 'finished_standings_restore_failed', error: String((err as Error)?.message || err) })}`);
+    return 0;
+  }
+}
 
 // Track which socket is at which table/seat
 interface PlayerSession {
@@ -4283,7 +4314,10 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
  *    handle or phone. The anonymous REST list stays name-free (R2 C3).
  */
 function qualifierLobbyListFields(id: string, qt: QualifierTournamentReg, withNames: boolean, now: number = Date.now()): Record<string, unknown> {
-  const pointer = qualifierResultsPointer(id, qt, qualifierTournaments.entries(), (tid) => tournamentManager.hasStandings?.(tid, now) === true);
+  // 2026-11-26 (review fix, finding 1) — + the latest KEPT roster of the type (it
+  // survives a restart; the finished registry entry does not).
+  const pointer = qualifierResultsPointer(id, qt, qualifierTournaments.entries(), (tid) => tournamentManager.hasStandings?.(tid, now) === true,
+    (type) => tournamentManager.latestQualifierResults?.(type, now) ?? null);
   if (!withNames) return { ...pointer };
   const registrantNames = qt.cancelled ? [] : registrantNamesOf(qt.players.map((p) => ({ key: p.masterPlayerId || p.playerId, name: p.playerName })));
   return { ...pointer, registrantNames };
@@ -5126,6 +5160,11 @@ function markQualifierFinished(tournamentId: string, data: { results?: Array<{ p
     qt.status = 'finished';
     qt.finishedAt = Date.now();
     qt.results = results;
+    // 2026-11-26 (lobby-lists review fix, finding 1) — the kept roster (who busted in
+    // each place) is THIS event's results: written again with the mark, so after a
+    // restart (this registry entry gone) the next card of the type still opens them
+    // (qualifierLobbyListFields -> latestQualifierResults). Never throws into the finish.
+    try { tournamentManager.tagFinishedStandingsQualifier?.(tournamentId, { type: qt.qualifierType, id: qualId }); } catch { /* the pointer falls back to the registry */ }
     if (qt.kind === 'league') onlineLeagueStats.finished++;
     const publicResults = results.map((r) => ({ place: r.place, playerName: r.playerName, wonSeat: r.wonSeat, seats: r.seats }));
     // 2026-11-21 (Online League, owner) — a league night's frame adds kind:'league', the
@@ -31915,6 +31954,11 @@ httpServer.listen(PORT, async () => {
     } catch (err) {
       console.warn('[Rehydrate] fairness scan failed:', (err as Error)?.message);
     }
+
+    // 2026-11-26 (lobby-lists review fix, finding 1) — the kept finished rosters
+    // (who busted in each place, >= 24 h): last night's league / Sunday's weekly /
+    // a club or custom event's results survive this restart. Never throws.
+    await restoreFinishedStandingsFromRedis();
   }
 });
 

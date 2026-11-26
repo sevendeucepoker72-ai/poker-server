@@ -33,12 +33,13 @@ import { createHash } from 'crypto';
 import { TournamentManager } from '../src/game/TournamentManager';
 import {
   registrantNamesOf, REGISTRANT_NAMES_MAX, FinishedStandingsStore, FinishedStandingsRecord, FINISHED_STANDINGS_KEEP_MS,
-  FINISHED_STANDINGS_MAX, qualifierResultsPointer,
+  FINISHED_STANDINGS_MAX, qualifierResultsPointer, serializeFinishedStandings, parseFinishedStandings, keptCardOf,
+  keptFinishedItemOf, rosterHasAccount, FINISHED_STANDINGS_FORMAT, KEPT_CARD_FIELDS, FinishedStandingsPersistence,
 } from '../src/game/lobbyLists';
 import { publicNameOf } from '../src/social/publicIdentity';
 import {
   qualifierWindows, qualifierStatusOf, seatsForTopWith, qualifierStructure, QUALIFIER_BASE_STACK,
-  QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifierEventConfig,
+  QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifierEventConfig, seatsWonAt, leagueFinishFrameFields,
 } from '../src/game/qualifierSchedule';
 import { SRC, slice, fnSrc, handlerSrc, load } from './helpers/indexSource';
 
@@ -195,6 +196,244 @@ describe('qualifierResultsPointer — which finish order a qualifier card opens'
     expect(qualifierResultsPointer('W1', ev({ qualifierType: 'weekly' }), events, has)).toEqual({ resultsTournamentId: 'T-W0', resultsQualifierId: 'W0' });
     expect(qualifierResultsPointer('M1', ev({ qualifierType: 'monthly' }), events, has)).toEqual({ resultsTournamentId: null, resultsQualifierId: null });
   });
+
+  it('2026-11-26 (finding 1) keptLatest: used when the registry has no finished event of the type (after a restart) or only an older one; CONTROL: absent / throwing / unreadable = the rule above', () => {
+    const tonight = ev({ status: 'registering' });
+    const keptL = (type: string) => (type === 'online_league' ? { tournamentId: 'T-L1', qualifierId: 'L1', finishedAt: 200 } : null);
+    // A restart: the registry holds only tonight's card — the kept roster answers.
+    expect(qualifierResultsPointer('L9', tonight, [['L9', tonight]], has, keptL)).toEqual({ resultsTournamentId: 'T-L1', resultsQualifierId: 'L1' });
+    // Never another type's.
+    expect(qualifierResultsPointer('W1', ev({ qualifierType: 'weekly' }), [], has, keptL)).toEqual({ resultsTournamentId: null, resultsQualifierId: null });
+    // The registry's own finished event is newer → it wins; an older one → the kept roster wins.
+    expect(qualifierResultsPointer('L9', tonight, [['L0', ev({ status: 'finished', tournamentId: 'T-L0', finishedAt: 300 })]], has, keptL))
+      .toEqual({ resultsTournamentId: 'T-L0', resultsQualifierId: 'L0' });
+    expect(qualifierResultsPointer('L9', tonight, [['L0', ev({ status: 'finished', tournamentId: 'T-L0', finishedAt: 100 })]], has, keptL))
+      .toEqual({ resultsTournamentId: 'T-L1', resultsQualifierId: 'L1' });
+    // CONTROL: no keptLatest, a throwing one, or one whose roster is no longer readable.
+    const none = { resultsTournamentId: null, resultsQualifierId: null };
+    expect(qualifierResultsPointer('L9', tonight, [], has)).toEqual(none);
+    expect(qualifierResultsPointer('L9', tonight, [], has, () => { throw new Error('boom'); })).toEqual(none);
+    expect(qualifierResultsPointer('L9', tonight, [], has, () => ({ tournamentId: 'T-GONE', qualifierId: 'L3', finishedAt: 999 }))).toEqual(none);
+    // Running / finished cards still answer their OWN event only.
+    expect(qualifierResultsPointer('Q', ev({ status: 'running', tournamentId: 'T-RUN' }), [], has, keptL)).toEqual({ resultsTournamentId: 'T-RUN', resultsQualifierId: 'Q' });
+    expect(qualifierResultsPointer('Lx', ev({ status: 'finished', cancelled: true, tournamentId: 'T-RUN' }), [], has, keptL)).toEqual(none);
+  });
+});
+
+describe('2026-11-26 review fix (finding 1) — kept rosters survive a restart: persisted, read back, a qualifier\'s tagged', () => {
+  /** A fake persistence (what index.ts does with Redis): key -> text, + the TTLs asked for. */
+  function fakeRedis(opts: { answer?: unknown } = {}) {
+    const keys = new Map<string, string>();
+    const ttls: Array<[string, number]> = [];
+    const drops: string[] = [];
+    const p: FinishedStandingsPersistence = {
+      save: (r, ttlMs) => { keys.set(r.tournamentId, serializeFinishedStandings(r)); ttls.push([r.tournamentId, ttlMs]); return 'answer' in opts ? opts.answer : true; },
+      drop: (id) => { keys.delete(id); drops.push(id); return true; },
+    };
+    return { p, keys, ttls, drops, read: () => [...keys.values()].map((s) => parseFinishedStandings(s)) };
+  }
+
+  it('note writes the roster with the REST of the keep window as its TTL; a qualifier tag writes it again; an eviction deletes it; CONTROL: no persistence = memory only', () => {
+    const r = fakeRedis();
+    const s = new FinishedStandingsStore(10 * H, 3);
+    s.setPersistence(r.p);
+    s.note(rec('t1', 'tournament:t1', 1000), 1000 + H);
+    expect(r.ttls).toEqual([['t1', 9 * H]]);
+    expect(parseFinishedStandings(r.keys.get('t1'))).toMatchObject({ tournamentId: 't1', cardKey: 'tournament:t1' });
+    expect(s.tagQualifier('t1', { type: 'online_league', id: 'L0' }, 1000 + 2 * H)).toBe(true);
+    expect(r.ttls[1]).toEqual(['t1', 8 * H]);
+    expect(parseFinishedStandings(r.keys.get('t1'))!.qualifier).toEqual({ type: 'online_league', id: 'L0' });
+    expect(s.tagQualifier('nope', { type: 'weekly', id: 'W' })).toBe(false);
+    // The size bound (3): a 4th template roster pushes out the oldest non-latest — deleted there too.
+    for (const [id, at] of [['a', 2000], ['b', 3000], ['c', 4000]] as const) s.note(rec(id, 'template:Sit & Go', at), 5000);
+    expect(r.drops).toEqual(['a']);
+    expect(r.keys.has('a')).toBe(false);
+    expect(s.stats).toMatchObject({ persisted: 5, persistErrors: 0, evicted: 1 });
+    // CONTROL: without a persistence nothing is written and nothing throws.
+    const mem = new FinishedStandingsStore();
+    mem.note(rec('m1', 'tournament:m1', Date.now()));
+    expect(mem.stats).toMatchObject({ noted: 1, persisted: 0, persistErrors: 0 });
+  });
+
+  it('a persistence that throws or rejects never breaks a note (persistErrors counted); a save answering false (no Redis) is not counted as written', async () => {
+    const thrower = new FinishedStandingsStore();
+    thrower.setPersistence({ save: () => { throw new Error('redis down'); }, drop: () => { throw new Error('x'); } });
+    expect(() => thrower.note(rec('t1', 'tournament:t1', Date.now()))).not.toThrow();
+    expect(thrower.get('t1')).not.toBeNull();
+    const rejecter = new FinishedStandingsStore();
+    rejecter.setPersistence({ save: () => Promise.reject(new Error('READONLY')), drop: () => Promise.resolve(true) });
+    rejecter.note(rec('t2', 'tournament:t2', Date.now()));
+    const offline = new FinishedStandingsStore();
+    offline.setPersistence({ save: () => Promise.resolve(false), drop: () => Promise.resolve(false) });
+    offline.note(rec('t3', 'tournament:t3', Date.now()));
+    await Promise.resolve(); await Promise.resolve();
+    expect(thrower.stats).toMatchObject({ noted: 1, persisted: 0, persistErrors: 1 });
+    expect(rejecter.stats).toMatchObject({ noted: 1, persisted: 0, persistErrors: 1 });
+    expect(offline.stats).toMatchObject({ noted: 1, persisted: 0, persistErrors: 0 });
+  });
+
+  it('serialize -> parse round-trips a roster; CONTROL: malformed / another format / no id / no finish time → null; the card and the player fields are re-whitelisted', () => {
+    const full: FinishedStandingsRecord = {
+      ...rec('t1', 'tournament:t1', 1234), unlisted: true, accounts: [{ userId: 7 }, { masterUserId: 'm-8' }],
+      card: { buyIn: 100, payouts: [{ place: 1, amount: 900 }], isFreeroll: false }, qualifier: { type: 'weekly', id: 'W1' },
+    };
+    expect(parseFinishedStandings(serializeFinishedStandings(full))).toEqual(full);
+    expect(JSON.parse(serializeFinishedStandings(full)).v).toBe(FINISHED_STANDINGS_FORMAT);
+    // At rest: public names only (a phone typed as a name is "Player"; extra player fields never written).
+    const phoney = { ...full, players: [{ playerId: 'a', playerName: '3035551234', chipCount: 0, finishPosition: 1, phone: '3035551234' } as any] };
+    expect(serializeFinishedStandings(phoney)).not.toContain('3035551234');
+    expect(parseFinishedStandings(serializeFinishedStandings(phoney))!.players).toEqual([{ playerId: 'a', playerName: 'Player', chipCount: 0, finishPosition: 1 }]);
+    for (const bad of [
+      'not json', '', null, 42, '[]',
+      JSON.stringify({ ...full, v: FINISHED_STANDINGS_FORMAT + 1 }),
+      JSON.stringify({ ...full }),                                         // no version
+      JSON.stringify({ v: 1, ...full, tournamentId: '' }),
+      JSON.stringify({ v: 1, ...full, finishedAt: 'yesterday' }),
+      JSON.stringify({ v: 1, ...full, players: 'everyone' }),
+      JSON.stringify({ v: 1, ...full, players: [{ playerName: 'no id' }] }),
+    ]) expect(parseFinishedStandings(bad)).toBeNull();
+    const dirty = parseFinishedStandings(JSON.stringify({
+      v: 1, ...full,
+      players: [{ playerId: 'a', playerName: 'Ann', chipCount: 0, finishPosition: 1, phone: '3035551234', userId: 7 }, { playerId: 'b', playerName: 'Bob', chipCount: 'x', finishPosition: 0 }],
+      card: { buyIn: 100, name: '<b>x</b>', registered: true, entryId: 'E1', registrantNames: ['Ann'], payouts: [{ place: 1, amount: 900, who: 'Ann' }] },
+      accounts: [{ userId: 7.5 }, { masterUserId: 9 }, 'm-1', { userId: 3, masterUserId: 'm-3', phone: '3035551234' }],
+    }))!;
+    expect(dirty.players).toEqual([
+      { playerId: 'a', playerName: 'Ann', chipCount: 0, finishPosition: 1 },
+      { playerId: 'b', playerName: 'Bob', chipCount: 0, finishPosition: null },
+    ]);
+    expect(dirty.card).toEqual({ buyIn: 100, payouts: [{ place: 1, amount: 900 }] });
+    expect(dirty.accounts).toEqual([{ userId: 3, masterUserId: 'm-3' }]);
+  });
+
+  it('restore: the previous process\'s rosters come back inside the keep window only, never twice, never re-written; then the tag finds the newest of a type', () => {
+    const r = fakeRedis();
+    const before = new FinishedStandingsStore();
+    before.setPersistence(r.p);
+    const t0 = Date.now();
+    before.note(rec('L-old', 'tournament:L-old', t0 - 30 * H));            // past the keep window (its key would have expired)
+    before.note({ ...rec('L-0', 'tournament:L-0', t0 - 2 * H), qualifier: { type: 'online_league', id: 'Q-L0' } });
+    before.note({ ...rec('L-1', 'tournament:L-1', t0 - H), qualifier: { type: 'online_league', id: 'Q-L1' } });
+    before.note({ ...rec('W-0', 'tournament:W-0', t0 - 3 * H), qualifier: { type: 'weekly', id: 'Q-W0' } });
+    const writes = r.ttls.length;
+    // "The restart": a NEW store, read back from the persisted texts.
+    const after = new FinishedStandingsStore();
+    after.setPersistence(r.p);
+    expect(after.latestQualifier('online_league')).toBeNull();               // CONTROL: before the restore, nothing
+    const texts = [...r.keys.values()];
+    expect(after.restore([...texts.map((x) => parseFinishedStandings(x)), parseFinishedStandings(serializeFinishedStandings(rec('L-old', 'tournament:L-old', t0 - 30 * H))), null], t0)).toBe(3);
+    expect(after.restore(texts.map((x) => parseFinishedStandings(x)), t0)).toBe(0);   // never twice
+    expect(r.ttls.length).toBe(writes);                                       // never re-written
+    expect(after.stats).toMatchObject({ restored: 3, noted: 0 });
+    expect(after.get('L-old')).toBeNull();
+    expect(after.get('L-1')!.players.map((p) => [p.playerName, p.finishPosition])).toEqual([['Ann', 1], ['Bob', 2]]);
+    expect(after.latestQualifier('online_league')).toEqual({ tournamentId: 'L-1', qualifierId: 'Q-L1', finishedAt: t0 - H });
+    expect(after.latestQualifier('weekly')).toEqual({ tournamentId: 'W-0', qualifierId: 'Q-W0', finishedAt: t0 - 3 * H });
+    expect(after.latestQualifier('monthly')).toBeNull();
+  });
+});
+
+describe('2026-11-26 review fix (finding 1) — through the REAL redisStore (fake client): written with a TTL, read back by a NEW TournamentManager', () => {
+  /** A fake node-redis client: strings with EX, del, scanIterator (the calls redisStore makes). */
+  function fakeClient() {
+    const strings = new Map<string, string>();
+    const ex = new Map<string, number>();
+    const handlers: Record<string, (...a: any[]) => void> = {};
+    const client: any = {
+      on: (ev: string, fn: (...a: any[]) => void) => { handlers[ev] = fn; return client; },
+      connect: async () => { if (handlers.ready) handlers.ready(); },
+      set: async (k: string, v: string, o?: { EX?: number }) => { strings.set(k, v); if (o?.EX) ex.set(k, o.EX); return 'OK'; },
+      get: async (k: string) => strings.get(k) ?? null,
+      del: async (k: string) => { const had = strings.delete(k); ex.delete(k); return had ? 1 : 0; },
+      scanIterator: async function* scan(opts: { MATCH: string }) {
+        const pre = opts.MATCH.replace(/\*$/, '');
+        for (const k of [...strings.keys()]) if (k.startsWith(pre)) yield k;
+      },
+    };
+    return { client, strings, ex };
+  }
+  async function realRedisStore(connect = true) {
+    const fake = fakeClient();
+    let rs: any;
+    jest.isolateModules(() => {
+      jest.doMock('redis', () => ({ createClient: () => fake.client }));
+      rs = require('../src/redisStore');
+    });
+    if (connect) {
+      const prev = process.env.REDIS_URL;
+      process.env.REDIS_URL = 'redis://fake-for-test';
+      const quiet = jest.spyOn(console, 'log').mockImplementation(() => {});
+      try { expect(await rs.connectRedis()).toBe(true); } finally {
+        quiet.mockRestore();
+        if (prev === undefined) delete process.env.REDIS_URL; else process.env.REDIS_URL = prev;
+      }
+    }
+    return { rs, fake };
+  }
+
+  it('a finish is written under poker:finishedStandings:<id> with the rest of the 25 h as EX; a new process reads it back and answers the same standings; CONTROL: Redis-less = false / [] (memory only, nothing thrown)', async () => {
+    const { rs, fake } = await realRedisStore();
+    const persistence: FinishedStandingsPersistence = {
+      save: (r, ttlMs) => rs.saveFinishedStandings(r.tournamentId, serializeFinishedStandings(r), Math.ceil(ttlMs / 1000)),
+      drop: (id) => rs.deleteFinishedStandings(id),
+    };
+    const before = new TournamentManager();
+    before.setFinishedStandingsPersistence(persistence);
+    const tid = custom(before, 'Redis Cup');
+    for (const [pid, nm] of [['user-1', 'Ann'], ['user-2', 'Bob']]) before.registerPlayer(tid, pid, nm, `s-${pid}`, Number(pid.slice(5)));
+    before.startTournament(tid);
+    before.eliminatePlayer(tid, 'user-2');
+    await Promise.resolve(); await Promise.resolve();
+    const key = `poker:finishedStandings:${tid}`;
+    expect(fake.strings.has(key)).toBe(true);
+    expect(fake.ex.get(key)).toBe(Math.ceil(FINISHED_STANDINGS_KEEP_MS / 1000));
+    expect(before.finishedStandingsHealth()).toMatchObject({ persisted: 1, persistErrors: 0 });
+    // The new process: scan -> parse -> restore (index.ts restoreFinishedStandingsFromRedis).
+    const after = new TournamentManager();
+    const raws: string[] = await rs.scanFinishedStandings();
+    expect(raws).toHaveLength(1);
+    expect(after.restoreFinishedStandings(raws.map((x) => parseFinishedStandings(x)))).toBe(1);
+    expect(after.getTournamentStandings(tid, null)).toEqual(before.getTournamentStandings(tid, null));
+    expect(await rs.deleteFinishedStandings(tid)).toBe(true);
+    expect(fake.strings.has(key)).toBe(false);
+    // CONTROL: no REDIS_URL — every call is a quiet no-op.
+    const off = await realRedisStore(false);
+    expect(await off.rs.saveFinishedStandings('x', '{}', 60)).toBe(false);
+    expect(await off.rs.deleteFinishedStandings('x')).toBe(false);
+    expect(await off.rs.scanFinishedStandings()).toEqual([]);
+    expect(off.fake.strings.size).toBe(0);
+  });
+});
+
+describe('2026-11-26 review fix (finding 3) — the kept finished item: the card, public names, its own results; account keys never leave', () => {
+  it('keptFinishedItemOf: status finished, resultsTournamentId = itself, resultsKept, public names, the whitelisted card; never an account key / entrant id; rosterHasAccount = the entryOfAccount rule', () => {
+    const r: FinishedStandingsRecord = {
+      ...rec('t-club', 'tournament:t-club', 5000), unlisted: true,
+      players: [
+        { playerId: 'user-101', playerName: 'Ann', chipCount: 0, finishPosition: 2 },
+        { playerId: 'user-102', playerName: '3035551234', chipCount: 0, finishPosition: 1 },
+      ],
+      accounts: [{ userId: 101 }, { userId: 102, masterUserId: 'm-102' }],
+      card: { buyIn: 500, fundedPool: 1000, isFreeroll: false, maxPlayers: 9, payouts: [{ place: 1, amount: 625 }], blindLevelCount: 12 },
+    };
+    const it0 = keptFinishedItemOf(r, true);
+    expect(it0).toMatchObject({
+      tournamentId: 't-club', name: 't-club', status: 'finished', registered: true, entryId: null, registeredPlayers: 2,
+      registrantNames: ['Ann', 'Player'], resultsTournamentId: 't-club', resultsKept: true, finishedAt: 5000,
+      buyIn: 500, fundedPool: 1000, isFreeroll: false, maxPlayers: 9, payouts: [{ place: 1, amount: 625 }], currentBlinds: null, paused: false,
+    });
+    const json = JSON.stringify(it0);
+    for (const leak of ['user-101', 'user-102', 'm-102', '3035551234', '"accounts"', '"unlisted"', '"players"']) expect(json).not.toContain(leak);
+    expect(keptFinishedItemOf(r, false).registered).toBe(false);
+    expect(rosterHasAccount(r, { userId: 101 })).toBe(true);
+    expect(rosterHasAccount(r, { masterUserId: 'm-102' })).toBe(true);
+    expect(rosterHasAccount(r, { userId: 999, masterUserId: 'm-999' })).toBe(false);
+    expect(rosterHasAccount(r, null)).toBe(false);
+    expect(rosterHasAccount({ ...r, accounts: undefined }, { userId: 101 })).toBe(false);
+    // keptCardOf: only the whitelisted viewer-independent fields.
+    expect(Object.keys(keptCardOf({ registered: true, entryId: 'E', registrantNames: ['A'], name: 'x', buyIn: 1, minPlayers: 2 })).sort()).toEqual(['buyIn', 'minPlayers']);
+    for (const k of KEPT_CARD_FIELDS) expect(['registered', 'entryId', 'registrantNames', 'tournamentId', 'name']).not.toContain(k);
+  });
 });
 
 // ═════════════════════════════════════════════ the REAL TournamentManager
@@ -275,7 +514,9 @@ describe('TournamentManager — getTournamentStandings for a FINISHED tournament
     expect(item(tm, tid).resultsTournamentId).toBe(tid);
     expect(tm.pruneEndedTournaments(Date.now() + H + 1)).toEqual([tid]);
     expect(tm.getTournament(tid)).toBeUndefined();
-    expect(item(tm, tid)).toBeUndefined();               // the card leaves the list as before (1 h)
+    // 2026-11-26 review fix (finding 3) — the card STAYS listed from the kept roster
+    // (it used to leave the list here, an hour after the finish).
+    expect(item(tm, tid)).toMatchObject({ status: 'finished', resultsKept: true, resultsTournamentId: tid });
     const kept = tm.getTournamentStandings(tid, null)!;
     expect(kept).toEqual(live);
     expect(tm.hasStandings(tid)).toBe(true);
@@ -321,6 +562,16 @@ describe('TournamentManager — getTournamentStandings for a FINISHED tournament
     jest.advanceTimersByTime(10_000);                      // finishTournament's re-creation drops the record
     expect(tm.getTournament(tid)).toBeUndefined();
     expect(item(tm, next).resultsTournamentId).toBe(tid);
+    // 2026-11-26 review fix (finding 2) — the CLIENT CONTRACT (poker-3d
+    // src/utils/tournamentLists.js tournamentResultsTournamentId +
+    // resultsButtonLabel): the finished card is GONE from the list (no kept item for
+    // a template roster), so the registering card's `resultsTournamentId` — a string
+    // that is NOT its own tournamentId — is the only way to the results ("Last
+    // results"). A rename of this field breaks that button: keep the name.
+    expect(item(tm, tid)).toBeUndefined();
+    expect(typeof item(tm, next).resultsTournamentId).toBe('string');
+    expect(item(tm, next).resultsTournamentId).not.toBe(item(tm, next).tournamentId);
+    expect((tm.getTournamentList() as any[]).filter((x) => x.resultsKept)).toEqual([]);
     expect(tm.getTournamentStandings(tid, null)).toEqual(live);
     expect(placesOf(live)).toEqual(Object.fromEntries(Array.from({ length: 9 }, (_, i) => [`user-${i}`, i + 1])));
   });
@@ -380,6 +631,95 @@ describe('TournamentManager — getTournamentStandings for a FINISHED tournament
     expect(done.players).toHaveLength(3);
     expect(placesOf(done)).toEqual({ a: 2, b: 3, c: 1 });
     expect(done.eliminationOrder).toEqual(['b', 'a']);
+  });
+});
+
+describe('2026-11-26 review fix (finding 3) — a finished custom / club event stays LISTED for the keep window (>= 24 h), not 1 h', () => {
+  /** Plays a 3-entrant event to the end: 103 busts 3rd, 102 2nd, 101 wins. */
+  function play(tm: TournamentManager, tid: string, masters: Array<string | undefined> = []) {
+    const field: Array<[string, string, number]> = [['user-101', 'Ann', 101], ['user-102', 'Bob', 102], ['user-103', '3035551234', 103]];
+    field.forEach(([pid, nm, uid], i) => expect(tm.registerPlayer(tid, pid, nm, `s-${pid}`, masters[i] ? undefined : uid, masters[i]).success).toBe(true));
+    tm.startTournament(tid);
+    tm.eliminatePlayer(tid, 'user-103');
+    tm.eliminatePlayer(tid, 'user-102');
+    expect(tm.getTournament(tid)!.status).toBe('finished');
+  }
+  const itemsOf = (tm: TournamentManager, tid: string, viewer: any = null) => (tm.getTournamentList(viewer) as any[]).filter((x) => x.tournamentId === tid);
+
+  it('custom: one live item, then (record dropped at 1 h) ONE kept finished item with the same card, public names and its own results — 24 h on still listed; CONTROL: past the keep window gone', () => {
+    const tm = new TournamentManager();
+    const t0 = Date.now();
+    const tid = custom(tm, 'Friday Cup', 9, { prizePool: 900 });
+    play(tm, tid);
+    const live = itemsOf(tm, tid);
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ status: 'finished', resultsTournamentId: tid });
+    expect(live[0]).not.toHaveProperty('resultsKept');
+    expect(tm.pruneEndedTournaments(t0 + H + 1)).toEqual([tid]);
+    const kept = itemsOf(tm, tid);
+    expect(kept).toHaveLength(1);
+    expect(kept[0]).toMatchObject({
+      status: 'finished', resultsKept: true, resultsTournamentId: tid, name: 'Friday Cup', registeredPlayers: 3,
+      registrantNames: ['Ann', 'Bob', 'Player'], buyIn: live[0].buyIn, prizePool: 900, fundedPool: live[0].fundedPool,
+      isFreeroll: true, maxPlayers: 9, payouts: live[0].payouts, blindStructure: live[0].blindStructure, registered: false, entryId: null,
+    });
+    expect(itemsOf(tm, tid, { userId: 101 })[0].registered).toBe(true);
+    expect(JSON.stringify(kept[0])).not.toMatch(/user-10|3035551234|"accounts"/);
+    expect(tm.getTournamentStandings(kept[0].resultsTournamentId, null)).toMatchObject({ status: 'finished', tournamentId: tid });
+    jest.setSystemTime(t0 + 24 * H);
+    expect(itemsOf(tm, tid)).toHaveLength(1);
+    jest.setSystemTime(t0 + FINISHED_STANDINGS_KEEP_MS + 1);
+    expect(itemsOf(tm, tid)).toEqual([]);                    // CONTROL: the keep window ended
+  });
+
+  it('a CLUB (unlisted) finished event: the kept item reaches ONLY its own entrants (local id or master id), never anyone else — names included', () => {
+    const tm = new TournamentManager();
+    const tid = custom(tm, '[Aces] Club Night', 9, { unlisted: true });
+    play(tm, tid, [undefined, undefined, 'm-103']);          // the 3rd entrant by master id only
+    tm.pruneEndedTournaments(Date.now() + H + 1);
+    expect(tm.getTournament(tid)).toBeUndefined();
+    expect(itemsOf(tm, tid, null)).toEqual([]);
+    expect(itemsOf(tm, tid, { userId: 999, masterUserId: 'm-999' })).toEqual([]);
+    expect(JSON.stringify(tm.getTournamentList({ userId: 999 }))).not.toMatch(/Club Night|"Ann"|"Bob"/);
+    expect(itemsOf(tm, tid, { userId: 101 })[0]).toMatchObject({ registered: true, resultsKept: true, registrantNames: ['Ann', 'Bob', 'Player'] });
+    expect(itemsOf(tm, tid, { masterUserId: 'm-103' })[0]).toMatchObject({ registered: true, resultsKept: true });
+  });
+
+  it('…and after a RESTART: the persisted roster brings the club item back for its own entrants only (the account keys travel server-side, never in an item)', () => {
+    const redis = new Map<string, string>();
+    const before = new TournamentManager();
+    before.setFinishedStandingsPersistence({ save: (r) => { redis.set(r.tournamentId, serializeFinishedStandings(r)); return true; }, drop: (id) => redis.delete(id) });
+    const tid = custom(before, '[Aces] Club Night', 9, { unlisted: true });
+    play(before, tid, [undefined, undefined, 'm-103']);
+    expect(redis.has(tid)).toBe(true);
+    const after = new TournamentManager();                     // the new process
+    expect(itemsOf(after, tid, { userId: 101 })).toEqual([]); // CONTROL: nothing before the restore
+    expect(after.restoreFinishedStandings([...redis.values()].map((x) => parseFinishedStandings(x)))).toBe(1);
+    expect(itemsOf(after, tid, null)).toEqual([]);
+    expect(itemsOf(after, tid, { userId: 102 })[0]).toMatchObject({ status: 'finished', resultsKept: true, registered: true, name: '[Aces] Club Night' });
+    expect(itemsOf(after, tid, { masterUserId: 'm-103' })).toHaveLength(1);
+    // The same standings, names as players see them (Redis holds public names only: the phone-like one is "Player").
+    const live = before.getTournamentStandings(tid, null)!;
+    expect(after.getTournamentStandings(tid, null)).toEqual({ ...live, players: live.players.map((p) => ({ ...p, playerName: publicNameOf(p.playerName) })) });
+    expect(JSON.stringify([...redis.values()])).not.toContain('3035551234');
+    expect(placesOf(after.getTournamentStandings(tid, null))).toEqual({ 'user-101': 1, 'user-102': 2, 'user-103': 3 });
+    expect(after.finishedStandingsHealth()).toMatchObject({ restored: 1, kept: 1 });
+  });
+
+  it('CONTROL: a QUALIFIER\'s roster (tagged by markQualifierFinished) is NOT a tournament-lobby item (the qualifier lobby is its home); untagged, the same roster would be', () => {
+    const tm = new TournamentManager();
+    const q = custom(tm, 'Online League', 999);
+    const c = custom(tm, 'Plain Cup', 9);
+    play(tm, q);
+    for (const [pid, nm] of [['x1', 'Xi'], ['x2', 'Yu']]) tm.registerPlayer(c, pid, nm, `s-${pid}`);
+    tm.startTournament(c);
+    tm.eliminatePlayer(c, 'x2');
+    expect(tm.tagFinishedStandingsQualifier(q, { type: 'online_league', id: 'L0' })).toBe(true);
+    tm.pruneEndedTournaments(Date.now() + H + 1);
+    expect(itemsOf(tm, q)).toEqual([]);
+    expect(itemsOf(tm, c)).toHaveLength(1);
+    expect(tm.getTournamentStandings(q, null)).toMatchObject({ status: 'finished' });   // still openable by id (the qualifier card's pointer)
+    expect(tm.latestQualifierResults('online_league')).toMatchObject({ tournamentId: q, qualifierId: 'L0' });
   });
 });
 
@@ -531,6 +871,50 @@ describe('index.ts (REAL) — the qualifier lobby list: registrantNames + the re
     expect(w.standings({ tournamentId: lastNight })).toBeNull();
   });
 
+  it('2026-11-26 (finding 1) — a RESTART: last night\'s league results (tagged by the REAL markQualifierFinished, persisted) still open from tonight\'s card and by id; CONTROL: without the read-back nothing (the bug)', async () => {
+    // The OLD process: the night is played and finished through the REAL markQualifierFinished.
+    const redis = new Map<string, string>();
+    const a = qualWorld();
+    a.tm.setFinishedStandingsPersistence({ save: (r) => { redis.set(r.tournamentId, serializeFinishedStandings(r)); return true; }, drop: (id) => redis.delete(id) });
+    const lastNight = a.playQualifier([['user-11', 'Wanda'], ['user-12', '3035551234'], ['user-13', 'Redbeard']]);
+    const now = Date.now();
+    a.qualifierTournaments.set('L0', a.qt({ qualifierType: 'online_league', qualifierName: 'Online League', kind: 'league', status: 'running', tournamentId: lastNight,
+      scheduledAt: new Date(now - 4 * H).toISOString(), players: [a.reg('user-11', 'm-11', 'Wanda'), a.reg('user-12', 'm-12', '3035551234'), a.reg('user-13', 'm-13', 'Redbeard')] }));
+    const markScope: Record<string, unknown> = {
+      qualifierTournaments: a.qualifierTournaments, tournamentManager: a.tm, seatsForTopWith, seatsWonAt, publicNameOf, leagueFinishFrameFields,
+      onlineLeagueStats: { finished: 0 }, socketsOfMaster: () => [], io: { emit() {} },
+    };
+    const marked = load(fnSrc('function markQualifierFinished('), markScope, '{ markQualifierFinished }');
+    marked.exports.markQualifierFinished(lastNight, { results: [
+      { playerId: 'user-11', playerName: 'Wanda', position: 1 }, { playerId: 'user-12', playerName: '3035551234', position: 2 }, { playerId: 'user-13', playerName: 'Redbeard', position: 3 },
+    ] });
+    expect([...marked.stubbed]).toEqual([]);
+    expect(a.qualifierTournaments.get('L0')).toMatchObject({ status: 'finished' });
+    expect(parseFinishedStandings(redis.get(lastNight))!.qualifier).toEqual({ type: 'online_league', id: 'L0' });   // re-written WITH the mark
+    const before = a.standings({ tournamentId: lastNight });
+    expect(before).toMatchObject({ status: 'finished' });
+
+    // The NEW process: its registry holds only tonight's card (the sync never re-opens a night past 7:00 PM).
+    const b = qualWorld();
+    b.qualifierTournaments.set('L1', b.qt({ qualifierType: 'online_league', qualifierName: 'Online League', kind: 'league', status: 'registering', scheduledAt: new Date(now + 20 * H).toISOString() }));
+    let [l1] = await b.socketList(['league']);
+    expect(l1).toMatchObject({ qualifierId: 'L1', resultsTournamentId: null, resultsQualifierId: null });   // CONTROL: the reported bug
+    expect(b.standings({ tournamentId: lastNight })).toBeNull();
+    // The boot read-back (index.ts restoreFinishedStandingsFromRedis: scan -> parse -> restore).
+    expect(b.tm.restoreFinishedStandings([...redis.values()].map((x) => parseFinishedStandings(x)))).toBe(1);
+    [l1] = await b.socketList(['league']);
+    expect(l1).toMatchObject({ qualifierId: 'L1', resultsTournamentId: lastNight, resultsQualifierId: 'L0' });
+    expect(b.standings({ tournamentId: lastNight })).toEqual(before);
+    expect(b.rest('/api/qualifier-tournaments', {}, { kinds: 'league' }).tournaments[0]).toMatchObject({ qualifierId: 'L1', resultsTournamentId: lastNight, resultsQualifierId: 'L0' });
+    // Its home is the qualifier lobby: the tournament lobby does not list it.
+    expect((b.tm.getTournamentList() as any[]).some((x) => x.tournamentId === lastNight)).toBe(false);
+    // 25 h on, gone (CONTROL: bounded like everything kept).
+    jest.setSystemTime(now + FINISHED_STANDINGS_KEEP_MS + 1);
+    [l1] = await b.socketList(['league']);
+    expect(l1).toMatchObject({ resultsTournamentId: null, resultsQualifierId: null });
+    expect([...b.stubbed]).toEqual([]);
+  });
+
   it('CONTROL — getTournamentStandings with NO id still answers a RUNNING tournament only (never a finished one)', () => {
     const w = qualWorld();
     const done = w.playQualifier([['user-1', 'Ann'], ['user-2', 'Bob']]);
@@ -558,9 +942,32 @@ describe('wiring: the socket list asks for names, REST does not; the update broa
     expect(SRC).toContain("lobbyLists: healthSection('r2Play.lobbyLists', () => ({ ...tournamentManager.finishedStandingsHealth() })),");
   });
 
+  it('2026-11-26 (finding 1) — boot: the kept rosters are written to Redis from the first finish and read back in the Redis rehydrate block; the qualifier finish tags its roster', () => {
+    expect(SRC).toContain('tournamentManager.setFinishedStandingsPersistence(finishedStandingsRedisPersistence);');
+    expect(SRC.indexOf('tournamentManager.setFinishedStandingsPersistence(')).toBeLessThan(SRC.indexOf("io.on('connection'"));
+    const persistence = slice('const finishedStandingsRedisPersistence: FinishedStandingsPersistence = {', '\n};\n');
+    expect(persistence).toContain('saveFinishedStandings(rec.tournamentId, serializeFinishedStandings(rec), Math.ceil(ttlMs / 1000))');
+    expect(persistence).toContain('deleteFinishedStandings(tournamentId)');
+    const restore = fnSrc('async function restoreFinishedStandingsFromRedis(');
+    expect(restore).toContain('parseFinishedStandings(raw)');
+    expect(restore).toContain('tournamentManager.restoreFinishedStandings(recs)');
+    // Inside the `if (redisConnected)` block, after the fairness read-back.
+    const boot = slice('const redisConnected = await connectHandStore();', '\n});\n');
+    expect(boot).toContain('await restoreFinishedStandingsFromRedis();');
+    expect(boot.indexOf('await restoreFinishedStandingsFromRedis();')).toBeGreaterThan(boot.indexOf('scanFairnessBuffers()'));
+    expect(fnSrc('function markQualifierFinished(')).toContain('tournamentManager.tagFinishedStandingsQualifier?.(tournamentId, { type: qt.qualifierType, id: qualId })');
+    expect(fnSrc('function qualifierLobbyListFields(')).toContain('tournamentManager.latestQualifierResults?.(type, now)');
+    // The Redis helpers: one key per roster, a TTL on every write.
+    const redisSrc = fs.readFileSync(path.join(__dirname, '..', 'src', 'redisStore.ts'), 'utf8');
+    expect(redisSrc).toContain("const FINISHED_STANDINGS_KEY_PREFIX = 'poker:finishedStandings:';");
+    expect(redisSrc).toContain('await client.set(FINISHED_STANDINGS_KEY_PREFIX + tournamentId, json, { EX: ttl });');
+  });
+
   it('canonical-features.txt locks the lobby-list tokens', () => {
     const manifest = fs.readFileSync(path.join(__dirname, '..', 'canonical-features.txt'), 'utf8').split('\n').map((l) => l.trim());
-    for (const tok of ['registrantNames:', 'resultsTournamentId:', 'resultsQualifierId', 'function registrantNamesOf(', 'function qualifierResultsPointer(', 'finished_standings_note_failed', 'function qualifierLobbyListFields(', 'r2Play.lobbyLists']) {
+    for (const tok of ['registrantNames:', 'resultsTournamentId:', 'resultsQualifierId', 'function registrantNamesOf(', 'function qualifierResultsPointer(', 'finished_standings_note_failed', 'function qualifierLobbyListFields(', 'r2Play.lobbyLists',
+      // 2026-11-26 review fixes (finding 1: restart; finding 3: finished custom / club events stay listed).
+      'finished_standings_restored', 'poker:finishedStandings:', 'tagFinishedStandingsQualifier', 'resultsKept: true']) {
       expect({ tok, listed: manifest.includes(tok) }).toEqual({ tok, listed: true });
     }
   });
