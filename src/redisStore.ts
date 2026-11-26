@@ -304,3 +304,50 @@ export async function scanFairnessBuffers(): Promise<Array<{ tableId: string; en
   }
   return results;
 }
+
+// ── 2026-11-26 lobby-lists review fix (finding 1) — kept finished tournament
+// rosters (src/game/lobbyLists.ts FinishedStandingsStore) survive a restart.
+// One STRING per tournament (`poker:finishedStandings:<tournamentId>`, the
+// serialized roster: public names, places, the card, the qualifier tag and the
+// entrants' account keys — read only by this server, never served raw), TTL =
+// what is left of the 25 h keep window, so nothing outlives it. index.ts reads
+// them back at boot (scanFinishedStandings -> parseFinishedStandings ->
+// tournamentManager.restoreFinishedStandings). Redis-less: no-op (memory only).
+
+const FINISHED_STANDINGS_KEY_PREFIX = 'poker:finishedStandings:';
+/** At most this many kept rosters are read back at boot (the store keeps at most 200; the rest of a flood just expires). */
+export const FINISHED_STANDINGS_SCAN_MAX = 1000;
+
+/** Write one kept roster for `ttlSeconds`. Resolves true when written, false when Redis is not configured / ready; REJECTS on a Redis error (the store counts it). */
+export async function saveFinishedStandings(tournamentId: string, json: string, ttlSeconds: number): Promise<boolean> {
+  if (!isRedisReady() || !client) return false;
+  const ttl = Math.max(1, Math.ceil(Number(ttlSeconds) || 0));
+  await client.set(FINISHED_STANDINGS_KEY_PREFIX + tournamentId, json, { EX: ttl });
+  return true;
+}
+
+/** Remove one kept roster (the store's size bound pushed it out). Resolves false without Redis; rejects on a Redis error. */
+export async function deleteFinishedStandings(tournamentId: string): Promise<boolean> {
+  if (!isRedisReady() || !client) return false;
+  await client.del(FINISHED_STANDINGS_KEY_PREFIX + tournamentId);
+  return true;
+}
+
+/** Every kept roster's text (at most FINISHED_STANDINGS_SCAN_MAX), for the boot restore. [] without Redis or on an error (logged). */
+export async function scanFinishedStandings(): Promise<string[]> {
+  if (!isRedisReady() || !client) return [];
+  const out: string[] = [];
+  try {
+    for await (const key of client.scanIterator({ MATCH: FINISHED_STANDINGS_KEY_PREFIX + '*', COUNT: 100 })) {
+      const keys = Array.isArray(key) ? key : [key];
+      for (const k of keys) {
+        if (out.length >= FINISHED_STANDINGS_SCAN_MAX) return out;
+        const v = await client.get(k as string);
+        if (typeof v === 'string' && v) out.push(v);
+      }
+    }
+  } catch (err) {
+    console.warn('[redisStore] scanFinishedStandings failed:', (err as Error)?.message);
+  }
+  return out;
+}

@@ -27,6 +27,7 @@ import {
 } from '../src/game/qualifierSchedule';
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart } from '../src/game/qualifierNoShow';
 import { SRC, slice, fnSrc, handlerSrc, load, flush, deferred } from './helpers/indexSource';
+import { registrantNamesOf, qualifierResultsPointer } from '../src/game/lobbyLists';
 // Review fix-up (ff9a1cb) — the runtime overflow cap's X-Internal-Token check.
 import { createHash, timingSafeEqual } from 'crypto';
 // 2026-10-24 (owner 2026-10-23: "Fix both") — the seat-bubble close. require (not import): on
@@ -101,6 +102,8 @@ const CODE = [
   fnSrc('function qualifierEventFor('),
   fnSrc('function qualifierListItem('),
   fnSrc('function qualifierList('),
+  // 2026-11-25 (owner: lobby lists) — registrantNames / resultsTournamentId (lobbyLists.ts).
+  fnSrc('function qualifierLobbyListFields('),
   fnSrc('function releaseQualifierRegistration('),
   fnSrc('function socketsOfMaster('),
   slice('/** R2 (TOURNEY-9) — the answer when a qualifier seat would take over', '\n  return null;\n}\n'),
@@ -249,6 +252,8 @@ function world(opts: {
     qualifierWindows, qualifierStatusOf, seatsForTopOf, seatsForTopWith, seatsWonAt, qualifierStructure, QUALIFIER_BASE_STACK,
     // 2026-11-21 (Online League) — the event config + the finish frames' league fields (the REAL pure module).
     qualifierEventConfig: QS.qualifierEventConfig, leagueFinishFrameFields: QS.leagueFinishFrameFields,
+    // 2026-11-25 (owner: lobby lists) — the REAL pure helpers qualifierLobbyListFields reads.
+    registrantNamesOf, qualifierResultsPointer,
     QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers,
     samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart,
     assertPlayable: async () => null,
@@ -483,7 +488,11 @@ describe('registerQualifierTournament — only listed events, the master account
     await b.handlers.getQualifierTournaments();
     expect(w.of('SA', 'qualifierTournamentList')[0][0]).toMatchObject({ registered: true, players: 1 });
     expect(w.of('SB', 'qualifierTournamentList')[0][0]).toMatchObject({ registered: false, players: 1 });
-    expect(JSON.stringify(w.of('SB', 'qualifierTournamentList'))).not.toMatch(/Alice|alice|m-alice/);
+    // 2026-11-25 (owner: "see who is registered in the lobby") — the lobby list now names
+    // the field by PUBLIC name (registrantNames); never her login ('alice.x'), master id
+    // or entrant id (was: no name at all, R2 C3).
+    expect(w.of('SB', 'qualifierTournamentList')[0][0].registrantNames).toEqual(['Alice']);
+    expect(JSON.stringify(w.of('SB', 'qualifierTournamentList'))).not.toMatch(/alice\.x|m-alice|user-101/);
   });
 });
 
@@ -2247,6 +2256,8 @@ const S4_CODE = [
   fnSrc('function qualifierEventFor('),
   fnSrc('function qualifierListItem('),
   fnSrc('function qualifierList('),
+  // 2026-11-25 (owner: lobby lists) — registrantNames / resultsTournamentId (lobbyLists.ts).
+  fnSrc('function qualifierLobbyListFields('),
   fnSrc('function releaseQualifierRegistration('),
   fnSrc('function socketsOfMaster('),
   slice('/** R2 (TOURNEY-9) — the answer when a qualifier seat would take over', '\n  return null;\n}\n'),
@@ -2373,6 +2384,8 @@ function earlyRoomsWorld(opts: {
     qualifierWindows, qualifierStatusOf, seatsForTopOf, seatsForTopWith, seatsWonAt, qualifierStructure, QUALIFIER_BASE_STACK,
     // 2026-11-21 (Online League) — the event config + the finish frames' league fields (the REAL pure module).
     qualifierEventConfig: QS.qualifierEventConfig, leagueFinishFrameFields: QS.leagueFinishFrameFields,
+    // 2026-11-25 (owner: lobby lists) — the REAL pure helpers qualifierLobbyListFields reads.
+    registrantNamesOf, qualifierResultsPointer,
     QUALIFIER_MAX_REENTRIES, qualifierReEntriesLeft, qualifiedPlayers: new Map(),
     samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart,
     qualifierBlindLevels, qualifierBreakConfig: s4BreakConfig, qualifierTestTimeScale: s4TimeScale,

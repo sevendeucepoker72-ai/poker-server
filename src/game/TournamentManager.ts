@@ -1,4 +1,8 @@
 import { v4 as uuidv4 } from 'uuid';
+import {
+  FinishedStandingsStore, FinishedStandingsRecord, FinishedStandingsPersistence, registrantNamesOf, keptCardOf,
+  keptFinishedItemOf, rosterHasAccount, standingsPlaceOf, qualifierCardKey, StandingsRow,
+} from './lobbyLists';
 
 export interface BlindLevel {
   sb: number;
@@ -45,6 +49,14 @@ export interface TournamentConfig {
    * qualifier event never is, whatever its name.
    */
   fromTemplate?: boolean;
+  /**
+   * 2026-11-26 (lobby-lists review fix, finding 5) — the qualifier event type
+   * this engine tournament plays ('weekly', 'monthly', 'online_league', …):
+   * set only by index.ts startQualifierTournament. Its finished roster's card
+   * is then `qualifier:<type>` (lobbyLists.qualifierCardKey), which the kept
+   * rosters' size bound evicts LAST. Nothing else reads it.
+   */
+  qualifierType?: string;
 }
 
 /** S3 — the break schedule: `seconds` of break after every `everyLevels`-th level. */
@@ -314,6 +326,8 @@ export interface TournamentTemplate {
   unlisted?: boolean;
   /** S3 (2026-10-23) — see TournamentConfig.breaks (qualifiers only). */
   breaks?: TournamentBreaks;
+  /** 2026-11-26 (finding 5) — see TournamentConfig.qualifierType (qualifier engine tournaments only). */
+  qualifierType?: string;
 }
 
 /**
@@ -500,6 +514,15 @@ export class TournamentManager {
    * consumed, so this is the second lock).
    */
   readonly lateEntryBubbleStats = { closed: 0, resolverErrors: 0, lockRefusals: 0 };
+  /**
+   * 2026-11-25 (owner: "a list for it to show who busted in each position") —
+   * every FINISHED tournament's roster, kept >= 24 h after its finish
+   * (src/game/lobbyLists.ts; bounded). getTournamentStandings answers from it
+   * once this record is dropped (a template 10 s after its finish, any other an
+   * hour after), and the lobby items' resultsTournamentId points into it.
+   * Health r2Play.lobbyLists (finishedStandingsHealth).
+   */
+  private readonly finishedStandings = new FinishedStandingsStore();
 
   constructor() {
     this.createTemplateTournaments();
@@ -528,6 +551,8 @@ export class TournamentManager {
       ...(template.unlisted ? { unlisted: true } : {}),
       ...(template.breaks ? { breaks: { everyLevels: template.breaks.everyLevels, seconds: template.breaks.seconds } } : {}),
       ...(opts?.fromTemplate ? { fromTemplate: true } : {}),   // F9
+      // 2026-11-26 (lobby-lists finding 5) — a qualifier / league engine tournament's type (its results card).
+      ...(typeof template.qualifierType === 'string' && template.qualifierType ? { qualifierType: template.qualifierType } : {}),
     };
 
     const now = Date.now();
@@ -609,6 +634,8 @@ export class TournamentManager {
       this.dropTournament(id);
       dropped.push(id);
     }
+    // 2026-11-25 — kept finished rosters past their 24 h+ window go too (the 10 s sweep calls this).
+    this.finishedStandings.prune(now);
     return dropped;
   }
 
@@ -635,6 +662,16 @@ export class TournamentManager {
    * item carries `registered` (an entry of THIS account — by local userId or
    * master id) and `entryId` (that entry's id, else null). Without a viewer
    * both are false / null. `minPlayers` = the start threshold.
+   *
+   * 2026-11-26 review fix (finding 3) — then, newest first, a 'finished' item
+   * (lobbyLists.keptFinishedItemOf: the card at the finish, resultsKept: true)
+   * for every KEPT roster of a custom / club / other non-template,
+   * non-qualifier event whose live record was already dropped (an hour after
+   * its finish), for the rest of the keep window (>= 24 h): its results stay
+   * openable from the lobby. A club (unlisted) one reaches only its own
+   * entrants (rosterHasAccount — the entryOfAccount rule on the kept account
+   * keys). A template's roster is reached from its registering card
+   * (resultsTournamentId); a qualifier's from the qualifier lobby.
    */
   getTournamentList(viewer?: { userId?: number; masterUserId?: string | null } | null): object[] {
     const list: object[] = [];
@@ -642,9 +679,22 @@ export class TournamentManager {
       if (t.status === 'cancelled') continue; // don't surface cancelled tournaments
       const mine = viewer ? this.entryOfAccount(id, viewer) : undefined;
       if (t.config.unlisted && !mine) continue;   // R2 — a club tournament: its own entrants only
+      list.push(this.listItemOf(id, t, mine));
+    }
+    for (const rec of this.finishedStandings.listable()) {
+      if (this.tournaments.has(rec.tournamentId)) continue;   // still live: listed above
+      const mine = viewer ? rosterHasAccount(rec, viewer) : false;
+      if (rec.unlisted && !mine) continue;                     // a club event: its own entrants only
+      list.push(keptFinishedItemOf(rec, mine));
+    }
+    return list;
+  }
+
+  /** One lobby item (getTournamentList; the same fields since R2 — 2026-11-26 moved here so a finish can keep its card). */
+  private listItemOf(id: string, t: Tournament, mine: TournamentPlayer | undefined): Record<string, unknown> {
       const currentBlinds = t.config.blindLevels[t.currentBlindLevel] || t.config.blindLevels[0];
       const isFreeroll = (t.config.buyIn || 0) === 0;
-      list.push({
+      return {
         registered: !!mine,
         entryId: mine?.entryId ?? null,
         minPlayers: this.startThreshold(t),
@@ -689,13 +739,24 @@ export class TournamentManager {
         // tournament's fairness seeds until it ends (index.ts fairnessSeedHoldOf) and
         // keeps every hand of it 7 days. Absent on an older server.
         seedsHeldUntilEnd: true,
+        // 2026-11-25 (owner: "see who is registered in the lobby") — additive:
+        // registrantNames = the PUBLIC names of the field in registration order
+        // (lobbyLists.registrantNamesOf: publicNameOf, each entry once, at most
+        // REGISTRANT_NAMES_MAX — registeredPlayers is the full count; never an id,
+        // a login or a phone). Only on items this viewer sees (a club tournament:
+        // its own entrants, above).
+        registrantNames: registrantNamesOf(t.players.map((p) => ({ key: p.playerId, name: p.playerName }))),
+        // 2026-11-25 (owner: "a list ... who busted in each position") — additive:
+        // the tournament whose finish order this card opens (socket
+        // getTournamentStandings {tournamentId}): its own while running / finished,
+        // else the latest finished instance of the same template still kept
+        // (>= 24 h), else null.
+        resultsTournamentId: this.resultsTournamentIdOf(id, t),
         // F21 (2026-10-24) — the structure, for the lobby card / detail (additive):
         // the starting stack, the one level length in seconds (null when the
         // levels differ) and every level.
         ...this.structureOf(t),
-      });
-    }
-    return list;
+      };
   }
 
   /**
@@ -739,6 +800,135 @@ export class TournamentManager {
     if (!p || !p.eliminated || !(p.finishPosition > 0) || p.tieGroup !== undefined || p.disqualified) return null;
     const row = this.payoutTableOf(t).payouts.find((x) => x.place === p.finishPosition);
     return row && row.amount > 0 ? row.amount : null;
+  }
+
+  /**
+   * 2026-11-25 — the card a finished roster belongs to: its template, else the
+   * tournament itself. 2026-11-26 (finding 5) — a qualifier / league engine
+   * tournament (config.qualifierType): `qualifier:<type>`, evicted last by the
+   * kept rosters' size bound (lobbyLists.evictionRankOf).
+   */
+  private standingsCardKeyOf(tournamentId: string, t: Tournament): string {
+    if (t.config.qualifierType) return qualifierCardKey(t.config.qualifierType);
+    return t.config.fromTemplate ? `template:${t.config.name}` : `tournament:${tournamentId}`;
+  }
+
+  /**
+   * 2026-11-26 (lobby-lists review fix, finding 4) — the entrants who TIE
+   * (TDA): once finished, the stored finalResults `tied` rows; before that the
+   * same rule finishTournament applies — a tie group (markSimultaneousBustTie /
+   * placeSimultaneousBusts) with 2+ ELIMINATED members.
+   */
+  private tiedPlayerIdsOf(t: Tournament): Set<string> {
+    if (Array.isArray(t.finalResults)) return new Set(t.finalResults.filter((r) => r.tied === true).map((r) => r.playerId));
+    const groups = new Map<number, string[]>();
+    for (const p of t.players) {
+      if (p.tieGroup === undefined || !p.eliminated) continue;
+      const g = groups.get(p.tieGroup) || [];
+      g.push(p.playerId);
+      groups.set(p.tieGroup, g);
+    }
+    const out = new Set<string>();
+    for (const ids of groups.values()) if (ids.length >= 2) for (const id of ids) out.add(id);
+    return out;
+  }
+
+  /** 2026-11-25 — a lobby item's resultsTournamentId (see getTournamentList). */
+  private resultsTournamentIdOf(tournamentId: string, t: Tournament): string | null {
+    if (t.status === 'running' || t.status === 'finished') return tournamentId;
+    if (t.status !== 'registering') return null;
+    return this.finishedStandings.latestIdFor(this.standingsCardKeyOf(tournamentId, t));
+  }
+
+  /**
+   * 2026-11-25 — getTournamentStandings can answer for this id: a live record
+   * (any status), or a finished roster still kept. index.ts's qualifier list
+   * points its resultsTournamentId only at ids this answers true for.
+   */
+  hasStandings(tournamentId: string, now: number = Date.now()): boolean {
+    return this.tournaments.has(tournamentId) || this.finishedStandings.has(tournamentId, now);
+  }
+
+  /** 2026-11-25 — health r2Play.lobbyLists: the kept finished rosters (see lobbyLists.FinishedStandingsStats) + how many are kept now. */
+  finishedStandingsHealth(): Record<string, number> {
+    return { ...this.finishedStandings.stats, kept: this.finishedStandings.size };
+  }
+
+  /**
+   * 2026-11-26 review fix (finding 1) — where kept rosters are written so a
+   * restart keeps them (index.ts: Redis). null = memory only (tests, no Redis).
+   */
+  setFinishedStandingsPersistence(p: FinishedStandingsPersistence | null): void {
+    this.finishedStandings.setPersistence(p);
+  }
+
+  /** 2026-11-26 (finding 1) — the previous process's kept rosters, read back at boot (parsed by lobbyLists.parseFinishedStandings). Returns how many were kept. */
+  restoreFinishedStandings(recs: ReadonlyArray<FinishedStandingsRecord | null | undefined>, now: number = Date.now()): number {
+    return this.finishedStandings.restore(recs, now);
+  }
+
+  /**
+   * 2026-11-26 (finding 1) — index.ts markQualifierFinished: this finished
+   * tournament's roster is the results of qualifier event `q` (its lobby card
+   * is in the qualifier lobby, and a restart still finds the latest of a type).
+   */
+  tagFinishedStandingsQualifier(tournamentId: string, q: { type: string; id: string }): boolean {
+    return this.finishedStandings.tagQualifier(tournamentId, q);
+  }
+
+  /** 2026-11-26 (finding 1) — the latest kept qualifier roster of a type (qualifierResultsPointer's keptLatest). */
+  latestQualifierResults(qualifierType: string, now: number = Date.now()): { tournamentId: string; qualifierId: string; finishedAt: number } | null {
+    return this.finishedStandings.latestQualifier(qualifierType, now);
+  }
+
+  /**
+   * 2026-11-25 — record a FINISHED tournament's roster (the
+   * getTournamentStandings shape: everyone has his place, so no live stack is
+   * read). Called by finishTournament before 'tournamentFinished' is emitted;
+   * never throws (a failure is counted + logged and the finish goes on).
+   * 2026-11-26 review fix (finding 3) — + the event's lobby card at the
+   * finish (keptCardOf), `unlisted` and the entrants' account keys
+   * (server-side only), so its kept 'finished' item can stay listed.
+   * 2026-11-26 review fix (finding 4) — each row through standingsPlaceOf
+   * (the live path's rule): a disqualified entrant has no place
+   * (`disqualified: true`), a TDA tie keeps its stored place + `tied: true`.
+   */
+  private noteFinishedStandings(tournamentId: string, t: Tournament): void {
+    try {
+      const accounts: Array<{ userId?: number; masterUserId?: string }> = [];
+      for (const p of t.players) {
+        const a: { userId?: number; masterUserId?: string } = {};
+        if (typeof p.userId === 'number') a.userId = p.userId;
+        if (p.masterUserId) a.masterUserId = String(p.masterUserId);
+        if (a.userId !== undefined || a.masterUserId !== undefined) accounts.push(a);
+      }
+      const tied = this.tiedPlayerIdsOf(t);
+      const rec: FinishedStandingsRecord = {
+        tournamentId,
+        name: t.config.name,
+        status: 'finished',
+        eliminationOrder: [...(t.eliminationOrder || [])],
+        players: t.players.map((p): StandingsRow => {
+          const placed = !!p.finishPosition && p.finishPosition > 0;
+          const out = !!p.eliminated || placed;
+          return {
+            playerId: p.playerId,
+            playerName: p.playerName,
+            chipCount: out ? 0 : (p.chips ?? 0),
+            ...standingsPlaceOf(p, tied.has(p.playerId)),
+          };
+        }),
+        finishedAt: t.finishedAt ?? Date.now(),
+        cardKey: this.standingsCardKeyOf(tournamentId, t),
+        ...(t.config.unlisted ? { unlisted: true } : {}),
+        accounts,
+        card: keptCardOf(this.listItemOf(tournamentId, t, undefined)),
+      };
+      this.finishedStandings.note(rec);
+    } catch (e: any) {
+      this.finishedStandings.stats.noteErrors++;
+      console.warn(`[Tournament] ${JSON.stringify({ event: 'finished_standings_note_failed', tournamentId, error: String(e?.message || e) })}`);
+    }
   }
 
   /** F8 — the stall-cancel fields of a lobby item (see getTournamentList). */
@@ -1679,6 +1869,11 @@ export class TournamentManager {
       ...(r.tied ? { tied: true } : {}), ...(r.disqualified ? { disqualified: true } : {}),
     }));
 
+    // 2026-11-25 (owner: "a list ... who busted in each position") — the finish
+    // order kept >= 24 h (this record is dropped 10 s / 1 h from now), BEFORE the
+    // event: a listener that asks for the standings already finds them. Never throws.
+    this.noteFinishedStandings(tournamentId, tournament);
+
     this.emitEvent(tournamentId, 'tournamentFinished', {
       tournamentId,
       results,
@@ -1923,17 +2118,41 @@ export class TournamentManager {
    * the start/alive value 0 -> null. TournamentPlayer.chips is start-only, so we
    * resolve each alive player's LIVE stack from their seat via playerTableMap +
    * tableManager. Eliminated players report 0.
+   *
+   * 2026-11-25 (owner: "a list ... who busted in each position") — a FINISHED
+   * tournament answers too: from its live record while it is kept (+ additive
+   * `finishedAt`), then from the roster finishTournament kept (>= 24 h,
+   * lobbyLists.FinishedStandingsStore) once the record is dropped. Places are
+   * always the STORED finishPosition (ties, hand-for-hand, late-entry shifts:
+   * whatever the engine recorded), never recomputed.
+   *
+   * 2026-11-26 (lobby-lists review fix, finding 4) — additive row flags, the
+   * server's own treatment (lobbyLists.standingsPlaceOf, the kept roster's
+   * rule too): a DISQUALIFIED entrant (suspended mid-tournament: paid nothing,
+   * no qualifier / master result, never the champion) holds no place —
+   * finishPosition null + `disqualified: true`, chipCount 0; a TDA TIE keeps its
+   * stored place + `tied: true`. Nobody else's place changes.
    */
   getTournamentStandings(tournamentId: string, tableManager: any): {
     tournamentId: string;
     name: string;
     status: TournamentStatus;
     eliminationOrder: string[];
-    players: { playerId: string; playerName: string; chipCount: number; finishPosition: number | null }[];
+    players: StandingsRow[];
+    finishedAt?: number;
   } | null {
     const t = this.tournaments.get(tournamentId);
-    if (!t) return null;
-    const players = t.players.map((p) => {
+    if (!t) {
+      const kept = this.finishedStandings.get(tournamentId);
+      if (!kept) return null;
+      this.finishedStandings.stats.served++;
+      return {
+        tournamentId: kept.tournamentId, name: kept.name, status: kept.status,
+        eliminationOrder: kept.eliminationOrder, players: kept.players, finishedAt: kept.finishedAt,
+      };
+    }
+    const tied = this.tiedPlayerIdsOf(t);
+    const players = t.players.map((p): StandingsRow => {
       const eliminated = !!p.eliminated || (p.finishPosition && p.finishPosition > 0);
       let chipCount = 0;
       if (!eliminated) {
@@ -1954,7 +2173,7 @@ export class TournamentManager {
         playerId: p.playerId,
         playerName: p.playerName,
         chipCount,
-        finishPosition: (p.finishPosition && p.finishPosition > 0) ? p.finishPosition : null,
+        ...standingsPlaceOf(p, tied.has(p.playerId)),
       };
     });
     return {
@@ -1963,6 +2182,8 @@ export class TournamentManager {
       status: t.status,
       eliminationOrder: t.eliminationOrder || [],
       players,
+      // 2026-11-25 — additive, a finished tournament only: when it finished (ms).
+      ...(t.status === 'finished' && t.finishedAt !== null ? { finishedAt: t.finishedAt } : {}),
     };
   }
 }

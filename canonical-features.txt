@@ -2633,3 +2633,31 @@ tp.playedAHand = true
 # plays the hand only when the server never acted for the seat that hand (his clock ran out with the tab open is
 # NOT a played hand; it is counted as sat out).
 function awayStreakServerActed(
+# 2026-11-25 (owner: "for all online tournaments to be able to see who is registered in the lobby and a list for it to show
+# who busted in each position") - lobby lists (src/game/lobbyLists.ts). Qualifier items (socket list only; REST stays name-free)
+# and tournament items carry registrantNames (PUBLIC names via publicNameOf, registration order, each entry once, <= 300) and
+# resultsTournamentId (+ qualifier resultsQualifierId); getTournamentStandings answers a FINISHED tournament from the roster
+# TournamentManager keeps >= 24 h (25 h, <= 200 rosters). Health r2Play.lobbyLists. tests/lobbyLists.test.ts.
+registrantNames:
+resultsTournamentId:
+resultsQualifierId
+function registrantNamesOf(
+function qualifierResultsPointer(
+function qualifierLobbyListFields(
+finished_standings_note_failed
+r2Play.lobbyLists
+# 2026-11-26 lobby-lists review fixes - (1) the kept finished rosters survive a restart: written to Redis
+# (poker:finishedStandings:<id>, TTL = rest of the 25 h window) and read back at boot; a qualifier's roster is tagged
+# (tagFinishedStandingsQualifier) so tonight's card still opens last night's results after a deploy. (3) a finished
+# custom / club event stays LISTED from its kept roster for the keep window (resultsKept: true; club = own entrants only).
+finished_standings_restored
+poker:finishedStandings:
+tagFinishedStandingsQualifier
+resultsKept: true
+# 2026-11-26 lobby-lists minor review fixes - (4) every standings row goes through standingsPlaceOf: a disqualified
+# (suspended) entrant has NO place (finishPosition null + disqualified: true, as payTournamentPrizes and the master
+# results treat him), a TDA tie keeps its stored place + tied: true. (5) the kept rosters' size bound evicts by
+# evictionRankOf: one-off events before templates, qualifier / league nights (card qualifier:<type>) LAST.
+function standingsPlaceOf(
+function evictionRankOf(
+function qualifierCardKey(

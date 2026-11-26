@@ -35,6 +35,7 @@ import {
 import { samplePresence, partitionByPresence, QUALIFIER_PRESENCE_LEAD_MS, noShowsSeatedAbsent, presentNeededToStart } from '../src/game/qualifierNoShow';
 import { resolveEventKey, resolveNext, isBroadcastableQualifier, type EventWorld } from '../src/broadcast/eventKey';
 import { SRC, slice, fnSrc, handlerSrc, load, flush } from './helpers/indexSource';
+import { registrantNamesOf, qualifierResultsPointer } from '../src/game/lobbyLists';
 import { qualifierWorld } from './helpers/broadcastWorld';
 import { broadcastRig } from './helpers/broadcastRig';
 import { createHash, timingSafeEqual } from 'crypto';
@@ -225,6 +226,8 @@ const CODE = [
   fnSrc('function qualifierEventFor('),
   fnSrc('function qualifierListItem('),
   fnSrc('function qualifierList('),
+  // 2026-11-25 (owner: lobby lists) — registrantNames / resultsTournamentId (lobbyLists.ts).
+  fnSrc('function qualifierLobbyListFields('),
   fnSrc('function releaseQualifierRegistration('),
   fnSrc('function socketsOfMaster('),
   slice('/** R2 (TOURNEY-9) — the answer when a qualifier seat would take over', '\n  return null;\n}\n'),
@@ -313,6 +316,8 @@ function world(opts: { overflowMax?: number; qualified?: (masterId: string, tier
     qualifierSyncStats: { syncs: 0, failures: 0, lastSyncAt: null, listed: 0, cancelledOffSchedule: 0 },
     // 2026-11-21 — the event config and the finish frames' league fields (the REAL pure module).
     qualifierEventConfig, leagueFinishFrameFields,
+    // 2026-11-25 (owner: lobby lists) — the REAL pure helpers qualifierLobbyListFields reads.
+    registrantNamesOf, qualifierResultsPointer,
     // Repair round 2 (mechanical harness addition) — the not_qualified text (the REAL pure module).
     notQualifiedText, onlineLeagueGivesWeeklyCredits,
     qualifierWindows, qualifierStatusOf, seatsForTopOf, seatsForTopWith, seatsWonAt, qualifierStructure, QUALIFIER_BASE_STACK,
