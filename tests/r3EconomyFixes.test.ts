@@ -359,6 +359,7 @@ function handWorld(kind: 'cash' | 'club' = 'cash') {
     progressionManager, tableProgressListeners: new Set(), bombPotActive: new Map(), GamePhase, PlayerAction, HandRank, cardToString,
     recordOpponentObservation() {}, incrementHandsPlayed() {}, settlePredictionsForHand: async () => {}, scheduleAutoStart() {},
     standUpSuspendedSeatsBeforeDeal() {}, tickReservedSeatHands() {}, settleInsuranceForHand() {}, captureTournamentBustCheck: () => null,
+    awayStreakAtHandEnd() {},   // 2026-11-25 — the tournament sit-out count (no capture on a cash / club hand: nothing)
     runTournamentBustCheck: () => { handDone(); }, rekickTournamentDealAfterBustCheck() {}, runPendingTournamentBustChecks() {},
     broadcastGameState() {}, tableCountsForChipsWon: () => kind === 'cash', tableFeedsClubStats: () => kind === 'club',
     potCountsForWalletRewards: () => true,   // Sit & Go fix-all F5 (2026-10-24) — not a tournament / Spin & Go table here

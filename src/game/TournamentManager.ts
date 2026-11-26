@@ -117,6 +117,49 @@ export interface TournamentPlayer {
    * unregister, stall-cancel, restart refund) names him by it. Identity only.
    */
   login?: string;
+  /**
+   * 2026-11-25 (owner: "A tournament player can't sit out more than 30 hands
+   * in a row") — this ENTRY's run of hands sat out in a row, counted by
+   * index.ts awayStreakAtHandEnd at each hand end. Kept on the entry (not a
+   * table seat, a session or a reservation), so it survives table moves,
+   * breaks, reconnects and reservations. Reset to 0 by a voluntary action, I'm
+   * back or acting from sit-out; cleared with the fields below by a re-entry
+   * (clearAwayStreak). Server-side only, never sent as is.
+   */
+  sitOutHands?: number;
+  /** The 3-hand warning went out in THIS run (once per run; reset with the count). */
+  sitOutWarned?: boolean;
+  /** `${tableId}:${handNumber}` of the last hand counted: one count per hand. */
+  sitOutLastHand?: string;
+  /**
+   * An Online League no-show (seated absent at the start, never arrived) is not
+   * removed before this moment (the night's lateRegUntil, 7:00 PM MT). Cleared
+   * when he arrives (a restore of his seat, or a hand he plays or acts in).
+   */
+  sitOutProtectedUntil?: number;
+  /** Set by the bust check that REMOVED him for sitting out: the elimination notices say why. */
+  removedFor?: 'sat_out_limit';
+  /** The hand limit he was removed at (the notices' `handsSatOut`; a no-show: his real count). */
+  removedSatOutHands?: number;
+  /**
+   * Review fix (2026-11-26) — removed as an Online League NO-SHOW still away when
+   * late entry closed (whatever his count): the notices add `noShow: true`.
+   */
+  removedNoShow?: boolean;
+}
+
+/**
+ * 2026-11-25 (owner) — a re-entry (or any un-elimination) starts a fresh entry:
+ * no sat-out run, no warning, no no-show protection, no removal reason.
+ */
+export function clearAwayStreak(p: TournamentPlayer): void {
+  delete p.sitOutHands;
+  delete p.sitOutWarned;
+  delete p.sitOutLastHand;
+  delete p.sitOutProtectedUntil;
+  delete p.removedFor;
+  delete p.removedSatOutHands;
+  delete p.removedNoShow;
 }
 
 export type TournamentStatus = 'registering' | 'running' | 'finished' | 'cancelled';
@@ -842,6 +885,7 @@ export class TournamentManager {
     p.finishPosition = 0;
     p.chips = chips;
     delete p.tieGroup;
+    clearAwayStreak(p);   // 2026-11-25 — a fresh entry: the sat-out run starts again at 0
     t.eliminationOrder = t.eliminationOrder.filter((id) => id !== playerId);
     t.entries++;   // S3 — a re-entry is another entry (a fresh starting stack in play)
     return true;
@@ -1334,6 +1378,10 @@ export class TournamentManager {
       playerName: player.playerName,
       position: player.finishPosition,
       eliminatorId,
+      // 2026-11-25 (owner) — additive, only for an entrant REMOVED for sitting out
+      // (index.ts sets removedFor before it eliminates him): the room copy says why.
+      // Review fix (2026-11-26): + noShow: true for a league no-show removed when late entry closed.
+      ...(player.removedFor ? { reason: player.removedFor, handsSatOut: player.removedSatOutHands, ...(player.removedNoShow ? { noShow: true } : {}) } : {}),
     });
 
     // Check if tournament is over
