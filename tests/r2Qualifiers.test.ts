@@ -2816,6 +2816,8 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     '  }',
     '}',
   ].join('\n');
+  /** The early rooms' deal's mark (review fix 2026-11-26: in the ALWAYS-run part, its own try). */
+  const DEAL_MARK = '      markLeagueFirstHour(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);\n';
   /** The previous starts: the 6:00 PM tick named its absent registrants, the deal named (2b)'s seated-absent ones. */
   const previousStarts = (src: string): string => {
     const swaps: Array<[string, string]> = [
@@ -2825,8 +2827,8 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
         "  let seatedAbsent = 0;   // 2026-11-25 — a league night's no-shows seated absent at the deal\n  const noShowIds: string[] = [];\n"],
       ['          if (seatPresentPendingAtDeal(qualId, qt, p)) seatedAbsent++;',
         '          if (seatPresentPendingAtDeal(qualId, qt, p)) { seatedAbsent++; noShowIds.push(p.playerId); }'],
-      ['      if (keepNoShows) markLeagueFirstHour(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);',
-        '      if (keepNoShows) markNoShowProtection(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil, noShowIds);'],
+      [DEAL_MARK,
+        '      markNoShowProtection(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil, noShowIds);\n'],
     ];
     for (const [now, before] of swaps) {
       expect(src.split(now).length).toBe(2);
@@ -2919,6 +2921,62 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     expect(w.tour().leagueFirstHourUntil).toBeUndefined();
     expect(Object.values(protectionOf(w)).every((v) => v === null)).toBe(true);
     expect(w.logEvents('tournament_no_show_protected')).toEqual([]);
+  });
+
+  // Review fix (2026-11-26) — the deal's mark sat at the END of its (1)-(6) try: a throw in any
+  // earlier step skipped it and the league night had NO first hour (every entrant who never played
+  // a hand removed at 30 before 7:00 PM). It now runs in the ALWAYS-run part, in its own try.
+  // CONTROL = the previous placement put back (the last line of the try).
+  const BALANCE_STEP = '      balanceMoves = balanceQualifierTablesNow(tournamentId, { ignoreSwitch: true });\n';
+  const PRESENCE_STEP = '      samplePresence(qt.players, qualifierRegistrantOnline, now);\n';
+  const swapOnce = (src: string, from: string, to: string): string => {
+    expect(src.split(from).length).toBe(2);
+    return src.replace(from, to);
+  };
+  /** A step of the deal THROWS: (6) the balance (after the seating) or (1) the presence sample (before everything). */
+  const throwAt = (step: 'balance' | 'presence') => (src: string): string => (step === 'balance'
+    ? swapOnce(src, BALANCE_STEP, `${BALANCE_STEP}      throw new Error('balance blew up');\n`)
+    : swapOnce(src, PRESENCE_STEP, "      throw new Error('presence blew up');\n"));
+  /** The previous placement: the mark is the try's last step (`if (keepNoShows) ...` right after the balance). */
+  const previousPlacement = (src: string): string => swapOnce(swapOnce(src, DEAL_MARK, ''), BALANCE_STEP,
+    `${BALANCE_STEP}      if (keepNoShows) markLeagueFirstHour(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);\n`);
+  /** E7e's morning (S1, S2 seated at the open, S2 leaves; S3, S4 pending offline), a step of the 11:00 deal throwing. */
+  const leagueDealThatThrows = async (step: 'balance' | 'presence', previous: boolean) => {
+    const codeOver = (src: string) => throwAt(step)(previous ? previousPlacement(src) : src);
+    const { w } = await openedEarly(4, 2, { extraCode: S4_MARK_CODE, codeOver });
+    w.qt().kind = 'league';
+    w.offline('S2');
+    w.playerSessions.delete('S2');
+    jest.advanceTimersByTime(10 * S4_MIN);                                   // 11:00:00 — the hold's timer deals
+    await flush();
+    return { w, until: qualifierWindows(S4_AT, w.qt().qualifierType).lateRegUntil };
+  };
+
+  it('E7h — LEAGUE night: a step of the deal THROWS ((6) the balance) — the night still has its first hour (marked in the always-run part), the event is still dealt; CONTROL: the previous placement (end of the try) left the night UNMARKED', async () => {
+    const { w, until } = await leagueDealThatThrows('balance', false);
+    expect(w.m.qualifierPreStartHolds.size).toBe(0);                         // un-held and dealt all the same
+    expect(w.m.qualifierPreStart.holdErrors).toBe(1);
+    expect(w.logEvents('qualifier_prestart_deal_failed')).toEqual([expect.objectContaining({ step: 'prepare', error: 'balance blew up' })]);
+    expect(w.tour().leagueFirstHourUntil).toBe(until);
+    expect(protectionOf(w)).toEqual({ 'user-1001': until, 'user-1002': until, 'user-1003': until, 'user-1004': until });
+    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ tournamentId: w.qt().tournamentId, until, notPlayedYet: 4 })]);
+    expect(w.logEvents('qualifier_prestart_deal')).toEqual([expect.objectContaining({ seatedAbsent: 2, error: 'balance blew up' })]);
+    const ctl = await leagueDealThatThrows('balance', true);
+    expect(ctl.w.m.qualifierPreStartHolds.size).toBe(0);
+    expect(ctl.w.m.qualifierPreStart.holdErrors).toBe(1);
+    expect(ctl.w.tour().leagueFirstHourUntil).toBeUndefined();
+    expect(Object.values(protectionOf(ctl.w)).every((v) => v === null)).toBe(true);
+    expect(ctl.w.logEvents('tournament_no_show_protected')).toEqual([]);
+  });
+
+  it('E7i — a throw in the FIRST step ((1) the presence sample, before anything is seated) still leaves the night marked; CONTROL: the previous placement left it unmarked', async () => {
+    const { w, until } = await leagueDealThatThrows('presence', false);
+    expect(w.m.qualifierPreStartHolds.size).toBe(0);
+    expect(w.logEvents('qualifier_prestart_deal_failed')).toEqual([expect.objectContaining({ step: 'prepare', error: 'presence blew up' })]);
+    expect(w.tour().leagueFirstHourUntil).toBe(until);
+    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ until })]);
+    const ctl = await leagueDealThatThrows('presence', true);
+    expect(ctl.w.tour().leagueFirstHourUntil).toBeUndefined();
   });
 
   it('E8 — lead 0 (QUALIFIER_TABLES_OPEN_BEFORE_MIN=0): nothing opens early; the start second takes the path of before (dealt at once, no hold)', async () => {

@@ -6459,6 +6459,8 @@ function seatPresentPendingAtDeal(qualId: string, qt: QualifierTournamentReg, re
  *      tables included); (9) the lobby and every table told.
  * Steps 1-6 are in a try: a throw counts holdErrors and the tournament is
  * STILL un-held and dealt (7-9 always run) — a held event is never left stuck.
+ * A league night's first hour (markLeagueFirstHour) is marked in its own try
+ * between them: a throw in 1-6 never leaves the night without it.
  */
 function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
   const hold = qualifierPreStartHolds.get(tournamentId);
@@ -6523,14 +6525,7 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
       }
       // (6) Review fix-up — the start's seating: even with the balance switch off.
       balanceMoves = balanceQualifierTablesNow(tournamentId, { ignoreSwitch: true });
-      // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — a LEAGUE
-      // night's first hour (owner 2026-11-25 11:15 PM: "A player who is seated
-      // before 6 and then leaves before never played a hand so they should get
-      // the 1st hour to play a hand"): every entrant who has NOT PLAYED A HAND yet
-      // — a no-show (2b) seated absent, one who sat at his early-room seat and
-      // left, one playing elsewhere, a late entrant — is not removed for sitting
-      // out before late entry closes (7:00 PM MT); their hands count.
-      if (keepNoShows) markLeagueFirstHour(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);
+      // (The league night's first hour is marked in the ALWAYS-run part below.)
       // Every table's progress listener (bust check, hand results) before its first hand.
       for (const tid of t.tableIds) {
         const table = tableManager.getTable(tid);
@@ -6541,6 +6536,25 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
     qualifierPreStart.holdErrors++;
     error = String(e?.message || e);
     console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: qualId, tournamentId, step: 'prepare', error })}`);
+  }
+  // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — a LEAGUE
+  // night's first hour (owner 2026-11-25 11:15 PM: "A player who is seated
+  // before 6 and then leaves before never played a hand so they should get
+  // the 1st hour to play a hand"): every entrant who has NOT PLAYED A HAND yet
+  // — a no-show (2b) seated absent, one who sat at his early-room seat and
+  // left, one playing elsewhere, a late entrant — is not removed for sitting
+  // out before late entry closes (7:00 PM MT); their hands count.
+  // Review fix (2026-11-26) — ALWAYS run (its own try), after the seating and
+  // before the hold ends and the tables are dealt: it sat at the end of the
+  // (1)-(6) try, so a throw in any earlier step skipped it and the night had
+  // no first hour (a league entrant who never played a hand removed at 30).
+  try {
+    if (qt && qt.tournamentId === tournamentId && noShowsSeatedAbsent(qt.kind) && tournamentManager.getTournament(tournamentId)?.status === 'running') {
+      markLeagueFirstHour(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);
+    }
+  } catch (e: any) {
+    qualifierPreStart.holdErrors++;
+    console.error(`[Qualifier] ${JSON.stringify({ event: 'qualifier_prestart_deal_failed', qualifierId: qualId, tournamentId, step: 'first_hour', error: String(e?.message || e) })}`);
   }
   // (7) + (8) ALWAYS: never a held event left stuck.
   try {
@@ -7669,10 +7683,11 @@ function currentTurnTimeoutMs(tableId: string): number {
  * breaks, reconnects and reservations; a re-entry starts at 0):
  *  - a hand COUNTS as sat out when the seat was dealt in, is the entrant's live
  *    seat, is human (not isAI), nobody PLAYS it at the hand's end (no session
- *    that is not sitting out on a connected socket) AND it made no voluntary
- *    action that hand (an actionLog fold / check / call / bet / raise / all-in
- *    WITHOUT an auto stamp: blinds, antes, dead blinds, 'folded (left table)'
- *    and uncalled-bet lines are never actions);
+ *    that is not sitting out on a connected socket — or one is, but the SERVER
+ *    acted for the seat that hand: review fix 2026-11-26) AND it made no
+ *    voluntary action that hand (an actionLog fold / check / call / bet / raise
+ *    / all-in WITHOUT an auto stamp: blinds, antes, dead blinds, 'folded (left
+ *    table)' and uncalled-bet lines are never actions);
  *  - a voluntary action, I'm back ('playerBack') and acting from sit-out
  *    (returnTournamentSessionFromSitOut) reset it to 0; a hand PLAYED with no
  *    voluntary action (a walk, a restore that did not act) leaves it unchanged;
@@ -7694,9 +7709,11 @@ function currentTurnTimeoutMs(tableId: string): number {
  *    count. If he still has not played a hand and is away then, he is removed at
  *    the first hand end after it WHATEVER his count (awayStreakNoShowDue; his
  *    notices add `noShow: true`). "Played a hand" = a hand end where he was
- *    dealt in at his live seat AND acted voluntarily or a session PLAYED his
- *    seat; a sign-in / restore alone is not. Once played, gone for good in the
- *    event (a re-entry keeps playedAHand).
+ *    dealt in at his live seat AND acted voluntarily, or a session PLAYED his
+ *    seat and the server never acted for it that hand (a walk while present);
+ *    a sign-in / restore alone is not, nor is a hand the server acted in for
+ *    him (his clock ran out with the tab open). Once played, gone for good in
+ *    the event (a re-entry keeps playedAHand).
  * Never throws into handleHandComplete / a socket handler.
  */
 const TOURNAMENT_SIT_OUT_HANDS_LIMIT = 30;
@@ -7712,6 +7729,19 @@ function awayStreakActed(table: PokerTable, seatIndex: number): boolean {
     if (!e || e.seatIndex !== seatIndex || e.auto) continue;
     const a = String(e.action || '');
     if (a === 'folded' || a === 'checked' || /^(called|bet|raised to|went all-in for) /.test(a)) return true;
+  }
+  return false;
+}
+/**
+ * Review fix (2026-11-26, owner: "played a hand" means HE played it, never the
+ * server) — the SERVER acted for this seat THIS hand: an auto-stamped fold /
+ * check / call / raise / all-in (his clock ran out: 'timeout'; acted for while
+ * away: 'away') or the fold of his departure ('folded (left table)').
+ */
+function awayStreakServerActed(table: PokerTable, seatIndex: number): boolean {
+  for (const e of table.actionLog || []) {
+    if (!e || e.seatIndex !== seatIndex) continue;
+    if (e.auto || e.action === 'folded (left table)') return true;
   }
   return false;
 }
@@ -7825,9 +7855,10 @@ function awayStreakWarn(tournamentId: string, tableId: string, tp: TournamentPla
  * every dealt-in human live seat, warn at 3, and put the seats at 30+ (not
  * protected) — and a league entrant still away after his first hour who has not
  * played a hand, at any count (awayStreakNoShowDue) — on the capture
- * (`check.awayLimitSeats`) for its bust check. A seat that acted or that a
- * session played at this hand end PLAYED A HAND (TournamentPlayer.playedAHand,
- * never cleared: the league's first hour is over for him).
+ * (`check.awayLimitSeats`) for its bust check. A seat that acted voluntarily,
+ * or that a session played at this hand end with no server act for it this
+ * hand, PLAYED A HAND (TournamentPlayer.playedAHand, never cleared: the
+ * league's first hour is over for him); every other dealt-in hand is counted.
  * Idempotent per tableId:handNumber. null check = not a tournament table.
  */
 function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: TournamentBustCheck | null): void {
@@ -7846,7 +7877,15 @@ function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: Tourname
       if (!tp || tournamentLiveSeatIndex(table, tp.playerId) !== i || tp.sitOutLastHand === key) continue;
       tp.sitOutLastHand = key;
       const acted = awayStreakActed(table, i);
-      const played = awayStreakPlayedNow(tableId, i);
+      // Review fix (2026-11-26, owner: "played a hand" means HE played it, never the server) —
+      // a session holding his seat at the hand end PLAYED it only when the server never acted
+      // for his seat this hand. A connected tab he walked away from used to count: his clock
+      // ran out, the server folded for him, and when that fold ENDED the hand this ran before
+      // the timeout sat him out (sitOutTournamentSeatAfterTimeout), so the session still read
+      // as playing — he lost the league's first hour on a hand he never touched. ONE rule for
+      // the flag and the count: such a hand is a sat-out hand (counted), exactly as when his
+      // timeout does not end the hand (sat out by the hand end).
+      const played = awayStreakPlayedNow(tableId, i) && !awayStreakServerActed(table, i);
       if (acted || played) tp.playedAHand = true;   // 2026-11-26 — he played a hand: no league first hour any more
       if (acted) {
         if ((tp.sitOutHands || 0) > 0 || tp.sitOutWarned) awayStreakStats.resetsByAction++;
@@ -7854,7 +7893,7 @@ function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: Tourname
         tp.sitOutWarned = false;
         continue;
       }
-      if (played) continue;                    // played, no action (a walk, a restore): unchanged
+      if (played) continue;                    // played, nothing done for him (a walk, a restore): unchanged
       if (seat.chipCount <= 0) continue;       // busted this hand: the bust check settles him
       tp.sitOutHands = (tp.sitOutHands || 0) + 1;
       awayStreakStats.counted++;

@@ -2592,3 +2592,7 @@ removedNoShow
 function markLeagueFirstHour(
 leagueFirstHourUntil
 tp.playedAHand = true
+# 2026-11-26 review fix (owner: "played a hand" means HE played it, never the server): a session at the hand end
+# plays the hand only when the server never acted for the seat that hand (his clock ran out with the tab open is
+# NOT a played hand; it is counted as sat out).
+function awayStreakServerActed(

@@ -136,9 +136,11 @@ export interface TournamentPlayer {
    * leaves before never played a hand so they should get the 1st hour to play a
    * hand") — this entrant has PLAYED A HAND in this event: a hand end where he
    * was dealt in at his live seat AND either took a voluntary action or a
-   * session played his seat at that hand end (connected, not sitting out). Set
-   * by index.ts awayStreakAtHandEnd; a sign-in / seat restore alone never sets
-   * it. NEVER cleared: a re-entry keeps it (clearAwayStreak leaves it), so the
+   * session played his seat at that hand end (connected, not sitting out) with
+   * no server act for his seat that hand (review fix 2026-11-26: HE played it,
+   * never the server — a timeout fold with the tab open is not a played hand).
+   * Set by index.ts awayStreakAtHandEnd; a sign-in / seat restore alone never
+   * sets it. NEVER cleared: a re-entry keeps it (clearAwayStreak leaves it), so the
    * Online League's first hour (Tournament.leagueFirstHourUntil) is gone for
    * good once he played. Server-side only.
    */

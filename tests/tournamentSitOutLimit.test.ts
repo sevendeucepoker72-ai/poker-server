@@ -202,7 +202,7 @@ function world(opts: {
     registerEvents, handleTableRebalance, autoStartNextHand, handleHandComplete, wireSocket,
     tournamentBustChecksPending, tournamentDealsHeldForBustCheck, runTournamentBustCheck, captureTournamentBustCheck,
     restoreAbsentTournamentSeat, restoreSeatReservation, tellKeptTournamentSeats, returnTournamentSessionFromSitOut,
-    autoActForSeat, seatHasPlayingSession, awayStreakAtHandEnd, awayStreakResetAt, awayStreakViewOf, awayStreakStats,
+    sitOutTournamentSeatAfterTimeout, autoActForSeat, seatHasPlayingSession, awayStreakAtHandEnd, awayStreakResetAt, awayStreakViewOf, awayStreakStats,
     markLeagueFirstHour, removalSignInNotices, handForHandStates, placeAndTellHandForHandBusts,
     TOURNAMENT_SIT_OUT_HANDS_LIMIT, TOURNAMENT_SIT_OUT_WARN_AT,
   }`);
@@ -285,6 +285,20 @@ async function hands(w: World, tableId: string, n: number) {
   for (let k = 0; k < n; k++) await w.playHand(tableId);
 }
 
+// -------------------------------------------------------------------------------------------------
+// Review fix (2026-11-26, owner rule: "played a hand" must mean HE played it, never the server) — a
+// session holding his seat at the hand end PLAYED the hand only when the server never acted for his
+// seat that hand (awayStreakServerActed). The flag and the count share the rule: a hand is either
+// played (playedAHand set, not counted) or sat out (counted).
+// CONTROL = the pre-fix line (any connected, not-sitting-out session at the hand end = played).
+// -------------------------------------------------------------------------------------------------
+const NEW_PLAYED = '      const played = awayStreakPlayedNow(tableId, i) && !awayStreakServerActed(table, i);';
+const OLD_PLAYED = '      const played = awayStreakPlayedNow(tableId, i);';
+function prePlayedFix(): Partial<typeof P> {
+  expect(P.absentClock.split(NEW_PLAYED).length).toBe(2);
+  return { absentClock: P.absentClock.replace(NEW_PLAYED, OLD_PLAYED) };
+}
+
 describe('the count: per ENTRY, only dealt-in hands nobody plays and the seat never acted in', () => {
   it('an AWAY seat (no session) at a level WITH antes counts 1, 2, 3 …: blind / ante lines are never actions; the played seats stay 0', async () => {
     const w = world({ layout: { TA: field('a', 3, 20000, 100) } });
@@ -331,22 +345,100 @@ describe('the count: per ENTRY, only dealt-in hands nobody plays and the seat ne
     });
     expect(w.tp('a0').sitOutHands).toBe(2);
     expect(w.tp('a0').playedAHand).toBeUndefined();     // a dead socket's session plays nothing
-    // CONTROL: the same seat on a LIVE socket that never acted is "played" (unchanged), not counted.
+    // Review fix (2026-11-26, owner: "played a hand" means HE played it, never the server) — the
+    // same seat on a LIVE socket whose every act that hand was the SERVER's is NOT played: counted
+    // (it used to read as "played", unchanged, and set playedAHand).
     w.live.get('S-a0').connected = true;
     await w.playHand('TA', (a, t) => {
       if (a !== 0) return false;
       w.m.autoActForSeat('TA', t, 0, 'timeout');
       return true;
     });
-    expect(w.tp('a0').sitOutHands).toBe(2);
-    expect(w.tp('a0').playedAHand).toBe(true);          // a session PLAYED his seat at the hand end (no action needed)
+    expect(w.tp('a0').sitOutHands).toBe(3);
+    expect(w.tp('a0').playedAHand).toBeUndefined();
     // Idempotent per tableId:handNumber: the same hand again changes nothing.
     const t = w.tables.get('TA')!;
     const c = w.m.captureTournamentBustCheck('TA', t, []);
     w.m.awayStreakAtHandEnd('TA', t, c);
     w.m.awayStreakAtHandEnd('TA', t, c);
-    expect(w.tp('a0').sitOutHands).toBe(2);
+    expect(w.tp('a0').sitOutHands).toBe(3);
     w.m.runTournamentBustCheck('TA', t, c, 'test');
+  });
+
+  it('what is a PLAYED hand: his voluntary FOLD (un-stamped) is one; a voluntary call then a timed-out check later in the hand is one; the server\'s act for a connected seat is NOT (counted); CONTROL: the pre-fix rule called the server\'s act a played hand', async () => {
+    const run = async (over?: Partial<typeof P>) => {
+      const w = world({ layout: { TA: field('a', 4, 20000, 100) }, over });
+      w.seatEveryoneExcept();
+      const TA = w.tables.get('TA')!;
+      const mine = (seat: number) => TA.actionLog.filter((e) => e.seatIndex === seat && !/^posted /.test(e.action));
+      // Hand 1: a1 FOLDS himself (no auto stamp); everyone else plays it out (check / call).
+      await w.playHand('TA', (a, t) => {
+        if (a === 1) { expect(t.playerFold(1)).toBe(true); return true; }
+        if (!t.playerCheck(a)) t.playerCall(a);
+        return true;
+      });
+      expect(mine(1)).toEqual([expect.objectContaining({ action: 'folded' })]);
+      expect(mine(1)[0].auto).toBeUndefined();
+      const fold = { played: w.tp('a1').playedAHand, n: w.tp('a1').sitOutHands ?? 0 };
+      // Hand 2: a2 CALLS / CHECKS himself on his first turn, then his clock runs out on a later turn
+      // (the server checks for him): he acted voluntarily, so it is his hand.
+      let a2Turns = 0;
+      await w.playHand('TA', (a, t) => {
+        if (a === 2 && ++a2Turns > 1) { w.m.autoActForSeat('TA', t, 2, 'timeout'); return true; }
+        if (!t.playerCheck(a)) t.playerCall(a);
+        return true;
+      });
+      expect(a2Turns).toBeGreaterThan(1);
+      expect(mine(2).some((e) => e.auto === 'timeout')).toBe(true);
+      expect(mine(2).some((e) => !e.auto)).toBe(true);
+      const mixed = { played: w.tp('a2').playedAHand, n: w.tp('a2').sitOutHands ?? 0 };
+      // A fresh table's first hand: c3 is connected and not sitting out, but EVERY act of his seat is the server's.
+      const w3 = world({ layout: { TC: field('c', 4, 20000, 300) }, over });
+      w3.seatEveryoneExcept();
+      const TC = w3.tables.get('TC')!;
+      await w3.playHand('TC', (a, t) => {
+        if (a === 3) { w3.m.autoActForSeat('TC', t, 3, 'timeout'); return true; }
+        if (!t.playerCheck(a)) t.playerCall(a);
+        return true;
+      });
+      const c3 = TC.actionLog.filter((e) => e.seatIndex === 3 && !/^(posted |uncalled bet)/.test(e.action));
+      expect(c3.length).toBeGreaterThan(0);
+      expect(c3.every((e) => e.auto === 'timeout')).toBe(true);
+      expect(w3.playerSessions.get('S-c3')).toMatchObject({ sittingOut: false });
+      expect(w3.live.get('S-c3').connected).toBe(true);
+      expect(w3.tp('c0').playedAHand).toBe(true);            // the others played it themselves
+      const server = { played: w3.tp('c3').playedAHand, n: w3.tp('c3').sitOutHands ?? 0 };
+      // A fresh table: its first hand is a WALK for the big blind (present, everyone folds to him):
+      // nothing of his and nothing the server did for him — a session played his seat.
+      const w2 = world({ layout: { TB: field('b', 4, 20000, 200) }, over });
+      w2.seatEveryoneExcept();
+      const TB = w2.tables.get('TB')!;
+      let bb = -1;
+      await w2.playHand('TB', (a, t) => {
+        if (a === bb) return false;
+        expect(t.playerFold(a)).toBe(true);
+        return true;
+      }, { onDeal: (t) => { bb = t.actionLog.find((e) => /^posted BB/.test(e.action))!.seatIndex; } });
+      expect(bb).toBeGreaterThanOrEqual(0);
+      // (only his blind / ante and the uncalled part of his blind returned: no action of his, no auto stamp)
+      expect(TB.actionLog.filter((e) => e.seatIndex === bb && (e.auto || /^(folded|checked|called |bet |raised to |went all-in)/.test(e.action)))).toEqual([]);
+      const bbTp = w2.tp(TB.seats[bb].playerId);
+      const walk = { played: bbTp.playedAHand, n: bbTp.sitOutHands ?? 0 };
+      return { fold, mixed, server, walk };
+    };
+    const fixed = await run();
+    expect(fixed.fold).toEqual({ played: true, n: 0 });
+    expect(fixed.mixed).toEqual({ played: true, n: 0 });
+    expect(fixed.server).toEqual({ played: undefined, n: 1 });   // NOT his hand: a sat-out hand, counted
+    expect(fixed.walk).toEqual({ played: true, n: 0 });          // a walk while present IS his hand
+    // CONTROL: the pre-fix rule — the server's act for a connected seat was "played" (flag set, not counted).
+    const ctl = await run(prePlayedFix());
+    expect(ctl.fold).toEqual({ played: true, n: 0 });
+    expect(ctl.server).toEqual({ played: true, n: 0 });
+    // CONTROL (the other side): a rule that kept only voluntary actions would lose the walk.
+    const voluntaryOnly = await run({ absentClock: P.absentClock.replace(NEW_PLAYED, '      const played = false;') });
+    expect(voluntaryOnly.walk).toEqual({ played: undefined, n: 1 });
+    expect(voluntaryOnly.fold).toEqual({ played: true, n: 0 });
   });
 
   it('a WALK while present (he is back, the others fold to his big blind) leaves the run unchanged; then his first voluntary action resets it to 0', async () => {
@@ -367,6 +459,7 @@ describe('the count: per ENTRY, only dealt-in hands nobody plays and the seat ne
       }, { onDeal: (t) => { if (before >= 3 && isBB0(t)) { w.seatLive('S-a0', 'TA', 0); back = true; } } });
       if (back) {
         expect(a0Acted()).toBe(false);                  // a walk: nothing of his
+        expect(TA.actionLog.some((e) => e.seatIndex === 0 && e.auto)).toBe(false);   // … and nothing the server did for him
         expect(w.tp('a0').sitOutHands).toBe(before);    // played, no action: unchanged
         expect(w.tp('a0').playedAHand).toBe(true);      // 2026-11-26 — but he PLAYED a hand (a session at the hand end)
         walkedAt = k;
@@ -1210,6 +1303,42 @@ describe('the Online League first hour: protected until he plays a hand, removed
     expectRemovedAt30(await runNight({ before: dropped, act: serverActs, previous: ['a0'] }));
   });
 
+  // Review fix (2026-11-26, owner rule: "played a hand" must mean HE played it, never the server).
+  it('THE OWNER\'S TAB-OPEN CASE: at his early-room seat on a LIVE socket, he walked away; his clock runs out at the 6:00 PM deal and the server\'s fold ENDS the hand (its hand end runs before the timeout sits him out) — not a played hand: protected at 30, removed after 7:00 PM; CONTROL: the pre-fix rule (a connected session at the hand end = played) took his first hour: removed at 30 at 6:20 PM', async () => {
+    const timedOutAtTheDeal = async (w: World) => {
+      const TA = w.tables.get('TA')!;
+      TA.presetFirstButton(3);                                  // the 6:00 PM hand: a1 (seat 1) is the big blind, last to act
+      let timedOut = false;
+      await w.playHand('TA', (a, t) => {
+        if (a === 2) { expect(t.playerRaise(2, 3 * BB)).toBe(true); return true; }   // a2 raises
+        if (a === 3) { expect(t.playerFold(3)).toBe(true); return true; }            // a3 folds
+        if (a !== 1) return false;                              // a0 (away): the server folds for him
+        // His 30 s clock runs out (armTurnTimer's order): the server acts for him, THEN the
+        // timeout rule sits him out (sitOutTournamentSeatAfterTimeout).
+        expect(w.playerSessions.get('S-a1')).toMatchObject({ sittingOut: false });
+        expect(w.live.get('S-a1').connected).toBe(true);    // the tab is open
+        w.m.autoActForSeat('TA', t, 1, 'timeout');
+        expect(t.isHandInProgress()).toBe(false);             // his fold ENDED the hand (its hand end has run)
+        expect(w.m.sitOutTournamentSeatAfterTimeout('TA', 1)).toBe(true);
+        timedOut = true;
+        return true;
+      });
+      expect(timedOut).toBe(true);
+      expect(TA.actionLog.some((e) => e.seatIndex === 1 && /^posted BB/.test(e.action))).toBe(true);
+      expect(TA.actionLog.filter((e) => e.seatIndex === 1 && !/^posted /.test(e.action))).toEqual([
+        expect.objectContaining({ action: 'folded', auto: 'timeout' }),
+      ]);
+      expect(w.playerSessions.get('S-a1')).toMatchObject({ sittingOut: true });   // sat out by the timeout, after the hand end
+    };
+    const r = await runNight({ after: timedOutAtTheDeal });
+    expectFirstHour(r);
+    expect(r.w.tp('a2').playedAHand).toBe(true);                // the raiser played (voluntary)
+    expect(r.w.tp('a3').playedAHand).toBe(true);                // the folder played (voluntary)
+    const ctl = await runNight({ after: timedOutAtTheDeal, over: prePlayedFix() });
+    expect(ctl.at30.playedAHand).toBe(true);
+    expectRemovedAt30(ctl);
+  });
+
   it('SITTING OUT at his seat on a live socket from the start (sitting out is not playing a hand): protected; CONTROL: removed at 30', async () => {
     const satOut = (w: World) => { w.playerSessions.get('S-a1').sittingOut = true; };
     expectFirstHour(await runNight({ before: satOut }));
@@ -1331,6 +1460,9 @@ describe('wiring + locks (source)', () => {
     // The ONE writer of playedAHand: a played hand end (never cleared, a re-entry keeps it).
     expect(SRC.split('playedAHand = ').length).toBe(2);
     expect(fnSrc('function awayStreakAtHandEnd(')).toContain('      if (acted || played) tp.playedAHand = true;');
+    // Review fix (2026-11-26) — a session at the hand end plays it only when the server never acted for the seat.
+    expect(fnSrc('function awayStreakAtHandEnd(')).toContain(NEW_PLAYED);
+    expect(fnSrc('function awayStreakServerActed(')).toContain("if (e.auto || e.action === 'folded (left table)') return true;");
     const tmSrc = read('src/game/TournamentManager.ts');
     const clearAt = tmSrc.indexOf('export function clearAwayStreak(');
     const clear = tmSrc.slice(clearAt, tmSrc.indexOf('\n}\n', clearAt));
@@ -1345,7 +1477,12 @@ describe('wiring + locks (source)', () => {
     expect(tick).toContain('if (noShowsSeatedAbsent(qt.kind)) markLeagueFirstHour(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil);');
     expect(tick.split('markLeagueFirstHour(').length).toBe(2);
     const deal = fnSrc('function runPreStartDeal(');
-    expect(deal).toContain('if (keepNoShows) markLeagueFirstHour(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);');
+    // Review fix (2026-11-26) — in the ALWAYS-run part (its own try), after the (1)-(6) try, before the hold ends.
+    const markAt = deal.indexOf('      markLeagueFirstHour(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);');
+    expect(markAt).toBeGreaterThan(deal.indexOf("step: 'prepare'"));
+    expect(markAt).toBeLessThan(deal.indexOf("tournamentManager.pauseTournament(tournamentId, false, 'prestart');"));
+    expect(deal).toContain('if (qt && qt.tournamentId === tournamentId && noShowsSeatedAbsent(qt.kind) && tournamentManager.getTournament(tournamentId)?.status === \'running\') {');
+    expect(deal).not.toContain('if (keepNoShows) markLeagueFirstHour(');
     expect(deal.split('markLeagueFirstHour(').length).toBe(2);
     expect(deal).not.toContain('noShowIds');
     expect(SRC).not.toContain('markNoShowProtection');
@@ -1387,7 +1524,7 @@ describe('wiring + locks (source)', () => {
     ]) expect(manifest).toContain(tok);
     // Review fix (2026-11-26) tokens.
     // + the owner's first-hour rule (2026-11-26): the night's mark and the one played-a-hand writer.
-    for (const tok of ['function awayStreakNoShowDue(', 'removedNoShow', 'function markLeagueFirstHour(', 'leagueFirstHourUntil', 'tp.playedAHand = true']) {
+    for (const tok of ['function awayStreakNoShowDue(', 'removedNoShow', 'function markLeagueFirstHour(', 'leagueFirstHourUntil', 'tp.playedAHand = true', 'function awayStreakServerActed(']) {
       expect(manifest.split('\n')).toContain(tok);
       expect(SRC + read('src/game/TournamentManager.ts')).toContain(tok);
     }
