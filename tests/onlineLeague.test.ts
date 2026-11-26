@@ -812,8 +812,9 @@ describe('the night itself: start, too-few cancel at 7:00 PM, overflow tables, r
     it('the 6:00 PM start marks the league night\'s no-shows protected until 7:00 PM; the weekly start marks nobody', async () => {
       const w = world();
       const at = Date.now() + H;
-      const marks: Array<[string, number]> = [];
-      w.scope.markNoShowProtection = (tid: string, until: number) => { marks.push([tid, until]); return 1; };
+      // Review fix (2026-11-26) — it names ONLY the true no-shows (no live socket at the start).
+      const marks: Array<[string, number, string[]]> = [];
+      w.scope.markNoShowProtection = (tid: string, until: number, ids: Iterable<string>) => { marks.push([tid, until, [...ids]]); return 1; };
       w.sync([leagueItem(at), weeklyItem(at)]);
       const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
       const b = w.mkSocket('SB', BOB, 'm-bob', 'Bob');
@@ -822,7 +823,8 @@ describe('the night itself: start, too-few cancel at 7:00 PM, overflow tables, r
       offline(w, 'SB');
       w.m.tickQualifierAutoStart(at + 1000);
       expect(w.qualifierTournaments.get(LEAGUE)).toMatchObject({ status: 'running', tournamentId: 'TQ' });
-      expect(marks).toEqual([['TQ', at + 60 * MIN]]);
+      const bobId = w.qualifierTournaments.get(LEAGUE).players.find((p: any) => p.masterPlayerId === 'm-bob').playerId;
+      expect(marks).toEqual([['TQ', at + 60 * MIN, [bobId]]]);                // Bob (away) only, never Alice (here)
       const c = w.mkSocket('SC', 103, 'm-carol', 'Carol');
       const d = w.mkSocket('SD', 104, 'm-dave', 'Dave');
       await enter(c, WEEKLY);

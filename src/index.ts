@@ -5690,7 +5690,9 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
       // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — a LEAGUE
       // night's no-shows (seated just now with nobody at the seat) are not removed
       // for sitting out before late entry closes (7:00 PM MT); their hands count.
-      if (noShowsSeatedAbsent(qt.kind)) markNoShowProtection(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil);
+      // Review fix (2026-11-26) — ONLY the true no-shows: the registrants with no
+      // live socket at the start (`absent` above), never one who was here.
+      if (noShowsSeatedAbsent(qt.kind)) markNoShowProtection(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil, absent.map((p) => p.playerId));
 
       // Notify all registered players — 2026-10-10: on the socket his seat was
       // bound to (bindRegistrantSocket — his own; '' = none), never on a
@@ -6466,6 +6468,8 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
   const qt = qualifierTournaments.get(qualId);
   let seated = 0;
   let seatedAbsent = 0;   // 2026-11-25 — a league night's no-shows seated absent at the deal
+  // Review fix (2026-11-26) — WHO (2b) seated absent: the only no-shows the deal protects.
+  const noShowIds: string[] = [];
   let released = 0;
   let rebound = 0;
   let breaks = 0;
@@ -6498,7 +6502,10 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
         noteLeagueNoShowsSeatedAbsent(qualId, qt, absent, 'deal');
         for (const p of absent) {
           if (!qt.players.includes(p) || !qualifierRegistrantIsPending(tournamentId, p)) continue;
-          if (seatPresentPendingAtDeal(qualId, qt, p)) seatedAbsent++;
+          if (seatPresentPendingAtDeal(qualId, qt, p)) {
+            seatedAbsent++;
+            noShowIds.push(p.playerId);
+          }
         }
       }
       // (4) Review fix-up — each one in its own try: one failure never blocks the deal.
@@ -6519,11 +6526,14 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
       // (6) Review fix-up — the start's seating: even with the balance switch off.
       balanceMoves = balanceQualifierTablesNow(tournamentId, { ignoreSwitch: true });
       // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — a LEAGUE
-      // night: whoever is seated with NOBODY at his seat at the deal (a no-show
-      // seated absent in (2b), one who left his early-room seat, one playing
-      // elsewhere) is not removed for sitting out before late entry closes
-      // (7:00 PM MT); his hands count. Cleared when he arrives.
-      if (keepNoShows) markNoShowProtection(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);
+      // night's TRUE no-shows are not removed for sitting out before late entry
+      // closes (7:00 PM MT); their hands count. Cleared when he arrives.
+      // Review fix (2026-11-26) — ONLY the ones (2b) seated absent (absent PENDING:
+      // never a seat or a session in the early rooms). One who ARRIVED (sat at his
+      // early-room seat with a session, e.g. 5:52 PM) and left before the deal is
+      // NOT protected (it used to be: his seat had no session at the deal), nor is
+      // one here who plays elsewhere.
+      if (keepNoShows) markNoShowProtection(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil, noShowIds);
       // Every table's progress listener (bust check, hand results) before its first hand.
       for (const tid of t.tableIds) {
         const table = tableManager.getTable(tid);
@@ -7847,18 +7857,25 @@ function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: Tourname
   }
 }
 /**
- * An Online League no-show seated ABSENT at the start (no session at his live
- * seat): protected until `until` (the night's lateRegUntil). `onlyPlayerId`: one
- * registrant (the early rooms' deal), else every alive entrant of the event (the
- * 6:00 PM start). Returns how many were marked.
+ * An Online League NO-SHOW seated ABSENT at the start: protected until `until`
+ * (the night's lateRegUntil). Review fix (2026-11-26) — ONLY the true no-shows
+ * the caller names (`noShowPlayerIds`): the 6:00 PM start's registrants with no
+ * live socket at the start (partitionByPresence's absent list), the early
+ * rooms' deal's step (2b) (absent PENDING registrants seated absent: never a
+ * seat or a session in the early rooms). It used to mark every alive entrant
+ * with no session at his seat, so one who ARRIVED in the early rooms (sat at
+ * his seat, e.g. 5:52 PM) and left before the 6:00 PM deal was protected; the
+ * owner's rule: one who arrived and left is NOT. A named entrant whose seat has
+ * a session now is still skipped. Returns how many were marked.
  */
-function markNoShowProtection(tournamentId: string, until: number, onlyPlayerId?: string): number {
+function markNoShowProtection(tournamentId: string, until: number, noShowPlayerIds: Iterable<string>): number {
   try {
     const t = tournamentManager.getTournament(tournamentId);
     if (!t || !Number.isFinite(until)) return 0;
+    const noShows = new Set(noShowPlayerIds);
     let n = 0;
     for (const tp of t.players) {
-      if (tp.eliminated || (onlyPlayerId !== undefined && tp.playerId !== onlyPlayerId)) continue;
+      if (tp.eliminated || !noShows.has(tp.playerId)) continue;
       const tableId = t.playerTableMap.get(tp.playerId) ?? t.tableId ?? undefined;
       const idx = tableId ? tournamentLiveSeatIndex(tableManager.getTable(tableId), tp.playerId) : -1;
       if (!tableId || idx < 0 || seatHasLiveSession(tableId, idx)) continue;

@@ -553,7 +553,7 @@ describe('the 3-hand warning', () => {
     const w = world({ layout: { TA: field('a', 3, 20000, 100) } });
     w.seatEveryoneExcept('a0');
     const until = Date.now() + 3600_000;
-    expect(w.m.markNoShowProtection(w.tid, until)).toBe(1);
+    expect(w.m.markNoShowProtection(w.tid, until, ['a0'])).toBe(1);
     const lobby = w.mkSocket('L1', 100);
     await hands(w, 'TA', 3);
     expect(evs(lobby, 'tournamentSitOutWarning')).toEqual([expect.objectContaining({
@@ -906,7 +906,7 @@ describe('the Online League no-show: protected for the first hour, removed at th
     const until = now + 60 * 60_000;                            // 7:00 PM MT
     const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
     try {
-      expect(w.m.markNoShowProtection(w.tid, until)).toBe(1);   // only a0: the others have sessions
+      expect(w.m.markNoShowProtection(w.tid, until, ['a0'])).toBe(1);   // only a0: the others have sessions
       expect(w.tp('a0').sitOutProtectedUntil).toBe(until);
       preCount(w, 'a0', LIMIT + 5);
       now = until - 1000;
@@ -941,7 +941,7 @@ describe('the Online League no-show: protected for the first hour, removed at th
     const until = now + 60 * 60_000;                              // 7:00 PM MT
     const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
     try {
-      expect(w.m.markNoShowProtection(w.tid, until)).toBe(1);   // a0 only
+      expect(w.m.markNoShowProtection(w.tid, until, ['a0'])).toBe(1);   // a0 only
       w.playerSessions.delete('S-a1');                            // a1 leaves later: away, NOT protected
       const lobby = w.mkSocket('L1', 100);
       preCount(w, 'a0', 21);
@@ -989,7 +989,7 @@ describe('the Online League no-show: protected for the first hour, removed at th
     const until = now + 60 * 60_000;
     const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
     try {
-      expect(w.m.markNoShowProtection(w.tid, until)).toBe(1);
+      expect(w.m.markNoShowProtection(w.tid, until, ['a0'])).toBe(1);
       preCount(w, 'a0', 21);
       now = until + 1000;
       await w.playHand('TA');
@@ -1035,7 +1035,7 @@ describe('the Online League no-show: protected for the first hour, removed at th
       const until = now + 60 * 60_000;
       const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
       try {
-        w.m.markNoShowProtection(w.tid, until);
+        w.m.markNoShowProtection(w.tid, until, ['a0']);
         const lobby = w.mkSocket('L1', 100);
         preCount(w, 'a0', 2);
         now = until + 1000;
@@ -1061,7 +1061,7 @@ describe('the Online League no-show: protected for the first hour, removed at th
     const w = world({ layout: { TA: field('a', 3, 20000, 100) } });
     w.seatEveryoneExcept('a0');
     const until = Date.now() + 3600_000;
-    w.m.markNoShowProtection(w.tid, until);
+    w.m.markNoShowProtection(w.tid, until, ['a0']);
     const s = w.mkSocket('S-back', 100);
     expect(w.m.restoreAbsentTournamentSeat(s, w.authSessions.get('S-back'), 'test')).toBeTruthy();
     expect(w.tp('a0').sitOutProtectedUntil).toBeUndefined();
@@ -1075,11 +1075,70 @@ describe('the Online League no-show: protected for the first hour, removed at th
     const w = world({ layout: { TA: field('a', 3, 20000, 100) } });
     w.seatEveryoneExcept();
     w.playerSessions.delete('S-a0');
-    w.m.markNoShowProtection(w.tid, Date.now() + 3600_000);
+    w.m.markNoShowProtection(w.tid, Date.now() + 3600_000, ['a0']);
     expect(w.tp('a0').sitOutProtectedUntil).toBeDefined();
     w.playerSessions.set('S-a0', { socketId: 'S-a0', tableId: 'TA', seatIndex: 0, playerName: 'a0', playerId: 'a0', sittingOut: false });
     await w.playHand('TA');
     expect(w.tp('a0').sitOutProtectedUntil).toBeUndefined();
+  });
+
+  // Review fix (2026-11-26) — the owner's rule: a league player who ARRIVED (any sign-in that bound
+  // his seat — say at his early-room seat at 5:52 PM) and left before the 6:00 PM deal is NOT
+  // protected. markNoShowProtection used to mark EVERY entrant with no session at his seat at the
+  // deal; it now marks only the TRUE no-shows the start names (the 6:00 PM start: no live socket at
+  // the start; the early rooms' deal: the ones its step (2b) seated absent). tests/r2Qualifiers.test.ts
+  // E7e / E7f run the REAL starts. CONTROL = the old marking (the name filter gone).
+  const oldMarking = (src: string) => src.replace(
+    '      if (tp.eliminated || !noShows.has(tp.playerId)) continue;',
+    '      if (tp.eliminated) continue;',
+  );
+
+  it('ARRIVED in the early rooms and LEFT before the deal (not named): NOT protected, removed at 30 like anyone; the TRUE no-show (named) is protected; CONTROL: the old marking protected both', async () => {
+    const run = async (over?: Partial<typeof P>) => {
+      const w = world({ layout: { TA: field('a', 4, 20000, 100) }, over });
+      w.seatEveryoneExcept('a0');                     // a0 never came; a1 sat at his seat (5:52 PM) …
+      w.playerSessions.delete('S-a1');                // … and left before the deal: no session at it
+      let now = SIX_PM_MT;
+      const until = now + 60 * 60_000;                // 7:00 PM MT
+      const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+      try {
+        const marked = w.m.markNoShowProtection(w.tid, until, ['a0']);   // the deal names (2b)'s only
+        preCount(w, 'a0', LIMIT - 1);
+        preCount(w, 'a1', LIMIT - 1);
+        now = SIX_PM_MT + 20 * 60_000;                // 6:20 PM: inside the first hour
+        await w.playHand('TA');
+        return { w, marked, until };
+      } finally {
+        spy.mockRestore();
+      }
+    };
+    const fixed = await run();
+    expect(fixed.marked).toBe(1);
+    expect(fixed.w.tp('a0')).toMatchObject({ eliminated: false, sitOutHands: LIMIT, sitOutProtectedUntil: fixed.until });
+    expect(fixed.w.tp('a1')).toMatchObject({ eliminated: true, sitOutHands: LIMIT, removedFor: 'sat_out_limit', removedSatOutHands: LIMIT });
+    expect(fixed.w.tp('a1').sitOutProtectedUntil).toBeUndefined();
+    expect(fixed.w.tp('a1').removedNoShow).toBeUndefined();    // removed by the 30-hand rule, not as a no-show
+    expect(fixed.w.m.awayStreakStats).toMatchObject({ noShowsProtected: 1, protectedHands: 1, removed: 1 });
+    // CONTROL: the old marking (every entrant with no session at the deal) protects a1 too: kept at 30.
+    const old = oldMarking(P.absentClock);
+    expect(old).not.toBe(P.absentClock);
+    const ctl = await run({ absentClock: old });
+    expect(ctl.marked).toBe(2);
+    expect(ctl.w.tp('a1')).toMatchObject({ eliminated: false, sitOutHands: LIMIT, sitOutProtectedUntil: ctl.until });
+    expect(ctl.w.tp('a0')).toMatchObject({ eliminated: false, sitOutProtectedUntil: ctl.until });
+  });
+
+  it('only a NAMED entrant with no session at his live seat is marked: a named one PLAYING his seat, an unknown id and an empty list mark nobody', () => {
+    const w = world({ layout: { TA: field('a', 4, 20000, 100) } });
+    w.seatEveryoneExcept('a0', 'a1');
+    const until = Date.now() + 3600_000;
+    expect(w.m.markNoShowProtection(w.tid, until, [])).toBe(0);
+    expect(w.m.markNoShowProtection(w.tid, until, ['nobody', 'a2'])).toBe(0);   // a2 plays his seat
+    expect(w.tp('a2').sitOutProtectedUntil).toBeUndefined();
+    expect(w.m.markNoShowProtection(w.tid, until, new Set(['a1']))).toBe(1);
+    expect(w.tp('a1').sitOutProtectedUntil).toBe(until);
+    expect(w.tp('a0').sitOutProtectedUntil).toBeUndefined();               // away too, but not named
+    expect(w.m.awayStreakStats.noShowsProtected).toBe(1);
   });
 });
 
@@ -1113,9 +1172,18 @@ describe('wiring + locks (source)', () => {
     expect(SEAT_RESTORE_SRC).not.toContain('awayStreakResetAt');
   });
 
-  it('both league start paths mark the no-shows; the gameState carries mySitOutLimit (always present); the lobby item says 30', () => {
-    expect(fnSrc('function tickQualifierAutoStart(')).toContain('if (noShowsSeatedAbsent(qt.kind)) markNoShowProtection(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil);');
-    expect(fnSrc('function runPreStartDeal(')).toContain('if (keepNoShows) markNoShowProtection(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);');
+  it('both league start paths mark ONLY their true no-shows; the gameState carries mySitOutLimit (always present); the lobby item says 30', () => {
+    // Review fix (2026-11-26): the 6:00 PM start names its absent registrants; the deal names (2b)'s only.
+    const tick = fnSrc('function tickQualifierAutoStart(');
+    expect(tick).toContain('if (noShowsSeatedAbsent(qt.kind)) markNoShowProtection(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil, absent.map((p) => p.playerId));');
+    expect(tick.split('markNoShowProtection(').length).toBe(2);
+    const deal = fnSrc('function runPreStartDeal(');
+    expect(deal).toContain('if (keepNoShows) markNoShowProtection(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil, noShowIds);');
+    expect(deal.split('markNoShowProtection(').length).toBe(2);
+    expect(deal.split('noShowIds.push(').length).toBe(2);
+    const step2b = deal.slice(deal.indexOf('noteLeagueNoShowsSeatedAbsent(qualId, qt, absent, \'deal\');'), deal.indexOf('// (4) Review fix-up'));
+    expect(step2b).toContain('seatedAbsent++;\n            noShowIds.push(p.playerId);');
+    expect(fnSrc('function markNoShowProtection(')).toContain('if (tp.eliminated || !noShows.has(tp.playerId)) continue;');
     const gs = fnSrc('function getGameStateForPlayer(');
     expect(gs).toContain('stateObj.mySitOutLimit = stateTournamentId && playerSeatIndex >= 0');
     expect(gs).toContain('(awayStreakViewOf(stateTournamentId, table, playerSeatIndex) ?? null) : null;');
