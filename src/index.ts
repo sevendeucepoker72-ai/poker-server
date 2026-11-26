@@ -3414,10 +3414,11 @@ app.get('/api/health', async (_req, res) => {
         // 2026-10-26 (owner: "After 1") - tournament timeout sit-out + stale-table Sit Out / I'm back fallbacks.
         tournamentTimeoutSitOut: { ...tournamentTimeoutSitOutStats },
         // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — counted (hands counted),
-        // warned (3-hand warnings), removed, removedProtectedAfterHour (league no-shows removed
-        // after 7:00 PM), protectedHands (hands at 30+ inside the first hour), resetsByAction /
-        // resetsByBack, removalsSkipped (re-check said no at the bust check), noShowsProtected,
-        // toldOnSignIn, errors (should stay 0).
+        // warned (3-hand warnings), removed, removedProtectedAfterHour (league entrants who never
+        // played a hand, removed after 7:00 PM), protectedHands (hands at 30+ inside the first
+        // hour), resetsByAction / resetsByBack, removalsSkipped (re-check said no at the bust
+        // check), noShowsProtected (entrants with no hand played yet when a league first hour
+        // was marked), toldOnSignIn, errors (should stay 0).
         tournamentSitOutLimit: { ...awayStreakStats, handsLimit: TOURNAMENT_SIT_OUT_HANDS_LIMIT, pendingSignInNotices: removalSignInNotices.size },
         // 2026-10-28 — handComplete is NOT a freeze count: it includes the
         // benign re-seeds of a public table everyone left (~29 per 45 h) and
@@ -5688,11 +5689,13 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
       qt.status = 'running';
       qt.tournamentId = result.tournamentId;
       // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — a LEAGUE
-      // night's no-shows (seated just now with nobody at the seat) are not removed
-      // for sitting out before late entry closes (7:00 PM MT); their hands count.
-      // Review fix (2026-11-26) — ONLY the true no-shows: the registrants with no
-      // live socket at the start (`absent` above), never one who was here.
-      if (noShowsSeatedAbsent(qt.kind)) markNoShowProtection(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil, absent.map((p) => p.playerId));
+      // night's first hour (owner 2026-11-25 11:15 PM: "A player who is seated
+      // before 6 and then leaves before never played a hand so they should get
+      // the 1st hour to play a hand"): every entrant who has NOT PLAYED A HAND yet
+      // is not removed for sitting out before late entry closes (7:00 PM MT) —
+      // away at the start, here then gone, playing elsewhere, a late entrant;
+      // their hands count. Not a list: the whole night (markLeagueFirstHour).
+      if (noShowsSeatedAbsent(qt.kind)) markLeagueFirstHour(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil);
 
       // Notify all registered players — 2026-10-10: on the socket his seat was
       // bound to (bindRegistrantSocket — his own; '' = none), never on a
@@ -6468,8 +6471,6 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
   const qt = qualifierTournaments.get(qualId);
   let seated = 0;
   let seatedAbsent = 0;   // 2026-11-25 — a league night's no-shows seated absent at the deal
-  // Review fix (2026-11-26) — WHO (2b) seated absent: the only no-shows the deal protects.
-  const noShowIds: string[] = [];
   let released = 0;
   let rebound = 0;
   let breaks = 0;
@@ -6502,10 +6503,7 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
         noteLeagueNoShowsSeatedAbsent(qualId, qt, absent, 'deal');
         for (const p of absent) {
           if (!qt.players.includes(p) || !qualifierRegistrantIsPending(tournamentId, p)) continue;
-          if (seatPresentPendingAtDeal(qualId, qt, p)) {
-            seatedAbsent++;
-            noShowIds.push(p.playerId);
-          }
+          if (seatPresentPendingAtDeal(qualId, qt, p)) seatedAbsent++;
         }
       }
       // (4) Review fix-up — each one in its own try: one failure never blocks the deal.
@@ -6526,14 +6524,13 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
       // (6) Review fix-up — the start's seating: even with the balance switch off.
       balanceMoves = balanceQualifierTablesNow(tournamentId, { ignoreSwitch: true });
       // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — a LEAGUE
-      // night's TRUE no-shows are not removed for sitting out before late entry
-      // closes (7:00 PM MT); their hands count. Cleared when he arrives.
-      // Review fix (2026-11-26) — ONLY the ones (2b) seated absent (absent PENDING:
-      // never a seat or a session in the early rooms). One who ARRIVED (sat at his
-      // early-room seat with a session, e.g. 5:52 PM) and left before the deal is
-      // NOT protected (it used to be: his seat had no session at the deal), nor is
-      // one here who plays elsewhere.
-      if (keepNoShows) markNoShowProtection(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil, noShowIds);
+      // night's first hour (owner 2026-11-25 11:15 PM: "A player who is seated
+      // before 6 and then leaves before never played a hand so they should get
+      // the 1st hour to play a hand"): every entrant who has NOT PLAYED A HAND yet
+      // — a no-show (2b) seated absent, one who sat at his early-room seat and
+      // left, one playing elsewhere, a late entrant — is not removed for sitting
+      // out before late entry closes (7:00 PM MT); their hands count.
+      if (keepNoShows) markLeagueFirstHour(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);
       // Every table's progress listener (bust check, hand results) before its first hand.
       for (const tid of t.tableIds) {
         const table = tableManager.getTable(tid);
@@ -7686,11 +7683,20 @@ function currentTurnTimeoutMs(tableId: string): number {
  *    check (check.awayLimitSeats), which REMOVES him as if busted
  *    (removeAwayLimitSeats, in the rebalance helpers): next place, chips out of
  *    play, no bounty, every bust notice / result / rebalance path.
- *  - An Online League no-show (seated absent at the start, never arrived) is
- *    protected until the night's lateRegUntil (7:00 PM MT): his hands still
- *    count; if he is still away then, he is removed at the first hand end after
- *    it WHATEVER his count (owner order; review fix 2026-11-26: it used to wait
- *    for 30 as well) — awayStreakNoShowDue; his notices add `noShow: true`.
+ *  - The Online League's FIRST HOUR (owner 2026-11-25 11:15 PM: "A player who
+ *    is seated before 6 and then leaves before never played a hand so they
+ *    should get the 1st hour to play a hand"): on a league night
+ *    (Tournament.leagueFirstHourUntil, markLeagueFirstHour) every entrant who
+ *    has NOT PLAYED A HAND yet (TournamentPlayer.playedAHand unset: away at the
+ *    start, sat in the early rooms and left, playing elsewhere, dropped in the
+ *    start's grace, a late entrant who left before his first hand) is never
+ *    removed for sitting out until lateRegUntil (7:00 PM MT); his hands still
+ *    count. If he still has not played a hand and is away then, he is removed at
+ *    the first hand end after it WHATEVER his count (awayStreakNoShowDue; his
+ *    notices add `noShow: true`). "Played a hand" = a hand end where he was
+ *    dealt in at his live seat AND acted voluntarily or a session PLAYED his
+ *    seat; a sign-in / restore alone is not. Once played, gone for good in the
+ *    event (a re-entry keeps playedAHand).
  * Never throws into handleHandComplete / a socket handler.
  */
 const TOURNAMENT_SIT_OUT_HANDS_LIMIT = 30;
@@ -7717,18 +7723,31 @@ function awayStreakPlayedNow(tableId: string, seatIndex: number): boolean {
   }
   return false;
 }
-/** An Online League no-show still inside his first hour. */
-function awayStreakProtected(tp: TournamentPlayer, now: number): boolean {
-  return typeof tp.sitOutProtectedUntil === 'number' && now <= tp.sitOutProtectedUntil;
+/**
+ * 2026-11-26 (owner 2026-11-25 11:15 PM) — the end of this entrant's Online
+ * League first hour (the night's lateRegUntil) while he has NOT PLAYED A HAND
+ * in this event; null = no first hour (not a league night, or he played).
+ */
+function awayStreakFirstHourUntil(t: Tournament | null | undefined, tp: TournamentPlayer): number | null {
+  const until = t?.leagueFirstHourUntil;
+  if (typeof until !== 'number' || !Number.isFinite(until) || tp.playedAHand) return null;
+  return until;
+}
+/** Inside his league first hour (he has not played a hand yet and it is not 7:00 PM yet). */
+function awayStreakProtected(t: Tournament | null | undefined, tp: TournamentPlayer, now: number): boolean {
+  const until = awayStreakFirstHourUntil(t, tp);
+  return until !== null && now <= until;
 }
 /**
- * Review fix (2026-11-26) — an Online League no-show whose first hour is OVER
- * and who never arrived (the mark is still on him: a restore, I'm back, a
- * played or acted hand all delete it). Owner order: "if still away then,
- * removed at the first hand end after lateRegUntil" — whatever his count.
+ * Review fix (2026-11-26) — his league first hour is OVER and he still has not
+ * played a hand. Owner order: "if still away then, removed at the first hand
+ * end after lateRegUntil" — whatever his count. The callers require him away
+ * NOW (the hand-end count is reached only for a seat nobody played; the bust
+ * check's re-check skips a seat a session plays).
  */
-function awayStreakNoShowDue(tp: TournamentPlayer, now: number): boolean {
-  return typeof tp.sitOutProtectedUntil === 'number' && now > tp.sitOutProtectedUntil;
+function awayStreakNoShowDue(t: Tournament | null | undefined, tp: TournamentPlayer, now: number): boolean {
+  const until = awayStreakFirstHourUntil(t, tp);
+  return until !== null && now > until;
 }
 /** The entrant alive at this LIVE tournament seat (human), else null. */
 function awayStreakEntrantAt(tournamentId: string, table: PokerTable | undefined, seatIndex: number): TournamentPlayer | null {
@@ -7745,11 +7764,12 @@ function awayStreakViewOf(tournamentId: string, table: PokerTable, seatIndex: nu
   const n = tp?.sitOutHands || 0;
   if (!tp || n < 1) return null;
   const now = Date.now();
+  const t = tournamentManager.getTournament(tournamentId);
   return {
     handsSatOut: n, handsLimit: TOURNAMENT_SIT_OUT_HANDS_LIMIT,
-    // A no-show past his first hour goes at THIS hand's end if still away: 1 left, never 30 - n.
-    handsLeft: awayStreakNoShowDue(tp, now) ? 1 : Math.max(0, TOURNAMENT_SIT_OUT_HANDS_LIMIT - n),
-    protectedUntil: awayStreakProtected(tp, now) ? tp.sitOutProtectedUntil! : null,
+    // Past his first hour with no hand played, he goes at THIS hand's end if still away: 1 left, never 30 - n.
+    handsLeft: awayStreakNoShowDue(t, tp, now) ? 1 : Math.max(0, TOURNAMENT_SIT_OUT_HANDS_LIMIT - n),
+    protectedUntil: awayStreakProtected(t, tp, now) ? awayStreakFirstHourUntil(t, tp) : null,
   };
 }
 /** The 3-hand warning text (the client shows its own copy; this is the fallback). */
@@ -7757,30 +7777,22 @@ function awayStreakWarningText(handsSatOut: number, handsLeft: number, protected
   if (protectedUntil) return `You have sat out ${handsSatOut} hands in a row. If you are still away when late entry closes, you will be removed from the tournament.`;
   return `You have sat out ${handsSatOut} hands in a row. Come back within ${handsLeft} hands or you will be removed from the tournament.`;
 }
-/** I'm back / a voluntary action at this seat: the entrant's run is over (and he has arrived). */
+/**
+ * I'm back / a voluntary action at this seat: the entrant's run is over. It does
+ * not end a league first hour by itself: only a hand END he plays does
+ * (awayStreakAtHandEnd sets playedAHand).
+ */
 function awayStreakResetAt(tableId: string, seatIndex: number, why: 'back' | 'action'): void {
   try {
     const tournamentId = tournamentTables.get(tableId);
     if (!tournamentId) return;
     const tp = awayStreakEntrantAt(tournamentId, tableManager.getTable(tableId), seatIndex);
     if (!tp) return;
-    delete tp.sitOutProtectedUntil;   // he is here
     if (!(tp.sitOutHands && tp.sitOutHands > 0) && !tp.sitOutWarned) return;
     tp.sitOutHands = 0;
     tp.sitOutWarned = false;
     if (why === 'back') awayStreakStats.resetsByBack++;
     else awayStreakStats.resetsByAction++;
-  } catch {
-    awayStreakStats.errors++;
-  }
-}
-/** A restore put him back on this seat: he ARRIVED (no-show protection ends). The run itself is unchanged. */
-function awayStreakArrivedAt(tableId: string, seatIndex: number): void {
-  try {
-    const tournamentId = tournamentIdOfTable(tableId);
-    if (!tournamentId) return;
-    const tp = awayStreakEntrantAt(tournamentId, tableManager.getTable(tableId), seatIndex);
-    if (tp) delete tp.sitOutProtectedUntil;
   } catch {
     awayStreakStats.errors++;
   }
@@ -7791,7 +7803,8 @@ function awayStreakWarn(tournamentId: string, tableId: string, tp: TournamentPla
   awayStreakStats.warned++;
   const handsSatOut = tp.sitOutHands || 0;
   const handsLeft = Math.max(0, TOURNAMENT_SIT_OUT_HANDS_LIMIT - handsSatOut);
-  const protectedUntil = awayStreakProtected(tp, now) ? tp.sitOutProtectedUntil! : null;
+  const t = tournamentManager.getTournament(tournamentId);
+  const protectedUntil = awayStreakProtected(t, tp, now) ? awayStreakFirstHourUntil(t, tp) : null;
   const payload = {
     tournamentId, tableId, handsSatOut, handsLimit: TOURNAMENT_SIT_OUT_HANDS_LIMIT, handsLeft, protectedUntil,
     message: awayStreakWarningText(handsSatOut, handsLeft, protectedUntil),
@@ -7810,8 +7823,11 @@ function awayStreakWarn(tournamentId: string, tableId: string, tp: TournamentPla
  * handleHandComplete, synchronously, right after captureTournamentBustCheck
  * (the hand's seats, hole cards and actionLog are intact): count this hand for
  * every dealt-in human live seat, warn at 3, and put the seats at 30+ (not
- * protected) — and a no-show still away after his first hour, at any count
- * (awayStreakNoShowDue) — on the capture (`check.awayLimitSeats`) for its bust check.
+ * protected) — and a league entrant still away after his first hour who has not
+ * played a hand, at any count (awayStreakNoShowDue) — on the capture
+ * (`check.awayLimitSeats`) for its bust check. A seat that acted or that a
+ * session played at this hand end PLAYED A HAND (TournamentPlayer.playedAHand,
+ * never cleared: the league's first hour is over for him).
  * Idempotent per tableId:handNumber. null check = not a tournament table.
  */
 function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: TournamentBustCheck | null): void {
@@ -7831,7 +7847,7 @@ function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: Tourname
       tp.sitOutLastHand = key;
       const acted = awayStreakActed(table, i);
       const played = awayStreakPlayedNow(tableId, i);
-      if (acted || played) delete tp.sitOutProtectedUntil;   // he arrived
+      if (acted || played) tp.playedAHand = true;   // 2026-11-26 — he played a hand: no league first hour any more
       if (acted) {
         if ((tp.sitOutHands || 0) > 0 || tp.sitOutWarned) awayStreakStats.resetsByAction++;
         tp.sitOutHands = 0;
@@ -7842,12 +7858,13 @@ function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: Tourname
       if (seat.chipCount <= 0) continue;       // busted this hand: the bust check settles him
       tp.sitOutHands = (tp.sitOutHands || 0) + 1;
       awayStreakStats.counted++;
-      // Review fix (2026-11-26) — a no-show still away after his first hour goes NOW,
-      // whatever his count (never a "come back within N hands" warning first).
-      const noShowDue = awayStreakNoShowDue(tp, now);
+      // Review fix (2026-11-26) — a league entrant who has not played a hand, still away
+      // after his first hour, goes NOW whatever his count (never a "come back within N
+      // hands" warning first).
+      const noShowDue = awayStreakNoShowDue(t, tp, now);
       if (tp.sitOutHands >= TOURNAMENT_SIT_OUT_WARN_AT && !tp.sitOutWarned && !noShowDue) awayStreakWarn(tournamentId, tableId, tp, now);
       if (tp.sitOutHands < TOURNAMENT_SIT_OUT_HANDS_LIMIT && !noShowDue) continue;
-      if (awayStreakProtected(tp, now)) { awayStreakStats.protectedHands++; continue; }
+      if (awayStreakProtected(t, tp, now)) { awayStreakStats.protectedHands++; continue; }
       if (!check.awayLimitSeats) check.awayLimitSeats = new Map();
       check.awayLimitSeats.set(i, tp.playerId);
     }
@@ -7857,33 +7874,26 @@ function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: Tourname
   }
 }
 /**
- * An Online League NO-SHOW seated ABSENT at the start: protected until `until`
- * (the night's lateRegUntil). Review fix (2026-11-26) — ONLY the true no-shows
- * the caller names (`noShowPlayerIds`): the 6:00 PM start's registrants with no
- * live socket at the start (partitionByPresence's absent list), the early
- * rooms' deal's step (2b) (absent PENDING registrants seated absent: never a
- * seat or a session in the early rooms). It used to mark every alive entrant
- * with no session at his seat, so one who ARRIVED in the early rooms (sat at
- * his seat, e.g. 5:52 PM) and left before the 6:00 PM deal was protected; the
- * owner's rule: one who arrived and left is NOT. A named entrant whose seat has
- * a session now is still skipped. Returns how many were marked.
+ * 2026-11-26 (owner 2026-11-25 11:15 PM: "A player who is seated before 6 and
+ * then leaves before never played a hand so they should get the 1st hour to
+ * play a hand"; replaces the "never arrived" list) — an ONLINE LEAGUE night's
+ * first hour: Tournament.leagueFirstHourUntil is set to `until` (the night's
+ * lateRegUntil, 7:00 PM MT). Every entrant who has not played a hand
+ * (playedAHand unset) is protected until then — whoever he is and whenever he
+ * entered (away at the start, sat in the early rooms and left, playing
+ * elsewhere, dropped in the start's grace, a late entrant); nobody is named.
+ * Both league starts call it (the 6:00 PM start, the early rooms' deal); no
+ * other tournament ever has it. Returns how many alive entrants have not played
+ * a hand yet (health noShowsProtected).
  */
-function markNoShowProtection(tournamentId: string, until: number, noShowPlayerIds: Iterable<string>): number {
+function markLeagueFirstHour(tournamentId: string, until: number): number {
   try {
     const t = tournamentManager.getTournament(tournamentId);
     if (!t || !Number.isFinite(until)) return 0;
-    const noShows = new Set(noShowPlayerIds);
-    let n = 0;
-    for (const tp of t.players) {
-      if (tp.eliminated || !noShows.has(tp.playerId)) continue;
-      const tableId = t.playerTableMap.get(tp.playerId) ?? t.tableId ?? undefined;
-      const idx = tableId ? tournamentLiveSeatIndex(tableManager.getTable(tableId), tp.playerId) : -1;
-      if (!tableId || idx < 0 || seatHasLiveSession(tableId, idx)) continue;
-      tp.sitOutProtectedUntil = until;
-      n++;
-    }
+    t.leagueFirstHourUntil = until;
+    const n = t.players.filter((tp) => !tp.eliminated && !tp.playedAHand).length;
     awayStreakStats.noShowsProtected += n;
-    if (n > 0) console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_no_show_protected', tournamentId, until, marked: n })}`);
+    console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_no_show_protected', tournamentId, until, notPlayedYet: n })}`);
     return n;
   } catch {
     awayStreakStats.errors++;
@@ -25770,9 +25780,9 @@ function restoreSeatReservation(
     sitOutTracker.get(reserved.tableId)?.delete(reserved.seatIndex);
   }
   syncSitOutToTable(reserved.tableId);
-  // 2026-11-25 (owner) — a tournament seat restored: he ARRIVED (an Online League
-  // no-show's protection ends); his sat-out run is NOT reset by a restore.
-  if (isTournamentReservation(reserved)) awayStreakArrivedAt(reserved.tableId, reserved.seatIndex);
+  // 2026-11-25 (owner) — a restored tournament seat: his sat-out run is NOT reset
+  // by a restore. 2026-11-26 (owner) — nor does a restore end an Online League
+  // first hour: only a hand END he plays does (awayStreakAtHandEnd).
   // 2026-06-11 audit E5: only forgive dead-blind debt for a genuine
   // connectivity blip — a player who was SITTING OUT owes what accrued.
   if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
@@ -26525,9 +26535,10 @@ function restoreAbsentTournamentSeat(
   seat.missedBlind = 'none';
   tp.socketId = socket.id;
   voluntarilyAbsentTournamentEntrants.delete(voluntaryAbsenceKey(tournamentId, tp.playerId));
-  // 2026-11-25 (owner) — he ARRIVED: an Online League no-show's first-hour protection
-  // ends. His sat-out run is NOT reset by a restore (only an action / I'm back).
-  delete tp.sitOutProtectedUntil;
+  // 2026-11-25 (owner) — his sat-out run is NOT reset by a restore (only an action /
+  // I'm back). 2026-11-26 (owner: "seated before 6 and then leaves before never played
+  // a hand") — a sign-in alone does not end an Online League first hour either: only
+  // a hand END he plays does (awayStreakAtHandEnd).
   tournamentSeatKeep.returned++;
   // F87 (2026-10-21) — + sittingOut: a tournament seat comes back playing (P-j).
   socket.emit('reconnectedToTable', { tableId, seatIndex, tournamentId, sittingOut: false });
@@ -29669,10 +29680,11 @@ function tellRemovalSignInNotices(socket: Socket, auth: SocketAuthSession, via: 
  * runTournamentBustCheck, BEFORE its candidate scan: each seat this hand's
  * capture put on `check.awayLimitSeats` is re-checked NOW (still that
  * entrant's live seat with chips, he is alive, the table is not broken and no
- * hand is in progress there, his run is still 30+ or he is a no-show past his
- * first hour (awayStreakNoShowDue) — an I'm back, an action or a restore during
- * the hand-end awaits ends that — he is not protected and nobody plays
- * the seat now) and his stack is set to 0: the bust loop then eliminates him
+ * hand is in progress there, his run is still 30+ (an I'm back or an action
+ * during the hand-end awaits ends that) or he is a league entrant past his first
+ * hour who has not played a hand (awayStreakNoShowDue), he is not protected and
+ * nobody plays the seat now (a restore / I'm back during the awaits) and his
+ * stack is set to 0: the bust loop then eliminates him
  * exactly like a bust of this hand (next place, ordered and tied with this
  * hand's busts by pre-hand stack, a hand-for-hand round's bust), with NO
  * eliminator (no bounty). His chips leave play. One shot per capture; a
@@ -29709,9 +29721,9 @@ function removeAwayLimitSeats(
     else if (!seat || seat.state !== 'occupied' || seat.playerId !== pid || seat.eliminated || seat.isAI) skip = 'seat_changed';
     else if (!tp || tp.eliminated) skip = 'not_alive';
     else if (seat.chipCount <= 0) skip = 'busted';
-    // Review fix (2026-11-26) — a no-show past his first hour is due at ANY count (as at the hand end).
-    else if ((tp.sitOutHands || 0) < TOURNAMENT_SIT_OUT_HANDS_LIMIT && !awayStreakNoShowDue(tp, now)) skip = 'back';
-    else if (awayStreakProtected(tp, now)) skip = 'protected';
+    // Review fix (2026-11-26) — past his league first hour with no hand played: due at ANY count (as at the hand end).
+    else if ((tp.sitOutHands || 0) < TOURNAMENT_SIT_OUT_HANDS_LIMIT && !awayStreakNoShowDue(t, tp, now)) skip = 'back';
+    else if (awayStreakProtected(t, tp, now)) skip = 'protected';
     else if (awayStreakPlayedNow(tableId, i)) skip = 'playing';
     else if (left <= 1) skip = 'last_standing';
     if (skip) {
@@ -29720,10 +29732,10 @@ function removeAwayLimitSeats(
       continue;
     }
     const chips = seat.chipCount;
-    // Review fix (2026-11-26) — a no-show (the mark still on him: he never arrived) is
-    // removed because late entry closed, not for 30 hands: the notices say so
+    // Review fix (2026-11-26) — a league entrant who never played a hand, past his first
+    // hour, is removed because late entry closed, not for 30 hands: the notices say so
     // (`noShow: true`) and carry his REAL count.
-    const noShow = tp!.sitOutProtectedUntil !== undefined;
+    const noShow = awayStreakNoShowDue(t, tp!, now);
     tp!.removedFor = 'sat_out_limit';
     tp!.removedSatOutHands = noShow ? Math.max(1, tp!.sitOutHands || 0) : TOURNAMENT_SIT_OUT_HANDS_LIMIT;
     if (noShow) tp!.removedNoShow = true;

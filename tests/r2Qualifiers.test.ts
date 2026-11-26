@@ -2280,7 +2280,11 @@ const S4_SEATS_CODE = [
 const S4_AT = Date.parse('2026-10-25T17:00:00.000Z');   // Sunday 11:00:00 MT
 const S4_MIN = 60_000;
 
-function earlyRoomsWorld(opts: { leadEnv?: string; overflowMax?: number; balance?: '0' | '1'; suspended?: string[]; screenGate?: Promise<void>; extraCode?: string } = {}) {
+function earlyRoomsWorld(opts: {
+  leadEnv?: string; overflowMax?: number; balance?: '0' | '1'; suspended?: string[]; screenGate?: Promise<void>; extraCode?: string;
+  /** CONTROL cases: put pre-fix code back into the sliced source (S4_CODE). */
+  codeOver?: (src: string) => string;
+} = {}) {
   jest.setSystemTime(S4_AT - 30 * S4_MIN);
   const qualifierTournaments = new Map<string, any>();
   const tm = new TournamentManager();
@@ -2372,7 +2376,7 @@ function earlyRoomsWorld(opts: { leadEnv?: string; overflowMax?: number; balance
     ensureChipsForBuyIn: async () => 0, deductChips: async () => false, addChipsToUser: async () => true,
     app: { post: (p: string, fn: (req: any, res: any) => void) => { routes.set(p, fn); } },
   };
-  const { exports: m } = load(`${S4_CODE}\n${opts.extraCode || ''}\nfunction wire(socket) {\n${S4_SEAT_SESSION_FOR}\n  ${S4_HANDLERS}\n}`, scope, `{
+  const { exports: m } = load(`${opts.codeOver ? opts.codeOver(S4_CODE) : S4_CODE}\n${opts.extraCode || ''}\nfunction wire(socket) {\n${S4_SEAT_SESSION_FOR}\n  ${S4_HANDLERS}\n}`, scope, `{
     wire, applyQualifierSchedule, qualifierList, tickQualifierAutoStart, tickQualifierScreens, runPreStartDeal, qualifierPreStartHolds,
     qualifierPreStart, qualifierPreStartHealth, qualifierNoShows, sweepTournamentRebalances, handleTableRebalance,
     serviceQualifierOverflowTables, startFreshTournamentTable, qualifierOverflowTables, applyDirectorPause, tournamentClockStateFor,
@@ -2778,23 +2782,70 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
   });
 
-  // Review fix (2026-11-26) — the 30-hand rule's first hour (owner 2026-11-25, Online League only):
-  // ONLY a TRUE no-show is protected until late entry closes. A league player who ARRIVED (sat at his
-  // early-room seat with a session, e.g. 5:52 PM) and left before the 6:00 PM deal is not — the old
-  // marking took everyone with no session at his seat at the deal. The REAL deal / start and the
-  // REAL markNoShowProtection; CONTROL = the old marking (the name filter gone).
-  // tests/tournamentSitOutLimit.test.ts runs the count and the removal at 30.
-  const S4_MARK_CODE = (old: boolean) => {
-    const mark = fnSrc('function markNoShowProtection(');
-    const oldMark = mark.replace('      if (tp.eliminated || !noShows.has(tp.playerId)) continue;', '      if (tp.eliminated) continue;');
-    expect(oldMark).not.toBe(mark);
-    return [fnSrc('function seatHasLiveSession('), slice('const awayStreakStats = {', '\n};\n'), old ? oldMark : mark].join('\n');
+  // 2026-11-26 (owner 2026-11-25 ~11:15 PM MT: "A player who is seated before 6 and then leaves before
+  // never played a hand so they should get the 1st hour to play a hand") — the 30-hand rule's first
+  // hour (Online League only) belongs to EVERY entrant who has NOT PLAYED A HAND yet: both REAL starts
+  // mark the NIGHT (markLeagueFirstHour -> Tournament.leagueFirstHourUntil), nobody is named. At the
+  // start nobody has played a hand, so everyone is inside it (a hand end he plays ends it:
+  // tests/tournamentSitOutLimit.test.ts runs the hands, the count and the removals).
+  // CONTROL = the PREVIOUS rule (039757f) put back into the REAL starts: only the "never arrived"
+  // no-shows the start named got a per-entry mark (sitOutProtectedUntil).
+  const S4_MARK_CODE = [fnSrc('function seatHasLiveSession('), slice('const awayStreakStats = {', '\n};\n'), fnSrc('function markLeagueFirstHour(')].join('\n');
+  /** The previous rule's marking, verbatim but for its log line (no template literal here). */
+  const PREVIOUS_MARK = [
+    'function markNoShowProtection(tournamentId: string, until: number, noShowPlayerIds: Iterable<string>): number {',
+    '  try {',
+    '    const t = tournamentManager.getTournament(tournamentId);',
+    '    if (!t || !Number.isFinite(until)) return 0;',
+    '    const noShows = new Set(noShowPlayerIds);',
+    '    let n = 0;',
+    '    for (const tp of t.players) {',
+    '      if (tp.eliminated || !noShows.has(tp.playerId)) continue;',
+    '      const tableId = t.playerTableMap.get(tp.playerId) ?? t.tableId ?? undefined;',
+    '      const idx = tableId ? tournamentLiveSeatIndex(tableManager.getTable(tableId), tp.playerId) : -1;',
+    '      if (!tableId || idx < 0 || seatHasLiveSession(tableId, idx)) continue;',
+    '      tp.sitOutProtectedUntil = until;',
+    '      n++;',
+    '    }',
+    '    awayStreakStats.noShowsProtected += n;',
+    "    if (n > 0) console.log('[Tournament] ' + JSON.stringify({ event: 'tournament_no_show_protected', tournamentId, until, marked: n }));",
+    '    return n;',
+    '  } catch {',
+    '    awayStreakStats.errors++;',
+    '    return 0;',
+    '  }',
+    '}',
+  ].join('\n');
+  /** The previous starts: the 6:00 PM tick named its absent registrants, the deal named (2b)'s seated-absent ones. */
+  const previousStarts = (src: string): string => {
+    const swaps: Array<[string, string]> = [
+      ['      if (noShowsSeatedAbsent(qt.kind)) markLeagueFirstHour(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil);',
+        '      if (noShowsSeatedAbsent(qt.kind)) markNoShowProtection(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil, absent.map((p) => p.playerId));'],
+      ["  let seatedAbsent = 0;   // 2026-11-25 — a league night's no-shows seated absent at the deal\n",
+        "  let seatedAbsent = 0;   // 2026-11-25 — a league night's no-shows seated absent at the deal\n  const noShowIds: string[] = [];\n"],
+      ['          if (seatPresentPendingAtDeal(qualId, qt, p)) seatedAbsent++;',
+        '          if (seatPresentPendingAtDeal(qualId, qt, p)) { seatedAbsent++; noShowIds.push(p.playerId); }'],
+      ['      if (keepNoShows) markLeagueFirstHour(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);',
+        '      if (keepNoShows) markNoShowProtection(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil, noShowIds);'],
+    ];
+    for (const [now, before] of swaps) {
+      expect(src.split(now).length).toBe(2);
+      src = src.replace(now, before);
+    }
+    return src;
   };
-  /** Each entrant's no-show protection (null = none). */
-  const protectionOf = (w: ReturnType<typeof earlyRoomsWorld>) => Object.fromEntries(w.tour().players.map((p: any) => [p.playerId, p.sitOutProtectedUntil ?? null]));
-  /** E7c's morning with a REAL departure: S1, S2 seated at the open (S2 ARRIVED: bound to his seat), S2 leaves; S3, S4 pending offline; dealt at 11:00. */
-  const leagueDealAfterArrivalLeft = async (old: boolean) => {
-    const { w } = await openedEarly(4, 2, { extraCode: S4_MARK_CODE(old) });
+  const startOpts = (previous: boolean) => (previous
+    ? { codeOver: previousStarts, extraCode: [fnSrc('function seatHasLiveSession('), slice('const awayStreakStats = {', '\n};\n'), PREVIOUS_MARK].join('\n') }
+    : { extraCode: S4_MARK_CODE });
+  /** Each entrant's first hour (null = none): the night's mark while he has played no hand; under CONTROL the previous per-entry mark. */
+  const protectionOf = (w: ReturnType<typeof earlyRoomsWorld>) => {
+    const t: any = w.tour();
+    return Object.fromEntries(t.players.map((p: any) => [p.playerId,
+      typeof t.leagueFirstHourUntil === 'number' && !p.playedAHand ? t.leagueFirstHourUntil : (p.sitOutProtectedUntil ?? null)]));
+  };
+  /** E7c's morning with a REAL departure: S1, S2 seated at the open (S2 SAT at his seat before 11:00), S2 leaves; S3, S4 pending offline; dealt at 11:00. */
+  const leagueDealAfterArrivalLeft = async (previous: boolean) => {
+    const { w } = await openedEarly(4, 2, startOpts(previous));
     w.qt().kind = 'league';
     expect(w.playerSessions.get('S2')).toMatchObject({ playerId: 'user-1002' });
     w.offline('S2');
@@ -2804,24 +2855,27 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     return { w, until: qualifierWindows(S4_AT, w.qt().qualifierType).lateRegUntil };
   };
 
-  it('E7e — LEAGUE night: one who ARRIVED in the early rooms and LEFT before the deal is NOT protected; the 2 PENDING ones (2b) seats absent ARE, until late entry closes', async () => {
+  it('E7e — LEAGUE night (THE OWNER\'S CASE): one SEATED in the early rooms who LEFT before the deal never played a hand — protected until late entry closes, like the 2 PENDING ones (2b) seats absent and everyone else (no hand played yet)', async () => {
     const { w, until } = await leagueDealAfterArrivalLeft(false);
     expect(w.m.qualifierPreStartHolds.size).toBe(0);
-    expect(protectionOf(w)).toEqual({ 'user-1001': null, 'user-1002': null, 'user-1003': until, 'user-1004': until });
-    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ tournamentId: w.qt().tournamentId, until, marked: 2 })]);
+    expect(w.tour().leagueFirstHourUntil).toBe(until);
+    expect(protectionOf(w)).toEqual({ 'user-1001': until, 'user-1002': until, 'user-1003': until, 'user-1004': until });
+    expect(w.tour().players.some((p: any) => p.playedAHand)).toBe(false);   // the deal itself is no played hand
+    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ tournamentId: w.qt().tournamentId, until, notPlayedYet: 4 })]);
     expect(w.logEvents('qualifier_prestart_deal')).toEqual([expect.objectContaining({ seated: 0, seatedAbsent: 2, released: 0, alive: 4 })]);
     expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
   });
 
-  it('E7e CONTROL — the old marking (everyone with no session at his seat at the deal) protects the one who ARRIVED and left too', async () => {
+  it('E7e CONTROL — the previous rule (the deal named only (2b)\'s seated-absent no-shows): the one who SAT at his early-room seat and left got no first hour', async () => {
     const { w, until } = await leagueDealAfterArrivalLeft(true);
-    expect(protectionOf(w)).toEqual({ 'user-1001': null, 'user-1002': until, 'user-1003': until, 'user-1004': until });
-    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ marked: 3 })]);
+    expect(w.tour().leagueFirstHourUntil).toBeUndefined();
+    expect(protectionOf(w)).toEqual({ 'user-1001': null, 'user-1002': null, 'user-1003': until, 'user-1004': until });
+    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ marked: 2 })]);
   });
 
-  /** Lead 0 (the 6:00 PM start of before) on a league night: S4 never here; S3 seen 60 s before the start, gone 30 s before (the 2-minute grace: HERE). */
-  const leagueStartWithGraceBlip = async (old: boolean) => {
-    const w = earlyRoomsWorld({ leadEnv: '0', extraCode: S4_MARK_CODE(old) });
+  /** Lead 0 (the 6:00 PM start of before) on a league night: S4 never here; S3 seen 60 s before the start, gone 30 s before (dropped inside the 2-minute grace). */
+  const leagueStartWithGraceBlip = async (previous: boolean) => {
+    const w = earlyRoomsWorld({ leadEnv: '0', ...startOpts(previous) });
     w.sync();
     await w.register(4);
     w.qt().kind = 'league';
@@ -2834,21 +2888,37 @@ describe('2026-10-23 (qualifier lifecycle S4, owner: "open the rooms 10 minutes 
     return { w, until: qualifierWindows(S4_AT, w.qt().qualifierType).lateRegUntil };
   };
 
-  it('E7f — LEAGUE night, lead 0: the 6:00 PM start protects ONLY the registrant with no live socket at the start (partitionByPresence\'s absent); one HERE in the grace with no socket is not', async () => {
+  it('E7f — LEAGUE night, lead 0: the 6:00 PM start marks the NIGHT: the one who DROPPED inside the 2-minute grace and the one never here are protected (as is everyone until he plays a hand)', async () => {
     const { w, until } = await leagueStartWithGraceBlip(false);
     expect(w.qt().status).toBe('running');
     expect(w.m.qualifierPreStart.opened).toBe(0);
     expect(w.tour().players.map((p: any) => p.playerId).sort()).toEqual(['user-1001', 'user-1002', 'user-1003', 'user-1004']);
     expect([...w.playerSessions.values()].map((s: any) => s.playerId).sort()).toEqual(['user-1001', 'user-1002']);   // S3 / S4 seated absent
     expect(w.audits.filter((a) => a.action === 'QUALIFIER_NO_SHOW_SEATED_ABSENT').map((a) => [a.d.masterId, a.d.where])).toEqual([['m-4', 'start']]);
-    expect(protectionOf(w)).toEqual({ 'user-1001': null, 'user-1002': null, 'user-1003': null, 'user-1004': until });
-    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ until, marked: 1 })]);
+    expect(w.tour().leagueFirstHourUntil).toBe(until);
+    expect(protectionOf(w)).toEqual({ 'user-1001': until, 'user-1002': until, 'user-1003': until, 'user-1004': until });
+    expect(w.logEvents('tournament_no_show_protected')).toEqual([expect.objectContaining({ until, notPlayedYet: 4 })]);
     expect(w.logs.filter((l) => l.startsWith('ERR'))).toEqual([]);
   });
 
-  it('E7f CONTROL — the old marking (everyone with no session at his seat at the start) protects the one HERE in the grace too', async () => {
+  it('E7f CONTROL — the previous rule (the start named only partitionByPresence\'s absent): the one who dropped inside the grace got no first hour', async () => {
     const { w, until } = await leagueStartWithGraceBlip(true);
-    expect(protectionOf(w)).toEqual({ 'user-1001': null, 'user-1002': null, 'user-1003': until, 'user-1004': until });
+    expect(w.tour().leagueFirstHourUntil).toBeUndefined();
+    expect(protectionOf(w)).toEqual({ 'user-1001': null, 'user-1002': null, 'user-1003': null, 'user-1004': until });
+  });
+
+  it('E7g — a WEEKLY start (lead 0) marks no first hour: nobody is protected, as before', async () => {
+    const w = earlyRoomsWorld({ leadEnv: '0', extraCode: S4_MARK_CODE });
+    w.sync();
+    await w.register(4);
+    w.offline('S4');
+    await w.screenAt(S4_AT - 5 * S4_MIN);
+    w.tickAt(S4_AT - 60_000);
+    w.tickAt(S4_AT);
+    expect(w.qt().status).toBe('running');
+    expect(w.tour().leagueFirstHourUntil).toBeUndefined();
+    expect(Object.values(protectionOf(w)).every((v) => v === null)).toBe(true);
+    expect(w.logEvents('tournament_no_show_protected')).toEqual([]);
   });
 
   it('E8 — lead 0 (QUALIFIER_TABLES_OPEN_BEFORE_MIN=0): nothing opens early; the start second takes the path of before (dealt at once, no hold)', async () => {
