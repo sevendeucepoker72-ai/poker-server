@@ -7183,8 +7183,10 @@ function getGameStateForPlayer(
   // cash table, so the per-socket delta clears it): 'short_table' while this
   // tournament table is HELD with fewer than 4 alive while 2+ tables play
   // (poker-3d shows "Waiting for players to be moved to this table." and hides
-  // Deal now).
-  stateObj.tableHold = stateTournamentId && tournamentTableShortHeld(stateTournamentId, table.config.tableId) ? 'short_table' : null;
+  // Deal now). Review fix-up: null while the tournament is PAUSED (the early
+  // rooms' 'prestart' hold, a director's pause, a break) — the pause holds the
+  // table then, not FIX 1 (tournamentTableHoldForState).
+  stateObj.tableHold = stateTournamentId ? tournamentTableHoldForState(stateTournamentId, table.config.tableId) : null;
 
   // 2026-10-11 (R1 contract #2) — what kind of table this is and whether a
   // rebuy is allowed here, ALWAYS present (the `rebuy` handler refuses with
@@ -28855,7 +28857,8 @@ const TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL = 4;
  * auto-balancing brings it to TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL? true when
  * the tournament is running, has more than one table, `tableId` is one of them
  * and fewer than 4 alive entrants are mapped there (TournamentManager's count:
- * present or away). Pure (no side effect): the gameState's `tableHold` reads it.
+ * present or away). Pure (no side effect): the gameState's `tableHold` reads it
+ * through tournamentTableHoldForState (never while the tournament is paused).
  * Every deal path asks it AFTER its bust-check wait (a 0-chip entrant counts
  * alive until his bust check ran) and after the under-5 planned break (so the
  * final merges [5,4] / [6,3] still run): autoStartNextHand,
@@ -28868,6 +28871,29 @@ function tournamentTableShortHeld(tournamentId: string, tableId: string): boolea
   const t = tournamentManager.getTournament(tournamentId);
   if (!t || t.status !== 'running' || t.tableIds.length <= 1 || !t.tableIds.includes(tableId)) return false;
   return tournamentManager.getAlivePlayersOnTable(tournamentId, tableId).length < TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL;
+}
+
+/**
+ * FIX 1 review fix-up (2026-11-25) — the gameState's `tableHold` for `tableId`:
+ * 'short_table' only when FIX 1 is really what holds the table, i.e.
+ * tournamentTableShortHeld AND the tournament is NOT paused. A paused tournament
+ * is held by the PAUSE, whatever its table counts: the early rooms' hold before
+ * the first deal (pauseReason 'prestart' — a weekly with 12 registrants opens
+ * [3,2] for up to 10 minutes; the start's own seating and fill run before its
+ * deal), a director's pause, a scheduled break. Those tables used to show
+ * "Waiting for players to be moved to this table." for the whole pause. Every
+ * un-pause re-sends each table's state (runPreStartDeal step 9 — its deal
+ * notes a still-short table's hold episode first —, applyDirectorPause, a
+ * break's end through 'blindLevelUp'), so a table still short then shows the
+ * hold at once. null = no FIX 1 hold. Pure. Display only: the deal paths keep
+ * asking tournamentTableShortHeld (a paused tournament deals nothing anyway —
+ * autoStartNextHand, tournamentDealHoldReason, restartWaitingTournamentTables
+ * and the 5 s sweep stop on the pause before they ask), so the deal rule is
+ * unchanged.
+ */
+function tournamentTableHoldForState(tournamentId: string, tableId: string): 'short_table' | null {
+  if (tournamentManager.getTournament(tournamentId)?.paused) return null;
+  return tournamentTableShortHeld(tournamentId, tableId) ? 'short_table' : null;
 }
 
 /**

@@ -1958,7 +1958,9 @@ balanceQualifierTables(tId, tableId, table);
 # idle tables, the 5 s sweep (which also re-kicks held tables once filled), a
 # break end, a resume, the early rooms' deal, a hand-for-hand round start (a
 # table still short is marked played: never waited for). The final table and
-# single-table events are never held. gameState tableHold; lobby
+# single-table events are never held. gameState tableHold (null while the
+# tournament is paused — the early rooms' prestart hold, a director pause, a
+# break: tournamentTableHoldForState); lobby
 # minTablePlayers; health tournamentSafety.shortTableHolds. tests/rebalanceSafety.test.ts FIX1-*.
 TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL = 4
 tournament_short_table_held
@@ -1977,6 +1979,7 @@ fillShortTournamentTables(tId, tableId, table);
 serviceShortTournamentTables();
 shortTableHolds
 stateObj.tableHold =
+tournamentTableHoldForState(
 minTablePlayers: 4
 
 # 2026-10-23 qualifier lifecycle S3 (owner 2026-10-22: "run the blinds and raise

@@ -4582,6 +4582,7 @@ s2x.plan = planTournamentRebalance; s2x.late = seatQualifierLateEntrant; s2x.bus
 s2x.short = tournamentShortTableHolds; s2x.holdReason = tournamentDealHoldReason; s2x.sweep = serviceShortTournamentTables;
 s2x.fillNow = fillShortTournamentTablesNow; s2x.episodes = tournamentShortTableEpisodes;
 s2x.restartWaiting = restartWaitingTournamentTables; s2x.isShort = tournamentTableShortHeld;
+s2x.tableHoldForState = tournamentTableHoldForState;
 `;
   const BALANCED = '"event":"qualifier_table_balanced"';
 
@@ -5387,6 +5388,75 @@ s2x.restartWaiting = restartWaitingTournamentTables; s2x.isShort = tournamentTab
     expect(p.t('TC').handNumber).toBe(0);                                    // paused: never dealt (the break end / resume kicks it)
   });
 
+  // FIX 1 review fix-up (2026-11-25) — the gameState's `tableHold` is 'short_table' only when FIX 1 is
+  // really what holds the table: never while the tournament is PAUSED. The early rooms' hold before the
+  // first deal (pauseReason 'prestart': a weekly with 12 registrants opens [3,2] for up to 10 minutes),
+  // a director's pause and a scheduled break hold every table whatever its count; those tables used to
+  // show "Waiting for players to be moved to this table." for the whole pause.
+  /** The REAL table state (getVariantInfo + getGameStateForPlayer) and its tableHold line. */
+  const GAME_STATE = fnSrc('function getVariantInfo(') + fnSrc('function getGameStateForPlayer(');
+  const TABLE_HOLD_LINE = 'stateObj.tableHold = stateTournamentId ? tournamentTableHoldForState(stateTournamentId, table.config.tableId) : null;';
+  /** The line before the fix-up (the CONTROL): the short-table predicate alone. */
+  const PRE_FIXUP_TABLE_HOLD_LINE = "stateObj.tableHold = stateTournamentId && tournamentTableShortHeld(stateTournamentId, table.config.tableId) ? 'short_table' : null;";
+  /** `id`'s tableHold as a spectator's full state shows it, through the REAL getGameStateForPlayer on world `x`. */
+  function tableHoldOf(x: Bal, src: string = GAME_STATE) {
+    const { exports: g, stubbed } = load(src, {
+      tournamentIdOfTable: (id: string) => (x.ids().includes(id) ? x.w.tid : null), tournamentManager: x.w.tm,
+      tournamentTableHoldForState: x.s2x.tableHoldForState, tournamentTableShortHeld: x.s2x.isShort,
+      PokerTable, GamePhase, MAX_SEATS: 9, playerSessions: new Map(), multiTableSessions: new Map(), reservedSeats: new Map(),
+      authSessions: new Map(), turnStartedAtMap: new Map(), TURN_TIMEOUT_MS: 30000, bombPotActive: new Map(), dealersChoiceState: new Map(),
+      cardToString: (c: any) => `${c.rank}${c.suit}`, insuranceQuoteForSeat: () => null, tableKindOf: () => 'tournament', rebuyAllowedAt: () => false,
+    }, '{ getGameStateForPlayer }');
+    expect([...stubbed].filter((n) => /tableHold|ShortHeld|tournamentIdOfTable|tournamentManager/.test(n))).toEqual([]);
+    return (id: string) => (g.getGameStateForPlayer(x.t(id), -1) as any).tableHold;
+  }
+
+  it('FIX1-11 — tableHold is null while the tournament is PAUSED (early rooms prestart [3,2], a director pause, a break) and \'short_table\' again the moment it runs; the deal rule is unchanged (still short, deal hold \'paused\'); CONTROL: the pre-fix-up line said short_table through the prestart hold', () => {
+    expect(GAME_STATE).toContain(TABLE_HOLD_LINE);
+    // (a) The early rooms: a weekly with 12 registrants opens [3,2], held before the first deal.
+    const e = bal({ layout: { TA: field('a', 3, 5000, 100), TB: field('b', 2, 5000, 200) } });
+    expect(e.w.tm.pauseTournament(e.w.tid, true, 'prestart')).toBe(true);
+    expect(e.w.tm.getTournament(e.w.tid)!.pauseReason).toBe('prestart');
+    const hold = tableHoldOf(e);
+    expect([hold('TA'), hold('TB')]).toEqual([null, null]);
+    expect([e.s2x.tableHoldForState(e.w.tid, 'TA'), e.s2x.tableHoldForState(e.w.tid, 'TB')]).toEqual([null, null]);
+    expect([e.s2x.isShort(e.w.tid, 'TA'), e.s2x.isShort(e.w.tid, 'TB')]).toEqual([true, true]);   // the count did not change
+    expect(e.s2x.holdReason('TB', e.w.tid, e.t('TB'))).toBe('paused');                          // what really holds it
+    // CONTROL — the line before the fix-up: both early rooms said short_table for the whole hold.
+    const pre = tableHoldOf(e, GAME_STATE.replace(TABLE_HOLD_LINE, PRE_FIXUP_TABLE_HOLD_LINE));
+    expect([pre('TA'), pre('TB')]).toEqual(['short_table', 'short_table']);
+    // The start (the 'prestart' resume): a table still short now IS held by FIX 1, and says so.
+    expect(e.w.tm.pauseTournament(e.w.tid, false, 'prestart')).toBe(true);
+    expect([hold('TA'), hold('TB')]).toEqual(['short_table', 'short_table']);
+
+    // (b) [7,3] mid-tournament: TB is short, TA is not.
+    const x = bal({ layout: seven3() });
+    const h = tableHoldOf(x);
+    expect([h('TA'), h('TB')]).toEqual([null, 'short_table']);             // CONTROL: running, FIX 1 holds TB
+    // A director's pause: the pause holds it.
+    expect(x.w.tm.pauseTournament(x.w.tid, true, 'director')).toBe(true);
+    expect([h('TA'), h('TB')]).toEqual([null, null]);
+    expect(x.s2x.isShort(x.w.tid, 'TB')).toBe(true);
+    expect(x.w.tm.pauseTournament(x.w.tid, false, 'director')).toBe(true);
+    expect([h('TA'), h('TB')]).toEqual([null, 'short_table']);
+    // A scheduled break (the REAL break start / end of TournamentManager and the REAL event handlers).
+    // TA's hand runs into it, so the break end's balance / fill find no idle source and TB stays short.
+    const t = x.w.tm.getTournament(x.w.tid)!;
+    t.config.blindLevels = [...t.config.blindLevels, { sb: 100, bb: 200, ante: 0, duration: 600 }, { sb: 200, bb: 400, ante: 0, duration: 600 }];
+    (t.config as any).breaks = { everyLevels: 1, seconds: 300 };
+    expect(x.t('TA').startNewHand()).toBe(true);
+    expect((x.w.tm as any).startBreakIfDue(x.w.tid)).toBe(true);
+    expect(t.pauseReason).toBe('break');
+    expect([h('TA'), h('TB')]).toEqual([null, null]);
+    (x.w.tm as any).endBreak(x.w.tid);
+    expect(t.paused).toBe(false);
+    expect(x.counts()).toEqual([7, 3]);
+    expect([h('TA'), h('TB')]).toEqual([null, 'short_table']);
+    // Off a tournament (a cash table): always present, null.
+    const cashHold = tableHoldOf({ ...x, ids: () => [] } as Bal);
+    expect(cashHold('TB')).toBeNull();
+  });
+
   it('FIX1-W — wiring + locks: the hold sits in every deal path (after the bust check, the under-5 break and the hand-for-hand gate; after the feed, the fill and the balance; before the deal); every fill caller; the gameState field; the lobby flag; health; manifest tokens', () => {
     const A = P.autoStart;
     const order = [
@@ -5418,7 +5488,13 @@ s2x.restartWaiting = restartWaitingTournamentTables; s2x.isShort = tournamentTab
     expect(fnSrc('function runPreStartDeal(')).toContain("fillShortTournamentTablesNow(tournamentId, 'pre_start', { rekick: false });");
     expect(fnSrc('function applyDirectorPause(')).toContain("fillShortTournamentTablesNow(tournamentId, 'resume');");
     expect(P.events).toContain("fillShortTournamentTablesNow(tournamentId, 'break_end');");
-    expect(fnSrc('function getGameStateForPlayer(')).toContain("stateObj.tableHold = stateTournamentId && tournamentTableShortHeld(stateTournamentId, table.config.tableId) ? 'short_table' : null;");
+    // Review fix-up: the gameState asks tournamentTableHoldForState (never 'short_table' while paused), not the bare predicate.
+    expect(fnSrc('function getGameStateForPlayer(')).toContain('stateObj.tableHold = stateTournamentId ? tournamentTableHoldForState(stateTournamentId, table.config.tableId) : null;');
+    expect(fnSrc('function getGameStateForPlayer(')).not.toContain('tournamentTableShortHeld(');
+    const HS = fnSrc('function tournamentTableHoldForState(');
+    expect(HS.indexOf('if (tournamentManager.getTournament(tournamentId)?.paused) return null;')).toBeGreaterThan(0);
+    expect(HS.indexOf('if (tournamentManager.getTournament(tournamentId)?.paused) return null;')).toBeLessThan(HS.indexOf('tournamentTableShortHeld(tournamentId, tableId)'));
+    expect(SRC.split('tournamentTableHoldForState(').length - 1).toBe(2);          // its definition + the gameState line
     expect(fnSrc('function qualifierListItem(')).toContain('minTablePlayers: 4,');
     expect(fnSrc('function executeShortTableFillMove(')).toContain("m.dstTid, m.dst, m.to, 'short_table')");
     expect(SRC).toContain('shortTableHolds: { ...tournamentShortTableHolds, heldNow: tournamentShortTableEpisodes.size },');
@@ -5432,7 +5508,7 @@ s2x.restartWaiting = restartWaitingTournamentTables; s2x.isShort = tournamentTab
       'tournament_short_table_rekicked', 'tournament_short_table_fill_failed', 'tournament_short_table_fill_refused',
       'tournament_short_table_fill_followup_failed', 'tournament_short_table_check_failed', 'tournament_short_table_sweep_failed',
       'tournament_waiting_table_deal_failed', "return 'short_table';", 'shortTableHolds',
-      'TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL = 4', 'stateObj.tableHold =', 'minTablePlayers: 4', 'tournament_table_short',
+      'TOURNAMENT_MIN_TABLE_PLAYERS_TO_DEAL = 4', 'stateObj.tableHold =', 'tournamentTableHoldForState(', 'minTablePlayers: 4', 'tournament_table_short',
       'fillShortTournamentTables(tId, tableId, table);', 'serviceShortTournamentTables();']) {
       expect({ tok, listed: manifest.includes(tok), inSource: SRC.includes(tok) }).toEqual({ tok, listed: true, inSource: true });
     }

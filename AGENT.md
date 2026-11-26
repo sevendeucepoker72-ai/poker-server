@@ -803,7 +803,10 @@ with the proof).
   4-handed (never heads-up any more — C1 / C12). A late entry onto a 1-alive
   table is held until 4.
 - **Contract (additive):** per-table gameState `tableHold: 'short_table' | null`
-  (always present); `'playerMoved'` optional `reason: 'short_table'`;
+  (always present; `tournamentTableHoldForState`: null while the tournament
+  is PAUSED — the early rooms' `'prestart'` hold, a director's pause, a break
+  — since the pause holds the table then, not FIX 1; every un-pause re-sends
+  each table's state); `'playerMoved'` optional `reason: 'short_table'`;
   qualifier list items `minTablePlayers: 4`; `tournamentDealHoldReason`
   answers `'short_table'` (the client startHand's `tournament_hand_held`).
 - **Health** `tournamentSafety.shortTableHolds` = { held (episodes), fills,
@@ -816,7 +819,8 @@ with the proof).
   `tournament_waiting_table_dealt` / `tournament_waiting_table_deal_failed`,
   `tournament_short_table_check_failed`, `tournament_short_table_sweep_failed`
   (every one a manifest token).
-- **Tests:** `tests/rebalanceSafety.test.ts` FIX1-1 … FIX1-10, FIX1-W (wiring +
+- **Tests:** `tests/rebalanceSafety.test.ts` FIX1-1 … FIX1-11 (11: tableHold
+  null while paused, through the REAL getGameStateForPlayer), FIX1-W (wiring +
   manifest) at the end of the S2 block, H-FIX1 in the H block; updated to the
   new rule: C1, C2 (a)/(d), C3, C6, C10, C11, C12, S2-1, S2-3, S2-5, S2-6, S2-8,
   S2-10, S2-15; `tests/r2Qualifiers.test.ts` B3 / B11 / B12 (REAL_DEAL_HOLD now
