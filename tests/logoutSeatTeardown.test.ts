@@ -238,7 +238,6 @@ function harness(opts: HarnessOpts = {}) {
     Sentry: null,
     // 2026-11-25 (owner: 30 hands sat out) — the sit-out limit's notice / restore helpers (tests/tournamentSitOutLimit.test.ts tests them).
     removalNoticeFields: () => ({}), queueRemovalSignInNotice() {}, dropRemovalSignInNotice() {}, tellRemovalSignInNotices: () => 0,
-    awayStreakArrivedAt() {},
     console: { log() {}, warn() {}, error() {} },
     setTimeout: (fn: () => void, ms: number) => { const t = { fn, ms, cleared: false }; timers.push(t); return t; },
     clearTimeout: (t: any) => { if (t) t.cleared = true; },

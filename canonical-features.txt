@@ -2600,8 +2600,9 @@ QUALIFIER_NO_SHOW_SEATED_ABSENT
 # (TournamentPlayer.sitOutHands): a dealt-in human live seat nobody plays at the hand end, with no voluntary action
 # (un-stamped fold/check/call/bet/raise/all-in; antes/blinds are not actions), counts one hand. Warned once at 3
 # ('tournamentSitOutWarning'), REMOVED at 30 through the bust check as if busted (next place, no bounty, not
-# disqualified, chips out of play; reason 'sat_out_limit' on every elimination notice). Online League no-shows are
-# protected until late entry closes. gameState mySitOutLimit; lobby item sitOutLimitHands. tests/tournamentSitOutLimit.test.ts.
+# disqualified, chips out of play; reason 'sat_out_limit' on every elimination notice). On an Online League night every
+# entrant who has not played a hand yet is protected until late entry closes (the first hour, below).
+# gameState mySitOutLimit; lobby item sitOutLimitHands. tests/tournamentSitOutLimit.test.ts.
 TOURNAMENT_SIT_OUT_HANDS_LIMIT = 30
 TOURNAMENT_SIT_OUT_WARN_AT = 3
 tournamentSitOutWarning
@@ -2620,3 +2621,15 @@ tournament_sit_out_removal_told_on_sign_in
 # "Sitting Out - I'm back" button) resets the sat-out run like playerBack.
 function awayStreakNoShowDue(
 removedNoShow
+# 2026-11-26 (owner 2026-11-25 11:15 PM: "A player who is seated before 6 and then leaves before never played a hand so
+# they should get the 1st hour to play a hand") - replaces the "never arrived" no-show list: a league night's first hour
+# (Tournament.leagueFirstHourUntil, set by markLeagueFirstHour at both league starts) protects EVERY entrant who has not
+# played a hand (TournamentPlayer.playedAHand, set only by a played hand end; a sign-in alone never sets it; a re-entry
+# keeps it). Weekly / monthly / every other tournament: no first hour.
+function markLeagueFirstHour(
+leagueFirstHourUntil
+tp.playedAHand = true
+# 2026-11-26 review fix (owner: "played a hand" means HE played it, never the server): a session at the hand end
+# plays the hand only when the server never acted for the seat that hand (his clock ran out with the tab open is
+# NOT a played hand; it is counted as sat out).
+function awayStreakServerActed(

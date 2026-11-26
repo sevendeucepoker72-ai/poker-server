@@ -132,11 +132,19 @@ export interface TournamentPlayer {
   /** `${tableId}:${handNumber}` of the last hand counted: one count per hand. */
   sitOutLastHand?: string;
   /**
-   * An Online League no-show (seated absent at the start, never arrived) is not
-   * removed before this moment (the night's lateRegUntil, 7:00 PM MT). Cleared
-   * when he arrives (a restore of his seat, or a hand he plays or acts in).
+   * 2026-11-26 (owner 2026-11-25: "A player who is seated before 6 and then
+   * leaves before never played a hand so they should get the 1st hour to play a
+   * hand") — this entrant has PLAYED A HAND in this event: a hand end where he
+   * was dealt in at his live seat AND either took a voluntary action or a
+   * session played his seat at that hand end (connected, not sitting out) with
+   * no server act for his seat that hand (review fix 2026-11-26: HE played it,
+   * never the server — a timeout fold with the tab open is not a played hand).
+   * Set by index.ts awayStreakAtHandEnd; a sign-in / seat restore alone never
+   * sets it. NEVER cleared: a re-entry keeps it (clearAwayStreak leaves it), so the
+   * Online League's first hour (Tournament.leagueFirstHourUntil) is gone for
+   * good once he played. Server-side only.
    */
-  sitOutProtectedUntil?: number;
+  playedAHand?: boolean;
   /** Set by the bust check that REMOVED him for sitting out: the elimination notices say why. */
   removedFor?: 'sat_out_limit';
   /** The hand limit he was removed at (the notices' `handsSatOut`; a no-show: his real count). */
@@ -150,13 +158,13 @@ export interface TournamentPlayer {
 
 /**
  * 2026-11-25 (owner) — a re-entry (or any un-elimination) starts a fresh entry:
- * no sat-out run, no warning, no no-show protection, no removal reason.
+ * no sat-out run, no warning, no removal reason. 2026-11-26 — `playedAHand` is
+ * KEPT: a re-entrant who played a hand never gets the league's first hour back.
  */
 export function clearAwayStreak(p: TournamentPlayer): void {
   delete p.sitOutHands;
   delete p.sitOutWarned;
   delete p.sitOutLastHand;
-  delete p.sitOutProtectedUntil;
   delete p.removedFor;
   delete p.removedSatOutHands;
   delete p.removedNoShow;
@@ -244,6 +252,17 @@ export interface Tournament {
    * answer the runner-up's bust notice (his bust is what finished it).
    */
   finalResults?: Array<{ playerId: string; position: number; payout: number; tied?: boolean; disqualified?: boolean }>;
+  /**
+   * 2026-11-26 (owner 2026-11-25: "A player who is seated before 6 and then
+   * leaves before never played a hand so they should get the 1st hour to play a
+   * hand") — an ONLINE LEAGUE night only: the night's lateRegUntil (7:00 PM MT).
+   * Until then, an entrant who has NOT PLAYED A HAND yet in this event
+   * (TournamentPlayer.playedAHand unset) is never removed for sitting out; after
+   * it, one still away who has not played a hand goes at the first hand end.
+   * Set by index.ts markLeagueFirstHour at both league starts; absent on every
+   * other tournament (weekly / monthly / Sit & Go / ...: no first hour).
+   */
+  leagueFirstHourUntil?: number;
 }
 
 /**
