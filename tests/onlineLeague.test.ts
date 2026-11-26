@@ -805,6 +805,34 @@ describe('the night itself: start, too-few cancel at 7:00 PM, overflow tables, r
       expect([...w.stubbed].filter((n) => /noShowsSeatedAbsent|presentNeededToStart|noteLeagueNoShowsSeatedAbsent|qualifierLeagueNoShowsSeated/.test(n))).toEqual([]);
     });
 
+    // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — the league's no-shows get the
+    // first hour: the 6:00 PM start marks them (markNoShowProtection, until the night's 7:00 PM late
+    // close); the weekly never does (its no-shows are released). tests/tournamentSitOutLimit.test.ts
+    // runs the mark, the count and the removal.
+    it('the 6:00 PM start marks the league night\'s no-shows protected until 7:00 PM; the weekly start marks nobody', async () => {
+      const w = world();
+      const at = Date.now() + H;
+      const marks: Array<[string, number]> = [];
+      w.scope.markNoShowProtection = (tid: string, until: number) => { marks.push([tid, until]); return 1; };
+      w.sync([leagueItem(at), weeklyItem(at)]);
+      const a = w.mkSocket('SA', ALICE, 'm-alice', 'Alice');
+      const b = w.mkSocket('SB', BOB, 'm-bob', 'Bob');
+      await enter(a);
+      await enter(b);
+      offline(w, 'SB');
+      w.m.tickQualifierAutoStart(at + 1000);
+      expect(w.qualifierTournaments.get(LEAGUE)).toMatchObject({ status: 'running', tournamentId: 'TQ' });
+      expect(marks).toEqual([['TQ', at + 60 * MIN]]);
+      const c = w.mkSocket('SC', 103, 'm-carol', 'Carol');
+      const d = w.mkSocket('SD', 104, 'm-dave', 'Dave');
+      await enter(c, WEEKLY);
+      await enter(d, WEEKLY);
+      marks.length = 0;
+      w.m.tickQualifierAutoStart(at + 2000);
+      expect(w.qualifierTournaments.get(WEEKLY).status).toBe('running');     // the weekly started too
+      expect(marks).toEqual([]);
+    });
+
     it('NOBODY here: it waits (nobody released) and is cancelled after 7:00 PM, as before; one registrant alone never starts', async () => {
       const w = world();
       const at = Date.now() + H;

@@ -285,6 +285,8 @@ function world(opts: WorldOpts = {}) {
     // 2026-10-24 hand-for-hand review fix-up: a Return / sign-in asks whether a bust's place is still
     // pending (a hand-for-hand round not settled) — never here (rebalanceSafety "H" tests it).
     handForHandBustPending: () => false,
+    // 2026-11-25 (owner: 30 hands sat out) — the sit-out limit's notice / restore helpers (tests/tournamentSitOutLimit.test.ts tests them).
+    removalNoticeFields: () => ({}), dropRemovalSignInNotice() {}, tellRemovalSignInNotices: () => 0, awayStreakArrivedAt() {},
     getGameStateForPlayer: () => ({}), scheduleAIAction() {}, log: { debug() {}, info() {} },
     // R2 (2026-10-11): the seat-teardown helper block (SEAT_TEARDOWN_SRC) tests it.
     FiveCardDrawTable: class {},

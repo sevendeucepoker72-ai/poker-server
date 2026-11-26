@@ -62,7 +62,7 @@ import { publicNameOf, PUBLIC_NAME_FALLBACK, isPublicDisplayName, LISTABLE_USER_
 import { createHash, randomInt, timingSafeEqual } from 'crypto';
 // F19 review fix-up (2026-10-24) — the room elimination copy's opaque entrant tokens (roomEntrantToken).
 import { createHmac, randomBytes } from 'crypto';
-import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer, Tournament } from './game/TournamentManager';
+import { TournamentManager, DEFAULT_BLIND_LEVELS, TournamentPlayer, Tournament, clearAwayStreak } from './game/TournamentManager';
 import { OmahaTable } from './game/variants/OmahaTable';
 import { ShortDeckTable } from './game/variants/ShortDeckTable';
 import { FiveCardDrawTable } from './game/variants/FiveCardDrawTable';
@@ -1312,6 +1312,11 @@ const DURABLE_AUDIT_ACTIONS = new Set([
   // seat bubble: the switch (POST /api/qualifiers/hand-for-hand), the same-hand
   // busts' places (the finish order's forensic trail) and a watchdog release.
   'QUALIFIER_HAND_FOR_HAND_SET', 'QUALIFIER_HAND_FOR_HAND_PLACES', 'QUALIFIER_HAND_FOR_HAND_WATCHDOG',
+  // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — a player REMOVED for
+  // sitting out (his place decides prizes, league points and championship seats; the
+  // master's results carry no reason, so this row is the only durable "why"). The
+  // 3-hand warning stays stdout-only (many per night).
+  'TOURNAMENT_SIT_OUT_REMOVED',
 ]);
 let _auditTableReady = false;
 async function _ensureAuditTable(): Promise<void> {
@@ -3408,6 +3413,12 @@ app.get('/api/health', async (_req, res) => {
         }))(liveBotChips())),
         // 2026-10-26 (owner: "After 1") - tournament timeout sit-out + stale-table Sit Out / I'm back fallbacks.
         tournamentTimeoutSitOut: { ...tournamentTimeoutSitOutStats },
+        // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — counted (hands counted),
+        // warned (3-hand warnings), removed, removedProtectedAfterHour (league no-shows removed
+        // after 7:00 PM), protectedHands (hands at 30+ inside the first hour), resetsByAction /
+        // resetsByBack, removalsSkipped (re-check said no at the bust check), noShowsProtected,
+        // toldOnSignIn, errors (should stay 0).
+        tournamentSitOutLimit: { ...awayStreakStats, handsLimit: TOURNAMENT_SIT_OUT_HANDS_LIMIT, pendingSignInNotices: removalSignInNotices.size },
         // 2026-10-28 — handComplete is NOT a freeze count: it includes the
         // benign re-seeds of a public table everyone left (~29 per 45 h) and
         // keeps counting them. handCompleteWithHuman (the revivals of a table a
@@ -4239,6 +4250,11 @@ function qualifierListItem(id: string, qt: QualifierTournamentReg, now: number, 
     // 2026-10-24 (owner 2026-10-23: "Fix both") — additive capability flag: this server keeps a
     // running qualifier's fairness seeds private until it ends (poker-3d's rules page reads it).
     seedsHeldUntilEnd: true,
+    // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — additive capability
+    // flag: this server removes a player at 30 hands sat out in a row (poker-3d's rules page
+    // shows the line only when it is present). A literal (= TOURNAMENT_SIT_OUT_HANDS_LIMIT):
+    // the lobby harnesses slice this function alone.
+    sitOutLimitHands: 30,
     lateRegOpen,
     lateRegClosedAt,
     lateRegClosedReason,
@@ -5671,6 +5687,10 @@ function tickQualifierAutoStart(now: number = Date.now()): void {
     if (result) {
       qt.status = 'running';
       qt.tournamentId = result.tournamentId;
+      // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — a LEAGUE
+      // night's no-shows (seated just now with nobody at the seat) are not removed
+      // for sitting out before late entry closes (7:00 PM MT); their hands count.
+      if (noShowsSeatedAbsent(qt.kind)) markNoShowProtection(result.tournamentId, qualifierWindows(scheduledTime, qt.qualifierType).lateRegUntil);
 
       // Notify all registered players — 2026-10-10: on the socket his seat was
       // bound to (bindRegistrantSocket — his own; '' = none), never on a
@@ -6498,6 +6518,12 @@ function runPreStartDeal(tournamentId: string, now: number = Date.now()): void {
       }
       // (6) Review fix-up — the start's seating: even with the balance switch off.
       balanceMoves = balanceQualifierTablesNow(tournamentId, { ignoreSwitch: true });
+      // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — a LEAGUE
+      // night: whoever is seated with NOBODY at his seat at the deal (a no-show
+      // seated absent in (2b), one who left his early-room seat, one playing
+      // elsewhere) is not removed for sitting out before late entry closes
+      // (7:00 PM MT); his hands count. Cleared when he arrives.
+      if (keepNoShows) markNoShowProtection(tournamentId, qualifierWindows(new Date(qt.scheduledAt).getTime(), qt.qualifierType).lateRegUntil);
       // Every table's progress listener (bust check, hand results) before its first hand.
       for (const tid of t.tableIds) {
         const table = tableManager.getTable(tid);
@@ -7157,6 +7183,12 @@ function getGameStateForPlayer(
   stateObj.nextBlindIn = levelClock ? levelClock.nextBlindIn : 0;
   stateObj.blindLevelDuration = levelClock ? levelClock.blindLevelDuration : null;
   stateObj.tournamentClock = levelClock ? levelClock.tournamentClock : null;
+  // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — ALWAYS
+  // present (null when not applicable, so the per-socket delta clears it): the
+  // viewer's OWN live tournament seat's sat-out run {handsSatOut, handsLimit,
+  // handsLeft, protectedUntil} while it is 1 or more. Spectators: null.
+  stateObj.mySitOutLimit = stateTournamentId && playerSeatIndex >= 0
+    ? (awayStreakViewOf(stateTournamentId, table, playerSeatIndex) ?? null) : null;
 
   // 2026-10-11 (R1 contract #2) — what kind of table this is and whether a
   // rebuy is allowed here, ALWAYS present (the `rebuy` handler refuses with
@@ -7603,6 +7635,7 @@ function returnTournamentSessionFromSitOut(sock: { emit: (ev: string, d: unknown
   syncSitOutToTable(session.tableId);
   tournamentTimeoutSitOutStats.backByAction++;
   sock.emit('sitOutToggled', { sittingOut: false, reason, tableId: session.tableId });
+  awayStreakResetAt(session.tableId, session.seatIndex, 'action');   // 2026-11-25 — his sat-out run ends
 }
 /**
  * 2026-10-26 — the length of the clock the CURRENT turn is on, stamped as
@@ -7619,6 +7652,210 @@ function currentTurnTimeoutMs(tableId: string): number {
   return ABSENT_TOURNAMENT_SEAT_TURN_MS;
 }
 // --- end tournament timeout sit-out ---
+
+// --- Tournament sit-out limit (owner 2026-11-25; inside the absent clock section so every harness that loads it has it) ---
+/**
+ * 2026-11-25 (owner: "A tournament player can't sit out more than 30 hands in a
+ * row") — every tournament (weekly / monthly qualifiers, the Online League,
+ * Sit & Go, club, custom, template, simulation). One timeout still sits a player
+ * out (row 32). Per ENTRY (TournamentPlayer.sitOutHands: survives table moves,
+ * breaks, reconnects and reservations; a re-entry starts at 0):
+ *  - a hand COUNTS as sat out when the seat was dealt in, is the entrant's live
+ *    seat, is human (not isAI), nobody PLAYS it at the hand's end (no session
+ *    that is not sitting out on a connected socket) AND it made no voluntary
+ *    action that hand (an actionLog fold / check / call / bet / raise / all-in
+ *    WITHOUT an auto stamp: blinds, antes, dead blinds, 'folded (left table)'
+ *    and uncalled-bet lines are never actions);
+ *  - a voluntary action, I'm back ('playerBack') and acting from sit-out
+ *    (returnTournamentSessionFromSitOut) reset it to 0; a hand PLAYED with no
+ *    voluntary action (a walk, a restore that did not act) leaves it unchanged;
+ *    a reconnect / restore alone never resets it;
+ *  - at TOURNAMENT_SIT_OUT_WARN_AT (3) his live sockets get ONE
+ *    'tournamentSitOutWarning' per run;
+ *  - at TOURNAMENT_SIT_OUT_HANDS_LIMIT (30) the seat goes on this hand's bust
+ *    check (check.awayLimitSeats), which REMOVES him as if busted
+ *    (removeAwayLimitSeats, in the rebalance helpers): next place, chips out of
+ *    play, no bounty, every bust notice / result / rebalance path.
+ *  - An Online League no-show (seated absent at the start, never arrived) is
+ *    protected until the night's lateRegUntil (7:00 PM MT): his hands still
+ *    count; he is removed at the first hand end after it if still at 30+.
+ * Never throws into handleHandComplete / a socket handler.
+ */
+const TOURNAMENT_SIT_OUT_HANDS_LIMIT = 30;
+const TOURNAMENT_SIT_OUT_WARN_AT = 3;
+/** Health engine.tournamentSitOutLimit. */
+const awayStreakStats = {
+  counted: 0, warned: 0, removed: 0, removedProtectedAfterHour: 0, protectedHands: 0,
+  resetsByAction: 0, resetsByBack: 0, removalsSkipped: 0, noShowsProtected: 0, toldOnSignIn: 0, errors: 0,
+};
+/** A voluntary action of the seat THIS hand: fold / check / call / bet / raise / all-in, never auto-stamped. */
+function awayStreakActed(table: PokerTable, seatIndex: number): boolean {
+  for (const e of table.actionLog || []) {
+    if (!e || e.seatIndex !== seatIndex || e.auto) continue;
+    const a = String(e.action || '');
+    if (a === 'folded' || a === 'checked' || /^(called|bet|raised to|went all-in for) /.test(a)) return true;
+  }
+  return false;
+}
+/** Somebody PLAYS this seat now: a main session that is not sitting out, on a socket still connected. */
+function awayStreakPlayedNow(tableId: string, seatIndex: number): boolean {
+  for (const [sid, s] of playerSessions) {
+    if (s.tableId !== tableId || s.seatIndex !== seatIndex || s.sittingOut) continue;
+    if (io.sockets.sockets.get(sid)?.connected) return true;
+  }
+  return false;
+}
+/** An Online League no-show still inside his first hour. */
+function awayStreakProtected(tp: TournamentPlayer, now: number): boolean {
+  return typeof tp.sitOutProtectedUntil === 'number' && now <= tp.sitOutProtectedUntil;
+}
+/** The entrant alive at this LIVE tournament seat (human), else null. */
+function awayStreakEntrantAt(tournamentId: string, table: PokerTable | undefined, seatIndex: number): TournamentPlayer | null {
+  const seat = table?.seats[seatIndex];
+  if (!seat || seat.state !== 'occupied' || seat.isAI || seat.eliminated) return null;
+  return tournamentManager.getTournament(tournamentId)?.players.find((p) => p.playerId === seat.playerId && !p.eliminated) ?? null;
+}
+/**
+ * gameState `mySitOutLimit` for the viewer's own live seat:
+ * {handsSatOut, handsLimit, handsLeft, protectedUntil} while his run is 1+, else null.
+ */
+function awayStreakViewOf(tournamentId: string, table: PokerTable, seatIndex: number): Record<string, unknown> | null {
+  const tp = awayStreakEntrantAt(tournamentId, table, seatIndex);
+  const n = tp?.sitOutHands || 0;
+  if (!tp || n < 1) return null;
+  return {
+    handsSatOut: n, handsLimit: TOURNAMENT_SIT_OUT_HANDS_LIMIT, handsLeft: Math.max(0, TOURNAMENT_SIT_OUT_HANDS_LIMIT - n),
+    protectedUntil: awayStreakProtected(tp, Date.now()) ? tp.sitOutProtectedUntil! : null,
+  };
+}
+/** The 3-hand warning text (the client shows its own copy; this is the fallback). */
+function awayStreakWarningText(handsSatOut: number, handsLeft: number, protectedUntil: number | null): string {
+  if (protectedUntil) return `You have sat out ${handsSatOut} hands in a row. If you are still away when late entry closes, you will be removed from the tournament.`;
+  return `You have sat out ${handsSatOut} hands in a row. Come back within ${handsLeft} hands or you will be removed from the tournament.`;
+}
+/** I'm back / a voluntary action at this seat: the entrant's run is over (and he has arrived). */
+function awayStreakResetAt(tableId: string, seatIndex: number, why: 'back' | 'action'): void {
+  try {
+    const tournamentId = tournamentTables.get(tableId);
+    if (!tournamentId) return;
+    const tp = awayStreakEntrantAt(tournamentId, tableManager.getTable(tableId), seatIndex);
+    if (!tp) return;
+    delete tp.sitOutProtectedUntil;   // he is here
+    if (!(tp.sitOutHands && tp.sitOutHands > 0) && !tp.sitOutWarned) return;
+    tp.sitOutHands = 0;
+    tp.sitOutWarned = false;
+    if (why === 'back') awayStreakStats.resetsByBack++;
+    else awayStreakStats.resetsByAction++;
+  } catch {
+    awayStreakStats.errors++;
+  }
+}
+/** A restore put him back on this seat: he ARRIVED (no-show protection ends). The run itself is unchanged. */
+function awayStreakArrivedAt(tableId: string, seatIndex: number): void {
+  try {
+    const tournamentId = tournamentIdOfTable(tableId);
+    if (!tournamentId) return;
+    const tp = awayStreakEntrantAt(tournamentId, tableManager.getTable(tableId), seatIndex);
+    if (tp) delete tp.sitOutProtectedUntil;
+  } catch {
+    awayStreakStats.errors++;
+  }
+}
+/** The 3-hand warning, ONCE per run, to every live socket signed in as the entrant (none: nobody is told). */
+function awayStreakWarn(tournamentId: string, tableId: string, tp: TournamentPlayer, now: number): void {
+  tp.sitOutWarned = true;
+  awayStreakStats.warned++;
+  const handsSatOut = tp.sitOutHands || 0;
+  const handsLeft = Math.max(0, TOURNAMENT_SIT_OUT_HANDS_LIMIT - handsSatOut);
+  const protectedUntil = awayStreakProtected(tp, now) ? tp.sitOutProtectedUntil! : null;
+  const payload = {
+    tournamentId, tableId, handsSatOut, handsLimit: TOURNAMENT_SIT_OUT_HANDS_LIMIT, handsLeft, protectedUntil,
+    message: awayStreakWarningText(handsSatOut, handsLeft, protectedUntil),
+  };
+  const sids = tournamentEliminationNoticeSockets(tournamentId, tp, null);
+  for (const sid of sids) io.sockets.sockets.get(sid)?.emit('tournamentSitOutWarning', payload);
+  console.log(`[Tournament] ${JSON.stringify({
+    event: 'tournament_sit_out_warned', tournamentId, tableId, playerId: tp.playerId, handsSatOut, handsLeft,
+    protectedUntil, sockets: sids.length,
+  })}`);
+  auditLog(tp.userId !== undefined ? String(tp.userId) : tp.playerId, 'TOURNAMENT_SIT_OUT_WARNED', {
+    tournamentId, tableId, playerId: tp.playerId, handsSatOut, handsLeft, protectedUntil, sockets: sids.length,
+  });
+}
+/**
+ * handleHandComplete, synchronously, right after captureTournamentBustCheck
+ * (the hand's seats, hole cards and actionLog are intact): count this hand for
+ * every dealt-in human live seat, warn at 3, and put the seats at 30+ (not
+ * protected) on the capture (`check.awayLimitSeats`) for its bust check.
+ * Idempotent per tableId:handNumber. null check = not a tournament table.
+ */
+function awayStreakAtHandEnd(tableId: string, table: PokerTable, check: TournamentBustCheck | null): void {
+  if (!check) return;
+  try {
+    const tournamentId = tournamentTables.get(tableId);
+    if (!tournamentId) return;
+    const t = tournamentManager.getTournament(tournamentId);
+    if (!t || t.status !== 'running') return;
+    const key = `${tableId}:${table.handNumber}`;
+    const now = Date.now();
+    for (let i = 0; i < MAX_SEATS; i++) {
+      const seat = table.seats[i];
+      if (!seat || seat.state !== 'occupied' || seat.isAI || seat.eliminated || seat.holeCards.length === 0) continue;
+      const tp = t.players.find((p) => p.playerId === seat.playerId && !p.eliminated);
+      if (!tp || tournamentLiveSeatIndex(table, tp.playerId) !== i || tp.sitOutLastHand === key) continue;
+      tp.sitOutLastHand = key;
+      const acted = awayStreakActed(table, i);
+      const played = awayStreakPlayedNow(tableId, i);
+      if (acted || played) delete tp.sitOutProtectedUntil;   // he arrived
+      if (acted) {
+        if ((tp.sitOutHands || 0) > 0 || tp.sitOutWarned) awayStreakStats.resetsByAction++;
+        tp.sitOutHands = 0;
+        tp.sitOutWarned = false;
+        continue;
+      }
+      if (played) continue;                    // played, no action (a walk, a restore): unchanged
+      if (seat.chipCount <= 0) continue;       // busted this hand: the bust check settles him
+      tp.sitOutHands = (tp.sitOutHands || 0) + 1;
+      awayStreakStats.counted++;
+      if (tp.sitOutHands >= TOURNAMENT_SIT_OUT_WARN_AT && !tp.sitOutWarned) awayStreakWarn(tournamentId, tableId, tp, now);
+      if (tp.sitOutHands < TOURNAMENT_SIT_OUT_HANDS_LIMIT) continue;
+      if (awayStreakProtected(tp, now)) { awayStreakStats.protectedHands++; continue; }
+      if (!check.awayLimitSeats) check.awayLimitSeats = new Map();
+      check.awayLimitSeats.set(i, tp.playerId);
+    }
+  } catch (e: any) {
+    awayStreakStats.errors++;
+    console.warn(`[Tournament] ${JSON.stringify({ event: 'tournament_sit_out_count_failed', tableId, error: String(e?.message || e) })}`);
+  }
+}
+/**
+ * An Online League no-show seated ABSENT at the start (no session at his live
+ * seat): protected until `until` (the night's lateRegUntil). `onlyPlayerId`: one
+ * registrant (the early rooms' deal), else every alive entrant of the event (the
+ * 6:00 PM start). Returns how many were marked.
+ */
+function markNoShowProtection(tournamentId: string, until: number, onlyPlayerId?: string): number {
+  try {
+    const t = tournamentManager.getTournament(tournamentId);
+    if (!t || !Number.isFinite(until)) return 0;
+    let n = 0;
+    for (const tp of t.players) {
+      if (tp.eliminated || (onlyPlayerId !== undefined && tp.playerId !== onlyPlayerId)) continue;
+      const tableId = t.playerTableMap.get(tp.playerId) ?? t.tableId ?? undefined;
+      const idx = tableId ? tournamentLiveSeatIndex(tableManager.getTable(tableId), tp.playerId) : -1;
+      if (!tableId || idx < 0 || seatHasLiveSession(tableId, idx)) continue;
+      tp.sitOutProtectedUntil = until;
+      n++;
+    }
+    awayStreakStats.noShowsProtected += n;
+    if (n > 0) console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_no_show_protected', tournamentId, until, marked: n })}`);
+    return n;
+  } catch {
+    awayStreakStats.errors++;
+    return 0;
+  }
+}
+// --- end tournament sit-out limit ---
 // ===== end absent tournament seat clock =====
 
 function armTurnTimer(tableId: string): void {
@@ -11598,6 +11835,10 @@ async function handleHandComplete(tableId: string, results: any[]): Promise<void
   // (tournamentDealWaitsForBustCheck), and what it needs (pot winners, pre-hand
   // stacks, the 0-chip seats) is read before anything can change the table.
   const tournamentBustCheck = captureTournamentBustCheck(tableId, table, results);
+  // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — this hand
+  // counted per ENTRY (still synchronous: seats, hole cards, actionLog intact);
+  // the seats at 30 go on the capture, and its bust check removes them.
+  awayStreakAtHandEnd(tableId, table, tournamentBustCheck);
 
   // 2026-10-11 (R2, C6 / C9 / C10) — this hand's ref (the per-hand HUD and
   // mission flags are keyed by table + hand: an account can be in two hands
@@ -15547,6 +15788,7 @@ io.on('connection', (socket: Socket) => {
               // stood up again and the no_seat refund below returns every charge.
               if (closedAtBubble()) { table.standUp(s); reseatRefusedClosed = true; break; }
               tp.eliminated = false; tp.chips = startingStack;
+              clearAwayStreak(tp);   // 2026-11-25 — a fresh entry: the sat-out run starts again at 0
             }
             // Update socket session — or CREATE one (2026-10-10). A rebalance
             // that stood his busted seat up for a moved player
@@ -21836,6 +22078,8 @@ Give feedback in this JSON format:
       // 2026-10-26 (owner: a timeout sits a tournament player out "until they
       // tap I'm Back") — a sat-out TOURNAMENT player who acts himself is back.
       if (session.sittingOut && isTournamentTable(session.tableId)) returnTournamentSessionFromSitOut(socket, session, 'action');
+      // 2026-11-25 (owner) — any voluntary action ends a tournament entrant's sat-out run (no-op elsewhere).
+      else awayStreakResetAt(session.tableId, session.seatIndex, 'action');
 
       // R2 (C10) — the action is recorded for progression by the table's
       // 'playerAction' listener (ensureTableProgressListener), with the street
@@ -22520,6 +22764,8 @@ Give feedback in this JSON format:
     // (Their EXISTING owed dead blinds are intentionally preserved — they pay
     // those on their first hand back, standard missed-blind rule.)
     syncSitOutToTable(session.tableId);
+    // 2026-11-25 (owner) — I'm back ends a tournament entrant's sat-out run (no-op elsewhere).
+    awayStreakResetAt(session.tableId, session.seatIndex, 'back');
 
     socket.emit('sitOutToggled', { sittingOut: false, reason: 'back', tableId: session.tableId });
     if (changed) broadcastGameState(session.tableId);   // G181 — the AWAY badge goes now
@@ -25485,6 +25731,9 @@ function restoreSeatReservation(
     sitOutTracker.get(reserved.tableId)?.delete(reserved.seatIndex);
   }
   syncSitOutToTable(reserved.tableId);
+  // 2026-11-25 (owner) — a tournament seat restored: he ARRIVED (an Online League
+  // no-show's protection ends); his sat-out run is NOT reset by a restore.
+  if (isTournamentReservation(reserved)) awayStreakArrivedAt(reserved.tableId, reserved.seatIndex);
   // 2026-06-11 audit E5: only forgive dead-blind debt for a genuine
   // connectivity blip — a player who was SITTING OUT owes what accrued.
   if (!reserved.sittingOut) { rSeat.deadBlindOwedChips = 0; rSeat.missedBlind = 'none'; }
@@ -25569,12 +25818,14 @@ function tellUnseenTournamentResults(socket: Socket, auth: SocketAuthSession | u
           continue;
         }
         const prize = r.prize > 0 ? { prize: r.prize } : {};
+        // 2026-11-25 — removed for sitting out (the entry is still known here): say why. The row has no reason column.
+        const why = removalNoticeFields(r.tournamentId, r.playerId);
         if (r.status === 'finished') {
-          socket.emit('tournamentFinishedForEntrant', { tournamentId: r.tournamentId, position: r.place, ...prize, tournamentName: r.name, atSignIn: true });
+          socket.emit('tournamentFinishedForEntrant', { tournamentId: r.tournamentId, position: r.place, ...prize, tournamentName: r.name, atSignIn: true, ...why });
         } else {
           const t = tournamentManager.getTournament(r.tournamentId);
           if (!t || t.status !== 'running') { unseenResultNotices.runningGone++; continue; }
-          socket.emit('playerEliminated', { tournamentId: r.tournamentId, playerId: r.playerId, playerName: r.playerName ?? '', position: r.place, ...prize, atSignIn: true });
+          socket.emit('playerEliminated', { tournamentId: r.tournamentId, playerId: r.playerId, playerName: r.playerName ?? '', position: r.place, ...prize, atSignIn: true, ...why });
         }
         unseenResultNotices.told++;
         void tournamentResults.markTold(r.tournamentId, r.playerId);
@@ -26235,6 +26486,9 @@ function restoreAbsentTournamentSeat(
   seat.missedBlind = 'none';
   tp.socketId = socket.id;
   voluntarilyAbsentTournamentEntrants.delete(voluntaryAbsenceKey(tournamentId, tp.playerId));
+  // 2026-11-25 (owner) — he ARRIVED: an Online League no-show's first-hour protection
+  // ends. His sat-out run is NOT reset by a restore (only an action / I'm back).
+  delete tp.sitOutProtectedUntil;
   tournamentSeatKeep.returned++;
   // F87 (2026-10-21) — + sittingOut: a tournament seat comes back playing (P-j).
   socket.emit('reconnectedToTable', { tableId, seatIndex, tournamentId, sittingOut: false });
@@ -26265,6 +26519,8 @@ function tellKeptTournamentSeats(socket: Socket, auth: SocketAuthSession, which:
     if (!socket.connected || authSessions.get(socket.id) !== auth) return 0;
     // 2026-10-20 — the same moment tells a qualifier no-show release (its own try/catch).
     tellQualifierNoShowReleases(socket, auth, via);
+    // 2026-11-25 — and a removal for sitting out he was away for (its own try/catch).
+    tellRemovalSignInNotices(socket, auth, via);
     const seats = absentTournamentSeatsOf(auth, { voluntary: which === 'voluntary' ? 'only' : 'any' });
     for (const s of seats) socket.emit('tournamentSeatKept', tournamentSeatKeptPayload(s.tournamentId, s.tableId, s.seatIndex, s.seat));
     if (seats.length > 0) {
@@ -26359,7 +26615,10 @@ function noticeTournamentEliminationToEntrant(
   /** 2026-10-24 (Sit & Go fix-all F7) — his prize (a paid place); added to the payload only when > 0. */
   prize?: number | null,
 ): number {
-  const payload = { tournamentId, playerId, playerName, position, ...(prize && prize > 0 ? { prize } : {}) };
+  const payload = {
+    tournamentId, playerId, playerName, position, ...(prize && prize > 0 ? { prize } : {}),
+    ...removalNoticeFields(tournamentId, playerId),   // 2026-11-25 — removed for sitting out: why
+  };
   let told = 0;
   for (const sid of sids) {
     const sock = io.sockets.sockets.get(sid);
@@ -26367,6 +26626,8 @@ function noticeTournamentEliminationToEntrant(
     sock.emit('playerEliminated', payload);
     told++;
   }
+  // 2026-11-25 — told now (the bust check, the G183 dead-seat notice): no sign-in notice of it later.
+  if (told > 0 && 'reason' in payload) dropRemovalSignInNotice(tournamentId, playerId);
   return told;
 }
 
@@ -29081,6 +29342,13 @@ interface TournamentBustCheck {
   bustedThisHand: Map<number, string>;
   /** Set when it has run — a second run (the deal guard ran it late) does nothing. */
   ran: boolean;
+  /**
+   * 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — the seats
+   * whose entrant reached TOURNAMENT_SIT_OUT_HANDS_LIMIT hands sat out with THIS
+   * hand (awayStreakAtHandEnd; seat index → playerId): removed by this check as
+   * if busted in this hand (removeAwayLimitSeats). Absent = none.
+   */
+  awayLimitSeats?: Map<number, string>;
 }
 /** S1 — tournament table → its captured, not yet run, bust checks (by hand number). */
 const tournamentBustChecksPending = new Map<string, Map<number, TournamentBustCheck>>();
@@ -29273,6 +29541,153 @@ function roomEliminationPayload<T>(tournamentId: string, data: T): T {
 // ===== end F19 review fix-up =====
 
 /**
+ * 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — the
+ * elimination fields of an entrant REMOVED for sitting out ({reason:
+ * 'sat_out_limit', handsSatOut}), else {}: added to every notice of his
+ * elimination (eliminatedToSpectator, the direct and at-sign-in
+ * 'playerEliminated', the hand-for-hand room copy). Never throws.
+ */
+function removalNoticeFields(tournamentId: string, playerId: string): { reason?: 'sat_out_limit'; handsSatOut?: number } {
+  try {
+    const tp = tournamentManager.getTournament(tournamentId)?.players.find((p) => p.playerId === playerId);
+    return tp?.removedFor ? { reason: tp.removedFor, handsSatOut: tp.removedSatOutHands } : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 2026-11-25 (owner) — a removed entrant no socket could be told about (away,
+ * no live socket) is told ONCE at his next sign-in (tellRemovalSignInNotices,
+ * from tellKeptTournamentSeats), within 24 h. Only events OUTSIDE the durable
+ * results (qualifiers, the Online League, account-less events): a non-qualifier
+ * event already tells him at sign-in through its untold result row
+ * (tellUnseenTournamentResults), so it is never told twice. Any later direct
+ * notice of his elimination (the G183 dead-seat notice at sign-in) consumes it.
+ */
+const REMOVAL_SIGN_IN_NOTICE_TTL_MS = 24 * 60 * 60 * 1000;
+const removalSignInNotices = new Map<string, { tournamentId: string; playerId: string; playerName: string; position: number; userId: number | null; masterId: string | null; tournamentName: string; at: number }>();
+function removalNoticeKey(tournamentId: string, playerId: string): string {
+  return `${tournamentId}\u0000${playerId}`;
+}
+function dropRemovalSignInNotice(tournamentId: string, playerId: string): void {
+  removalSignInNotices.delete(removalNoticeKey(tournamentId, playerId));
+}
+/**
+ * After a sign-in (tellKeptTournamentSeats): this account's untold removals —
+ * still running → 'playerEliminated' {tournamentId, playerId, playerName,
+ * position, prize?, atSignIn:true, reason:'sat_out_limit', handsSatOut};
+ * finished → 'tournamentFinishedForEntrant' {tournamentId, position, prize?,
+ * tournamentName, atSignIn:true, reason, handsSatOut}. Each once. Never throws.
+ */
+function tellRemovalSignInNotices(socket: Socket, auth: SocketAuthSession, via: string): number {
+  try {
+    if (removalSignInNotices.size === 0 || !socket.connected) return 0;
+    const master = auth.masterUserId || auth.statsMasterUserId || null;
+    const now = Date.now();
+    let told = 0;
+    for (const [k, n] of [...removalSignInNotices]) {
+      if (now - n.at >= REMOVAL_SIGN_IN_NOTICE_TTL_MS) { removalSignInNotices.delete(k); continue; }
+      const mine = (n.userId !== null && auth.userId === n.userId) || (!!n.masterId && !!master && String(master) === n.masterId);
+      if (!mine) continue;
+      removalSignInNotices.delete(k);
+      const t = tournamentManager.getTournament(n.tournamentId);
+      const tp = t?.players.find((p) => p.playerId === n.playerId);
+      const position = tp && tp.eliminated && tp.finishPosition > 0 ? tp.finishPosition : n.position;
+      const prize = tournamentManager.prizeForEntrant(n.tournamentId, n.playerId);
+      const why = { reason: 'sat_out_limit' as const, handsSatOut: tp?.removedSatOutHands ?? TOURNAMENT_SIT_OUT_HANDS_LIMIT };
+      if (t && t.status === 'running') {
+        socket.emit('playerEliminated', {
+          tournamentId: n.tournamentId, playerId: n.playerId, playerName: n.playerName, position,
+          ...(prize && prize > 0 ? { prize } : {}), atSignIn: true, ...why,
+        });
+      } else {
+        socket.emit('tournamentFinishedForEntrant', {
+          tournamentId: n.tournamentId, position, ...(prize && prize > 0 ? { prize } : {}),
+          tournamentName: n.tournamentName, atSignIn: true, ...why,
+        });
+      }
+      told++;
+    }
+    awayStreakStats.toldOnSignIn += told;
+    if (told > 0) console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_sit_out_removal_told_on_sign_in', via, told })}`);
+    return told;
+  } catch {
+    awayStreakStats.errors++;
+    return 0;
+  }
+}
+
+/**
+ * 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — inside
+ * runTournamentBustCheck, BEFORE its candidate scan: each seat this hand's
+ * capture put on `check.awayLimitSeats` is re-checked NOW (still that
+ * entrant's live seat with chips, he is alive, the table is not broken and no
+ * hand is in progress there, his run is still 30+ — an I'm back or an action
+ * during the hand-end awaits reset it — he is not protected and nobody plays
+ * the seat now) and his stack is set to 0: the bust loop then eliminates him
+ * exactly like a bust of this hand (next place, ordered and tied with this
+ * hand's busts by pre-hand stack, a hand-for-hand round's bust), with NO
+ * eliminator (no bounty). His chips leave play. One shot per capture; a
+ * skipped seat stays counted and is taken at a later hand end. Returns the
+ * seats zeroed now.
+ */
+function removeAwayLimitSeats(
+  tableId: string, table: PokerTable, tournamentId: string, check: TournamentBustCheck, tableBroken: boolean, via: string,
+): Set<number> {
+  const out = new Set<number>();
+  const seats = check.awayLimitSeats;
+  check.awayLimitSeats = undefined;
+  if (!seats || seats.size === 0) return out;
+  const t = tournamentManager.getTournament(tournamentId);
+  const now = Date.now();
+  // Never the LAST one standing: with this hand's busts and removals, at least one
+  // entrant stays alive (he wins, as after a bust). Removed smallest pre-hand stack
+  // first, so the biggest stack is the one kept.
+  let left = 0;
+  if (t) {
+    left = t.players.filter((p) => !p.eliminated).length;
+    for (const [bi, bpid] of check.bustedThisHand) {
+      if (table.seats[bi]?.playerId === bpid && t.players.some((p) => p.playerId === bpid && !p.eliminated)) left--;
+    }
+  }
+  const order = [...seats].sort((a, b) => (check.startChips.get(a[0]) || 0) - (check.startChips.get(b[0]) || 0));
+  for (const [i, pid] of order) {
+    const seat = table.seats[i];
+    const tp = t?.players.find((p) => p.playerId === pid);
+    let skip: string | null = null;
+    if (!t || t.status !== 'running') skip = 'not_running';
+    else if (tableBroken) skip = 'table_broken';
+    else if (table.isHandInProgress()) skip = 'hand_in_progress';
+    else if (!seat || seat.state !== 'occupied' || seat.playerId !== pid || seat.eliminated || seat.isAI) skip = 'seat_changed';
+    else if (!tp || tp.eliminated) skip = 'not_alive';
+    else if (seat.chipCount <= 0) skip = 'busted';
+    else if ((tp.sitOutHands || 0) < TOURNAMENT_SIT_OUT_HANDS_LIMIT) skip = 'back';
+    else if (awayStreakProtected(tp, now)) skip = 'protected';
+    else if (awayStreakPlayedNow(tableId, i)) skip = 'playing';
+    else if (left <= 1) skip = 'last_standing';
+    if (skip) {
+      awayStreakStats.removalsSkipped++;
+      console.log(`[Tournament] ${JSON.stringify({ event: 'tournament_sit_out_removal_skipped', tournamentId, tableId, seatIndex: i, playerId: pid, skip, handNumber: check.handNumber, via })}`);
+      continue;
+    }
+    const chips = seat.chipCount;
+    tp!.removedFor = 'sat_out_limit';
+    tp!.removedSatOutHands = TOURNAMENT_SIT_OUT_HANDS_LIMIT;
+    seat.chipCount = 0;
+    out.add(i);
+    left--;
+    awayStreakStats.removed++;
+    if (tp!.sitOutProtectedUntil !== undefined) awayStreakStats.removedProtectedAfterHour++;
+    console.warn(`[Tournament] ${JSON.stringify({
+      event: 'tournament_sit_out_removed', tournamentId, tableId, seatIndex: i, playerId: pid, handsSatOut: tp!.sitOutHands,
+      chipsOutOfPlay: chips, startStack: check.startChips.get(i) || 0, handNumber: check.handNumber, noShow: tp!.sitOutProtectedUntil !== undefined, via,
+    })}`);
+  }
+  return out;
+}
+
+/**
  * S1 — the tournament bust check (moved out of handleHandComplete; same rules):
  * every 0-chip seat on `tableId` is eliminated through TournamentManager —
  * exactly once (seat.eliminated is set first; eliminatePlayer ignores an
@@ -29341,6 +29756,13 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
   // 20s stale backstop, a deal path outside autoStartNextHand) used to
   // eliminate him mid-hand. The hand's own capture settles him when it ends.
   const inHandInProgress = (s: Seat): boolean => table.isHandInProgress() && (s.totalInvestedThisHand || 0) > 0;
+  // 2026-11-25 (owner: "can't sit out more than 30 hands in a row") — this hand's
+  // removals: their stacks go to 0 NOW, and the loop below eliminates them as
+  // busts of this hand (place, same-hand order and ties, hand-for-hand), never
+  // credited to anyone.
+  const removedNow: Set<number> = check?.awayLimitSeats && check.awayLimitSeats.size > 0
+    ? removeAwayLimitSeats(tableId, table, tournamentId, check, tableBroken, via)
+    : new Set<number>();
   // 2026-06-11 audit R2: when multiple players bust the SAME hand, finish
   // position — and now the real funded prize payout — must be decided by
   // PRE-HAND stack (the bigger stack outlasted more, so finishes higher),
@@ -29363,7 +29785,7 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
     const byStack = new Map<number, string[]>();
     for (const i of bustedSeatIdx) {
       const s = table.seats[i];
-      if (!s || check.bustedThisHand.get(i) !== s.playerId) continue;
+      if (!s || (check.bustedThisHand.get(i) !== s.playerId && !removedNow.has(i))) continue;   // + this hand's removals (2026-11-25)
       const st = startChips.get(i) || 0;
       if (st <= 0) continue;
       const ids = byStack.get(st) || [];
@@ -29430,7 +29852,9 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
     // 2026-10-24 — a human's bust of this table's hand-for-hand round hand: the
     // room's 'playerEliminated' waits (the bootstrap listener asks
     // handForHandNoticeDeferred) and so does his own notice (recorded below).
-    const hfhQuiet = !!hfhRound && thisHand && !seat.isAI;
+    // 2026-11-25 — a removal of this hand is one of the round's busts too.
+    const removedHere = removedNow.has(i);
+    const hfhQuiet = !!hfhRound && (thisHand || removedHere) && !seat.isAI;
     try {
       let result: ReturnType<typeof tournamentManager.eliminatePlayer>;
       eliminationDirectNotice = noticeSids.length > 0 ? { playerId: seat.playerId, sids: noticeSids } : null;
@@ -29448,6 +29872,16 @@ function runTournamentBustCheck(tableId: string, table: PokerTable, check: Tourn
       // round 6 skips the directly told sockets).
       const bustPosition = bustTp && bustTp.eliminated && bustTp.finishPosition > 0
         ? bustTp.finishPosition : (result ? result.position : 0);
+      // 2026-11-25 (owner) — the removal's durable record (who, why, the place: a
+      // hand-for-hand round re-places it at the settle, logged there).
+      if (removedHere && bustTp) {
+        auditLog(bustTp.userId !== undefined ? String(bustTp.userId) : bustTp.playerId, 'TOURNAMENT_SIT_OUT_REMOVED', {
+          tournamentId, tableId, seatIndex: i, playerId: bustTp.playerId, place: bustPosition, placeFinal: !hfhQuiet,
+          handsSatOut: bustTp.sitOutHands ?? null, handNumber: check?.handNumber ?? null, startStack: startChips.get(i) || 0,
+          noShow: bustTp.sitOutProtectedUntil !== undefined, finished: !!result?.finished,
+          qualifierId: qualifierOfTournament(tournamentId)?.qualId ?? null,
+        });
+      }
       // The elimination may have broken THIS table right now (playerEliminated
       // → handleTableRebalance runs synchronously): read it again.
       const brokenNow = !tournamentTables.has(tableId);
@@ -29552,6 +29986,7 @@ function tellTournamentBustNow(
       status: tournamentManager.getTournamentStatus(tournamentId),
       tableIds: tournamentManager.getTournament(tournamentId)?.tableIds || [],
       ...(bustPrize && bustPrize > 0 ? { prize: bustPrize } : {}),   // F7
+      ...removalNoticeFields(tournamentId, bust.playerId),   // 2026-11-25 — removed for sitting out: why
     });
     toldSockets++;
   }
@@ -29560,7 +29995,33 @@ function tellTournamentBustNow(
   // signed in as him except the one switched to spectator above — the
   // room's copy skipped them (one notice each).
   toldSockets += noticeTournamentEliminationToEntrant(tournamentId, bust.playerId, noticeSids, bust.playerName, bustPosition, bustPrize);
+  // 2026-11-25 (owner) — a REMOVED entrant nobody could tell now: told once at his next sign-in.
+  if (toldSockets === 0) queueRemovalSignInNotice(tournamentId, bust.playerId, bust.playerName, bustPosition);
   return toldSockets;
+}
+
+/**
+ * 2026-11-25 — queue the one-time sign-in notice of a removal (see
+ * removalSignInNotices): only for an entrant removed for sitting out, of an
+ * event outside the durable results, with an account to tell. Never throws.
+ */
+function queueRemovalSignInNotice(tournamentId: string, playerId: string, playerName: string, position: number): void {
+  try {
+    const t = tournamentManager.getTournament(tournamentId);
+    const tp = t?.players.find((p) => p.playerId === playerId);
+    if (!t || !tp?.removedFor || tournamentResultsInScope(tournamentId)) return;
+    const masterId = tp.masterUserId || qualifierEntrantMasterId(tournamentId, playerId) || null;
+    const userId = tp.userId !== undefined ? tp.userId : null;
+    if (!masterId && userId === null) return;
+    const now = Date.now();
+    for (const [k, n] of removalSignInNotices) if (now - n.at >= REMOVAL_SIGN_IN_NOTICE_TTL_MS) removalSignInNotices.delete(k);
+    removalSignInNotices.set(removalNoticeKey(tournamentId, playerId), {
+      tournamentId, playerId, playerName, position, userId, masterId: masterId ? String(masterId) : null,
+      tournamentName: t.config.name || 'Tournament', at: now,
+    });
+  } catch {
+    awayStreakStats.errors++;
+  }
 }
 
 /** S1 — run every capture still pending on this table now (its handleHandComplete threw), then re-kick its deal. */
@@ -30875,7 +31336,10 @@ function emitHandForHandRoomBust(
   for (const tid of tournamentManager.getTournament(tournamentId)?.tableIds || []) {
     try {
       const room = io.to(`table:${tid}`);
-      (except.length > 0 ? room.except(except) : room).emit('playerEliminated', { ...roomEliminationPayload(tournamentId, payload), handForHand: true });   // F19 review fix-up
+      (except.length > 0 ? room.except(except) : room).emit('playerEliminated', {
+        ...roomEliminationPayload(tournamentId, payload), handForHand: true,   // F19 review fix-up
+        ...removalNoticeFields(tournamentId, payload.playerId),   // 2026-11-25 — removed for sitting out: why
+      });
     } catch (e) {
       handForHandFailed(tournamentId, 'room_notice', e, tid);
     }
